@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    The guards that hold this chart to the platform's code: probe paths against ProbeEndpoints, the
+    drain deadline against ServiceDefaults, ConfigMap keys against their readers, the migration Job
+    model, the Modules__Required__N ceiling against the record contract, and the rest. They moved
+    out of the platform's test projects (and briefly through MeshWeaver.Plugins) with the chart.
+    Chart files resolve against THIS repository; platform files against $(MeshWeaverRoot).
+  -->
+  <PropertyGroup>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- ProbeSeparationTest, RollGateReadinessOnlyTest, RollMidSessionDrainTest drive the platform's
+         REAL probe and drain composition on the paths the chart ships. -->
+    <ProjectReference Include="$(MeshWeaverRoot)/memex/aspire/Memex.Portal.ServiceDefaults/Memex.Portal.ServiceDefaults.csproj" />
+    <ProjectReference Include="$(MeshWeaverRoot)/memex/Memex.Portal.Shared/Memex.Portal.Shared.csproj" />
+    <ProjectReference Include="$(MeshWeaverRoot)/src/MeshWeaver.Hosting/MeshWeaver.Hosting.csproj" />
+    <ProjectReference Include="$(MeshWeaverRoot)/src/MeshWeaver.Mesh.Contract/MeshWeaver.Mesh.Contract.csproj" />
+    <ProjectReference Include="$(MeshWeaverRoot)/src/MeshWeaver.Deployment.Contract/MeshWeaver.Deployment.Contract.csproj" />
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" />
+    <!-- AutomationSwitchesReachTheConfigMapGuard and its two siblings parse `helm template`'s output. -->
+    <PackageReference Include="YamlDotNet" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- ChartRoots.PlatformRoot resolves the platform checkout at RUN time through this. -->
+    <AssemblyMetadata Include="MeshWeaverRoot" Value="$([System.IO.Path]::GetFullPath('$(MeshWeaverRoot)'))" />
+  </ItemGroup>
+</Project>

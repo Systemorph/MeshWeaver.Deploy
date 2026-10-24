@@ -1,0 +1,8 @@
+<Project>
+  <!-- ONE source of package versions: the platform's. Never a hand-maintained PackageVersion list
+       here — it would drift and build green against a different assembly than the platform ships. -->
+  <PropertyGroup>
+    <MeshWeaverRoot Condition="'$(MeshWeaverRoot)' == ''">$(MSBuildThisFileDirectory)../../MeshWeaver</MeshWeaverRoot>
+  </PropertyGroup>
+  <Import Project="$(MeshWeaverRoot)/test/Directory.Packages.props" />
+</Project>

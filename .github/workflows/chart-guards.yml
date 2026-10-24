@@ -1,0 +1,101 @@
+name: Chart guards
+
+# Does this chart still agree with the PLATFORM's code?
+#
+# The guards in test/MeshWeaver.Deploy.ChartGuards compare the chart with code that lives in the
+# platform repository: the probe paths with ProbeEndpoints and the health-check tags, the drain
+# deadline with ServiceDefaults and the portal base image, every ConfigMap key with a reader, the
+# migration Job model, the Modules__Required__N ceiling with the record contract. They lived in the
+# platform's test projects until the chart left it (core slimming); they moved WITH the chart, and
+# they build against a platform checkout as PROJECT references — the platform is read, never copied.
+#
+# 🛡️ NO SKIP-TRAPDOOR: every input is a checkout (this repository, and the PUBLIC platform repository
+# — no token). No secret, no cluster, no `continue-on-error:`, no input-shaped `if:`, no path filter.
+# The run must PRINT its verdict line with a non-zero total and zero failures; an exit code alone is
+# not a verdict.
+#
+# 🔭 WHAT THIS CANNOT SEE. A platform change that breaks this agreement reaches here on the next PR
+# or on the daily schedule below — no platform pull request runs this. That is the cost of the chart
+# living outside the platform; the schedule bounds it to a day.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chart-guards-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Which platform the guards compile against — DECLARED, never defaulted at the point of use
+  # (MeshWeaver#3259). The chart is deployed against the platform's tip, so the guards track it.
+  # The repo VARIABLE MW_PLATFORM_REF wins over it.
+  MW_CHART_GUARDS_PLATFORM_REF: main
+  # 22 guard classes are deterministic (71 tests); 3 more render the chart with `helm template`
+  # (17). The floor is the REAL count at the move (88) — raise it with every test added, or a lost
+  # class passes.
+  MIN_TESTS: "88"
+
+jobs:
+  guards:
+    name: Chart guards (vs platform)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve the platform ref the guards compile against
+        id: platform-ref
+        env:
+          REF: ${{ vars.MW_PLATFORM_REF || env.MW_CHART_GUARDS_PLATFORM_REF }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REF:-}" ]; then
+            echo "::error title=No platform ref declared::Neither the repo VARIABLE MW_PLATFORM_REF nor this workflow's MW_CHART_GUARDS_PLATFORM_REF names a platform ref."
+            exit 1
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+      # PUBLIC: no token.
+      - name: Check out the platform
+        uses: actions/checkout@v7
+        with:
+          repository: Systemorph/MeshWeaver
+          ref: ${{ steps.platform-ref.outputs.ref }}
+          path: meshweaver
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+      # Three guard classes parse `helm template`'s render of this chart.
+      - name: Install helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.16.3
+      - name: Build (Release, warnings as errors)
+        run: |
+          set -euo pipefail
+          echo "platform $(git -C meshweaver rev-parse HEAD)"
+          dotnet build test/MeshWeaver.Deploy.ChartGuards/MeshWeaver.Deploy.ChartGuards.csproj \
+            -c Release -warnaserror -p:MeshWeaverRoot="$GITHUB_WORKSPACE/meshweaver"
+      - name: Run the guards
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/guards.log"
+          set +e
+          test/MeshWeaver.Deploy.ChartGuards/bin/Release/net10.0/MeshWeaver.Deploy.ChartGuards > "$out" 2>&1
+          rc=$?
+          set -e
+          cat "$out"
+          summary="$(grep -E 'Total: [0-9]+, Errors: [0-9]+, Failed: [0-9]+' "$out" | tail -1)"
+          [ -n "$summary" ] || { echo "::error::the run printed no 'Total/Errors/Failed' summary — an exit code is not a verdict"; exit 1; }
+          total="$(sed -E 's/.*Total: ([0-9]+).*/\1/' <<<"$summary")"
+          errors="$(sed -E 's/.*Errors: ([0-9]+).*/\1/' <<<"$summary")"
+          failed="$(sed -E 's/.*Failed: ([0-9]+).*/\1/' <<<"$summary")"
+          [ "$rc" -eq 0 ] && [ "$errors" -eq 0 ] && [ "$failed" -eq 0 ] || { echo "::error::guards failed (exit $rc): $summary"; exit 1; }
+          [ "$total" -ge "$MIN_TESTS" ] || { echo "::error::only $total guard(s) ran, the floor is $MIN_TESTS — a class went missing"; exit 1; }
+          echo "$total guard(s), 0 failed"

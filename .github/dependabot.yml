@@ -1,0 +1,9 @@
+version: 2
+updates:
+  # The workflows' actions. The chart's image pins and the platform ref are NOT bumped here: the
+  # running build is chosen by the self-updater and the operator, and each workflow declares its
+  # platform ref on purpose.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
