@@ -100,8 +100,9 @@ roleRef:
 #     current field and its deprecated alias (`serviceAccount`) are checked: either one selects the
 #     identity.
 #   * No Secret through the spec: a `default`-identity pod could otherwise mount the operator's synced
-#     Key Vault Secret, a Secrets Store CSI volume, or a service-account-token Secret, and print it to
-#     the log this token can read.
+#     Key Vault Secret, a Secrets Store CSI volume, a service-account-token Secret, or a storage
+#     Secret behind an in-tree volume (azureFile.secretName, a secretRef), and print or use it in a
+#     log this token can read. Volume sources are therefore an ALLOWLIST.
 #   * The node itself is held by Pod Security `baseline` on the namespace (namespace.yaml): no
 #     privileged container, hostPath or host namespace, so a Job cannot reach another pod's token
 #     through the node.
@@ -146,11 +147,16 @@ spec:
         (!has(variables.podSpec.serviceAccountName) || variables.podSpec.serviceAccountName == 'default')
         && (!has(variables.podSpec.serviceAccount) || variables.podSpec.serviceAccount == 'default')
       message: "the hosting job-runner may only start Jobs that run as the namespace's default ServiceAccount; a Job naming hosting-operator (or any other identity) would hand the portal-held token the operator's cluster-wide rights. Run lifecycle actions through the Actions executor."
+    # An ALLOWLIST, not a denylist: `secret` and `csi` are not the only volume sources that reach a
+    # Secret — azureFile.secretName, and the secretRef of cephfs/rbd/iscsi/flexVolume/cinder/scaleIO/
+    # storageos, have the kubelet use a Secret the job-runner itself may not read. Any key outside
+    # the list (every such source, and any source a later Kubernetes adds) is refused.
     - expression: >-
         !has(variables.podSpec.volumes) || variables.podSpec.volumes.all(v,
-          !has(v.secret) && !has(v.csi)
-          && (!has(v.projected) || !has(v.projected.sources) || v.projected.sources.all(src, !has(src.secret))))
-      message: "the hosting job-runner may not start a Job that mounts a Secret, a projected Secret or a CSI volume: the Job's log is readable by the token that started it"
+          v.all(k, k in ['name', 'emptyDir', 'configMap', 'downwardAPI', 'projected', 'ephemeral'])
+          && (!has(v.projected) || !has(v.projected.sources) || v.projected.sources.all(src,
+                src.all(k, k in ['configMap', 'downwardAPI', 'serviceAccountToken', 'clusterTrustBundle']))))
+      message: "the hosting job-runner may only start a Job whose volumes are emptyDir, configMap, downwardAPI, ephemeral or a projected volume of configMap/downwardAPI/serviceAccountToken/clusterTrustBundle: any other source (secret, csi, azureFile, a secretRef-bearing in-tree volume) reaches a Secret, and the Job's log is readable by the token that started it"
     - expression: >-
         variables.containers.all(c,
           (!has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef)))

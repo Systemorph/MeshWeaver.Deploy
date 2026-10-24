@@ -218,6 +218,24 @@ class JobRunnerFence(unittest.TestCase):
         self.assertDenied(operator_job(None, volumes=[{'name': 'p', 'projected': {'sources': [
             {'configMap': {'name': 'c'}}, {'secret': {'name': 'hosting-operator-token'}}]}}]))
 
+    def test_secret_backed_in_tree_volumes_are_denied(self):
+        """Volume sources that hand the kubelet a Secret by NAME rather than mounting it — the shape a
+        `secret`/`csi` denylist let through (Deploy#2 review)."""
+        for source in ({'azureFile': {'secretName': 'storage-key', 'shareName': 's'}},
+                       {'cephfs': {'monitors': ['m'], 'secretRef': {'name': 'ceph'}}},
+                       {'rbd': {'monitors': ['m'], 'image': 'i', 'secretRef': {'name': 'ceph'}}},
+                       {'iscsi': {'targetPortal': 't', 'iqn': 'q', 'lun': 0, 'secretRef': {'name': 'chap'}}},
+                       {'flexVolume': {'driver': 'd', 'secretRef': {'name': 'flex'}}},
+                       {'cinder': {'volumeID': 'v', 'secretRef': {'name': 'os'}}},
+                       {'persistentVolumeClaim': {'claimName': 'operator-data'}},
+                       {'hostPath': {'path': '/var/lib/kubelet'}}):
+            with self.subTest(source=next(iter(source))):
+                self.assertDenied(operator_job(None, volumes=[{'name': 'v', **source}]))
+
+    def test_projected_source_outside_allowlist_is_denied(self):
+        self.assertDenied(operator_job(None, volumes=[{'name': 'p', 'projected': {'sources': [
+            {'downwardAPI': {'items': []}}, {'podCertificate': {'signerName': 's'}}]}}]))
+
     def test_secret_env_from_is_denied(self):
         job = operator_job(None)
         job['spec']['template']['spec']['containers'][0]['envFrom'] = [{'secretRef': {'name': 'hosting-operator-keyvault'}}]
@@ -237,7 +255,9 @@ class JobRunnerFence(unittest.TestCase):
         self.assertAdmitted(operator_job(None, volumes=[
             {'name': 'c', 'configMap': {'name': 'c'}},
             {'name': 'p', 'projected': {'sources': [{'configMap': {'name': 'c'}}, {'downwardAPI': {'items': []}}]}},
-            {'name': 't', 'emptyDir': {}}]))
+            {'name': 't', 'emptyDir': {}},
+            {'name': 'sa', 'projected': {'sources': [{'serviceAccountToken': {'path': 'token'}}]}},
+            {'name': 'e', 'ephemeral': {'volumeClaimTemplate': {'spec': {'accessModes': ['ReadWriteOnce']}}}}]))
 
     def test_other_requesters_are_not_matched(self):
         """The fence is about the PORTAL's token. The operator's own lanes and the secret writer's
