@@ -38,9 +38,10 @@ env:
   # (MeshWeaver#3259). The chart is deployed against the platform's tip, so the guards track it.
   # The repo VARIABLE MW_PLATFORM_REF wins over it.
   MW_CHART_GUARDS_PLATFORM_REF: main
-  # 17 guard classes are deterministic; 3 more render the chart with `helm template`. The floor is
-  # the REAL count at the move (65) — raise it with every fact added, or a lost class passes.
-  MIN_TESTS: "65"
+  # 22 guard classes are deterministic (71 tests); 3 more render the chart with `helm template`
+  # (17). The floor is the REAL count at the move (88) — raise it with every test added, or a lost
+  # class passes.
+  MIN_TESTS: "88"
 
 jobs:
   guards:
