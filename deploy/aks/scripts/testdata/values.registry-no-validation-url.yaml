@@ -1,0 +1,6 @@
+# A complete registry overlay (values.registry.example.yaml, layered before this) with the validator
+# OMITTED. The chart must refuse it by name: docker_auth hands every login's instance key to that URL,
+# and the chart used to fill a blank with one installation's portal, so an independent installation
+# that left it out sent its instance keys there.
+registry:
+  validationUrl: ""

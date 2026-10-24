@@ -1,5 +1,5 @@
 {{- /*
-The fleet's own container registry (`cr.meshweaver.cloud`) — a SEPARATE service beside the portal,
+A container registry for the fleet's images and bundles — a SEPARATE service beside the portal,
 built from two off-the-shelf images and zero registry code of ours:
 
   * distribution   the CNCF reference registry (ghcr.io/distribution/distribution), storage driver
@@ -35,7 +35,7 @@ start. The one exception is deliberate and safe: `publisher.passwordBcrypt` is a
 {{- $notifications := ($r.notifications | default dict) -}}
 {{- $ingress := ($r.ingress | default dict) -}}
 {{- $resources := ($r.resources | default dict) -}}
-{{- $host := required "registry.host is required when registry.enabled — the public hostname the registry answers on (e.g. cr.meshweaver.cloud)" $r.host -}}
+{{- $host := required "registry.host is required when registry.enabled — the public hostname the registry answers on (e.g. registry.example.com)" $r.host -}}
 {{- $image := required "registry.image is required when registry.enabled — the distribution image, pinned by digest (ghcr.io/distribution/distribution:3.1.1@sha256:…)" $r.image -}}
 {{- $authImage := required "registry.authImage is required when registry.enabled — the cesanta/docker_auth image, pinned by digest" $r.authImage -}}
 {{- $accountName := required "registry.storage.accountName is required when registry.enabled — the Azure Storage account holding the registry's blobs" $storage.accountName -}}
@@ -46,6 +46,10 @@ start. The one exception is deliberate and safe: `publisher.passwordBcrypt` is a
 {{- $keyObject := required "registry.keyVault.keyObject is required when registry.enabled — the vault secret holding the token-signing private key (PEM)" $kv.keyObject -}}
 {{- $httpSecretObject := required "registry.keyVault.httpSecretObject is required when registry.enabled — the vault secret holding distribution's http.secret; without a shared one every replica signs upload state differently and chunked pushes fail across pods" $kv.httpSecretObject -}}
 {{- $passwordBcrypt := required "registry.publisher.passwordBcrypt is required when registry.enabled — the publisher account's bcrypt HASH (htpasswd -nB <user>); without it the ACL would name an account nobody can authenticate as" $publisher.passwordBcrypt -}}
+{{- /* 🚨 NO DEFAULT. docker_auth hands every non-publisher login's password — an instance key — to
+       this URL. A default naming one installation's portal would send every OTHER installation's
+       instance keys there, and authenticate them against the wrong authority. */ -}}
+{{- $validationUrl := required "registry.validationUrl is required when registry.enabled — the portal key→token exchange that validates every instance key presented at this registry (e.g. https://portal.example.com/api/instances/token). There is no default: docker_auth sends each login's instance key to this URL, so it must name YOUR installation's validator" (($r.validationUrl | default "") | toString | trim) -}}
 {{- $notificationUrl := ($notifications.url | default "") -}}
 {{- $notificationSecretObject := ($kv.notificationSecretObject | default "") -}}
 {{- if and $notificationUrl (not $notificationSecretObject) -}}
@@ -69,7 +73,7 @@ start. The one exception is deliberate and safe: `publisher.passwordBcrypt` is a
       "notificationSecretObject" $notificationSecretObject
       "publisherUsername" ($publisher.username | default "publisher")
       "publisherPasswordBcrypt" $passwordBcrypt
-      "validationUrl" ($r.validationUrl | default "https://memex.meshweaver.cloud/api/instances/token")
+      "validationUrl" $validationUrl
       "notificationUrl" $notificationUrl
       "ingressClassName" ($ingress.className | default "nginx")
       "clusterIssuer" ($ingress.clusterIssuer | default "")

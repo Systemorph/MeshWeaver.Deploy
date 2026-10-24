@@ -1,0 +1,8 @@
+# Two pass-through keys the chart has no line for, differing only by CASE. .NET folds environment
+# keys case-insensitively, so both would race for one configuration value on every pod start. The
+# chart refused a pass-through key that collided with a LITERAL chart key, but not two pass-through
+# keys colliding with each other; it must refuse those too.
+config:
+  memex_portal:
+    Example__PassThrough__Switch: "true"
+    EXAMPLE__PASSTHROUGH__SWITCH: "false"

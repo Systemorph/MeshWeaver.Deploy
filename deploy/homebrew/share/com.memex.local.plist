@@ -4,7 +4,7 @@
 <!--
   memex-local launchd login agent — 1:1 automation of LocalColimaMac.md §7.
   Runs ~/.memex-local/port-forward.sh at login (RunAtLoad) and restarts it if it
-  ever drops (KeepAlive), keeping https://memex.localhost:8443 available across
+  ever drops (KeepAlive), keeping https://memex.localhost:<MEMEX_PORT, default 8443> available across
   reboots with NO sudo (8443 is unprivileged — see §6/§7).
 
   `memex-local up` writes a copy of this file with the __TOKENS__ substituted to
@@ -28,6 +28,11 @@
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- The host port the CLI chose (MEMEX_PORT, default 8443). launchd does not inherit the
+             invoking shell's environment, so without this the forward bound 8443 while the CLI
+             waited for and verified the port it was asked for. -->
+        <key>MEMEX_PORT</key>
+        <string>__PORT__</string>
     </dict>
 
     <key>RunAtLoad</key>

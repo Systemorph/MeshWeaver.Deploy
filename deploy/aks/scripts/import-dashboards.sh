@@ -29,9 +29,29 @@ if [ ${#files[@]} -eq 0 ]; then
   echo "no dashboard *.json found in $(pwd)"; exit 1
 fi
 
+# 🚨 A non-2xx answer is a FAILURE. curl exits 0 on any HTTP status it received, so printing the
+# code and moving on made a rejected dashboard (HTTP 4xx/5xx) indistinguishable from an imported one,
+# and the lane that ran this reported success. Every file is still attempted, so one run names every
+# rejection, and the script exits non-zero if any was rejected or unreachable.
+resp="$(mktemp)"
+trap 'rm -f "$resp"' EXIT
+failed=0
 for f in "${files[@]}"; do
-  code=$(curl -s -o /tmp/grafana-resp -w '%{http_code}' -u "admin:$PW" \
-    -H 'Content-Type: application/json' \
-    -X POST "$G/api/dashboards/db" --data-binary @"$f")
-  echo "$f -> HTTP $code  $(cat /tmp/grafana-resp)"
+  if ! code=$(curl -s -o "$resp" -w '%{http_code}' -u "admin:$PW" \
+      -H 'Content-Type: application/json' \
+      -X POST "$G/api/dashboards/db" --data-binary @"$f"); then
+    echo "$f -> FAILED: curl could not reach $G (exit $?)" >&2
+    failed=$((failed + 1))
+    continue
+  fi
+  case "$code" in
+    2??) echo "$f -> HTTP $code  $(cat "$resp")" ;;
+    *)   echo "$f -> REJECTED: HTTP $code  $(cat "$resp")" >&2
+         failed=$((failed + 1)) ;;
+  esac
 done
+if [ "$failed" -gt 0 ]; then
+  echo "$failed of ${#files[@]} dashboard(s) were NOT imported" >&2
+  exit 1
+fi
+echo "imported ${#files[@]} dashboard(s)"

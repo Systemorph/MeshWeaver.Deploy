@@ -19,8 +19,9 @@ THE RULES, in order, per config.memex_portal key:
      (a present key with a YAML null would otherwise render "<nil>", and a blank would override a
      code default with "").
   3. REFUSED, failing the render by name:
-       • a key that differs only by CASE from a key the literal half rendered — .NET folds env keys,
-         so the two would race for one configuration value on every pod start;
+       • a key that differs only by CASE from a key the literal half rendered, or from a pass-through
+         key already emitted — .NET folds env keys, so the two would race for one configuration
+         value on every pod start;
        • a key that is not a valid ConfigMap key ([-._a-zA-Z0-9]+);
        • a map or a list — an environment variable carries one string;
        • a Modules__Required__N slot the literal block does not carry (outside 0..19). That block's
@@ -45,7 +46,7 @@ THE RULES, in order, per config.memex_portal key:
 {{- $value := get $config $key -}}
 {{- if not (hasKey $rendered $key) -}}
 {{- if hasKey $folded (lower $key) -}}
-{{- fail (printf "config.memex_portal.%s differs only by case from the chart key %s — .NET folds environment keys case-insensitively, so the two would race for one configuration value; use the chart's spelling" $key (get $folded (lower $key))) -}}
+{{- fail (printf "config.memex_portal.%s differs only by case from the key %s the ConfigMap already carries — .NET folds environment keys case-insensitively, so the two would race for one configuration value; keep one spelling" $key (get $folded (lower $key))) -}}
 {{- end -}}
 {{- if not (regexMatch "^[-._a-zA-Z0-9]+$" $key) -}}
 {{- fail (printf "config.memex_portal.%s is not a valid ConfigMap key ([-._a-zA-Z0-9]+), so it cannot reach the container" $key) -}}
@@ -63,6 +64,9 @@ THE RULES, in order, per config.memex_portal key:
 {{- fail (printf "config.memex_portal.%s is a boot-module slot the chart's literal Modules__Required__N block does not carry (it renders 0..19) — raise that block and MaxChartRenderedRequiredModuleSlot together, or move the module into the contiguous list" $key) -}}
 {{- end }}
   {{ $key }}: {{ $text | quote }}
+{{- /* Registered as EMITTED, so a later spelling of the same key (sortAlpha puts upper case first)
+       is refused like a collision with a literal key — not rendered beside it. */ -}}
+{{- $_ := set $folded (lower $key) $key -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

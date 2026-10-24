@@ -1,0 +1,6 @@
+# Layered over the mirror-consumer + bundle-fetch fixtures: bundles.root set, but to a directory the
+# portal does not read. The fetch would fill /data/bundles while PreWarm__PrebuiltBundleRoot (what the
+# pre-warm reads) names /data/prebuilt-bundles. The chart must refuse it — a fetch that succeeds into
+# a directory nothing reads is the silent failure.
+bundles:
+  root: "/data/bundles"
