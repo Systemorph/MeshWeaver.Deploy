@@ -305,7 +305,10 @@ instancesAdmin:
 hostingOperator:
   enabled: false
   # WHICH EXECUTOR runs the lifecycle actions (Plugins#1738). Read OUTSIDE `enabled`:
-  #   Job     the in-cluster operator Job (needs enabled: true, image, and the jobrunner token)
+  #   Job     the in-cluster operator Job (needs enabled: true, image, and the jobrunner token).
+  #           🚨 The reference job-runner (deploy/aks/manifests/hosting-operator/jobrunner.yaml)
+  #           REFUSES it at admission: its Jobs run as hosting-operator, and a portal-held token that
+  #           can start the operator holds the operator's rights.
   #   Actions Systemorph/Memex aks-ops.yml, dispatched through the systemorph-com GitHub App and
   #           approved in the mesh. Runs with enabled: false, so no Job, no token, no cluster grant.
   # Anything else FAILS the render: the portal reads every other value as Job.
@@ -958,11 +961,13 @@ registry:
   publisher:
     username: "publisher"
     passwordBcrypt: ""            # (required) bcrypt HASH — `htpasswd -nB publisher`
-  # Where an instance key is validated — a POST with an empty JSON body and the key as a bearer:
-  # any 200 authenticates, 401/403 denies, anything else is an error (never a pass). The default
-  # is the public portal's key→token exchange, which answers in ~0.2 s; the plugin catalog is not
-  # a validator (it renders in full, measured 14–18 s, past the validator's 10 s cap).
-  validationUrl: "https://memex.meshweaver.cloud/api/instances/token"
+  # (required) Where an instance key is validated — a POST with an empty JSON body and the key as a
+  # bearer: any 200 authenticates, 401/403 denies, anything else is an error (never a pass). Name
+  # your installation's key→token exchange (`https://<portal>/api/instances/token`, ~0.2 s); the
+  # plugin catalog is not a validator (it renders in full, measured 14–18 s, past the validator's
+  # 10 s cap). 🚨 NO DEFAULT: every login's instance key is SENT to this URL, so a default naming one
+  # installation would route every other installation's keys to it. A render without it fails.
+  validationUrl: ""
   notifications:
     url: ""                       # registry events are POSTed here when set
   ingress:

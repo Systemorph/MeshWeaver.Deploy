@@ -5,14 +5,26 @@ Applied on the **control instance's** cluster only. Three principals, deliberate
 | Principal | Can | Cannot |
 |---|---|---|
 | `memex-portal-sa` (the portal, unchanged) | `get`/`patch` its own Deployment — what the self-updater needs | anything in this directory |
-| `hosting-jobrunner` (mounted into the portal as a token) | create/get/delete Jobs and read pod logs **in `memex-ops` only** | touch a namespace, a database, or any cloud resource |
+| `hosting-jobrunner` (mounted into the portal as a token) | create/get/delete Jobs and read pod logs **in `memex-ops` only** — Jobs that run as the namespace's `default` ServiceAccount and reach no Secret (a ValidatingAdmissionPolicy holds it, `jobrunner.yaml`) | start a Job as `hosting-operator` or any other identity, read a Secret, touch a namespace, a database, or any cloud resource |
 | `hosting-operator` (the Job's own SA) | namespaces, Helm releases, ingresses cluster-wide, and — via Workload Identity — the Azure control plane | exist outside the seconds a run takes |
 | `hosting-secret-writer` (a SECRET action's Job, in its own namespace `memex-secrets`, `secret-writer.yaml`) | via Workload Identity, as `secret-writer`: list, set, delete, recover and purge Key Vault secrets, never read one; in-cluster, read which object version each pod mounted and restart the portal Deployment (a ValidatingAdmissionPolicy holds the patch to the restart annotation) | read a vault value, create or delete anything in the cluster, change a pod template ([Secrets: Write-Only Entry](../../../../src/MeshWeaver.Documentation/Data/Architecture/SecretsWriteOnlyEntry.md)) |
 | `hosting-secret-jobrunner` (mounted into the CONTROL portal as `hosting-jobrunner-token`, `secret-writer.yaml`) | create/get/list/watch/delete Jobs and read pod logs **in `memex-secrets` only** | start a Job anywhere else, run as `hosting-operator`, read a Secret |
 
-The portal never holds the powerful credential. It holds a token whose entire power is *"start an
-operator job and read what it said"*, which is what makes a prompt injection into an in-pod AI CLI
-a nuisance rather than a cloud compromise.
+The portal never holds the powerful credential, and it never holds a token that can START a Job as
+the powerful identity either. A Role cannot see inside the Job it lets you create, so `create jobs`
+in `memex-ops` alone let the job-runner write `serviceAccountName: hosting-operator` with any command
+— and pinning the image and command would not close it, because the operator's `run.sh` executes the
+plan it is handed. So the fence is ADMISSION: `jobrunner.yaml` ends in a ValidatingAdmissionPolicy
+that refuses any Job, CronJob or Pod the job-runner writes unless it runs as `default` and reaches no
+Secret, and `namespace.yaml` enforces Pod Security `baseline`, so such a Job cannot reach the node
+either. `deploy/aks/scripts/test-jobrunner-admission.py` evaluates the policy offline in the chart
+gate, with the operator-identity Job as the control that must be denied. That is what makes a prompt
+injection into an in-pod AI CLI a nuisance rather than a cloud compromise.
+
+🚨 **Consequence: the in-cluster `Job` executor is refused.** Its Jobs name `hosting-operator`
+(`Hosting:Operator:ServiceAccount`), which is exactly what the policy denies. Lifecycle actions run
+through the `Actions` executor below, where an approved request rather than the portal decides what
+runs as the operator.
 
 ## Apply
 
@@ -69,7 +81,7 @@ lifecycle actions (Plugins#1738):
 
 | Executor | What runs an action | What the portal needs |
 |---|---|---|
-| `Job` (default) | This operator image, as a Job in `memex-ops` | `enabled: true`, `image`, the jobrunner token mount |
+| `Job` (default) | This operator image, as a Job in `memex-ops` running as `hosting-operator` — **refused by the job-runner's admission policy** (above): a portal-held token must not be able to start the operator | `enabled: true`, `image`, the jobrunner token mount |
 | `Actions` | Systemorph/Memex `aks-ops.yml`, dispatched through the `systemorph-com` GitHub App and approved in the mesh | Nothing on the cluster: run it with `enabled: false` |
 
 The chart renders `Hosting__Operator__Executor` outside the `enabled` block, because the Actions

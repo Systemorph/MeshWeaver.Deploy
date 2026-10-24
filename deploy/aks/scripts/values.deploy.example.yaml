@@ -25,8 +25,10 @@ secrets:
     Authentication__LinkedIn__ClientSecret: "<LINKEDIN_CLIENT_SECRET>"
 config:
   memex_portal:
-    # 1 replica => Localhost. For >1 replica use AzureTables clustering (follow-up).
-    Deployment__Orleans__Clustering: "Localhost"
+    # 🚨 NO Deployment__Orleans__Clustering here. values.aks.yaml sets AdoNet (the silos form one
+    # cluster through the shared Postgres), and this file is layered AFTER it, so a "Localhost" here
+    # would override it while KEDA still runs two or more replicas: each pod its own single-silo
+    # mesh, a split mesh. Only a deliberately single-replica, non-KEDA install may use Localhost.
     Authentication__Provider: "Custom"
     Authentication__EnableDevLogin: "false"
     # Microsoft/Entra single-tenant home directory

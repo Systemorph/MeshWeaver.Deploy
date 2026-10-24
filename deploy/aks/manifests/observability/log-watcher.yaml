@@ -9,6 +9,9 @@
 # the portal. A wedged portal only delays delivery — the watcher keeps reading Loki and queues to
 # its PVC until the portal answers again.
 #
+# A REFERENCE: the namespace list and the portal address below are examples. Fill in your own and
+# keep the filled-in copy with your installation's private configuration.
+#
 # Apply:
 #   az aks command invoke -g <aks-resource-group> -n <aks-cluster> \
 #     --command "kubectl apply -f log-watcher.yaml" --file log-watcher.yaml
@@ -74,15 +77,19 @@ spec:
           env:
             - name: LogWatcher__LokiUrl
               value: "http://loki.monitoring.svc.cluster.local:3100"
-            # The namespaces to watch — one entry per portal deployment.
+            # The namespaces to watch — one entry per portal deployment. EXAMPLES: replace them
+            # with your portals' namespaces (an estate keeps its real list in its private
+            # deployment repository, beside the rest of its installation).
             - name: LogWatcher__Namespaces__0
-              value: "memex"
+              value: "portal-a"
             - name: LogWatcher__Namespaces__1
-              value: "memex-cloud"
-            # In-cluster service URL: no ingress hop, no TLS cert to trust, and the ingest
-            # endpoint never has to be reachable from outside the cluster.
+              value: "portal-b"
+            # The portal that triages the incidents, by its in-cluster service URL: no ingress hop,
+            # no TLS cert to trust, and the ingest endpoint never has to be reachable from outside
+            # the cluster. EXAMPLE namespace `portal-a`: name the portal whose LogWatch:IngestToken
+            # matches the secret below.
             - name: LogWatcher__PortalUrl
-              value: "http://memex-portal-service.memex.svc.cluster.local:8080"
+              value: "http://memex-portal-service.portal-a.svc.cluster.local:8080"
             - name: LogWatcher__IngestToken
               valueFrom:
                 secretKeyRef:

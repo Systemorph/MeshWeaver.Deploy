@@ -125,7 +125,7 @@ COMBOS=(
   # off by default — so without this combination a broken registry template is invisible to every
   # pull request and surfaces as a failed `helm upgrade` in the deployment repo. The example
   # overlay sets every required key (object NAMES and a bcrypt HASH, no credential).
-  "AKS overlay + the fleet registry (cr.meshweaver.cloud)|deploy/helm/values.yaml:deploy/aks/values.aks.yaml:deploy/helm/values.registry.example.yaml"
+  "AKS overlay + a registry (values.registry.example.yaml)|deploy/helm/values.yaml:deploy/aks/values.aks.yaml:deploy/helm/values.registry.example.yaml"
   # A mirror consumer that ALSO materialises its plugin bundles from the fleet registry before the
   # portal starts (bundles.*, Doc/Architecture/PluginBundlesInTheRegistry): the only combination
   # that renders the `bundle-fetch` init container, its shelf, its script and the projected pull
@@ -439,6 +439,13 @@ REFUSALS=(
   "a crash-dump root that resolves outside /data|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.crash-dumps-root-escapes-data.yaml|must be a normalised directory strictly below /data"
   "a crash-dump root that normalises to /data itself|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.crash-dumps-root-is-data.yaml|must be a normalised directory strictly below /data"
   "a crash-dump root with an empty segment|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.crash-dumps-root-double-slash.yaml|must be a normalised directory strictly below /data"
+  # A registry with no validator: docker_auth sends every login's instance key to that URL, so a
+  # default naming one installation routed other installations' keys there.
+  "a registry with no validationUrl (instance keys routed to another installation)|deploy/helm/values.yaml:deploy/aks/values.aks.yaml:deploy/helm/values.registry.example.yaml:deploy/aks/scripts/testdata/values.registry-no-validation-url.yaml|registry.validationUrl is required"
+  # bundles.root alone: the fetch fills a directory the pre-warm does not read.
+  "a bundle root the portal does not read|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.mirror-consumer.yaml:deploy/aks/scripts/testdata/values.bundle-fetch.yaml:deploy/aks/scripts/testdata/values.bundle-root-mismatch.yaml|the init container would fill one directory while the pre-warm reads the other"
+  # Two pass-through keys that differ only by case: .NET folds them into one value.
+  "two pass-through keys differing only by case|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.passthrough-case-collision.yaml|differs only by case from the key"
 )
 refused=0
 for entry in "${REFUSALS[@]}"; do

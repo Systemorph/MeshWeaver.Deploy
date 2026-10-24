@@ -655,6 +655,29 @@ case "$(cat "$CLI")" in
   *) bad "autoroll's launchd job carries MEMEX_CHANNEL" "the plist never sets it — the watcher would follow main" ;;
 esac
 
+# The port-forward agent gets the port the CLI chose. launchd does not inherit the invoking shell's
+# environment, so MEMEX_PORT=9443 used to start the forward on 8443 while the CLI verified 9443.
+# The template must carry the token, install_launchd must fill it, and a render with the same three
+# substitutions must leave no token behind — so a token one side has and the other lacks is red.
+PLIST_TEMPLATE="$HERE/../share/com.memex.local.plist"
+case "$(cat "$PLIST_TEMPLATE")" in
+  *'<key>MEMEX_PORT</key>'*'<string>__PORT__</string>'*) ok "the launchd template carries MEMEX_PORT as __PORT__" ;;
+  *) bad "the launchd template carries MEMEX_PORT as __PORT__" "launchd would start the forward on the default port" ;;
+esac
+install_body="$(awk -v f='^install_launchd\\(\\)' '$0 ~ f { on=1 } on { print } on && /^}$/ { exit }' "$CLI")"
+# shellcheck disable=SC2016  # a literal '${HOST_PORT}' is the text being searched for
+case "$install_body" in
+  *'-e "s|__PORT__|${HOST_PORT}|g"'*) ok "install_launchd substitutes __PORT__ with the chosen HOST_PORT" ;;
+  *) bad "install_launchd substitutes __PORT__ with the chosen HOST_PORT" "not in install_launchd(): ${install_body}" ;;
+esac
+rendered="$(PF_SCRIPT=/x/pf.sh PF_LOG=/x/pf.log HOST_PORT=9443 bash -c '
+  sed -e "s|__SCRIPT__|${PF_SCRIPT}|g" -e "s|__LOG__|${PF_LOG}|g" -e "s|__PORT__|${HOST_PORT}|g" "$1"' _ "$PLIST_TEMPLATE")"
+case "$rendered" in
+  *__SCRIPT__*|*__LOG__*|*__PORT__*) bad "the rendered launchd plist has no token left" "$(grep -n -E '__(SCRIPT|LOG|PORT)__' <<<"$rendered")" ;;
+  *'<key>MEMEX_PORT</key>'*'<string>9443</string>'*) ok "MEMEX_PORT=9443 reaches the rendered launchd agent" ;;
+  *) bad "MEMEX_PORT=9443 reaches the rendered launchd agent" "$rendered" ;;
+esac
+
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"

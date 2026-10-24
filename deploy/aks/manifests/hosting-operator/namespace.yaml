@@ -1,8 +1,17 @@
 # The ops namespace. Nothing serves traffic here — it exists so the operator's Jobs have a home
 # with its own RBAC boundary, separate from every portal namespace.
+#
+# Pod Security `baseline` is ENFORCED: no privileged container, hostPath or host namespace. That is
+# half of the job-runner's fence (jobrunner.yaml): a Job it writes runs as `default` and reaches no
+# Secret, and without this it could still reach the node and, from there, the operator Job's token.
+# The operator's own Jobs need none of these.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: memex-ops
   labels:
     app.kubernetes.io/managed-by: meshweaver-hosting
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

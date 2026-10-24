@@ -42,9 +42,17 @@ no second secret.
 {{- fail (printf "bundles.imageIdentityPath must be an absolute path inside the portal image (got %q)" $imageIdentityPath) -}}
 {{- end -}}
 {{- $image := required "bundles.image is required when bundles.registry is set — the ORAS image, pinned by digest (ghcr.io/oras-project/oras:v1.3.4@sha256:…)" $b.image -}}
-{{- $root := ($b.root | default ((.Values.config).memex_portal).PreWarm__PrebuiltBundleRoot | default "") -}}
+{{- $portalRoot := (((.Values.config).memex_portal).PreWarm__PrebuiltBundleRoot | default "" | toString | trim) -}}
+{{- $root := ($b.root | default $portalRoot | toString | trim) -}}
 {{- if not $root -}}
 {{- fail "bundles.root (or config.memex_portal.PreWarm__PrebuiltBundleRoot, which it defaults to) is required when bundles.registry is set — it is the directory the init container fills AND the one the pre-warm reads; with neither set the fetch lands where nothing looks" -}}
+{{- end -}}
+{{- /* The fetched root and the root the portal READS are one directory, or the fetch succeeds into a
+       directory nothing looks at. Setting `bundles.root` alone used to pass: the init container filled
+       it while PreWarm__PrebuiltBundleRoot (rendered independently by config.yaml) stayed blank or
+       named another path. Invariant 13 holds the same equality over the rendered output. */ -}}
+{{- if ne (trimSuffix "/" $root) (trimSuffix "/" $portalRoot) -}}
+{{- fail (printf "bundles.root is %q but config.memex_portal.PreWarm__PrebuiltBundleRoot is %q — the init container would fill one directory while the pre-warm reads the other. Set PreWarm__PrebuiltBundleRoot (bundles.root defaults to it), or set both to the same path" $root $portalRoot) -}}
 {{- end -}}
 {{- $pullSecret := required "portal.imagePullSecret is required when bundles.registry is set — the kubernetes.io/dockerconfigjson Secret whose credential pulls the platform image is the one the init container pulls bundles with" (.Values.portal).imagePullSecret -}}
 {{- $out := dict

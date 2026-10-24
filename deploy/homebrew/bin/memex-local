@@ -934,11 +934,13 @@ setup_ollama() {
 # ---------------------------------------------------------------------------
 install_launchd() {
   local share; share="$(resolve_share)"
-  step "Installing durable launchd port-forward 8443 -> ingress :443 (§7)"
+  step "Installing durable launchd port-forward ${HOST_PORT} -> ingress :443 (§7)"
   install -m 0755 "$share/port-forward.sh" "$PF_SCRIPT"
   mkdir -p "$HOME/Library/LaunchAgents"
+  # __PORT__ carries MEMEX_PORT into the agent: launchd does not inherit this shell's environment.
   sed -e "s|__SCRIPT__|${PF_SCRIPT}|g" \
       -e "s|__LOG__|${PF_LOG}|g" \
+      -e "s|__PORT__|${HOST_PORT}|g" \
       "$share/com.memex.local.plist" > "$PLIST_DST"
   # Reload idempotently.
   launchctl bootout "gui/$(id -u)" "$PLIST_DST" >/dev/null 2>&1 || true

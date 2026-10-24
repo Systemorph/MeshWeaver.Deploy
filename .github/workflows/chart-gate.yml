@@ -227,6 +227,19 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 deploy/aks/scripts/test-observability-values.py
 
+      # The job-runner's fence (deploy/aks/manifests/hosting-operator/jobrunner.yaml): the token the
+      # control portal holds may create Jobs in the ops namespace, and only its ValidatingAdmissionPolicy
+      # stops one of them from running as hosting-operator. That policy is CEL no render ever executes,
+      # so this evaluates it against admission requests offline — the operator-identity Job is the
+      # negative control and must be DENIED. cel-python is pinned; it is installed here, not above,
+      # because nothing else needs it.
+      - name: Assert the job-runner cannot start a Job as the operator
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          pip install cel-python==0.5.0
+          python3 deploy/aks/scripts/test-jobrunner-admission.py
+
   # The three pieces of shell behind Doc/Architecture/PluginBundlesInTheRegistry — the publisher
   # (.github/scripts/push-bundle-publication.sh), the `bundle-fetch` init container's script and
   # docker_auth's ext_auth hook (deploy/helm/files/) — EXECUTED against the real distribution and

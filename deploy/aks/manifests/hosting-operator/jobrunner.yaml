@@ -1,5 +1,21 @@
-# The token the PORTAL holds. Its entire power is "start an operator job in memex-ops and read what
-# it said" — it cannot create a namespace, drop a database, or read a secret anywhere.
+# The token the PORTAL holds. Its power is "start a Job in memex-ops and read what it said" — and,
+# held by the admission policy at the end of this file, that Job can NEVER run as `hosting-operator`
+# or any other identity of that namespace: it runs as the namespace's `default` ServiceAccount, which
+# holds no grant. It cannot create a namespace, drop a database, or read a Secret anywhere.
+#
+# 🛡️ WHY THE ROLE ALONE WAS NOT A BOUNDARY. A Role grants a verb on a resource; it cannot say what
+# the created object may contain. With `create jobs` in memex-ops, the token could write
+# `serviceAccountName: hosting-operator` and any image and command, and the Job would run with the
+# operator's cluster-wide rights and its federated Azure identity — so a portal compromise (or a
+# prompt injection into an in-pod AI CLI) WAS a cluster and cloud compromise. Pinning the image and
+# the command does not close it: the operator's entrypoint (`run.sh`) executes the shell commands it
+# is handed in HOSTING_PLAN, so whoever writes the Job writes the operator's commands. The only
+# property that holds is the one enforced below: the job-runner cannot select a privileged identity.
+#
+# 🚨 CONSEQUENCE: the in-cluster `Job` executor (`hostingOperator.executor: Job`, whose Jobs name
+# `hosting-operator`) is REFUSED by this policy. Run lifecycle actions through the `Actions` executor,
+# where an approved request — not the portal — decides what runs as the operator. The secret writer
+# keeps its own fence (secret-writer.yaml: its own namespace, its own job-runner).
 #
 # 🚨 This is deliberately NOT the portal's own ServiceAccount. A pod projects only its own SA token,
 # so a second identity has to arrive as a mounted Secret — and that indirection is the point: this
@@ -10,7 +26,7 @@
 # unmountable by construction: the portal's volume mount could never resolve, and the failure
 # would have read as a missing token rather than a wrong namespace. The SA's HOME namespace is
 # irrelevant to its RIGHTS — those come from the RoleBinding in memex-ops below, which names this
-# SA as a foreign subject.
+# SA as a foreign subject. Keep the NAME `hosting-jobrunner`: the admission policy below matches it.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -43,12 +59,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "pods/log"]
     verbs: ["get", "list"]
-  # The one-shot handover Secret an export job writes its download URL into: the mesh reads it once
-  # and deletes it, so the URL never reaches a log line or a node. `create` is deliberately absent —
-  # only the job writes one.
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "delete"]
+  # 🚨 NO `secrets` rule. It used to grant get/delete on every Secret in memex-ops, for the one-shot
+  # handover Secret an export Job (running as the operator) writes its download URL into. Those Jobs
+  # are refused below, and a namespace-wide `get secrets` would hand this token whatever else lives
+  # in memex-ops (the operator's Key Vault sync, a service-account token).
 ---
 # 🚨 The binding that makes the Role above real — shipped MISSING from #2051: the Role and the
 # ServiceAccount both existed, nothing connected them, and the portal's token met a 403 on its
@@ -73,3 +87,82 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: hosting-jobrunner
+---
+# 🛡️ THE FENCE. Every Job, CronJob or Pod the job-runner writes runs as the namespace's `default`
+# ServiceAccount (or names none, which is the same thing), and reaches no Secret through its spec.
+# Held by admission, not by the Role, because a Role cannot see inside the object it lets you create.
+#
+#   * matchConditions select requests BY the job-runner — any ServiceAccount named
+#     `hosting-jobrunner`, in any namespace, so moving the SA to another portal namespace cannot open
+#     the fence. Everyone else (the operator's own lanes, a cluster admin) is not matched, and pods the
+#     Job controller creates are not matched either: the Job was already checked when it was written.
+#   * The pod spec is the Job's template, a CronJob's job template, or a Pod's own spec. Both the
+#     current field and its deprecated alias (`serviceAccount`) are checked: either one selects the
+#     identity.
+#   * No Secret through the spec: a `default`-identity pod could otherwise mount the operator's synced
+#     Key Vault Secret, a Secrets Store CSI volume, or a service-account-token Secret, and print it to
+#     the log this token can read.
+#   * The node itself is held by Pod Security `baseline` on the namespace (namespace.yaml): no
+#     privileged container, hostPath or host namespace, so a Job cannot reach another pod's token
+#     through the node.
+#
+# failurePolicy Fail: a policy the API server cannot evaluate refuses the request; it never admits it.
+# Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA), as secret-writer.yaml does.
+# Tested offline: deploy/aks/scripts/test-jobrunner-admission.py evaluates these expressions against
+# admission requests, the operator-identity Job among them as the negative control.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: hosting-jobrunner-no-privileged-identity
+  labels:
+    app.kubernetes.io/managed-by: meshweaver-hosting
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["batch"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["jobs", "cronjobs"]
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: requested-by-the-jobrunner
+      expression: "request.userInfo.username.startsWith('system:serviceaccount:') && request.userInfo.username.endsWith(':hosting-jobrunner')"
+  variables:
+    - name: podSpec
+      expression: >-
+        object.kind == 'Pod' ? object.spec
+        : object.kind == 'CronJob' ? object.spec.jobTemplate.spec.template.spec
+        : object.spec.template.spec
+    - name: containers
+      expression: >-
+        (has(variables.podSpec.containers) ? variables.podSpec.containers : [])
+        + (has(variables.podSpec.initContainers) ? variables.podSpec.initContainers : [])
+  validations:
+    - expression: >-
+        (!has(variables.podSpec.serviceAccountName) || variables.podSpec.serviceAccountName == 'default')
+        && (!has(variables.podSpec.serviceAccount) || variables.podSpec.serviceAccount == 'default')
+      message: "the hosting job-runner may only start Jobs that run as the namespace's default ServiceAccount; a Job naming hosting-operator (or any other identity) would hand the portal-held token the operator's cluster-wide rights. Run lifecycle actions through the Actions executor."
+    - expression: >-
+        !has(variables.podSpec.volumes) || variables.podSpec.volumes.all(v,
+          !has(v.secret) && !has(v.csi)
+          && (!has(v.projected) || !has(v.projected.sources) || v.projected.sources.all(src, !has(src.secret))))
+      message: "the hosting job-runner may not start a Job that mounts a Secret, a projected Secret or a CSI volume: the Job's log is readable by the token that started it"
+    - expression: >-
+        variables.containers.all(c,
+          (!has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef)))
+          && (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef))))
+      message: "the hosting job-runner may not start a Job that reads a Secret into its environment: the Job's log is readable by the token that started it"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: hosting-jobrunner-no-privileged-identity
+  labels:
+    app.kubernetes.io/managed-by: meshweaver-hosting
+spec:
+  policyName: hosting-jobrunner-no-privileged-identity
+  validationActions: ["Deny"]
