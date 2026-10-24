@@ -50,14 +50,17 @@ gitignored.
 
 ## Gates
 
-Every one is a hard PR gate, runs unconditionally (no input-shaped `if:`, no
-`continue-on-error:`, no path filter on a required job) and caps at a literal `timeout-minutes` ≤ 45:
+Every job caps at a literal `timeout-minutes` ≤ 45 and carries no input-shaped `if:` and no
+`continue-on-error:`. The REQUIRED ones run on every pull request, with no path filter:
 
 1. `chart-gate.yml` — `Chart invariants`, `Observability values (rendered + binary-validated)`,
    `Bundle registry scripts (executed)`, `Registry retention (this chart against core's record)`.
 2. `chart-guards.yml` — `Chart guards (vs platform)`: the C# guards built and run against the
    declared platform ref.
-3. `homebrew.yml` — `brew install + test (macOS)` on a change under `deploy/homebrew/`.
+
+`homebrew.yml` is path-filtered to `deploy/homebrew/**` and `deploy/helm/**` and therefore NOT a
+required check (a skipped required check reads as satisfied): `memex-local (Linux — …)` and
+`brew install + test (macOS)` on a change there, and the tap publish on `main`.
 
 A chart change is effective at the next deploy that reads this repository's `main`, and the
 operator image picks it up on its next build — so a bad chart change is live on merge. Treat a red
