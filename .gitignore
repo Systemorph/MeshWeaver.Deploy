@@ -1,0 +1,19 @@
+# Worktrees (AGENTS.md "Work in worktrees")
+.worktrees/
+
+# Claude Code per-user local state — but DO track shared skills under .claude/skills/.
+.claude/*
+!.claude/skills/
+
+# .NET build output — scoped to the one .NET tree here, never bare (a bare [Dd]ebug/ rule would
+# swallow a directory of that name anywhere, and git never reports what it never descends into).
+test/**/bin/
+test/**/obj/
+TestResults/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

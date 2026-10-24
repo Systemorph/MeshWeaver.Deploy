@@ -1,0 +1,25 @@
+MeshWeaver is dual-licensed. You may use it under EITHER:
+
+  * The Apache License, Version 2.0  — see LICENSE-APACHE  (the preferred licence)
+  * The MIT License                  — see LICENSE-MIT
+
+SPDX-License-Identifier: Apache-2.0 OR MIT
+
+You may choose either licence; you are not required to comply with both.
+
+WHY BOTH
+  Apache-2.0 is the preferred licence and the one new contributions are made
+  under. It carries an express PATENT GRANT — real protection for a platform
+  that compiles and executes user-authored code — and its section 5 states
+  plainly that a contribution is offered under the same terms, so inbound
+  contributions need no separate paperwork.
+
+  MIT stays on offer because Apache-2.0 is incompatible with GPLv2, and MIT is
+  not. Keeping both means a downstream GPLv2 project can still build on this.
+
+  Neither licence obliges anyone to publish source. That is deliberate: packages
+  may ship source-partial, and nothing here turns that into a disclosure duty.
+
+CONTRIBUTIONS
+  Unless you state otherwise, any contribution you submit for inclusion is
+  licensed as above (Apache-2.0 OR MIT), per Apache-2.0 section 5.
