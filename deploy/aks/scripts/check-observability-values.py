@@ -209,8 +209,15 @@ def loki_image(app_version):
     name = f"grafana/loki:{app_version}"
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return name
-    mirror = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
-                          ".github", "scripts", "dockerhub-mirror.sh")
+    # The resolver and its list are the PLATFORM's (they left nowhere: images the platform builds
+    # read them too), so CI hands this script a declared platform checkout. No fallback.
+    platform = os.environ.get("MW_PLATFORM_ROOT", "").strip()
+    if not platform:
+        print("::error::MW_PLATFORM_ROOT is not set — the Docker Hub mirror resolver "
+              "(.github/scripts/dockerhub-mirror.sh) is the platform's; point it at a "
+              "Systemorph/MeshWeaver checkout. This is a failure, not a skip.")
+        sys.exit(1)
+    mirror = os.path.join(platform, ".github", "scripts", "dockerhub-mirror.sh")
     result = run(["bash", mirror, "ref", name])
     if result.returncode != 0:
         print(result.stderr.strip())

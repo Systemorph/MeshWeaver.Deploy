@@ -352,9 +352,12 @@ if command -v helm >/dev/null 2>&1; then
   printf '%s' "$out" | grep -q 'memex-artifact-store-sync' && fail "case 23: a control with no upstream rendered a sync job"
 fi
 
-# The copy of compose-gate-host.sh the build runs must BE the platform's — one implementation.
-cmp -s "$FILES/compose-gate-host.sh" "$REPO/.github/scripts/compose-gate-host.sh" \
-  || fail "deploy/helm/files/compose-gate-host.sh differs from .github/scripts/compose-gate-host.sh — copy it byte for byte"
+# The copy of compose-gate-host.sh the build runs must BE the platform's — one implementation. The
+# platform's copy is read from a DECLARED platform checkout ($MW_PLATFORM_ROOT); no fallback.
+[ -n "${MW_PLATFORM_ROOT:-}" ] \
+  || fail "MW_PLATFORM_ROOT is not set — compose-gate-host.sh is compared with the platform's .github/scripts/compose-gate-host.sh"
+cmp -s "$FILES/compose-gate-host.sh" "$MW_PLATFORM_ROOT/.github/scripts/compose-gate-host.sh" \
+  || fail "deploy/helm/files/compose-gate-host.sh differs from the platform's .github/scripts/compose-gate-host.sh — copy it byte for byte"
 
 if [ "$cases" -ne "$EXPECTED_CASES" ]; then
   fail "ran $cases case(s), expected $EXPECTED_CASES — a case was added or dropped without updating the count"

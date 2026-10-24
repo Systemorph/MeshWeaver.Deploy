@@ -86,8 +86,33 @@ jobs:
     name: Chart invariants
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      MW_PLATFORM_ROOT: ${{ github.workspace }}/meshweaver
     steps:
       - uses: actions/checkout@v7
+      # The platform's scripts some checks compare with or execute (compose-gate-host.sh, the Docker
+      # Hub mirror resolver and its list). PUBLIC: no token. DECLARED ref, fail-closed.
+      - name: Resolve the platform ref
+        id: platform-ref
+        env:
+          REF: ${{ vars.MW_PLATFORM_REF || env.MW_CHART_GATE_PLATFORM_REF }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REF:-}" ]; then
+            echo "::error title=No platform ref declared::Neither the repo VARIABLE MW_PLATFORM_REF nor this workflow's MW_CHART_GATE_PLATFORM_REF names a platform ref."
+            exit 1
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+      - name: Check out the platform's scripts
+        uses: actions/checkout@v7
+        with:
+          repository: Systemorph/MeshWeaver
+          ref: ${{ steps.platform-ref.outputs.ref }}
+          path: meshweaver
+          sparse-checkout: |
+            .github/scripts
+            .github/dockerhub-mirror.list
+          sparse-checkout-cone-mode: false
       - name: Install shellcheck (pinned, checksum-verified)
         run: |
           set -euo pipefail
@@ -246,8 +271,33 @@ jobs:
     permissions:
       contents: read
       packages: read
+    env:
+      MW_PLATFORM_ROOT: ${{ github.workspace }}/meshweaver
     steps:
       - uses: actions/checkout@v7
+      # The platform's scripts some checks compare with or execute (compose-gate-host.sh, the Docker
+      # Hub mirror resolver and its list). PUBLIC: no token. DECLARED ref, fail-closed.
+      - name: Resolve the platform ref
+        id: platform-ref
+        env:
+          REF: ${{ vars.MW_PLATFORM_REF || env.MW_CHART_GATE_PLATFORM_REF }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REF:-}" ]; then
+            echo "::error title=No platform ref declared::Neither the repo VARIABLE MW_PLATFORM_REF nor this workflow's MW_CHART_GATE_PLATFORM_REF names a platform ref."
+            exit 1
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+      - name: Check out the platform's scripts
+        uses: actions/checkout@v7
+        with:
+          repository: Systemorph/MeshWeaver
+          ref: ${{ steps.platform-ref.outputs.ref }}
+          path: meshweaver
+          sparse-checkout: |
+            .github/scripts
+            .github/dockerhub-mirror.list
+          sparse-checkout-cone-mode: false
       # Docker Hub images come from the fleet's digest-pinned GHCR mirror, read with this job's own
       # token — never anonymously from docker.io, whose per-IP limit the hosted pool shares
       # (Doc/Architecture/DockerHubInCi; `toomanyrequests` red this gate on 2026-10-09, #6381).
@@ -376,10 +426,27 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      # Two platform states, both a REAL re-derivation of THIS chart (never a skip):
+      #  • the platform's record names this repository (`chartRepository`) and its gate takes
+      #    `--chart-root` → hand it this checkout;
+      #  • a platform that predates that (its record still points at its own `deploy/helm`, which
+      #    is leaving) → overlay THIS chart onto the platform checkout at that path, so the gate
+      #    re-derives this chart rather than the platform's departing copy.
+      # Which one ran is printed.
       - name: Re-derive this chart against core's retention record
         run: |
           set -euo pipefail
-          python3 meshweaver/.github/scripts/lock-pinned-digests.py --check-registry-retention meshweaver --chart-root . | tee "$RUNNER_TEMP/retention.log"
+          gate=meshweaver/.github/scripts/lock-pinned-digests.py
+          if grep -q -- '--chart-root' "$gate"; then
+            echo "platform gate takes --chart-root: re-deriving this checkout's chart"
+            python3 "$gate" --check-registry-retention meshweaver --chart-root . | tee "$RUNNER_TEMP/retention.log"
+          else
+            echo "platform gate predates --chart-root: overlaying this chart onto the platform checkout"
+            rm -rf meshweaver/deploy/helm
+            mkdir -p meshweaver/deploy
+            cp -a deploy/helm meshweaver/deploy/helm
+            python3 "$gate" --check-registry-retention meshweaver | tee "$RUNNER_TEMP/retention.log"
+          fi
           # A run that re-derived no chart inspected nothing here; that is not a pass.
           grep -Eq '; [1-9][0-9]* chart\(s\) re-derived;' "$RUNNER_TEMP/retention.log" \
             || { echo "::error::the retention gate re-derived ZERO charts against this checkout — core's record no longer names this repository's chart, or the gate stopped reading it"; exit 1; }
