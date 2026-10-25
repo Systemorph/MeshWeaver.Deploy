@@ -1,0 +1,525 @@
+name: Build host — runner image and the build-latest hand-over
+
+# 🔥 STANDING BUILD HOSTS (platform Doc/Architecture/BuildHosts; MeshWeaver.Plugins
+# Hosting/StandingBuildHosts §2, rule 2 "the platform's CD deploys the updated host").
+#
+# WHY THIS LIVES HERE. The platform's CD (Systemorph/MeshWeaver `main-cd.yml`) builds and seals the
+# product image set — portal, migration, plugin-test, control — and nothing else (core slimming:
+# deployment material leaves the platform). At the end of every CD run it hands the result over
+# with ONE `repository_dispatch` of type `platform-set-sealed` (contract:
+# `.github/scripts/platform-set-dispatch.py`). Everything a standing build host needs from that set
+# happens here, in the order the platform's former jobs `build-host-image` → `build-host-latest` →
+# `build-host-report` ran it:
+#
+#   1. `image`    — the build host's RUNNER image `mw-build-host:<version>` for the set the CD run
+#                   published: this repository's Dockerfile and runner (`build-run.py`), plus the
+#                   platform's helpers and `meshweaver-plugin-build` from the SET'S OWN commit.
+#   2. `handover` — the newest ARMED set handed to `build-latest`: a SIGNED
+#                   `build-host-update-available` into the control plane's inbox, which the
+#                   operations instance turns into a change of its OWN record and that record's
+#                   Reconcile. Never `kubectl set image`, never a hand-edited Deployment.
+#   3. `report`   — the lane's own alert issue (label `build-host-latest`) in THIS repository.
+#
+# 🚨 A NO-OP UNTIL DECLARED: `.github/build-hosts.json` `enabled: false` (the default) ⇒ the
+# hand-over writes one summary line, sends nothing and uses no inbox credential. The receiver guards
+# the same fact again on the record (`buildHosts.enabled`). The runner IMAGE is built regardless,
+# exactly as before the move, so a set is never armed with no runner to hand over.
+#
+# NEVER BACKWARDS: only the newest armed set is sent, re-sent on every CD run (every dispatch), so a
+# missed hand-over self-heals on the next one; the receiver changes nothing for a set it already
+# holds and never moves backwards.
+#
+# 🛡️ NO SKIP-TRAPDOOR. On a pull request (and a push to main) the `test` job builds the image from
+# this tree against the platform's `main` and runs every self-test: no secret, no registry, no
+# cluster. The publishing jobs run only on the two events that CARRY a hand-over —
+# `repository_dispatch` and `workflow_dispatch` — and that is the one exemption, expressed once, on
+# the EVENT. On those events `preflight` asserts every credential and is RED naming what to
+# provision; nothing downstream asks whether a secret is set.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  repository_dispatch:
+    types: [platform-set-sealed]
+  workflow_dispatch:
+    inputs:
+      run_url:
+        description: The platform CD run this re-runs (https URL) — recorded on the event.
+        required: true
+        type: string
+      run_core_sha:
+        description: The platform commit whose scripts the jobs fetch (40 hex, on the platform's main).
+        required: true
+        type: string
+      set_version:
+        description: The set whose runner image to build (x.y.z), or empty to build none.
+        required: false
+        type: string
+        default: ""
+      set_core_sha:
+        description: The platform commit that set was built from (40 hex), or empty with an empty version.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # One hand-over at a time, never cancelled: a half-done hand-over is exactly what the next
+  # dispatch exists to complete. A pull request's own run is superseded by its next push.
+  group: build-host-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  ACR: meshweaver.azurecr.io
+  REGISTRY: cr.meshweaver.cloud
+  REGISTRY_PUBLISHER: publisher
+  PLATFORM_REPO: Systemorph/MeshWeaver
+
+jobs:
+  # ─────────────── the gate on every change: build the image, run every self-test ───────────────
+  test:
+    name: Build host (runner image + self-tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: deploy
+      - name: The hand-over reader can say no (self-test)
+        run: python3 deploy/.github/scripts/platform-set-dispatch.py --self-test
+      - name: The runner can say no (self-test)
+        run: python3 deploy/.github/scripts/build-run.py --self-test
+      - name: The announcement can say no (self-test)
+        run: python3 deploy/.github/scripts/build-host-announcement.py --self-test
+      # The platform commit the image is composed against: the set's own commit when a hand-over
+      # names one, the platform's main otherwise (a change here is tested against the platform it
+      # will next be built with).
+      - name: Which platform commit to compose against
+        id: platform
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = repository_dispatch ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
+            python3 deploy/.github/scripts/platform-set-dispatch.py read --event "$GITHUB_EVENT_PATH" --event-name "$EVENT_NAME" > "$RUNNER_TEMP/claim"
+            ref=$(sed -n 's/^set_core_sha=//p' "$RUNNER_TEMP/claim")
+            [ -n "$ref" ] || ref=$(sed -n 's/^run_core_sha=//p' "$RUNNER_TEMP/claim")
+          else
+            ref=main
+          fi
+          [ -n "$ref" ] || { echo "::error::no platform ref resolved"; exit 1; }
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      # PUBLIC: no token.
+      - name: Check out the platform
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PLATFORM_REPO }}
+          ref: ${{ steps.platform.outputs.ref }}
+          path: platform
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+      - name: Stage the image context (this runner + the platform's helpers and plugin-build)
+        run: bash deploy/deploy/build-host/stage-context.sh deploy platform "$RUNNER_TEMP/ctx"
+      - uses: docker/setup-buildx-action@v4
+      # The Dockerfile's own RUN steps execute build-run.py --self-test and sandbox-postgres.sh
+      # --self-test INSIDE the image, so a green build is a runnable runner.
+      - name: Build mw-build-host (local, not pushed)
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64 -f deploy/deploy/build-host/Dockerfile \
+            --tag mw-build-host:ci --load "$RUNNER_TEMP/ctx"
+          entry="$(docker image inspect mw-build-host:ci --format '{{json .Config.Entrypoint}}')"
+          case "$entry" in *build-run.py*--host*) ;; *) echo "::error::the image's entrypoint does not start the runner: $entry"; exit 1 ;; esac
+          user="$(docker image inspect mw-build-host:ci --format '{{.Config.User}}')"
+          [ "$user" = 1654 ] || { echo "::error::the image runs as '$user', not the unprivileged uid 1654"; exit 1; }
+          echo "mw-build-host:ci built against platform $(git -C platform rev-parse HEAD); entrypoint and user verified"
+
+  # ─────────────── the publishing lane: only on an event that carries a hand-over ───────────────
+  preflight:
+    name: "Build host: assert the inputs exist"
+    # 🚨 The ONE sanctioned condition, and it is on the EVENT: only these two events carry a set.
+    if: github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_url: ${{ steps.claim.outputs.run_url }}
+      run_core_sha: ${{ steps.claim.outputs.run_core_sha }}
+      set_version: ${{ steps.claim.outputs.set_version }}
+      set_core_sha: ${{ steps.claim.outputs.set_core_sha }}
+      armed: ${{ steps.claim.outputs.armed }}
+      armed_version: ${{ steps.claim.outputs.armed_version }}
+      armed_core_sha: ${{ steps.claim.outputs.armed_core_sha }}
+      armed_plugins_sha: ${{ steps.claim.outputs.armed_plugins_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+      - name: Every credential the publishing lane uses, or a red run naming what to provision
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          MW_REGISTRY_PUBLISHER_PASSWORD: ${{ secrets.MW_REGISTRY_PUBLISHER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "$AZURE_CLIENT_ID" ]       || missing+=("secrets.AZURE_CLIENT_ID — the OIDC app registration that pushes to and reads the platform registry (its federated credential must trust this repository)")
+          [ -n "$AZURE_TENANT_ID" ]       || missing+=("secrets.AZURE_TENANT_ID — that app registration's tenant")
+          [ -n "$AZURE_SUBSCRIPTION_ID" ] || missing+=("secrets.AZURE_SUBSCRIPTION_ID — the subscription that holds the platform registry")
+          [ -n "$MW_REGISTRY_PUBLISHER_PASSWORD" ] || missing+=("secrets.MW_REGISTRY_PUBLISHER_PASSWORD — the fleet registry's publisher password (the same value the platform repository holds)")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::the build-host lane cannot publish — provision the following on this repository, then re-run:"
+            printf '  • %s\n' "${missing[@]}"
+            exit 1
+          fi
+          echo "All publishing inputs are present."
+      - name: Read the hand-over (validated field by field)
+        id: claim
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/platform-set-dispatch.py read --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" | tee -a "$GITHUB_OUTPUT"
+      # A commit the event names is believed only once the platform's own history contains it:
+      # GitHub's compare of <sha>...main on the PUBLIC platform repository answers `identical` or
+      # `ahead` for a commit on main. Anything else — behind, diverged, unknown — is red.
+      - name: Every platform commit the hand-over names is on the platform's main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHAS: ${{ steps.claim.outputs.shas }}
+        run: |
+          set -euo pipefail
+          for sha in $SHAS; do
+            st=$(gh api "repos/$PLATFORM_REPO/compare/$sha...main" --jq .status) \
+              || { echo "::error::could not compare $sha with the platform's main — refusing a commit that cannot be placed"; exit 1; }
+            case "$st" in
+              identical|ahead) echo "platform commit $sha is on main ($st)" ;;
+              *) echo "::error::platform commit $sha is not on the platform's main (compare: $st) — the hand-over is refused"; exit 1 ;;
+            esac
+          done
+
+  image:
+    name: "Build + push mw-build-host (the build-host runner)"
+    needs: [preflight, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: This run's set
+        id: set
+        env:
+          VERSION: ${{ needs.preflight.outputs.set_version }}
+          CORE_SHA: ${{ needs.preflight.outputs.set_core_sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VERSION" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "- mw-build-host: the platform CD run published no set — no runner image to build" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "mw-build-host:$VERSION from platform $CORE_SHA"
+          fi
+      - uses: actions/checkout@v7
+        if: steps.set.outputs.build == 'true'
+        with:
+          path: deploy
+      - name: Check out the platform at the set's commit
+        if: steps.set.outputs.build == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PLATFORM_REPO }}
+          ref: ${{ needs.preflight.outputs.set_core_sha }}
+          path: platform
+      - name: Ensure Azure CLI
+        if: steps.set.outputs.build == 'true'
+        run: command -v az >/dev/null || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+      - name: Azure login (OIDC)
+        if: steps.set.outputs.build == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: ACR login
+        if: steps.set.outputs.build == 'true'
+        run: bash platform/.github/scripts/acr-login.sh
+      - name: The set exists in the platform registry
+        if: steps.set.outputs.build == 'true'
+        env:
+          VERSION: ${{ needs.preflight.outputs.set_version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$ACR/memex-portal-ai:$VERSION" --format '{{json .Manifest.Digest}}' >/dev/null \
+            || { echo "::error::memex-portal-ai:$VERSION does not exist — the hand-over names a set the platform never published"; exit 1; }
+      - uses: actions/setup-dotnet@v6
+        if: steps.set.outputs.build == 'true'
+        with:
+          dotnet-version: 10.0.x
+      - name: Stage the image context (this runner + the set's helpers and plugin-build)
+        if: steps.set.outputs.build == 'true'
+        run: bash deploy/deploy/build-host/stage-context.sh deploy platform "$RUNNER_TEMP/ctx"
+      - uses: docker/setup-buildx-action@v4
+        if: steps.set.outputs.build == 'true'
+      # 🚨 ONE DIGEST PER VERSION. The hosts are handed the runner BY DIGEST, so a version's tag is
+      # written once: a second hand-over of the same set (a re-sent dispatch, a re-run) reads the
+      # digest that is there instead of pushing different bytes under the same name.
+      - name: "Build + push mw-build-host:<version> (linux/amd64), and read its digest"
+        if: steps.set.outputs.build == 'true'
+        id: push
+        env:
+          VERSION: ${{ needs.preflight.outputs.set_version }}
+        run: |
+          set -euo pipefail
+          ref="$ACR/mw-build-host:$VERSION"
+          if d=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' 2>/dev/null); then
+            digest=$(printf '%s' "$d" | tr -d '"')
+            echo "::notice title=mw-build-host:$VERSION exists::kept $digest — a version's runner is written once"
+          else
+            docker buildx build --platform linux/amd64 -f deploy/deploy/build-host/Dockerfile \
+              --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+              --label "io.meshweaver.platform.revision=$(git -C platform rev-parse HEAD)" \
+              --tag "$ref" --push "$RUNNER_TEMP/ctx"
+            digest=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          fi
+          case "$digest" in sha256:*) ;; *) echo "::error::mw-build-host:$VERSION resolves to no digest ('$digest')"; exit 1 ;; esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "- mw-build-host \`$VERSION\` = \`$digest\`" >> "$GITHUB_STEP_SUMMARY"
+      # The same manifest to the fleet registry, digest verified — the registry contract every image
+      # of the set keeps, so a build-host record whose runnerRepository names the fleet registry can
+      # pull the digest it is handed.
+      - name: Log in to the fleet registry (publisher)
+        if: steps.set.outputs.build == 'true'
+        env:
+          REGISTRY_PASSWORD: ${{ secrets.MW_REGISTRY_PUBLISHER_PASSWORD }}
+        run: bash platform/.github/scripts/registry-login.sh "$REGISTRY" "$REGISTRY_PUBLISHER"
+      - name: Mirror mw-build-host:<version> to the fleet registry — same manifest, digest verified
+        if: steps.set.outputs.build == 'true'
+        env:
+          VERSION: ${{ needs.preflight.outputs.set_version }}
+        run: bash platform/.github/scripts/mirror-image-to-registry.sh "$ACR/mw-build-host:$VERSION" "$REGISTRY/mw-build-host:$VERSION"
+
+  handover:
+    name: "Build host: hand the armed set to build-latest (record path)"
+    # ORDERED after the runner image, so a set is never handed over before its mw-build-host
+    # exists; and it runs on EVERY hand-over, not only an arming one: it hands over the NEWEST ARMED
+    # set each time, so a hand-over missed once is recovered by the next dispatch.
+    needs: [preflight, image]
+    if: always() && needs.preflight.result == 'success' && needs.image.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      handed: ${{ steps.build_host_send.outputs.handed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: deploy
+          sparse-checkout: |
+            .github/scripts
+            .github/build-hosts.json
+          sparse-checkout-cone-mode: false
+      # The platform's scripts and its control-instance declaration, at the commit of the CD run
+      # that sent this hand-over (the same vintage that job used before the move). PUBLIC: no token.
+      - name: Check out the platform's scripts at the sending run's commit
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PLATFORM_REPO }}
+          ref: ${{ needs.preflight.outputs.run_core_sha }}
+          path: platform
+          sparse-checkout: |
+            .github/scripts
+            .github/control-instance.json
+          sparse-checkout-cone-mode: false
+      - name: "The announcement can say no (self-test)"
+        run: python3 deploy/.github/scripts/build-host-announcement.py --self-test
+      - name: "Does this estate run standing build hosts?"
+        id: build_host
+        run: |
+          set -euo pipefail
+          python3 deploy/.github/scripts/build-host-announcement.py decide --channel latest \
+            --declaration deploy/.github/build-hosts.json --control-instance platform/.github/control-instance.json \
+            | tee -a "$GITHUB_OUTPUT"
+      - name: Not enabled — say so and send nothing
+        if: steps.build_host.outputs.enabled != 'true'
+        env:
+          WHY: ${{ steps.build_host.outputs.why }}
+        run: |
+          echo "- build-latest: $WHY" >> "$GITHUB_STEP_SUMMARY"
+      # A gate never tests its own inputs: once the hand-over is DECLARED, every credential it uses
+      # is asserted here and a missing one is RED, naming it.
+      - name: Assert the hand-over's inputs exist (only once it is declared)
+        if: steps.build_host.outputs.enabled == 'true'
+        env:
+          CONTROL_WEBHOOK_SECRET: ${{ secrets.CONTROL_WEBHOOK_SECRET }}
+          CONTROL_WEBHOOK_URL: ${{ vars.CONTROL_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "$CONTROL_WEBHOOK_SECRET" ] || missing+=("secrets.CONTROL_WEBHOOK_SECRET — the control plane inbox's HMAC key (the org secret; add this repository to its selected repositories)")
+          [ -n "$CONTROL_WEBHOOK_URL" ]    || missing+=("vars.CONTROL_WEBHOOK_URL — the control plane's Hosting/PlatformBuilds inbox (the org variable; add this repository to its selected repositories)")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::build-latest is declared but its inputs are missing:"; printf '  • %s\n' "${missing[@]}"; exit 1
+          fi
+      - name: Ensure Azure CLI
+        if: steps.build_host.outputs.enabled == 'true'
+        run: command -v az >/dev/null || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+      - name: Azure login (OIDC)
+        if: steps.build_host.outputs.enabled == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: "The newest armed set, and its runner"
+        id: build_host_current
+        if: steps.build_host.outputs.enabled == 'true'
+        env:
+          ARMED_HERE: ${{ needs.preflight.outputs.armed }}
+          V_ARMED_HERE: ${{ needs.preflight.outputs.armed_version }}
+          CORE_HERE: ${{ needs.preflight.outputs.armed_core_sha }}
+          PLUGINS_HERE: ${{ needs.preflight.outputs.armed_plugins_sha }}
+          IMAGE_LEG: ${{ needs.image.result }}
+        run: |
+          set -euo pipefail
+          az acr manifest list-metadata --registry meshweaver --name memex-portal-ai --top 300 --orderby time_desc \
+            -o json --only-show-errors > "$RUNNER_TEMP/portal-manifests.json"
+          st=$(python3 platform/.github/scripts/arm-promoted-set.py armed-state --manifests "$RUNNER_TEMP/portal-manifests.json")
+          newest=$(printf '%s' "$st" | jq -r '.version // empty')
+          [ -n "$newest" ] || { echo "::error::no armed set could be read from memex-portal-ai — nothing to hand build-latest, and nothing to say it is current"; exit 1; }
+          python3 platform/.github/scripts/platform-version.py ordinal "$newest" >/dev/null \
+            || { echo "::error::the newest armed set '$newest' carries no run ordinal — the armed-state reading is not trustworthy"; exit 1; }
+          core=""; plugins=""
+          if [ "$ARMED_HERE" = true ] && [ "$V_ARMED_HERE" = "$newest" ]; then core="$CORE_HERE"; plugins="$PLUGINS_HERE"; fi
+          bash platform/.github/scripts/acr-login.sh
+          runner=""
+          if d=$(docker buildx imagetools inspect "$ACR/mw-build-host:$newest" --format '{{json .Manifest.Digest}}'); then
+            runner=$(printf '%s' "$d" | tr -d '"')
+          fi
+          case "$runner" in
+            sha256:*) echo "send=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              if [ "$ARMED_HERE" = true ] && [ "$V_ARMED_HERE" = "$newest" ]; then
+                echo "::error::the sending run armed $newest but mw-build-host:$newest does not exist (image: $IMAGE_LEG) — build-latest was NOT handed the set; the next hand-over retries once the runner image is published"
+                exit 1
+              fi
+              echo "send=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::the newest armed set $newest has no mw-build-host image (built before the runner lane, or its image leg failed) — build-latest keeps its set until a set with a runner is armed"
+              echo "- build-latest: $newest has no runner image — not handed over" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
+          { echo "version=$newest"; echo "core=$core"; echo "plugins=$plugins"; echo "runner=$runner"; } >> "$GITHUB_OUTPUT"
+      - name: "Sign and POST build-host-update-available for build-latest"
+        id: build_host_send
+        if: steps.build_host.outputs.enabled == 'true' && steps.build_host_current.outputs.send == 'true'
+        env:
+          URL: ${{ vars.CONTROL_WEBHOOK_URL }}
+          SECRET: ${{ secrets.CONTROL_WEBHOOK_SECRET }}
+          DEPLOYMENT: ${{ steps.build_host.outputs.deployment }}
+          V_SET: ${{ steps.build_host_current.outputs.version }}
+          CORE_SHA: ${{ steps.build_host_current.outputs.core }}
+          PLUGINS_SHA: ${{ steps.build_host_current.outputs.plugins }}
+          RUNNER_DIGEST: ${{ steps.build_host_current.outputs.runner }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "$URL" in
+            https://*/api/hooks/Hosting/PlatformBuilds) ;;
+            *) echo "::error::vars.CONTROL_WEBHOOK_URL is not an https URL of a Hosting/PlatformBuilds inbox — refusing to sign anything to it"; exit 1 ;;
+          esac
+          bash platform/.github/scripts/acr-login.sh
+          # Resolved from the ARMED set's version tag, never a moving name — the same rule the
+          # platform's notify-platform-update follows, so the host runs exactly the set the fleet
+          # is offered.
+          resolve() {
+            local d
+            if d=$(docker buildx imagetools inspect "$ACR/$1:$V_SET" --format '{{json .Manifest.Digest}}'); then
+              printf '%s' "$d" | tr -d '"'
+            fi
+          }
+          TESTER_DIGEST=$(resolve mw-plugin-test)
+          PORTAL_DIGEST=$(resolve memex-portal-ai)
+          # RUNNER_DIGEST was resolved (and required) by the previous step, for the same version.
+          BODY=$(python3 deploy/.github/scripts/build-host-announcement.py body --deployment "$DEPLOYMENT" --channel latest \
+            --version "$V_SET" --tester-image "$ACR/mw-plugin-test" --tester-digest "$TESTER_DIGEST" \
+            --portal-image "$ACR/memex-portal-ai" --portal-digest "$PORTAL_DIGEST" \
+            --runner-image "$ACR/mw-build-host" --runner-digest "$RUNNER_DIGEST" \
+            --core-sha "$CORE_SHA" --plugins-sha "$PLUGINS_SHA" --instance "$RUN_URL")
+          SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^.*= /sha256=/')
+          code=$(curl -sS -o "$RUNNER_TEMP/build-host-resp" -w '%{http_code}' --connect-timeout 10 --max-time 60 \
+            -X POST "$URL" -H 'Content-Type: application/json' \
+            -H "X-Hub-Signature-256: $SIG" --data "$BODY") || code=000
+          echo "POST $URL -> $code"; cat "$RUNNER_TEMP/build-host-resp" || true
+          verdict=$(tr -d '\n' < "$RUNNER_TEMP/build-host-resp" 2>/dev/null | sed -n 's/.*"signature"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+          case "$code" in
+            2*)
+              [ "$verdict" = verified ] || { echo "::error::the inbox stored the build-host event but did not VERIFY its signature (signature: '${verdict:-<none>}') — the router drops what it cannot verify, so build-latest would not move"; exit 1; }
+              # STORED AND VERIFIED IS NOT DELIVERED: the receiver changes the record only when that
+              # record declares buildHosts.enabled. Whether build-latest RUNS the set is read on the
+              # run nodes it claims (`PlatformVersion`), never inferred from this 200.
+              echo "handed=true" >> "$GITHUB_OUTPUT"
+              echo "- build-latest handed \`$V_SET\` (tester \`${TESTER_DIGEST:7:12}\`, portal \`${PORTAL_DIGEST:7:12}\`, runner \`${RUNNER_DIGEST:7:12}\`) for record \`$DEPLOYMENT\`: STORED and signature-verified (HTTP $code). Not yet a roll — the record's Reconcile is" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            000) echo "::error::could not reach the control plane's inbox — build-latest was NOT handed $V_SET"; exit 1 ;;
+            401) echo "::error::the inbox REFUSED the signature (HTTP 401): secrets.CONTROL_WEBHOOK_SECRET and the instance's Hosting:PlatformWebhookSecret differ — build-latest was NOT handed $V_SET"; exit 1 ;;
+            *)   echo "::error::the inbox refused the build-host event (HTTP $code) — build-latest was NOT handed $V_SET"; exit 1 ;;
+          esac
+
+  # 📣 THE BUILD-HOST LANE REPORTS ITSELF, on its own label, in THIS repository. A red `image` or
+  # `handover` files or comments on the ONE open `build-host-latest` issue; that issue is CLOSED only
+  # by a run that actually handed build-latest a set (`handed`) — never by a disabled no-op. REST
+  # only (a GraphQL secondary limit must never swallow the alert).
+  report:
+    name: "Build host: report the build-latest lane (its own alert)"
+    needs: [preflight, test, image, handover]
+    if: always() && needs.preflight.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: File, comment or close the build-host-latest alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TEST: ${{ needs.test.result }}
+          IMAGE: ${{ needs.image.result }}
+          HANDOVER: ${{ needs.handover.result }}
+          HANDED: ${{ needs.handover.outputs.handed }}
+        run: |
+          set -euo pipefail
+          # A red `test` on a hand-over skips `image`: that is a lane that did not build its runner.
+          [ "$TEST" = success ] || IMAGE="$TEST (test)"
+          open=$(gh api "repos/$GITHUB_REPOSITORY/issues?labels=build-host-latest&state=open&per_page=10" --jq '.[].number')
+          # failed OR cancelled (a timeout, a cancelled run) is a lane that did not hand over
+          case "$IMAGE" in success|skipped) img_ok=true ;; *) img_ok=false ;; esac
+          if [ "$img_ok" = false ] || [ "$HANDOVER" = failure ] || [ "$HANDOVER" = cancelled ]; then
+            body="The build-latest lane failed: [run ${GITHUB_RUN_ID}](${RUN_URL}) — image: \`${IMAGE}\`, handover: \`${HANDOVER}\`. Every image of the platform set IS published and the fleet's delivery is unaffected; build-latest keeps its previous set until a run hands it over. Read the failed job's ::error:: line (platform Doc/Architecture/BuildHosts)."
+            first=$(printf '%s\n' "$open" | head -n 1)
+            if [ -n "$first" ]; then
+              gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$first/comments" -f body="$body" >/dev/null
+            else
+              gh label create build-host-latest --repo "$GITHUB_REPOSITORY" --description "The build-latest hand-over lane (build-host.yml) failed" \
+                --color D93F0B --force || echo "::warning::could not ensure the build-host-latest label (continuing)"
+              url=$(gh api -X POST "repos/$GITHUB_REPOSITORY/issues" -f title="build-latest lane failed: run ${GITHUB_RUN_ID}" \
+                -f body="$body" -f 'labels[]=build-host-latest' --jq .html_url)
+              gh api -X POST "repos/$GITHUB_REPOSITORY/issues/${url##*/}/labels" -f 'labels[]=bug' -f 'labels[]=sev:M' >/dev/null \
+                || echo "::warning::could not stamp bug + sev:M on ${url}"
+            fi
+            exit 0
+          fi
+          if [ "$HANDED" = true ]; then
+            for n in $open; do
+              gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$n/comments" -f body="Recovered: build-latest was handed its set by [run ${GITHUB_RUN_ID}](${RUN_URL})." >/dev/null
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/$n" -f state=closed -f state_reason=completed >/dev/null
+            done
+          fi

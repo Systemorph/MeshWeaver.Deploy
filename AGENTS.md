@@ -31,6 +31,7 @@ Mac). It left the platform repository so that the platform stays framework only 
 | `deploy/aks/manifests/` | cluster manifests the governed `ApplyClusterManifest` applies, incl. the operator's ClusterRole | the estate's aks-ops lane; the operator's RBAC tests |
 | `deploy/aks/scripts/` | chart invariants, values-are-read, chart-drift render/compare/record, observability checks, fixtures, setup examples | the chart gate; the operator image (drift scripts) |
 | `deploy/homebrew/` | `memex-local` — CLI, formula, local values, tests | `homebrew.yml` → the public tap `Systemorph/homebrew-memex` |
+| `deploy/build-host/`, `.github/scripts/build-run.py`, `build-host-announcement.py`, `platform-set-dispatch.py`, `.github/build-hosts.json` | the standing build host's runner image and runner, and the hand-over of the platform's sets to `build-latest` / `build-stable` | `build-host.yml` (on the platform's `platform-set-sealed` dispatch), `build-host-stable.yml` (daily) |
 | `scripts/check-config-key-coverage.py` | overlay ↔ chart key check | the estate's `config-key-coverage` |
 | `test/MeshWeaver.Deploy.ChartGuards/` | the guards that hold the chart to the platform's code (probe paths, drain deadline, ConfigMap keys, the migration Job, …) | `chart-guards.yml`, against a platform checkout |
 
@@ -57,6 +58,11 @@ Every job caps at a literal `timeout-minutes` ≤ 45 and carries no input-shaped
    `Bundle registry scripts (executed)`, `Registry retention (this chart against core's record)`.
 2. `chart-guards.yml` — `Chart guards (vs platform)`: the C# guards built and run against the
    declared platform ref.
+
+3. `build-host.yml` — `Build host (runner image + self-tests)`: the runner image built against the
+   platform's `main` with every self-test, on every pull request. Not yet in the ruleset: adding it
+   is an owner's change to `main pr protection`. (Its publishing jobs run only on
+   the two events that carry a hand-over; `preflight` is red there on a missing credential.)
 
 `homebrew.yml` is path-filtered to `deploy/homebrew/**` and `deploy/helm/**` and therefore NOT a
 required check (a skipped required check reads as satisfied): `memex-local (Linux — …)` and
