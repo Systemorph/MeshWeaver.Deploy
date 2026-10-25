@@ -184,7 +184,13 @@ The refusals, and why each one exists:
        RELEASE, so two such releases — or one beside a portal release that also renders hosts — never collide. */ -}}
 {{- $shared := "build-host" -}}
 {{- if ne (include "memex.portal.enabled" .) "true" -}}
-{{- $shared = printf "build-host-%s" .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- $shared = printf "build-host-%s" .Release.Name -}}
+{{- /* Helm allows a 53-character release name, so `build-host-<release>` can pass a DNS label's 63. A bare
+       truncation would map two releases that differ only past the cut onto ONE name; shorten with a
+       hash of the FULL release name instead (review of #14). */ -}}
+{{- if gt (len $shared) 63 -}}
+{{- $shared = printf "%s-%s" ($shared | trunc 52 | trimSuffix "-") (sha256sum .Release.Name | trunc 10) -}}
+{{- end -}}
 {{- end -}}
 {{- $np := ($b.networkPolicy | default dict) -}}
 {{- $wi := ($b.workloadIdentity | default dict) -}}

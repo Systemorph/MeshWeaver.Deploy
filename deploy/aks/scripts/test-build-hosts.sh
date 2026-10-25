@@ -399,6 +399,36 @@ else
   report "the build-host-only release does not render:"; sed 's/^/    /' "$WORK/release.err" "$WORK/release-b.err"
 fi
 
+# 3d'. two valid 53-character release names that differ only in their LAST character must still get
+#      two distinct shared names within a DNS label's 63 characters (review of #14: a plain truncation
+#      mapped both onto one ServiceAccount + NetworkPolicy, and the second install failed Helm's
+#      ownership check).
+long_a="build-3-1-0-$(printf 'a%.0s' $(seq 40))1"; long_b="${long_a%1}2"
+if helm template "$long_a" "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-host-release.yaml" --namespace check > "$WORK/long-a.yaml" 2> "$WORK/long.err" \
+   && helm template "$long_b" "$CHART" -f "$CHART/values.yaml" -f "$WORK/release-b.yaml" --namespace check > "$WORK/long-b.yaml" 2>> "$WORK/long.err"; then
+  if python3 - "$WORK/long-a.yaml" "$WORK/long-b.yaml" <<'PY'
+import sys, yaml
+def shared(p):
+    return {d["kind"]: d["metadata"]["name"] for d in yaml.safe_load_all(open(p)) if d and d["kind"] in ("ServiceAccount", "NetworkPolicy")}
+a, b = shared(sys.argv[1]), shared(sys.argv[2])
+problems = []
+for k in ("ServiceAccount", "NetworkPolicy"):
+    if k not in a or k not in b:
+        problems.append(f"{k} missing: {a} {b}"); continue
+    if a[k] == b[k]:
+        problems.append(f"{k}: two release names that differ only in the last character share the name {a[k]}")
+    if max(len(a[k]), len(b[k])) > 63:
+        problems.append(f"{k}: a name exceeds 63 characters: {a[k]} / {b[k]}")
+if problems:
+    print("\n".join(problems)); sys.exit(1)
+PY
+  then ok "53-character release names that differ only at the end get distinct shared names within 63 characters"
+  else report "long release names collide or overflow (see above)"
+  fi
+else
+  report "the long-release-name renders fail:"; sed 's/^/    /' "$WORK/long.err"
+fi
+
 # 3e. every template OUTSIDE templates/build-host/ opens with the portal gate — so a template added
 #     later cannot render into a build-host-only release because nobody wrapped it (the fixture above
 #     only sees the values it sets; this sees every file).
