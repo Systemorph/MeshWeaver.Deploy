@@ -1231,11 +1231,15 @@ data:
   # model, e.g. the in-cluster model service (core deploy/ollama, Doc/Architecture/LocalModelService):
   #   Ocr__OllamaVision__Endpoint = http://ollama:11434/v1, Ocr__OllamaVision__Model = qwen3.6
   # The optional key (Ocr__OllamaVision__ApiKey) is a secret and never belongs in this ConfigMap.
-  {{- if hasKey .Values.config.memex_portal "Ocr__OllamaVision__Endpoint" }}
-  Ocr__OllamaVision__Endpoint: "{{ .Values.config.memex_portal.Ocr__OllamaVision__Endpoint }}"
+  {{- /* Rendered only when PRESENT, not null and non-blank, trimmed and YAML-quoted: exactly what the
+         pass-through rendered for these keys before they were listed here, so no overlay changes value. */}}
+  {{- $ocrVisionEndpoint := .Values.config.memex_portal.Ocr__OllamaVision__Endpoint }}
+  {{- if and (hasKey .Values.config.memex_portal "Ocr__OllamaVision__Endpoint") (not (kindIs "invalid" $ocrVisionEndpoint)) (ne ($ocrVisionEndpoint | toString | trim) "") }}
+  Ocr__OllamaVision__Endpoint: {{ $ocrVisionEndpoint | toString | trim | quote }}
   {{- end }}
-  {{- if hasKey .Values.config.memex_portal "Ocr__OllamaVision__Model" }}
-  Ocr__OllamaVision__Model: "{{ .Values.config.memex_portal.Ocr__OllamaVision__Model }}"
+  {{- $ocrVisionModel := .Values.config.memex_portal.Ocr__OllamaVision__Model }}
+  {{- if and (hasKey .Values.config.memex_portal "Ocr__OllamaVision__Model") (not (kindIs "invalid" $ocrVisionModel)) (ne ($ocrVisionModel | toString | trim) "") }}
+  Ocr__OllamaVision__Model: {{ $ocrVisionModel | toString | trim | quote }}
   {{- end }}
   {{- $ocrVisionTokens := .Values.config.memex_portal.Ocr__OllamaVision__MaxOutputTokens }}
   {{- if and (hasKey .Values.config.memex_portal "Ocr__OllamaVision__MaxOutputTokens") (not (kindIs "invalid" $ocrVisionTokens)) (ne ($ocrVisionTokens | toString | trim) "") }}
