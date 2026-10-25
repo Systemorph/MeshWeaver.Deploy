@@ -1500,7 +1500,8 @@ class Host:
                                   "--key-env", "MW_REGISTRY_INSTANCE_KEY", "--version", version, "--out", out], env)
 
     def refresh_seal(self) -> bool:
-        status, body = self.api.call("GET", "/hosts/inputs")
+        # The claim scope: a versioned server asks by its version (`?version=`), a channel host by its channel.
+        status, body = self.api.call("GET", "/hosts/inputs", query=self.scope)
         if status != 200 or not isinstance(body, dict):
             self.log(f"hosts/inputs unreadable (HTTP {status}) — NOT claiming this cycle: a run must "
                      f"record the plugins layer that compiled it")
@@ -3168,13 +3169,18 @@ def self_test() -> int:
         hv_claim.cycle()
         check("version/the claim names the version and no channel",
               claims_v and claims_v[0].get("version") == "3.1.10412" and "channel" not in claims_v[0], claims_v)
+        iq = [c[3] for c in hv_claim.api.calls if c[1] == "/hosts/inputs"]
+        check("version/the inputs request names the version and no channel", iq and iq[0] == {"version": "3.1.10412"}, iq)
         check("version/the claim proves the host's set: its tester, portal and runner digests",
               claims_v and claims_v[0].get("testerDigest") == "sha256:" + "a" * 64 and claims_v[0].get("portalDigest") == "sha256:" + "b" * 64
               and claims_v[0].get("runnerDigest") == "sha256:" + "c" * 64, claims_v)
         claims_c: list[dict] = []
-        host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})],
-                       ("POST", "/claim"): lambda p_, b: (claims_c.append(b), (204, None))[1]})).cycle()
+        hc = host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})],
+                            ("POST", "/claim"): lambda p_, b: (claims_c.append(b), (204, None))[1]}))
+        hc.cycle()
         check("version/a CHANNEL host's claim carries no set digests", claims_c and "testerDigest" not in claims_c[0], claims_c)
+        ic = [c[3] for c in hc.api.calls if c[1] == "/hosts/inputs"]
+        check("version/a channel host's inputs request names its channel", ic and set(ic[0]) == {"channel"}, ic)
         check("version/no core-tests image in the env → none in the claim", claims_v and "coreTestsDigest" not in claims_v[0], claims_v)
         claims_t: list[dict] = []
         host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})],
