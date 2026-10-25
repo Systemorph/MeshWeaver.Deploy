@@ -12,7 +12,7 @@ The public deployment reference for [MeshWeaver](https://github.com/Systemorph/M
 | `.github/scripts/build-run.py` | the build host's runner (claims runs, executes stages in a `bwrap` sandbox) |
 | `.github/workflows/build-host.yml` | on every platform set the platform's CD hands over: the runner image, then the newest armed set handed to `build-latest` |
 | `.github/workflows/build-host-stable.yml` | once a day: the main-passed ceiling handed to `build-stable` |
-| `.github/workflows/build-host-deploy-test-switch.yml` | the target shape, **switched off** (`.github/deploy-test-switch.json`): deploy `build-<version>`, test ON it (a probe pinned to the version: claimed = deployed, its verdict = the test), switch `latest` on green — events, the hosts reader (`complete`, never `ready`) and the probe in `.github/scripts/deploy-test-switch.py` |
+| `.github/workflows/build-host-deploy-test-switch.yml` | the target shape, **switched off** (`.github/deploy-test-switch.json`): deploy `build-<version>`, test ON it (one probe pinned to the version per planned run — per shard of core's suite (`CI_SHARD_TOTAL`), the doc gate, each dependent's gate; claimed = deployed, every run ENDED succeeded = the test), switch `latest` on green naming every run under `runs`. Known limitation: `/probes` has no shard selector yet, so `shardStage: null` and only the dependents' gate runs are planned — events, the hosts reader (`complete`, never `ready`) and the probe in `.github/scripts/deploy-test-switch.py` |
 | `test/MeshWeaver.Deploy.ChartGuards` | guards that hold the chart to the platform's code |
 
 Everything here is reference material: defaults, placeholders and example values. An installation's

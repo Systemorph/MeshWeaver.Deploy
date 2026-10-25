@@ -1,4 +1,8 @@
 {
   "$comment": "Whether the platform sets reach the standing build hosts by DEPLOY → TEST THE DEPLOY → SWITCH LATEST (platform Doc/Architecture/DeployTestSwitchLatest; workflow build-host-deploy-test-switch.yml; deploy-test-switch.py). OFF until the receivers (BuildHostDeploy / BuildHostSwitch / BuildHostTeardown, MeshWeaver.Plugins P3c) are deployed on the control instance and the probe API accepts a pinned version (P3b). While false the workflow sends nothing and build-latest follows the armed set through build-host.yml.",
-  "enabled": false
+  "enabled": false,
+  "$shardStage": "The stage that selects ONE shard of core's suite, carrying `{shard}` (0-based, as dotnet-test.yml's matrix); the plan submits one pinned run per shard, CI_SHARD_TOTAL of them, read from core's dotnet-test.yml. null = the KNOWN CONTRACT GAP: POST /probes carries no shard selector and core declares no per-shard stage (.github/build-stages.json, DeployTestSwitchLatest §8 P4), so the shards are NOT run on the candidate and every run warns so by name.",
+  "shardStage": null,
+  "$docGateStage": "The stage of core's doc gate, run once on the candidate. null = core declares none yet (same gap).",
+  "docGateStage": null
 }
