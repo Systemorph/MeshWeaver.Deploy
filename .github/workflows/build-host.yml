@@ -266,8 +266,12 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.set_version }}
         run: |
           set -euo pipefail
-          docker buildx imagetools inspect "$ACR/memex-portal-ai:$VERSION" --format '{{json .Manifest.Digest}}' >/dev/null \
-            || { echo "::error::memex-portal-ai:$VERSION does not exist — the hand-over names a set the platform never published"; exit 1; }
+          # The tester's version tag is written when the set is PROMOTED (main-cd phase A). The
+          # portal's version tag is not read here: it is the ARMING write (phase C), and a published
+          # set the platform has not armed (yet) still needs its runner, so that arming it later
+          # finds one to hand over.
+          docker buildx imagetools inspect "$ACR/mw-plugin-test:$VERSION" --format '{{json .Manifest.Digest}}' >/dev/null \
+            || { echo "::error::mw-plugin-test:$VERSION does not exist — the hand-over names a set the platform never published"; exit 1; }
       - uses: actions/setup-dotnet@v6
         if: steps.set.outputs.build == 'true'
         with:
