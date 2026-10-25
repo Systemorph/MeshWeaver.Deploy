@@ -37,12 +37,10 @@ python3 -c "import yaml" >/dev/null 2>&1 || { echo "::error::python3 with PyYAML
 
 # 1. one implementation: the runner and the composer ship INSIDE the mw-build-host image, copied
 #    from .github/scripts by deploy/build-host/Dockerfile — the chart carries no copy of either.
-#    The runner and its Dockerfile STAY in the platform repository (main-cd builds the image there),
-#    so they are read from a DECLARED platform checkout ($MW_PLATFORM_ROOT) — no fallback.
-[ -n "${MW_PLATFORM_ROOT:-}" ] \
-  || { echo "::error::MW_PLATFORM_ROOT is not set — the runner (.github/scripts/build-run.py) and deploy/build-host/Dockerfile are read from a Systemorph/MeshWeaver checkout"; exit 1; }
-PLATFORM="$MW_PLATFORM_ROOT"
-DOCKERFILE="$PLATFORM/deploy/build-host/Dockerfile"
+#    The runner and its Dockerfile live in THIS repository (build-host.yml builds the image), so
+#    they are read from this tree; the platform's helpers they ship with are staged by
+#    deploy/build-host/stage-context.sh at the set's commit.
+DOCKERFILE="$REPO/deploy/build-host/Dockerfile"
 if [ -f "$CHART/files/build-run.py" ]; then
   report "deploy/helm/files/build-run.py exists — the chart must not carry a second copy of the runner; it ships in the mw-build-host image"
 fi
@@ -57,7 +55,7 @@ if [ -f "$DOCKERFILE" ] \
 else
   report "deploy/build-host/Dockerfile must COPY .github/scripts/{build-run.py,compose-gate-host.sh,sandbox-postgres.sh,module-build-key.py} and artifacts/plugin-build/ to /opt/build-host/, install bubblewrap, run both self-tests, and name no :latest base"
 fi
-if python3 "$PLATFORM/.github/scripts/build-run.py" --self-test; then
+if python3 "$REPO/.github/scripts/build-run.py" --self-test; then
   ok "build-run.py passes its self-test"
 else
   report "build-run.py fails its self-test"
