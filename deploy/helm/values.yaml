@@ -609,6 +609,11 @@ ollama:
 # -ing over the shared ghcr names — retagging those is global to the Docker daemon, so it silently
 # swaps whatever else on the machine is already running them at its next restart.
 portal:
+  # false = a BUILD-HOST-ONLY release (MeshWeaver.Plugins Hosting/BuildQueue, phase 2): one platform
+  # version's build host as its own release, beside the control instance's portal in its namespace.
+  # It renders templates/build-host/* and NOTHING else, and refuses (templates/_portal.tpl) unless
+  # buildHosts.enabled is true and postgres.enabled and ingress.enabled are false.
+  enabled: true
   image: "ghcr.io/systemorph/memex-portal-ai:latest"
   # The NAME of a kubernetes.io/dockerconfigjson Secret in this namespace, rendered as
   # `imagePullSecrets` on the portal Deployment's pod spec AND the migration Job's — the two pods

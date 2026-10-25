@@ -13,7 +13,7 @@
 apiVersion: "v1"
 kind: "ServiceAccount"
 metadata:
-  name: "build-host"
+  name: {{ $b.sharedName | quote }}
   labels:
     app.kubernetes.io/name: "{{ .Chart.Name }}"
     app.kubernetes.io/component: "build-host"
@@ -32,7 +32,7 @@ automountServiceAccountToken: false
 apiVersion: "networking.k8s.io/v1"
 kind: "NetworkPolicy"
 metadata:
-  name: "build-host"
+  name: {{ $b.sharedName | quote }}
   labels:
     app.kubernetes.io/name: "{{ .Chart.Name }}"
     app.kubernetes.io/component: "build-host"
@@ -135,7 +135,7 @@ spec:
         azure.workload.identity/skip-containers: "tester;portal;oras"
       {{- end }}
     spec:
-      serviceAccountName: "build-host"
+      serviceAccountName: {{ $b.sharedName | quote }}
       automountServiceAccountToken: false
       # The runner image's unprivileged user; the shared cache and the emptyDirs are group-writable.
       securityContext:

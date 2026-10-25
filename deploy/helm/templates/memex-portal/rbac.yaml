@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- /*
 🚨 RENDERED ONLY WHEN `selfUpdate.canPatch` IS TRUE — and the chart's default is FALSE (MeshWeaver#4098,
 P3b of Hosting/AksOperationsViaActions: "the only place that alters AKS is the systemorph-com App").
@@ -62,4 +63,5 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: "memex-portal-sa"
+{{- end }}
 {{- end }}

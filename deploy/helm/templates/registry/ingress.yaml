@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- if (.Values.registry).enabled }}
 {{- $r := include "memex.registry" . | fromYaml }}
 # ---- ONE Ingress for the registry host --------------------------------------
@@ -51,4 +52,5 @@ spec:
                 name: "memex-registry-service"
                 port:
                   number: 5000
+{{- end }}
 {{- end }}

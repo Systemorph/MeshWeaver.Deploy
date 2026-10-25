@@ -178,9 +178,17 @@ The refusals, and why each one exists:
 {{- if not $channels -}}
 {{- fail "buildHosts.enabled is true but no channel is enabled and no version is listed (buildHosts.latest.enabled / buildHosts.stable.enabled / buildHosts.versions)" -}}
 {{- end -}}
+{{- /* The ServiceAccount and NetworkPolicy are shared by every host of ONE release. In the portal's release
+       (portal.enabled true) they keep their fixed name `build-host`; a build-host-only release (portal.enabled
+       false, one per platform version, installed beside the portal in its namespace) names them after the
+       RELEASE, so two such releases — or one beside a portal release that also renders hosts — never collide. */ -}}
+{{- $shared := "build-host" -}}
+{{- if ne (include "memex.portal.enabled" .) "true" -}}
+{{- $shared = printf "build-host-%s" .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
 {{- $np := ($b.networkPolicy | default dict) -}}
 {{- $wi := ($b.workloadIdentity | default dict) -}}
-{{- toYaml (dict "enabled" true "apiUrl" $api "tokenSecret" $tokName "tokenKey" $tokKey
+{{- toYaml (dict "enabled" true "sharedName" $shared "apiUrl" $api "tokenSecret" $tokName "tokenKey" $tokKey
       "workloadIdentityClientId" (trim ($wi.clientId | default ""))
       "cacheClaim" $cache "cache" $cacheCreate "imagePullSecret" ($b.imagePullSecret | default "")
       "pluginsRegistry" ($b.pluginsRegistry | default "") "pluginsSource" ($b.pluginsSource | default "plugins")

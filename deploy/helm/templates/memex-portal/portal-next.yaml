@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- if eq (include "memex.portalNext.mode" .) "image" }}
 # ---- Next.js React portal — the DEVELOPER OVERRIDE (a separately built image) ----
 # 🚂 Rendered ONLY when portalNext.image is set. The normal shape is BUNDLED: the front end ships
@@ -92,4 +93,5 @@ spec:
       protocol: "TCP"
       port: 3000
       targetPort: 3000
+{{- end }}
 {{- end }}

@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- if .Values.postgres.enabled }}
 ---
 apiVersion: "apps/v1"
@@ -50,4 +51,5 @@ spec:
         resources:
           requests:
             storage: 10Gi
+{{- end }}
 {{- end }}

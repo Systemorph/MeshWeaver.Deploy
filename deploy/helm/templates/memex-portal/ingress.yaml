@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- if .Values.ingress.enabled }}
 {{- $tls := .Values.ingress.tlsSecret | default "" }}
 {{- $issuer := .Values.ingress.clusterIssuer | default "" }}
@@ -204,4 +205,5 @@ spec:
                 name: "memex-portal-service"
                 port:
                   number: {{ .Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+{{- end }}
 {{- end }}

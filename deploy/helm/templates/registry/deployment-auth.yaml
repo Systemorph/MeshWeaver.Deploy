@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- if (.Values.registry).enabled }}
 {{- $r := include "memex.registry" . | fromYaml }}
 # ---- docker_auth: the token server -----------------------------------------
@@ -118,4 +119,5 @@ spec:
       protocol: "TCP"
       port: 5001
       targetPort: 5001
+{{- end }}
 {{- end }}

@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- /*
 The portal's PersistentVolumeClaims — rendered ONLY for a `persistence.<name>` entry that says
 `create: true` (MeshWeaver#3353).
@@ -45,5 +46,6 @@ spec:
   resources:
     requests:
       storage: "{{ required (printf "persistence.%s.size is required when persistence.%s.create is true — the chart will not guess a volume size" $name $name) $spec.size }}"
+{{- end }}
 {{- end }}
 {{- end }}

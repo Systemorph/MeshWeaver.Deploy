@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 ---
 apiVersion: "v1"
 kind: "Service"
@@ -26,3 +27,4 @@ spec:
       protocol: "TCP"
       port: 18890
       targetPort: 18890
+{{- end }}

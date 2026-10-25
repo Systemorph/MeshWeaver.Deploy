@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- if .Values.instancesAdmin.clusterRead }}
 ---
 # Cluster-scoped READ for the platform-admin Instances overview (Doc/Architecture/Instances.md):
@@ -39,4 +40,5 @@ subjects:
   - kind: ServiceAccount
     name: "memex-portal-sa"
     namespace: "{{ .Release.Namespace }}"
+{{- end }}
 {{- end }}

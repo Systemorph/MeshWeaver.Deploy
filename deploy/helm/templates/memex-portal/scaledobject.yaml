@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- if .Values.keda.enabled }}
 # KEDA autoscaler for the Blazor Server portal. Requires the KEDA operator
 # (AKS managed add-on) + metrics-server, and AdoNet Orleans clustering so the
@@ -60,4 +61,5 @@ spec:
         valueLocation: "waiting"
         targetValue: "{{ .Values.keda.queueDepth.waitingPerReplica | default 4 }}"
     {{- end }}
+{{- end }}
 {{- end }}
