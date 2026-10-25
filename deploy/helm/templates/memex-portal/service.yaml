@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 ---
 apiVersion: "v1"
 kind: "Service"
@@ -32,4 +33,5 @@ spec:
       protocol: "TCP"
       port: {{ .Values.grpc.port }}
       targetPort: {{ .Values.grpc.port }}
+{{- end }}
 {{- end }}

@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 ---
 # Run-once migration JOB.
 #
@@ -246,3 +247,4 @@ spec:
         - {{ toYaml . | nindent 10 | trim }}
         {{- end }}
       {{- end }}
+{{- end }}

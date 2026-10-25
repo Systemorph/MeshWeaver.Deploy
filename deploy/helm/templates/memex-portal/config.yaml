@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 ---
 apiVersion: "v1"
 kind: "ConfigMap"
@@ -24,6 +25,7 @@ data:
 {{- $literalData := include "memex.portalConfigData" . }}
 {{- $literalData }}
 {{- include "memex.portalConfigPassThrough" (dict "root" . "literal" $literalData) }}
+{{- end }}
 {{- define "memex.portalConfigData" }}
   MEMEX_HOST: "{{ .Values.config.memex_portal.MEMEX_HOST }}"
   MEMEX_PORT: "{{ .Values.config.memex_portal.MEMEX_PORT }}"

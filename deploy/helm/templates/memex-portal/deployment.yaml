@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 ---
 apiVersion: "apps/v1"
 kind: "Deployment"
@@ -854,3 +855,4 @@ spec:
       # rollout there buys FALSE CONFIDENCE — the gate reports, and the outage happens anyway.
       maxUnavailable: 0
     type: "RollingUpdate"
+{{- end }}

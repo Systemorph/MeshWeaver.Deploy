@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 ---
 apiVersion: "v1"
 kind: "ConfigMap"
@@ -20,3 +21,4 @@ data:
   Embedding__Provider: "{{ .Values.config.memex_migration.Embedding__Provider | default "" }}"
   Embedding__Endpoint: "{{ .Values.config.memex_migration.Embedding__Endpoint | default "" }}"
   Embedding__Model: "{{ .Values.config.memex_migration.Embedding__Model | default "" }}"
+{{- end }}

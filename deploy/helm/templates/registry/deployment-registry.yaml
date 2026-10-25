@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- if (.Values.registry).enabled }}
 {{- $r := include "memex.registry" . | fromYaml }}
 # ---- distribution: the registry pods ---------------------------------------
@@ -150,4 +151,5 @@ spec:
       protocol: "TCP"
       port: 5000
       targetPort: 5000
+{{- end }}
 {{- end }}

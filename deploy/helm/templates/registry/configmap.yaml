@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- if (.Values.registry).enabled }}
 {{- $r := include "memex.registry" . | fromYaml }}
 # ---- distribution (the registry) configuration ------------------------------
@@ -181,4 +182,5 @@ data:
   # registry.validationUrl; docker_auth execs the hook with its own environment.
   validate.sh: |
 {{ .Files.Get "files/registry-validate.sh" | indent 4 }}
+{{- end }}
 {{- end }}

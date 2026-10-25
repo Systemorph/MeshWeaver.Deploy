@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 ---
 apiVersion: "apps/v1"
 kind: "Deployment"
@@ -41,3 +42,4 @@ spec:
       maxSurge: 1
       maxUnavailable: 1
     type: "RollingUpdate"
+{{- end }}

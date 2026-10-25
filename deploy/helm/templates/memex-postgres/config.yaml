@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- if .Values.postgres.enabled }}
 ---
 apiVersion: "v1"
@@ -12,4 +13,5 @@ data:
   POSTGRES_HOST_AUTH_METHOD: "{{ .Values.config.memex_postgres.POSTGRES_HOST_AUTH_METHOD }}"
   POSTGRES_INITDB_ARGS: "{{ .Values.config.memex_postgres.POSTGRES_INITDB_ARGS }}"
   POSTGRES_USER: "{{ .Values.config.memex_postgres.POSTGRES_USER }}"
+{{- end }}
 {{- end }}

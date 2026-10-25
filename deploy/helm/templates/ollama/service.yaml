@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- if .Values.ollama.external.enabled }}
 # ---- External Ollama, fronted by an in-cluster Service ---------------------
 # A host-native Ollama (e.g. macOS Metal GPU — Docker/k8s on macOS has no GPU
@@ -38,4 +39,5 @@ subsets:
       - name: "http"
         protocol: "TCP"
         port: {{ .Values.ollama.external.port }}
+{{- end }}
 {{- end }}

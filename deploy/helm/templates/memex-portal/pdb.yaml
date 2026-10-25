@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- $floor := ternary (int .Values.keda.minReplicas) (int ((.Values.replicas).portal | default 1)) .Values.keda.enabled }}
 {{- if ge $floor 2 }}
 # A PodDisruptionBudget for the portal. Rendered whenever the REPLICA FLOOR is two or more — under
@@ -51,4 +52,5 @@ spec:
       app.kubernetes.io/name: "{{ .Chart.Name }}"
       app.kubernetes.io/component: "memex-portal"
       app.kubernetes.io/instance: "{{ .Release.Name }}"
+{{- end }}
 {{- end }}

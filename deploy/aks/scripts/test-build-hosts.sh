@@ -17,6 +17,9 @@
 #      share — plus a ServiceAccount with no token and a NetworkPolicy with no ingress whose egress
 #      is pinned whole (DNS to the cluster resolver only; the build API's pods on their port; 80/443
 #      outside every private range, IMDS and WireServer);
+#   3d. a build-host-only release (portal.enabled: false) renders the version's host, its cache and
+#      the release-named ServiceAccount + NetworkPolicy and NOTHING of the portal, and two such
+#      releases and the portal's own never name one object twice;
 #   4. the refusals hold: a tag instead of a digest, plain http to a public host, and a registry
 #      credential for the host, fail
 #      `helm template` naming why.
@@ -318,6 +321,128 @@ else
 fi
 
 
+# 3d. a BUILD-HOST-ONLY release (portal.enabled: false — MeshWeaver.Plugins Hosting/BuildQueue, phase 2):
+#     one platform version's host as its OWN release beside the control instance's portal. It must
+#     render EXACTLY the version's Deployment + ScaledObject, its cache claim, and the release's
+#     ServiceAccount + NetworkPolicy — and nothing of the portal. A second such release (another
+#     version) and the portal's own release (which may render hosts too) share the namespace, so no
+#     (kind, name) may occur in two of the three renders.
+REL="build-3-1-11641"
+sed -e 's/3\.1\.11641/3.1.11700/' -e 's/build-cache-3-1-11641/build-cache-3-1-11700/' \
+  "$TD/values.build-host-release.yaml" > "$WORK/release-b.yaml"
+if helm template "$REL" "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-host-release.yaml" --namespace check \
+     > "$WORK/release.yaml" 2> "$WORK/release.err" \
+   && helm template build-3-1-11700 "$CHART" -f "$CHART/values.yaml" -f "$WORK/release-b.yaml" --namespace check \
+     > "$WORK/release-b.out" 2> "$WORK/release-b.err"; then
+  if python3 - "$WORK/release.yaml" "$REL" "$WORK/release-b.out" "$WORK/hosts.yaml" <<'PY'
+import sys, yaml
+from collections import Counter
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+rel = sys.argv[2]
+problems = []
+kinds = Counter(d["kind"] for d in docs)
+want = Counter({"Deployment": 1, "ScaledObject": 1, "PersistentVolumeClaim": 1, "ServiceAccount": 1, "NetworkPolicy": 1})
+if kinds != want:
+    problems.append(f"the release renders {dict(kinds)}, not exactly {dict(want)}")
+foreign = [f"{d['kind']}/{d['metadata']['name']}" for d in docs
+           if (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") != "build-host"]
+if foreign:
+    problems.append(f"objects that are not build-host objects render (portal, migration, postgres, registry, …): {foreign}")
+names = {(d["kind"], d["metadata"]["name"]) for d in docs}
+shared = f"build-host-{rel}"
+for k, n in [("Deployment", "build-3-1-11641"), ("ScaledObject", "build-3-1-11641-scaler"),
+             ("PersistentVolumeClaim", "build-cache-3-1-11641"), ("ServiceAccount", shared), ("NetworkPolicy", shared)]:
+    if (k, n) not in names:
+        problems.append(f"{k}/{n} is missing: {sorted(names)}")
+dep = next((d for d in docs if d["kind"] == "Deployment"), None)
+if dep:
+    pod = dep["spec"]["template"]["spec"]
+    if pod.get("serviceAccountName") != shared:
+        problems.append(f"the host does not run as its release's ServiceAccount {shared}: {pod.get('serviceAccountName')}")
+    if pod.get("imagePullSecrets") != [{"name": "build-pull"}]:
+        problems.append(f"imagePullSecret did not render: {pod.get('imagePullSecrets')}")
+    vols = {v["name"]: v for v in pod.get("volumes", [])}
+    if vols.get("cache", {}).get("persistentVolumeClaim", {}).get("claimName") != "build-cache-3-1-11641":
+        problems.append("the host does not mount the release's cache claim")
+    wt = vols.get("worker-token", {}).get("secret", {})
+    if wt.get("secretName") != "build-worker-synced" or wt.get("items") != [{"key": "Hosting__Builds__WorkerToken", "path": "token"}]:
+        problems.append(f"the worker token is not the synced Secret's key mounted as a file: {wt}")
+    build = next(c for c in pod["containers"] if c["name"] == "build")
+    env = {e["name"]: e.get("value") for e in build.get("env", [])}
+    if env.get("MW_BUILD_VERSION") != "3.1.11641" or env.get("MW_BUILD_CORE_TESTS_DIGEST") != "sha256:" + "4" * 64:
+        problems.append(f"the host does not claim by its version with its core-tests digest: {env.get('MW_BUILD_VERSION')} {env.get('MW_BUILD_CORE_TESTS_DIGEST')}")
+    if build.get("securityContext", {}).get("appArmorProfile") != {"type": "Localhost", "localhostProfile": "mw-build-host"}:
+        problems.append(f"the sandbox AppArmor profile did not render: {build.get('securityContext')}")
+np = next((d for d in docs if d["kind"] == "NetworkPolicy"), None)
+if np and np["spec"]["podSelector"]["matchLabels"].get("app.kubernetes.io/instance") != rel:
+    problems.append(f"the release's NetworkPolicy does not select its own release's pods: {np['spec']['podSelector']}")
+pvc = next((d for d in docs if d["kind"] == "PersistentVolumeClaim"), None)
+if pvc and (pvc["spec"].get("accessModes") != ["ReadWriteMany"] or pvc["spec"].get("storageClassName") != "azurefile-memex"
+            or (pvc["metadata"].get("annotations") or {}).get("helm.sh/resource-policy") != "keep"):
+    problems.append(f"the cache claim is not a kept RWX claim on the stated class: {pvc}")
+# Two releases and the portal's own release in ONE namespace: no object may be named twice.
+seen = {}
+for label, path in [("release " + rel, sys.argv[1]), ("release build-3-1-11700", sys.argv[3]), ("the portal release", sys.argv[4])]:
+    for d in yaml.safe_load_all(open(path)):
+        if d and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "build-host":
+            key = (d["kind"], d["metadata"]["name"])
+            if key in seen:
+                problems.append(f"{key[0]}/{key[1]} renders in both {seen[key]} and {label} — they would collide in one namespace")
+            seen[key] = label
+if problems:
+    print("\n".join(problems)); sys.exit(1)
+PY
+  then ok "a build-host-only release renders exactly build-3-1-11641 (+ its scaler), its cache claim and the release-named ServiceAccount + NetworkPolicy, nothing of the portal, and collides with neither another version's release nor the portal's"
+  else report "the build-host-only release renders a wrong shape (see above)"
+  fi
+else
+  report "the build-host-only release does not render:"; sed 's/^/    /' "$WORK/release.err" "$WORK/release-b.err"
+fi
+
+# 3d'. two valid 53-character release names that differ only in their LAST character must still get
+#      two distinct shared names within a DNS label's 63 characters (review of #14: a plain truncation
+#      mapped both onto one ServiceAccount + NetworkPolicy, and the second install failed Helm's
+#      ownership check).
+long_a="build-3-1-0-$(printf 'a%.0s' $(seq 40))1"; long_b="${long_a%1}2"
+if helm template "$long_a" "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-host-release.yaml" --namespace check > "$WORK/long-a.yaml" 2> "$WORK/long.err" \
+   && helm template "$long_b" "$CHART" -f "$CHART/values.yaml" -f "$WORK/release-b.yaml" --namespace check > "$WORK/long-b.yaml" 2>> "$WORK/long.err"; then
+  if python3 - "$WORK/long-a.yaml" "$WORK/long-b.yaml" <<'PY'
+import sys, yaml
+def shared(p):
+    return {d["kind"]: d["metadata"]["name"] for d in yaml.safe_load_all(open(p)) if d and d["kind"] in ("ServiceAccount", "NetworkPolicy")}
+a, b = shared(sys.argv[1]), shared(sys.argv[2])
+problems = []
+for k in ("ServiceAccount", "NetworkPolicy"):
+    if k not in a or k not in b:
+        problems.append(f"{k} missing: {a} {b}"); continue
+    if a[k] == b[k]:
+        problems.append(f"{k}: two release names that differ only in the last character share the name {a[k]}")
+    if max(len(a[k]), len(b[k])) > 63:
+        problems.append(f"{k}: a name exceeds 63 characters: {a[k]} / {b[k]}")
+if problems:
+    print("\n".join(problems)); sys.exit(1)
+PY
+  then ok "53-character release names that differ only at the end get distinct shared names within 63 characters"
+  else report "long release names collide or overflow (see above)"
+  fi
+else
+  report "the long-release-name renders fail:"; sed 's/^/    /' "$WORK/long.err"
+fi
+
+# 3e. every template OUTSIDE templates/build-host/ opens with the portal gate — so a template added
+#     later cannot render into a build-host-only release because nobody wrapped it (the fixture above
+#     only sees the values it sets; this sees every file).
+GATE='{{- if eq (include "memex.portal.enabled" .) "true" -}}'
+ungated=""
+while IFS= read -r f; do
+  [ "$(head -n1 "$f")" = "$GATE" ] || ungated="$ungated ${f#"$CHART"/}"
+done < <(find "$CHART/templates" -type f ! -name '_*' ! -path '*/templates/build-host/*' | sort)
+if [ -z "$ungated" ]; then
+  ok "every template outside templates/build-host/ opens with the portal.enabled gate"
+else
+  report "templates outside templates/build-host/ that do not open with the portal.enabled gate (they would render into a build-host-only release):$ungated"
+fi
+
 # 4. refusals
 for entry in \
   "values.build-hosts-tag-not-digest.yaml|must be a sha256:<64 hex> digest" \
@@ -336,7 +461,10 @@ for entry in \
   "values.build-hosts-trailing-dash.yaml|ending in a letter or digit" \
   "values.build-hosts-zero-replicas.yaml|maxReplicas must be at least 1" \
   "values.build-hosts-name-collision.yaml|one deployment per name" \
-  "values.build-hosts-cache-no-class.yaml|buildHosts.cache.storageClass is required"; do
+  "values.build-hosts-cache-no-class.yaml|buildHosts.cache.storageClass is required" \
+  "values.build-host-release-no-hosts.yaml|portal.enabled is false but buildHosts.enabled is not true" \
+  "values.build-host-release-postgres.yaml|portal.enabled is false but postgres.enabled is true" \
+  "values.build-host-release-ingress.yaml|portal.enabled is false but ingress.enabled is true"; do
   f="${entry%%|*}"; phrase="${entry#*|}"
   if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/$f" > "$WORK/refusal.yaml" 2> "$WORK/refusal.err"; then
     report "refusal $f RENDERED — the chart must refuse it"

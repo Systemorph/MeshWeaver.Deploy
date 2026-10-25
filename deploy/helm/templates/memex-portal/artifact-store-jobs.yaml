@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- $a := include "memex.artifactStore" . | fromYaml }}
 {{- if $a.enabled }}
 # The shared artifact store's OWNER jobs (Doc/Architecture/SharedArtifactStore): the scripts they run,
@@ -290,6 +291,7 @@ spec:
                 items:
                   - key: "token"
                     path: "token"
+{{- end }}
 {{- end }}
 {{- end }}
 {{- end }}
