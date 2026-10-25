@@ -1,0 +1,57 @@
+# Arm auto-merge on every non-draft PR, so a PR that goes green LANDS.
+#
+# 🚨 THIS FILE IS A CALLER — THE LANE ITSELF LIVES ONCE, IN Systemorph/MeshWeaver.
+# Do not paste its body back in here. Everything the arm does — the App-token mint, the
+# draft/fork exemption, the two-shape `gh pr merge` (merge queue vs none), the read-back —
+# is in `.github/workflows/auto-arm.yml` over there, following main below.
+#
+# WHY IT IS A CALLER. This file used to be a hand-copy of that lane, in all seven repos of the
+# fleet, under a header asserting the copies were identical. Measured 2026-09-02, they were not,
+# in three ways at once: core had been moved to a minted `meshweaver-cloud` App installation
+# token while every satellite copy still armed with `secrets.GITHUB_TOKEN`; only .Crm carried the
+# `landed:` read-back fix; several copies had no `timeout-minutes` at all.
+#
+# The first divergence is an OUTAGE, and it was running here unnoticed. GitHub performs an
+# auto-merge as the identity that ARMED it, and a push created with `GITHUB_TOKEN` deliberately
+# triggers no workflow runs — so every merge this lane performed landed on `main` and started
+# NOTHING: no build, no tests, no tag-modules, no publish-bake. MeshWeaver.Reinsurance's `main`
+# had no `push`-event run after 09:11Z that day while pull requests merged all afternoon, and
+# nothing was red anywhere, because the evidence that would have been red is precisely the run
+# that never existed (Systemorph/MeshWeaver#2916).
+#
+# So: one lane, seven callers, no copies. A satellite's CI calls the platform's reusable
+# workflows — it does not copy them (AGENTS.md → "never hand-roll or copy-paste a node repo's
+# CI"). The shared lane follows main; implementation changes belong there.
+#
+# 🚨 The two secrets are forwarded EXPLICITLY, never `secrets: inherit` — inherit would hand the
+# platform's lane every secret this repository owns. They are named exactly as the lane declares
+# them; the lane's preflight step fails RED naming what to provision if either is empty, so a
+# missing secret is a visible red here, not a silently unarmed pull request.
+name: Arm auto-merge
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# No `concurrency:` here on purpose. The lane declares it on its own JOB, and a group is
+# per-repository: naming the same group on this caller run would queue the job it dispatches
+# behind the run that is waiting for it.
+
+jobs:
+  # Job id `arm`, so the check context reads `arm / Arm auto-merge on this PR`. Verified
+  # 2026-09-02 against this repo's branch protection / rulesets: the arm context is not a
+  # required status check anywhere in the fleet, so the rename gates nothing.
+  # No `timeout-minutes` — GitHub ignores it on a `uses:` job; the cap (10 minutes) lives on the
+  # job inside the reusable workflow, where check-workflow-timeouts.py gates it.
+  arm:
+    uses: Systemorph/MeshWeaver/.github/workflows/auto-arm.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+    secrets:
+      MESHWEAVER_APP_ID: ${{ secrets.MESHWEAVER_APP_ID }}
+      MESHWEAVER_APP_PRIVATE_KEY: ${{ secrets.MESHWEAVER_APP_PRIVATE_KEY }}
