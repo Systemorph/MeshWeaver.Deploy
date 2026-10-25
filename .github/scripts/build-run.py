@@ -1366,6 +1366,9 @@ class Host:
         self.set_identity = {"testerDigest": env.get("MW_BUILD_TESTER_DIGEST", "").strip(),
                              "portalDigest": env.get("MW_BUILD_PORTAL_DIGEST", "").strip(),
                              "runnerDigest": env.get("MW_BUILD_RUNNER_DIGEST", "").strip()} if self.version else {}
+        # The optional fifth part of a set: sent exactly when the chart renders it, so the claim proves the whole token.
+        if self.version and env.get("MW_BUILD_CORE_TESTS_DIGEST", "").strip():
+            self.set_identity["coreTestsDigest"] = env["MW_BUILD_CORE_TESTS_DIGEST"].strip()
         self.lane = self.version or self.channel
         self.identity = env.get("MW_BUILD_FRAMEWORK_IDENTITY", "").strip()
         if not self.identity and env.get("MW_BUILD_IDENTITY_FILE"):
@@ -1408,7 +1411,9 @@ class Host:
                                "— a versioned server runs exactly the set its version names")
             for name, value in (("MW_BUILD_TESTER_DIGEST", self.set_identity.get("testerDigest", "")),
                                 ("MW_BUILD_PORTAL_DIGEST", self.set_identity.get("portalDigest", "")),
-                                ("MW_BUILD_RUNNER_DIGEST", self.set_identity.get("runnerDigest", ""))):
+                                ("MW_BUILD_RUNNER_DIGEST", self.set_identity.get("runnerDigest", "")),
+                                *((("MW_BUILD_CORE_TESTS_DIGEST", self.set_identity["coreTestsDigest"]),)
+                                  if "coreTestsDigest" in self.set_identity else ())):
                 if not DIGEST.match(value):
                     missing.append(f"{name} as a sha256:<64 hex> digest — a versioned server proves its set on every claim")
         elif not CHANNEL.match(self.channel):
@@ -3170,6 +3175,18 @@ def self_test() -> int:
         host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})],
                        ("POST", "/claim"): lambda p_, b: (claims_c.append(b), (204, None))[1]})).cycle()
         check("version/a CHANNEL host's claim carries no set digests", claims_c and "testerDigest" not in claims_c[0], claims_c)
+        check("version/no core-tests image in the env → none in the claim", claims_v and "coreTestsDigest" not in claims_v[0], claims_v)
+        claims_t: list[dict] = []
+        host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})],
+                       ("POST", "/claim"): lambda p_, b: (claims_t.append(b), (204, None))[1]}),
+             env=dict(env_v, MW_BUILD_CORE_TESTS_DIGEST="sha256:" + "d" * 64)).cycle()
+        check("version/a set's core-tests image is proved on the claim too",
+              claims_t and claims_t[0].get("coreTestsDigest") == "sha256:" + "d" * 64, claims_t)
+        try:
+            host(_FakeApi({}), env=dict(env_v, MW_BUILD_CORE_TESTS_DIGEST="nope")).preflight()
+            check("version/refused: a malformed core-tests digest", False, "started")
+        except Refusal as e:
+            check("version/refused: a malformed core-tests digest", "MW_BUILD_CORE_TESTS_DIGEST" in str(e), e)
         posted.clear()
         av = api_ev()
         hv = host(av, env=env_v, checkout=checkout_with({"stages": [{"name": "s", "kind": "build", "command": "true"}]}))
