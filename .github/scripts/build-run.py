@@ -74,7 +74,10 @@ Environment (rendered by the chart from `buildHosts.*`):
   BUILD_API                    https://<operations instance>/api/builds              required
   BUILD_TOKEN_FILE             the mounted worker token (Hosting:Builds:WorkerToken)  default /run/build-worker/token
                                (BUILD_TOKEN in the environment is REFUSED)
-  MW_BUILD_CHANNEL             latest | stable                                        required
+  MW_BUILD_CHANNEL             latest | stable                     required unless MW_BUILD_VERSION
+  MW_BUILD_VERSION             a VERSIONED build server's version (Doc/Architecture/DeployTestSwitchLatest §3):
+                               it claims, reports and scales by version, never by channel; exactly one of
+                               the two is set, and it must equal MW_BUILD_PLATFORM_VERSION
   MW_BUILD_PLATFORM_VERSION    the set this host runs (3.x.y-ci.N / 3.x.N)            required
   MW_BUILD_FRAMEWORK_IDENTITY  or MW_BUILD_IDENTITY_FILE (first token of the file)    required
   MW_BUILD_HOST                the claiming host's name (default: hostname)
@@ -117,6 +120,7 @@ from typing import Callable, Iterable, Optional
 
 STAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 CHANNEL = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 REPO = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -563,7 +567,9 @@ class EventSink:
         self.claim_id = claim_id   # the assignment every batch belongs to
         self.path = events_path(repo, sha, stage)
         # A probe run's identity is (repo, sha, channel, probe): its id rides on every callback.
-        self.query = {"channel": channel, **({"probe": probe} if probe else {})}
+        # `channel` is a channel name, or a host's whole claim scope ({"version": v} on a versioned server).
+        scope = dict(channel) if isinstance(channel, dict) else {"channel": channel}
+        self.query = {**scope, **({"probe": probe} if probe else {})}
         self.buf: list[dict] = []
         self.last = clock()
         self.dropped = 0
@@ -1354,7 +1360,20 @@ class Host:
         self.stopping = False
         self.host = env.get("MW_BUILD_HOST") or socket.gethostname()
         self.channel = env.get("MW_BUILD_CHANNEL", "").strip()
+        self.version = env.get("MW_BUILD_VERSION", "").strip()
         self.platform_version = env.get("MW_BUILD_PLATFORM_VERSION", "").strip()
+        # The claim scope every call names: a versioned server claims, reports and scales by its VERSION.
+        self.scope = {"version": self.version} if self.version else {"channel": self.channel}
+        # A versioned server PROVES the set it runs on every claim: the three images of its v/<version> set, as the chart
+        # renders them. The server drains a host whose images are not the set the version names now, and records the set
+        # on the claim, so a run's green is a test of exactly those images (Plugins#4221).
+        self.set_identity = {"testerDigest": env.get("MW_BUILD_TESTER_DIGEST", "").strip(),
+                             "portalDigest": env.get("MW_BUILD_PORTAL_DIGEST", "").strip(),
+                             "runnerDigest": env.get("MW_BUILD_RUNNER_DIGEST", "").strip()} if self.version else {}
+        # The optional fifth part of a set: sent exactly when the chart renders it, so the claim proves the whole token.
+        if self.version and env.get("MW_BUILD_CORE_TESTS_DIGEST", "").strip():
+            self.set_identity["coreTestsDigest"] = env["MW_BUILD_CORE_TESTS_DIGEST"].strip()
+        self.lane = self.version or self.channel
         self.identity = env.get("MW_BUILD_FRAMEWORK_IDENTITY", "").strip()
         if not self.identity and env.get("MW_BUILD_IDENTITY_FILE"):
             try:
@@ -1377,6 +1396,7 @@ class Host:
         self.run_sinks: dict[str, EventSink] = {}
         self.claim_id = ""
         self.probe: Optional[str] = None
+        self.run_scope = {"channel": self.channel}
 
     def preflight(self) -> None:
         missing = []
@@ -1385,8 +1405,23 @@ class Host:
                            "cluster-local host — the worker token rides on it)")
         if not self.api.token:
             missing.append("the worker token (BUILD_TOKEN_FILE, the mounted Hosting:Builds:WorkerToken)")
-        if not CHANNEL.match(self.channel):
-            missing.append("MW_BUILD_CHANNEL (latest | stable)")
+        if self.version and self.channel:
+            missing.append("exactly ONE of MW_BUILD_CHANNEL and MW_BUILD_VERSION (a versioned server claims by version only)")
+        elif self.version:
+            if not VERSION.match(self.version):
+                missing.append(f"MW_BUILD_VERSION as MAJOR.MINOR.PATCH[-pre] (got {self.version!r})")
+            elif self.platform_version and self.platform_version != self.version:
+                missing.append(f"MW_BUILD_PLATFORM_VERSION equal to MW_BUILD_VERSION ({self.platform_version!r} != {self.version!r}) "
+                               "— a versioned server runs exactly the set its version names")
+            for name, value in (("MW_BUILD_TESTER_DIGEST", self.set_identity.get("testerDigest", "")),
+                                ("MW_BUILD_PORTAL_DIGEST", self.set_identity.get("portalDigest", "")),
+                                ("MW_BUILD_RUNNER_DIGEST", self.set_identity.get("runnerDigest", "")),
+                                *((("MW_BUILD_CORE_TESTS_DIGEST", self.set_identity["coreTestsDigest"]),)
+                                  if "coreTestsDigest" in self.set_identity else ())):
+                if not DIGEST.match(value):
+                    missing.append(f"{name} as a sha256:<64 hex> digest — a versioned server proves its set on every claim")
+        elif not CHANNEL.match(self.channel):
+            missing.append("MW_BUILD_CHANNEL (latest | stable) or MW_BUILD_VERSION")
         if not self.platform_version:
             missing.append("MW_BUILD_PLATFORM_VERSION (the set this host runs)")
         if not self.identity:
@@ -1469,7 +1504,8 @@ class Host:
                                   "--key-env", "MW_REGISTRY_INSTANCE_KEY", "--version", version, "--out", out], env)
 
     def refresh_seal(self) -> bool:
-        status, body = self.api.call("GET", "/hosts/inputs")
+        # The claim scope: a versioned server asks by its version (`?version=`), a channel host by its channel.
+        status, body = self.api.call("GET", "/hosts/inputs", query=self.scope)
         if status != 200 or not isinstance(body, dict):
             self.log(f"hosts/inputs unreadable (HTTP {status}) — NOT claiming this cycle: a run must "
                      f"record the plugins layer that compiled it")
@@ -1516,7 +1552,7 @@ class Host:
           * `stale-set` — this host's platform set is no longer its channel's: DRAIN (stop claiming;
             the run in hand, if any, finishes; the replacement replica runs the new set)."""
         for fresh in range(2):
-            body = {"host": self.host, "channel": self.channel, "platformVersion": self.platform_version,
+            body = {"host": self.host, **self.scope, **self.set_identity, "platformVersion": self.platform_version,
                     "frameworkIdentity": self.identity, "pluginsDigest": self.plugins_digest,
                     "pluginsKey": self.plugins_key, "claimId": str(uuid.uuid4())}
             self.claim_id = body["claimId"]
@@ -1542,7 +1578,7 @@ class Host:
                 return None
             if error.startswith("stale-set"):
                 self.log(f"the instance answers stale-set: this host's set {self.platform_version} is no longer "
-                         f"channel {self.channel}'s — DRAINING (no further claims)")
+                         f"{'version' if self.version else 'channel'} {self.lane}'s — DRAINING (no further claims)")
                 self.stopping = True
                 return None
             self.log(f"claim answered HTTP {status} — retrying after a pause")
@@ -1584,6 +1620,11 @@ class Host:
         self.run_sinks: dict[str, EventSink] = {}       # seq restarts at 1 for every assignment
         probe_id = claim.get("probe")
         self.probe = str(probe_id) if isinstance(probe_id, str) and probe_id.strip() else None
+        # Run-scoped calls (events, heartbeat, token) name the CLAIMED RUN, which the server finds by
+        # (repo, sha, channel): the claim answer's channel — a versioned server's own scope is its
+        # version, used only for claiming, the queue and its inputs.
+        claimed = claim.get("channel")
+        self.run_scope = {"channel": claimed.strip()} if isinstance(claimed, str) and claimed.strip() else {"channel": self.channel}
         if claim.get("claimId"):
             self.claim_id = str(claim["claimId"])
         with Heartbeat() as hb:
@@ -1622,7 +1663,7 @@ class Host:
             # The lease is kept from the first second — a first clone into an empty mirror can take
             # longer than the instance's lease, and the checkout posts nothing else.
             self._sink_for(repo, sha, last_stage)
-            self.log(f"claimed {path} ({repo}@{sha[:12]}, channel {self.channel}, trunk={trunk}, publish={publish})")
+            self.log(f"claimed {path} ({repo}@{sha[:12]}, {'version' if self.version else 'channel'} {self.lane}, trunk={trunk}, publish={publish})")
             token = self.installation_token(claim)
             try:
                 # The checkout is bounded by the run's deadline: a stalled clone or fetch ends the run
@@ -1669,7 +1710,7 @@ class Host:
             # cannot publish whatever it says; publication is the publish lane's, on the aggregate check `build`.
             extra = {
                 "MW_BUILD_PUBLISH": "true" if publish else "false",
-                "MW_BUILD_CHANNEL": self.channel, "MW_BUILD_REPO": repo, "MW_BUILD_SHA": sha,
+                "MW_BUILD_CHANNEL": self.channel, "MW_BUILD_VERSION": self.version, "MW_BUILD_REPO": repo, "MW_BUILD_SHA": sha,
                 "MW_BUILD_RUN_PATH": path, "MW_BUILD_IS_TRUNK": "true" if trunk else "false",
                 "MW_BUILD_PLATFORM_VERSION": self.platform_version,
                 "MW_BUILD_FRAMEWORK_IDENTITY": self.identity,
@@ -1746,7 +1787,7 @@ class Host:
             return "lost"
 
     def sink(self, repo: str, sha: str, stage: str) -> EventSink:
-        return EventSink(self.api, self.host, repo, sha, stage, self.channel, self.log,
+        return EventSink(self.api, self.host, repo, sha, stage, self.run_scope, self.log,
                          sleep=self.sleep, clock=self.clock, claim_id=self.claim_id, probe=self.probe)
 
     def installation_token(self, claim: dict) -> Optional[str]:
@@ -1754,7 +1795,7 @@ class Host:
         It stays in the host process; no stage ever sees it. None ⇒ clone anonymously."""
         status, body = self.api.call("POST", "/token", {"host": self.host, "path": claim.get("path"),
                                                         "repo": claim.get("repo"), "sha": claim.get("sha")},
-                                     {"channel": self.channel, **({"probe": self.probe} if self.probe else {})})
+                                     {**self.run_scope, **({"probe": self.probe} if self.probe else {})})
         if status == 200 and isinstance(body, dict) and body.get("token"):
             return str(body["token"])
         self.log(f"no installation token for {claim.get('repo')} (HTTP {status}) — cloning anonymously")
@@ -1865,7 +1906,7 @@ class Host:
         """Run ONE stage in a fresh sandboxed process tree; post its events; return success."""
         name, started = st["name"], self.clock()
         parser = OutputParser(checkout, name)
-        sink.add([{"kind": "line", "text": f"[00:00:00] {st['kind']}/{name} on build-{self.channel} "
+        sink.add([{"kind": "line", "text": f"[00:00:00] {st['kind']}/{name} on build-{self.lane} "
                                            f"({self.platform_version}, plugins {(self.plugins_digest or '-')[:19]})"}])
         try:
             argv = self.sandbox.argv(st["command"], checkout, outputs, sandbox_env(self.env, extra, self.cache),
@@ -2008,7 +2049,7 @@ class Host:
             # The DIGEST is in the key: a later attempt, probe or platform-set build of the same
             # commit/channel/stage that produces OTHER bytes writes a different object, so an earlier
             # acknowledged receipt's object is never replaced under it.
-            key = f"build-hosts/{repo}/{sha}/{self.channel}/{stage}/{digest}/{unit}"
+            key = f"build-hosts/{repo}/{sha}/{self.lane}/{stage}/{digest}/{unit}"
             try:
                 rc, out = store([sys.executable, script, "put", "--store", store_url, "--key", key, "--file", full])
             except subprocess.TimeoutExpired:
@@ -3116,6 +3157,59 @@ def self_test() -> int:
                 check(f"budget/a run deadline of {bad_deadline} s is refused", False, "started")
             except Refusal as e:
                 check("budget/the refusal names the RUN budget", "RUN budget" in str(e), e)
+        # a VERSIONED build server (Doc/Architecture/DeployTestSwitchLatest §3): it claims, reports and asks for its
+        # token by VERSION, never by channel — and exactly one of the two is set.
+        env_v = {k: v for k, v in dict(env, MW_BUILD_VERSION="3.1.10412", BUILD_TOKEN_FILE=tf,
+                                       MW_BUILD_TESTER_DIGEST="sha256:" + "a" * 64, MW_BUILD_PORTAL_DIGEST="sha256:" + "b" * 64,
+                                       MW_BUILD_RUNNER_DIGEST="sha256:" + "c" * 64).items() if k != "MW_BUILD_CHANNEL"}
+        host(_FakeApi({}), env=env_v).preflight()
+        for bad_env, why in ((dict(env_v, MW_BUILD_CHANNEL="latest"), "exactly ONE"),
+                             (dict(env_v, MW_BUILD_PLATFORM_VERSION="3.1.10500"), "equal to MW_BUILD_VERSION"),
+                             (dict(env_v, MW_BUILD_VERSION="3.1", MW_BUILD_PLATFORM_VERSION="3.1"), "MAJOR.MINOR.PATCH"),
+                             (dict(env_v, MW_BUILD_RUNNER_DIGEST=""), "MW_BUILD_RUNNER_DIGEST as a sha256"),
+                             (dict(env_v, MW_BUILD_TESTER_DIGEST="sha256:short"), "MW_BUILD_TESTER_DIGEST as a sha256")):
+            try:
+                host(_FakeApi({}), env=bad_env).preflight()
+                check(f"version/refused: {why}", False, "started")
+            except Refusal as e:
+                check(f"version/refused: {why}", why in str(e), e)
+        claims_v: list[dict] = []
+        hv_claim = host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})],
+                                  ("POST", "/claim"): lambda p_, b: (claims_v.append(b), (204, None))[1]}), env=env_v)
+        hv_claim.cycle()
+        check("version/the claim names the version and no channel",
+              claims_v and claims_v[0].get("version") == "3.1.10412" and "channel" not in claims_v[0], claims_v)
+        iq = [c[3] for c in hv_claim.api.calls if c[1] == "/hosts/inputs"]
+        check("version/the inputs request names the version and no channel", iq and iq[0] == {"version": "3.1.10412"}, iq)
+        check("version/the claim proves the host's set: its tester, portal and runner digests",
+              claims_v and claims_v[0].get("testerDigest") == "sha256:" + "a" * 64 and claims_v[0].get("portalDigest") == "sha256:" + "b" * 64
+              and claims_v[0].get("runnerDigest") == "sha256:" + "c" * 64, claims_v)
+        claims_c: list[dict] = []
+        hc = host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})],
+                            ("POST", "/claim"): lambda p_, b: (claims_c.append(b), (204, None))[1]}))
+        hc.cycle()
+        check("version/a CHANNEL host's claim carries no set digests", claims_c and "testerDigest" not in claims_c[0], claims_c)
+        ic = [c[3] for c in hc.api.calls if c[1] == "/hosts/inputs"]
+        check("version/a channel host's inputs request names its channel", ic and set(ic[0]) == {"channel"}, ic)
+        check("version/no core-tests image in the env → none in the claim", claims_v and "coreTestsDigest" not in claims_v[0], claims_v)
+        claims_t: list[dict] = []
+        host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})],
+                       ("POST", "/claim"): lambda p_, b: (claims_t.append(b), (204, None))[1]}),
+             env=dict(env_v, MW_BUILD_CORE_TESTS_DIGEST="sha256:" + "d" * 64)).cycle()
+        check("version/a set's core-tests image is proved on the claim too",
+              claims_t and claims_t[0].get("coreTestsDigest") == "sha256:" + "d" * 64, claims_t)
+        try:
+            host(_FakeApi({}), env=dict(env_v, MW_BUILD_CORE_TESTS_DIGEST="nope")).preflight()
+            check("version/refused: a malformed core-tests digest", False, "started")
+        except Refusal as e:
+            check("version/refused: a malformed core-tests digest", "MW_BUILD_CORE_TESTS_DIGEST" in str(e), e)
+        posted.clear()
+        av = api_ev()
+        hv = host(av, env=env_v, checkout=checkout_with({"stages": [{"name": "s", "kind": "build", "command": "true"}]}))
+        check("version/ran", hv.run(dict(claim, channel="stable")) == "ran")
+        vq = [c[3] for c in av.calls if c[1].endswith("/events") or c[1] == "/token"]
+        check("version/every event POST and the token request name the CLAIMED run's channel (the server finds the run by it)",
+              vq and all(q.get("channel") == "stable" and "version" not in q for q in vq), vq)
         # a probe runs EXACTLY its requestedStages and plans only those
         posted.clear()
         hrq = host(api_ev(), env=env_s, checkout=checkout_with({"stages": [
