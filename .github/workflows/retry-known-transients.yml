@@ -1,0 +1,36 @@
+# ──────────── One automatic retry for NAMED infrastructure transients ────────────
+# A THIN CALLER of core's reusable lane — never a copy. The decision (curated log signatures, the
+# check-run ANNOTATION path for a runner death, the every-job rule, one retry per run, a RED when an
+# input cannot be read) lives in Systemorph/MeshWeaver `.github/scripts/retry-known-transients.py`,
+# fetched and self-tested by `node-repo-retry-transients.yml` on every call.
+#
+# Why not the inline copy that was here: it read job LOGS only, so a self-hosted runner death — no
+# log is ever uploaded, and the reason exists only in the job's annotation ("The self-hosted runner
+# lost communication with the server") — was declined every time and main stayed red
+# (Systemorph/MeshWeaver.Manufacturing#84). A copy keeps none of the fixes made after it.
+#
+# The caller grants are recorded in core's `.github/lane-caller-grants.yml`; change them there and
+# here together. This workflow is not a required context: it judges a run after it completed.
+name: Retry known transients
+
+on:
+  workflow_run:
+    workflows: ["Chart Gate", "Chart guards"]
+    types: [completed]
+
+permissions:
+  actions: write
+  checks: read
+  contents: read
+
+jobs:
+  retry:
+    uses: Systemorph/MeshWeaver/.github/workflows/node-repo-retry-transients.yml@main
+    permissions:
+      actions: write     # list the run's jobs, read their logs, POST the one rerun
+      checks: read       # check-runs/<job>/annotations — the ONLY record of a runner death
+      contents: read
+    with:
+      # Scripts-only lane: it fetches its decision script at `scripts-ref`, and `main` keeps that
+      # script one vintage with the `@main` lane that fetches it (scripts/check-shared-lanes.py).
+      scripts-ref: main
