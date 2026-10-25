@@ -12,6 +12,7 @@ The public deployment reference for [MeshWeaver](https://github.com/Systemorph/M
 | `.github/scripts/build-run.py` | the build host's runner (claims runs, executes stages in a `bwrap` sandbox) |
 | `.github/workflows/build-host.yml` | on every platform set the platform's CD hands over: the runner image, then the newest armed set handed to `build-latest` |
 | `.github/workflows/build-host-stable.yml` | once a day: the main-passed ceiling handed to `build-stable` |
+| `.github/workflows/build-host-deploy-test-switch.yml` | the target shape, **switched off** (`.github/deploy-test-switch.json`), chained off `build-host.yml` (below): deploy `build-<version>`, test ON it (one probe pinned to the version per planned run — per shard of core's suite (stage `test-shard-<k>`), the doc gate (`doc-gate`), each dependent's gate — the shard count and stages read AT THE CANDIDATE commit, never platform main; claimed = deployed, a pinned probe refused 409 = the deploy failed, every run ENDED succeeded = the test), switch `latest` on green naming every run under `runs`. A 503 from `/hosts` is an outage, retried, never an empty list — events, the hosts reader (`complete`, never `ready`) and the probe in `.github/scripts/deploy-test-switch.py` |
 | `test/MeshWeaver.Deploy.ChartGuards` | guards that hold the chart to the platform's code |
 
 Everything here is reference material: defaults, placeholders and example values. An installation's
@@ -53,6 +54,26 @@ platform commit is on the platform's `main` (compare API) and every version agai
 before it builds or signs anything, and the hand-over re-reads the newest armed set from the
 registry itself. A missed tick heals on the next one.
 
+**Deploy → test → switch is chained off this lane, inside this repository.**
+`build-host-deploy-test-switch.yml` runs `on: workflow_run` of `build-host.yml` (`types: [completed]`);
+it does not listen for `platform-set-sealed`, which nothing sends. Its `select` job starts a candidate
+only when every one of these holds:
+
+- the completed build-host run read a set (on `schedule` or a dispatch, never on a pull request or a push) and succeeded;
+- the candidate is the newest ARMED set, and its `mw-build-host:<version>` exists;
+- `GET /api/builds/hosts` does not list it, so it is not already `v/<version>` and not latest;
+- it is newer than latest;
+- no earlier automatic run attempted it.
+
+`apply` records each automatic attempt as the artifact `deploy-test-switch-attempt-<version>` before
+it sends anything. A candidate that failed is torn down and unlisted again, and that record keeps it
+from being redeployed on every tick. A person re-runs it by `workflow_dispatch`, or a newer armed set
+supersedes it. The candidate's core and MeshWeaver.Plugins commits come from the platform CD run's
+`promotion-record`, the run its staging tag names. The rules are in
+`.github/scripts/deploy-test-switch-trigger.py`, whose self-test includes the negative control: an
+already-deployed set does not start. With `enabled: false` the lane prints that it is off and starts
+nothing.
+
 ## Deployment material: what moved here, what is still in the platform
 
 The platform keeps BUILD + SEAL; deployment lives here (core slimming). The inventory, with what
@@ -71,6 +92,7 @@ deploy/aks/scripts/check-values-are-read.sh      # every key a values file sets 
 dotnet test test/MeshWeaver.Deploy.ChartGuards -p:MeshWeaverRoot=../MeshWeaver
 python3 .github/scripts/build-run.py --self-test                 # the build host's runner
 python3 .github/scripts/platform-set-dispatch.py --self-test     # the platform's hand-over contract
+python3 .github/scripts/deploy-test-switch-trigger.py --self-test # when deploy → test → switch starts, for which set
 deploy/build-host/stage-context.sh . ../MeshWeaver /tmp/ctx && docker build -f deploy/build-host/Dockerfile /tmp/ctx
 ```
 

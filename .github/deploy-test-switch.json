@@ -1,0 +1,8 @@
+{
+  "$comment": "Whether the platform sets reach the standing build hosts by DEPLOY → TEST THE DEPLOY → SWITCH LATEST (platform Doc/Architecture/DeployTestSwitchLatest; workflow build-host-deploy-test-switch.yml; deploy-test-switch.py). OFF until the owner provisions the lane's inputs (secrets.MW_PROBE_TOKEN, vars.MW_BUILD_API, the AZURE OIDC trio, the control inbox's hook secret and URL) and the receivers (MeshWeaver.Plugins #4221: BuildHostDeploy / BuildHostSwitch / BuildHostTeardown, pinned POST /probes, GET /api/builds/hosts) run on the control instance. While false the workflow sends nothing and build-latest follows the armed set through build-host.yml.",
+  "enabled": false,
+  "$shardStage": "The stage that selects ONE shard of core's suite, carrying `{shard}` (0-based, as dotnet-test.yml's matrix): core's .github/build-stages.json declares test-shard-0..N-1, generated from CI_SHARD_TOTAL. The plan submits one pinned run per shard, CI_SHARD_TOTAL of them, both READ AT THE CANDIDATE commit (never platform main); a stage the candidate does not declare is refused before anything is sent. null = the contract gap (no shard stage): the shards are NOT run on the candidate and every run warns so by name.",
+  "shardStage": "test-shard-{shard}",
+  "$docGateStage": "The stage of core's doc gate, run once on the candidate (core .github/build-stages.json `doc-gate`). null = not run, warned by name.",
+  "docGateStage": "doc-gate"
+}
