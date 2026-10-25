@@ -3,7 +3,7 @@
 
 The HOST half of the standing build hosts (MeshWeaver.Plugins `Hosting/StandingBuildHosts` §2 and
 §4.3; platform reference Doc/Architecture/BuildHosts). One warm Deployment per release channel
-(`build-latest`, `build-stable`, chart `deploy/helm/templates/build-host/`) runs this as its main
+(`build-latest`, `build-stable`, chart `deploy/helm/templates/build-host/` in Systemorph/MeshWeaver.Deploy) runs this as its main
 process:
 
     build-run.py --host          the loop: refresh the plugins layer → claim → run → repeat
@@ -1615,7 +1615,10 @@ class Host:
                 return outcome
             finally:
                 self.heartbeat = None
-                if outcome == "undelivered" and os.listdir(self.artifacts_dir or workdir):
+                # A run refused before any stage never created its artifacts directory: nothing was
+                # handed over, so there is no receipt to keep the workspace for.
+                if (outcome == "undelivered" and os.path.isdir(self.artifacts_dir)
+                        and os.listdir(self.artifacts_dir)):
                     # H9: the workspace goes only after every receipt was ACKNOWLEDGED. It is kept
                     # (and named) for the instance's re-queue, and swept once older than two deadlines.
                     self.log(f"{path}: receipts not acknowledged — keeping the workspace {workdir}")
@@ -1755,6 +1758,10 @@ class Host:
                      f"{_hms(self.clock() - started)}")
             return "ran"
         except Lost as e:
+            # The abandoned run's undelivered verdicts go with it: they belong to a claim this host no
+            # longer holds, so retrying them before the NEXT run's posts would only draw 409s again
+            # and abandon that run too — every later claim, until a restart.
+            self.held = []
             self.log(f"{path}: {e} — abandoning the run")
             return "lost"
 
@@ -2788,6 +2795,27 @@ def self_test() -> int:
         check("events/a lasting outage posts NO run-finished over a missing stage verdict",
               outcome == "undelivered" and "run-finished" not in sent_kinds,
               (outcome, sent_kinds))
+        # a run refused before any stage, with the API down, keeps the host alive: no artifacts
+        # directory was ever made, so the workspace cleanup must not list one
+        refused_down = host(_FakeApi({("POST", "/token"): [(404, None)], ("POST", "/MeshWeaver.Plugins/"): [(503, None)]}),
+                            env=env_s, checkout=empty_checkout)
+        try:
+            outcome = refused_down.run(claim)
+        except OSError as e:
+            outcome = f"raised {e!r}"
+        check("events/a refusal during an outage is undelivered, never a crash", outcome == "undelivered", outcome)
+        # a 409 while verdicts are held drops them: the next claim is not abandoned by the old run's 409s
+        lost_left = {"n": 0}
+
+        def held_then_lost(path, body):
+            if "stage-finished" in [e["kind"] for e in body["events"]]:
+                lost_left["n"] += 1
+                return (503, None) if lost_left["n"] <= 6 else (409, None)
+            return 202, None
+        hl = host(_FakeApi({("POST", "/token"): [(404, None)], ("POST", "/MeshWeaver.Plugins/"): held_then_lost}),
+                  env=env_s, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": "true"}]}))
+        check("events/a 409 over a held verdict abandons the run", hl.run(claim) == "lost")
+        check("events/a lost run leaves no held verdict for the next claim", hl.held == [], hl.held)
         # successful batches never consume the failure budget: 1,000 events drain through 5 batches
         big = EventSink(_FakeApi({("POST", "/r/"): [(202, None)]}), "h", "r", "a" * 40, "s", "latest", lambda m: None,
                         sleep=lambda x: None)

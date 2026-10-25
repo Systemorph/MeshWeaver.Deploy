@@ -10,7 +10,7 @@
 # here: it is the set's tester and portal images, copied in by the host's init containers by digest.
 #
 # Built and pushed by MeshWeaver.Deploy's `build-host.yml` (job `image`) as `mw-build-host:<version>`
-# for every platform set the platform's CD hands over (`repository_dispatch: platform-set-sealed`),
+# for every platform set the lane discovers in the platform registry (its 15-minute `schedule`),
 # and handed to the hosts BY DIGEST with the rest of the set (`BuildHostChannel.RunnerDigest`). No
 # moving tag names it anywhere. The runner (`build-run.py`) is this repository's; its helpers and
 # the plugin-build tool are the PLATFORM's, read at the set's own commit.
