@@ -207,6 +207,9 @@ spec:
             - { name: MW_BUILD_TESTER_DIGEST, value: {{ $c.testerDigest | quote }} }
             - { name: MW_BUILD_PORTAL_DIGEST, value: {{ $c.portalDigest | quote }} }
             - { name: MW_BUILD_RUNNER_DIGEST, value: {{ $c.runnerDigest | quote }} }
+            {{- if $c.coreTestsDigest }}
+            - { name: MW_BUILD_CORE_TESTS_DIGEST, value: {{ $c.coreTestsDigest | quote }} }
+            {{- end }}
             - { name: MW_BUILD_IDENTITY_FILE, value: "/portal/app/meshweaver-framework.identity" }
             - name: MW_BUILD_HOST
               valueFrom: { fieldRef: { fieldPath: metadata.name } }

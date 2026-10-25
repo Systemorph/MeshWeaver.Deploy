@@ -141,6 +141,10 @@ The refusals, and why each one exists:
 {{- fail (printf "buildHosts.versions[%s].%s %q must be a sha256:<64 hex> digest — a build server runs ONE immutable set" $ver $k $d) -}}
 {{- end -}}
 {{- end -}}
+{{- /* The optional fifth part of a set: the core-tests image, which the host presents on every claim when it is set. */ -}}
+{{- if and (hasKey $v "coreTestsDigest") $v.coreTestsDigest (not (regexMatch "^sha256:[0-9a-f]{64}$" (toString $v.coreTestsDigest))) -}}
+{{- fail (printf "buildHosts.versions[%s].coreTestsDigest %q must be a sha256:<64 hex> digest when it is set" $ver (toString $v.coreTestsDigest)) -}}
+{{- end -}}
 {{- range $a := ($v.aliases | default list) -}}
 {{- if not (has $a (list "latest" "candidate" "previous" "stable")) -}}
 {{- fail (printf "buildHosts.versions[%s] names alias %q — the aliases are latest, candidate, previous and stable" $ver $a) -}}
@@ -168,6 +172,7 @@ The refusals, and why each one exists:
       "tester" (printf "%s@%s" $testerRepo $v.testerDigest) "portal" (printf "%s@%s" $portalRepo $v.portalDigest)
       "runner" (printf "%s@%s" $runnerRepo $v.runnerDigest)
       "testerDigest" $v.testerDigest "portalDigest" $v.portalDigest "runnerDigest" $v.runnerDigest
+      "coreTestsDigest" ($v.coreTestsDigest | default "")
       "resource" $dns "queueQuery" (printf "version=%s" $ver) "kind" "version" "version" $ver "aliases" ($v.aliases | default list)) -}}
 {{- end -}}
 {{- if not $channels -}}

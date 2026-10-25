@@ -259,6 +259,10 @@ for v, alias, mx in want:
     env = {e["name"]: e.get("value") for e in build.get("env", [])}
     if env.get("MW_BUILD_VERSION") != v or "MW_BUILD_CHANNEL" in env or env.get("MW_BUILD_PLATFORM_VERSION") != v:
         problems.append(f"{v}: the runner does not claim by version: {[k for k in env if k.startswith('MW_BUILD_')]}")
+    # The core-tests image reaches the runner exactly when the version's set names one (it is proved on every claim).
+    want_tests = "sha256:" + "d" * 64 if v == "3.1.10600" and "3.1.10400" in sys.argv[2] else None
+    if env.get("MW_BUILD_CORE_TESTS_DIGEST") != want_tests:
+        problems.append(f"{v}: MW_BUILD_CORE_TESTS_DIGEST is {env.get('MW_BUILD_CORE_TESTS_DIGEST')!r}, want {want_tests!r}")
     pod_labels = dep["spec"]["template"]["metadata"]["labels"]
     if any(k.startswith("meshweaver.io/build-alias-") for k in pod_labels):
         problems.append(f"{v}: an alias label is in the POD template — a switch would roll the pods: {pod_labels}")
@@ -329,6 +333,7 @@ for entry in \
   "values.build-hosts-version-twice.yaml|one deployment per version" \
   "values.build-hosts-bad-version.yaml|must be MAJOR.MINOR.PATCH" \
   "values.build-hosts-version-too-long.yaml|allows at most 48" \
+  "values.build-hosts-bad-core-tests.yaml|coreTestsDigest \"latest\" must be a sha256" \
   "values.build-hosts-versions-old-runner.yaml|versionedRunner is not true" \
   "values.build-hosts-trailing-dash.yaml|ending in a letter or digit" \
   "values.build-hosts-zero-replicas.yaml|maxReplicas must be at least 1" \

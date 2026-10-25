@@ -25,5 +25,6 @@ buildHosts:
       testerDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
       portalDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
       runnerDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      coreTestsDigest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
       maxReplicas: 4
       aliases: ["candidate"]
