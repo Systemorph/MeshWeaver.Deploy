@@ -1338,8 +1338,12 @@ class Host:
         self.work = env.get("MW_BUILD_WORK", "/work")
         # NEVER the cache root: what a stage may read of the shared cache is bound per stage
         # (stage_readonly) — its own repository's mirror and the dependency artifacts it declares.
+        # The staged image roots are bound read-only, `--ro-bind-try` (absent on a set that names no
+        # such image): /core-tests is where a set's mw-core-tests image is staged, and core's shard and
+        # doc-gate stages run `python3 /core-tests/core-tests.py …` from it.
         self.sandbox = sandbox or Sandbox(env.get("BWRAP", "bwrap"), [
-            p for p in (env.get("MW_BUILD_GATE_HOST"), env.get("MeshWeaverRefs"), "/portal", "/tester", "/tools") if p])
+            p for p in (env.get("MW_BUILD_GATE_HOST"), env.get("MeshWeaverRefs"),
+                        "/portal", "/tester", "/tools", "/core-tests") if p])
         self.leftovers = leftovers or pid_namespace_leftovers
         self.registry_get = registry_get or _registry_get
         self.store_runner = store_runner or _run_capture_stdout
@@ -2263,6 +2267,12 @@ def self_test() -> int:
     check("bwrap/env only via --setenv", av.count("--setenv") == 2 and av.index("--clearenv") < av.index("--setenv"), av)
     check("bwrap/command last", av[-4:] == ["--", "/bin/bash", "-c", "make test"], av[-4:])
     check("bwrap/no network namespace (builds fetch packages)", "--unshare-net" not in av and "--unshare-all" not in av)
+    # The host's OWN sandbox binds every staged image root read-only — /core-tests included: core's
+    # shard and doc-gate stages run `python3 /core-tests/core-tests.py …` (core .github/build-stages.json).
+    hav = " ".join(Host({}, None, log=lambda s: None).sandbox.argv("true", "/w/s", "/w/o", {}))
+    for root in ("/portal", "/tester", "/tools", "/core-tests"):
+        check(f"bwrap/the staged image root {root} is visible READ-ONLY in a stage",
+              f"--ro-bind-try {root} {root}" in hav and f"--bind {root} " not in hav, hav)
     se = sandbox_env({"PATH": "/bin", "BUILD_TOKEN_FILE": "/run/build-worker/token", "AZURE_CLIENT_SECRET": "s",
                       "BUILD_API": "https://x", "KUBERNETES_SERVICE_HOST": "10.0.0.1", "MeshWeaverRefs": "/portal/app"},
                      {"MW_BUILD_PUBLISH": "false"}, "/cache")

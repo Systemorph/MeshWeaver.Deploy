@@ -112,6 +112,15 @@ from pathlib import Path
 
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 VERSION = re.compile(r"^\d+\.\d+\.\d+$")
+# What the RECEIVER lists (core `BuildHostSetKeys.IsVersion`): MAJOR.MINOR.PATCH with an optional
+# prerelease of [0-9A-Za-z.-] ending in a letter or digit, at most 48 characters. The hosts reader
+# validates rows and aliases against THIS contract — a retained prerelease is a valid listing and
+# must not block the candidate's read-back; what this lane SENDS stays the stricter VERSION.
+HOST_VERSION = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]*[0-9A-Za-z])?$")
+
+
+def host_version(v: str) -> bool:
+    return len(v) <= 48 and HOST_VERSION.fullmatch(v) is not None
 RUN = re.compile(r"^Hosting/Builds/[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 PACKAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DEPLOYMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -255,11 +264,11 @@ def read_hosts(doc: object, version: str) -> dict:
         raise Refusal("the hosts answer carries no `aliases` object and `versions` list")
     out = {a: str(aliases.get(a) or "") for a in ALIASES}
     for a in ALIASES:
-        if out[a] and not VERSION.fullmatch(out[a]):
+        if out[a] and not host_version(out[a]):
             raise Refusal(f"alias {a} names {out[a]!r}, which is not a version")
     entry = None
     for v in versions:
-        if not isinstance(v, dict) or not VERSION.fullmatch(str(v.get("version") or "")):
+        if not isinstance(v, dict) or not host_version(str(v.get("version") or "")):
             raise Refusal(f"a versions entry is malformed: {v!r}")
         if v["version"] == version:
             if entry is not None:
@@ -864,6 +873,16 @@ def self_test() -> int:
     check("complete and scaled to zero (`ready: false` beside it) IS complete",
           lambda: read_hosts({"aliases": {}, "versions": [row("3.1.1", True, ready=False)]}, "3.1.1"),
           lambda o: o["complete"] == "true")
+    # The RECEIVER's version contract (core BuildHostSetKeys.IsVersion) admits a prerelease, so a
+    # retained prerelease row or alias is a valid listing — it must not block reading the candidate.
+    mixed = {"aliases": {"latest": "3.1.10400", "candidate": "3.1.10412", "previous": "3.0.0-ci.9898"},
+             "versions": [row("3.0.0-ci.9898", True), row("3.1.1-alpha.1", True), row("3.1.10400", True), row("3.1.10412", True)]}
+    check("a mixed listing (retained prereleases) still reads the candidate",
+          lambda: read_hosts(mixed, "3.1.10412"),
+          lambda o: o["listed"] == "true" and o["complete"] == "true" and o["previous"] == "3.0.0-ci.9898")
+    for bad in ("3.1.1-", "3.1.1-alpha.", "3.1.1-bad_char", "3.1", "3.1.1-" + "a" * 48):
+        check(f"the reader refuses a row the receiver's contract refuses ({bad!r})",
+              lambda bad=bad: read_hosts({"aliases": {}, "versions": [row(bad, True)]}, "3.1.1"), refused=True)
     for name, doc in [("a list", []), ("no versions", {"aliases": {}}), ("a malformed entry", {"aliases": {}, "versions": [{"v": 1}]}),
                       ("a twice-listed version", {"aliases": {}, "versions": [{"version": "3.1.1", "deploymentName": "a"}] * 2}),
                       ("an entry with no deployment name", {"aliases": {}, "versions": [{"version": "3.1.1"}]}),

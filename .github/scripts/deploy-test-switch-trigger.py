@@ -215,6 +215,8 @@ def _self_test() -> int:
           sel(), lambda o: starts(o) and o["version"] == V and o["core7"] == "aaaaaaa" and o["run_id"] == "901")
     check("a dispatched build-host run starts it too", sel(upstream_event="workflow_dispatch"), starts)
     check("nothing deployed at all yet (no latest): starts", sel(hosts=hosts(latest="", rows=())), starts)
+    check("a retained prerelease (legacy latest) does not block the selection",
+          sel(hosts=hosts(latest="3.0.0-ci.9898", rows=("3.0.0-ci.9898", "3.1.1-alpha.1"))), starts)
     # ── 🚨 THE NEGATIVE CONTROL: a set that is already deployed does NOT start the deploy ──
     check("NEGATIVE CONTROL: the set already latest is never re-deployed",
           sel(hosts=hosts(latest=V, rows=(V, OLD), previous=OLD)), stays("already latest"))
