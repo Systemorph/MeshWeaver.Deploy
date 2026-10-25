@@ -23,7 +23,16 @@ build-host run starts P4 for a set only when ALL of these hold (`select`, below)
      artifact `deploy-test-switch-attempt-<version>` before it sends anything. A candidate that
      failed and was torn down is unlisted again — without this record every 15-minute tick would
      deploy and tear it down once more. A person re-runs a set by `workflow_dispatch`; a newer
-     armed set supersedes it.
+     armed set supersedes it. 🚨 Only a marker THIS lane wrote counts: its run must be this
+     workflow's own `workflow_run` execution on the default branch, in this repository. A marker
+     from a pull request (a fork can upload any artifact name), a push or another workflow is
+     ignored — otherwise anyone could hold a set back from automatic deployment for 90 days.
+
+The selection runs TWICE: once in `select`, and again inside `apply` AFTER it has acquired the
+`apply` concurrency group (`--exclude-run` = its own run). Two build-host completions can select
+the same set before either records its attempt; the second waits for the group while the first
+deploys, fails and tears down — so a run that waited re-reads hosts, the newest armed set and
+the attempts, and stands down unless it would still start the SAME set.
 
 Then (`record`) the candidate's commits come from the platform CD run that built it — its
 `promotion-record` artifact, the run named by the set's `staging-<core7>-<run id>` tag: the full
@@ -34,7 +43,8 @@ RED, never a guess.
     deploy-test-switch-trigger.py armed --portal p.json
         → version=<newest armed set>   (exit 1 when nothing was ever armed)
     deploy-test-switch-trigger.py select --upstream-event E --upstream-conclusion C --portal p.json \\
-        --runner r.json (--hosts h.json | --api https://…/api/builds [--window S]) --attempts a.json
+        --runner r.json (--hosts h.json | --api https://…/api/builds [--window S]) --attempts a.json \\
+        --attempt-runs runs.json --default-branch main [--exclude-run ID]
         → start=true|false, version=, core7=, run_id=, why=
     deploy-test-switch-trigger.py record --record promotion-record.json --version V --core7 c
         → core_sha=, plugins_sha=
@@ -56,6 +66,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 READ_EVENTS = ("schedule", "workflow_dispatch", "repository_dispatch")
 ATTEMPT_PREFIX = "deploy-test-switch-attempt-"
+# The ONE workflow whose automatic runs write attempt markers (`apply`, on `workflow_run`).
+WORKFLOW = ".github/workflows/build-host-deploy-test-switch.yml"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 CORE7 = re.compile(r"^[0-9a-f]{7}$")
 
@@ -87,18 +99,43 @@ def armed(portal: object) -> dict:
     return got
 
 
-def attempted(listing: object, version: str) -> str:
+def _trusted(run: dict, default_branch: str) -> bool:
+    """Whether `run` (GET /repos/{repo}/actions/runs/{id}) is THIS lane's own automatic execution:
+    this workflow file, on `workflow_run`, on the default branch, from this repository (not a fork)."""
+    path = str(run.get("path") or "").split("@", 1)[0]
+    repo, head = run.get("repository"), run.get("head_repository")
+    same_repo = isinstance(repo, dict) and isinstance(head, dict) and repo.get("id") is not None \
+        and repo.get("id") == head.get("id")
+    return path == WORKFLOW and run.get("event") == "workflow_run" \
+        and run.get("head_branch") == default_branch and same_repo
+
+
+def attempted(listing: object, version: str, runs: object, default_branch: str, exclude_run: str = "") -> str:
     """The run that already attempted `version` automatically, or "" when none did. `listing` is
-    GET /repos/{repo}/actions/artifacts?name=<ATTEMPT_PREFIX><version>. An answer that is not that
-    listing is a Refusal — an unreadable record of attempts must never read as "never attempted"."""
+    GET /repos/{repo}/actions/artifacts?name=<ATTEMPT_PREFIX><version>; `runs` is the list of
+    GET /repos/{repo}/actions/runs/{id} answers for the runs those artifacts name. A marker counts
+    only when its run is this lane's own automatic run (`_trusted`) — any other run can upload an
+    artifact of that name. An answer that cannot be read is a Refusal — an unreadable record of
+    attempts must never read as "never attempted"."""
     if not isinstance(listing, dict) or not isinstance(listing.get("artifacts"), list) \
             or type(listing.get("total_count")) is not int:
         raise Refusal("the artifacts listing is not {total_count, artifacts[]} — cannot say whether the set was attempted")
+    if not isinstance(runs, list) or not all(isinstance(r, dict) for r in runs):
+        raise Refusal("the attempt runs are not a list of workflow-run objects — cannot say which markers this lane wrote")
+    by_id = {str(r.get("id")): r for r in runs}
     want = ATTEMPT_PREFIX + version
     for a in listing["artifacts"]:
-        if isinstance(a, dict) and a.get("name") == want:
-            run = (a.get("workflow_run") or {}).get("id") if isinstance(a.get("workflow_run"), dict) else None
-            return str(run or "an earlier run")
+        if not (isinstance(a, dict) and a.get("name") == want):
+            continue
+        wr = a.get("workflow_run")
+        run_id = str(wr.get("id") or "") if isinstance(wr, dict) else ""
+        if run_id and run_id == str(exclude_run or ""):
+            continue  # the run asking — it re-checks before it records its own attempt
+        run = by_id.get(run_id) if run_id else None
+        if run is None:
+            raise Refusal(f"the marker {want} names run {run_id or '?'}, which was not read — cannot say whether this lane wrote it")
+        if _trusted(run, default_branch):
+            return run_id
     if listing["total_count"] and not listing["artifacts"]:
         raise Refusal(f"the artifacts listing counts {listing['total_count']} but lists none — cannot say whether the set was attempted")
     return ""
@@ -112,7 +149,7 @@ def _ordinal(version: str) -> int:
 
 
 def select(*, upstream_event: str, upstream_conclusion: str, portal: object, runner: object,
-           hosts: object, attempts: object) -> dict:
+           hosts: object, attempts: object, runs: object, default_branch: str, exclude_run: str = "") -> dict:
     """Whether a completed build-host run starts deploy → test → switch, and for which set. Every
     "no" says why; an input that cannot be read is a Refusal, never a "no"."""
     def no(why: str, cand: dict | None = None) -> dict:
@@ -145,7 +182,7 @@ def select(*, upstream_event: str, upstream_conclusion: str, portal: object, run
         return no(f"{v} is already deployed as v/{v}" + (f" (alias {', '.join(named)})" if named else ""), cand)
     if h["latest"] and _ordinal(v) <= _ordinal(h["latest"]):
         return no(f"{v} is not newer than latest {h['latest']} — never backwards", cand)
-    by = attempted(attempts, v)
+    by = attempted(attempts, v, runs, default_branch, exclude_run)
     if by:
         return no(f"{v} was already attempted automatically (run {by}) and is not deployed now — it is not retried "
                   "on its own; re-run it by workflow_dispatch, or a newer armed set supersedes it", cand)
@@ -202,7 +239,14 @@ def _self_test() -> int:
 
     none = {"total_count": 0, "artifacts": []}
     ok = dict(upstream_event="schedule", upstream_conclusion="success", portal=portal, runner=runner,
-              hosts=hosts(), attempts=none)
+              hosts=hosts(), attempts=none, runs=[], default_branch="main")
+
+    def run(rid, *, path=WORKFLOW, event="workflow_run", branch="main", head_repo=1):
+        return {"id": rid, "path": path, "event": event, "head_branch": branch,
+                "repository": {"id": 1}, "head_repository": {"id": head_repo}}
+
+    def marker(rid, version=V):
+        return {"total_count": 1, "artifacts": [{"name": ATTEMPT_PREFIX + version, "workflow_run": {"id": rid}}]}
 
     def sel(**kw):
         return lambda: select(**{**ok, **kw})
@@ -227,10 +271,31 @@ def _self_test() -> int:
     check("a set older than latest never starts (never backwards)",
           sel(hosts=hosts(latest="3.1.10500", rows=("3.1.10500",))), stays("never backwards"))
     check("a set already attempted automatically (failed, torn down, unlisted again) is NOT retried",
-          sel(attempts={"total_count": 1, "artifacts": [{"name": ATTEMPT_PREFIX + V, "workflow_run": {"id": 77}}]}),
-          stays("run 77"))
+          sel(attempts=marker(77), runs=[run(77)]), stays("run 77"))
     check("another set's attempt record does not hold this one",
           sel(attempts={"total_count": 1, "artifacts": [{"name": ATTEMPT_PREFIX + OLD}]}), starts)
+    # ── 🚨 only THIS lane's own automatic runs write a marker that counts ──
+    check("a FORK pull request's marker of that name does NOT hold the set back",
+          sel(attempts=marker(78), runs=[run(78, event="pull_request", branch="feat", head_repo=2)]), starts)
+    check("a same-repository pull request's marker does not hold it either",
+          sel(attempts=marker(79), runs=[run(79, event="pull_request", branch="feat")]), starts)
+    check("another workflow's marker of that name does not hold it",
+          sel(attempts=marker(80), runs=[run(80, path=".github/workflows/other.yml")]), starts)
+    check("a marker from this workflow on another branch does not hold it",
+          sel(attempts=marker(81), runs=[run(81, branch="feat")]), starts)
+    check("a forged marker beside the real one: the real one still holds the set",
+          sel(attempts={"total_count": 2, "artifacts": [{"name": ATTEMPT_PREFIX + V, "workflow_run": {"id": 78}},
+                                                         {"name": ATTEMPT_PREFIX + V, "workflow_run": {"id": 77}}]},
+              runs=[run(78, event="pull_request", head_repo=2), run(77)]), stays("run 77"))
+    check("refuses a marker whose run was not read (cannot say who wrote it)",
+          sel(attempts=marker(77), runs=[]), refused=True)
+    check("refuses attempt runs that are not a list", sel(runs={}), refused=True)
+    # ── the re-check inside `apply` (after the concurrency group): its OWN run is not an attempt,
+    #    but an attempt another run made while it waited holds it ──
+    check("the re-check does not count the asking run's own marker",
+          sel(attempts=marker(90), runs=[], exclude_run="90"), starts)
+    check("NEGATIVE CONTROL (the race): the run that waited sees the attempt the first run recorded, and stands down",
+          sel(attempts=marker(77), runs=[run(77)], exclude_run="90"), stays("run 77"))
     check("a pull-request build-host run never starts it", sel(upstream_event="pull_request"), stays("reads no set"))
     check("a push build-host run never starts it", sel(upstream_event="push"), stays("reads no set"))
     check("a failed build-host run never starts it", sel(upstream_conclusion="failure"), stays("`failure`"))
@@ -268,6 +333,22 @@ def _self_test() -> int:
           lambda: (name and name.group(1), trig and trig.group(1)), lambda t: t[0] and t[0] == t[1])
     check("P4 no longer waits on the platform-set-sealed dispatch nobody sends",
           lambda: me, lambda t: "repository_dispatch" not in t.split("\njobs:")[0])
+    check("this module's WORKFLOW is the lane's real file", lambda: (HERE.parents[1] / WORKFLOW).is_file(), bool)
+
+    def _apply_rechecks(t: str) -> bool:
+        if "\n  apply:\n" not in t:
+            return False
+        a = t.split("\n  apply:\n", 1)[1].split("\n  report:\n", 1)[0]
+        group = a.find("group: build-host-deploy-test-switch-apply")
+        again = a.find("deploy-test-switch-select.sh")
+        rec = a.find("- name: Record this automatic attempt")
+        return -1 < group < again < rec and "EXCLUDE_RUN: ${{ github.run_id }}" in a[:rec] \
+            and "actions: read" in a[:again] and "steps.what.outputs.action != 'none'" in a[rec:rec + 400]
+    check("apply re-selects UNDER its concurrency group, excluding its own run, before it records an attempt",
+          lambda: me, _apply_rechecks)
+    sh = (HERE / "deploy-test-switch-select.sh").read_text()
+    check("select and apply share ONE selection script, which reads every marker's run",
+          lambda: sh, lambda t: "actions/runs/" in t and "--attempt-runs" in t and "--default-branch" in t)
 
     # ── the CLI, end to end through files and a FAKE curl for GET /hosts ──
     me_py = str(Path(__file__).resolve())
@@ -280,12 +361,17 @@ def _self_test() -> int:
             return subprocess.run([sys.executable, me_py, *args], capture_output=True, text=True, env=env)
 
         base = ["select", "--upstream-event", "schedule", "--upstream-conclusion", "success",
-                "--portal", f("p.json", portal), "--runner", f("r.json", runner), "--attempts", f("a.json", none)]
+                "--portal", f("p.json", portal), "--runner", f("r.json", runner), "--attempts", f("a.json", none),
+                "--attempt-runs", f("runs.json", []), "--default-branch", "main"]
         r = cli(*base, "--hosts", f("h.json", hosts()))
         check("CLI select: start=true and the set on stdout", lambda: r,
               lambda r: r.returncode == 0 and {"start=true", f"version={V}", "core7=aaaaaaa", "run_id=901"} <= set(r.stdout.splitlines()))
         r = cli(*base, "--hosts", f("h2.json", hosts(latest=V, rows=(V,))))
         check("CLI select NEGATIVE CONTROL: the deployed set → exit 0, start=false", lambda: r,
+              lambda r: r.returncode == 0 and "start=false" in r.stdout.splitlines())
+        r = cli(*base[:-6], "--attempts", f("a2.json", marker(77)), "--attempt-runs", f("runs2.json", [run(77)]),
+                "--default-branch", "main", "--exclude-run", "90", "--hosts", f("h5.json", hosts()))
+        check("CLI select --exclude-run: another run's recorded attempt → start=false", lambda: r,
               lambda r: r.returncode == 0 and "start=false" in r.stdout.splitlines())
         r = cli(*base, "--hosts", f("h3.json", {"nope": 1}))
         check("CLI select: an unreadable hosts answer → exit 1, nothing on stdout", lambda: r,
@@ -320,7 +406,8 @@ def _self_test() -> int:
     print(f"deploy-test-switch-trigger self-test: {total} cases passed (a successful set-reading build-host run "
           "starts the deploy for the NEWEST ARMED set with its runner; NEGATIVE CONTROL: an already-deployed or "
           "already-latest set does not start; nor a PR/push/failed upstream, an older set, a set without its runner, "
-          "or one already attempted; unreadable inputs are red; the record must match the set; the trigger names "
+          "or one already attempted by THIS lane (a fork's or another workflow's marker does not count; the "
+          "re-check under the apply group sees an attempt made while it waited); unreadable inputs are red; the record must match the set; the trigger names "
           "build-host's real name)")
     return 0
 
@@ -338,6 +425,9 @@ def main(argv: list[str]) -> int:
     s.add_argument("--portal", type=Path, required=True)
     s.add_argument("--runner", type=Path, required=True)
     s.add_argument("--attempts", type=Path, required=True)
+    s.add_argument("--attempt-runs", type=Path, required=True)
+    s.add_argument("--default-branch", required=True)
+    s.add_argument("--exclude-run", default="")
     g = s.add_mutually_exclusive_group(required=True)
     g.add_argument("--hosts", type=Path)
     g.add_argument("--api")
@@ -358,7 +448,9 @@ def main(argv: list[str]) -> int:
                 hosts = dts.get_hosts(dts._api(a.api), time.monotonic() + a.window, a.poll)
             out = select(upstream_event=a.upstream_event, upstream_conclusion=a.upstream_conclusion,
                          portal=json.loads(a.portal.read_text()), runner=json.loads(a.runner.read_text()),
-                         hosts=hosts, attempts=json.loads(a.attempts.read_text()))
+                         hosts=hosts, attempts=json.loads(a.attempts.read_text()),
+                         runs=json.loads(a.attempt_runs.read_text()), default_branch=a.default_branch,
+                         exclude_run=a.exclude_run)
         else:
             out = record(json.loads(a.record.read_text()), a.version, a.core7)
     except (Refusal, dts.Refusal, psd.Refusal, ValueError, OSError) as e:
