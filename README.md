@@ -20,9 +20,24 @@ own values live in its operator's private deployments repository, never here.
 ## How a platform set reaches this repository
 
 The platform's CD (`Systemorph/MeshWeaver` `main-cd.yml`) BUILDS and SEALS the product image set
-(portal, migration, plugin-test, control) and nothing else. At the end of every CD run it hands the
-result over with ONE `repository_dispatch` of type `platform-set-sealed`, sent with the org's
-dispatch App (Contents: write on this repository — only a holder of that grant can send one):
+(portal, migration, plugin-test, control) and nothing else — and it dispatches to NO repository.
+The platform knows nothing about what consumes its sets (its policy
+`dependents-verify-on-their-side`, held by its guard
+`PlatformReleaseNotifyGuard.CoreDispatchesToNoRepository`), so this repository PULLS.
+
+Every 15 minutes `build-host.yml` (`schedule`) reads the platform's sealed sets from the registry
+they were sealed into: a set is PROMOTED when `mw-plugin-test` carries its version tag and ARMED
+when `memex-portal-ai` does, and both tags sit on the manifest whose `staging-<core7>-<run id>` tag
+names the platform commit and the CD run (`platform-set-dispatch.py discover`). The newest ARMED,
+then the newest PROMOTED, set that still has no `mw-build-host:<version>` becomes the hand-over; when
+every runner is there, the tick builds nothing and re-sends the newest armed set to `build-latest`
+(idempotent at the receiver). A set therefore reaches `build-latest` within one tick of being armed,
+and nothing in the platform's delivery waits on it.
+
+Two events carry the same hand-over explicitly, read through the same contract (schema 1): a
+`workflow_dispatch` (a person re-running one) and a `repository_dispatch` of type
+`platform-set-sealed` — the shape an event-based emitter (memex, which fans the platform's events
+out; never the platform's CD) sends:
 
 ```json
 { "schema": 1,
@@ -31,12 +46,12 @@ dispatch App (Contents: write on this repository — only a holder of that grant
   "armed": { "armed": true, "version": "<x.y.z>", "coreSha": "<40 hex>", "pluginsSha": "<40 hex>" } }
 ```
 
-`set` is the set that run published (both fields empty when it published none), `armed` is what
-its `arm` job decided. Nothing in it is trusted by shape: `.github/scripts/platform-set-dispatch.py`
-validates every field, `build-host.yml` checks every platform commit is on the platform's `main`
-(compare API) and every version against the registry before it builds or signs anything, and the
-hand-over re-reads the newest armed set from the registry itself — the payload only tells it which
-commits that set was built from. A missed dispatch heals on the next one: every CD run sends one.
+`set` is the set whose runner to build (both fields empty for none), `armed` what an arming decided
+(a discovered hand-over names none). Nothing in it is trusted by shape:
+`.github/scripts/platform-set-dispatch.py` validates every field, `build-host.yml` checks every
+platform commit is on the platform's `main` (compare API) and every version against the registry
+before it builds or signs anything, and the hand-over re-reads the newest armed set from the
+registry itself. A missed tick heals on the next one.
 
 ## Deployment material: what moved here, what is still in the platform
 
