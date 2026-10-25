@@ -1,9 +1,14 @@
-# Arm auto-merge on every non-draft PR, so a PR that goes green LANDS.
+# The auto-merge lane: on a push it DISARMS (a push invalidates the review), and it ARMS exactly
+# one kind of pull request — a generated-only one by the `meshweaver-cloud` App, which owes no
+# review. Arming an ordinary pull request is NOT done here: that is the control instance's decision
+# (its PR steward, App `systemorph-com`), taken once the current head is reviewed, every finding is
+# answered and the required checks are green. Provisioning the secrets below gives this repository
+# the disarm and the generated-only arm, nothing more. The lane's own header carries the contract.
 #
 # 🚨 THIS FILE IS A CALLER — THE LANE ITSELF LIVES ONCE, IN Systemorph/MeshWeaver.
-# Do not paste its body back in here. Everything the arm does — the App-token mint, the
-# draft/fork exemption, the two-shape `gh pr merge` (merge queue vs none), the read-back —
-# is in `.github/workflows/auto-arm.yml` over there, following main below.
+# Do not paste its body back in here. Everything it does — the App-token mint, the disarm on
+# `synchronize`, the generated-only arm and its provenance predicate, the read-back — is in
+# `.github/workflows/auto-arm.yml` over there, following main below.
 #
 # WHY IT IS A CALLER. This file used to be a hand-copy of that lane, in all seven repos of the
 # fleet, under a header asserting the copies were identical. Measured 2026-09-02, they were not,
@@ -26,7 +31,7 @@
 # 🚨 The two secrets are forwarded EXPLICITLY, never `secrets: inherit` — inherit would hand the
 # platform's lane every secret this repository owns. They are named exactly as the lane declares
 # them; the lane's preflight step fails RED naming what to provision if either is empty, so a
-# missing secret is a visible red here, not a silently unarmed pull request.
+# missing secret is a visible red here, not a silently skipped disarm.
 name: Arm auto-merge
 
 on:
