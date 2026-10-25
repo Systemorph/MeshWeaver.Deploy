@@ -23,8 +23,11 @@ for repo in memex-portal-ai mw-build-host; do
 done
 python3 "$t" armed --portal "$d/memex-portal-ai.json" > "$d/armed"
 v=$(sed -n 's/^version=//p' "$d/armed")
-# The record of automatic attempts: one exact-name artifact per set.
-gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=deploy-test-switch-attempt-$v&per_page=100" > "$d/attempts.json"
+# The record of automatic attempts: every artifact of that exact name, ALL pages merged. Anyone can
+# upload a marker of that name, so a trusted one may sit on any page; the trigger refuses a listing
+# that lists fewer than it counts.
+gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/artifacts?name=deploy-test-switch-attempt-$v&per_page=100" \
+  | jq '{total_count: (map(.total_count) | max // 0), artifacts: (map(.artifacts // []) | add // [])}' > "$d/attempts.json"
 # Every run a marker names — who wrote it decides whether it counts. A run that cannot be read
 # fails this script (set -e): an unreadable marker must never read as "never attempted".
 : > "$d/runs.ndjson"

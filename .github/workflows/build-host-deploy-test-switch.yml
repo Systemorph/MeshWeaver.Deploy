@@ -174,10 +174,14 @@ jobs:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          FLEET_READER_APP_ID: ${{ secrets.FLEET_READER_APP_ID }}
+          FLEET_READER_APP_PRIVATE_KEY: ${{ secrets.FLEET_READER_APP_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           missing=()
           [ -n "$MW_BUILD_API" ]          || missing+=("vars.MW_BUILD_API — the operations instance's build API base (https://<control>/api/builds), whose GET /hosts says what is deployed")
+          [ -n "$FLEET_READER_APP_ID" ]          || missing+=("secrets.FLEET_READER_APP_ID — the read-only fleet-reader App (needs Actions: read on MeshWeaver: the candidate's promotion-record artifact)")
+          [ -n "$FLEET_READER_APP_PRIVATE_KEY" ] || missing+=("secrets.FLEET_READER_APP_PRIVATE_KEY")
           [ -n "$AZURE_CLIENT_ID" ]       || missing+=("secrets.AZURE_CLIENT_ID — the OIDC identity that reads the platform registry")
           [ -n "$AZURE_TENANT_ID" ]       || missing+=("secrets.AZURE_TENANT_ID — that identity's tenant")
           [ -n "$AZURE_SUBSCRIPTION_ID" ] || missing+=("secrets.AZURE_SUBSCRIPTION_ID — the subscription that holds the platform registry")
@@ -210,13 +214,27 @@ jobs:
           bash deploy/.github/scripts/deploy-test-switch-select.sh > "$RUNNER_TEMP/sel"
           tee -a "$GITHUB_OUTPUT" < "$RUNNER_TEMP/sel"
           echo "- build-host run $UPSTREAM: $(sed -n 's/^why=//p' "$RUNNER_TEMP/sel")" >> "$GITHUB_STEP_SUMMARY"
+      # 🚨 The promotion record is an artifact of ANOTHER repository: github.token is scoped to this one
+      # and cannot download it (cross-repository artifact downloads need Actions: read on the source).
+      # The fleet-reader App's token, as build-host-stable.yml mints it; a request it cannot satisfy fails HERE.
+      - name: A read token for MeshWeaver's CD runs (fleet-reader App)
+        id: reader
+        if: steps.select.outputs.start == 'true'
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.FLEET_READER_APP_ID }}
+          private-key: ${{ secrets.FLEET_READER_APP_PRIVATE_KEY }}
+          owner: Systemorph
+          repositories: MeshWeaver
+          permission-actions: read
+          permission-contents: read
       # The candidate's commits, from the platform CD run that built the set (named by its staging
       # tag): its promotion record. A record that does not match the set is red, never a guess.
       - name: "The candidate's commits: the platform run's promotion record"
         id: record
         if: steps.select.outputs.start == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.reader.outputs.token }}
           V: ${{ steps.select.outputs.version }}
           CORE7: ${{ steps.select.outputs.core7 }}
           RUN_ID: ${{ steps.select.outputs.run_id }}

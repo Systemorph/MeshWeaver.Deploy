@@ -122,6 +122,10 @@ def attempted(listing: object, version: str, runs: object, default_branch: str, 
         raise Refusal("the artifacts listing is not {total_count, artifacts[]} — cannot say whether the set was attempted")
     if not isinstance(runs, list) or not all(isinstance(r, dict) for r in runs):
         raise Refusal("the attempt runs are not a list of workflow-run objects — cannot say which markers this lane wrote")
+    if len(listing["artifacts"]) < listing["total_count"]:
+        # A truncated listing (one page of several) can hide the ONE trusted marker behind forged ones.
+        raise Refusal(f"the artifacts listing counts {listing['total_count']} but lists {len(listing['artifacts'])} "
+                      "— a truncated listing cannot say whether the set was attempted")
     by_id = {str(r.get("id")): r for r in runs}
     want = ATTEMPT_PREFIX + version
     for a in listing["artifacts"]:
@@ -136,8 +140,6 @@ def attempted(listing: object, version: str, runs: object, default_branch: str, 
             raise Refusal(f"the marker {want} names run {run_id or '?'}, which was not read — cannot say whether this lane wrote it")
         if _trusted(run, default_branch):
             return run_id
-    if listing["total_count"] and not listing["artifacts"]:
-        raise Refusal(f"the artifacts listing counts {listing['total_count']} but lists none — cannot say whether the set was attempted")
     return ""
 
 
@@ -313,6 +315,13 @@ def _self_test() -> int:
     check("refuses an unreadable attempts listing", sel(attempts={"artifacts": "?"}), refused=True)
     check("refuses an attempts listing that counts what it does not list",
           sel(attempts={"total_count": 2, "artifacts": []}), refused=True)
+    forged = [{"name": ATTEMPT_PREFIX + V, "workflow_run": {"id": 1000 + i}} for i in range(100)]
+    check("NEGATIVE CONTROL (pagination): one page of 100 forged markers out of 101 is refused, never 'not attempted'",
+          sel(attempts={"total_count": 101, "artifacts": forged},
+              runs=[run(1000 + i, event="pull_request", head_repo=2) for i in range(100)]), refused=True)
+    check("every page merged: the trusted marker behind 100 forged ones still holds the set",
+          sel(attempts={"total_count": 101, "artifacts": forged + [{"name": ATTEMPT_PREFIX + V, "workflow_run": {"id": 77}}]},
+              runs=[run(1000 + i, event="pull_request", head_repo=2) for i in range(100)] + [run(77)]), stays("run 77"))
     # ── the promotion record ──
     c, p = "a" * 7 + "1" * 33, "c" * 40
     rec = {"core_sha": c, "plugins_sha": p, "v_portal": V}
@@ -348,7 +357,17 @@ def _self_test() -> int:
           lambda: me, _apply_rechecks)
     sh = (HERE / "deploy-test-switch-select.sh").read_text()
     check("select and apply share ONE selection script, which reads every marker's run",
-          lambda: sh, lambda t: "actions/runs/" in t and "--attempt-runs" in t and "--default-branch" in t)
+          lambda: sh, lambda t: "actions/runs/" in t and "--attempt-runs" in t and "--default-branch" in t
+          and "--paginate --slurp" in t)
+
+    def _record_reads_with_the_reader(t: str) -> bool:
+        sj = t.split("\n  select:\n", 1)[-1].split("\n  apply:\n", 1)[0]
+        tok, rec = sj.find("actions/create-github-app-token@"), sj.find("id: record")
+        return -1 < tok < rec and "repositories: MeshWeaver\n" in sj[tok:rec] \
+            and "GH_TOKEN: ${{ steps.reader.outputs.token }}" in sj[rec:] \
+            and "FLEET_READER_APP_ID" in sj[:tok] and "FLEET_READER_APP_PRIVATE_KEY" in sj[:tok]
+    check("the promotion record is read from MeshWeaver with the fleet-reader token (asserted, then minted), "
+          "never this repository's github.token", lambda: me, _record_reads_with_the_reader)
 
     # ── the CLI, end to end through files and a FAKE curl for GET /hosts ──
     me_py = str(Path(__file__).resolve())
