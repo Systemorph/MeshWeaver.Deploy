@@ -1,0 +1,65 @@
+# `Workflow hygiene (vs platform)` — the platform's workflow guards, run against THIS tree.
+#
+# A node repository gets these from core's `node-repo-validate.yml`; this repository is a chart
+# repository with no node-repo validate caller, so it runs the same three guards directly:
+#   - check-workflow-timeouts.py    every job carries a LITERAL `timeout-minutes` ≤ 45;
+#   - check-workflow-yaml-keys.py   no workflow key GitHub silently ignores;
+#   - check-pr-secret-preflight.py  every secret a pull-request job consumes is asserted by a
+#                                   preflight, or declared in .github/pr-secret-preflight-allow.txt.
+# Each script is FETCHED from Systemorph/MeshWeaver at `main` — the same vintage as the `@main`
+# lanes this repository calls — its identity is asserted, and its self-test runs immediately before
+# the check, because against a clean tree a guard prints the same green whether it measured or not.
+# Never a local copy: a copy keeps none of the fixes made after it.
+#
+# Every line is load-bearing: no path filter (a skipped required check reads as satisfied), no
+# job-level `if:`, no `continue-on-error:`.
+name: Repo hygiene
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repo-hygiene-${{ github.ref }}
+  cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+
+jobs:
+  hygiene:
+    name: Workflow hygiene (vs platform)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SCRIPTS_REF: main
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install PyYAML (pinned)
+        run: python3 -c "import yaml" 2>/dev/null || python3 -m pip install --quiet --disable-pip-version-check 'PyYAML==6.0.2'
+      - name: Fetch the platform's guards
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/guards"
+          for g in check-workflow-timeouts check-workflow-yaml-keys check-pr-secret-preflight; do
+            curl -fsSL --retry 3 \
+              "https://raw.githubusercontent.com/Systemorph/MeshWeaver/${SCRIPTS_REF}/.github/scripts/${g}.py" \
+              -o "$RUNNER_TEMP/guards/${g}.py" \
+              || { echo "::error::could not fetch .github/scripts/${g}.py at ${SCRIPTS_REF} from Systemorph/MeshWeaver"; exit 1; }
+            head -c 400 "$RUNNER_TEMP/guards/${g}.py" | grep -q "${g}" \
+              || { echo "::error::the fetched ${g}.py at ${SCRIPTS_REF} does not look like the guard"; exit 1; }
+          done
+      - name: Timeouts — the guard can fail (self-test)
+        run: python3 "$RUNNER_TEMP/guards/check-workflow-timeouts.py" --self-test
+      - name: Timeouts — every job capped at ≤ 45 minutes
+        run: python3 "$RUNNER_TEMP/guards/check-workflow-timeouts.py" --root .
+      - name: YAML keys — the guard can fail (self-test)
+        run: python3 "$RUNNER_TEMP/guards/check-workflow-yaml-keys.py" --self-test
+      - name: YAML keys — no key GitHub ignores
+        run: python3 "$RUNNER_TEMP/guards/check-workflow-yaml-keys.py" --root .
+      - name: Secret preflight — the guard can fail (self-test)
+        run: python3 "$RUNNER_TEMP/guards/check-pr-secret-preflight.py" --self-test
+      - name: Secret preflight — every PR-reachable secret is asserted
+        run: python3 "$RUNNER_TEMP/guards/check-pr-secret-preflight.py" --root .

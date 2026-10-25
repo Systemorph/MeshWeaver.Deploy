@@ -1,0 +1,60 @@
+# `review-answered / Automatic review answered`: does this pull request's head have its automatic
+# review, and does every thread that review opened carry a human reply? "Automatic review" is what
+# core's predicate (check-review-answered.py, REVIEWER_LOGINS) accepts: a Copilot review, or the
+# internal reviewer's `internal-review` check run. The `Copilot review for default branch` ruleset
+# requests Copilot on every pull request here; this file is what makes the ANSWER count.
+#
+# 🚨 WHY (MeshWeaver#4776). Nothing in this repository's protection read the answer, so pull
+# requests merged with findings unanswered: measured 2026-09-19 over the last 20 merges of six
+# repositories, 55 of 120 merged past unanswered findings, N of N every time.
+#
+# The thin caller of core's node-repo-review-answered.yml, identical to MeshWeaver.Plugins'
+# review-answered.yml. The lane carries the predicate, its self-test, the bounded wait for the
+# review, the settle wait for a reply burst, and the self-refresh. Every line below is load-bearing:
+# - a SEPARATE file, never ci.yml: it needs review events, and ci.yml's cancel rules must not
+#   apply to it;
+# - NO job-level `if:`, NO path or branch filter, NO `merge_group:` trigger. A SKIPPED required
+#   context counts as SATISFIED, and this repository has no merge-queue rule;
+# - the WORKFLOW-level concurrency group, split by event class. Branch protection reads the
+#   `pull_request` and `pull_request_review` runs and NOT the `pull_request_review_comment` ones
+#   (core #4649); a job-level group would publish a `cancelled` check-run, read as a failure;
+# - `actions: write` is the lane's `refresh` job ONLY (re-runs the newest `pull_request` run for
+#   the head after a GREEN verdict on a reply). It is recorded in core's
+#   .github/lane-caller-grants.yml — a called workflow's permissions are a hard requirement on every
+#   caller (startup_failure, zero jobs, otherwise).
+#
+# 🔁 The lane floats on `@main` with `scripts-ref: main`, like every other lane this repository calls.
+#
+# 🚦 The context joins protection only after this workflow has been seen published on a live pull
+# request here (classic protection blocks forever on an absent required context — Plugins#1453).
+name: Review answered
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+  pull_request_review_comment:
+    types: [created, deleted]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  checks: read
+
+concurrency:
+  group: review-answered-${{ github.event.pull_request.number }}-${{ github.event_name == 'pull_request_review_comment' && 'feedback' || 'gate' }}
+  cancel-in-progress: false
+
+jobs:
+  review-answered:
+    uses: Systemorph/MeshWeaver/.github/workflows/node-repo-review-answered.yml@main
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: read
+      actions: write
+    with:
+      scripts-ref: main
