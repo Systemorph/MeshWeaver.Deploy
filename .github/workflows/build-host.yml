@@ -5,14 +5,20 @@ name: Build host — runner image and the build-latest hand-over
 #
 # WHY THIS LIVES HERE. The platform's CD (Systemorph/MeshWeaver `main-cd.yml`) builds and seals the
 # product image set — portal, migration, plugin-test, control — and nothing else (core slimming:
-# deployment material leaves the platform). At the end of every CD run it hands the result over
-# with ONE `repository_dispatch` of type `platform-set-sealed` (contract:
-# `.github/scripts/platform-set-dispatch.py`). Everything a standing build host needs from that set
-# happens here, in the order the platform's former jobs `build-host-image` → `build-host-latest` →
-# `build-host-report` ran it:
+# deployment material leaves the platform). It dispatches to NO repository: the platform knows
+# nothing about what consumes its sets (policy `dependents-verify-on-their-side`, held by core's
+# `PlatformReleaseNotifyGuard.CoreDispatchesToNoRepository`). So THIS repository PULLS: every
+# 15 minutes (`schedule`) `preflight` reads the platform's sealed sets from the registry they were
+# sealed into (`platform-set-dispatch.py discover`) and turns the newest ARMED, then the newest
+# PROMOTED, set that still lacks a runner into a hand-over. The two events that carry a hand-over
+# explicitly read the same contract: `workflow_dispatch` (a person re-running one) and
+# `repository_dispatch: platform-set-sealed` (the shape an event-based emitter — memex, never the
+# platform's CD — sends). Everything a standing build host needs from that set happens here, in the
+# order the platform's former jobs `build-host-image` → `build-host-latest` → `build-host-report`
+# ran it:
 #
-#   1. `image`    — the build host's RUNNER image `mw-build-host:<version>` for the set the CD run
-#                   published: this repository's Dockerfile and runner (`build-run.py`), plus the
+#   1. `image`    — the build host's RUNNER image `mw-build-host:<version>` for the hand-over's set:
+#                   this repository's Dockerfile and runner (`build-run.py`), plus the
 #                   platform's helpers and `meshweaver-plugin-build` from the SET'S OWN commit.
 #   2. `handover` — the newest ARMED set handed to `build-latest`: a SIGNED
 #                   `build-host-update-available` into the control plane's inbox, which the
@@ -25,21 +31,27 @@ name: Build host — runner image and the build-latest hand-over
 # the same fact again on the record (`buildHosts.enabled`). The runner IMAGE is built regardless,
 # exactly as before the move, so a set is never armed with no runner to hand over.
 #
-# NEVER BACKWARDS: only the newest armed set is sent, re-sent on every CD run (every dispatch), so a
-# missed hand-over self-heals on the next one; the receiver changes nothing for a set it already
-# holds and never moves backwards.
+# NEVER BACKWARDS: only the newest armed set is sent, re-sent on every tick, so a missed hand-over
+# self-heals on the next one; the receiver changes nothing for a set it already holds and never
+# moves backwards. The latency this costs is one tick: a set armed now reaches build-latest within
+# ~15 minutes (plus GitHub's schedule jitter) — no fleet roll waits on it, the build host is outside
+# the platform's delivery.
 #
 # 🛡️ NO SKIP-TRAPDOOR. On a pull request (and a push to main) the `test` job builds the image from
 # this tree against the platform's `main` and runs every self-test: no secret, no registry, no
-# cluster. The publishing jobs run only on the two events that CARRY a hand-over —
+# cluster. The publishing jobs run only on the three events that READ a set — `schedule`,
 # `repository_dispatch` and `workflow_dispatch` — and that is the one exemption, expressed once, on
 # the EVENT. On those events `preflight` asserts every credential and is RED naming what to
-# provision; nothing downstream asks whether a secret is set.
+# provision; nothing downstream asks whether a secret is set. A `schedule` tick skips `test` (an
+# image build every tick is the cost the pull must not carry); the image it publishes still runs
+# both self-tests inside its own build.
 
 on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: "4,19,34,49 * * * *"
   repository_dispatch:
     types: [platform-set-sealed]
   workflow_dispatch:
@@ -86,6 +98,8 @@ jobs:
   # ─────────────── the gate on every change: build the image, run every self-test ───────────────
   test:
     name: Build host (runner image + self-tests)
+    # The event, never an input: a schedule tick reads the registry and builds only what is missing.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -145,10 +159,13 @@ jobs:
   # ─────────────── the publishing lane: only on an event that carries a hand-over ───────────────
   preflight:
     name: "Build host: assert the inputs exist"
-    # 🚨 The ONE sanctioned condition, and it is on the EVENT: only these two events carry a set.
-    if: github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch'
+    # 🚨 The ONE sanctioned condition, and it is on the EVENT: only these three events read a set.
+    if: github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
     outputs:
       run_url: ${{ steps.claim.outputs.run_url }}
       run_core_sha: ${{ steps.claim.outputs.run_core_sha }}
@@ -182,11 +199,68 @@ jobs:
             exit 1
           fi
           echo "All publishing inputs are present."
-      - name: Read the hand-over (validated field by field)
-        id: claim
+      # THE PULL: a schedule tick reads the platform's sealed sets from the registry itself. The
+      # platform's CD dispatches to no repository, so this is how a set it sealed reaches us.
+      - name: "Schedule: ensure Azure CLI"
+        if: github.event_name == 'schedule'
+        run: command -v az >/dev/null || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+      - name: "Schedule: Azure login (OIDC), to read the platform registry"
+        if: github.event_name == 'schedule'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: "Schedule: discover the newest sealed set that still lacks a runner"
+        id: discover
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/platform-set-dispatch.py read --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" | tee -a "$GITHUB_OUTPUT"
+          for repo in mw-plugin-test memex-portal-ai mw-build-host; do
+            az acr manifest list-metadata --registry meshweaver --name "$repo" --top 300 --orderby time_desc \
+              -o json --only-show-errors > "$RUNNER_TEMP/$repo.json"
+          done
+          python3 .github/scripts/platform-set-dispatch.py discover --tester "$RUNNER_TEMP/mw-plugin-test.json" \
+            --portal "$RUNNER_TEMP/memex-portal-ai.json" --runner "$RUNNER_TEMP/mw-build-host.json" > "$RUNNER_TEMP/found"
+          cat "$RUNNER_TEMP/found"
+          get() { sed -n "s/^$1=//p" "$RUNNER_TEMP/found"; }
+          # The registry names a commit by its seven characters; the platform's PUBLIC history names
+          # it in full. An abbreviation it cannot resolve is red, never a guess.
+          full() {
+            local s
+            s=$(gh api "repos/$PLATFORM_REPO/commits/$1" --jq .sha) || { echo "::error::platform commit $1 cannot be resolved" >&2; return 1; }
+            case "$s" in "$1"*) printf '%s' "$s" ;; *) echo "::error::platform commit $1 resolved to $s" >&2; return 1 ;; esac
+          }
+          need=$(get need_version)
+          if [ -n "$need" ]; then
+            run_id=$(get need_run_id); core=$(full "$(get need_core7)"); version="$need"
+          else
+            run_id=$(get promoted_run_id); core=$(full "$(get promoted_core7)"); version=""
+          fi
+          {
+            echo "run_url=https://github.com/$PLATFORM_REPO/actions/runs/$run_id"
+            echo "run_core_sha=$core"
+            echo "set_version=$version"
+            echo "set_core_sha=${version:+$core}"
+          } >> "$GITHUB_OUTPUT"
+          echo "- discovered: $(get why)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Read the hand-over (validated field by field)
+        id: claim
+        env:
+          D_RUN_URL: ${{ steps.discover.outputs.run_url }}
+          D_RUN_CORE: ${{ steps.discover.outputs.run_core_sha }}
+          D_SET_VERSION: ${{ steps.discover.outputs.set_version }}
+          D_SET_CORE: ${{ steps.discover.outputs.set_core_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            python3 .github/scripts/platform-set-dispatch.py claim --run-url "$D_RUN_URL" --run-core-sha "$D_RUN_CORE" \
+              --set-version "$D_SET_VERSION" --set-core-sha "$D_SET_CORE" | tee -a "$GITHUB_OUTPUT"
+          else
+            python3 .github/scripts/platform-set-dispatch.py read --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" | tee -a "$GITHUB_OUTPUT"
+          fi
       # A commit the event names is believed only once the platform's own history contains it:
       # GitHub's compare of <sha>...main on the PUBLIC platform repository answers `identical` or
       # `ahead` for a commit on main. Anything else — behind, diverged, unknown — is red.
@@ -209,8 +283,14 @@ jobs:
     name: "Build + push mw-build-host (the build-host runner)"
     needs: [preflight, test]
     # The event, again, on the job itself: it is what proves (check-pr-secret-preflight.py) that no
-    # pull request reaches a job consuming the publishing credentials.
-    if: github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch'
+    # pull request reaches a job consuming the publishing credentials. `test` must be green — except
+    # on a schedule tick, where it is skipped by its own event condition (the image's build runs
+    # both self-tests anyway).
+    if: >-
+      always() &&
+      (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch') &&
+      needs.preflight.result == 'success' &&
+      (needs.test.result == 'success' || (github.event_name == 'schedule' && needs.test.result == 'skipped'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
@@ -231,7 +311,7 @@ jobs:
           set -euo pipefail
           if [ -z "$VERSION" ]; then
             echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "- mw-build-host: the platform CD run published no set — no runner image to build" >> "$GITHUB_STEP_SUMMARY"
+            echo "- mw-build-host: the hand-over names no set (every sealed set the registry offers already has its runner, or the run published none) — no runner image to build" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "build=true" >> "$GITHUB_OUTPUT"
             echo "mw-build-host:$VERSION from platform $CORE_SHA"
@@ -266,8 +346,12 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.set_version }}
         run: |
           set -euo pipefail
-          docker buildx imagetools inspect "$ACR/memex-portal-ai:$VERSION" --format '{{json .Manifest.Digest}}' >/dev/null \
-            || { echo "::error::memex-portal-ai:$VERSION does not exist — the hand-over names a set the platform never published"; exit 1; }
+          # The tester's version tag is written when the set is PROMOTED (main-cd phase A). The
+          # portal's version tag is not read here: it is the ARMING write (phase C), and a published
+          # set the platform has not armed (yet) still needs its runner, so that arming it later
+          # finds one to hand over.
+          docker buildx imagetools inspect "$ACR/mw-plugin-test:$VERSION" --format '{{json .Manifest.Digest}}' >/dev/null \
+            || { echo "::error::mw-plugin-test:$VERSION does not exist — the hand-over names a set the platform never published"; exit 1; }
       - uses: actions/setup-dotnet@v6
         if: steps.set.outputs.build == 'true'
         with:
@@ -327,10 +411,10 @@ jobs:
     name: "Build host: hand the armed set to build-latest (record path)"
     # ORDERED after the runner image, so a set is never handed over before its mw-build-host
     # exists; and it runs on EVERY hand-over, not only an arming one: it hands over the NEWEST ARMED
-    # set each time, so a hand-over missed once is recovered by the next dispatch.
+    # set each time, so a hand-over missed once is recovered by the next tick.
     needs: [preflight, image]
     if: >-
-      always() && (github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch') &&
+      always() && (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch') &&
       needs.preflight.result == 'success' && needs.image.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -519,8 +603,9 @@ jobs:
           HANDED: ${{ needs.handover.outputs.handed }}
         run: |
           set -euo pipefail
-          # A red `test` on a hand-over skips `image`: that is a lane that did not build its runner.
-          [ "$TEST" = success ] || IMAGE="$TEST (test)"
+          # A red `test` on a hand-over skips `image`: that is a lane that did not build its runner. A
+          # schedule tick skips `test` by its own event condition, and that is no failure.
+          if [ "$TEST" != success ] && ! { [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$TEST" = skipped ]; }; then IMAGE="$TEST (test)"; fi
           open=$(gh api "repos/$GITHUB_REPOSITORY/issues?labels=build-host-latest&state=open&per_page=10" --jq '.[].number')
           # failed OR cancelled (a timeout, a cancelled run) is a lane that did not hand over
           case "$IMAGE" in success|skipped) img_ok=true ;; *) img_ok=false ;; esac
