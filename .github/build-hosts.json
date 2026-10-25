@@ -1,0 +1,7 @@
+{
+  "$comment": "Whether the platform's estate runs STANDING BUILD HOSTS (platform Doc/Architecture/BuildHosts; MeshWeaver.Plugins Hosting/StandingBuildHosts), and which channels are rolled onto the set the platform's CD arms (`build-host.yml` job `handover`, on its 15-minute schedule that pulls the platform's sealed sets; `build-host-stable.yml` daily; `build-host-announcement.py`). The hosts live on the operations record the platform's `.github/control-instance.json` names. While `enabled` is false the hand-over sends NOTHING; the receiver guards the same fact again (it changes a record only when that record's `buildHosts.enabled` is true). Turning it on is two acts in this order: the record's `buildHosts` block (through its approval path), then `enabled: true` here.",
+  "enabled": false,
+  "channels": [
+    "latest"
+  ]
+}
