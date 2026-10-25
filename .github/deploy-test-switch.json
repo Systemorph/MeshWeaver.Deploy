@@ -1,0 +1,4 @@
+{
+  "$comment": "Whether the platform sets reach the standing build hosts by DEPLOY → TEST THE DEPLOY → SWITCH LATEST (platform Doc/Architecture/DeployTestSwitchLatest; workflow build-host-deploy-test-switch.yml; deploy-test-switch.py). OFF until the receivers (BuildHostDeploy / BuildHostSwitch / BuildHostTeardown, MeshWeaver.Plugins P3c) are deployed on the control instance and the probe API accepts a pinned version (P3b). While false the workflow sends nothing and build-latest follows the armed set through build-host.yml.",
+  "enabled": false
+}

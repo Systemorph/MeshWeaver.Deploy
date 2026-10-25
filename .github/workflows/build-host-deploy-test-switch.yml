@@ -1,0 +1,339 @@
+name: Build host — deploy, test the deploy, switch latest
+
+# 🔥 THE TARGET SHAPE OF THE STANDING BUILD HOSTS (platform Doc/Architecture/DeployTestSwitchLatest,
+# policy `deploy-test-switch-latest`): image set → deploy `build-<version>` → test ON that deployment
+# → on green, switch `latest` to it. `latest` only ever points at a deployment that passed, and the
+# switch moves no image: the candidate is already warm, because it was just tested.
+#
+#   deploy    `build-host-deploy-requested` (reason `candidate`) → the receiver's BuildHostDeploy
+#             writes `v/<version>` + `alias/candidate`; this job then WAITS until GET
+#             /api/builds/hosts lists the version AND reports its Deployment ready.
+#   test      a run pinned to the candidate VERSION, followed stage by stage. 🚨 NOT WIRED YET: it
+#             needs the probe API's pinned version (P3b) and the affected Plugins + satellite gates
+#             on the candidate (owner decision: the switch waits on them). Until then the step is
+#             RED by name when the lane is enabled — never a green that tested nothing.
+#   switch    on green, `build-host-switch-requested` naming the green run; re-read: alias latest
+#             must name the candidate (the previous latest becomes alias/previous, retained).
+#   teardown  on red, `build-host-teardown-requested`; re-read: the version is gone, or still held
+#             by retention (`pinned`), which is said by name.
+#   rollback  by hand (workflow_dispatch): the switch event with `rollback: true`, only to
+#             alias/previous; re-read: alias latest names it.
+#
+# The events, their validation and the hosts reader are `.github/scripts/deploy-test-switch.py`;
+# the receivers are MeshWeaver.Plugins' (P3). 🚨 NEVER TRUST THE INBOX'S 202 — every event is
+# followed by a re-read of GET /api/builds/hosts, and only that re-read is the verdict.
+#
+# 🚨 SWITCHED OFF: `.github/deploy-test-switch.json` `enabled: false` ⇒ one summary line, nothing
+# sent, no credential used. Until it is on, build-latest follows the armed set through
+# `build-host.yml` exactly as before.
+#
+# 🛡️ NO SKIP-TRAPDOOR: a pull request runs the self-tests (no secret). Once the lane is DECLARED,
+# every credential is asserted and a missing one is RED, naming it.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  repository_dispatch:
+    types: [platform-set-sealed]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: deploy-test-switch (a candidate), rollback (latest back to alias/previous) or teardown (one version).
+        required: true
+        type: choice
+        options: [deploy-test-switch, rollback, teardown]
+      version:
+        description: The platform version (x.y.z) the action is about.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # One candidate at a time across every trigger, never cancelled: a half-done deploy is what
+  # teardown or the next candidate has to settle, not something to cause.
+  group: build-host-deploy-test-switch-${{ github.event_name == 'pull_request' && github.ref || 'apply' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  ACR: meshweaver.azurecr.io
+  PLATFORM_REPO: Systemorph/MeshWeaver
+
+jobs:
+  self-test:
+    name: Deploy-test-switch (self-tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: The events and the hosts reader can say no (self-test)
+        run: python3 .github/scripts/deploy-test-switch.py --self-test
+      - name: The hand-over reader can say no (self-test)
+        run: python3 .github/scripts/platform-set-dispatch.py --self-test
+
+  apply:
+    name: "Deploy-test-switch: deploy, test, switch (or roll back / tear down)"
+    # 🚨 The ONE sanctioned condition, on the EVENT: only these carry a set or a request.
+    if: github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch'
+    needs: [self-test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      enabled: ${{ steps.decide.outputs.enabled }}
+      action: ${{ steps.what.outputs.action }}
+      version: ${{ steps.what.outputs.version }}
+      outcome: ${{ steps.verdict.outputs.outcome }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: deploy
+      - name: Check out the platform's scripts (control-instance declaration, acr-login)
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PLATFORM_REPO }}
+          ref: main
+          path: platform
+          sparse-checkout: |
+            .github/scripts
+            .github/control-instance.json
+          sparse-checkout-cone-mode: false
+      - name: Is deploy → test → switch declared?
+        id: decide
+        run: |
+          set -euo pipefail
+          python3 deploy/.github/scripts/deploy-test-switch.py decide --declaration deploy/.github/deploy-test-switch.json | tee -a "$GITHUB_OUTPUT"
+      - name: Not enabled — say so and send nothing
+        if: steps.decide.outputs.enabled != 'true'
+        env:
+          WHY: ${{ steps.decide.outputs.why }}
+        run: |
+          echo "- deploy-test-switch: $WHY" >> "$GITHUB_STEP_SUMMARY"
+      - name: Assert the inputs exist (only once the lane is declared)
+        if: steps.decide.outputs.enabled == 'true'
+        env:
+          CONTROL_WEBHOOK_SECRET: ${{ secrets.CONTROL_WEBHOOK_SECRET }}
+          CONTROL_WEBHOOK_URL: ${{ vars.CONTROL_WEBHOOK_URL }}
+          MW_BUILD_API: ${{ vars.MW_BUILD_API }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "$CONTROL_WEBHOOK_SECRET" ] || missing+=("secrets.CONTROL_WEBHOOK_SECRET — the control plane inbox's HMAC key (org secret; add this repository)")
+          [ -n "$CONTROL_WEBHOOK_URL" ]    || missing+=("vars.CONTROL_WEBHOOK_URL — the control plane's Hosting/PlatformBuilds inbox (org variable; add this repository)")
+          [ -n "$MW_BUILD_API" ]           || missing+=("vars.MW_BUILD_API — the operations instance's build API base (https://<control>/api/builds), whose GET /hosts is the verdict")
+          [ -n "$AZURE_CLIENT_ID" ]        || missing+=("secrets.AZURE_CLIENT_ID — the OIDC identity that reads the platform registry")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::deploy-test-switch is declared but its inputs are missing:"; printf '  • %s\n' "${missing[@]}"; exit 1
+          fi
+          case "$CONTROL_WEBHOOK_URL" in https://*/api/hooks/Hosting/PlatformBuilds) ;; *) echo "::error::vars.CONTROL_WEBHOOK_URL is not an https Hosting/PlatformBuilds inbox"; exit 1 ;; esac
+          case "$MW_BUILD_API" in https://*/api/builds) ;; *) echo "::error::vars.MW_BUILD_API is not an https …/api/builds base"; exit 1 ;; esac
+      - name: What to do, for which version
+        id: what
+        if: steps.decide.outputs.enabled == 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_ACTION: ${{ inputs.action }}
+          IN_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = repository_dispatch ]; then
+            python3 deploy/.github/scripts/platform-set-dispatch.py read --event "$GITHUB_EVENT_PATH" --event-name "$EVENT_NAME" > "$RUNNER_TEMP/claim"
+            armed=$(sed -n 's/^armed=//p' "$RUNNER_TEMP/claim"); v=$(sed -n 's/^armed_version=//p' "$RUNNER_TEMP/claim")
+            if [ "$armed" != true ]; then
+              echo "action=none" >> "$GITHUB_OUTPUT"
+              echo "- deploy-test-switch: the platform run armed no set — no candidate to deploy" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "action=deploy-test-switch" >> "$GITHUB_OUTPUT"
+          else
+            v="$IN_VERSION"; echo "action=$IN_ACTION" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "deployment=$(jq -r .deployment platform/.github/control-instance.json)" >> "$GITHUB_OUTPUT"
+      # One signer and one reader for every event below: sign the exact bytes sent, POST, demand a
+      # verified signature, then RE-READ the hosts — the 202 is never the verdict.
+      - name: Write the event helpers
+        if: steps.decide.outputs.enabled == 'true' && steps.what.outputs.action != 'none'
+        run: |
+          cat > "$RUNNER_TEMP/dts.sh" <<'SH'
+          post_event() {  # post_event <body json>
+            local body="$1" sig code verdict
+            sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^.*= /sha256=/')
+            code=$(curl -sS -o "$RUNNER_TEMP/resp" -w '%{http_code}' --connect-timeout 10 --max-time 60 -X POST "$URL" \
+              -H 'Content-Type: application/json' -H "X-Hub-Signature-256: $sig" --data "$body") || code=000
+            verdict=$(tr -d '\n' < "$RUNNER_TEMP/resp" 2>/dev/null | sed -n 's/.*"signature"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+            echo "POST $(printf '%s' "$body" | jq -r .event) -> $code (signature: ${verdict:-none})"
+            case "$code" in 2*) [ "$verdict" = verified ] || { echo "::error::the inbox did not VERIFY the signature"; return 1; } ;;
+              *) echo "::error::the inbox refused the event (HTTP $code): $(head -c 400 "$RUNNER_TEMP/resp")"; return 1 ;; esac
+          }
+          read_hosts() {  # read_hosts <version> → key=value lines; non-zero on an unreadable answer
+            curl -fsS --connect-timeout 10 --max-time 30 "$API/hosts" -o "$RUNNER_TEMP/hosts.json" || { echo "::error::GET $API/hosts failed"; return 1; }
+            python3 deploy/.github/scripts/deploy-test-switch.py hosts --hosts "$RUNNER_TEMP/hosts.json" --version "$1"
+          }
+          SH
+      - name: Ensure Azure CLI
+        if: steps.what.outputs.action == 'deploy-test-switch'
+        run: command -v az >/dev/null || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+      - name: Azure login (OIDC)
+        if: steps.what.outputs.action == 'deploy-test-switch'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: "Deploy build-<version>: request it, then wait until it is listed AND ready"
+        id: deploy
+        if: steps.what.outputs.action == 'deploy-test-switch'
+        env:
+          URL: ${{ vars.CONTROL_WEBHOOK_URL }}
+          SECRET: ${{ secrets.CONTROL_WEBHOOK_SECRET }}
+          API: ${{ vars.MW_BUILD_API }}
+          V: ${{ steps.what.outputs.version }}
+          DEPLOYMENT: ${{ steps.what.outputs.deployment }}
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/dts.sh"
+          bash platform/.github/scripts/acr-login.sh
+          digest() { docker buildx imagetools inspect "$ACR/$1:$V" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"'; }
+          tester=$(digest mw-plugin-test); portal=$(digest memex-portal-ai); runner=$(digest mw-build-host)
+          # The FIFTH digest (owner decision): mw-core-tests, once the platform builds it.
+          core_tests=$(digest mw-core-tests || true)
+          body=$(python3 deploy/.github/scripts/deploy-test-switch.py body deploy --deployment "$DEPLOYMENT" --version "$V" \
+            --tester-digest "$tester" --portal-digest "$portal" --runner-digest "$runner" --core-tests-digest "$core_tests")
+          post_event "$body"
+          # The wait ends on the CONDITION, read from the build API: listed, then ready. 25 minutes
+          # covers a cold node, the image pulls and the plugins layer staging; beyond it the
+          # deployment is stuck, and the step says which half it never reached.
+          deadline=$(( $(date +%s) + 1500 )); listed=false
+          while :; do
+            read_hosts "$V" > "$RUNNER_TEMP/h" || exit 1
+            listed=$(sed -n 's/^listed=//p' "$RUNNER_TEMP/h")
+            [ "$(sed -n 's/^ready=//p' "$RUNNER_TEMP/h")" = true ] && break
+            [ "$(date +%s)" -lt "$deadline" ] || { echo "::error::build-$V did not become ready (listed: $listed) — the candidate is stuck; read its Deployment through the control instance"; exit 1; }
+            sleep 30
+          done
+          echo "- deployed \`$V\` as \`$(sed -n 's/^deployment_name=//p' "$RUNNER_TEMP/h")\`: listed and READY" >> "$GITHUB_STEP_SUMMARY"
+      - name: "Test the deployment (a run pinned to the candidate version)"
+        id: test
+        if: steps.what.outputs.action == 'deploy-test-switch'
+        run: |
+          # 🚨 NOT WIRED: the run that tests the candidate needs the probe API's pinned `version`
+          # (MeshWeaver.Plugins P3b) and the affected Plugins + satellite gates queued on the
+          # candidate. Until both exist this is RED — a switch never follows a test that did not run.
+          echo "::error::the candidate test is not wired yet (needs P3b's pinned-version probe and the dependents' affected gates) — latest is NOT switched"
+          exit 1
+      - name: "Switch latest to the candidate (on green), and read it back"
+        id: switch
+        if: steps.what.outputs.action == 'deploy-test-switch' && steps.test.outcome == 'success'
+        env:
+          URL: ${{ vars.CONTROL_WEBHOOK_URL }}
+          SECRET: ${{ secrets.CONTROL_WEBHOOK_SECRET }}
+          API: ${{ vars.MW_BUILD_API }}
+          V: ${{ steps.what.outputs.version }}
+          DEPLOYMENT: ${{ steps.what.outputs.deployment }}
+          RUN: ${{ steps.test.outputs.run }}
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/dts.sh"
+          post_event "$(python3 deploy/.github/scripts/deploy-test-switch.py body switch --deployment "$DEPLOYMENT" --version "$V" --run "$RUN")"
+          read_hosts "$V" > "$RUNNER_TEMP/h"
+          latest=$(sed -n 's/^latest=//p' "$RUNNER_TEMP/h")
+          [ "$latest" = "$V" ] || { echo "::error::the switch was accepted but alias latest names '$latest', not $V — the receiver refused it; read its InstanceAction"; exit 1; }
+          echo "- latest := \`$V\` (previous: \`$(sed -n 's/^previous=//p' "$RUNNER_TEMP/h")\`)" >> "$GITHUB_STEP_SUMMARY"
+      - name: "Tear the candidate down (deploy or test red), and read it back"
+        id: teardown
+        if: >-
+          always() && (steps.what.outputs.action == 'teardown' ||
+          (steps.what.outputs.action == 'deploy-test-switch' && (steps.deploy.outcome == 'failure' || steps.test.outcome == 'failure')))
+        env:
+          URL: ${{ vars.CONTROL_WEBHOOK_URL }}
+          SECRET: ${{ secrets.CONTROL_WEBHOOK_SECRET }}
+          API: ${{ vars.MW_BUILD_API }}
+          V: ${{ steps.what.outputs.version }}
+          DEPLOYMENT: ${{ steps.what.outputs.deployment }}
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/dts.sh"
+          post_event "$(python3 deploy/.github/scripts/deploy-test-switch.py body teardown --deployment "$DEPLOYMENT" --version "$V")"
+          read_hosts "$V" > "$RUNNER_TEMP/h"
+          if [ "$(sed -n 's/^listed=//p' "$RUNNER_TEMP/h")" = true ]; then
+            pinned=$(jq -r --arg v "$V" '.versions[] | select(.version == $v) | .pinned // 0' "$RUNNER_TEMP/hosts.json")
+            [ "${pinned:-0}" != 0 ] || { echo "::error::build-$V is still listed and nothing pins it — the teardown did not happen"; exit 1; }
+            echo "- \`$V\` kept: retention pins it ($pinned)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- \`$V\` torn down (no longer listed)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: "Roll latest back to alias/previous, and read it back"
+        if: steps.what.outputs.action == 'rollback'
+        env:
+          URL: ${{ vars.CONTROL_WEBHOOK_URL }}
+          SECRET: ${{ secrets.CONTROL_WEBHOOK_SECRET }}
+          API: ${{ vars.MW_BUILD_API }}
+          V: ${{ steps.what.outputs.version }}
+          DEPLOYMENT: ${{ steps.what.outputs.deployment }}
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/dts.sh"
+          read_hosts "$V" > "$RUNNER_TEMP/h"
+          prev=$(sed -n 's/^previous=//p' "$RUNNER_TEMP/h")
+          [ "$prev" = "$V" ] || { echo "::error::a rollback goes only to alias/previous ('$prev'), not $V"; exit 1; }
+          post_event "$(python3 deploy/.github/scripts/deploy-test-switch.py body rollback --deployment "$DEPLOYMENT" --version "$V")"
+          read_hosts "$V" > "$RUNNER_TEMP/h"
+          [ "$(sed -n 's/^latest=//p' "$RUNNER_TEMP/h")" = "$V" ] || { echo "::error::the rollback was accepted but alias latest does not name $V"; exit 1; }
+          echo "- latest rolled back to \`$V\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Verdict
+        id: verdict
+        if: always()
+        env:
+          ENABLED: ${{ steps.decide.outputs.enabled }}
+          SWITCH: ${{ steps.switch.outcome }}
+        run: |
+          if [ "$ENABLED" != true ]; then echo "outcome=off" >> "$GITHUB_OUTPUT"
+          elif [ "$SWITCH" = success ]; then echo "outcome=switched" >> "$GITHUB_OUTPUT"
+          else echo "outcome=not-switched" >> "$GITHUB_OUTPUT"; fi
+
+  # 📣 Its own alert, in this repository: a red apply files or comments on the ONE open
+  # `build-host-switch` issue; only a run that SWITCHED closes it. REST only.
+  report:
+    name: "Deploy-test-switch: report (its own alert)"
+    needs: [apply]
+    if: always() && needs.apply.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: File, comment or close the build-host-switch alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RESULT: ${{ needs.apply.result }}
+          OUTCOME: ${{ needs.apply.outputs.outcome }}
+          V: ${{ needs.apply.outputs.version }}
+        run: |
+          set -euo pipefail
+          open=$(gh api "repos/$GITHUB_REPOSITORY/issues?labels=build-host-switch&state=open&per_page=10" --jq '.[].number')
+          if [ "$RESULT" != success ]; then
+            body="deploy → test → switch did not complete for \`${V:-?}\`: [run ${GITHUB_RUN_ID}](${RUN_URL}) — result \`${RESULT}\`, outcome \`${OUTCOME:-?}\`. latest is unchanged; read the failed step's ::error:: line."
+            first=$(printf '%s\n' "$open" | head -n 1)
+            if [ -n "$first" ]; then
+              gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$first/comments" -f body="$body" >/dev/null
+            else
+              gh label create build-host-switch --repo "$GITHUB_REPOSITORY" --description "deploy → test → switch latest did not complete" \
+                --color D93F0B --force || echo "::warning::could not ensure the build-host-switch label (continuing)"
+              gh api -X POST "repos/$GITHUB_REPOSITORY/issues" -f title="deploy-test-switch failed: run ${GITHUB_RUN_ID}" \
+                -f body="$body" -f 'labels[]=build-host-switch' -f 'labels[]=bug' >/dev/null
+            fi
+            exit 0
+          fi
+          if [ "$OUTCOME" = switched ]; then
+            for n in $open; do
+              gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$n/comments" -f body="Recovered: latest switched to \`$V\` by [run ${GITHUB_RUN_ID}](${RUN_URL})." >/dev/null
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/$n" -f state=closed -f state_reason=completed >/dev/null
+            done
+          fi
