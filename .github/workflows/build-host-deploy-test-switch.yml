@@ -7,11 +7,16 @@ name: Build host — deploy, test the deploy, switch latest
 #
 #   deploy    `build-host-deploy-requested` (reason `candidate`) → the receiver's BuildHostDeploy
 #             writes `v/<version>` + `alias/candidate`; this job then WAITS until GET
-#             /api/builds/hosts lists the version AND reports its Deployment ready.
-#   test      a run pinned to the candidate VERSION, followed stage by stage. 🚨 NOT WIRED YET: it
-#             needs the probe API's pinned version (P3b) and the affected Plugins + satellite gates
-#             on the candidate (owner decision: the switch waits on them). Until then the step is
-#             RED by name when the lane is enabled — never a green that tested nothing.
+#             /api/builds/hosts lists the version `complete: true` (the record holds its full set,
+#             so the chart renders its Deployment), submits a probe PINNED to the version
+#             (`POST /api/builds/probes` with `version`) and waits until a host CLAIMS it. A host
+#             claims only after staging that set, so the claim is the proof the deployment serves.
+#             🚨 `/hosts` has NO `ready` and none is read: control cannot observe pods truthfully
+#             and KEDA scales an idle version to zero (Plugins `Hosting/StandingBuildHosts` §7b).
+#             Not complete, or not claimed, inside the 20-minute deploy window is the deploy
+#             FAILURE: red, torn down, latest unchanged.
+#   test      the probe's verdict: its run (the armed Plugins commit, pinned to the candidate)
+#             must END `succeeded`. The switch names that run, and the receiver re-reads it.
 #   switch    on green, `build-host-switch-requested` naming the green run; re-read: alias latest
 #             must name the candidate (the previous latest becomes alias/previous, retained).
 #   teardown  on red, `build-host-teardown-requested`; re-read: the version is gone, or still held
@@ -46,6 +51,10 @@ on:
       version:
         description: The platform version (x.y.z) the action is about.
         required: true
+        type: string
+      plugins_sha:
+        description: deploy-test-switch only — the MeshWeaver.Plugins commit (40 hex) the pinned probe tests on the candidate.
+        required: false
         type: string
 
 permissions:
@@ -120,6 +129,7 @@ jobs:
           CONTROL_WEBHOOK_URL: ${{ vars.CONTROL_WEBHOOK_URL }}
           MW_BUILD_API: ${{ vars.MW_BUILD_API }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          MW_PROBE_TOKEN: ${{ secrets.MW_PROBE_TOKEN }}
         run: |
           set -euo pipefail
           missing=()
@@ -127,6 +137,7 @@ jobs:
           [ -n "$CONTROL_WEBHOOK_URL" ]    || missing+=("vars.CONTROL_WEBHOOK_URL — the control plane's Hosting/PlatformBuilds inbox (org variable; add this repository)")
           [ -n "$MW_BUILD_API" ]           || missing+=("vars.MW_BUILD_API — the operations instance's build API base (https://<control>/api/builds), whose GET /hosts is the verdict")
           [ -n "$AZURE_CLIENT_ID" ]        || missing+=("secrets.AZURE_CLIENT_ID — the OIDC identity that reads the platform registry")
+          [ -n "$MW_PROBE_TOKEN" ]         || missing+=("secrets.MW_PROBE_TOKEN — a global administrator's mw_ API token on the operations instance; the pinned probe that proves and tests the candidate is submitted and read with it")
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::deploy-test-switch is declared but its inputs are missing:"; printf '  • %s\n' "${missing[@]}"; exit 1
           fi
@@ -139,6 +150,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           IN_ACTION: ${{ inputs.action }}
           IN_VERSION: ${{ inputs.version }}
+          IN_PLUGINS_SHA: ${{ inputs.plugins_sha }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = repository_dispatch ]; then
@@ -150,11 +162,19 @@ jobs:
               exit 0
             fi
             echo "action=deploy-test-switch" >> "$GITHUB_OUTPUT"
+            probe_sha=$(sed -n 's/^armed_plugins_sha=//p' "$RUNNER_TEMP/claim")
           else
             v="$IN_VERSION"; echo "action=$IN_ACTION" >> "$GITHUB_OUTPUT"
+            probe_sha="$IN_PLUGINS_SHA"
+            if [ "$IN_ACTION" = deploy-test-switch ] && ! printf '%s' "$probe_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::deploy-test-switch needs plugins_sha — the MeshWeaver.Plugins commit (40 hex) the pinned probe tests on the candidate"; exit 1
+            fi
           fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "deployment=$(jq -r .deployment platform/.github/control-instance.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo "probe_sha=$probe_sha"
+            echo "version=$v"
+            echo "deployment=$(jq -r .deployment platform/.github/control-instance.json)"
+          } >> "$GITHUB_OUTPUT"
       # One signer and one reader for every event below: sign the exact bytes sent, POST, demand a
       # verified signature, then RE-READ the hosts — the 202 is never the verdict.
       - name: Write the event helpers
@@ -186,7 +206,7 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      - name: "Deploy build-<version>: request it, then wait until it is listed AND ready"
+      - name: "Deploy build-<version>: request it, wait until it is COMPLETE, then until a host CLAIMS the pinned probe"
         id: deploy
         if: steps.what.outputs.action == 'deploy-test-switch'
         env:
@@ -195,6 +215,8 @@ jobs:
           API: ${{ vars.MW_BUILD_API }}
           V: ${{ steps.what.outputs.version }}
           DEPLOYMENT: ${{ steps.what.outputs.deployment }}
+          PROBE_SHA: ${{ steps.what.outputs.probe_sha }}
+          MW_PROBE_TOKEN: ${{ secrets.MW_PROBE_TOKEN }}
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/dts.sh"
@@ -206,27 +228,37 @@ jobs:
           body=$(python3 deploy/.github/scripts/deploy-test-switch.py body deploy --deployment "$DEPLOYMENT" --version "$V" \
             --tester-digest "$tester" --portal-digest "$portal" --runner-digest "$runner" --core-tests-digest "$core_tests")
           post_event "$body"
-          # The wait ends on the CONDITION, read from the build API: listed, then ready. 25 minutes
-          # covers a cold node, the image pulls and the plugins layer staging; beyond it the
-          # deployment is stuck, and the step says which half it never reached.
-          deadline=$(( $(date +%s) + 1500 )); listed=false
-          while :; do
-            read_hosts "$V" > "$RUNNER_TEMP/h" || exit 1
-            listed=$(sed -n 's/^listed=//p' "$RUNNER_TEMP/h")
-            [ "$(sed -n 's/^ready=//p' "$RUNNER_TEMP/h")" = true ] && break
-            [ "$(date +%s)" -lt "$deadline" ] || { echo "::error::build-$V did not become ready (listed: $listed) — the candidate is stuck; read its Deployment through the control instance"; exit 1; }
-            sleep 30
-          done
-          echo "- deployed \`$V\` as \`$(sed -n 's/^deployment_name=//p' "$RUNNER_TEMP/h")\`: listed and READY" >> "$GITHUB_STEP_SUMMARY"
-      - name: "Test the deployment (a run pinned to the candidate version)"
+          # ONE deploy window (20 minutes) for both conditions, read from the build API: the record
+          # holds the version COMPLETE, then a host CLAIMS a probe pinned to it. It covers a cold
+          # node (the version may be scaled to zero), the image pulls and the plugins-layer staging;
+          # beyond it the deployment is stuck, and the failing half says which it never reached.
+          deadline=$(( $(date +%s) + 1200 ))
+          python3 deploy/.github/scripts/deploy-test-switch.py wait-complete --api "$API" --version "$V" \
+            --window 1200 --poll 30 > "$RUNNER_TEMP/h"
+          left=$(( deadline - $(date +%s) )); [ "$left" -gt 0 ] || left=1
+          python3 deploy/.github/scripts/deploy-test-switch.py probe-claim --api "$API" --version "$V" \
+            --repo MeshWeaver.Plugins --sha "$PROBE_SHA" --channel latest --window "$left" --poll 15 > "$RUNNER_TEMP/probe"
+          cat "$RUNNER_TEMP/probe" >> "$GITHUB_OUTPUT"
+          echo "- deployed \`$V\` as \`$(sed -n 's/^deployment_name=//p' "$RUNNER_TEMP/h")\`: COMPLETE, and a host CLAIMED probe \`$(sed -n 's/^probe=//p' "$RUNNER_TEMP/probe")\` pinned to it" >> "$GITHUB_STEP_SUMMARY"
+      - name: "Test the deployment: the pinned probe's verdict"
         id: test
-        if: steps.what.outputs.action == 'deploy-test-switch'
+        if: steps.what.outputs.action == 'deploy-test-switch' && steps.deploy.outcome == 'success'
+        env:
+          API: ${{ vars.MW_BUILD_API }}
+          PROBE_SHA: ${{ steps.what.outputs.probe_sha }}
+          PROBE: ${{ steps.deploy.outputs.probe }}
+          STAGE: ${{ steps.deploy.outputs.stage }}
+          RUN_PATH: ${{ steps.deploy.outputs.path }}
+          MW_PROBE_TOKEN: ${{ secrets.MW_PROBE_TOKEN }}
         run: |
-          # 🚨 NOT WIRED: the run that tests the candidate needs the probe API's pinned `version`
-          # (MeshWeaver.Plugins P3b) and the affected Plugins + satellite gates queued on the
-          # candidate. Until both exist this is RED — a switch never follows a test that did not run.
-          echo "::error::the candidate test is not wired yet (needs P3b's pinned-version probe and the dependents' affected gates) — latest is NOT switched"
-          exit 1
+          set -euo pipefail
+          # The verdict is the probe's RUN, once it ENDED: green only for `succeeded` (18 minutes,
+          # inside the job's 45-minute cut with the teardown after it). The switch names this run
+          # and the receiver re-reads it — every stage Succeeded, pinned to the version.
+          python3 deploy/.github/scripts/deploy-test-switch.py probe-verdict --api "$API" --repo MeshWeaver.Plugins \
+            --sha "$PROBE_SHA" --channel latest --probe "$PROBE" --stage "$STAGE" --window 1080 --poll 30 >> "$GITHUB_OUTPUT"
+          echo "run=$RUN_PATH" >> "$GITHUB_OUTPUT"
+          echo "- tested: probe \`$PROBE\` ended succeeded (\`$RUN_PATH\`)" >> "$GITHUB_STEP_SUMMARY"
       - name: "Switch latest to the candidate (on green), and read it back"
         id: switch
         if: steps.what.outputs.action == 'deploy-test-switch' && steps.test.outcome == 'success'
