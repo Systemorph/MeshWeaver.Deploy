@@ -163,8 +163,9 @@ Every job caps at a literal `timeout-minutes` ≤ 45 and carries no input-shaped
 
 The thin callers of the platform's other lanes, none of them a required context:
 `request-review-on-change.yml` (one Copilot review per push that changed the diff — the ruleset
-does not review on push), `auto-arm.yml` (arms auto-merge; needs the `meshweaver-cloud` App
-secrets) and `retry-known-transients.yml` (one automatic rerun of a named infrastructure
+does not review on push), `auto-arm.yml` (disarms auto-merge on a push and arms only a
+generated-only App pull request; an ordinary pull request is armed by the control instance's PR
+steward once it is reviewed and answered; needs the `meshweaver-cloud` App secrets) and `retry-known-transients.yml` (one automatic rerun of a named infrastructure
 transient). Each calls its lane `@main`; never paste a lane's body in here.
 
 3. `build-host.yml` — `Build host (runner image + self-tests)`: the runner image built against the
