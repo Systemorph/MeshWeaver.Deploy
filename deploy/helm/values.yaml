@@ -1221,6 +1221,9 @@ buildHosts:
   # — never authored by hand. Each entry: version, testerDigest, portalDigest, runnerDigest, maxReplicas,
   # aliases (latest | candidate | previous | stable; an alias names ONE version).
   versions: []
+  # The runner image claims by MW_BUILD_VERSION (build-run.py). Until it does, versions is REFUSED: a runner that knows
+  # only MW_BUILD_CHANNEL exits at startup. Set true only once the sets' runner digest carries that support.
+  versionedRunner: false
   stable:
     enabled: false
     maxReplicas: 1

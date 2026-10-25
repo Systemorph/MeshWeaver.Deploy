@@ -118,10 +118,18 @@ The refusals, and why each one exists:
 {{- $seenVersions := dict -}}
 {{- $seenAliases := dict -}}
 {{- $seenNames := dict -}}
+{{- /* A versioned host's runner must claim by MW_BUILD_VERSION; a runner that knows only MW_BUILD_CHANNEL exits at startup.
+       Until the runner image declares that it does (buildHosts.versionedRunner), no versioned host renders (review of #10). */ -}}
+{{- if and ($b.versions | default list) (not $b.versionedRunner) -}}
+{{- fail "buildHosts.versions is set but buildHosts.versionedRunner is not true — the runner image must claim by MW_BUILD_VERSION (build-run.py) before a versioned build server can start; set it only once that runner is the one the sets name" -}}
+{{- end -}}
 {{- range $i, $v := ($b.versions | default list) -}}
 {{- $ver := required (printf "buildHosts.versions[%d].version is required" $i) $v.version -}}
 {{- if not (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]*[0-9A-Za-z])?$" $ver) -}}
 {{- fail (printf "buildHosts.versions[%d].version %q must be MAJOR.MINOR.PATCH with an optional -prerelease ending in a letter or digit" $i $ver) -}}
+{{- end -}}
+{{- if gt (len $ver) 48 -}}
+{{- fail (printf "buildHosts.versions[%d].version %q is %d characters — the platform's version rule (BuildHostSetKeys.IsVersion) allows at most 48" $i $ver (len $ver)) -}}
 {{- end -}}
 {{- if hasKey $seenVersions $ver -}}
 {{- fail (printf "buildHosts.versions names %s twice — one deployment per version" $ver) -}}

@@ -328,6 +328,8 @@ for entry in \
   "values.build-hosts-alias-twice.yaml|an alias is ONE version" \
   "values.build-hosts-version-twice.yaml|one deployment per version" \
   "values.build-hosts-bad-version.yaml|must be MAJOR.MINOR.PATCH" \
+  "values.build-hosts-version-too-long.yaml|allows at most 48" \
+  "values.build-hosts-versions-old-runner.yaml|versionedRunner is not true" \
   "values.build-hosts-trailing-dash.yaml|ending in a letter or digit" \
   "values.build-hosts-zero-replicas.yaml|maxReplicas must be at least 1" \
   "values.build-hosts-name-collision.yaml|one deployment per name" \
