@@ -45,15 +45,31 @@ name: Build host — deploy, test the deploy, switch latest
 # sent, no credential used. Until it is on, build-latest follows the armed set through
 # `build-host.yml` exactly as before.
 #
+# 🔗 WHAT STARTS IT: the build-host lane, inside this repository. The platform's CD dispatches to
+# no repository (policy `dependents-verify-on-their-side`), and nothing sends `platform-set-sealed`
+# — `build-host.yml` PULLS the sealed sets every 15 minutes and builds each one's runner. This lane
+# is chained off it (`workflow_run`, `types: [completed]`): `select` reads the completed build-host
+# run and starts deploy → test → switch for the NEWEST ARMED set only when that run READ a set
+# (schedule / dispatch, never a pull request or a push) and SUCCEEDED, the set has its runner
+# `mw-build-host:<version>`, `/hosts` does not list it (not `v/<version>`, so never the set that is
+# already latest), it is newer than latest, and no earlier automatic run attempted it (the
+# `deploy-test-switch-attempt-<version>` artifact `apply` writes before it sends anything — a failed
+# candidate is torn down and unlisted again, and is NOT redeployed every tick; a person re-runs it
+# by workflow_dispatch). Its commits come from the platform CD run's `promotion-record`. The rules
+# and their self-test (negative control: an already-deployed set does not start) are
+# `.github/scripts/deploy-test-switch-trigger.py`. `workflow_dispatch` stays for a person.
+#
 # 🛡️ NO SKIP-TRAPDOOR: a pull request runs the self-tests (no secret). Once the lane is DECLARED,
-# every credential is asserted and a missing one is RED, naming it.
+# every credential is asserted and a missing one is RED, naming it. The conditions on `select` and
+# `apply` are on the EVENT (and on `select`'s printed decision), never on whether a secret is set.
 
 on:
   pull_request:
   push:
     branches: [main]
-  repository_dispatch:
-    types: [platform-set-sealed]
+  workflow_run:
+    workflows: ["Build host — runner image and the build-latest hand-over"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       action:
@@ -78,15 +94,17 @@ permissions:
   contents: read
 
 concurrency:
-  # One candidate at a time across the two OPERATIONAL triggers, never cancelled: a half-done deploy
-  # is what teardown or the next candidate has to settle, not something to cause. A pull request or
-  # a push to main only runs the self-tests, so it gets its OWN group per ref: GitHub replaces a
-  # PENDING run in a group even with cancel-in-progress false, and a validation push sharing `apply`
-  # could discard a queued rollback or teardown.
+  # One candidate at a time is held by the `apply` JOB's own group (below), never cancelled: a
+  # half-done deploy is what teardown or the next candidate has to settle, not something to cause.
+  # The RUN is never grouped on the operational triggers: GitHub replaces a PENDING run in a group
+  # even with cancel-in-progress false, and a build-host completion arrives every 15 minutes — a
+  # run-level `apply` group would let a tick that selects nothing discard a queued rollback or
+  # teardown. Only a run whose `select` chose a set enters the `apply` queue. A pull request or a
+  # push to main only runs the self-tests, in its own group per ref, superseded by the next push.
   group: >-
-    build-host-deploy-test-switch-${{ (github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch')
-    && 'apply' || format('validate-{0}', github.ref) }}
-  cancel-in-progress: ${{ github.event_name != 'repository_dispatch' && github.event_name != 'workflow_dispatch' }}
+    build-host-deploy-test-switch-${{ (github.event_name == 'workflow_run' || github.event_name == 'workflow_dispatch')
+    && format('run-{0}', github.run_id) || format('validate-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_run' && github.event_name != 'workflow_dispatch' }}
 
 env:
   ACR: meshweaver.azurecr.io
@@ -103,14 +121,145 @@ jobs:
         run: python3 .github/scripts/deploy-test-switch.py --self-test
       - name: The hand-over reader can say no (self-test)
         run: python3 .github/scripts/platform-set-dispatch.py --self-test
+      - name: The trigger can say no — an already-deployed set does not start (self-test)
+        run: python3 .github/scripts/deploy-test-switch-trigger.py --self-test
+
+  # ─────────────── the chain: a completed build-host run → which set, if any ───────────────
+  select:
+    name: "Deploy-test-switch: does this build-host run start a candidate?"
+    # 🚨 The sanctioned condition, on the EVENT: only a build-host run that READ a set (its
+    # schedule pull, or a dispatch) is examined; its pull-request and push runs test that tree only.
+    # Whether it succeeded, and every other rule, is decided — and PRINTED — by the steps below.
+    if: >-
+      github.event_name == 'workflow_run' &&
+      (github.event.workflow_run.event == 'schedule' || github.event.workflow_run.event == 'workflow_dispatch' ||
+      github.event.workflow_run.event == 'repository_dispatch')
+    needs: [self-test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    outputs:
+      start: ${{ steps.select.outputs.start }}
+      version: ${{ steps.select.outputs.version }}
+      core_sha: ${{ steps.record.outputs.core_sha }}
+      plugins_sha: ${{ steps.record.outputs.plugins_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: deploy
+          sparse-checkout: |
+            .github/scripts
+            .github/deploy-test-switch.json
+          sparse-checkout-cone-mode: false
+      - name: Is deploy → test → switch declared?
+        id: decide
+        run: |
+          set -euo pipefail
+          python3 deploy/.github/scripts/deploy-test-switch.py decide --declaration deploy/.github/deploy-test-switch.json | tee -a "$GITHUB_OUTPUT"
+      # A DECLARED switch, not a secret test: off ⇒ one summary line, nothing read, nothing started.
+      - name: Not enabled — say so and start nothing
+        if: steps.decide.outputs.enabled != 'true'
+        env:
+          WHY: ${{ steps.decide.outputs.why }}
+          UPSTREAM: ${{ github.event.workflow_run.html_url }}
+        run: |
+          echo "- deploy-test-switch: $WHY — build-host run $UPSTREAM starts no candidate" >> "$GITHUB_STEP_SUMMARY"
+      - name: Assert the selection's inputs exist (only once the lane is declared)
+        if: steps.decide.outputs.enabled == 'true'
+        env:
+          MW_BUILD_API: ${{ vars.MW_BUILD_API }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "$MW_BUILD_API" ]          || missing+=("vars.MW_BUILD_API — the operations instance's build API base (https://<control>/api/builds), whose GET /hosts says what is deployed")
+          [ -n "$AZURE_CLIENT_ID" ]       || missing+=("secrets.AZURE_CLIENT_ID — the OIDC identity that reads the platform registry")
+          [ -n "$AZURE_TENANT_ID" ]       || missing+=("secrets.AZURE_TENANT_ID — that identity's tenant")
+          [ -n "$AZURE_SUBSCRIPTION_ID" ] || missing+=("secrets.AZURE_SUBSCRIPTION_ID — the subscription that holds the platform registry")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::deploy-test-switch is declared but the selection's inputs are missing:"; printf '  • %s\n' "${missing[@]}"; exit 1
+          fi
+      - name: Ensure Azure CLI
+        if: steps.decide.outputs.enabled == 'true'
+        run: command -v az >/dev/null || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+      - name: Azure login (OIDC), to read the platform registry
+        if: steps.decide.outputs.enabled == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: "Select: the newest armed set — has its runner, is not deployed, was never attempted?"
+        id: select
+        if: steps.decide.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API: ${{ vars.MW_BUILD_API }}
+          UP_EVENT: ${{ github.event.workflow_run.event }}
+          UP_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          UPSTREAM: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          for repo in memex-portal-ai mw-build-host; do
+            az acr manifest list-metadata --registry meshweaver --name "$repo" --top 300 --orderby time_desc \
+              -o json --only-show-errors > "$RUNNER_TEMP/$repo.json"
+          done
+          t=deploy/.github/scripts/deploy-test-switch-trigger.py
+          python3 "$t" armed --portal "$RUNNER_TEMP/memex-portal-ai.json" > "$RUNNER_TEMP/armed"
+          v=$(sed -n 's/^version=//p' "$RUNNER_TEMP/armed")
+          # The record of automatic attempts: one exact-name artifact per set (REST, never GraphQL).
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=deploy-test-switch-attempt-$v&per_page=10" > "$RUNNER_TEMP/attempts.json"
+          python3 "$t" select --upstream-event "$UP_EVENT" --upstream-conclusion "$UP_CONCLUSION" \
+            --portal "$RUNNER_TEMP/memex-portal-ai.json" --runner "$RUNNER_TEMP/mw-build-host.json" \
+            --attempts "$RUNNER_TEMP/attempts.json" --api "$API" --window 120 --poll 10 > "$RUNNER_TEMP/sel"
+          tee -a "$GITHUB_OUTPUT" < "$RUNNER_TEMP/sel"
+          echo "- build-host run $UPSTREAM: $(sed -n 's/^why=//p' "$RUNNER_TEMP/sel")" >> "$GITHUB_STEP_SUMMARY"
+      # The candidate's commits, from the platform CD run that built the set (named by its staging
+      # tag): its promotion record. A record that does not match the set is red, never a guess.
+      - name: "The candidate's commits: the platform run's promotion record"
+        id: record
+        if: steps.select.outputs.start == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.select.outputs.version }}
+          CORE7: ${{ steps.select.outputs.core7 }}
+          RUN_ID: ${{ steps.select.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          url=$(gh api "repos/$PLATFORM_REPO/actions/runs/$RUN_ID/artifacts?name=promotion-record" \
+            --jq '[.artifacts[] | select(.name == "promotion-record" and (.expired | not))] | if length == 1 then .[0].archive_download_url else "" end')
+          [ -n "$url" ] || { echo "::error::platform run $RUN_ID (the set $V) has no single unexpired promotion-record — its commits cannot be read, so it is not deployed"; exit 1; }
+          gh api "$url" > "$RUNNER_TEMP/record.zip"
+          mkdir -p "$RUNNER_TEMP/record"
+          unzip -o -q "$RUNNER_TEMP/record.zip" -d "$RUNNER_TEMP/record"
+          python3 deploy/.github/scripts/deploy-test-switch-trigger.py record --record "$RUNNER_TEMP/record/promotion-record.json" \
+            --version "$V" --core7 "$CORE7" > "$RUNNER_TEMP/rec"
+          core=$(sed -n 's/^core_sha=//p' "$RUNNER_TEMP/rec")
+          # Believed only once the platform's own history contains it (the build-host lane's rule).
+          st=$(gh api "repos/$PLATFORM_REPO/compare/$core...main" --jq .status) \
+            || { echo "::error::could not compare $core with the platform's main"; exit 1; }
+          case "$st" in identical|ahead) ;; *) echo "::error::the candidate's core commit $core is not on the platform's main (compare: $st)"; exit 1 ;; esac
+          tee -a "$GITHUB_OUTPUT" < "$RUNNER_TEMP/rec"
 
   apply:
     name: "Deploy-test-switch: deploy, test, switch (or roll back / tear down)"
-    # 🚨 The ONE sanctioned condition, on the EVENT: only these carry a set or a request.
-    if: github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch'
-    needs: [self-test]
+    # 🚨 On the EVENT: a person's dispatch, or a build-host completion whose `select` CHOSE a set
+    # (otherwise `select` printed why it chose none, and that run is complete without an apply).
+    if: >-
+      always() && needs.self-test.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && needs.select.result == 'success' && needs.select.outputs.start == 'true'))
+    needs: [self-test, select]
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    concurrency:
+      group: build-host-deploy-test-switch-apply
+      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write
@@ -174,29 +323,24 @@ jobs:
           IN_VERSION: ${{ inputs.version }}
           IN_PLUGINS_SHA: ${{ inputs.plugins_sha }}
           IN_CORE_SHA: ${{ inputs.core_sha }}
+          SEL_VERSION: ${{ needs.select.outputs.version }}
+          SEL_PLUGINS_SHA: ${{ needs.select.outputs.plugins_sha }}
+          SEL_CORE_SHA: ${{ needs.select.outputs.core_sha }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = repository_dispatch ]; then
-            python3 deploy/.github/scripts/platform-set-dispatch.py read --event "$GITHUB_EVENT_PATH" --event-name "$EVENT_NAME" > "$RUNNER_TEMP/claim"
-            armed=$(sed -n 's/^armed=//p' "$RUNNER_TEMP/claim"); v=$(sed -n 's/^armed_version=//p' "$RUNNER_TEMP/claim")
-            if [ "$armed" != true ]; then
-              echo "action=none" >> "$GITHUB_OUTPUT"
-              echo "- deploy-test-switch: the platform run armed no set — no candidate to deploy" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            echo "action=deploy-test-switch" >> "$GITHUB_OUTPUT"
-            probe_sha=$(sed -n 's/^armed_plugins_sha=//p' "$RUNNER_TEMP/claim")
-            core_sha=$(sed -n 's/^armed_core_sha=//p' "$RUNNER_TEMP/claim")
+          if [ "$EVENT_NAME" = workflow_run ]; then
+            # The set `select` chose from the completed build-host run, with its CD run's commits.
+            action=deploy-test-switch; v="$SEL_VERSION"; probe_sha="$SEL_PLUGINS_SHA"; core_sha="$SEL_CORE_SHA"
           else
-            v="$IN_VERSION"; echo "action=$IN_ACTION" >> "$GITHUB_OUTPUT"
-            probe_sha="$IN_PLUGINS_SHA"; core_sha="$IN_CORE_SHA"
-            if [ "$IN_ACTION" = deploy-test-switch ] && ! printf '%s' "$probe_sha" | grep -Eq '^[0-9a-f]{40}$'; then
-              echo "::error::deploy-test-switch needs plugins_sha — the MeshWeaver.Plugins commit (40 hex) the pinned probe tests on the candidate"; exit 1
-            fi
+            action="$IN_ACTION"; v="$IN_VERSION"; probe_sha="$IN_PLUGINS_SHA"; core_sha="$IN_CORE_SHA"
+          fi
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          if [ "$action" = deploy-test-switch ] && ! printf '%s' "$probe_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::deploy-test-switch needs plugins_sha — the MeshWeaver.Plugins commit (40 hex) the pinned probe tests on the candidate"; exit 1
           fi
           # The candidate's core commit is where the plan is READ (CI_SHARD_TOTAL, build-stages.json)
           # and what the shard and doc-gate runs test — never platform main.
-          if { [ "$EVENT_NAME" = repository_dispatch ] || [ "$IN_ACTION" = deploy-test-switch ]; } && ! printf '%s' "$core_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+          if [ "$action" = deploy-test-switch ] && ! printf '%s' "$core_sha" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::deploy-test-switch needs the candidate's core commit (40 hex) — got '${core_sha}'; the plan is read at it"; exit 1
           fi
           {
@@ -205,6 +349,28 @@ jobs:
             echo "version=$v"
             echo "deployment=$(jq -r .deployment platform/.github/control-instance.json)"
           } >> "$GITHUB_OUTPUT"
+      # 🚨 THE ATTEMPT IS RECORDED BEFORE ANYTHING IS SENT (automatic runs only): `select` reads
+      # this exact-name artifact, so a candidate that fails and is torn down — unlisted again — is
+      # not redeployed on every build-host tick. Written here, not in `select`, so a run GitHub
+      # replaced while it was still queued records nothing and the next tick selects the set again.
+      - name: Record this automatic attempt
+        id: attempt
+        if: steps.decide.outputs.enabled == 'true' && github.event_name == 'workflow_run'
+        env:
+          V: ${{ steps.what.outputs.version }}
+          UPSTREAM: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/attempt"
+          jq -n --arg v "$V" --arg run "$GITHUB_RUN_ID" --arg up "$UPSTREAM" '{version: $v, run: $run, buildHostRun: $up}' \
+            > "$RUNNER_TEMP/attempt/attempt.json"
+      - uses: actions/upload-artifact@v7
+        if: steps.attempt.outcome == 'success'
+        with:
+          name: deploy-test-switch-attempt-${{ steps.what.outputs.version }}
+          path: ${{ runner.temp }}/attempt/attempt.json
+          if-no-files-found: error
+          retention-days: 90
       # One signer and one reader for every event below: sign the exact bytes sent, POST, demand a
       # verified signature, then RE-READ the hosts — the 202 is never the verdict.
       - name: Write the event helpers
@@ -271,10 +437,9 @@ jobs:
           cat "$RUNNER_TEMP/plan" >> "$GITHUB_OUTPUT"
           # ONE deploy window (20 minutes) for every condition, in order: the set's images are
           # PUBLISHED, the record holds the version COMPLETE, a host CLAIMS a probe pinned to it.
-          # The images come first because build-host.yml starts on the same platform-set-sealed
-          # event and publishes mw-build-host:<version> in parallel with this job, so the runner
-          # image may not exist yet when this step starts: it is WAITED for inside the window,
-          # never read once and aborted on. The window also covers a cold node (the version may be
+          # The images come first: a chained run starts only once its set's runner exists, but a
+          # person's dispatch can name a set whose images are still being published, so each is
+          # WAITED for inside the window, never read once and aborted on. The window also covers a cold node (the version may be
           # scaled to zero), the image pulls and the plugins-layer staging; beyond it the deployment
           # is stuck, and the failing condition says which it never reached.
           deadline=$(( $(date +%s) + 1200 ))
@@ -409,8 +574,9 @@ jobs:
   # `build-host-switch` issue; only a run that SWITCHED closes it. REST only.
   report:
     name: "Deploy-test-switch: report (its own alert)"
-    needs: [apply]
-    if: always() && needs.apply.result != 'skipped'
+    needs: [select, apply]
+    # A red `select` is a lane that could not decide — reported like a red apply.
+    if: always() && (needs.apply.result != 'skipped' || needs.select.result == 'failure')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -421,10 +587,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RESULT: ${{ needs.apply.result }}
+          SELECT: ${{ needs.select.result }}
           OUTCOME: ${{ needs.apply.outputs.outcome }}
-          V: ${{ needs.apply.outputs.version }}
+          V: ${{ needs.apply.outputs.version || needs.select.outputs.version }}
         run: |
           set -euo pipefail
+          if [ "$SELECT" = failure ]; then RESULT="select: failure"; fi
           open=$(gh api "repos/$GITHUB_REPOSITORY/issues?labels=build-host-switch&state=open&per_page=10" --jq '.[].number')
           if [ "$RESULT" != success ]; then
             body="deploy → test → switch did not complete for \`${V:-?}\`: [run ${GITHUB_RUN_ID}](${RUN_URL}) — result \`${RESULT}\`, outcome \`${OUTCOME:-?}\`. latest is UNVERIFIED — a switch or rollback can land after its read-back failed, or after the job ended: read GET /api/builds/hosts (aliases.latest) and the InstanceAction on the control instance before retrying; the failed step's ::error:: line says where it stopped."
