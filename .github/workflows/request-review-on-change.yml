@@ -1,0 +1,45 @@
+# `Request review on real change` (policy `review-on-real-change`): on every push to a pull request,
+# request ONE Copilot review when the push changed the pull request's own diff, and nothing when it
+# only merged `main`. The thin caller of core's node-repo-request-review.yml — the lane header there
+# states the contract, and the predicate is check-review-answered.py `review_request_action`, the SAME
+# function `Automatic review answered` uses to decide whether Copilot's last review still covers the
+# head.
+#
+# WHY. With the ruleset's `copilot_code_review` rule at `review_on_push: true`, every push — a merge of
+# `main` included — bought a full Copilot round: new threads about code the pull request did not
+# change. The rule moves to `review_on_push: false` only once this caller is merged and has been seen
+# requesting a review here; until then the ruleset requests first and this lane reads the request as
+# pending and asks for nothing (it is idempotent by construction).
+#
+# Every line below is load-bearing:
+# - `schedule` is the sweep: a review requested while another was pending can land on the previous
+#   head, and no event follows. Every 15 minutes the lane re-judges the open pull requests.
+# - NO job-level `if:`, NO path or branch filter: a fork pull request is an EVENT property, decided
+#   inside the lane and printed as a ::warning:: naming the manual step.
+# - `contents: read` + `pull-requests: write` is exactly what the lane's job demands (its one GraphQL
+#   `requestReviews`). A called workflow can only narrow its caller's grant, so a missing permission is
+#   a `startup_failure` with zero jobs; the pairing is recorded in core's .github/lane-caller-grants.yml
+#   and asserted by check-workflow-permission-pairing.py.
+#
+# Not a required check: its job is to ASK for a review. What a missing or unanswered review does to the
+# merge is this repository's protection's decision (`Automatic review answered`, where it is required).
+name: Request review on real change
+
+on:
+  pull_request:
+    types: [synchronize]
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  request:
+    uses: Systemorph/MeshWeaver/.github/workflows/node-repo-request-review.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      scripts-ref: main
