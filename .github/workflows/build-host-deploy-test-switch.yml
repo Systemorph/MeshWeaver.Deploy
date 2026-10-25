@@ -12,25 +12,30 @@ name: Build host — deploy, test the deploy, switch latest
 #             the version (`POST /api/builds/probes` with `version`) and waits until a host CLAIMS
 #             one. A host claims only after staging that set, so a claim is the proof the
 #             deployment serves. The PLAN (platform DeployTestSwitchLatest §2 step 3): one run PER
-#             SHARD of core's suite — CI_SHARD_TOTAL, READ from core's dotnet-test.yml — the doc
-#             gate, and each affected dependent's gate. Fewer submitted than planned is red.
-#             🚨 KNOWN LIMITATION (a contract gap): POST /probes carries no shard selector and core
-#             declares no per-shard stage, so `.github/deploy-test-switch.json` holds
-#             `shardStage: null` and the plan is the dependents' gate runs only; every run warns,
-#             by name, that the shards and the doc gate were NOT run on the candidate.
+#             SHARD of core's suite (the stage `test-shard-<k>`), the doc gate (`doc-gate`), and
+#             each affected dependent's gate. Fewer submitted than planned is red.
+#             🚨 The shard count (CI_SHARD_TOTAL in dotnet-test.yml) and the stage names (core's
+#             .github/build-stages.json) are read AT THE CANDIDATE COMMIT — a checkout whose HEAD
+#             the script proves is `core_sha` — never at platform main, whose count may differ.
+#             A plan with core stages needs the set's mw-core-tests image: its digest is waited
+#             for and the deploy event carries it as `coreTestsDigest`.
 #             🚨 `/hosts` has NO `ready` and none is read: control cannot observe pods truthfully
 #             and KEDA scales an idle version to zero (Plugins `Hosting/StandingBuildHosts` §7b).
-#             Not complete, or not claimed, inside the 20-minute deploy window is the deploy
-#             FAILURE: red, torn down, latest unchanged.
+#             A 503 from `/hosts` is the endpoint failing CLOSED on a partial listing — an outage,
+#             retried inside the step's window, never an empty list. A pinned probe refused 409
+#             (the record does not deploy `v/<version>` as a complete set naming it) is the deploy
+#             FAILURE, named. Not complete, or not claimed, inside the 20-minute deploy window is
+#             the deploy FAILURE: red, torn down, latest unchanged.
 #   test      the COMBINED verdict: every planned run must be CLAIMED and then END `succeeded`;
 #             one red, missing, never-claimed or unfinished run holds the switch.
 #   switch    on green, `build-host-switch-requested` naming EVERY run under `runs` (never `run`),
 #             as many as were planned; the receiver re-reads each; re-read: alias latest
 #             must name the candidate (the previous latest becomes alias/previous, retained).
 #   teardown  on red, `build-host-teardown-requested`; re-read: the version is gone, or still held
-#             by retention (`pinned`), which is said by name.
+#             by retention (an alias, `pinned` runs, `caps`), which is said by name.
 #   rollback  by hand (workflow_dispatch): the switch event with `rollback: true`, only to
-#             alias/previous; re-read: alias latest names it.
+#             alias/previous and only while its set is COMPLETE (the receiver refuses an
+#             incomplete one); re-read: alias latest names it.
 #
 # The events, their validation and the hosts reader are `.github/scripts/deploy-test-switch.py`;
 # the receivers are MeshWeaver.Plugins' (P3). 🚨 NEVER TRUST THE INBOX'S 202 — every event is
@@ -65,7 +70,7 @@ on:
         required: false
         type: string
       core_sha:
-        description: deploy-test-switch only — the core commit (40 hex) the shard and doc-gate runs test; needed once those stages are declared.
+        description: deploy-test-switch only — the core commit (40 hex) the shard and doc-gate runs test; the plan is read AT this commit.
         required: false
         type: string
 
@@ -127,7 +132,6 @@ jobs:
           sparse-checkout: |
             .github/scripts
             .github/control-instance.json
-            .github/workflows/dotnet-test.yml
           sparse-checkout-cone-mode: false
       - name: Is deploy → test → switch declared?
         id: decide
@@ -190,6 +194,11 @@ jobs:
               echo "::error::deploy-test-switch needs plugins_sha — the MeshWeaver.Plugins commit (40 hex) the pinned probe tests on the candidate"; exit 1
             fi
           fi
+          # The candidate's core commit is where the plan is READ (CI_SHARD_TOTAL, build-stages.json)
+          # and what the shard and doc-gate runs test — never platform main.
+          if { [ "$EVENT_NAME" = repository_dispatch ] || [ "$IN_ACTION" = deploy-test-switch ]; } && ! printf '%s' "$core_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::deploy-test-switch needs the candidate's core commit (40 hex) — got '${core_sha}'; the plan is read at it"; exit 1
+          fi
           {
             echo "probe_sha=$probe_sha"
             echo "core_sha=$core_sha"
@@ -212,11 +221,21 @@ jobs:
             case "$code" in 2*) [ "$verdict" = verified ] || { echo "::error::the inbox did not VERIFY the signature"; return 1; } ;;
               *) echo "::error::the inbox refused the event (HTTP $code): $(head -c 400 "$RUNNER_TEMP/resp")"; return 1 ;; esac
           }
-          read_hosts() {  # read_hosts <version> → key=value lines; non-zero on an unreadable answer
-            curl -fsS --connect-timeout 10 --max-time 30 "$API/hosts" -o "$RUNNER_TEMP/hosts.json" || { echo "::error::GET $API/hosts failed"; return 1; }
-            python3 deploy/.github/scripts/deploy-test-switch.py hosts --hosts "$RUNNER_TEMP/hosts.json" --version "$1"
+          read_hosts() {  # read_hosts <version> → key=value lines; a 503 outage retried 2 min, any other failure red
+            python3 deploy/.github/scripts/deploy-test-switch.py read --api "$API" --version "$1" --window 120 --poll 10
           }
           SH
+      - name: Check out the CANDIDATE's core commit (the plan is read there, never at main)
+        if: steps.what.outputs.action == 'deploy-test-switch'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PLATFORM_REPO }}
+          ref: ${{ steps.what.outputs.core_sha }}
+          path: candidate
+          sparse-checkout: |
+            .github/workflows/dotnet-test.yml
+            .github/build-stages.json
+          sparse-checkout-cone-mode: false
       - name: Ensure Azure CLI
         if: steps.what.outputs.action == 'deploy-test-switch'
         run: command -v az >/dev/null || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
@@ -242,11 +261,12 @@ jobs:
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/dts.sh"
-          # The PLAN first, before anything is sent: one pinned run per shard (CI_SHARD_TOTAL, read
-          # from core's dotnet-test.yml), the doc gate, each affected dependent's gate. Its
-          # limitations (the shard-selector contract gap) are ::warning:: lines, never silent.
+          # The PLAN first, before anything is sent: one pinned run per shard and the doc gate —
+          # CI_SHARD_TOTAL and the stage names read AT THE CANDIDATE (the script proves the
+          # checkout's HEAD is CORE_SHA and refuses a stage the candidate does not declare) — and
+          # each affected dependent's gate. Its limitations are ::warning:: lines, never silent.
           python3 deploy/.github/scripts/deploy-test-switch.py plan --declaration deploy/.github/deploy-test-switch.json \
-            --dotnet-test platform/.github/workflows/dotnet-test.yml --version "$V" --core-sha "$CORE_SHA" \
+            --candidate candidate --version "$V" --core-sha "$CORE_SHA" \
             --dependent "MeshWeaver.Plugins=$PROBE_SHA" --out "$RUNNER_TEMP/plan.json" > "$RUNNER_TEMP/plan"
           cat "$RUNNER_TEMP/plan" >> "$GITHUB_OUTPUT"
           # ONE deploy window (20 minutes) for every condition, in order: the set's images are
@@ -260,19 +280,26 @@ jobs:
           deadline=$(( $(date +%s) + 1200 ))
           bash platform/.github/scripts/acr-login.sh
           digest() { docker buildx imagetools inspect "$ACR/$1:$V" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"'; }
-          for image in mw-plugin-test memex-portal-ai mw-build-host; do
+          images="mw-plugin-test memex-portal-ai mw-build-host"
+          core_tests_flag=()
+          if [ "$(sed -n 's/^core_tests=//p' "$RUNNER_TEMP/plan")" = required ]; then
+            # The plan runs core's stages, which run from the set's mw-core-tests image: WAITED for
+            # like the others, and the deploy event must carry it.
+            images="$images mw-core-tests"; core_tests_flag=(--core-tests-required)
+          fi
+          for image in $images; do
             until d=$(digest "$image") && [ -n "$d" ]; do
               [ "$(date +%s)" -lt "$deadline" ] || { echo "::error::$ACR/$image:$V was not published within the deploy window — the set is incomplete; nothing was requested"; exit 1; }
               echo "waiting for $ACR/$image:$V to be published"; sleep 30
             done
             printf -v "digest_${image//-/_}" '%s' "$d"
           done
-          # The FIFTH digest (owner decision): mw-core-tests, once the platform builds it — optional,
-          # so it is read once and its absence is not waited for.
-          core_tests=$(digest mw-core-tests || true)
+          # The FIFTH digest (owner decision): mw-core-tests — waited for above when the plan runs
+          # core's stages; otherwise read once, and its absence is not waited for.
+          core_tests=${digest_mw_core_tests:-$(digest mw-core-tests || true)}
           body=$(python3 deploy/.github/scripts/deploy-test-switch.py body deploy --deployment "$DEPLOYMENT" --version "$V" \
             --tester-digest "$digest_mw_plugin_test" --portal-digest "$digest_memex_portal_ai" \
-            --runner-digest "$digest_mw_build_host" --core-tests-digest "$core_tests")
+            --runner-digest "$digest_mw_build_host" --core-tests-digest "$core_tests" "${core_tests_flag[@]}")
           post_event "$body"
           left=$(( deadline - $(date +%s) )); [ "$left" -gt 0 ] || left=1
           python3 deploy/.github/scripts/deploy-test-switch.py wait-complete --api "$API" --version "$V" \
@@ -283,7 +310,7 @@ jobs:
           echo "- deployed \`$V\` as \`$(sed -n 's/^deployment_name=//p' "$RUNNER_TEMP/h")\`: COMPLETE; $(sed -n 's/^submitted=//p' "$RUNNER_TEMP/probes") of $(sed -n 's/^planned=//p' "$RUNNER_TEMP/plan") planned runs submitted pinned to it, and a host CLAIMED probe \`$(sed -n 's/^claimed=//p' "$RUNNER_TEMP/probes")\`" >> "$GITHUB_STEP_SUMMARY"
           shards=$(sed -n 's/^shard_total=//p' "$RUNNER_TEMP/plan")
           if [ "$(jq '.limitations | length' "$RUNNER_TEMP/plan.json")" != 0 ]; then
-            echo "- ⚠️ KNOWN LIMITATION: not everything was planned on the candidate (core's suite has $shards shards, CI_SHARD_TOTAL) — POST /probes carries no shard selector; the ::warning:: lines name what was NOT run" >> "$GITHUB_STEP_SUMMARY"
+            echo "- ⚠️ KNOWN LIMITATION: not everything was planned on the candidate (core's suite has $shards shards, CI_SHARD_TOTAL at the candidate) — the ::warning:: lines name what was NOT run" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: "Test the deployment: the COMBINED verdict over every planned run"
         id: test
@@ -343,7 +370,7 @@ jobs:
           python3 deploy/.github/scripts/deploy-test-switch.py wait-gone --api "$API" --version "$V" \
             --window 240 --poll 10 > "$RUNNER_TEMP/h"
           if [ "$(sed -n 's/^torn_down=//p' "$RUNNER_TEMP/h")" != true ]; then
-            echo "- \`$V\` kept: retention pins it ($(sed -n 's/^pinned=//p' "$RUNNER_TEMP/h"))" >> "$GITHUB_STEP_SUMMARY"
+            echo "- \`$V\` kept: retention holds it ($(sed -n 's/^held_by=//p' "$RUNNER_TEMP/h"))" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "- \`$V\` torn down (no longer listed)" >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -361,6 +388,8 @@ jobs:
           read_hosts "$V" > "$RUNNER_TEMP/h"
           prev=$(sed -n 's/^previous=//p' "$RUNNER_TEMP/h")
           [ "$prev" = "$V" ] || { echo "::error::a rollback goes only to alias/previous ('$prev'), not $V"; exit 1; }
+          # The receiver refuses a rollback to an incomplete set: say so here, before sending.
+          [ "$(sed -n 's/^complete=//p' "$RUNNER_TEMP/h")" = true ] || { echo "::error::alias/previous $V is not a COMPLETE set on the record — the receiver refuses a rollback to it; nothing was sent"; exit 1; }
           post_event "$(python3 deploy/.github/scripts/deploy-test-switch.py body rollback --deployment "$DEPLOYMENT" --version "$V")"
           python3 deploy/.github/scripts/deploy-test-switch.py wait-alias --api "$API" --version "$V" --alias latest \
             --window 240 --poll 10 > "$RUNNER_TEMP/h"

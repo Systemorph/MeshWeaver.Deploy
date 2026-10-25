@@ -23,10 +23,13 @@ caller and executed as System. The shapes below are theirs, copied — change bo
 
 🚨 NEVER TRUST THE INBOX'S 202. Every event is followed by a re-read of `GET /api/builds/hosts`
 (anonymous): `{"aliases":{"latest","candidate","previous"},"versions":[{"version",
-"deploymentName","complete","maxReplicas","aliases":[…],"pinned":N, …}]}` (MeshWeaver.Plugins
+"deploymentName","complete","maxReplicas","aliases":[…],"pinned":N,"caps":N, …}]}` (MeshWeaver.Plugins
 `Hosting/StandingBuildHosts` §7b). A version is LISTED once its `v/` entry is written and COMPLETE
-once the record holds its full set, so the chart renders its Deployment. An answer this reader
-cannot read is RED, never "not yet".
+once the record holds its full set, so the chart renders its Deployment. `pinned` counts the queued
+or running attempts pinned to the version, `caps` the package caps that need it (`cappedBy`, the
+names, only for the worker token — never read here). An answer this reader cannot read is RED,
+never "not yet" — with ONE exception: a 503 is the endpoint failing CLOSED on a listing it could
+not read completely, an OUTAGE, retried inside the step's window and never read as an empty list.
 
 🚨 THERE IS NO `ready`, AND NONE IS READ. The control instance cannot observe pods truthfully, and
 KEDA scales an idle version to ZERO, so "is a pod up" is not a question `/hosts` answers. What
@@ -38,22 +41,26 @@ proves a host is up AND staged is a CLAIM: a host claims only after staging its 
               dependent's gate run. 1–32 runs (the switch receiver's bound); zero is refused.
     deploy  = request → wait until `/hosts` lists the version `complete: true` → submit EVERY
               planned run as a probe PINNED to the version (`POST /api/builds/probes` with
-              `version`) → wait until a host CLAIMS one. Fewer submitted than planned is red; not
-              complete, or nothing claimed, inside the deploy window is the deploy FAILURE: red,
-              the candidate is torn down, and `latest` does not move (§7).
+              `version`) → wait until a host CLAIMS one. Fewer submitted than planned is red; a
+              probe refused 409 (the record does not deploy `v/<version>` as a complete set naming
+              it) is the deploy FAILURE, named; not complete, or nothing claimed, inside the deploy
+              window is the deploy FAILURE: red, the candidate is torn down, and `latest` does not
+              move (§7).
     test    = the COMBINED verdict: every planned run must be CLAIMED and then END `succeeded`.
               One red, missing, never-claimed or unfinished run holds the switch. The switch names
               every run under `runs`, and its receiver re-reads each one (Succeeded, every stage
               Succeeded, pinned to the version) and never trusts this job.
 
-🚨 KNOWN LIMITATION — A CONTRACT GAP. `POST /probes` (Plugins §7a/§7b) takes `repo`, `sha`,
-`channel`, `stages` and `version` and NO shard selector, and core declares no per-shard stage
-(`.github/build-stages.json` does not exist yet, DeployTestSwitchLatest §8 P4). A shard can
-therefore only be selected as a STAGE, and there is none to name. Until there is,
-`.github/deploy-test-switch.json` declares `shardStage: null` and `docGateStage: null`: the plan
-holds the dependents' gate runs only, and every run says, as a `::warning::`, that the
-CI_SHARD_TOTAL shards and the doc gate were NOT run on the candidate. Declaring `shardStage`
-(e.g. `test-shard-{shard}`, shards 0-based as in `dotnet-test.yml`) turns the per-shard runs on.
+THE SHARDS ARE STAGES. `POST /probes` (Plugins §7a/§7b) carries no shard selector, so a shard is
+selected as a STAGE: core's `.github/build-stages.json` declares `test-shard-0..N-1` (generated
+from CI_SHARD_TOTAL) and `doc-gate`, and `.github/deploy-test-switch.json` names them
+(`shardStage: "test-shard-{shard}"`, `docGateStage: "doc-gate"`). 🚨 Both are read AT THE CANDIDATE
+COMMIT (`plan --candidate <core checkout>`, whose HEAD must BE `--core-sha`): the shard count and the
+stage names of platform `main` may differ from the commit the probes test, and a plan built from
+the wrong commit would omit a shard or name a stage the candidate does not have. A declared stage
+the candidate's build-stages.json does not list is refused before anything is sent. A plan with
+core stages needs the set's `mw-core-tests` image (the stages run from it), so its deploy event
+must carry `coreTestsDigest`. A `null` declaration still means the gap and still warns by name.
 
 🚨 SWITCHED OFF UNTIL DECLARED. `.github/deploy-test-switch.json` `enabled: false` (the shipped
 value): the workflow writes one summary line and sends nothing. It is turned on only once the
@@ -62,7 +69,8 @@ receivers (P3c) are deployed on the control instance.
     deploy-test-switch.py decide --declaration .github/deploy-test-switch.json
         → GITHUB_OUTPUT lines enabled=, why=
     deploy-test-switch.py body deploy --deployment control --version 3.1.N --tester-digest sha256:… \\
-        --portal-digest sha256:… --runner-digest sha256:… [--core-tests-digest sha256:…] [--reason candidate]
+        --portal-digest sha256:… --runner-digest sha256:… [--core-tests-digest sha256:…] [--core-tests-required] \\
+        [--reason candidate]
     deploy-test-switch.py body switch --deployment control --version 3.1.N --runs-file runs.json --planned N
     deploy-test-switch.py body rollback --deployment control --version 3.1.N
     deploy-test-switch.py body teardown --deployment control --version 3.1.N
@@ -75,11 +83,13 @@ receivers (P3c) are deployed on the control instance.
         → the hosts lines once the alias names the version (after a switch or rollback: the 202 is
           the inbox ACCEPTING the event, not the action having run); exit 1 when the window passes first
     deploy-test-switch.py wait-gone --api … --version 3.1.N --window S
-        → torn_down=true once unlisted, or torn_down=false pinned=N when retention still holds it at
-          the window's end; exit 1 when it is still listed and nothing pins it
-    deploy-test-switch.py plan --declaration … --dotnet-test <core>/.github/workflows/dotnet-test.yml \\
-        --version 3.1.N [--core-sha <40 hex>] --dependent MeshWeaver.Plugins=<40 hex> … --out plan.json
-        → planned=, shard_total=; every limitation as a ::warning:: on stderr
+        → torn_down=true once unlisted, or torn_down=false pinned=N caps=N held_by=… when retention
+          still holds it at the window's end; exit 1 when it is still listed and nothing holds it
+    deploy-test-switch.py read --api … --version 3.1.N --window S
+        → the hosts lines (a 503 outage is retried inside the window; any other non-200 is red at once)
+    deploy-test-switch.py plan --declaration … --candidate <core checkout AT --core-sha> \\
+        --version 3.1.N --core-sha <40 hex> --dependent MeshWeaver.Plugins=<40 hex> … --out plan.json
+        → planned=, shard_total=, core_tests=required|none; every limitation as a ::warning:: on stderr
     deploy-test-switch.py probes-submit --api … --plan plan.json --out runs.json --window S  (token: $MW_PROBE_TOKEN)
         → planned=, submitted=, claimed= once a host CLAIMED one; exit 1 on a short submission or no claim
     deploy-test-switch.py probes-verdict --api … --runs runs.json --planned N --out verdict.json --window S
@@ -199,7 +209,7 @@ def _runs(runs: list[str] | None, planned: int) -> list[str]:
 
 def body(kind: str, *, deployment: str, version: str, tester_digest: str = "", portal_digest: str = "",
          runner_digest: str = "", core_tests_digest: str = "", reason: str = "candidate", run: str = "",
-         runs: list[str] | None = None, planned: int = 0) -> dict:
+         runs: list[str] | None = None, planned: int = 0, core_tests_required: bool = False) -> dict:
     """One event, every field validated. Key order is the wire order: `event` first."""
     dep, ver = _record(deployment), _version(version)
     if kind == "deploy":
@@ -208,6 +218,12 @@ def body(kind: str, *, deployment: str, version: str, tester_digest: str = "", p
         ev = {"event": "build-host-deploy-requested", "deployment": dep, "version": ver,
               "testerDigest": _digest("tester", tester_digest), "portalDigest": _digest("portal", portal_digest),
               "runnerDigest": _digest("runner", runner_digest)}
+        # The set names a core-tests image EXACTLY when the plan runs core's stages from it: a host
+        # presents `coreTestsDigest` only when the set names one, and a shard stage on a set with
+        # none would have no /core-tests to run.
+        if core_tests_required and not core_tests_digest:
+            raise Refusal("the plan runs core's stages on the candidate, which run from the set's mw-core-tests image — "
+                          "the deploy event must name its coreTestsDigest, and none was given")
         if core_tests_digest:
             ev["coreTestsDigest"] = _digest("core-tests", core_tests_digest)
         ev["reason"] = reason
@@ -333,13 +349,36 @@ def _api(api: str) -> str:
     return base
 
 
+def get_hosts(base: str, deadline: float, poll: float) -> object:
+    """GET /hosts. A 503 is the endpoint failing CLOSED on a listing it could not read completely
+    (Plugins §7b): an OUTAGE, retried until `deadline` and NEVER read as an empty list — "nothing
+    listed" would read as torn down, or as a version never deployed. Every other non-200, a curl
+    failure, and a 200 that is not JSON is a Refusal at once."""
+    while True:
+        status, text = http("GET", f"{base}/hosts")
+        if status != 503:
+            return _json(status, text, what=f"GET {base}/hosts")
+        if time.monotonic() >= deadline:
+            raise Refusal(f"GET {base}/hosts answered 503 until the window ended — the control instance could not read "
+                          f"the sets completely (fail closed): an OUTAGE, so nothing about the version is known: {text[:200]}")
+        say(f"GET {base}/hosts answered 503 (a partial listing, refused fail closed) — an outage, retrying")
+        time.sleep(poll)
+
+
+def read_once(api: str, version: str, window: float, poll: float) -> dict:
+    """One verdict-grade read of the hosts for `version` (a 503 outage retried inside `window`)."""
+    base, version = _api(api), _version(version)
+    return read_hosts(get_hosts(base, time.monotonic() + window, poll), version)
+
+
 def wait_complete(api: str, version: str, window: float, poll: float) -> dict:
     """Polls GET /hosts until `version` is listed COMPLETE. The window passing first is a Refusal
-    naming which half it never reached; an unreadable answer is a Refusal at once."""
+    naming which half it never reached; an unreadable answer is a Refusal at once (a 503 is an
+    outage, retried inside the same window)."""
     base, version = _api(api), _version(version)
     deadline = time.monotonic() + window
     while True:
-        out = read_hosts(_json(*http("GET", f"{base}/hosts"), what=f"GET {base}/hosts"), version)
+        out = read_hosts(get_hosts(base, deadline, poll), version)
         if out["complete"] == "true":
             return out
         if time.monotonic() >= deadline:
@@ -357,7 +396,7 @@ def wait_alias(api: str, version: str, alias: str, window: float, poll: float) -
         raise Refusal(f"alias {alias!r} is not one of {ALIASES}")
     deadline = time.monotonic() + window
     while True:
-        out = read_hosts(_json(*http("GET", f"{base}/hosts"), what=f"GET {base}/hosts"), version)
+        out = read_hosts(get_hosts(base, deadline, poll), version)
         if out[alias] == version:
             return out
         if time.monotonic() >= deadline:
@@ -367,23 +406,38 @@ def wait_alias(api: str, version: str, alias: str, window: float, poll: float) -
         time.sleep(poll)
 
 
+def _count(entry: dict, key: str) -> int:
+    v = entry.get(key, 0)
+    if v is None:
+        return 0
+    if type(v) is not int or v < 0:
+        raise Refusal(f"version {entry.get('version')} carries `{key}` {v!r}, which is not a count")
+    return v
+
+
 def wait_gone(api: str, version: str, window: float, poll: float) -> dict:
     """After a teardown: polls GET /hosts until `version` is no longer listed. Still listed when the
-    window passes is retention only if something PINS it (said by name), else a Refusal."""
+    window passes is RETENTION only if the listing says what holds it — an alias naming it, queued
+    or running attempts pinned to it (`pinned`), package caps that need it (`caps`) — said by
+    name; listed with nothing holding it is a Refusal."""
     base, version = _api(api), _version(version)
     deadline = time.monotonic() + window
     while True:
-        doc = _json(*http("GET", f"{base}/hosts"), what=f"GET {base}/hosts")
+        doc = get_hosts(base, deadline, poll)
         out = read_hosts(doc, version)
         if out["listed"] == "false":
-            return {**out, "torn_down": "true", "pinned": "0"}
+            return {**out, "torn_down": "true", "pinned": "0", "caps": "0", "held_by": ""}
         if time.monotonic() >= deadline:
             entry = next(v for v in doc["versions"] if v["version"] == version)
-            pinned = entry.get("pinned")
-            if type(pinned) is int and pinned > 0:
-                return {**out, "torn_down": "false", "pinned": str(pinned)}
+            pinned, caps = _count(entry, "pinned"), _count(entry, "caps")
+            aliases = [a for a in ALIASES if out[a] == version]
+            held = ([f"alias/{a}" for a in aliases] + ([f"{pinned} pinned run(s)"] if pinned else [])
+                    + ([f"{caps} package cap(s)"] if caps else []))
+            if held:
+                return {**out, "torn_down": "false", "pinned": str(pinned), "caps": str(caps), "held_by": ", ".join(held)}
             raise Refusal(f"build-{version} is still listed {int(window)}s after the teardown was accepted and nothing "
-                          "pins it — the teardown did not happen; read the BuildHostTeardown InstanceAction")
+                          "holds it (no alias, pinned 0, caps 0) — the teardown did not happen; read the "
+                          "BuildHostTeardown InstanceAction")
         time.sleep(poll)
 
 
@@ -403,8 +457,32 @@ def shard_total(text: str, where: str = "dotnet-test.yml") -> int:
     return int(raw)
 
 
+def candidate(checkout: Path, core_sha: str) -> tuple[int, set[str] | None]:
+    """Core's CI_SHARD_TOTAL and declared stage names, read from a checkout whose HEAD IS the
+    candidate commit `core_sha` — never from platform `main`, whose shard count and stages can
+    differ from the commit the probes test. A checkout at any other commit is a Refusal. The
+    stages are None when the candidate declares no build-stages.json at all."""
+    if not SHA.fullmatch(core_sha or ""):
+        raise Refusal(f"core sha {core_sha!r} is not a full 40-hex commit — the plan is read at the candidate commit")
+    head = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"], capture_output=True, text=True)
+    if head.returncode != 0 or head.stdout.strip() != core_sha:
+        raise Refusal(f"{checkout} is at {head.stdout.strip() or 'no commit'!r}, not the candidate {core_sha} — "
+                      "CI_SHARD_TOTAL and the stages are read AT THE CANDIDATE, never at another commit")
+    dt = checkout / ".github" / "workflows" / "dotnet-test.yml"
+    shards = shard_total(dt.read_text(), f"{dt} @ {core_sha[:12]}")
+    bs = checkout / ".github" / "build-stages.json"
+    if not bs.exists():
+        return shards, None
+    doc = json.loads(bs.read_text())
+    rows = doc.get("stages") if isinstance(doc, dict) else None
+    if not isinstance(rows, list) or not all(isinstance(r, dict) and isinstance(r.get("name"), str) for r in rows):
+        raise Refusal(f"{bs} @ {core_sha[:12]} carries no `stages` list of named stages")
+    return shards, {r["name"] for r in rows}
+
+
 def plan(declaration: dict, *, shards: int, version: str, core_sha: str, dependents: list[tuple[str, str]],
-         core_repo: str = "MeshWeaver", channel: str = "latest", dependents_complete: bool = False) -> dict:
+         core_repo: str = "MeshWeaver", channel: str = "latest", dependents_complete: bool = False,
+         core_stages: set[str] | None = None, core_stages_read: bool = False) -> dict:
     """The candidate's runs (DeployTestSwitchLatest §2 step 3): one PINNED run per shard, the doc
     gate, each affected dependent's gate. Returns {"runs": [...], "limitations": [...]}."""
     _version(version)
@@ -436,6 +514,11 @@ def plan(declaration: dict, *, shards: int, version: str, core_sha: str, depende
             raise Refusal(f"dependent {repo} is named twice")
         seen.add(repo)
         runs.append({"role": f"{repo} gate", "repo": repo, "sha": sha, "stages": []})
+    if core_stages_read:  # every core stage planned must exist AT THE CANDIDATE
+        missing = [s for r in runs if r["repo"] == core_repo for s in r["stages"] if s not in (core_stages or set())]
+        if missing:
+            raise Refusal(f"the candidate's .github/build-stages.json does not declare {missing} — a probe naming a "
+                          "stage the candidate does not have can never be green; the plan is refused before anything is sent")
     if not runs:
         raise Refusal("the plan holds no run — a candidate nothing tested is never switched")
     if len(runs) > MAX_RUNS:
@@ -443,13 +526,22 @@ def plan(declaration: dict, *, shards: int, version: str, core_sha: str, depende
     for r in runs:  # every run's probe body validates now, before anything is sent
         probe_body(repo=r["repo"], sha=r["sha"], channel=channel, version=version, stages=r["stages"])
         r["channel"], r["version"] = channel, version
-    return {"runs": runs, "limitations": limitations}
+    core_tests = any(r["repo"] == core_repo and r["stages"] for r in runs)
+    return {"runs": runs, "limitations": limitations, "coreTests": "required" if core_tests else "none"}
 
 
 def _submit(base: str, token: str, run: dict) -> dict:
     """POST one pinned probe → the run as followed: role, repo, sha, channel, stage, probe, path."""
     pb = probe_body(repo=run["repo"], sha=run["sha"], channel=run["channel"], version=run["version"], stages=run["stages"])
     status, raw = http("POST", f"{base}/probes", token=token, data=json.dumps(pb, separators=(",", ":")))
+    if status == 409:
+        # Plugins §7b: a pinned probe is admitted only while the record deploys `v/<version>` as a
+        # COMPLETE set naming that version (read from its owning node, fail closed). A 409 after
+        # `complete` was read is the deploy FAILING — torn down, redeployed with another set, or the
+        # record unreadable — never a reason to resubmit.
+        raise Refusal(f"the deploy FAILED: POST {base}/probes ({run['role']}) was refused 409 — the record does not "
+                      f"deploy v/{pb['version']} as a complete set naming {pb['version']} (torn down, redeployed with "
+                      f"another set, or unreadable); the answer: {raw[:300]}")
     if status != 202:
         raise Refusal(f"POST {base}/probes ({run['role']}) answered HTTP {status or 'nothing (curl failed)'}: {raw[:300]}")
     try:
@@ -489,11 +581,18 @@ def probes_submit(api: str, token: str, plan_: dict, window: float, poll: float)
     planned = plan_.get("runs") if isinstance(plan_, dict) else None
     if not isinstance(planned, list) or not planned:
         raise Refusal("the plan holds no runs")
-    runs = [_submit(base, token, r) for r in planned]
+    # The window starts BEFORE the submissions: up to 32 sequential POSTs are part of the deploy's
+    # budget, never added on top of it (each is bounded by curl's --max-time).
+    deadline = time.monotonic() + window
+    runs = []
+    for r in planned:
+        if time.monotonic() >= deadline:
+            raise Refusal(f"the deploy window ({int(window)}s) ended after {len(runs)} of {len(planned)} submissions — "
+                          "a missing run is red")
+        runs.append(_submit(base, token, r))
     paths = [r["path"] for r in runs]
     if len(runs) < len(planned) or len(set(paths)) != len(paths):
         raise Refusal(f"{len(set(paths))} distinct run(s) submitted for {len(planned)} planned — a missing run is red")
-    deadline = time.monotonic() + window
     while True:
         states = {}
         for r in runs:
@@ -605,7 +704,13 @@ def self_test() -> int:
             return
         if refused:
             fails.append(f"{name}: accepted {got!r}")
-        elif want is not None and not want(got):
+            return
+        try:  # a predicate that cannot read the answer is a failure of that case, never a crashed run
+            ok = want is None or want(got)
+        except Exception as e:
+            fails.append(f"{name}: {type(e).__name__}: {e} reading {got!r}")
+            return
+        if not ok:
             fails.append(f"{name}: {got!r}")
 
     dep = dict(deployment="control", version="3.1.10412", tester_digest=d("1"), portal_digest=d("2"), runner_digest=d("3"))
@@ -615,6 +720,10 @@ def self_test() -> int:
     check("deploy with the 5th digest", lambda: body("deploy", core_tests_digest=d("4"), **dep),
           lambda b: b["coreTestsDigest"] == d("4"))
     check("deploy for a cap", lambda: body("deploy", reason="cap:Acme.Pkg", **dep), lambda b: b["reason"] == "cap:Acme.Pkg")
+    check("a plan running core's stages carries coreTestsDigest",
+          lambda: body("deploy", core_tests_digest=d("4"), core_tests_required=True, **dep), lambda b: b["coreTestsDigest"] == d("4"))
+    check("NEGATIVE: a plan running core's stages with NO coreTestsDigest is refused — the stages would have no /core-tests",
+          lambda: body("deploy", core_tests_required=True, **dep), refused=True, says="coreTestsDigest")
     check("a record path is kept", lambda: body("teardown", deployment="Deployments/control", version="3.1.1"),
           lambda b: b == {"event": "build-host-teardown-requested", "deployment": "Deployments/control", "version": "3.1.1"})
     R3 = ["Hosting/Builds/MeshWeaver/r-1", "Hosting/Builds/MeshWeaver/r-2", "Hosting/Builds/MeshWeaver.Plugins/r-3"]
@@ -675,10 +784,12 @@ def self_test() -> int:
                        dependents_complete=True),
           lambda p: len(p["runs"]) == 10 and [r["stages"] for r in p["runs"][:8]] == [[f"test-shard-{k}"] for k in range(8)]
           and p["runs"][8]["stages"] == ["doc-gate"] and p["runs"][9]["repo"] == "MeshWeaver.Plugins"
-          and all(r["version"] == "3.1.1" and r["sha"] == core_sha for r in p["runs"][:9]) and p["limitations"] == [])
+          and all(r["version"] == "3.1.1" and r["sha"] == core_sha for r in p["runs"][:9]) and p["limitations"] == []
+          and p["coreTests"] == "required")
     check("KNOWN LIMITATION: with no shard selector the plan is the dependents' runs, and says what it did not run",
           lambda: plan(off, shards=8, version="3.1.1", core_sha="", dependents=[("MeshWeaver.Plugins", plug_sha)]),
           lambda p: len(p["runs"]) == 1 and len(p["limitations"]) == 3 and "the 8 shards" in p["limitations"][0]
+          and p["coreTests"] == "none"
           and "doc gate" in p["limitations"][1] and "satellites' gates are NOT run" in p["limitations"][2])
     check("an affected-dependents set not known to be complete is named as a limitation, never silent",
           lambda: plan(on, shards=2, version="3.1.1", core_sha=core_sha, dependents=[("MeshWeaver.Plugins", plug_sha)]),
@@ -694,6 +805,43 @@ def self_test() -> int:
     check("a dependent with a short sha is refused before anything is sent",
           lambda: plan(off, shards=8, version="3.1.1", core_sha="", dependents=[("R", "abc")]), refused=True, says="40-hex")
     check("refuses an unknown kind", lambda: body("promote", deployment="control", version="3.1.1"), refused=True)
+
+    # ── the plan is read AT THE CANDIDATE: a real git checkout, two commits that disagree ──
+    with tempfile.TemporaryDirectory() as core:
+        def git(*a):
+            return subprocess.run(["git", "-C", core, "-c", "user.name=t", "-c", "user.email=t@example.com",
+                                   "-c", "commit.gpgsign=false", *a], capture_output=True, text=True, check=True).stdout.strip()
+
+        def commit(total: int, stages: list[str]) -> str:
+            Path(core, ".github", "workflows").mkdir(parents=True, exist_ok=True)
+            Path(core, ".github", "workflows", "dotnet-test.yml").write_text(f"env:\n  CI_SHARD_TOTAL: {total}\njobs: {{}}\n")
+            Path(core, ".github", "build-stages.json").write_text(json.dumps({"stages": [{"name": n} for n in stages]}))
+            git("add", "-A")
+            git("commit", "-q", "-m", f"{total} shards")
+            return git("rev-parse", "HEAD")
+        git("init", "-q")
+        eight = [f"test-shard-{k}" for k in range(8)] + ["doc-gate"]
+        old = commit(8, eight)
+        new = commit(4, [f"test-shard-{k}" for k in range(4)] + ["doc-gate"])
+        check("the candidate's CI_SHARD_TOTAL and stages are read at ITS commit", lambda: candidate(Path(core), new),
+              lambda r: r[0] == 4 and "test-shard-3" in r[1] and "test-shard-4" not in r[1])
+        check("NEGATIVE CONTROL: a checkout at ANOTHER commit (platform main, not the candidate) is refused",
+              lambda: candidate(Path(core), old), refused=True, says="not the candidate")
+        check("a candidate that is not a 40-hex sha is refused", lambda: candidate(Path(core), "main"), refused=True)
+
+        def plan_at(sha):
+            n, st = candidate(Path(core), sha)
+            return plan(on, shards=n, version="3.1.1", core_sha=sha, dependents=[], core_stages=st, core_stages_read=True)
+        check("the plan follows the candidate: 4 shards there plan 4 shard runs and the doc gate",
+              lambda: plan_at(new), lambda p: [r["stages"][0] for r in p["runs"]] == [f"test-shard-{k}" for k in range(4)] + ["doc-gate"])
+        commit(8, [f"test-shard-{k}" for k in range(7)] + ["doc-gate"])
+        check("NEGATIVE: a shard the candidate's build-stages.json does not declare is refused before anything is sent",
+              lambda: plan_at(git("rev-parse", "HEAD")), refused=True, says="does not declare ['test-shard-7']")
+        Path(core, ".github", "build-stages.json").unlink()
+        git("add", "-A")
+        git("commit", "-q", "-m", "no stages")
+        check("a candidate declaring NO build-stages.json plans no core stage (refused, named)",
+              lambda: plan_at(git("rev-parse", "HEAD")), refused=True, says="does not declare")
 
     # ── the hosts reader: `complete`, never `ready` ──
     def row(v, complete, **extra):
@@ -778,9 +926,23 @@ def self_test() -> int:
             scenario([{"method": "GET", "match": "/hosts", "answers": [[200, hosts_doc(row(V, None, ready=True))]]}])
             check("NEGATIVE: a version that only says `ready: true` never completes — red when the window passes",
                   lambda: wait_complete(api, V, window=0.1, poll=0.02), refused=True, says="did not become complete")
-            log = scenario([{"method": "GET", "match": "/hosts", "answers": [[503, "{}"]]}])
-            check("an unreadable /hosts is red at once, never a wait",
-                  lambda: wait_complete(api, V, window=5, poll=0.01), refused=True, says="HTTP 503")
+            log = scenario([{"method": "GET", "match": "/hosts", "answers": [
+                [503, {"error": "a set could not be read"}], [503, "{}"], [200, hosts_doc(row(V, True))]]}])
+            check("a 503 (a PARTIAL listing, failed closed) is an OUTAGE: retried inside the window, then the answer",
+                  lambda: wait_complete(api, V, window=5, poll=0.01), lambda o: o["complete"] == "true" and len(calls(log)) == 3)
+            scenario([{"method": "GET", "match": "/hosts", "answers": [[503, "{}"]]}])
+            check("NEGATIVE: a 503 that outlasts the window is red, named an OUTAGE — never 'not complete yet'",
+                  lambda: wait_complete(api, V, window=0.1, poll=0.02), refused=True, says="an OUTAGE")
+            scenario([{"method": "GET", "match": "/hosts", "answers": [[503, "{}"]]}])
+            check("NEGATIVE CONTROL: a 503 is NEVER an empty listing — wait-gone does not report a teardown through it",
+                  lambda: wait_gone(api, V, window=0.1, poll=0.02), refused=True, says="an OUTAGE")
+            log = scenario([{"method": "GET", "match": "/hosts", "answers": [[500, "{}"], [200, hosts_doc(row(V, True))]]}])
+            check("any OTHER non-200 /hosts is red at once, never a wait",
+                  lambda: wait_complete(api, V, window=5, poll=0.01), refused=True, says="HTTP 500")
+            check("… after exactly one read", lambda: calls(log), lambda c: len(c) == 1)
+            scenario([{"method": "GET", "match": "/hosts", "answers": [[200, []]]}])
+            check("a 200 that is not a listing is red at once", lambda: wait_complete(api, V, window=5, poll=0.01),
+                  refused=True, says="not an object")
             scenario([{"method": "GET", "match": "/hosts", "answers": [[0, ""]]}])
             check("a /hosts curl cannot reach is red", lambda: wait_complete(api, V, window=5, poll=0.01),
                   refused=True, says="curl failed")
@@ -796,19 +958,34 @@ def self_test() -> int:
             scenario([{"method": "GET", "match": "/hosts", "answers": [[200, aliased("3.1.10400", row(V, True))]]}])
             check("NEGATIVE: an alias that never moves is red, and says latest is UNVERIFIED",
                   lambda: wait_alias(api, V, "latest", window=0.1, poll=0.02), refused=True, says="UNVERIFIED")
-            scenario([{"method": "GET", "match": "/hosts", "answers": [[200, aliased("3.1.10400")], [503, "{}"]]}])
+            scenario([{"method": "GET", "match": "/hosts", "answers": [[200, aliased("3.1.10400")], [404, "{}"]]}])
             check("an unreadable /hosts during the read-back is red at once, never a wait",
-                  lambda: wait_alias(api, V, "latest", window=5, poll=0.01), refused=True, says="HTTP 503")
+                  lambda: wait_alias(api, V, "latest", window=5, poll=0.01), refused=True, says="HTTP 404")
+            log = scenario([{"method": "GET", "match": "/hosts", "answers": [
+                [503, "{}"], [200, aliased(V, row(V, True))]]}])
+            check("a 503 during the read-back is an outage, retried — latest then read",
+                  lambda: wait_alias(api, V, "latest", window=5, poll=0.01), lambda o: o["latest"] == V and len(calls(log)) == 2)
             log = scenario([{"method": "GET", "match": "/hosts", "answers": [
                 [200, aliased("3.1.10400", row(V, False))], [200, aliased("3.1.10400")]]}])
             check("wait-gone waits until the version is no longer listed",
                   lambda: wait_gone(api, V, window=5, poll=0.01), lambda o: o["torn_down"] == "true" and len(calls(log)) == 2)
             scenario([{"method": "GET", "match": "/hosts", "answers": [[200, aliased("3.1.10400", row(V, True, pinned=2))]]}])
             check("a version still listed when the window passes is KEPT only because something pins it, said by count",
-                  lambda: wait_gone(api, V, window=0.1, poll=0.02), lambda o: o["torn_down"] == "false" and o["pinned"] == "2")
+                  lambda: wait_gone(api, V, window=0.1, poll=0.02),
+                  lambda o: o["torn_down"] == "false" and o["pinned"] == "2" and o["held_by"] == "2 pinned run(s)")
+            scenario([{"method": "GET", "match": "/hosts", "answers": [[200, aliased("3.1.10400", row(V, True, caps=1))]]}])
+            check("… or because a package CAP needs it (`caps`, the anonymous count), said by count",
+                  lambda: wait_gone(api, V, window=0.1, poll=0.02),
+                  lambda o: o["torn_down"] == "false" and o["caps"] == "1" and o["held_by"] == "1 package cap(s)")
+            scenario([{"method": "GET", "match": "/hosts", "answers": [[200, aliased(V, row(V, True))]]}])
+            check("… or because an alias names it",
+                  lambda: wait_gone(api, V, window=0.1, poll=0.02), lambda o: o["torn_down"] == "false" and o["held_by"] == "alias/latest")
             scenario([{"method": "GET", "match": "/hosts", "answers": [[200, aliased("3.1.10400", row(V, True))]]}])
-            check("NEGATIVE: still listed and nothing pins it — the teardown did not happen, red",
-                  lambda: wait_gone(api, V, window=0.1, poll=0.02), refused=True, says="nothing pins it")
+            check("NEGATIVE: still listed and nothing holds it — the teardown did not happen, red",
+                  lambda: wait_gone(api, V, window=0.1, poll=0.02), refused=True, says="nothing holds it")
+            scenario([{"method": "GET", "match": "/hosts", "answers": [[200, aliased("3.1.10400", row(V, True, caps="1"))]]}])
+            check("a `caps` that is not a count is red, never read as zero",
+                  lambda: wait_gone(api, V, window=0.1, poll=0.02), refused=True, says="not a count")
 
             # A plan of THREE runs (two shards, one dependent) — the per-shard shape, through a fake curl.
             p3 = plan({"enabled": True, "shardStage": "test-shard-{shard}", "docGateStage": None}, shards=2, version=V,
@@ -854,6 +1031,17 @@ def self_test() -> int:
             scenario([{"method": "POST", "match": "/probes", "answers": submits}, *pages([[200, {"runState": "unobserved"}]])])
             check("a probe that ended before any claim is red", lambda: probes_submit(api, "t", p3, window=5, poll=0.01),
                   refused=True, says="before any host claimed")
+            log = scenario([{"method": "POST", "match": "/probes", "answers": [
+                submits[0], [409, {"error": "version 3.1.10412 is not deployed as a complete set"}]]}])
+            check("NEGATIVE: a pinned probe refused 409 is the deploy FAILING — red at once, naming the reason",
+                  lambda: probes_submit(api, "t", p3, window=5, poll=0.01), refused=True,
+                  says="the deploy FAILED: POST https://control.example.com/api/builds/probes (shard 1/2) was refused 409")
+            check("… the receiver's own reason is carried, and nothing is resubmitted or read",
+                  lambda: calls(log), lambda c: len(c) == 2 and all(x["method"] == "POST" for x in c))
+            log = scenario([{"method": "POST", "match": "/probes", "answers": submits}])
+            check("the deploy window counts the submissions: a window already spent submits nothing",
+                  lambda: probes_submit(api, "t", p3, window=0, poll=0.01), refused=True, says="ended after 0 of 3")
+            check("… and nothing was sent", lambda: calls(log), lambda c: c == [])
             scenario([{"method": "POST", "match": "/probes", "answers": [[403, {"error": "only a global administrator"}]]}])
             check("a refused probe submission is red, naming the answer", lambda: probes_submit(api, "t", p3, window=5, poll=0.01),
                   refused=True, says="HTTP 403")
@@ -939,15 +1127,41 @@ def self_test() -> int:
                     os.path.join(files, "verdict.json"), "--planned", "3", "--run", subs[0]["path"])
             check("CLI: `--run` beside `--runs-file` → exit 1, never sent",
                   lambda: p, lambda p: p.returncode == 1 and p.stdout == "" and "never both" in p.stderr)
-            Path(files, "core").mkdir()
-            Path(files, "core", "dotnet-test.yml").write_text(dotnet_test)
+            cdir = os.path.join(files, "core")
+            Path(cdir, ".github", "workflows").mkdir(parents=True)
+            Path(cdir, ".github", "workflows", "dotnet-test.yml").write_text(dotnet_test)
+            Path(cdir, ".github", "build-stages.json").write_text(json.dumps(
+                {"stages": [{"name": f"test-shard-{k}"} for k in range(8)] + [{"name": "doc-gate"}]}))
+            gitc = ["git", "-C", cdir, "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"]
+            subprocess.run([*gitc, "init", "-q"], check=True)
+            subprocess.run([*gitc, "add", "-A"], check=True)
+            subprocess.run([*gitc, "commit", "-q", "-m", "core"], check=True)
+            csha = subprocess.run([*gitc, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+            shipped = str(Path(__file__).resolve().parents[1] / "deploy-test-switch.json")
+            p = cli("plan", "--declaration", shipped, "--candidate", cdir, "--core-sha", csha, "--version", V,
+                    "--dependent", f"MeshWeaver.Plugins={sha}", "--out", os.path.join(files, "p.json"))
+            check("CLI plan (the SHIPPED declaration, read at the candidate): 8 shards + doc gate + Plugins = 10, core tests required",
+                  lambda: p, lambda p: p.returncode == 0
+                  and {"planned=10", "shard_total=8", "core_tests=required"} <= set(p.stdout.splitlines())
+                  and "contract gap" not in p.stderr)
+            p = cli("plan", "--declaration", shipped, "--candidate", cdir, "--core-sha", "d" * 40, "--version", V,
+                    "--dependent", f"MeshWeaver.Plugins={sha}", "--out", os.path.join(files, "p.json"))
+            check("CLI plan: a checkout that is not the candidate → exit 1, nothing on stdout",
+                  lambda: p, lambda p: p.returncode == 1 and p.stdout == "" and "not the candidate" in p.stderr)
             Path(files, "decl.json").write_text(json.dumps(off))
-            p = cli("plan", "--declaration", os.path.join(files, "decl.json"), "--dotnet-test",
-                    os.path.join(files, "core", "dotnet-test.yml"), "--version", V, "--dependent", f"MeshWeaver.Plugins={sha}",
-                    "--out", os.path.join(files, "p.json"))
-            check("CLI plan (the shipped gap): planned=1, shard_total=8 READ, the limitation a ::warning::",
-                  lambda: p, lambda p: p.returncode == 0 and {"planned=1", "shard_total=8"} <= set(p.stdout.splitlines())
+            p = cli("plan", "--declaration", os.path.join(files, "decl.json"), "--candidate", cdir, "--core-sha", csha,
+                    "--version", V, "--dependent", f"MeshWeaver.Plugins={sha}", "--out", os.path.join(files, "p.json"))
+            check("CLI plan (a null declaration): planned=1, shard_total=8 READ, the gap a ::warning::",
+                  lambda: p, lambda p: p.returncode == 0 and {"planned=1", "shard_total=8", "core_tests=none"} <= set(p.stdout.splitlines())
                   and "::warning::contract gap: POST /probes carries no shard selector" in p.stderr)
+            scenario([{"method": "GET", "match": "/hosts", "answers": [[503, "{}"], [200, hosts_doc(row(V, True))]]}])
+            p = cli("read", "--api", api, "--version", V, "--window", "5", "--poll", "0.01")
+            check("CLI read: a 503 then the listing → exit 0, complete=true",
+                  lambda: p, lambda p: p.returncode == 0 and "complete=true" in p.stdout.splitlines())
+            scenario([{"method": "GET", "match": "/hosts", "answers": [[503, "{}"]]}])
+            p = cli("read", "--api", api, "--version", V, "--window", "0.1", "--poll", "0.02")
+            check("CLI read: a 503 outlasting the window → exit 1, an OUTAGE, nothing on stdout",
+                  lambda: p, lambda p: p.returncode == 1 and p.stdout == "" and "OUTAGE" in p.stderr)
         finally:
             for k, v in saved.items():
                 if v is None:
@@ -955,17 +1169,22 @@ def self_test() -> int:
                 else:
                     os.environ[k] = v
 
-    check("the shipped declaration is off", lambda: decide(load_declaration(Path(__file__).resolve().parents[1] / "deploy-test-switch.json")),
-          lambda r: r[0] is False)
+    shipped_decl = Path(__file__).resolve().parents[1] / "deploy-test-switch.json"
+    check("the shipped declaration is off", lambda: decide(load_declaration(shipped_decl)), lambda r: r[0] is False)
+    check("the shipped declaration names core's per-shard and doc-gate stages (core .github/build-stages.json)",
+          lambda: load_declaration(shipped_decl),
+          lambda d: d["shardStage"] == "test-shard-{shard}" and d["docGateStage"] == "doc-gate")
     if fails:
         print("deploy-test-switch self-test FAILED:")
         for f in fails:
             print("  - " + f)
         return 1
     print(f"deploy-test-switch self-test: {total} cases passed (the four receiver shapes, every refusal; the switch "
-          "names EVERY run under `runs` and never `run`; CI_SHARD_TOTAL is read, one pinned probe per shard, a missing "
-          "shard and one failed shard are red; the hosts reader reads `complete` and never `ready`; a never-claimed probe "
-          "is red; the verdict is every run's ENDED state, through a fake curl; the shipped declaration is off)")
+          "names EVERY run under `runs` and never `run`; CI_SHARD_TOTAL and the stages are read AT THE CANDIDATE, one pinned "
+          "probe per shard, a missing shard and one failed shard are red; the hosts reader reads `complete` and never "
+          "`ready`, a 503 is an outage retried and never an empty list; a probe refused 409 is the deploy failing; a "
+          "never-claimed probe is red; the verdict is every run's ENDED state, through a fake curl; the shipped "
+          "declaration is off and names the stages)")
     return 0
 
 
@@ -996,18 +1215,23 @@ def main(argv: list[str]) -> int:
     b.add_argument("--runs-file", type=Path, help="switch: the verdict's JSON list of run paths")
     b.add_argument("--planned", type=int, default=0, help="switch: how many runs the plan held")
     b.add_argument("--reason", default="candidate")
+    b.add_argument("--core-tests-required", action="store_true",
+                   help="deploy: the plan runs core's stages, so the set must name its mw-core-tests digest")
     h = sub.add_parser("hosts")
     h.add_argument("--hosts", type=Path, required=True)
     h.add_argument("--version", required=True)
     pl = sub.add_parser("plan")
     pl.add_argument("--declaration", type=Path, required=True)
-    pl.add_argument("--dotnet-test", type=Path, required=True, help="core's .github/workflows/dotnet-test.yml (CI_SHARD_TOTAL)")
+    pl.add_argument("--candidate", type=Path, required=True,
+                    help="a core checkout whose HEAD IS --core-sha (CI_SHARD_TOTAL and build-stages.json are read there)")
     pl.add_argument("--version", required=True)
-    pl.add_argument("--core-sha", default="")
+    pl.add_argument("--core-sha", required=True)
     pl.add_argument("--dependent", action="append", default=[], help="<repo>=<40 hex>, one per affected dependent")
     pl.add_argument("--out", type=Path, required=True)
     pl.add_argument("--dependents-complete", action="store_true",
                     help="the --dependent list IS every affected dependent (no satellite limitation is reported)")
+    rd = sub.add_parser("read")
+    rd.add_argument("--version", required=True)
     w = sub.add_parser("wait-complete")
     w.add_argument("--version", required=True)
     wa = sub.add_parser("wait-alias")
@@ -1020,7 +1244,7 @@ def main(argv: list[str]) -> int:
     pv = sub.add_parser("probes-verdict")
     pv.add_argument("--runs", type=Path, required=True)
     pv.add_argument("--planned", type=int, required=True)
-    for p in (w, wa, wg, ps, pv):
+    for p in (rd, w, wa, wg, ps, pv):
         p.add_argument("--api", required=True)
         p.add_argument("--window", type=float, required=True)
         p.add_argument("--poll", type=float, default=15.0)
@@ -1038,19 +1262,22 @@ def main(argv: list[str]) -> int:
             print(json.dumps(body(a.kind, deployment=a.deployment, version=a.version, tester_digest=a.tester_digest,
                                   portal_digest=a.portal_digest, runner_digest=a.runner_digest,
                                   core_tests_digest=a.core_tests_digest, reason=a.reason, run=a.run,
-                                  runs=runs, planned=a.planned),
+                                  runs=runs, planned=a.planned, core_tests_required=a.core_tests_required),
                              separators=(",", ":")))
             return 0
         elif a.cmd == "hosts":
             out = read_hosts(json.loads(a.hosts.read_text()), _version(a.version))
         elif a.cmd == "plan":
-            shards = shard_total(a.dotnet_test.read_text(), str(a.dotnet_test))
+            shards, stages = candidate(a.candidate, a.core_sha)
             p = plan(load_declaration(a.declaration), shards=shards, version=a.version, core_sha=a.core_sha,
-                     dependents=[_dependent(d) for d in a.dependent], dependents_complete=a.dependents_complete)
+                     dependents=[_dependent(d) for d in a.dependent], dependents_complete=a.dependents_complete,
+                     core_stages=stages, core_stages_read=True)
             for lim in p["limitations"]:
                 print(f"::warning::{lim}", file=sys.stderr)
             _write_json(a.out, p)
-            out = {"planned": str(len(p["runs"])), "shard_total": str(shards)}
+            out = {"planned": str(len(p["runs"])), "shard_total": str(shards), "core_tests": p["coreTests"]}
+        elif a.cmd == "read":
+            out = read_once(a.api, a.version, a.window, a.poll)
         elif a.cmd == "wait-complete":
             out = wait_complete(a.api, a.version, a.window, a.poll)
         elif a.cmd == "wait-alias":
