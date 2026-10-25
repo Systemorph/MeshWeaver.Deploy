@@ -91,7 +91,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # The platform's scripts some checks compare with or execute (compose-gate-host.sh, the Docker
-      # Hub mirror resolver and its list). PUBLIC: no token. DECLARED ref, fail-closed.
+      # Hub mirror resolver and its list, the build-host runner and its Dockerfile, which stay in the
+      # platform because main-cd builds that image there). PUBLIC: no token. DECLARED ref, fail-closed.
       - name: Resolve the platform ref
         id: platform-ref
         env:
@@ -112,6 +113,7 @@ jobs:
           sparse-checkout: |
             .github/scripts
             .github/dockerhub-mirror.list
+            deploy/build-host/Dockerfile
           sparse-checkout-cone-mode: false
       - name: Install shellcheck (pinned, checksum-verified)
         run: |
@@ -199,6 +201,14 @@ jobs:
       - name: Assert the artifact-store sync and local build publish whole generations and delete nothing
         if: ${{ !cancelled() }}
         run: deploy/aks/scripts/test-artifact-store-jobs.sh
+
+      # The standing build hosts (templates/build-host/, Doc/Architecture/BuildHosts): the runner the
+      # chart ships is the platform's byte for byte and passes its self-test, the defaults render no
+      # host, the fixture renders the per-channel Deployment + ScaledObject shape, and the refusals
+      # (a tag for a digest, plain http to a public host) hold. No cluster, no network.
+      - name: Assert the build hosts render per channel, ship the platform's runner, and refuse a half-declared block
+        if: ${{ !cancelled() }}
+        run: deploy/aks/scripts/test-build-hosts.sh
 
       - name: Assert observability installation refuses ephemeral or unverified storage
         if: ${{ !cancelled() }}
