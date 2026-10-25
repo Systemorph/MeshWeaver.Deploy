@@ -1227,6 +1227,28 @@ data:
   {{- if hasKey .Values.config.memex_portal "Ocr__HttpService__Endpoint" }}
   Ocr__HttpService__Endpoint: "{{ .Values.config.memex_portal.Ocr__HttpService__Endpoint }}"
   {{- end }}
+  # The vision-model engine (Ocr__Engine = OllamaVision): an OpenAI-compatible base URL and a vision
+  # model, e.g. the in-cluster model service (core deploy/ollama, Doc/Architecture/LocalModelService):
+  #   Ocr__OllamaVision__Endpoint = http://ollama:11434/v1, Ocr__OllamaVision__Model = qwen3.6
+  # The optional key (Ocr__OllamaVision__ApiKey) is a secret and never belongs in this ConfigMap.
+  {{- /* Rendered only when PRESENT, not null and non-blank, trimmed and YAML-quoted: exactly what the
+         pass-through rendered for these keys before they were listed here, so no overlay changes value. */}}
+  {{- $ocrVisionEndpoint := .Values.config.memex_portal.Ocr__OllamaVision__Endpoint }}
+  {{- if and (hasKey .Values.config.memex_portal "Ocr__OllamaVision__Endpoint") (not (kindIs "invalid" $ocrVisionEndpoint)) (ne ($ocrVisionEndpoint | toString | trim) "") }}
+  Ocr__OllamaVision__Endpoint: {{ $ocrVisionEndpoint | toString | trim | quote }}
+  {{- end }}
+  {{- $ocrVisionModel := .Values.config.memex_portal.Ocr__OllamaVision__Model }}
+  {{- if and (hasKey .Values.config.memex_portal "Ocr__OllamaVision__Model") (not (kindIs "invalid" $ocrVisionModel)) (ne ($ocrVisionModel | toString | trim) "") }}
+  Ocr__OllamaVision__Model: {{ $ocrVisionModel | toString | trim | quote }}
+  {{- end }}
+  {{- $ocrVisionTokens := .Values.config.memex_portal.Ocr__OllamaVision__MaxOutputTokens }}
+  {{- if and (hasKey .Values.config.memex_portal "Ocr__OllamaVision__MaxOutputTokens") (not (kindIs "invalid" $ocrVisionTokens)) (ne ($ocrVisionTokens | toString | trim) "") }}
+  Ocr__OllamaVision__MaxOutputTokens: "{{ $ocrVisionTokens | int64 }}"
+  {{- end }}
+  {{- $ocrTimeout := .Values.config.memex_portal.Ocr__TimeoutSeconds }}
+  {{- if and (hasKey .Values.config.memex_portal "Ocr__TimeoutSeconds") (not (kindIs "invalid" $ocrTimeout)) (ne ($ocrTimeout | toString | trim) "") }}
+  Ocr__TimeoutSeconds: "{{ $ocrTimeout | int64 }}"
+  {{- end }}
   {{- if hasKey .Values.config.memex_portal "Commerce__BaseUrl" }}
   Commerce__BaseUrl: "{{ .Values.config.memex_portal.Commerce__BaseUrl }}"
   {{- end }}
