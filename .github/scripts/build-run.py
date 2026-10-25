@@ -1360,6 +1360,12 @@ class Host:
         self.platform_version = env.get("MW_BUILD_PLATFORM_VERSION", "").strip()
         # The claim scope every call names: a versioned server claims, reports and scales by its VERSION.
         self.scope = {"version": self.version} if self.version else {"channel": self.channel}
+        # A versioned server PROVES the set it runs on every claim: the three images of its v/<version> set, as the chart
+        # renders them. The server drains a host whose images are not the set the version names now, and records the set
+        # on the claim, so a run's green is a test of exactly those images (Plugins#4221).
+        self.set_identity = {"testerDigest": env.get("MW_BUILD_TESTER_DIGEST", "").strip(),
+                             "portalDigest": env.get("MW_BUILD_PORTAL_DIGEST", "").strip(),
+                             "runnerDigest": env.get("MW_BUILD_RUNNER_DIGEST", "").strip()} if self.version else {}
         self.lane = self.version or self.channel
         self.identity = env.get("MW_BUILD_FRAMEWORK_IDENTITY", "").strip()
         if not self.identity and env.get("MW_BUILD_IDENTITY_FILE"):
@@ -1400,6 +1406,11 @@ class Host:
             elif self.platform_version and self.platform_version != self.version:
                 missing.append(f"MW_BUILD_PLATFORM_VERSION equal to MW_BUILD_VERSION ({self.platform_version!r} != {self.version!r}) "
                                "— a versioned server runs exactly the set its version names")
+            for name, value in (("MW_BUILD_TESTER_DIGEST", self.set_identity.get("testerDigest", "")),
+                                ("MW_BUILD_PORTAL_DIGEST", self.set_identity.get("portalDigest", "")),
+                                ("MW_BUILD_RUNNER_DIGEST", self.set_identity.get("runnerDigest", ""))):
+                if not DIGEST.match(value):
+                    missing.append(f"{name} as a sha256:<64 hex> digest — a versioned server proves its set on every claim")
         elif not CHANNEL.match(self.channel):
             missing.append("MW_BUILD_CHANNEL (latest | stable) or MW_BUILD_VERSION")
         if not self.platform_version:
@@ -1531,7 +1542,7 @@ class Host:
           * `stale-set` — this host's platform set is no longer its channel's: DRAIN (stop claiming;
             the run in hand, if any, finishes; the replacement replica runs the new set)."""
         for fresh in range(2):
-            body = {"host": self.host, **self.scope, "platformVersion": self.platform_version,
+            body = {"host": self.host, **self.scope, **self.set_identity, "platformVersion": self.platform_version,
                     "frameworkIdentity": self.identity, "pluginsDigest": self.plugins_digest,
                     "pluginsKey": self.plugins_key, "claimId": str(uuid.uuid4())}
             self.claim_id = body["claimId"]
@@ -3132,11 +3143,15 @@ def self_test() -> int:
                 check("budget/the refusal names the RUN budget", "RUN budget" in str(e), e)
         # a VERSIONED build server (Doc/Architecture/DeployTestSwitchLatest §3): it claims, reports and asks for its
         # token by VERSION, never by channel — and exactly one of the two is set.
-        env_v = {k: v for k, v in dict(env, MW_BUILD_VERSION="3.1.10412", BUILD_TOKEN_FILE=tf).items() if k != "MW_BUILD_CHANNEL"}
+        env_v = {k: v for k, v in dict(env, MW_BUILD_VERSION="3.1.10412", BUILD_TOKEN_FILE=tf,
+                                       MW_BUILD_TESTER_DIGEST="sha256:" + "a" * 64, MW_BUILD_PORTAL_DIGEST="sha256:" + "b" * 64,
+                                       MW_BUILD_RUNNER_DIGEST="sha256:" + "c" * 64).items() if k != "MW_BUILD_CHANNEL"}
         host(_FakeApi({}), env=env_v).preflight()
         for bad_env, why in ((dict(env_v, MW_BUILD_CHANNEL="latest"), "exactly ONE"),
                              (dict(env_v, MW_BUILD_PLATFORM_VERSION="3.1.10500"), "equal to MW_BUILD_VERSION"),
-                             (dict(env_v, MW_BUILD_VERSION="3.1", MW_BUILD_PLATFORM_VERSION="3.1"), "MAJOR.MINOR.PATCH")):
+                             (dict(env_v, MW_BUILD_VERSION="3.1", MW_BUILD_PLATFORM_VERSION="3.1"), "MAJOR.MINOR.PATCH"),
+                             (dict(env_v, MW_BUILD_RUNNER_DIGEST=""), "MW_BUILD_RUNNER_DIGEST as a sha256"),
+                             (dict(env_v, MW_BUILD_TESTER_DIGEST="sha256:short"), "MW_BUILD_TESTER_DIGEST as a sha256")):
             try:
                 host(_FakeApi({}), env=bad_env).preflight()
                 check(f"version/refused: {why}", False, "started")
@@ -3148,6 +3163,13 @@ def self_test() -> int:
         hv_claim.cycle()
         check("version/the claim names the version and no channel",
               claims_v and claims_v[0].get("version") == "3.1.10412" and "channel" not in claims_v[0], claims_v)
+        check("version/the claim proves the host's set: its tester, portal and runner digests",
+              claims_v and claims_v[0].get("testerDigest") == "sha256:" + "a" * 64 and claims_v[0].get("portalDigest") == "sha256:" + "b" * 64
+              and claims_v[0].get("runnerDigest") == "sha256:" + "c" * 64, claims_v)
+        claims_c: list[dict] = []
+        host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})],
+                       ("POST", "/claim"): lambda p_, b: (claims_c.append(b), (204, None))[1]})).cycle()
+        check("version/a CHANNEL host's claim carries no set digests", claims_c and "testerDigest" not in claims_c[0], claims_c)
         posted.clear()
         av = api_ev()
         hv = host(av, env=env_v, checkout=checkout_with({"stages": [{"name": "s", "kind": "build", "command": "true"}]}))
