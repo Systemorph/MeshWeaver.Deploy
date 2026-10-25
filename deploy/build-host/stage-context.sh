@@ -29,6 +29,11 @@ CTX="${3:?usage: stage-context.sh <deploy checkout> <platform checkout> <context
 
 rm -rf "$CTX"
 mkdir -p "$CTX/.github/scripts" "$CTX/artifacts"
+# Absolute from here on: the publish below runs INSIDE the platform checkout, so a relative context
+# would put the plugin-build tool in a second, different directory.
+CTX="$(cd -- "$CTX" && pwd)"
+DEPLOY="$(cd -- "$DEPLOY" && pwd)"
+PLATFORM="$(cd -- "$PLATFORM" && pwd)"
 
 put() {  # put <source file> <name>
   [ -s "$1" ] || { echo "::error::stage-context: $1 is missing or empty"; exit 1; }
