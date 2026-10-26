@@ -70,7 +70,11 @@ The refusals, and why each one exists:
 {{- end -}}
 {{- $sb := ($b.sandbox | default dict) -}}
 {{- $sandbox := dict "seccompProfile" ($sb.seccompProfile | default "") "seccompLocalhostProfile" ($sb.seccompLocalhostProfile | default "")
-      "appArmorProfile" ($sb.appArmorProfile | default "") "appArmorLocalhostProfile" ($sb.appArmorLocalhostProfile | default "") -}}
+      "appArmorProfile" ($sb.appArmorProfile | default "") "appArmorLocalhostProfile" ($sb.appArmorLocalhostProfile | default "")
+      "userNamespace" ($sb.userNamespace | default false) -}}
+{{- if not (kindIs "bool" $sandbox.userNamespace) -}}
+{{- fail (printf "buildHosts.sandbox.userNamespace %v must be true or false" $sandbox.userNamespace) -}}
+{{- end -}}
 {{- range $kind := (list "seccomp" "appArmor") -}}
 {{- $t := index $sandbox (printf "%sProfile" $kind) -}}
 {{- if and $t (not (has $t (list "RuntimeDefault" "Unconfined" "Localhost"))) -}}
@@ -208,6 +212,13 @@ The refusals, and why each one exists:
 {{- $shared = printf "%s-%s" ($shared | trunc 52 | trimSuffix "-") (sha256sum .Release.Name | trunc 10) -}}
 {{- end -}}
 {{- end -}}
+{{- /* A pod in its own user namespace runs only on a node whose kernel and runtime support it (kernel >= 6.3,
+       containerd 2): on a node pool the selector gains `kernel-userns: "true"` (Memex estate.bicep cibuildu24).
+       A host with NO node selector (a single-node cluster, e.g. the Mac overlay) is not narrowed. */ -}}
+{{- $nodeSelector := ($b.nodeSelector | default dict) -}}
+{{- if and $sandbox.userNamespace $nodeSelector -}}
+{{- $nodeSelector = merge (dict "kernel-userns" "true") $nodeSelector -}}
+{{- end -}}
 {{- $np := ($b.networkPolicy | default dict) -}}
 {{- $wi := ($b.workloadIdentity | default dict) -}}
 {{- toYaml (dict "enabled" true "sharedName" $shared "apiUrl" $api "tokenSecret" $tokName "tokenKey" $tokKey
@@ -215,7 +226,7 @@ The refusals, and why each one exists:
       "cacheClaim" $cache "cache" $cacheCreate "imagePullSecret" ($b.imagePullSecret | default "")
       "pluginsRegistry" ($b.pluginsRegistry | default "") "pluginsSource" ($b.pluginsSource | default "plugins")
       "orasImage" (required "buildHosts.orasImage is required" $b.orasImage)
-      "nodeSelector" ($b.nodeSelector | default dict) "tolerations" ($b.tolerations | default list)
+      "nodeSelector" $nodeSelector "tolerations" ($b.tolerations | default list)
       "resources" ($b.resources | default dict) "workSizeLimit" ($b.workSizeLimit | default "60Gi")
       "runDeadline" $runDeadline
       "scaleDownStabilizationSeconds" (int ($b.scaleDownStabilizationSeconds | default 300))
