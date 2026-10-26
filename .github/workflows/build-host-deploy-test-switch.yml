@@ -631,7 +631,14 @@ jobs:
     name: "Deploy-test-switch: report (its own alert)"
     needs: [select, apply]
     # A red `select` is a lane that could not decide — reported like a red apply.
-    if: always() && (needs.apply.result != 'skipped' || needs.select.result == 'failure')
+    # 🚨 Only on the events that can START an apply (a dispatch, a build-host completion). On a
+    # pull_request or push run `apply` never starts, but when cancel-in-progress supersedes the run
+    # before its `if` is evaluated GitHub marks it `cancelled`, not `skipped` — and this job used to
+    # file "latest is UNVERIFIED" for a candidate that never existed (Deploy #18: a pull-request run
+    # on a feature branch, superseded by the next push).
+    if: >-
+      always() && (github.event_name == 'workflow_run' || github.event_name == 'workflow_dispatch') &&
+      (needs.apply.result != 'skipped' || needs.select.result == 'failure')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
