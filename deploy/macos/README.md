@@ -144,19 +144,27 @@ not need the App Store either: an MDM pushes a `.pkg` natively (§1c).
 login session, so no LaunchAgent ever loads. The package therefore carries a second, **unselected** choice,
 *Unattended host*: `/Library/LaunchDaemons/com.memex.local.daemon.plist` running
 `/opt/memex/libexec/memex-daemon.sh` at boot **as the service user** (`UserName` — the stack, the VM and
-`~/.memex-local` belong to a user, never to root), `KeepAlive`, logging to `/var/log/memex/daemon.log`.
+`~/.memex-local` belong to a user, never to root), `KeepAlive` on a failed exit, logging to
+`/var/log/memex/daemon.log`.
 Its postinstall writes the service user (managed preference `ServiceUser`, else the console user) into the
 plist and drives launchd's **persisted** state from the managed preference `Unattended`, in both
 directions: true → `launchctl enable` + bootstrap; anything else → bootout whatever an earlier
 `Unattended=true` install loaded AND `launchctl disable`, so the installed plist (which carries
 `RunAtLoad`/`KeepAlive`) cannot start at the next boot until someone enables it — a daemon that starts a
-VM at every boot is armed by a declaration, not by installing. The daemon sets `MEMEX_HEADLESS=1` and runs
-`memex-local up`: headless, the CLI holds the port-forward as a **background process** (its pid in
+VM at every boot is armed by a declaration, not by installing. The postinstall exits **non-zero** when
+that state was not reached — `launchctl enable`/`bootstrap`/`disable` refused, or `Unattended=true` with no
+usable service user (that path still boots out and disables an earlier job first) — so Installer and an MDM
+report it. The daemon sets `MEMEX_HEADLESS=1` and runs the CLI this package shipped, by path
+(`/opt/memex/bin/memex-local up` — a Homebrew copy earlier on `PATH` may predate headless mode): headless, the CLI holds the port-forward as a **background process** (its pid in
 `~/.memex-local/port-forward.pid`) instead of a LaunchAgent no session exists to load, and runs its
 usability verification against it like any other `up`. A failed `up` (an image pull before the network
 settled, an unreachable registry) is **retried with a growing pause** and is never mistaken for done; once
 `up` succeeds the daemon watches the forward's pid and exits when it ends, so `KeepAlive` re-runs `up`,
-which re-creates what is missing. `memex-local down` stops the headless forward. 🚨 **Follow-up:** the
+which re-creates what is missing. `memex-local down` first writes `~/.memex-local/daemon.stopped`, then
+stops the headless forward; while that file exists the daemon exits **0**, which its `KeepAlive`
+(`SuccessfulExit=false`) does not restart, so a deliberate teardown is not re-provisioned under `down`'s
+feet — and the stop survives a reboot. An explicit `memex-local up` removes the file;
+`sudo launchctl kickstart system/com.memex.local.daemon` then hands the stack back to the daemon. 🚨 **Follow-up:** the
 headless path is exercised by the test suites against stubs (`install_launchd` under `MEMEX_HEADLESS=1`,
 the daemon postinstall's enable/disable) and the package's install by the CI runner; its first unattended
 boot on a real Mac mini is the next change set's acceptance test. Nothing here claims that run has happened.
@@ -224,7 +232,10 @@ time **probes the machine first**. One resolver, one precedence list, one manife
   resolved copies whatever else `PATH` holds: a below-floor Homebrew copy ahead of the fallback, a stale
   fallback link after a Homebrew copy appeared. The per-user agents (port-forward, sampler) and the daemon
   run the same resolver (`MEMEX_LOCAL_SHARE` in their plists), and every agent's `PATH` lists
-  `/opt/memex/bin` last. `memex-local down` and the exit trap remove the selection directory.
+  `/opt/memex/bin` last. The directory belongs to the process that created it: a selection directory
+  is never counted as an "existing" copy (it carries a marker file), and a process that inherited one
+  from its parent (the headless forward started by `up`) builds its own and leaves the parent's alone, so
+  each exit trap removes only its own.
 
 **The postinstall** (`scripts/postinstall`) runs that resolution as root at install time and makes it
 physical: for a tool resolved to its vendored copy it **activates** the fallback — a symlink

@@ -99,6 +99,9 @@ _tool_existing_on_path() {
     if [ "$rest" = "$dir" ]; then rest=""; else rest="${rest#*:}"; fi
     [ -n "$dir" ] || continue
     case "$dir" in "$TOOLS_PREFIX_BIN"|"$TOOLS_VENDOR_DIR"|"$TOOLS_VENDOR_DIR"/*) continue ;; esac
+    # A selection directory (ours or one inherited from a parent process) only holds links to what a
+    # resolution already chose: counting it as "existing" made a second activation link each tool to itself.
+    _tools_is_selection "$dir" && continue
     if [ -x "$dir/$bin" ] && [ ! -d "$dir/$bin" ]; then printf '%s\n' "$dir/$bin"; return 0; fi
   done
   return 1
@@ -172,32 +175,59 @@ tools_report() {
   done
 }
 
+# Is <dir> a selection directory? Every one tools_activate creates carries this marker file; the name
+# pattern also catches one an older resolver created before the marker existed.
+TOOLS_SELECTION_MARKER=".memex-tools-selection"
+_tools_is_selection() {
+  [ -e "$1/$TOOLS_SELECTION_MARKER" ] && return 0
+  case "${1##*/}" in memex-tools.*) return 0 ;; esac
+  return 1
+}
+
 # tools_activate — make the resolution EFFECTIVE for this process and everything it runs: a selection
 # directory holding one symlink per resolved tool (to the existing copy or to the vendored one) is
 # prepended to PATH, so `colima`, `limactl`, `kubectl`, `helm`, `mkcert` all run exactly the copy the
 # resolver chose — whatever else PATH holds (a below-floor Homebrew copy ahead of the fallback, a stale
 # fallback link in <prefix>/bin after a Homebrew copy appeared). A tool that does not resolve gets no
-# link, so `need` and `command -v` see it as missing. The directory is per process (MEMEX_TOOLS_SELECTED;
-# the caller removes it on exit) and nothing on disk outside it is touched.
+# link, so `need` and `command -v` see it as missing. Nothing on disk outside the directory is touched.
+#
+# OWNERSHIP: the directory belongs to the process that created it (_TOOLS_SEL_OWNED, deliberately NOT
+# exported). A second activation in the same process re-uses and refreshes it; an independently running
+# process that inherited MEMEX_TOOLS_SELECTED and PATH from its parent (the headless port-forward, the
+# back-lease sampler) drops the inherited directory from its PATH and creates its OWN — so neither process
+# rewrites the other's links, and neither one's exit removes a directory the other still runs from.
 tools_activate() {
-  local name line kind path sel
+  local name line kind path sel dir rest newpath=""
   sel="${MEMEX_TOOLS_SELECTED:-}"
-  if [ -z "$sel" ] || [ ! -d "$sel" ]; then
+  if [ -z "${_TOOLS_SEL_OWNED:-}" ] || [ "$sel" != "$_TOOLS_SEL_OWNED" ] || [ ! -d "$sel" ]; then
     sel="$(mktemp -d "${TMPDIR:-/tmp}/memex-tools.XXXXXX")" || return 1
+    : > "$sel/$TOOLS_SELECTION_MARKER"
+    _TOOLS_SEL_OWNED="$sel"
     export MEMEX_TOOLS_SELECTED="$sel"
   fi
+  # Drop every selection directory from PATH (ours is re-prepended below; an inherited one is not ours).
+  rest="$PATH"
+  while [ -n "$rest" ]; do
+    dir="${rest%%:*}"
+    if [ "$rest" = "$dir" ]; then rest=""; else rest="${rest#*:}"; fi
+    if [ -n "$dir" ] && _tools_is_selection "$dir"; then continue; fi
+    newpath="${newpath:+$newpath:}$dir"
+  done
+  export PATH="$newpath"
   for name in $(tools_list); do
     line="$(tool_resolve "$name")" || { rm -f "$sel/$(tool_field "$name" 2 | cut -d: -f1)"; continue; }
     IFS=$'\t' read -r name kind path _ <<<"$line"
     [ "$kind" = "existing" ] || [ "$kind" = "vendored" ] || continue
     ln -sfn "$path" "$sel/$(basename "$path")"
   done
-  case ":$PATH:" in *":$sel:"*) ;; *) export PATH="$sel:$PATH" ;; esac
+  export PATH="$sel${PATH:+:$PATH}"
   return 0
 }
 
-# tools_deactivate — remove the selection directory (the CLI's exit trap).
+# tools_deactivate — remove the selection directory THIS process created (the exit trap). An inherited
+# one belongs to the parent, which removes it itself.
 tools_deactivate() {
-  [ -n "${MEMEX_TOOLS_SELECTED:-}" ] && [ -d "${MEMEX_TOOLS_SELECTED}" ] && rm -rf "${MEMEX_TOOLS_SELECTED}"
+  [ -n "${_TOOLS_SEL_OWNED:-}" ] && [ -d "$_TOOLS_SEL_OWNED" ] && rm -rf "$_TOOLS_SEL_OWNED"
+  _TOOLS_SEL_OWNED=""
   return 0
 }

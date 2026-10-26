@@ -741,6 +741,25 @@ mkdir -p "$TPRE/bin"; ln -sfn "$TPRE/libexec/vendor/colima/bin/colima" "$TPRE/bi
 ACT="$(env PATH="$TPRE/bin:$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" bash -c '. "$1/tools.sh"; tools_activate; command -v colima; rm -rf "$MEMEX_TOOLS_SELECTED"' _ "$HERE/../share")"
 case "$ACT" in */memex-tools.*/colima) ok "with a stale fallback FIRST on PATH, 'colima' still resolves through the selection (→ the existing copy)" ;; *) bad "selection beats a stale fallback" "$ACT" ;; esac
 rm -rf "${TPRE:?}/bin"
+# A SECOND activation in the same process (up --with-observability) must not resolve through its own
+# selection directory and relink each tool to itself.
+ACT="$(env PATH="$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" bash -c '. "$1/tools.sh"; tools_activate; s1="$MEMEX_TOOLS_SELECTED"; tools_activate; printf "%s|%s|%s|" "$s1" "$MEMEX_TOOLS_SELECTED" "$(readlink "$MEMEX_TOOLS_SELECTED/colima")"; colima; tools_deactivate' _ "$HERE/../share" 2>&1)"
+IFS='|' read -r s1 s2 lnk ran <<<"$ACT"
+[ "$s1" = "$s2" ] && [ "$lnk" = "$TEX/colima" ] && [ "$ran" = "colima version 0.10.3" ] \
+  && ok "a second activation in one process re-uses its selection and still links colima → the existing copy (runs)" || bad "second activation keeps links usable" "$ACT"
+# An independently running child (the headless forward) inherits MEMEX_TOOLS_SELECTED + PATH: it must build
+# its OWN selection, never rewrite the parent's links, and its exit must not delete the parent's directory.
+ACT="$(env PATH="$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" bash -c '
+  . "$1/tools.sh"; tools_activate; parent="$MEMEX_TOOLS_SELECTED"
+  child="$(bash -c ". \"\$1/tools.sh\"; tools_activate; printf \"%s,%s,%s\" \"\$MEMEX_TOOLS_SELECTED\" \"\$(readlink \"\$MEMEX_TOOLS_SELECTED/colima\")\" \"\$PATH\"; tools_deactivate" _ "$1")"
+  printf "%s|%s|%s|%s|" "$parent" "$child" "$(readlink "$parent/colima")" "$( [ -d "$parent" ] && echo kept || echo gone)"
+  tools_deactivate' _ "$HERE/../share" 2>&1)"
+IFS='|' read -r parent child plnk pstate <<<"$ACT"
+IFS=',' read -r csel clnk cpath <<<"$child"
+[ -n "$csel" ] && [ "$csel" != "$parent" ] && ok "a child process creates its OWN selection directory" || bad "child owns its selection" "$ACT"
+[ "$clnk" = "$TEX/colima" ] && [ "$plnk" = "$TEX/colima" ] && ok "both selections link colima → the existing copy (no self-reference, no link into the other selection)" || bad "child/parent links" "$ACT"
+case ":$cpath:" in *":$parent:"*) bad "the child drops the inherited selection from its PATH" "$cpath" ;; *) ok "the child drops the parent's selection directory from its PATH" ;; esac
+[ "$pstate" = "kept" ] && ok "the child's exit trap leaves the parent's selection directory alone" || bad "child deactivate spares the parent's dir" "$ACT"
 tstub "$TEX" kubectl "Client Version: v1.20.0"
 resolve kubectl; case "$RC:$OUT" in 0:"kubectl	vendored	"*"	1.37.1	1.31.0	ok	existing $TEX/kubectl is 1.20.0, below the floor 1.31.0") ok "one below the floor (kubectl 1.20.0) → the vendored copy, and the note says why" ;; *) bad "below floor → vendored with reason" "rc=$RC: $OUT" ;; esac
 activate
@@ -820,9 +839,17 @@ case "$RC:$OUT" in 0:*"Headless host: holding the port-forward"*"port-forward st
 [ ! -e "$HL/home/Library/LaunchAgents/com.memex.local.plist" ] && ok "headless: no LaunchAgent plist is written" || bad "headless: no plist" ""
 OUT="$(env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/home/.memex-local" MEMEX_HEADLESS=1 MEMEX_LOCAL_LIB=1 bash -c '. "$1"; uninstall_launchd' _ "$CLI" 2>&1)"
 [ ! -e "$HL/home/.memex-local/port-forward.pid" ] && ok "uninstall_launchd (down) removes the headless forward's pid record" || bad "down removes pid" "$OUT"
+[ -s "$HL/home/.memex-local/daemon.stopped" ] && ok "down writes daemon.stopped, so the unattended daemon does not re-run 'up' under it" || bad "down writes the daemon stop request" "$(ls -a "$HL/home/.memex-local")"
+# cmd_up with preflight replaced by an exit: what happens to the stop request BEFORE anything is started.
+upmark() { env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/home/.memex-local" MEMEX_LOCAL_LIB=1 "$@" bash -c '. "$1"; preflight() { exit 0; }; cmd_up' _ "$CLI" >/dev/null 2>&1; }
+upmark MEMEX_DAEMON=1
+[ -e "$HL/home/.memex-local/daemon.stopped" ] && ok "the daemon's own 'up' (MEMEX_DAEMON=1) leaves the stop request in place" || bad "daemon up keeps the stop request" ""
+upmark
+[ ! -e "$HL/home/.memex-local/daemon.stopped" ] && ok "an explicit 'memex-local up' clears the stop request" || bad "explicit up clears the stop request" ""
 # The daemon program drives exactly this: MEMEX_HEADLESS=1, retries `up`, then watches the pid.
 DAEMON="$HERE/../../macos/libexec/memex-daemon.sh"
-case "$(cat "$DAEMON")" in *'export MEMEX_HEADLESS=1'*'until memex-local up; do'*'port-forward.pid'*) ok "memex-daemon.sh sets MEMEX_HEADLESS=1, retries 'up' until it succeeds, then watches port-forward.pid" ;; *) bad "memex-daemon.sh lifecycle" "" ;; esac
+case "$(cat "$DAEMON")" in *'export MEMEX_HEADLESS=1'*'cli="${MEMEX_DAEMON_CLI:-/opt/memex/bin/memex-local}"'*'until "$cli" up; do'*'port-forward.pid'*) ok "memex-daemon.sh sets MEMEX_HEADLESS=1, retries the SHIPPED /opt/memex/bin/memex-local 'up' until it succeeds, then watches port-forward.pid" ;; *) bad "memex-daemon.sh lifecycle" "$(grep -n 'memex-local\|until' "$DAEMON")" ;; esac
+grep -q 'until memex-local up' "$DAEMON" && bad "memex-daemon.sh must not run a bare 'memex-local' (Homebrew's copy wins on its PATH)" "$(grep -n 'until memex-local' "$DAEMON")" || ok "memex-daemon.sh never runs a bare 'memex-local' that Homebrew's older copy could answer"
 case "$(cat "$DAEMON")" in *'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/memex/bin"'*) ok "memex-daemon.sh lists /opt/memex/bin LAST (existing installations first)" ;; *) bad "daemon PATH order" "$(grep -n 'export PATH' "$DAEMON")" ;; esac
 rm -rf "$HL"
 

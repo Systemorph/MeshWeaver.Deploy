@@ -349,8 +349,23 @@ jobs:
             exit 0
           fi
           tag="memex-local/v$VERSION"
+          assets() { gh release view "$tag" --json assets --jq '.assets[] | select(.state == "uploaded") | .name'; }
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "release $tag exists — reusing"
+            # A rerun after a failed or interrupted creation finds the release with only SOME assets. Reconcile
+            # per architecture: a package and its .sha256 must come from the SAME build (a re-signed package has
+            # different bytes), so a complete pair is kept and an incomplete one is re-uploaded as a pair
+            # (--clobber replaces the lone half). The verification after this if/else then fails the step unless
+            # all four are uploaded — on a fresh release too.
+            have="$(assets)"
+            for arch in arm64 x86_64; do
+              pkg="memex-local-$VERSION-$arch.pkg"
+              if printf '%s\n' "$have" | grep -qxF "$pkg" && printf '%s\n' "$have" | grep -qxF "$pkg.sha256"; then
+                echo "release $tag: $arch pair present — kept"
+              else
+                echo "release $tag: $arch pair incomplete — uploading $pkg + $pkg.sha256 from this build"
+                gh release upload "$tag" "$PKGDIR/$pkg" "$PKGDIR/$pkg.sha256" --clobber
+              fi
+            done
           else
             # --target pins the tag to THIS run's commit: without it the tag lands on main's tip, which may
             # have moved during the two notarizations and would describe a tree other than the one packed.
@@ -360,4 +375,11 @@ jobs:
               --title "memex-local $VERSION (macOS installer)" \
               --notes "Signed, notarized and stapled macOS installer for memex-local $VERSION, built from ${GITHUB_REPOSITORY}@${GITHUB_SHA}. Design: deploy/macos/README.md."
           fi
+          have="$(assets)"
+          missing=""
+          for a in arm64.pkg x86_64.pkg arm64.pkg.sha256 x86_64.pkg.sha256; do
+            printf '%s\n' "$have" | grep -qxF "memex-local-$VERSION-$a" || missing="$missing memex-local-$VERSION-$a"
+          done
+          if [ -n "$missing" ]; then echo "::error::release $tag is missing:$missing"; exit 1; fi
+          echo "release $tag: all four assets uploaded"
           echo "- Released: \`$tag\`" >> "$GITHUB_STEP_SUMMARY"

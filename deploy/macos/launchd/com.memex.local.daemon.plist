@@ -43,8 +43,13 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- Restart on a FAILED exit only: memex-daemon.sh exits 0 exactly when `memex-local down` asked the
+         stack to stay down (~/.memex-local/daemon.stopped), and that must not re-run `up`. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <key>StandardOutPath</key>
     <string>/var/log/memex/daemon.log</string>

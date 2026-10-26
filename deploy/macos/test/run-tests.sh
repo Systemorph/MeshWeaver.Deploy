@@ -173,8 +173,8 @@ pkg2="$(printf '%s\n' "$out" | tail -1)"
 case "$rc:$pkg2" in 0:*/memex-local-0.3.778-arm64-unsigned.pkg) ok "a vendored build (fixture manifest, file:// assets) succeeds with no -novendor label" ;;
   *) bad "a vendored build succeeds" "rc=$rc: $out" ;; esac
 F2="$T/full2"; pkgutil --expand-full "$pkg2" "$F2" >/dev/null 2>&1
-[ -x "$F2/memex-local-cli.pkg/Payload/opt/memex/libexec/vendor/fakea/bin/fakea" ] && ok "a `binary` asset lands at libexec/vendor/<tool>/bin/<bin>" || bad "binary asset placement" "$(find "$F2/memex-local-cli.pkg/Payload/opt/memex/libexec" 2>/dev/null)"
-[ -x "$F2/memex-local-cli.pkg/Payload/opt/memex/libexec/vendor/fakeb/bin/fakeb" ] && ok "a `tar.gz` asset's member lands at libexec/vendor/<tool>/bin/<bin>" || bad "tar.gz asset placement" ""
+[ -x "$F2/memex-local-cli.pkg/Payload/opt/memex/libexec/vendor/fakea/bin/fakea" ] && ok "a 'binary' asset lands at libexec/vendor/<tool>/bin/<bin>" || bad "binary asset placement" "$(find "$F2/memex-local-cli.pkg/Payload/opt/memex/libexec" 2>/dev/null)"
+[ -x "$F2/memex-local-cli.pkg/Payload/opt/memex/libexec/vendor/fakeb/bin/fakeb" ] && ok "a 'tar.gz' asset's member lands at libexec/vendor/<tool>/bin/<bin>" || bad "tar.gz asset placement" ""
 [ "$(cat "$F2/memex-local-cli.pkg/Payload/opt/memex/libexec/vendor/fakeb/VERSION")" = "9.9.9" ] && ok "libexec/vendor/<tool>/VERSION records the pinned version" || bad "vendor VERSION file" ""
 [ -f "$T/cache/$sha_a" ] && [ -f "$T/cache/$sha_b" ] && ok "downloads are cached by sha256" || bad "downloads are cached by sha256" "$(ls "$T/cache")"
 out="$(env MEMEX_TOOLS_MANIFEST="$FIX/bad.manifest" "$BUILD" --version 0.3.779 --arch arm64 --out "$T/vend-bad" --cache "$T/cache-bad" --sign never 2>&1)"; rc=$?
@@ -270,7 +270,14 @@ case "$key" in ServiceUser) [ -n "${FAKE_SERVICE_USER:-}" ] && { printf '%s\n' "
   Unattended) [ -n "${FAKE_UNATTENDED:-}" ] && { printf '%s\n' "$FAKE_UNATTENDED"; exit 0; }; exit 1 ;; esac
 exit 1
 STUB
-printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "$FAKE_LAUNCHCTL_LOG"\nexit 0\n' > "$D/stubs/launchctl"
+# launchctl: logs every call; FAKE_LAUNCHCTL_FAIL names the subcommands that fail (e.g. "enable bootstrap";
+# "bootout" models the first-install state where nothing is loaded yet).
+cat > "$D/stubs/launchctl" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "$FAKE_LAUNCHCTL_LOG"
+case " ${FAKE_LAUNCHCTL_FAIL:-} " in *" $1 "*) echo "launchctl $1: simulated failure" >&2; exit 5 ;; esac
+exit 0
+STUB
 chmod +x "$D/stubs/defaults" "$D/stubs/launchctl"
 DPOST="$MACOS/daemon/postinstall"
 rund() { OUT="$(env "$@" FAKE_LAUNCHCTL_LOG="$D/launchctl.log" MEMEX_PKG_DAEMON_PLIST="$D/plist" MEMEX_PKG_DAEMON_LOGDIR="$D/log" PATH="$D/stubs:/usr/libexec:/usr/bin:/bin:/usr/sbin" "$DPOST" 2>&1)"; RC=$?; }
@@ -291,9 +298,132 @@ grep -q "bootout system $D/plist" "$D/launchctl.log" && grep -q "disable system/
 rund FAKE_SERVICE_USER=memexsvc FAKE_UNATTENDED=true
 [ "$(plutil -extract UserName raw "$D/plist")" = "memexsvc" ] && case "$OUT" in *"(was memexsvc)"*) ok "a re-run finds the previous user, re-renders the same plist and re-bootstraps" ;; *) bad "re-run idempotent" "$OUT" ;; esac
 cp "$MACOS/launchd/com.memex.local.daemon.plist" "$D/plist"
-rund FAKE_SERVICE_USER=root FAKE_UNATTENDED=true
-case "$RC:$OUT" in 0:*"no service user"*) ok "a root/absent service user → refuses to render, daemon stays unloaded, exit 0" ;; *) bad "no service user handled" "rc=$RC: $OUT" ;; esac
+: > "$D/launchctl.log"
+rund FAKE_SERVICE_USER=root FAKE_UNATTENDED=
+case "$RC:$OUT" in 0:*"no service user"*) ok "a root/absent service user, Unattended unset → refuses to render, exit 0" ;; *) bad "no service user handled" "rc=$RC: $OUT" ;; esac
 grep -q '__USER__' "$D/plist" && ok "the token stays in the plist when no user could be chosen" || bad "token stays" ""
+# The early no-user return must STILL stop and persistently disable a job an earlier enabled install left
+# running (it used to return before the bootout/disable, leaving it running and enabled).
+grep -q "bootout system $D/plist" "$D/launchctl.log" && grep -q "disable system/com.memex.local.daemon" "$D/launchctl.log" && ! grep -qE "^(enable|bootstrap)" "$D/launchctl.log" \
+  && ok "no service user → the previous job is booted out AND disabled before returning" || bad "no-user path stops + disables" "$(cat "$D/launchctl.log")"
+: > "$D/launchctl.log"
+rund FAKE_SERVICE_USER=root FAKE_UNATTENDED=true
+case "$RC:$OUT" in 0:*) bad "Unattended=true with no service user fails the install" "exited 0: $OUT" ;; *"cannot be honoured without a service user"*) ok "Unattended=true with no service user → non-zero (MDM sees the failure), after stopping + disabling" ;; *) bad "Unattended=true, no user" "rc=$RC: $OUT" ;; esac
+grep -q "disable system/com.memex.local.daemon" "$D/launchctl.log" && ok "…and the disable was issued first" || bad "disable issued on the failing no-user path" "$(cat "$D/launchctl.log")"
+# A requested operation that fails is a failed install; an absent old job on bootout is not.
+cp "$MACOS/launchd/com.memex.local.daemon.plist" "$D/plist"
+: > "$D/launchctl.log"
+rund FAKE_SERVICE_USER=memexsvc FAKE_UNATTENDED=true FAKE_LAUNCHCTL_FAIL=bootout
+case "$RC:$OUT" in 0:*"enabled + bootstrapped"*) ok "bootout failing (nothing loaded yet — a first install) is tolerated: enable + bootstrap, exit 0" ;; *) bad "absent old job tolerated" "rc=$RC: $OUT" ;; esac
+rund FAKE_SERVICE_USER=memexsvc FAKE_UNATTENDED=true FAKE_LAUNCHCTL_FAIL=enable
+case "$RC:$OUT" in 0:*) bad "a failed launchctl enable fails the install" "exited 0: $OUT" ;; *"launchctl enable system/com.memex.local.daemon FAILED"*) ok "Unattended=true and launchctl enable fails → non-zero, naming the step" ;; *) bad "enable failure" "rc=$RC: $OUT" ;; esac
+: > "$D/launchctl.log"
+rund FAKE_SERVICE_USER=memexsvc FAKE_UNATTENDED=true FAKE_LAUNCHCTL_FAIL=bootstrap
+case "$RC:$OUT" in 0:*) bad "a failed launchctl bootstrap fails the install" "exited 0: $OUT" ;; *"launchctl bootstrap FAILED 3 times"*) ok "Unattended=true and launchctl bootstrap keeps failing → non-zero after 3 tries" ;; *) bad "bootstrap failure" "rc=$RC: $OUT" ;; esac
+[ "$(grep -c '^bootstrap ' "$D/launchctl.log")" = "3" ] && ok "bootstrap is retried (a just-booted-out job can refuse for a moment)" || bad "bootstrap retried 3 times" "$(cat "$D/launchctl.log")"
+rund FAKE_SERVICE_USER=memexsvc FAKE_UNATTENDED=false FAKE_LAUNCHCTL_FAIL=disable
+case "$RC:$OUT" in 0:*) bad "a failed launchctl disable fails the install" "exited 0: $OUT" ;; *"launchctl disable system/com.memex.local.daemon FAILED"*) ok "Unattended not true and launchctl disable fails → non-zero (it might still start at boot)" ;; *) bad "disable failure" "rc=$RC: $OUT" ;; esac
+
+echo "── the release step reconciles a release a failed run left incomplete ──"
+# The workflow step's own script, extracted from macos-pkg.yml and run against a stub `gh` whose release
+# state lives in a directory (exists flag + one file per uploaded asset).
+WF="$REPO/.github/workflows/macos-pkg.yml"
+RL="$T/release"; mkdir -p "$RL/stubs" "$RL/pkg"
+awk '/- name: Release the notarized packages on this repository/ { f = 1 } f && /^        run: \|/ { r = 1; next }
+     r { if ($0 ~ /^          / || $0 ~ /^[[:space:]]*$/) { sub(/^          /, ""); print } else exit }' "$WF" > "$RL/step.sh"
+grep -q 'gh release create' "$RL/step.sh" && ok "extracted the release step's script from macos-pkg.yml" || bad "extract the release step" "$(head -5 "$RL/step.sh")"
+cat > "$RL/stubs/gh" <<'STUB'
+#!/bin/bash
+st="$FAKE_GH_STATE"
+[ "$1" = release ] || exit 2
+sub="$2"; tag="$3"; shift 3
+case "$sub" in
+  view)
+    [ -e "$st/exists" ] || exit 1
+    case "$*" in *"--json assets"*) ls "$st/assets" 2>/dev/null ;; esac ;;
+  upload)
+    [ -e "$st/exists" ] || exit 1
+    for f in "$@"; do case "$f" in --*) ;; *) [ -n "${FAKE_GH_UPLOAD_NOOP:-}" ] || : > "$st/assets/$(basename "$f")" ;; esac; done ;;
+  create)
+    : > "$st/exists"
+    for f in "$@"; do case "$f" in --target|--title|--notes) break ;; *) : > "$st/assets/$(basename "$f")" ;; esac; done ;;
+esac
+exit 0
+STUB
+chmod +x "$RL/stubs/gh"
+for a in arm64.pkg x86_64.pkg arm64.pkg.sha256 x86_64.pkg.sha256; do : > "$RL/pkg/memex-local-1.2.3-$a"; done
+# runrel <asset…> — a release that already exists with exactly these assets ("none" = no release at all).
+runrel() {
+  rm -rf "$RL/state"; mkdir -p "$RL/state/assets"
+  if [ "$1" != none ]; then : > "$RL/state/exists"; for a in "$@"; do : > "$RL/state/assets/memex-local-1.2.3-$a"; done; fi
+  OUT="$(env PATH="$RL/stubs:/usr/bin:/bin" FAKE_GH_STATE="$RL/state" NOTARIZED=true VERSION=1.2.3 PKGDIR="$RL/pkg" \
+    GITHUB_SHA=abc GITHUB_REPOSITORY=o/r GITHUB_STEP_SUMMARY="$RL/summary" ${RL_EXTRA:-} bash "$RL/step.sh" 2>&1)"; RC=$?
+  HAVE="$(ls "$RL/state/assets" | tr '\n' ' ')"
+}
+full="memex-local-1.2.3-arm64.pkg memex-local-1.2.3-arm64.pkg.sha256 memex-local-1.2.3-x86_64.pkg memex-local-1.2.3-x86_64.pkg.sha256 "
+runrel none
+[ "$RC" = 0 ] && [ "$HAVE" = "$full" ] && ok "no release yet → created with all four assets, exit 0" || bad "fresh release" "rc=$RC have=$HAVE: $OUT"
+runrel arm64.pkg arm64.pkg.sha256
+[ "$RC" = 0 ] && [ "$HAVE" = "$full" ] && ok "an existing release missing the x86_64 pair → the pair is uploaded, all four present" || bad "reuse uploads the missing pair" "rc=$RC have=$HAVE: $OUT"
+runrel arm64.pkg x86_64.pkg x86_64.pkg.sha256
+case "$RC:$OUT" in 0:*"arm64 pair incomplete"*"x86_64 pair present"*) [ "$HAVE" = "$full" ] && ok "a lone package without its .sha256 → re-uploaded AS A PAIR (one build's bytes); the complete pair is kept" || bad "lone half re-uploaded" "have=$HAVE" ;; *) bad "lone half re-uploaded" "rc=$RC: $OUT" ;; esac
+RL_EXTRA="FAKE_GH_UPLOAD_NOOP=1" runrel arm64.pkg
+case "$RC:$OUT" in 0:*) bad "a release still incomplete after reconciling fails the step" "exited 0: $OUT" ;; *"is missing:"*"x86_64.pkg"*) ok "uploads that do not land → the step fails, naming the missing assets" ;; *) bad "incomplete release fails" "rc=$RC: $OUT" ;; esac
+
+echo "── the daemon program: the SHIPPED CLI, retries, and a 'down' it must not undo ──"
+# Runs memex-daemon.sh itself against a stub CLI (MEMEX_DAEMON_CLI) in a scratch MEMEX_LOCAL_HOME. The
+# daemon's own PATH names /opt/homebrew/bin first, so this section is only ever run where a real
+# memex-local cannot be reached — CI's runner has none, and locally the suite runs under a sandbox
+# profile that denies exec of /opt/homebrew and /opt/memex.
+DAEMON="$MACOS/libexec/memex-daemon.sh"
+DM="$T/daemon-run"; mkdir -p "$DM/home"
+cat > "$DM/memex-local" <<'STUB'
+#!/bin/bash
+printf '%s MEMEX_DAEMON=%s MEMEX_HEADLESS=%s\n' "$*" "${MEMEX_DAEMON:-}" "${MEMEX_HEADLESS:-}" >> "$FAKE_CLI_LOG"
+[ "$1" = up ] || exit 0
+[ -e "${FAKE_UP_FAIL_FILE:-/nonexistent}" ] && exit 1
+mkdir -p "$MEMEX_LOCAL_HOME"
+sleep 120 >/dev/null 2>&1 &          # the "forward"
+echo $! > "$MEMEX_LOCAL_HOME/port-forward.pid"
+exit 0
+STUB
+chmod +x "$DM/memex-local"
+DLH="$DM/home/.memex-local"
+# startdm [VAR=value…] — the daemon in the background; waitdm — its exit status (or "timeout" after 30s).
+startdm() {
+  rm -rf "$DLH"; mkdir -p "$DLH"; : > "$DM/cli.log"
+  env MEMEX_DAEMON_CLI="$DM/memex-local" MEMEX_LOCAL_HOME="$DLH" MEMEX_DAEMON_RETRY_UNIT=0 MEMEX_DAEMON_WATCH_INTERVAL=1 \
+    FAKE_CLI_LOG="$DM/cli.log" "$@" /bin/bash "$DAEMON" > "$DM/out" 2>&1 &
+  DPID=$!
+}
+waitdm() {
+  local i=0
+  while kill -0 "$DPID" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 1; i=$((i + 1)); done
+  if kill -0 "$DPID" 2>/dev/null; then kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; RC=timeout; else wait "$DPID"; RC=$?; fi
+  OUT="$(cat "$DM/out")"
+}
+until_file() { local i=0; while [ ! -s "$1" ] && [ "$i" -lt 20 ]; do sleep 1; i=$((i + 1)); done; }
+grep -q 'cli="${MEMEX_DAEMON_CLI:-/opt/memex/bin/memex-local}"' "$DAEMON" && grep -q 'until "$cli" up; do' "$DAEMON" && ! grep -q 'until memex-local up' "$DAEMON" \
+  && ok "the daemon invokes /opt/memex/bin/memex-local by path, never a bare 'memex-local' a Homebrew copy could answer" || bad "daemon invokes the shipped CLI" "$(grep -n 'memex-local' "$DAEMON")"
+[ "$(plutil -extract KeepAlive.SuccessfulExit raw "$MACOS/launchd/com.memex.local.daemon.plist" 2>/dev/null)" = "false" ] \
+  && ok "the daemon plist restarts on a FAILED exit only (KeepAlive.SuccessfulExit=false)" || bad "KeepAlive SuccessfulExit=false" "$(plutil -extract KeepAlive xml1 -o - "$MACOS/launchd/com.memex.local.daemon.plist" 2>&1)"
+# 1. up succeeds, the forward ends WITHOUT a stop request → exit 1 (KeepAlive re-runs up).
+startdm; until_file "$DLH/port-forward.pid"; sleep 1; kill "$(cat "$DLH/port-forward.pid")" 2>/dev/null; waitdm
+case "$RC:$OUT" in 1:*"ended — exiting so launchd re-runs 'up'"*) ok "the forward dying on its own → exit 1, so launchd re-runs up" ;; *) bad "forward death → exit 1" "rc=$RC: $OUT" ;; esac
+grep -q '^up MEMEX_DAEMON=1 MEMEX_HEADLESS=1$' "$DM/cli.log" && ok "the daemon ran the CLI it was given with MEMEX_DAEMON=1 + MEMEX_HEADLESS=1" || bad "CLI invocation" "$(cat "$DM/cli.log")"
+# 2. `down` (stop request, then the forward killed) → exit 0, which KeepAlive does not restart.
+startdm; until_file "$DLH/port-forward.pid"; sleep 1
+date > "$DLH/daemon.stopped"; kill "$(cat "$DLH/port-forward.pid")" 2>/dev/null; waitdm
+case "$RC:$OUT" in 0:*"stopped by 'memex-local down'"*) ok "'down' kills the forward after writing daemon.stopped → the daemon exits 0 (no re-run of up mid-teardown)" ;; *) bad "down respected" "rc=$RC: $OUT" ;; esac
+# 3. A stop request present at start (after a reboot) → exit 0 without running up at all.
+rm -rf "$DLH"; mkdir -p "$DLH"; date > "$DLH/daemon.stopped"; : > "$DM/cli.log"
+env MEMEX_DAEMON_CLI="$DM/memex-local" MEMEX_LOCAL_HOME="$DLH" FAKE_CLI_LOG="$DM/cli.log" /bin/bash "$DAEMON" > "$DM/out" 2>&1 & DPID=$!; waitdm
+case "$RC:$OUT" in 0:*"at start"*) ok "a stop request at start → exit 0" ;; *) bad "stop at start" "rc=$RC: $OUT" ;; esac
+[ ! -s "$DM/cli.log" ] && ok "…and the CLI is never invoked" || bad "no up when stopped" "$(cat "$DM/cli.log")"
+# 4. `down` while up is failing and being retried → the next retry is not made.
+: > "$DM/upfail"
+startdm FAKE_UP_FAIL_FILE="$DM/upfail"; until_file "$DM/cli.log"; date > "$DLH/daemon.stopped"; waitdm
+case "$RC:$OUT" in 0:*"stopped by 'memex-local down'"*) ok "a stop request during the up-retry loop → exit 0 before the next attempt" ;; *) bad "stop during retries" "rc=$RC: $OUT" ;; esac
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"

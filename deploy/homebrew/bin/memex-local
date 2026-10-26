@@ -152,6 +152,10 @@ readonly PF_LOG="$LOCAL_HOME/port-forward.log"
 # session, so no LaunchAgent can load; the port-forward is held as a background process instead and its
 # pid recorded here, for the daemon to watch and for `down` to stop.
 readonly PF_PID="$LOCAL_HOME/port-forward.pid"
+# The unattended daemon's STOP REQUEST: `down` writes it before killing the forward, so the daemon exits 0
+# (which its KeepAlive does not restart) instead of reading the dead forward as a failure and re-running
+# `up` under `down`'s feet; an explicit `up` (not the daemon's own, MEMEX_DAEMON=1) removes it.
+readonly DAEMON_STOP="$LOCAL_HOME/daemon.stopped"
 readonly HEADLESS="${MEMEX_HEADLESS:-}"
 readonly PLIST_LABEL="com.memex.local"
 readonly PLIST_DST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
@@ -1289,6 +1293,8 @@ wait_port_forward() {
 }
 
 uninstall_launchd() {
+  mkdir -p "$LOCAL_HOME"
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$DAEMON_STOP"
   if [ -f "$PF_PID" ]; then
     kill "$(cat "$PF_PID")" 2>/dev/null && ok "headless port-forward (pid $(cat "$PF_PID")) stopped"
     rm -f "$PF_PID"
@@ -2428,6 +2434,8 @@ cmd_up() {
     shift
   done
 
+  # An explicit start lifts a `down`'s stop request; the daemon's own `up` never does (MEMEX_DAEMON=1).
+  [ "${MEMEX_DAEMON:-}" = "1" ] || rm -f "$DAEMON_STOP"
   preflight
   ensure_overlay
   start_colima                                   # §2
