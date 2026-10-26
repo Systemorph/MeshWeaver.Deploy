@@ -353,16 +353,21 @@ jobs:
           assets=("$PKGDIR"/memex-local-"$VERSION"-arm64.pkg "$PKGDIR"/memex-local-"$VERSION"-x86_64.pkg
                   "$PKGDIR"/memex-local-"$VERSION"-arm64.pkg.sha256 "$PKGDIR"/memex-local-"$VERSION"-x86_64.pkg.sha256)
           if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .id >/dev/null 2>&1; then
-            # An interrupted earlier run may have left the release with SOME assets: reconcile all four,
-            # uploading what is missing, and fail if any is still absent afterwards.
-            echo "release $tag exists — reconciling its assets"
+            # An interrupted earlier run may have left the release with SOME assets. A package and its
+            # .sha256 are a PAIR from the same bytes (a rebuild re-signs with a new timestamp, so the same
+            # file name is not the same bytes): a pair with either member missing is replaced AS A PAIR
+            # from this run (--clobber); a complete pair is kept. Fail if anything is still absent.
+            echo "release $tag exists — reconciling its asset pairs"
             present="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[].name')"
-            missing=()
-            for a in "${assets[@]}"; do grep -qxF "$(basename "$a")" <<<"$present" || missing+=("$a"); done
-            if [ ${#missing[@]} -gt 0 ]; then
-              echo "uploading ${#missing[@]} missing asset(s): ${missing[*]##*/}"
-              gh release upload "$tag" "${missing[@]}"
-            fi
+            for arch in arm64 x86_64; do
+              pkg="$PKGDIR/memex-local-$VERSION-$arch.pkg"
+              if grep -qxF "$(basename "$pkg")" <<<"$present" && grep -qxF "$(basename "$pkg").sha256" <<<"$present"; then
+                echo "$arch: pair present — kept"
+              else
+                echo "$arch: pair incomplete — replacing BOTH from this run's bytes"
+                gh release upload "$tag" "$pkg" "$pkg.sha256" --clobber
+              fi
+            done
             present="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[].name')"
             for a in "${assets[@]}"; do grep -qxF "$(basename "$a")" <<<"$present" || { echo "::error::release $tag still lacks $(basename "$a")"; exit 1; }; done
           else

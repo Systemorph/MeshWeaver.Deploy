@@ -36,8 +36,11 @@ until route -n get default >/dev/null 2>&1 || [ "$tries" -ge 60 ]; do tries=$((t
 [ "$tries" -lt 60 ] || log "no default route after 300s — continuing; 'up' will say what it cannot reach"
 
 attempt=0
-until "$CLI" up; do
+while :; do
+  # The stop check sits IMMEDIATELY before every `up` — including after a retry pause, during which a
+  # `down` may have written the marker; `up` would otherwise remove it and rebuild the stack.
   if stopped; then log "stopped by 'memex-local down' during provisioning — staying down"; exit 0; fi
+  "$CLI" up && break
   attempt=$((attempt + 1))
   pause=$((attempt * 60)); [ "$pause" -gt 600 ] && pause=600
   log "'$CLI up' failed (attempt $attempt) — retrying in ${pause}s; the stack is NOT reported up until it succeeds"

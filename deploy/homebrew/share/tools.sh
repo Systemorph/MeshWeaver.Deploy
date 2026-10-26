@@ -76,35 +76,32 @@ tool_version_of() {
   printf '%s\n' "$out"
 }
 
-# The first EXISTING <binary> that is neither the .pkg's fallback link nor its vendored copy. The
-# manifest's binary column may hold several candidates separated by `:` — a bare name is searched on
-# PATH, an absolute path is tested as is (socket_vmnet is keg-only in Homebrew: never on PATH, always
-# at <brew prefix>/opt/socket_vmnet/bin/socket_vmnet, which is where colima looks for it too).
-tool_existing() {
+# EVERY existing <binary> on the search path, one per line, in PATH order — never the .pkg's fallback
+# links, never the vendored tree, never a selection directory. The manifest's binary column may hold
+# several candidates separated by `:` — a bare name is searched on PATH, an absolute path is tested as
+# is (socket_vmnet is keg-only in Homebrew: never on PATH, always at <brew prefix>/opt/socket_vmnet/bin).
+# The caller walks the list until one meets the floor: a below-floor copy FIRST on PATH must not hide a
+# satisfying one behind it.
+tool_existing_all() {
   local cands="$1" bin dir rest
   while [ -n "$cands" ]; do
     bin="${cands%%:*}"
     if [ "$cands" = "$bin" ]; then cands=""; else cands="${cands#*:}"; fi
     case "$bin" in
-      /*) if [ -x "$bin" ] && [ ! -d "$bin" ]; then printf '%s\n' "$bin"; return 0; fi; continue ;;
+      /*) if [ -x "$bin" ] && [ ! -d "$bin" ]; then printf '%s\n' "$bin"; fi; continue ;;
     esac
-    _tool_existing_on_path "$bin" && return 0
+    rest="$PATH"
+    while [ -n "$rest" ]; do
+      dir="${rest%%:*}"
+      if [ "$rest" = "$dir" ]; then rest=""; else rest="${rest#*:}"; fi
+      [ -n "$dir" ] || continue
+      case "$dir" in "$TOOLS_PREFIX_BIN"|"$TOOLS_VENDOR_DIR"|"$TOOLS_VENDOR_DIR"/*|*/memex-tools.*) continue ;; esac
+      if [ -x "$dir/$bin" ] && [ ! -d "$dir/$bin" ]; then printf '%s\n' "$dir/$bin"; fi
+    done
   done
-  return 1
 }
-_tool_existing_on_path() {
-  local bin="$1" dir rest="$PATH"
-  while [ -n "$rest" ]; do
-    dir="${rest%%:*}"
-    if [ "$rest" = "$dir" ]; then rest=""; else rest="${rest#*:}"; fi
-    [ -n "$dir" ] || continue
-    # Never the .pkg's fallback links, never the vendored tree, never a SELECTION directory (this
-    # process's or an ancestor's: a second activation would otherwise link a selection entry to itself).
-    case "$dir" in "$TOOLS_PREFIX_BIN"|"$TOOLS_VENDOR_DIR"|"$TOOLS_VENDOR_DIR"/*|*/memex-tools.*) continue ;; esac
-    if [ -x "$dir/$bin" ] && [ ! -d "$dir/$bin" ]; then printf '%s\n' "$dir/$bin"; return 0; fi
-  done
-  return 1
-}
+# The first existing candidate (what `command -v` would say, minus the exclusions). Exit 1 when none.
+tool_existing() { tool_existing_all "$1" | head -1 | grep .; }
 
 # The vendored copy of <name>, if the .pkg laid one down (always bin/<first binary name>).
 tool_vendored() {
@@ -125,18 +122,24 @@ tool_name_for_binary() {
 # The exit status is 0 for a usable resolution (existing or vendored at/above the floor), 1 otherwise.
 tool_resolve() {
   local name="$1" bin floor probe existing vendored ever vver note="" kind path version verdict
+  local cand cver
   bin="$(tool_field "$name" 2)"; floor="$(tool_field "$name" 5)"; probe="$(tool_probe "$name")"
   [ -n "$bin" ] || { printf '%s\tmissing\t-\t-\t-\tmissing\tnot a manifest tool\n' "$name"; return 1; }
-  if existing="$(tool_existing "$bin")"; then
-    if ever="$(tool_version_of "$existing" "$probe")"; then
-      if version_ge "$ever" "$floor"; then
-        printf '%s\texisting\t%s\t%s\t%s\tok\t\n' "$name" "$existing" "$ever" "$floor"; return 0
+  # Walk EVERY existing candidate in PATH order; the first that meets the floor wins, and the ones
+  # passed over on the way are named in the note so `doctor` says why a later copy was chosen.
+  existing=""; ever=""
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    if cver="$(tool_version_of "$cand" "$probe")"; then
+      if version_ge "$cver" "$floor"; then
+        printf '%s\texisting\t%s\t%s\t%s\tok\t%s\n' "$name" "$cand" "$cver" "$floor" "${note:+skipped: $note}"; return 0
       fi
-      note="existing $existing is $ever, below the floor $floor"
+      note="${note:+$note; }existing $cand is $cver, below the floor $floor"
     else
-      note="existing $existing reports no version"
+      note="${note:+$note; }existing $cand reports no version"
     fi
-  fi
+    [ -n "$existing" ] || { existing="$cand"; ever="$cver"; }
+  done <<<"$(tool_existing_all "$bin")"
   if vendored="$(tool_vendored "$name" "$bin")"; then
     # A vendored copy must PROVE its version like any other: a binary that prints none is damaged or
     # incompatible, and substituting the manifest's pin would activate it as a working fallback.

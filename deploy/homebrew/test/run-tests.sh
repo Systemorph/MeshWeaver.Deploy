@@ -770,6 +770,11 @@ resolve ollama; case "$RC:$OUT" in 1:"ollama	missing	-	-	0.5.0	missing	not on PA
 tstub "$TEX" helm "v3.2.0"; rm -rf "$TPRE/libexec/vendor/helm"
 resolve helm; case "$RC:$OUT" in 1:"helm	existing	$TEX/helm	3.2.0	3.16.0	below-floor	existing $TEX/helm is 3.2.0, below the floor 3.16.0") ok "below the floor with nothing vendored → verdict below-floor, exit 1" ;; *) bad "below floor, nothing vendored" "rc=$RC: $OUT" ;; esac
 tvend helm helm "v4.3.1+gabc"
+# A below-floor copy FIRST on PATH must not hide a satisfying one behind it; the skipped one is named.
+texisting_all; TEX2="$TT/existing2"; mkdir -p "$TEX2"; tstub "$TEX" helm "v3.2.0"; tstub "$TEX2" helm "v4.2.4+g"
+OUT="$(env PATH="$TEX:$TEX2:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" bash -c '. "$1/tools.sh"; tool_resolve helm' _ "$HERE/../share" 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:"helm	existing	$TEX2/helm	4.2.4	3.16.0	ok	skipped: existing $TEX/helm is 3.2.0, below the floor 3.16.0") ok "helm 3.2.0 first and 4.2.4 second on PATH → the satisfying second copy is chosen, the skipped one named" ;; *) bad "scan past a below-floor first copy" "rc=$RC: $OUT" ;; esac
+rm -rf "$TEX2"; texisting_all
 # A re-run resolves identically (pure: no state is written by resolving).
 resolve helm; first="$OUT"; resolve helm; [ "$OUT" = "$first" ] && ok "resolving twice gives the same answer (the resolver writes nothing)" || bad "resolver pure" "$first vs $OUT"
 # `need` through the CLI's own definition: a tool below its floor is refused BY NAME with floor + remedy.
@@ -835,7 +840,7 @@ OUT="$(env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/h
 [ ! -e "$HL/home/.memex-local/port-forward.pid" ] && ok "uninstall_launchd (down) removes the headless forward's pid record" || bad "down removes pid" "$OUT"
 # The daemon program drives exactly this: MEMEX_HEADLESS=1, retries `up`, then watches the pid.
 DAEMON="$HERE/../../macos/libexec/memex-daemon.sh"
-case "$(cat "$DAEMON")" in *'export MEMEX_HEADLESS=1'*'CLI="${MEMEX_LOCAL_CLI:-/opt/memex/bin/memex-local}"'*'until "$CLI" up; do'*'port-forward.pid'*) ok "memex-daemon.sh invokes THE package's CLI (/opt/memex/bin/memex-local) with MEMEX_HEADLESS=1, retries 'up' until it succeeds, then watches port-forward.pid" ;; *) bad "memex-daemon.sh lifecycle" "" ;; esac
+case "$(cat "$DAEMON")" in *'export MEMEX_HEADLESS=1'*'CLI="${MEMEX_LOCAL_CLI:-/opt/memex/bin/memex-local}"'*'while :; do'*'if stopped; then'*'"$CLI" up && break'*'port-forward.pid'*) ok "memex-daemon.sh invokes THE package's CLI with MEMEX_HEADLESS=1, checks the stop marker immediately before EVERY 'up' (after each retry pause too), then watches port-forward.pid" ;; *) bad "memex-daemon.sh lifecycle" "" ;; esac
 case "$(cat "$DAEMON")" in *'stopped() { [ -f "$stop_marker" ]; }'*'if stopped; then'*'exit 0'*) ok "memex-daemon.sh exits 0 (no KeepAlive restart) while the stop marker from 'memex-local down' exists" ;; *) bad "daemon honours the stop marker" "" ;; esac
 # Text form (this suite also runs on Linux, which has no plutil; the macOS suite lints the plist).
 case "$(tr -d ' \n\t' < "$HERE/../../macos/launchd/com.memex.local.daemon.plist")" in
