@@ -531,13 +531,14 @@ install_backlease_sampler() {
       -e "s|__INTERVAL__|${interval}|g" \
       -e "s|__DIR__|${BACKLEASE_DIR}|g" \
       -e "s|__PORT__|${HOST_PORT}|g" \
+      -e "s|__HOSTNAME__|${HOSTNAME_LOCAL}|g" \
       -e "s|__NAMESPACE__|${NAMESPACE}|g" \
       "$share/com.memex.local.backlease.plist" > "$BACKLEASE_PLIST_DST"
   launchctl bootout "gui/$(id -u)" "$BACKLEASE_PLIST_DST" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$(id -u)" "$BACKLEASE_PLIST_DST"
   ok "launchd agent '$BACKLEASE_PLIST_LABEL' loaded (logs: $BACKLEASE_LOG)"
   # one sample now, so `status` has something to read before the first tick
-  MEMEX_BACKLEASE_DIR="$BACKLEASE_DIR" MEMEX_PORT="$HOST_PORT" MEMEX_NAMESPACE="$NAMESPACE" bash "$BACKLEASE_SAMPLER" --once || warn "the first sample could not be taken — the agent retries every ${interval}s"
+  MEMEX_BACKLEASE_DIR="$BACKLEASE_DIR" MEMEX_PORT="$HOST_PORT" MEMEX_HOSTNAME="$HOSTNAME_LOCAL" MEMEX_NAMESPACE="$NAMESPACE" bash "$BACKLEASE_SAMPLER" --once || warn "the first sample could not be taken — the agent retries every ${interval}s"
 }
 
 uninstall_backlease_sampler() {

@@ -32,6 +32,8 @@
         <string>__DIR__</string>
         <key>MEMEX_PORT</key>
         <string>__PORT__</string>
+        <key>MEMEX_HOSTNAME</key>
+        <string>__HOSTNAME__</string>
         <key>MEMEX_NAMESPACE</key>
         <string>__NAMESPACE__</string>
     </dict>

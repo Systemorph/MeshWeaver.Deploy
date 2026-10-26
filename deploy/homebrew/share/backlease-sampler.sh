@@ -129,8 +129,10 @@ write_sample() {
   models="$(sample_models)"; m_rc=$?
   vm="$(sample_vm)"; v_rc=$?
   colima status >/dev/null 2>&1; colima_rc=$?
-  # the launchd port-forward serves TLS on MEMEX_PORT (a local certificate, hence -k)
-  curl -sk -m 3 -o /dev/null -w '%{http_code}' "https://127.0.0.1:${MEMEX_PORT:-8443}/health" 2>/dev/null | grep -q '^200$'; portal_rc=$?
+  # the launchd port-forward serves TLS on MEMEX_PORT for the ingress HOST (a local certificate, hence -k;
+  # the ingress answers 404 to a bare IP, so the hostname is resolved to loopback explicitly)
+  curl -sk -m 3 -o /dev/null -w '%{http_code}' --resolve "${MEMEX_HOSTNAME:-memex.localhost}:${MEMEX_PORT:-8443}:127.0.0.1" \
+    "https://${MEMEX_HOSTNAME:-memex.localhost}:${MEMEX_PORT:-8443}/health" 2>/dev/null | grep -q '^200$'; portal_rc=$?
   tmp="$OUT.tmp.$$"
   {
     printf '{"os":"macOS %s","machine":"%s",' "$(sw_vers -productVersion 2>/dev/null || echo unknown)" \
