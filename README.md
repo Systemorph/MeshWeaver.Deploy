@@ -31,8 +31,10 @@ they were sealed into: a set is PROMOTED when `mw-plugin-test` carries its versi
 when `memex-portal-ai` does, and both tags sit on the manifest whose `staging-<core7>-<run id>` tag
 names the platform commit and the CD run (`platform-set-dispatch.py discover`). The newest ARMED
 set that still has no `mw-build-host:<version>` becomes the hand-over; otherwise the OLDEST retained
-set — armed or promoted — that still lacks one does (a BACKFILL). Every set the registry still
-carries a version tag for is a candidate, not only the newest: when two sets arrive between two
+PROMOTED set that still lacks one does (a BACKFILL). Every set `mw-plugin-test` still carries a
+version tag for is a candidate, not only the newest (the image job needs that tag, so a version only
+the portal still carries is not one); a version the two repositories place on different commits is
+skipped, and refused when it is the newest. When two sets arrive between two
 ticks (A, then B), only B is ever the newest, and without the backfill A would never get a runner —
 so a `build-stable` hand-over whose main-passed ceiling is A would fail on the missing
 `mw-build-host:A`. The bounds: ONE runner image per tick, and a window of the retained sets not older
@@ -44,8 +46,9 @@ delivery waits on it.
 
 `build-host-stable.yml` does not rely on the backfill alone: when its main-passed ceiling has no
 `mw-build-host:<ceiling>` (a ceiling outside the window, or one the backfill has not reached yet),
-it dispatches `build-host.yml` for exactly that set and waits for the image (up to 35 minutes)
-before it hands the ceiling to `build-stable` — instead of failing on a missing runner digest.
+it dispatches `build-host.yml` for exactly that set and waits (up to 35 minutes) for that run's image
+job to SUCCEED — the job that also mirrors the runner to the fleet registry, digest verified — before
+it hands the ceiling to `build-stable`, instead of failing on a missing runner digest.
 
 Two events carry the same hand-over explicitly, read through the same contract (schema 1): a
 `workflow_dispatch` (a person re-running one) and a `repository_dispatch` of type

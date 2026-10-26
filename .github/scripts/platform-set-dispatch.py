@@ -60,8 +60,10 @@ run the set is. `discover` picks the ONE set this tick builds a runner for:
 
   1. the newest ARMED set, when `mw-build-host:<version>` does not exist yet — the build-latest
      hand-over needs its runner NOW;
-  2. otherwise the OLDEST retained set — armed or promoted — that still lacks its runner (BACKFILL).
-     Every set the registry still carries a version tag for is a candidate, not only the newest:
+  2. otherwise the OLDEST retained PROMOTED set (an armed set is a promoted one) that still lacks
+     its runner (BACKFILL). Every set `mw-plugin-test` still carries a version tag for is a
+     candidate, not only the newest — the image job needs that tag, so a version only the portal
+     still carries is not one:
      two sets that both arrive between two ticks (A, then B, so only B is ever the newest) would
      otherwise leave A without a runner forever, and a build-stable hand-over whose main-passed
      ceiling is A would fail on the missing `mw-build-host:A`.
@@ -269,24 +271,29 @@ def discover(tester: object, portal: object, runner: object) -> dict:
     armed = newest_set(portal, "memex-portal-ai")
     runners = {t for tags in _rows(runner, "mw-build-host") for t in tags}
 
-    # Every retained set, placed by its own manifest. A version both repositories carry must name the
-    # same commit in both; one that does not is unplaceable, never a coin toss.
+    # Every retained PROMOTED set, placed by its own mw-plugin-test manifest: the image job builds a
+    # runner only for a set whose `mw-plugin-test:<version>` exists, so a version only the portal
+    # still carries (its tester tag aged out) is no backfill candidate — selecting it would fail the
+    # image job on every tick and stall the backfill behind it. The portal's placement is a CHECK: a
+    # version both repositories carry must name the same commit in both, or it is unplaceable, never
+    # a coin toss.
     sets, unplaced = retained_sets(tester, "mw-plugin-test")
     portal_sets, portal_unplaced = retained_sets(portal, "memex-portal-ai")
     for v, why in portal_unplaced.items():
-        unplaced.setdefault(v, why)
+        if v in sets:
+            unplaced.setdefault(v, why)
     for v, cand in portal_sets.items():
         mine = sets.get(v)
-        if mine is None:
-            if v not in unplaced:
-                sets[v] = cand
-        elif mine["core7"] != cand["core7"]:
+        if mine is not None and mine["core7"] != cand["core7"]:
             unplaced[v] = (f"{v} is commit {mine['core7']} in mw-plugin-test but {cand['core7']} in "
                            "memex-portal-ai — cannot say which commit the set is")
-            del sets[v]
+    # The newest two are what discovery always guaranteed. One of them unplaceable is a Refusal —
+    # never a runner built from whichever repository's commit happened to be read last.
+    for c in (promoted, armed):
+        if c is not None and c["version"] in unplaced:
+            raise Refusal(f"the newest set {c['version']} is unplaceable: {unplaced[c['version']]}")
     for v in unplaced:
         sets.pop(v, None)
-    # The newest two are what discovery always guaranteed; they are placed (or refused) above.
     sets[promoted["version"]] = promoted
     if armed is not None:
         sets[armed["version"]] = armed
@@ -485,9 +492,15 @@ def _self_test() -> int:
           lambda: discover(two_tester, [two_portal[0], {"tags": ["staging-fffffff-901", a_]}, two_portal[2]],
                            [{"tags": [z]}, {"tags": [b_]}]),
           lambda o: o["need_version"] == "" and a_ in o["why"])
-    check("a set only the portal still carries is backfilled from the portal's manifest",
+    check("a set only the portal still carries is NOT backfilled (its tester tag aged out; the image job could not build it)",
           lambda: discover([two_tester[0], two_tester[2]], two_portal, [{"tags": [z]}, {"tags": [b_]}]),
-          lambda o: o["need_version"] == a_ and o["need_run_id"] == "901")
+          lambda o: o["need_version"] == "" and o["backlog"] == "0")
+    check("refuses a NEWEST armed set whose commit differs between the two repositories",
+          lambda: discover(two_tester, [{"tags": ["staging-fffffff-902", b_]}] + two_portal[1:], [{"tags": [z]}]),
+          REFUSED)
+    check("refuses a NEWEST promoted set the portal places on another commit",
+          lambda: discover(two_tester, [{"tags": ["staging-fffffff-902", b_, "x"]}], [{"tags": [z]}]),
+          REFUSED)
     check("a discovered claim reads through the contract, never armed",
           lambda: claim("https://github.com/o/r/actions/runs/901", a, "3.1.10412", a),
           lambda o: o["set_version"] == "3.1.10412" and o["armed"] == "false" and o["shas"] == a)

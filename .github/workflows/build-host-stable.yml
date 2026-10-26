@@ -169,20 +169,40 @@ jobs:
             exit 0
           fi
           echo "::notice title=build-stable ceiling has no runner::$ref is missing — dispatching build-host.yml to build it"
+          since=$(date -u -d '-30 seconds' +%Y-%m-%dT%H:%M:%SZ)
           gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/build-host.yml/dispatches" \
             -f ref="$DEFAULT_BRANCH" \
             -f "inputs[run_url]=$CD_RUN_URL" -f "inputs[run_core_sha]=$CORE_SHA" \
             -f "inputs[set_version]=$V_SET" -f "inputs[set_core_sha]=$CORE_SHA" \
             || { echo "::error::could not dispatch build-host.yml for $V_SET — build-stable was NOT handed it"; exit 1; }
+          # The ACR tag appears BEFORE that run's image job mirrors the runner to the fleet registry,
+          # so the tag alone is not "available": wait for the dispatched run's image job to SUCCEED
+          # (build or keep, then mirror, digest verified), and only then for the tag. The run is the
+          # oldest workflow_dispatch run of build-host.yml created since just before the dispatch.
+          export IMAGE_JOB="Build + push mw-build-host (the build-host runner)"
           deadline=$(( $(date +%s) + RUNNER_WAIT_MINUTES * 60 ))
+          run=""
           while [ "$(date +%s)" -lt "$deadline" ]; do
             sleep 60
-            if present; then
-              echo "- build-stable: the ceiling \`$V_SET\` had no runner — built on demand (build-host.yml dispatched)" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
+            if [ -z "$run" ]; then
+              run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build-host.yml/runs?event=workflow_dispatch&created=%3E%3D$since&per_page=20" \
+                --jq '[.workflow_runs[]] | sort_by(.created_at) | .[0].id // empty') || run=""
+              [ -n "$run" ] && echo "dispatched build-host.yml run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"
+              continue
             fi
+            job=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs?per_page=100" \
+              --jq '[.jobs[] | select(.name == env.IMAGE_JOB)] | .[0] | "\(.status // "") \(.conclusion // "")"' 2>/dev/null) || job=""
+            case "$job" in
+              "completed success")
+                present || { echo "::error::run $run's image job succeeded but $ref is not in the registry — build-stable was NOT handed $V_SET"; exit 1; }
+                echo "- build-stable: the ceiling \`$V_SET\` had no runner — built and mirrored on demand by build-host.yml run $run" >> "$GITHUB_STEP_SUMMARY"
+                exit 0 ;;
+              "completed "*)
+                echo "::error::build-host.yml run $run's image job ended '${job#completed }' — mw-build-host:$V_SET was not built and mirrored; build-stable was NOT handed $V_SET"
+                exit 1 ;;
+            esac
           done
-          echo "::error::$ref did not appear within ${RUNNER_WAIT_MINUTES} min of dispatching build-host.yml — build-stable was NOT handed $V_SET; read that workflow's newest workflow_dispatch run (the image is kept, so the next daily run hands it over)"
+          echo "::error::the dispatched build-host.yml run (${run:-not found}) did not build and mirror mw-build-host:$V_SET within ${RUNNER_WAIT_MINUTES} min — build-stable was NOT handed $V_SET; the image is kept, so the next daily run hands it over"
           exit 1
       - name: "Sign and POST build-host-update-available for build-stable"
         if: steps.build_host_stable.outputs.enabled == 'true'
