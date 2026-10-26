@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  memex-local DEVICE RELAY — a launchd login agent (MeshWeaver.Plugins Hosting/DeviceRelay).
+  Runs the native `memex-relay run`, which holds ONE outbound connection to the owner's cloud instance
+  and answers inbox reads about chats that exist only on this Mac (iMessage, WhatsApp Desktop),
+  read-only, live; nothing is stored in the cloud. KeepAlive restarts it if it ever exits.
+
+  The API token is NOT in this file: it lives in ~/.memex-relay/token (0600), written by
+  `memex-relay pair` from stdin.
+
+  `memex-local relay pair` writes a copy of this file with __BINARY__ and __LOG__ substituted to
+  ~/Library/LaunchAgents/com.memex.local.relay.plist and bootstraps it; `relay off` boots it out.
+
+  macOS Full Disk Access is granted to THIS binary (System Settings > Privacy & Security > Full Disk
+  Access > +), at the path below — which is why the path is stable and not inside a build folder.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memex.local.relay</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BINARY__</string>
+        <string>run</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>__LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG__</string>
+</dict>
+</plist>
