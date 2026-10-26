@@ -174,22 +174,34 @@ jobs:
           else
             echo "::notice title=build-stable ceiling has no runner::$ref is missing — dispatching build-host.yml to build it"
           fi
-          since=$(date -u -d '-5 minutes' +%Y-%m-%dT%H:%M:%SZ)
-          export REQUEST_TITLE="Build host — request stable-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/build-host.yml/dispatches" \
-            -f ref="$DEFAULT_BRANCH" \
-            -f "inputs[run_url]=$CD_RUN_URL" -f "inputs[run_core_sha]=$CORE_SHA" \
-            -f "inputs[set_version]=$V_SET" -f "inputs[set_core_sha]=$CORE_SHA" \
-            -f "inputs[request_id]=stable-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
-            || { echo "::error::could not dispatch build-host.yml for $V_SET — build-stable was NOT handed it"; exit 1; }
           # The ACR tag appears BEFORE that run's image job mirrors the runner to the fleet registry,
           # so the tag alone is not "available": wait for the dispatched run's image job to SUCCEED
           # (build or keep, then mirror, digest verified), and only then for the tag. The run is the
-          # one whose NAME carries this job's request id (build-host.yml's run-name) — never merely
-          # the oldest dispatch, which could be someone else's.
+          # one whose NAME carries this dispatch's request id (build-host.yml's run-name) — never
+          # merely the oldest dispatch, which could be someone else's.
+          # 🚨 CONTENTION: the image job's per-version concurrency group keeps ONE pending job and
+          # REPLACES it with the next (even with cancel-in-progress: false), so a schedule tick for the
+          # same version can cancel this dispatch's pending image job. A CANCELLED image job is
+          # therefore re-dispatched with a fresh request id while the wait budget lasts; a FAILED or
+          # SKIPPED one is red. Only a success is ever handed over.
           export IMAGE_JOB="Build + push mw-build-host (the build-host runner)"
           deadline=$(( $(date +%s) + RUNNER_WAIT_MINUTES * 60 ))
-          run=""
+          attempt=0
+          dispatch() {
+            attempt=$((attempt + 1))
+            request="stable-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$attempt"
+            export REQUEST_TITLE="Build host — request $request"
+            since=$(date -u -d '-5 minutes' +%Y-%m-%dT%H:%M:%SZ)
+            run=""
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/build-host.yml/dispatches" \
+              -f ref="$DEFAULT_BRANCH" \
+              -f "inputs[run_url]=$CD_RUN_URL" -f "inputs[run_core_sha]=$CORE_SHA" \
+              -f "inputs[set_version]=$V_SET" -f "inputs[set_core_sha]=$CORE_SHA" \
+              -f "inputs[request_id]=$request" \
+              || { echo "::error::could not dispatch build-host.yml for $V_SET — build-stable was NOT handed it"; exit 1; }
+            echo "dispatched build-host.yml for $V_SET (request $request)"
+          }
+          dispatch
           while [ "$(date +%s)" -lt "$deadline" ]; do
             sleep 60
             if [ -z "$run" ]; then
@@ -205,12 +217,15 @@ jobs:
                 present || { echo "::error::run $run's image job succeeded but $ref is not in the registry — build-stable was NOT handed $V_SET"; exit 1; }
                 echo "- build-stable: the ceiling \`$V_SET\`'s runner was built or kept, and mirrored, by build-host.yml run $run" >> "$GITHUB_STEP_SUMMARY"
                 exit 0 ;;
+              "completed cancelled")
+                echo "::warning::build-host.yml run $run's image job was cancelled (replaced in its per-version concurrency group) — dispatching again"
+                dispatch ;;
               "completed "*)
                 echo "::error::build-host.yml run $run's image job ended '${job#completed }' — mw-build-host:$V_SET was not built and mirrored; build-stable was NOT handed $V_SET"
                 exit 1 ;;
             esac
           done
-          echo "::error::the dispatched build-host.yml run (${run:-not found}) did not build and mirror mw-build-host:$V_SET within ${RUNNER_WAIT_MINUTES} min — build-stable was NOT handed $V_SET; the image is kept, so the next daily run hands it over"
+          echo "::error::no dispatched build-host.yml run (last: ${run:-not found}, $attempt dispatch(es)) built and mirrored mw-build-host:$V_SET within ${RUNNER_WAIT_MINUTES} min — build-stable was NOT handed $V_SET; the image is kept, so the next daily run hands it over"
           exit 1
       - name: "Sign and POST build-host-update-available for build-stable"
         if: steps.build_host_stable.outputs.enabled == 'true'
