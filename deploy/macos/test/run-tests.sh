@@ -234,10 +234,14 @@ case "$RC:$OUT" in 0:*"changed: 0"*) ok "all tools present and satisfying → ex
 [ -z "$(links)" ] && ok "all present and satisfying → NOTHING vendored is activated (bin/ holds no fallback)" || bad "nothing activated when all satisfy" "links: $(links)"
 [ -f "$P/etc/tools.report" ] && grep -q 'colima        existing  0.10.3' "$P/etc/tools.report" && ok "etc/tools.report records the probe (colima existing 0.10.3)" || bad "tools.report written" "$(cat "$P/etc/tools.report" 2>/dev/null)"
 grep -q 'using the existing installation' "$P/etc/tools.report" && ok "the report says the existing installation is used" || bad "report wording" ""
-case "$(sed -n '/^probe_all()/,/^}/p' "$POST")" in *'sudo -u "$probe_user" -H env PATH="$PROBE_PATH"'*) ok "as root, the probe (which EXECUTES the found tools) runs through sudo as the console user / nobody, never as root" ;; *) bad "unprivileged probe" "" ;; esac
+case "$(sed -n '/^probe_all()/,/^}/p' "$POST")" in *'sudo -u "$probe_user" -H env PATH="$PROBE_PATH" MEMEX_PREFIX="$PREFIX" /bin/bash -c'*) ok "as root, the probe (which EXECUTES the found tools) runs through sudo as the console user / nobody, never as root, with the SYSTEM bash by absolute path" ;; *) bad "unprivileged probe" "$(sed -n '/^probe_all()/,/^}/p' "$POST")" ;; esac
 grep -q '^export PATH="/usr/bin:/bin:/usr/sbin:/sbin"$' "$POST" && ok "root's own PATH in the postinstall is the trusted system PATH" || bad "trusted root PATH" "$(grep -n 'export PATH' "$POST")"
-grep -q "brew_bin=\"\$(PATH=\"\$PROBE_PATH\" bash -c 'command -v brew' 2>/dev/null || true)\"" "$POST" && ! grep -q 'env PATH="$PROBE_PATH" command' "$POST" \
-  && ok "the brew lookup is the shell builtin under a PATH assignment, never an \`env … command\` that would run an executable named 'command' from the probe PATH as root" || bad "brew lookup via builtin" "$(grep -n 'brew_bin=' "$POST")"
+grep -q 'brew_bin="$(PATH="$PROBE_PATH" command -v brew 2>/dev/null || true)"' "$POST" && ! grep -q 'env PATH="$PROBE_PATH" command' "$POST" && ! grep -q 'PATH="$PROBE_PATH" bash -c' "$POST" \
+  && ok "the brew lookup is the shell builtin under a PATH assignment in THIS shell — no env … command, no PATH=… bash -c (bash resolves the command under the prefix PATH)" || bad "brew lookup via builtin" "$(grep -n 'brew_bin=' "$POST")"
+# Behaviour: a planted `bash` on the probe PATH must never run during the lookup.
+PL="$T/planted"; mkdir -p "$PL"; printf '#!/bin/sh\necho PLANTED-BASH-RAN\n' > "$PL/bash"; chmod +x "$PL/bash"; printf '#!/bin/sh\n' > "$PL/brew"; chmod +x "$PL/brew"
+out="$(env MEMEX_PKG_PREFIX="$P" MEMEX_PKG_PROBE_PATH="$PL:$EX:$TSYS" PATH="/usr/bin:/bin" "$POST" 2>&1)"
+case "$out" in *PLANTED-BASH-RAN*) bad "a planted bash on the probe PATH is never executed by the postinstall's own lookups" "$out" ;; *) ok "a planted bash on the probe PATH is never executed by the postinstall's own lookups" ;; esac
 grep -q '^set -euo pipefail' "$POST" && ok "the postinstall fails on an unhandled error (set -e)" || bad "set -e" ""
 
 rm -f "$EX/helm"; runpost

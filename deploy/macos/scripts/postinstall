@@ -30,12 +30,15 @@ export MEMEX_PREFIX="$PREFIX"
 console_user="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
 case "$console_user" in ""|root|loginwindow|_*) probe_user="nobody" ;; *) probe_user="$console_user" ;; esac
 # probe_all → every tool's tool_resolve line, produced by an UNPRIVILEGED process when we are root.
+# The interpreter is the SYSTEM bash by absolute path: `env PATH=<probe> bash` would resolve `bash` on the
+# user-writable probe PATH. Only the probe's own lookups (the tools it versions) use that PATH — and
+# those run as the probe user, never as root.
 probe_all() {
   local script='. "$1/share/tools.sh"; for n in $(tools_list); do tool_resolve "$n" || true; done'
   if [ "$(id -u)" -eq 0 ]; then
-    sudo -u "$probe_user" -H env PATH="$PROBE_PATH" MEMEX_PREFIX="$PREFIX" bash -c "$script" _ "$PREFIX"
+    sudo -u "$probe_user" -H env PATH="$PROBE_PATH" MEMEX_PREFIX="$PREFIX" /bin/bash -c "$script" _ "$PREFIX"
   else
-    env PATH="$PROBE_PATH" MEMEX_PREFIX="$PREFIX" bash -c "$script" _ "$PREFIX"
+    env PATH="$PROBE_PATH" MEMEX_PREFIX="$PREFIX" /bin/bash -c "$script" _ "$PREFIX"
   fi
 }
 mkdir -p "$PREFIX/etc" "$PREFIX/bin"
@@ -46,10 +49,11 @@ say() { printf '%s\n' "$*"; lines="${lines}${1}"$'\n'; }
 
 # `brew list --versions <formula>` for the report — informational, only when brew is on the probe PATH,
 # and as the probe user (brew refuses root).
-# A PATH assignment on the shell BUILTIN `command -v` — never `env PATH=… command`, which would search the
-# user-writable probe PATH for an EXECUTABLE named `command` and run it as root. `bash` itself resolves
-# on root's trusted PATH above; the builtin only looks brew up, it executes nothing.
-brew_bin="$(PATH="$PROBE_PATH" bash -c 'command -v brew' 2>/dev/null || true)"
+# A PATH assignment on the shell BUILTIN `command -v`, in THIS shell: no external program is looked up or
+# run at all. Neither `env PATH=… command` (an EXECUTABLE named `command` on the user-writable probe PATH
+# would run as root) nor `PATH=… bash -c …` (bash applies a prefix assignment DURING the lookup, so a
+# planted `bash` on the probe PATH would run as root). The builtin only looks brew up.
+brew_bin="$(PATH="$PROBE_PATH" command -v brew 2>/dev/null || true)"
 brew_version() {
   [ -n "$brew_bin" ] || return 0
   if [ "$(id -u)" -eq 0 ]; then
