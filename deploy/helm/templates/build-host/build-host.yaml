@@ -100,8 +100,13 @@ spec:
   # No `replicas`: the ScaledObject below owns the count (0 when nothing is claimable or running).
   revisionHistoryLimit: 3
   strategy:
+    {{- if eq ($b.rolloutStrategy | default "RollingUpdate") "Recreate" }}
+    # A single-node host (a leased-back Mac) cannot fit the new pod beside the old one: drain, then replace.
+    type: Recreate
+    {{- else }}
     type: RollingUpdate
     rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+    {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/component: "build-host"

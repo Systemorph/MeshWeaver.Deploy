@@ -53,7 +53,11 @@ The refusals, and why each one exists:
 {{- if $cc.create -}}
 {{- $cacheCreate = dict "create" true
       "storageClass" (required "buildHosts.cache.storageClass is required when buildHosts.cache.create — the build cache is shared by every replica, so it needs a ReadWriteMany class (e.g. azurefile-memex)" $cc.storageClass)
-      "size" (required "buildHosts.cache.size is required when buildHosts.cache.create — the chart will not guess a volume size" $cc.size) -}}
+      "size" (required "buildHosts.cache.size is required when buildHosts.cache.create — the chart will not guess a volume size" $cc.size)
+      "accessMode" ($cc.accessMode | default "ReadWriteMany") -}}
+{{- if not (has $cacheCreate.accessMode (list "ReadWriteMany" "ReadWriteOnce")) -}}
+{{- fail (printf "buildHosts.cache.accessMode %q must be ReadWriteMany or ReadWriteOnce" $cacheCreate.accessMode) -}}
+{{- end -}}
 {{- end -}}
 {{- if ($b.postgres | default dict).enabled -}}
 {{- fail "buildHosts.postgres is not supported — a build host runs NO shared database; a stage that needs PostgreSQL starts a disposable one inside its own sandbox (sandbox-postgres.sh)" -}}
@@ -92,7 +96,19 @@ The refusals, and why each one exists:
 {{- $regSecret = required "buildHosts.registry.instanceKeySecret.name is required with buildHosts.registry.url — the Secret holding the read-only mwi_ instance key" ($reg.instanceKeySecret | default dict).name -}}
 {{- end -}}
 {{- $channels := list -}}
-{{- range $name := (list "latest" "stable") -}}
+{{- /* EXTRA channels (`buildHosts.extraChannels`): a host on an opt-in channel of its own — a leased-back Mac's `mac` —
+       configured exactly like `latest`/`stable` under `buildHosts.<name>`. A channel name is lower-case, starts with a letter,
+       and is never `latest`, `stable` or a reserved `probe*` (the build API's BuildChannel rule). */ -}}
+{{- if not (has ($b.rolloutStrategy | default "RollingUpdate") (list "RollingUpdate" "Recreate")) -}}
+{{- fail (printf "buildHosts.rolloutStrategy %q must be RollingUpdate or Recreate" $b.rolloutStrategy) -}}
+{{- end -}}
+{{- $extra := ($b.extraChannels | default list) -}}
+{{- range $name := $extra -}}
+{{- if or (not (regexMatch "^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$" $name)) (has $name (list "latest" "stable")) (hasPrefix "probe" $name) -}}
+{{- fail (printf "buildHosts.extraChannels names %q — a channel is lower-case [a-z][a-z0-9-]{0,31}, ending in a letter or digit (a Kubernetes name and label), not latest, stable or probe*" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- range $name := (concat (list "latest" "stable") $extra | uniq) -}}
 {{- $c := (index $b $name | default dict) -}}
 {{- if $c.enabled -}}
 {{- range $k := (list "testerDigest" "portalDigest" "runnerDigest") -}}
@@ -210,6 +226,7 @@ The refusals, and why each one exists:
                             "dnsPodSelector" ($np.dnsPodSelector | default (dict "k8s-app" "kube-dns"))
                             "apiPort" (int ($np.apiPort | default 8080)) "privateCidrs" ($np.privateCidrs | default list))
       "artifactStore" (dict "spec" $asSpec "claimName" $asClaim)
+      "rolloutStrategy" ($b.rolloutStrategy | default "RollingUpdate")
       "registry" (dict "url" $regUrl "keySecret" $regSecret "keySecretKey" ((($reg.instanceKeySecret | default dict).key) | default "key"))
       "channels" $channels) -}}
 {{- end -}}

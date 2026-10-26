@@ -1,0 +1,43 @@
+# A leased-back Mac's FIRST ATTACH as a build host (MeshWeaver.Plugins Hosting/BuildQueue §3c; Hosting/BackLease
+# phase 2b, which its `backlease enroll` later adopts). A build-host-only release of the platform chart in the Mac's
+# own k3s (Colima), on the opt-in `mac` channel: only jobs routed to that channel land here. Applied by
+# deploy/backlease/first-attach.sh, which supplies everything estate-specific (the build API, the registry, the set)
+# on the command line — nothing here names an estate, and no digest is committed.
+portal:
+  enabled: false
+postgres:
+  enabled: false
+ingress:
+  enabled: false
+buildHosts:
+  enabled: true
+  imagePullSecret: "build-pull"
+  # A Mac is ONE node with no CI pool: no pool selector or taint toleration (null clears the chart default; an empty
+  # map would merge with it), and a budget that fits the Colima VM — first-attach.sh checks the node's allocatable.
+  # The plugins layer: a Mac has no workload identity and holds NO registry credential (StandingBuildHosts §2), so it
+  # reads the registry's bundle index (H8) with a READ-ONLY instance key — first-attach.sh sets registry.url and the Secret.
+  registry: {instanceKeySecret: {name: "build-registry-key-mac", key: "key"}}
+  rolloutStrategy: "Recreate"
+  nodeSelector: null
+  tolerations: null
+  resources:
+    requests: { cpu: "4", memory: 8Gi }
+    limits: { cpu: "6", memory: 12Gi }
+  workSizeLimit: 12Gi
+  cacheClaimName: "build-cache-mac"
+  # The Mac's only class is node-local; one replica owns the cache.
+  cache: {create: true, storageClass: "local-path", size: "20Gi", accessMode: "ReadWriteOnce"}
+  # bwrap needs `userns`; first-attach.sh loads this profile into the Colima VM before the release.
+  sandbox: {appArmorProfile: "Localhost", appArmorLocalhostProfile: "mw-build-host"}
+  # The Mac's OWN worker token (the operations instance accepts it for channel `mac` only).
+  workerTokenSecret: {name: "build-worker-mac", key: "token"}
+  latest: {enabled: false}
+  stable: {enabled: false}
+  # NO artifact store: the first attach takes only jobs routed to `mac` on purpose, and a stage that PRODUCES a module
+  # bundle or gate artifact fails its hand-over by design (build-run.py: "no artifact store is configured") — module
+  # builds stay off macos targets until arch-qualified bundle keys exist (Hosting/BackLease, core G10). The store the
+  # publishing side reads is the operations instance's shared CI artifact store; reaching it from a Mac is BackLease phase 2.
+  extraChannels: ["mac"]
+  mac:
+    enabled: true
+    maxReplicas: 1
