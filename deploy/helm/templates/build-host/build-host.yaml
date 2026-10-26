@@ -170,7 +170,12 @@ spec:
         - name: "tester"
           image: {{ $c.tester | quote }}
           imagePullPolicy: "IfNotPresent"
-          command: ["/bin/sh", "-c", "cp -a /app/. /tester/"]
+          # cp -R, never cp -a: the copy runs as the pod's unprivileged user into the ROOT of an
+          # emptyDir it does not own, and -a's attempt to set that directory's times and mode fails
+          # (EPERM) — measured on control: "cp: preserving times for '/tester/.': Operation not
+          # permitted", the init container crash-looped and the host never started. The portal's
+          # copy is safe because it targets subdirectories it created itself.
+          command: ["/bin/sh", "-c", "cp -R /app/. /tester/"]
           volumeMounts:
             - { name: "tester", mountPath: "/tester" }
           securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }

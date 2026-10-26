@@ -88,7 +88,7 @@ fi
 if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --namespace check \
      > "$WORK/hosts.yaml" 2> "$WORK/hosts.err"; then
   if python3 - "$WORK/hosts.yaml" <<'PY'
-import sys, yaml
+import re, sys, yaml
 docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
 mine = [d for d in docs if (d.get("metadata", {}).get("labels") or {}).get("app.kubernetes.io/component") == "build-host"]
 problems = []
@@ -150,6 +150,14 @@ for ch, (tester, portal, runner, mx, pv) in want.items():
     cmd = " ".join(build.get("command", []))
     if "compose-gate-host.sh /portal/app /tester /host/app" not in cmd or env.get("MW_BUILD_GATE_HOST", {}).get("value") != "/host/app":
         problems.append(f"{ch}: the gate host must be composed into /host/app (the composer removes its output; /host is a mount point)")
+    # An init container copying into the ROOT of a mount it does not own must not preserve
+    # attributes: `cp -a` sets the mount's own times/mode and fails EPERM as the unprivileged user
+    # (measured on control 2026-10-26: the tester copy crash-looped, the host never started).
+    for _ic in pod.get("initContainers", []):
+        _c = " ".join(_ic.get("command", []))
+        for _m in _ic.get("volumeMounts", []):
+            if re.search(r"cp -a \S+/\. " + re.escape(_m["mountPath"]) + r"/?(\s|$)", _c):
+                problems.append(f"{ch}: init container {_ic['name']} copies with cp -a into the root of mount {_m['mountPath']} — fails EPERM as the pod's user; use cp -R")
     if any(c["name"] == "postgres" for c in pod.get("containers", []) + pod.get("initContainers", [])):
         problems.append(f"{ch}: a shared Postgres container renders — a stage's database is disposable, inside its own sandbox")
     _vols = {v["name"]: v for v in pod.get("volumes", [])}
