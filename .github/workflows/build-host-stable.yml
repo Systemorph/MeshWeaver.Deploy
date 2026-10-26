@@ -169,16 +169,19 @@ jobs:
             exit 0
           fi
           echo "::notice title=build-stable ceiling has no runner::$ref is missing — dispatching build-host.yml to build it"
-          since=$(date -u -d '-30 seconds' +%Y-%m-%dT%H:%M:%SZ)
+          since=$(date -u -d '-5 minutes' +%Y-%m-%dT%H:%M:%SZ)
+          export REQUEST_TITLE="Build host — request stable-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/build-host.yml/dispatches" \
             -f ref="$DEFAULT_BRANCH" \
             -f "inputs[run_url]=$CD_RUN_URL" -f "inputs[run_core_sha]=$CORE_SHA" \
             -f "inputs[set_version]=$V_SET" -f "inputs[set_core_sha]=$CORE_SHA" \
+            -f "inputs[request_id]=stable-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             || { echo "::error::could not dispatch build-host.yml for $V_SET — build-stable was NOT handed it"; exit 1; }
           # The ACR tag appears BEFORE that run's image job mirrors the runner to the fleet registry,
           # so the tag alone is not "available": wait for the dispatched run's image job to SUCCEED
           # (build or keep, then mirror, digest verified), and only then for the tag. The run is the
-          # oldest workflow_dispatch run of build-host.yml created since just before the dispatch.
+          # one whose NAME carries this job's request id (build-host.yml's run-name) — never merely
+          # the oldest dispatch, which could be someone else's.
           export IMAGE_JOB="Build + push mw-build-host (the build-host runner)"
           deadline=$(( $(date +%s) + RUNNER_WAIT_MINUTES * 60 ))
           run=""
@@ -186,7 +189,7 @@ jobs:
             sleep 60
             if [ -z "$run" ]; then
               run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build-host.yml/runs?event=workflow_dispatch&created=%3E%3D$since&per_page=20" \
-                --jq '[.workflow_runs[]] | sort_by(.created_at) | .[0].id // empty') || run=""
+                --jq '[.workflow_runs[] | select(.display_title == env.REQUEST_TITLE)] | .[0].id // empty') || run=""
               [ -n "$run" ] && echo "dispatched build-host.yml run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"
               continue
             fi

@@ -48,6 +48,11 @@ name: Build host — runner image and the build-latest hand-over
 # image build every tick is the cost the pull must not carry); the image it publishes still runs
 # both self-tests inside its own build.
 
+# A dispatch that names a request_id is findable by it: build-host-stable.yml dispatches this
+# workflow for its ceiling and waits on exactly the run whose name carries its id (the dispatch API
+# returns no run id). Every other run keeps the workflow's name.
+run-name: ${{ inputs.request_id != '' && format('Build host — request {0}', inputs.request_id) || github.workflow }}
+
 on:
   pull_request:
   push:
@@ -73,6 +78,11 @@ on:
         default: ""
       set_core_sha:
         description: The platform commit that set was built from (40 hex), or empty with an empty version.
+        required: false
+        type: string
+        default: ""
+      request_id:
+        description: An opaque id a caller (build-host-stable.yml) uses to find THIS run — it becomes the run's name. Empty for a person.
         required: false
         type: string
         default: ""
