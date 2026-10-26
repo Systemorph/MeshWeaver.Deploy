@@ -47,11 +47,25 @@ The refusals, and why each one exists:
 {{- if $b.bakeShares -}}
 {{- fail "buildHosts.bakeShares is not supported — a build host mounts NO bake share; publication is the publish lane's, on the aggregate check build" -}}
 {{- end -}}
-{{- $cache := required "buildHosts.cacheClaimName is required — the shared RWX build-cache claim" $b.cacheClaimName -}}
 {{- $cc := ($b.cache | default dict) -}}
-{{- $cacheCreate := dict "create" false -}}
-{{- if $cc.create -}}
-{{- $cacheCreate = dict "create" true
+{{- /* medium: `claim` (default) — a claim every replica shares; `node` — a node-local emptyDir, for a host in its OWN
+       user namespace (sandbox.userNamespace): the pod's volumes are ID-mapped, and SMB/NFS (Azure Files) supports no
+       idmap mount — measured: "failed to set MOUNT_ATTR_IDMAP … maybe the filesystem used doesn't support idmap
+       mounts on this kernel?". A node-local cache is per replica and lives as long as the pod. */ -}}
+{{- /* hasKey, not `default`: Sprig's default turns a present false, 0 or "" into "claim", which would silently
+       select the claim (an SMB mount a user-namespaced host cannot take). A PRESENT key must itself be valid. */ -}}
+{{- $medium := "claim" -}}
+{{- if hasKey $cc "medium" -}}{{- $medium = $cc.medium -}}{{- end -}}
+{{- if not (and (kindIs "string" $medium) (has $medium (list "claim" "node"))) -}}
+{{- fail (printf "buildHosts.cache.medium %q must be claim or node" $medium) -}}
+{{- end -}}
+{{- $cache := "" -}}
+{{- if eq $medium "claim" -}}
+{{- $cache = required "buildHosts.cacheClaimName is required — the shared RWX build-cache claim (or cache.medium: node)" $b.cacheClaimName -}}
+{{- end -}}
+{{- $cacheCreate := dict "create" false "medium" $medium "size" ($cc.size | default "") -}}
+{{- if and (eq $medium "claim") $cc.create -}}
+{{- $cacheCreate = dict "create" true "medium" $medium
       "storageClass" (required "buildHosts.cache.storageClass is required when buildHosts.cache.create — the build cache is shared by every replica, so it needs a ReadWriteMany class (e.g. azurefile-memex)" $cc.storageClass)
       "size" (required "buildHosts.cache.size is required when buildHosts.cache.create — the chart will not guess a volume size" $cc.size)
       "accessMode" ($cc.accessMode | default "ReadWriteMany") -}}
