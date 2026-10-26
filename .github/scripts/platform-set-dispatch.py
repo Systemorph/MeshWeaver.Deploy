@@ -48,7 +48,7 @@ a hand-over) goes through the same reader with the same rules.
     platform-set-dispatch.py discover --tester t.json --portal p.json --runner r.json
         (each `az acr manifest list-metadata -o json` of mw-plugin-test / memex-portal-ai /
         mw-build-host) → lines: promoted_version, promoted_core7, promoted_run_id, need_version,
-        need_core7, need_run_id, why
+        need_core7, need_run_id, backlog (retained sets in the window still lacking a runner), why
     platform-set-dispatch.py claim --run-url U --run-core-sha S [--set-version V --set-core-sha S]
         → the same lines `read` prints, for a hand-over this repository discovered itself
     platform-set-dispatch.py --self-test
@@ -56,10 +56,30 @@ a hand-over) goes through the same reader with the same rules.
 DISCOVERY (the pull). A set is PROMOTED when `mw-plugin-test` carries its version tag (main-cd
 phase A) and ARMED when `memex-portal-ai` does (phase C). Both tags sit on the manifest the run's
 own `staging-<core7>-<run id>` tag names, so the manifest says which platform commit and which CD
-run the set is. `discover` names the newest armed and the newest promoted set and picks the first
-of the two — armed first, the hand-over needs its runner NOW — whose `mw-build-host:<version>` does
-not exist yet; none ⇒ nothing to build. The registry is the record: what a registry listing cannot
-place (a newest version tag with no staging tag, or naming two commits) is a Refusal, never a guess.
+run the set is. `discover` picks the ONE set this tick builds a runner for:
+
+  1. the newest ARMED set, when `mw-build-host:<version>` does not exist yet — the build-latest
+     hand-over needs its runner NOW;
+  2. otherwise the OLDEST retained PROMOTED set (an armed set is a promoted one) that still lacks
+     its runner (BACKFILL). Every set `mw-plugin-test` still carries a version tag for is a
+     candidate, not only the newest — the image job needs that tag, so a version only the portal
+     still carries is not one:
+     two sets that both arrive between two ticks (A, then B, so only B is ever the newest) would
+     otherwise leave A without a runner forever, and a build-stable hand-over whose main-passed
+     ceiling is A would fail on the missing `mw-build-host:A`.
+
+THE BOUNDS. One runner image per tick (the `image` job builds exactly the one set named here; a tick
+is 15 minutes). The backfill window is the retained sets NOT OLDER than the oldest set
+`mw-build-host` still carries — a set older than every runner predates the runner lane, or its
+runner aged out with the registry's retention, and is not rebuilt — and at most the
+`BACKFILL_WINDOW` newest of them. A registry with no runner at all backfills nothing: only the
+newest armed and the newest promoted set get one. A ceiling outside the window still gets its runner
+— `build-host-stable.yml` builds it on demand before it hands the ceiling over.
+
+The registry is the record: what a registry listing cannot place (a NEWEST version tag with no
+staging tag, or naming two commits) is a Refusal, never a guess. An OLDER set it cannot place is
+skipped from the backfill and named in `why` — one unreadable old manifest must not stop the newest
+set from getting its runner.
 """
 from __future__ import annotations
 
@@ -83,6 +103,9 @@ LEGACY_SET = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?[.-]ci\.(\d+)$")
 SEMVER_SET = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 SEMVER_ERA_START = (3, 1)
 STAGING_TAG = re.compile(r"^staging-([0-9a-f]{7})-([0-9]+)$")
+# The backfill considers at most this many of the newest retained sets (see THE BOUNDS above). A
+# ceiling older than that is built on demand by build-host-stable.yml.
+BACKFILL_WINDOW = 60
 
 
 class Refusal(Exception):
@@ -192,6 +215,34 @@ def _rows(manifests: object, what: str) -> list[list[str]]:
     return out
 
 
+def _place(version: str, tags: list[str], what: str) -> dict:
+    """{version, core7, run_id} of `version` from the staging tags on ITS manifest, or a Refusal."""
+    staging = [m for t in tags if (m := STAGING_TAG.match(t))]
+    cores = {m.group(1) for m in staging}
+    if len(cores) != 1:
+        raise Refusal(f"{what} {version} names {len(cores)} platform commits through its staging tags "
+                      f"({tags}) — cannot say which commit the set is")
+    run_id = max(int(m.group(2)) for m in staging)
+    return {"version": version, "core7": next(iter(cores)), "run_id": str(run_id)}
+
+
+def retained_sets(manifests: object, what: str) -> tuple[dict[str, dict], dict[str, str]]:
+    """Every set a repository's manifests still carry a version tag for: ({version: {version, core7,
+    run_id}}, {version: why it cannot be placed}). Nothing here is a Refusal per set — the caller
+    decides whether an unplaceable set matters (the NEWEST one does; an older one is skipped)."""
+    placed: dict[str, dict] = {}
+    unplaced: dict[str, str] = {}
+    for tags in _rows(manifests, what):
+        for t in tags:
+            if run_number_of(t) is None:
+                continue
+            try:
+                placed[t] = _place(t, tags, what)
+            except Refusal as e:
+                unplaced[t] = str(e)
+    return placed, unplaced
+
+
 def newest_set(manifests: object, what: str) -> dict | None:
     """{version, core7, run_id} of the newest set a repository's manifests carry a version tag for,
     or None when none carries one. The commit and the run come from the SAME manifest's
@@ -204,36 +255,81 @@ def newest_set(manifests: object, what: str) -> dict | None:
                 best = (n, t, tags)
     if best is None:
         return None
-    staging = [m for t in best[2] if (m := STAGING_TAG.match(t))]
-    cores = {m.group(1) for m in staging}
-    if len(cores) != 1:
-        raise Refusal(f"{what} {best[1]} names {len(cores)} platform commits through its staging tags "
-                      f"({best[2]}) — cannot say which commit the set is")
-    run_id = max(int(m.group(2)) for m in staging)
-    return {"version": best[1], "core7": next(iter(cores)), "run_id": str(run_id)}
+    return _place(best[1], best[2], what)
 
 
 def discover(tester: object, portal: object, runner: object) -> dict:
-    """The newest PROMOTED set (mw-plugin-test's newest version tag), the newest ARMED set
-    (memex-portal-ai's), and the one of them — armed first — that still lacks
-    `mw-build-host:<version>`. A tester repository with no version tag at all is a Refusal: a
-    registry that never promoted anything is not 'nothing to do', it is a reading that went wrong."""
+    """The newest PROMOTED set (mw-plugin-test's newest version tag) and the ONE set this tick builds a
+    runner for: the newest ARMED set (memex-portal-ai's) when it lacks `mw-build-host:<version>`,
+    else the OLDEST retained set in the backfill window that lacks one (module docstring, DISCOVERY
+    and THE BOUNDS). A tester repository with no version tag at all is a Refusal: a registry that
+    never promoted anything is not 'nothing to do', it is a reading that went wrong."""
     promoted = newest_set(tester, "mw-plugin-test")
     if promoted is None:
         raise Refusal("mw-plugin-test carries no set version tag at all — refusing to read that as "
                       "'nothing was promoted'")
     armed = newest_set(portal, "memex-portal-ai")
     runners = {t for tags in _rows(runner, "mw-build-host") for t in tags}
+
+    # Every retained PROMOTED set, placed by its own mw-plugin-test manifest: the image job builds a
+    # runner only for a set whose `mw-plugin-test:<version>` exists, so a version only the portal
+    # still carries (its tester tag aged out) is no backfill candidate — selecting it would fail the
+    # image job on every tick and stall the backfill behind it. The portal's placement is a CHECK: a
+    # version both repositories carry must name the same commit in both, or it is unplaceable, never
+    # a coin toss.
+    sets, unplaced = retained_sets(tester, "mw-plugin-test")
+    portal_sets, portal_unplaced = retained_sets(portal, "memex-portal-ai")
+    for v, why in portal_unplaced.items():
+        if v in sets:
+            unplaced.setdefault(v, why)
+    for v, cand in portal_sets.items():
+        mine = sets.get(v)
+        if mine is not None and mine["core7"] != cand["core7"]:
+            unplaced[v] = (f"{v} is commit {mine['core7']} in mw-plugin-test but {cand['core7']} in "
+                           "memex-portal-ai — cannot say which commit the set is")
+    # The newest two are what discovery always guaranteed. One of them unplaceable is a Refusal —
+    # never a runner built from whichever repository's commit happened to be read last.
+    for c in (promoted, armed):
+        if c is not None and c["version"] in unplaced:
+            raise Refusal(f"the newest set {c['version']} is unplaceable: {unplaced[c['version']]}")
+    for v in unplaced:
+        sets.pop(v, None)
+    sets[promoted["version"]] = promoted
+    if armed is not None:
+        sets[armed["version"]] = armed
+
+    runner_ordinals = [n for t in runners if (n := run_number_of(t)) is not None]
+    floor = min(runner_ordinals) if runner_ordinals else None
+    ordered = sorted(sets.values(), key=lambda c: run_number_of(c["version"]) or 0)
+    if floor is None:
+        # No runner anywhere: nothing to backfill against — the newest armed and promoted sets only.
+        window = [c for c in ordered if c["version"] in {promoted["version"], (armed or {}).get("version")}]
+    else:
+        window = [c for c in ordered if (run_number_of(c["version"]) or 0) >= floor][-BACKFILL_WINDOW:]
+        for c in (promoted, armed):  # the newest two are never outside the window
+            if c is not None and c not in window:
+                window.append(c)
+        window.sort(key=lambda c: run_number_of(c["version"]) or 0)
+    missing = [c for c in window if c["version"] not in runners]
+
     need, why = None, ""
-    for label, cand in (("armed", armed), ("promoted", promoted)):
-        if cand is not None and cand["version"] not in runners:
-            need, why = cand, f"the newest {label} set {cand['version']} has no mw-build-host image yet"
-            break
-    if need is None:
+    if armed is not None and armed["version"] not in runners:
+        need, why = armed, f"the newest armed set {armed['version']} has no mw-build-host image yet"
+    elif missing:
+        need = missing[0]
+        label = "newest promoted" if need is promoted else "retained"
+        why = (f"the oldest {label} set without a runner is {need['version']} — "
+               f"backfill, {len(missing)} set(s) in the window still lack one")
+    else:
         why = (f"every runner is there: newest promoted {promoted['version']}, newest armed "
-               f"{armed['version'] if armed else '(none)'} — nothing to build")
+               f"{armed['version'] if armed else '(none)'}, {len(window)} retained set(s) in the "
+               f"backfill window — nothing to build")
+    skipped = sorted(v for v in unplaced if floor is None or (run_number_of(v) or 0) >= floor)
+    if skipped:
+        why += f" (not backfilled, unplaceable: {', '.join(skipped)})"
     out = {f"promoted_{k}": v for k, v in promoted.items()}
     out.update({f"need_{k}": (need or {}).get(k, "") for k in ("version", "core7", "run_id")})
+    out["backlog"] = str(len(missing))
     out["why"] = why
     return out
 
@@ -347,6 +443,64 @@ def _self_test() -> int:
     check("refuses a newest set naming two commits",
           lambda: newest_set([{"tags": ["3.1.10412", "staging-aaaaaaa-1", "staging-bbbbbbb-2"]}], "t"), REFUSED)
     check("refuses metadata that is not a list", lambda: discover({}, portal, []), REFUSED)
+
+    # ── backfill: every retained set gets its runner, not only the newest ──
+    # THE REGRESSION (core #7196 review): two sets arrive between two ticks — A, then B — so both
+    # the newest armed and the newest promoted set jump from Z straight to B. B gets its runner on
+    # the first tick; A must get one on the next, or a build-stable hand-over whose main-passed
+    # ceiling is A fails on the missing mw-build-host:A.
+    z, a_, b_ = "3.1.10390", "3.1.10400", "3.1.10412"
+    two_tester = [{"tags": ["staging-bbbbbbb-902", b_]}, {"tags": ["staging-aaaaaaa-901", a_]},
+                  {"tags": ["staging-ccccccc-900", z]}]
+    two_portal = [{"tags": ["staging-bbbbbbb-902", b_]}, {"tags": ["staging-aaaaaaa-901", a_]},
+                  {"tags": ["staging-ccccccc-900", z]}]
+    check("two sets arriving between ticks: the first tick builds the newest armed set B",
+          lambda: discover(two_tester, two_portal, [{"tags": [z]}]),
+          lambda o: o["need_version"] == b_ and o["need_run_id"] == "902" and o["backlog"] == "2")
+    check("two sets arriving between ticks: A still gets its runner on the next tick",
+          lambda: discover(two_tester, two_portal, [{"tags": [z]}, {"tags": [b_]}]),
+          lambda o: o["need_version"] == a_ and o["need_core7"] == "aaaaaaa" and o["need_run_id"] == "901"
+          and o["backlog"] == "1" and "backfill" in o["why"])
+    check("two sets arriving between ticks: then nothing is left to build",
+          lambda: discover(two_tester, two_portal, [{"tags": [z]}, {"tags": [b_]}, {"tags": [a_]}]),
+          lambda o: o["need_version"] == "" and o["backlog"] == "0" and "nothing to build" in o["why"])
+    check("the same, promoted only (nothing armed): A after B, oldest first",
+          lambda: discover(two_tester, [], [{"tags": [z]}, {"tags": [b_]}]),
+          lambda o: o["need_version"] == a_)
+    check("backfill builds the OLDEST missing set first",
+          lambda: discover(two_tester, two_portal[:1], [{"tags": [z]}]),
+          lambda o: o["need_version"] == b_)  # the newest ARMED still comes first …
+    check("… and with the armed set's runner there, the oldest missing retained set is next",
+          lambda: discover([{"tags": ["staging-ddddddd-903", "3.1.10420"]}] + two_tester, two_portal[:1],
+                           [{"tags": [z]}, {"tags": [b_]}]),
+          lambda o: o["need_version"] == a_ and o["backlog"] == "2")
+    check("a set OLDER than every runner is not backfilled (it predates the runner lane)",
+          lambda: discover(two_tester, two_portal, [{"tags": [a_]}, {"tags": [b_]}]),
+          lambda o: o["need_version"] == "" and o["backlog"] == "0")
+    check("a registry with no runner at all backfills nothing older than the newest two",
+          lambda: discover(two_tester, two_portal[1:], []),
+          lambda o: o["need_version"] == a_ and o["backlog"] == "2")
+    many = [{"tags": [f"staging-eeeeeee-{1000 + i}", f"3.1.{11000 + i}"]} for i in range(BACKFILL_WINDOW + 20)]
+    check(f"the backfill window is the {BACKFILL_WINDOW} newest retained sets",
+          lambda: discover(many, [], [{"tags": ["3.1.10000"]}]),
+          lambda o: o["need_version"] == f"3.1.{11000 + 20}" and o["backlog"] == str(BACKFILL_WINDOW))
+    check("an unplaceable OLDER set is skipped and named, never a refusal of the tick",
+          lambda: discover([two_tester[0], {"tags": [a_, "aaaaaaa"]}, two_tester[2]], [],
+                           [{"tags": [z]}, {"tags": [b_]}]),
+          lambda o: o["need_version"] == "" and a_ in o["why"] and "unplaceable" in o["why"])
+    check("a set naming different commits in the two repositories is skipped, never guessed",
+          lambda: discover(two_tester, [two_portal[0], {"tags": ["staging-fffffff-901", a_]}, two_portal[2]],
+                           [{"tags": [z]}, {"tags": [b_]}]),
+          lambda o: o["need_version"] == "" and a_ in o["why"])
+    check("a set only the portal still carries is NOT backfilled (its tester tag aged out; the image job could not build it)",
+          lambda: discover([two_tester[0], two_tester[2]], two_portal, [{"tags": [z]}, {"tags": [b_]}]),
+          lambda o: o["need_version"] == "" and o["backlog"] == "0")
+    check("refuses a NEWEST armed set whose commit differs between the two repositories",
+          lambda: discover(two_tester, [{"tags": ["staging-fffffff-902", b_]}] + two_portal[1:], [{"tags": [z]}]),
+          REFUSED)
+    check("refuses a NEWEST promoted set the portal places on another commit",
+          lambda: discover(two_tester, [{"tags": ["staging-fffffff-902", b_, "x"]}], [{"tags": [z]}]),
+          REFUSED)
     check("a discovered claim reads through the contract, never armed",
           lambda: claim("https://github.com/o/r/actions/runs/901", a, "3.1.10412", a),
           lambda o: o["set_version"] == "3.1.10412" and o["armed"] == "false" and o["shas"] == a)
@@ -360,7 +514,7 @@ def _self_test() -> int:
         for f in fails:
             print("  - " + f)
         return 1
-    print("platform-set-dispatch self-test: all cases passed (the contract, every refusal, both events)")
+    print("platform-set-dispatch self-test: all cases passed (the contract, every refusal, both events, the backfill)")
     return 0
 
 

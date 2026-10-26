@@ -34,10 +34,14 @@ jobs:
     name: "Build host: hand the main-passed ceiling to build-stable (daily, record path)"
     # The daily schedule only — `stable` is refused on any other trigger (build-host-announcement.py).
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 45, not 15: when the ceiling has no runner yet, this job builds it on demand (build-host.yml,
+    # dispatched) and waits for the image — up to RUNNER_WAIT_MINUTES — before it hands it over.
+    timeout-minutes: 45
     permissions:
       contents: read
       id-token: write
+      # Dispatches build-host.yml for the ceiling's runner when mw-build-host:<ceiling> is missing.
+      actions: write
     outputs:
       enabled: ${{ steps.build_host_stable.outputs.enabled }}
       handed: ${{ steps.post.outputs.handed }}
@@ -129,6 +133,100 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      # 🚨 THE CEILING'S RUNNER, ON DEMAND (core #7196 review). The ceiling is a set Plugins' main
+      # PASSED, which is usually not the newest one: two sets arriving between two build-host.yml
+      # ticks, or a ceiling older than that lane's backfill window, can leave it without
+      # `mw-build-host:<ceiling>`. Handing it over would then fail on the missing runner digest, so
+      # this step BUILDS it instead: it dispatches build-host.yml for exactly that set (the same
+      # image job, the same one-digest-per-version rule, the same checks of the set and its commit)
+      # and waits for that run's image job to SUCCEED (build or keep, then the fleet-registry
+      # mirror) — on every daily run, not only when the tag is missing. Only a registry that
+      # ANSWERED "not found" means absent; any other inspect failure is red.
+      - name: "The ceiling's runner: build (or keep) and mirror mw-build-host:<ceiling> before the hand-over"
+        if: steps.build_host_stable.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V_SET: ${{ steps.ceiling.outputs.set }}
+          CORE_SHA: ${{ steps.ceiling.outputs.sha }}
+          CD_RUN_URL: ${{ steps.ceiling.outputs.run-url }}
+          RUNNER_WAIT_MINUTES: "35"
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          [ -n "${V_SET:-}" ] || { echo "::error::the ceiling named no set — refusing to hand build-stable nothing"; exit 1; }
+          bash platform/.github/scripts/acr-login.sh
+          ref="meshweaver.azurecr.io/mw-build-host:$V_SET"
+          present() {
+            if docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' >/dev/null 2>"$RUNNER_TEMP/inspect.err"; then
+              return 0
+            fi
+            grep -qiE 'not found|manifest unknown|MANIFEST_UNKNOWN' "$RUNNER_TEMP/inspect.err" && return 1
+            cat "$RUNNER_TEMP/inspect.err"
+            echo "::error::could not establish whether $ref exists (the registry did not answer 'not found') — build-stable was NOT handed $V_SET"
+            exit 1
+          }
+          # ALWAYS dispatched, even when the ACR tag exists: a tag can be there while its fleet-registry
+          # mirror failed, or before another run's image job reached the mirror. The image job is
+          # idempotent — it KEEPS an existing digest (one digest per version) and mirrors it again,
+          # digest verified — so its success is the only proof the runner is pullable everywhere.
+          if present; then
+            echo "$ref exists — re-mirroring it through build-host.yml before the hand-over"
+          else
+            echo "::notice title=build-stable ceiling has no runner::$ref is missing — dispatching build-host.yml to build it"
+          fi
+          # The ACR tag appears BEFORE that run's image job mirrors the runner to the fleet registry,
+          # so the tag alone is not "available": wait for the dispatched run's image job to SUCCEED
+          # (build or keep, then mirror, digest verified), and only then for the tag. The run is the
+          # one whose NAME carries this dispatch's request id (build-host.yml's run-name) — never
+          # merely the oldest dispatch, which could be someone else's.
+          # 🚨 CONTENTION: the image job's per-version concurrency group keeps ONE pending job and
+          # REPLACES it with the next (even with cancel-in-progress: false), so a schedule tick for the
+          # same version can cancel this dispatch's pending image job. A CANCELLED image job is
+          # therefore re-dispatched with a fresh request id while the wait budget lasts; a FAILED or
+          # SKIPPED one is red. Only a success is ever handed over.
+          export IMAGE_JOB="Build + push mw-build-host (the build-host runner)"
+          deadline=$(( $(date +%s) + RUNNER_WAIT_MINUTES * 60 ))
+          attempt=0
+          dispatch() {
+            attempt=$((attempt + 1))
+            request="stable-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$attempt"
+            export REQUEST_TITLE="Build host — request $request"
+            since=$(date -u -d '-5 minutes' +%Y-%m-%dT%H:%M:%SZ)
+            run=""
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/build-host.yml/dispatches" \
+              -f ref="$DEFAULT_BRANCH" \
+              -f "inputs[run_url]=$CD_RUN_URL" -f "inputs[run_core_sha]=$CORE_SHA" \
+              -f "inputs[set_version]=$V_SET" -f "inputs[set_core_sha]=$CORE_SHA" \
+              -f "inputs[request_id]=$request" \
+              || { echo "::error::could not dispatch build-host.yml for $V_SET — build-stable was NOT handed it"; exit 1; }
+            echo "dispatched build-host.yml for $V_SET (request $request)"
+          }
+          dispatch
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            sleep 60
+            if [ -z "$run" ]; then
+              run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build-host.yml/runs?event=workflow_dispatch&created=%3E%3D$since&per_page=20" \
+                --jq '[.workflow_runs[] | select(.display_title == env.REQUEST_TITLE)] | .[0].id // empty') || run=""
+              [ -n "$run" ] && echo "dispatched build-host.yml run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"
+              continue
+            fi
+            job=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs?per_page=100" \
+              --jq '[.jobs[] | select(.name == env.IMAGE_JOB)] | .[0] | "\(.status // "") \(.conclusion // "")"' 2>/dev/null) || job=""
+            case "$job" in
+              "completed success")
+                present || { echo "::error::run $run's image job succeeded but $ref is not in the registry — build-stable was NOT handed $V_SET"; exit 1; }
+                echo "- build-stable: the ceiling \`$V_SET\`'s runner was built or kept, and mirrored, by build-host.yml run $run" >> "$GITHUB_STEP_SUMMARY"
+                exit 0 ;;
+              "completed cancelled")
+                echo "::warning::build-host.yml run $run's image job was cancelled (replaced in its per-version concurrency group) — dispatching again"
+                dispatch ;;
+              "completed "*)
+                echo "::error::build-host.yml run $run's image job ended '${job#completed }' — mw-build-host:$V_SET was not built and mirrored; build-stable was NOT handed $V_SET"
+                exit 1 ;;
+            esac
+          done
+          echo "::error::no dispatched build-host.yml run (last: ${run:-not found}, $attempt dispatch(es)) built and mirrored mw-build-host:$V_SET within ${RUNNER_WAIT_MINUTES} min — build-stable was NOT handed $V_SET; the image is kept, so the next daily run hands it over"
+          exit 1
       - name: "Sign and POST build-host-update-available for build-stable"
         if: steps.build_host_stable.outputs.enabled == 'true'
         id: post
@@ -177,7 +275,7 @@ jobs:
             401) echo "::error::the inbox REFUSED the signature (HTTP 401) — build-stable was NOT handed $V_SET"; exit 1 ;;
             *)   echo "::error::the inbox refused the build-host event (HTTP $code) — build-stable was NOT handed $V_SET"; exit 1 ;;
           esac
-  # The REPORT is its own job (if: always()): a step inside the 15-minute job it monitors dies with
+  # The REPORT is its own job (if: always()): a step inside the 45-minute job it monitors dies with
   # that job on a timeout, and `failure()` excludes a cancellation. This job reads the operation's
   # RESULT and its `handed` output: a failed or cancelled roll files (or comments on) the one open
   # `build-host` issue; only an ENABLED, completed hand-over clears it (a disabled no-op is not a

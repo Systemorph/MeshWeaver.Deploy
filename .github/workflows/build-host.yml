@@ -9,8 +9,10 @@ name: Build host — runner image and the build-latest hand-over
 # nothing about what consumes its sets (policy `dependents-verify-on-their-side`, held by core's
 # `PlatformReleaseNotifyGuard.CoreDispatchesToNoRepository`). So THIS repository PULLS: every
 # 15 minutes (`schedule`) `preflight` reads the platform's sealed sets from the registry they were
-# sealed into (`platform-set-dispatch.py discover`) and turns the newest ARMED, then the newest
-# PROMOTED, set that still lacks a runner into a hand-over. The two events that carry a hand-over
+# sealed into (`platform-set-dispatch.py discover`) and turns the newest ARMED set that still lacks
+# a runner, else the OLDEST retained set (armed or promoted) that still lacks one — a BACKFILL, one
+# image per tick, so two sets arriving between two ticks both get their runner — into a hand-over.
+# The two events that carry a hand-over
 # explicitly read the same contract: `workflow_dispatch` (a person re-running one) and
 # `repository_dispatch: platform-set-sealed` (the shape an event-based emitter — memex, never the
 # platform's CD — sends). Everything a standing build host needs from that set happens here, in the
@@ -46,6 +48,11 @@ name: Build host — runner image and the build-latest hand-over
 # image build every tick is the cost the pull must not carry); the image it publishes still runs
 # both self-tests inside its own build.
 
+# A dispatch that names a request_id is findable by it: build-host-stable.yml dispatches this
+# workflow for its ceiling and waits on exactly the run whose name carries its id (the dispatch API
+# returns no run id). Every other run keeps the workflow's name.
+run-name: ${{ inputs.request_id != '' && format('Build host — request {0}', inputs.request_id) || github.workflow }}
+
 on:
   pull_request:
   push:
@@ -71,6 +78,11 @@ on:
         default: ""
       set_core_sha:
         description: The platform commit that set was built from (40 hex), or empty with an empty version.
+        required: false
+        type: string
+        default: ""
+      request_id:
+        description: An opaque id a caller (build-host-stable.yml) uses to find THIS run — it becomes the run's name. Empty for a person.
         required: false
         type: string
         default: ""
@@ -207,7 +219,7 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      - name: "Schedule: discover the newest sealed set that still lacks a runner"
+      - name: "Schedule: discover the sealed set that still lacks a runner (newest armed, else the oldest retained)"
         id: discover
         if: github.event_name == 'schedule'
         env:
@@ -241,7 +253,7 @@ jobs:
             echo "set_version=$version"
             echo "set_core_sha=${version:+$core}"
           } >> "$GITHUB_OUTPUT"
-          echo "- discovered: $(get why)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- discovered: $(get why) — $(get backlog) retained set(s) in the backfill window lack a runner, this tick's included" >> "$GITHUB_STEP_SUMMARY"
       - name: Read the hand-over (validated field by field)
         id: claim
         env:
