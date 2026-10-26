@@ -236,6 +236,8 @@ case "$RC:$OUT" in 0:*"changed: 0"*) ok "all tools present and satisfying → ex
 grep -q 'using the existing installation' "$P/etc/tools.report" && ok "the report says the existing installation is used" || bad "report wording" ""
 case "$(sed -n '/^probe_all()/,/^}/p' "$POST")" in *'sudo -u "$probe_user" -H env PATH="$PROBE_PATH"'*) ok "as root, the probe (which EXECUTES the found tools) runs through sudo as the console user / nobody, never as root" ;; *) bad "unprivileged probe" "" ;; esac
 grep -q '^export PATH="/usr/bin:/bin:/usr/sbin:/sbin"$' "$POST" && ok "root's own PATH in the postinstall is the trusted system PATH" || bad "trusted root PATH" "$(grep -n 'export PATH' "$POST")"
+grep -q "brew_bin=\"\$(PATH=\"\$PROBE_PATH\" bash -c 'command -v brew' 2>/dev/null || true)\"" "$POST" && ! grep -q 'env PATH="$PROBE_PATH" command' "$POST" \
+  && ok "the brew lookup is the shell builtin under a PATH assignment, never an \`env … command\` that would run an executable named 'command' from the probe PATH as root" || bad "brew lookup via builtin" "$(grep -n 'brew_bin=' "$POST")"
 grep -q '^set -euo pipefail' "$POST" && ok "the postinstall fails on an unhandled error (set -e)" || bad "set -e" ""
 
 rm -f "$EX/helm"; runpost

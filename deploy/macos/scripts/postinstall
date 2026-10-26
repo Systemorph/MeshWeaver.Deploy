@@ -46,7 +46,10 @@ say() { printf '%s\n' "$*"; lines="${lines}${1}"$'\n'; }
 
 # `brew list --versions <formula>` for the report — informational, only when brew is on the probe PATH,
 # and as the probe user (brew refuses root).
-brew_bin="$(env PATH="$PROBE_PATH" command -v brew 2>/dev/null || true)"
+# A PATH assignment on the shell BUILTIN `command -v` — never `env PATH=… command`, which would search the
+# user-writable probe PATH for an EXECUTABLE named `command` and run it as root. `bash` itself resolves
+# on root's trusted PATH above; the builtin only looks brew up, it executes nothing.
+brew_bin="$(PATH="$PROBE_PATH" bash -c 'command -v brew' 2>/dev/null || true)"
 brew_version() {
   [ -n "$brew_bin" ] || return 0
   if [ "$(id -u)" -eq 0 ]; then
