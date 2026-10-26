@@ -574,6 +574,9 @@ for entry in \
   "values.build-hosts-extra-channel-dash.yaml|ending in a letter or digit" \
   "values.build-hosts-userns-not-bool.yaml|sandbox.userNamespace" \
   "values.build-hosts-cache-bad-medium.yaml|must be claim or node" \
+  "values.build-hosts-cache-medium-false.yaml|must be claim or node" \
+  "values.build-hosts-cache-medium-zero.yaml|must be claim or node" \
+  "values.build-hosts-cache-medium-empty.yaml|must be claim or node" \
   "values.build-hosts-userns-empty-0.yaml|sandbox.userNamespace" \
   "values.build-hosts-userns-empty-string.yaml|sandbox.userNamespace" \
   "values.build-hosts-userns-empty-list.yaml|sandbox.userNamespace" \
