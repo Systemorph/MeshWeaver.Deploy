@@ -40,7 +40,7 @@ RUN set -eu \
  && fetch /src/platform "$PLATFORM_REPO" "$PLATFORM_COMMIT" \
  && mkdir -p /out/scripts \
  && cp /src/deploy/.github/scripts/build-run.py /out/scripts/ \
- && for f in compose-gate-host.sh sandbox-postgres.sh module-build-key.py ci-artifact-store.py; do \
+ && for f in compose-gate-host.sh sandbox-postgres.sh module-build-key.py node-repo-scope.py ci-artifact-store.py; do \
       [ -s "/src/platform/.github/scripts/$f" ] || { echo "the platform at $PLATFORM_COMMIT has no .github/scripts/$f"; exit 1; }; \
       cp "/src/platform/.github/scripts/$f" /out/scripts/; \
     done \
@@ -58,11 +58,12 @@ RUN apt-get update \
 
 # The runner (this repository) and the platform's composer and helpers (the set's commit) — one
 # implementation each, versioned with the image (the chart ships no copy).
-COPY --from=sources /out/scripts/build-run.py /out/scripts/compose-gate-host.sh /out/scripts/sandbox-postgres.sh /out/scripts/module-build-key.py /out/scripts/ci-artifact-store.py /opt/build-host/
+COPY --from=sources /out/scripts/build-run.py /out/scripts/compose-gate-host.sh /out/scripts/sandbox-postgres.sh /out/scripts/module-build-key.py /out/scripts/node-repo-scope.py /out/scripts/ci-artifact-store.py /opt/build-host/
 COPY --from=sources /out/plugin-build/ /opt/build-host/plugin-build/
 RUN chmod 0555 /opt/build-host/*.py /opt/build-host/*.sh \
  && test -f /opt/build-host/plugin-build/MeshWeaver.Plugin.Build.dll \
  && python3 /opt/build-host/build-run.py --self-test \
+ && python3 /opt/build-host/module-build-key.py --self-test \
  && bash /opt/build-host/sandbox-postgres.sh --self-test
 
 # The SDK image's unprivileged `app` user (uid 1654). bwrap creates its namespaces unprivileged.
