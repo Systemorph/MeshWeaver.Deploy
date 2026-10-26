@@ -100,11 +100,23 @@ The hosting operator's image (`hosting-operator`) is NOT here: its scripts are v
 `hosting-operator.yml` — the ONE pipeline that publishes `hosting-operator:main` — which bakes this
 repository's charts and manifests in.
 
+## memex-local on a Mac: two channels
+
+`deploy/homebrew/` is the **developer channel** (`brew install memex-local` from the tap
+`Systemorph/homebrew-memex`). `deploy/macos/` is the **professional distribution**: a Developer ID signed
+and notarized `.pkg` that installs the same CLI under `/opt/memex` with a pinned toolchain used only where
+the Mac has none that meets the floor, the optional unattended-host LaunchDaemon, and the managed
+preferences an MDM pre-fills — design of record and manual in
+[`deploy/macos/README.md`](deploy/macos/README.md).
+
 ## Developing
 
 ```bash
 deploy/aks/scripts/check-chart-invariants.sh     # render every values combination, assert it is coherent
 deploy/aks/scripts/check-values-are-read.sh      # every key a values file sets reaches a template
+/bin/bash deploy/homebrew/test/run-tests.sh      # memex-local: the CLI, the toolchain resolver, the manifest↔formula drift
+/bin/bash deploy/macos/test/run-tests.sh         # the macOS installer (.pkg): payload, plists, probe-first postinstall, signing branches (macOS only)
+deploy/macos/build-pkg.sh --version 0.3.1 --arch arm64 --out dist --vendor none --sign never   # an unsigned installer from this tree
 dotnet test test/MeshWeaver.Deploy.ChartGuards -p:MeshWeaverRoot=../MeshWeaver
 python3 .github/scripts/build-run.py --self-test                 # the build host's runner
 python3 .github/scripts/platform-set-dispatch.py --self-test     # the platform's hand-over contract

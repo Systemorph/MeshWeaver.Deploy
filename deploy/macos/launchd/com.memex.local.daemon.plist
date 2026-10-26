@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  memex-local UNATTENDED HOST daemon — the OPTIONAL "Unattended host" choice of the Memex .pkg
+  (deploy/macos/README.md §1d). A headless Mac (a Mac mini that leases itself back to the fleet) has no
+  login session, so the per-user LaunchAgents (com.memex.local, com.memex.local.backlease) never load;
+  this LaunchDaemon runs /opt/memex/libexec/memex-daemon.sh at boot AS THE SERVICE USER (UserName —
+  Colima's VM and ~/.memex-local belong to a user, never to root) and keeps the port-forward alive.
+
+  The .pkg's daemon postinstall substitutes __USER__ (the managed preference com.memex.local
+  ServiceUser, else the console user at install time) and bootstraps the daemon ONLY when the managed
+  preference Unattended is true; otherwise it is installed and left unloaded:
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.memex.local.daemon.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memex.local.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/opt/memex/libexec/memex-daemon.sh</string>
+    </array>
+
+    <key>UserName</key>
+    <string>__USER__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/memex/bin</string>
+    </dict>
+
+    <!-- Disabled by default: launchd never loads this at boot unless `launchctl enable
+         system/com.memex.local.daemon` has been issued — which the daemon postinstall does ONLY when the
+         managed preference Unattended is true (and `launchctl disable`s it otherwise). The file being in
+         /Library/LaunchDaemons is therefore never enough to start a VM at boot. -->
+    <key>Disabled</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart the daemon only when it FAILS (the forward dropped, `up` could not complete). A
+         successful exit means a deliberate `memex-local down` (the stop marker ~/.memex-local/daemon.stopped),
+         which must not be answered with a fresh `up` into the teardown. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/memex/daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/memex/daemon.log</string>
+</dict>
+</plist>

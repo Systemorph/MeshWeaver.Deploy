@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Distribution.xml.in — the product archive's definition (deploy/macos/README.md §1a). build-pkg.sh
+  substitutes __VERSION__ and __HOST_ARCH__ (arm64 | x86_64 — one package per architecture, and
+  Installer refuses the other architecture before anything is written).
+-->
+<installer-gui-script minSpecVersion="2">
+  <title>Memex Local __VERSION__</title>
+  <organization>com.memex</organization>
+  <options customize="allow" require-scripts="true" rootVolumeOnly="true" hostArchitectures="__HOST_ARCH__"/>
+  <domains enable_localSystem="true"/>
+  <welcome file="welcome.html" mime-type="text/html"/>
+  <license file="license.html" mime-type="text/html"/>
+  <conclusion file="conclusion.html" mime-type="text/html"/>
+  <installation-check script="memex_install_check();"/>
+  <script><![CDATA[
+    function memex_install_check() {
+      if (system.compareVersions(system.version.ProductVersion, '13.0') < 0) {
+        my.result.title = 'macOS 13 or newer is required';
+        my.result.message = 'Memex Local runs its Kubernetes VM on the Virtualization framework, which needs macOS 13 (Ventura) or newer.';
+        my.result.type = 'Fatal';
+        return false;
+      }
+      return true;
+    }
+  ]]></script>
+  <choices-outline>
+    <line choice="cli"/>
+    <line choice="daemon"/>
+  </choices-outline>
+  <choice id="cli" title="memex-local" enabled="false" selected="true"
+          description="The memex-local command, its launchd agent templates and the chart under /opt/memex, with pinned copies of Colima, Lima, kubectl, helm and mkcert used only where this Mac has none that meets the floor. Nothing is written into Homebrew.">
+    <pkg-ref id="com.memex.local.cli"/>
+  </choice>
+  <choice id="daemon" title="Unattended host (LaunchDaemon)" start_selected="false"
+          description="For a headless Mac that leases itself back to the fleet: a root LaunchDaemon that runs 'memex-local up' at boot as the service user and holds the port-forward. Installed unloaded unless the managed preference com.memex.local Unattended is true.">
+    <pkg-ref id="com.memex.local.daemon"/>
+  </choice>
+  <pkg-ref id="com.memex.local.cli" version="__VERSION__" onConclusion="none">memex-local-cli.pkg</pkg-ref>
+  <pkg-ref id="com.memex.local.daemon" version="__VERSION__" onConclusion="none">memex-local-daemon.pkg</pkg-ref>
+</installer-gui-script>

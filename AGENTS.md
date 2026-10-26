@@ -30,7 +30,8 @@ Mac). It left the platform repository so that the platform stays framework only 
 | `deploy/aks/values.aks.yaml` | the generic AKS overlay (placeholders only) | the chart gate; first-time setup |
 | `deploy/aks/manifests/` | cluster manifests the governed `ApplyClusterManifest` applies, incl. the operator's ClusterRole | the estate's aks-ops lane; the operator's RBAC tests |
 | `deploy/aks/scripts/` | chart invariants, values-are-read, chart-drift render/compare/record, observability checks, fixtures, setup examples | the chart gate; the operator image (drift scripts) |
-| `deploy/homebrew/` | `memex-local` — CLI, formula, local values, tests | `homebrew.yml` → the public tap `Systemorph/homebrew-memex` |
+| `deploy/homebrew/` | `memex-local` — CLI, formula, local values, tests, and the ONE toolchain manifest + resolver (`share/tools.manifest`, `share/tools.sh`) both channels read | `homebrew.yml` → the public tap `Systemorph/homebrew-memex` |
+| `deploy/macos/` | the professional Mac distribution: the signed + notarized `.pkg` build, its probe-first postinstall, the optional unattended-host LaunchDaemon, the MDM profile example, the design of record (`README.md`) | `macos-pkg.yml` → the release `memex-local/v<version>` of this repository (signed only; unsigned = labelled artifact) |
 | `deploy/build-host/`, `.github/scripts/build-run.py`, `build-host-announcement.py`, `platform-set-dispatch.py`, `.github/build-hosts.json` | the standing build host's runner image and runner, and the hand-over of the platform's sets to `build-latest` / `build-stable` | `build-host.yml` (a 15-minute `schedule` that PULLS the platform's sealed sets from the registry; also `workflow_dispatch`), `build-host-stable.yml` (daily) |
 | `scripts/check-config-key-coverage.py` | overlay ↔ chart key check | the estate's `config-key-coverage` |
 | `test/MeshWeaver.Deploy.ChartGuards/` | the guards that hold the chart to the platform's code (probe paths, drain deadline, ConfigMap keys, the migration Job, …) | `chart-guards.yml`, against a platform checkout |
@@ -175,7 +176,12 @@ transient). Each calls its lane `@main`; never paste a lane's body in here.
 
 `homebrew.yml` is path-filtered to `deploy/homebrew/**` and `deploy/helm/**` and therefore NOT a
 required check (a skipped required check reads as satisfied): `memex-local (Linux — …)` and
-`brew install + test (macOS)` on a change there, and the tap publish on `main`.
+`brew install + test (macOS)` on a change there, and the tap publish on `main`. `macos-pkg.yml` is
+path-filtered the same way plus `deploy/macos/**`: `installer scripts (parse + shellcheck)`,
+`build + install (macOS, unsigned)` — both suites under bash 3.2, both architectures built, the package
+INSTALLED on the runner, re-installed (idempotent) and uninstalled — and on `main` `Sign + notarize +
+release`, which names every absent Apple secret in a warning and the step summary and releases ONLY a
+notarized package (`deploy/macos/README.md` §1f: the seven secrets are the maintainer's to mint).
 
 A chart change is effective at the next deploy that reads this repository's `main`, and the
 operator image picks it up on its next build — so a bad chart change is live on merge. Treat a red

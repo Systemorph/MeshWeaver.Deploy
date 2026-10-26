@@ -1,0 +1,104 @@
+#!/bin/bash
+# postinstall — the memex-local component of the Memex .pkg, run by Installer as root once the payload
+# is on disk (deploy/macos/README.md §1a, §2). Idempotent: a re-run of the installer, or the menu-bar
+# app's Update, repairs only what is missing and reports "unchanged" otherwise.
+#
+# "It will see what's there and install whatever is missing" (maintainer, 2026-10-26). The payload lays
+# every vendored tool down INERT under <prefix>/libexec/vendor/<tool>/; this script PROBES the machine
+# through the same resolver the CLI uses (share/tools.sh over share/tools.manifest) and ACTIVATES a
+# vendored copy — a symlink <prefix>/bin/<tool> — only for a tool that is missing or below its floor.
+# An existing installation that meets the floor (the developer's Homebrew copy, a hand install) is
+# used as is: never overwritten, never shadowed, and nothing is ever written into Homebrew's prefix.
+# A fallback activated earlier is REMOVED when a satisfying installation has since appeared, so the
+# user's copy takes over on the next run — the precedence list is the same in both directions.
+#
+# Installer runs scripts with a minimal environment; the probe PATH is set explicitly below and covers
+# both Homebrew prefixes. The two MEMEX_PKG_* variables exist for the test suite (deploy/macos/test):
+# Installer never sets them, so the defaults are what a real install uses.
+set -euo pipefail
+PREFIX="${MEMEX_PKG_PREFIX:-/opt/memex}"
+# Two PATHs, deliberately. Everything THIS script does as root (mkdir, ln, rm, the report) runs with a
+# TRUSTED system PATH. The probe — which EXECUTES whatever `colima`, `kubectl`, … it finds, to read
+# their versions — searches the user-writable Homebrew prefixes too, and therefore never runs as root:
+# it runs as the console user Installer is serving (else `nobody`), through sudo, with that wider PATH.
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+PROBE_PATH="${MEMEX_PKG_PROBE_PATH:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
+export MEMEX_PREFIX="$PREFIX"
+# shellcheck source=../../homebrew/share/tools.sh
+. "$PREFIX/share/tools.sh" || { echo "postinstall: $PREFIX/share/tools.sh is not in the payload" >&2; exit 1; }
+
+console_user="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
+case "$console_user" in ""|root|loginwindow|_*) probe_user="nobody" ;; *) probe_user="$console_user" ;; esac
+# probe_all → every tool's tool_resolve line, produced by an UNPRIVILEGED process when we are root.
+# The interpreter is the SYSTEM bash by absolute path: `env PATH=<probe> bash` would resolve `bash` on the
+# user-writable probe PATH. Only the probe's own lookups (the tools it versions) use that PATH — and
+# those run as the probe user, never as root.
+probe_all() {
+  local script='. "$1/share/tools.sh"; for n in $(tools_list); do tool_resolve "$n" || true; done'
+  if [ "$(id -u)" -eq 0 ]; then
+    sudo -u "$probe_user" -H env PATH="$PROBE_PATH" MEMEX_PREFIX="$PREFIX" /bin/bash -c "$script" _ "$PREFIX"
+  else
+    env PATH="$PROBE_PATH" MEMEX_PREFIX="$PREFIX" /bin/bash -c "$script" _ "$PREFIX"
+  fi
+}
+mkdir -p "$PREFIX/etc" "$PREFIX/bin"
+report="$PREFIX/etc/tools.report"
+changed=0
+lines=""
+say() { printf '%s\n' "$*"; lines="${lines}${1}"$'\n'; }
+
+# `brew list --versions <formula>` for the report — informational, only when brew is on the probe PATH,
+# and as the probe user (brew refuses root).
+# A PATH assignment on the shell BUILTIN `command -v`, in THIS shell: no external program is looked up or
+# run at all. Neither `env PATH=… command` (an EXECUTABLE named `command` on the user-writable probe PATH
+# would run as root) nor `PATH=… bash -c …` (bash applies a prefix assignment DURING the lookup, so a
+# planted `bash` on the probe PATH would run as root). The builtin only looks brew up.
+brew_bin="$(PATH="$PROBE_PATH" command -v brew 2>/dev/null || true)"
+brew_version() {
+  [ -n "$brew_bin" ] || return 0
+  if [ "$(id -u)" -eq 0 ]; then
+    sudo -u "$probe_user" -H "$brew_bin" list --versions "$1" 2>/dev/null | head -1 || true
+  else
+    "$brew_bin" list --versions "$1" 2>/dev/null | head -1 || true
+  fi
+  return 0
+}
+
+say "memex-local postinstall — toolchain probe ($(date -u +%Y-%m-%dT%H:%M:%SZ), prefix $PREFIX, manifest $TOOLS_MANIFEST)"
+say "existing installation first (floor met), vendored copy second, never into Homebrew's prefix (probe as $probe_user)"
+resolved="$(probe_all)" || { echo "postinstall: the toolchain probe (as $probe_user) failed" >&2; exit 1; }
+while IFS=$'\t' read -r name kind path version floor verdict note; do
+  [ -n "$name" ] || continue
+  bin="$(tool_field "$name" 2)"; bin="${bin%%:*}"
+  link="$PREFIX/bin/$bin"
+  action=""
+  case "$kind:$verdict" in
+    vendored:ok)
+      if [ "$(readlink "$link" 2>/dev/null || true)" = "$path" ]; then
+        action="kept the vendored fallback"
+      else
+        rm -f "$link"
+        ln -s "$path" "$link" || { echo "postinstall: cannot activate $link → $path (ln failed) — the toolchain was NOT repaired" >&2; exit 1; }
+        changed=$((changed + 1))
+        action="ACTIVATED the vendored fallback → $link"
+      fi ;;
+    existing:ok)
+      if [ -L "$link" ]; then
+        rm -f "$link"; changed=$((changed + 1))
+        action="removed the stale fallback $link — the existing installation now meets the floor"
+      else
+        action="using the existing installation"
+      fi ;;
+    *)
+      if [ -L "$link" ]; then rm -f "$link"; changed=$((changed + 1)); action="removed $link (its target no longer resolves); "; fi
+      action="${action}NOT RESOLVED — nothing vendored for it; install it ($(tool_field "$name" 3))" ;;
+  esac
+  bv="$(brew_version "$(tool_field "$name" 3)")"
+  say "  $(printf '%-13s %-9s %-9s floor %-7s %-12s %s%s%s' "$name" "$kind" "$version" "$floor" "$verdict" "$path" "${bv:+  [brew: $bv]}" "${note:+  ($note)}")"
+  say "  $(printf '%-13s → %s' "" "$action")"
+done <<<"$resolved"
+say "changed: $changed"
+printf '%s' "$lines" > "$report" || { echo "postinstall: cannot write $report" >&2; exit 1; }
+chmod 644 "$report"
+say "report: $report"
+exit 0

@@ -148,6 +148,16 @@ readonly CERT_FILE="$LOCAL_HOME/${HOSTNAME_LOCAL}.pem"
 readonly KEY_FILE="$LOCAL_HOME/${HOSTNAME_LOCAL}-key.pem"
 readonly PF_SCRIPT="$LOCAL_HOME/port-forward.sh"
 readonly PF_LOG="$LOCAL_HOME/port-forward.log"
+# HEADLESS HOST (MEMEX_HEADLESS=1 — set by the .pkg's LaunchDaemon, deploy/macos/README.md §1d): no GUI
+# session, so no LaunchAgent can load; the port-forward is held as a background process instead and its
+# pid recorded here, for the daemon to watch and for `down` to stop.
+readonly PF_PID="$LOCAL_HOME/port-forward.pid"
+# A deliberate `down` on a headless host writes this marker before stopping the forward; the daemon
+# (memex-daemon.sh) exits SUCCESSFULLY while it exists — launchd's KeepAlive (SuccessfulExit=false) then
+# leaves the host down, across reboots too — and an explicit `up` removes it. Without it a `down` looked
+# to the daemon exactly like a dropped forward and was answered with a fresh `up` mid-teardown.
+readonly DAEMON_STOP="$LOCAL_HOME/daemon.stopped"
+readonly HEADLESS="${MEMEX_HEADLESS:-}"
 readonly PLIST_LABEL="com.memex.local"
 readonly PLIST_DST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 # How long to wait for the launchd port-forward to actually BIND before reporting it did not.
@@ -235,7 +245,41 @@ resolve_repo() {
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
-need() { command -v "$1" >/dev/null 2>&1 || die "required tool '$1' not found — install it (see: brew install $2)"; }
+# The toolchain resolver — ONE precedence list for colima, lima, kubectl, helm, mkcert, ollama and
+# socket_vmnet (share/tools.sh over share/tools.manifest, the same files the .pkg's postinstall reads):
+# an EXISTING installation that meets the manifest's floor first, the .pkg's VENDORED copy second,
+# missing third. `doctor` prints the table; preflight activates the vendored copies the resolution
+# chose; `need` refuses a tool below its floor by NAME, with the floor and the remedy.
+# shellcheck source=../share/tools.sh
+. "$(resolve_share)/tools.sh"
+trap tools_deactivate EXIT
+
+need() {
+  local bin="$1" brew="$2" name line floor verdict note
+  name="$(tool_name_for_binary "$bin")"
+  if [ -n "$name" ]; then
+    tool_resolve "$name" >/dev/null && return 0
+    line="$(tool_resolve "$name" || true)"
+    IFS=$'\t' read -r name _ _ _ floor verdict note <<<"$line"
+    die "required tool '$bin' is $verdict${note:+ ($note)} — floor $floor; install it (brew install $brew) or run the Memex installer, which carries $(tool_field "$name" 6)"
+  fi
+  command -v "$bin" >/dev/null 2>&1 || die "required tool '$bin' not found — install it (see: brew install $2)"
+}
+
+# A MANAGED PREFERENCE (deploy/macos/README.md §3): a fleet pre-fills the control URL, deployment id and
+# registry URL through an MDM profile in the `com.memex.local` domain, so a machine enrols without
+# anyone typing them. Read from the managed-preferences store first (what an MDM writes), then the
+# user's own domain (what `defaults write com.memex.local <Key> <value>` sets by hand). Prints the
+# value or nothing; never fails. An explicit flag always wins over a preference.
+readonly MANAGED_PREF_DOMAIN="com.memex.local"
+managed_pref() {
+  local key="$1" v
+  command -v defaults >/dev/null 2>&1 || return 0
+  v="$(defaults read "/Library/Managed Preferences/${MANAGED_PREF_DOMAIN}" "$key" 2>/dev/null)" \
+    || v="$(defaults read "$MANAGED_PREF_DOMAIN" "$key" 2>/dev/null)" || v=""
+  [ -n "$v" ] && printf '%s' "$v"
+  return 0
+}
 
 # The host profile must be one this file knows. An unknown one is refused here rather than read as
 # the default: a Mac mini told it is a `mac-studo` would otherwise size a 32 GiB VM it cannot hold.
@@ -297,6 +341,7 @@ resolve_channel() {
 
 preflight() {
   check_profile
+  tools_activate
   need colima colima
   need kubectl kubernetes-cli
   need helm helm
@@ -542,6 +587,7 @@ install_backlease_sampler() {
       -e "s|__PORT__|${HOST_PORT}|g" \
       -e "s|__HOSTNAME__|${HOSTNAME_LOCAL}|g" \
       -e "s|__NAMESPACE__|${NAMESPACE}|g" \
+      -e "s|__SHARE__|${share}|g" \
       "$share/com.memex.local.backlease.plist" > "$BACKLEASE_PLIST_DST"
   launchctl bootout "gui/$(id -u)" "$BACKLEASE_PLIST_DST" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$(id -u)" "$BACKLEASE_PLIST_DST"
@@ -583,7 +629,10 @@ cmd_backlease() {
         esac
         shift
       done
-      case "$control" in https://*) ;; *) die "backlease enroll: --control must be the control instance's https URL (got '${control:-<none>}')" ;; esac
+      # A fleet pre-fills both through a managed preference (deploy/macos/README.md §3); a flag wins.
+      [ -n "$control" ]    || control="$(managed_pref ControlUrl)"
+      [ -n "$deployment" ] || deployment="$(managed_pref DeploymentId)"
+      case "$control" in https://*) ;; *) die "backlease enroll: --control must be the control instance's https URL (got '${control:-<none>}'; a fleet sets it as the managed preference $MANAGED_PREF_DOMAIN ControlUrl)" ;; esac
       [ -n "$deployment" ] || deployment="$(registry_instance_id)"
       [ -n "$deployment" ] || die "backlease enroll: --deployment <id> is required (the registry file names no instance id) — it MUST equal this machine's Deployments/<id> record on control"
       case "$deployment" in *[!a-z0-9-]*) die "backlease enroll: --deployment must be lower-case letters, digits and dashes (got '$deployment')" ;; esac
@@ -1178,13 +1227,31 @@ setup_ollama() {
 # ---------------------------------------------------------------------------
 install_launchd() {
   local share; share="$(resolve_share)"
-  step "Installing durable launchd port-forward ${HOST_PORT} -> ingress :443 (§7)"
+  mkdir -p "$LOCAL_HOME"
   install -m 0755 "$share/port-forward.sh" "$PF_SCRIPT"
+  rm -f "$DAEMON_STOP"   # an explicit `up` is a start: the daemon may run again
+  if [ "$HEADLESS" = "1" ]; then
+    # No GUI session → `launchctl bootstrap gui/…` cannot load an agent. Hold the forward as a background
+    # process; the daemon (deploy/macos/libexec/memex-daemon.sh) watches its pid and launchd's KeepAlive
+    # re-runs `up` when it ends. Idempotent: a live forward from an earlier run is kept.
+    step "Headless host: holding the port-forward ${HOST_PORT} -> ingress :443 as a background process (no LaunchAgent)"
+    if [ -f "$PF_PID" ] && kill -0 "$(cat "$PF_PID")" 2>/dev/null; then
+      ok "port-forward already running (pid $(cat "$PF_PID"))"
+    else
+      MEMEX_PORT="$HOST_PORT" MEMEX_LOCAL_SHARE="$share" nohup /bin/bash "$PF_SCRIPT" >> "$PF_LOG" 2>&1 &
+      echo $! > "$PF_PID"
+      ok "port-forward started (pid $(cat "$PF_PID"), log: $PF_LOG)"
+    fi
+    wait_port_forward || true
+    return 0
+  fi
+  step "Installing durable launchd port-forward ${HOST_PORT} -> ingress :443 (§7)"
   mkdir -p "$HOME/Library/LaunchAgents"
   # __PORT__ carries MEMEX_PORT into the agent: launchd does not inherit this shell's environment.
   sed -e "s|__SCRIPT__|${PF_SCRIPT}|g" \
       -e "s|__LOG__|${PF_LOG}|g" \
       -e "s|__PORT__|${HOST_PORT}|g" \
+      -e "s|__SHARE__|${share}|g" \
       "$share/com.memex.local.plist" > "$PLIST_DST"
   # Reload idempotently.
   launchctl bootout "gui/$(id -u)" "$PLIST_DST" >/dev/null 2>&1 || true
@@ -1228,6 +1295,13 @@ wait_port_forward() {
 }
 
 uninstall_launchd() {
+  if [ -f "$PF_PID" ]; then
+    # The marker FIRST, then the kill: the daemon reads it when the forward ends and exits 0 instead of
+    # re-running `up` into this teardown.
+    mkdir -p "$LOCAL_HOME"; : > "$DAEMON_STOP"
+    kill "$(cat "$PF_PID")" 2>/dev/null && ok "headless port-forward (pid $(cat "$PF_PID")) stopped — the daemon stays down until 'memex-local up'"
+    rm -f "$PF_PID"
+  fi
   if [ -f "$PLIST_DST" ]; then
     launchctl bootout "gui/$(id -u)" "$PLIST_DST" >/dev/null 2>&1 || true
     rm -f "$PLIST_DST"
@@ -2719,12 +2793,20 @@ cmd_channel() {
 cmd_doctor() {
   step "Host profile"
   cmd_profile
-  step "Checking required tools"
-  local tools=(colima kubectl helm mkcert ollama openssl curl)
+  step "Toolchain (existing installation first, the installer's vendored copy second — $TOOLS_MANIFEST)"
+  tools_report
+  if [ "$TOOLS_UNRESOLVED" -eq 0 ]; then ok "every tool resolves at or above its floor"
+  else warn "$TOOLS_UNRESOLVED tool(s) do not resolve — see the VERDICT column (the Memex .pkg installer carries a fallback for each vendored one)"; fi
   local t
-  for t in ${tools[@]+"${tools[@]}"}; do
-    if command -v "$t" >/dev/null 2>&1; then ok "$t: $(command -v "$t")"; else warn "$t: MISSING"; fi
+  for t in openssl curl; do
+    if command -v "$t" >/dev/null 2>&1; then ok "$t: $(command -v "$t")"; else warn "$t: MISSING (ships with macOS)"; fi
   done
+  step "Managed preferences ($MANAGED_PREF_DOMAIN)"
+  local k v any=""
+  for k in ControlUrl DeploymentId RegistryUrl Channel Profile; do
+    v="$(managed_pref "$k")"; [ -n "$v" ] && { info "$k: $v"; any=1; }
+  done
+  [ -n "$any" ] || info "none set (an MDM profile or 'defaults write $MANAGED_PREF_DOMAIN <Key> <value>' pre-fills enroll/registry)"
   if command -v dotnet >/dev/null 2>&1; then
     ok "dotnet (for local build / Option B): $(command -v dotnet)"
   else

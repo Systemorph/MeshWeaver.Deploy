@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>body{font-family:-apple-system,Helvetica,sans-serif;font-size:13px;line-height:1.45;margin:12px}code{font-family:Menlo,monospace;font-size:12px}</style></head>
+<body>
+<p><b>memex-local is installed.</b> Open a <b>new</b> terminal window (the PATH change takes effect in new
+shells) and run:</p>
+<pre><code>memex-local doctor      # which copy of each tool is in use, from where, and whether it met the floor
+memex-local registry https://&lt;your plugin registry&gt;
+az login                # the registry mode pulls the portal image with the Docker CLI + Azure CLI (not in this package)
+memex-local up          # Colima → image → chart → Ollama → port-forward; idempotent</code></pre>
+<p>Still needed from elsewhere: <b>Ollama</b>, the <b>Docker CLI</b> and the <b>Azure CLI</b> — <code>doctor</code>
+reports each; <code>MEMEX_OLLAMA_MODEL=none</code> skips only the large model, not Ollama.</p>
+<p>The toolchain probe's result is in <code>/opt/memex/etc/tools.report</code>. Re-running this installer
+repairs only what is missing and changes nothing else.</p>
+<p>Offer this Mac to the fleet: <code>memex-local backlease enroll --control https://&lt;control&gt; --deployment &lt;id&gt;</code>
+(a managed preference pre-fills both on a fleet-managed Mac).</p>
+</body></html>

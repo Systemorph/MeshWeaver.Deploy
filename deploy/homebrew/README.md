@@ -47,6 +47,14 @@ install --HEAD systemorph/memex-dev/memex-local`). A brew install's wrapper pins
 `MEMEX_CHART_DIR` to the vendored chart; run-from-checkout uses the live `deploy/helm`
 (or `MEMEX_REPO`/`MEMEX_CHART_DIR`) directly.
 
+**Not a developer?** The professional channel is the signed, notarized **macOS installer** built from
+[`deploy/macos`](../macos/README.md): the same CLI under `/opt/memex`, with pinned copies of Colima, Lima,
+kubectl, helm and mkcert used **only where this Mac has none that meets the floor** — an existing Homebrew
+installation is respected, never overwritten, and nothing is written into Homebrew's prefix. Both channels
+read ONE toolchain manifest, [`share/tools.manifest`](share/tools.manifest), through
+[`share/tools.sh`](share/tools.sh); `memex-local doctor` prints, per tool, which copy is in use, from where,
+at which version, and whether it met the floor.
+
 ## Two modes — where the plugins come from
 
 | Mode | `memex-local registry status` says | Plugins | Module binaries (Radzen, Analysis, EntityViews, GoogleMaps, Speech, Mcp…) | Image |
@@ -262,6 +270,8 @@ strings from it).
 | `share/values.local.yaml` | local Helm overlay template (full logging + pg + ingress + ollama + instance id) |
 | `share/port-forward.sh` | the §7 port-forward script (started by launchd) |
 | `share/com.memex.local.plist` | the §7 launchd login-agent template |
+| `share/tools.manifest` | the ONE toolchain declaration: per tool its formula, version floor, vendored pin and probe; per vendored tool the sha256-pinned release asset (read by the CLI, the `.pkg` build and its postinstall; drift against the formula's `depends_on` is a red test) |
+| `share/tools.sh` | the resolver: existing installation first (floor met), the `.pkg`'s vendored copy second — `need`, `preflight`, `doctor` |
 
 State lives in `~/.memex-local/` (overlay, mkcert cert/key, port-forward script +
 log, ollama log, grafana password) — exactly the paths the doc uses.

@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  EXAMPLE managed-preferences profile for a fleet rollout (deploy/macos/README.md §3). An MDM pushes
+  this beside the .pkg; the keys land in the com.memex.local domain, which memex-local reads when a flag
+  is not given (`backlease enroll` → ControlUrl, DeploymentId; the daemon postinstall → ServiceUser,
+  Unattended). Every value below is a PLACEHOLDER — replace the hosts and ids, and regenerate the UUIDs.
+-->
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadType</key>
+            <string>com.memex.local</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.memex.local.managed.settings</string>
+            <key>PayloadUUID</key>
+            <string>00000000-0000-4000-8000-000000000001</string>
+            <key>PayloadDisplayName</key>
+            <string>Memex Local — managed settings</string>
+            <!-- The control instance this machine reports to (the control URL `memex-local backlease enroll` takes). -->
+            <key>ControlUrl</key>
+            <string>https://control.example.com</string>
+            <!-- This machine's Deployments/<id> record on the control instance (the deployment id `backlease enroll` takes). -->
+            <key>DeploymentId</key>
+            <string>mac-mini-01</string>
+            <!-- The plugin registry the portal consumes (memex-local registry <url>). -->
+            <key>RegistryUrl</key>
+            <string>https://registry.example.com</string>
+            <!-- Optional: a release-channel label and a host profile (mac-studio | mac-mini). -->
+            <key>Channel</key>
+            <string>3-latest</string>
+            <key>Profile</key>
+            <string>mac-mini</string>
+            <!-- Unattended host only: the account the LaunchDaemon runs the stack as, and whether the
+                 daemon is bootstrapped at install (false leaves it installed and unloaded). -->
+            <key>ServiceUser</key>
+            <string>memex</string>
+            <key>Unattended</key>
+            <true/>
+        </dict>
+    </array>
+    <key>PayloadDisplayName</key>
+    <string>Memex Local</string>
+    <key>PayloadIdentifier</key>
+    <string>com.memex.local.managed</string>
+    <key>PayloadRemovalDisallowed</key>
+    <false/>
+    <key>PayloadScope</key>
+    <string>System</string>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>00000000-0000-4000-8000-000000000000</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+</dict>
+</plist>
