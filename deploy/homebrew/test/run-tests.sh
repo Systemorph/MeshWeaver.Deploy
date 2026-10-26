@@ -744,8 +744,9 @@ case "$RC:$OUT" in 0:*) bad "need refuses a tool below its floor" "exited 0: $OU
   *) bad "need's refusal names floor + remedies" "rc=$RC: $OUT" ;; esac
 OUT="$(env PATH="$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" MEMEX_LOCAL_LIB=1 bash -c '. "$1"; need colima colima && echo accepted' _ "$CLI" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:accepted) ok "need accepts an existing tool at/above its floor" ;; *) bad "need accepts a satisfying tool" "rc=$RC: $OUT" ;; esac
-OUT="$(env PATH="$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" MEMEX_LOCAL_LIB=1 bash -c '. "$1"; need docker docker' _ "$CLI" 2>&1)"; RC=$?
-case "$RC:$OUT" in 0:*) bad "need still refuses a non-manifest tool that is absent" "exited 0" ;; *"required tool 'docker' not found"*"brew install docker"*) ok "need keeps the presence-only check for a non-manifest tool (docker)" ;; *) bad "need non-manifest" "$OUT" ;; esac
+# A name no runner has (an Ubuntu runner HAS /usr/bin/docker, which made this pass vacuously once).
+OUT="$(env PATH="$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" MEMEX_LOCAL_LIB=1 bash -c '. "$1"; need frobnicator-xyz frobnicator' _ "$CLI" 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "need still refuses a non-manifest tool that is absent" "exited 0" ;; *"required tool 'frobnicator-xyz' not found"*"brew install frobnicator"*) ok "need keeps the presence-only check for a non-manifest tool" ;; *) bad "need non-manifest" "$OUT" ;; esac
 
 # `doctor` prints the table: per tool, which copy, from where, which version, whether it met the floor.
 texisting_all; rm -f "$TEX/helm"; tvend helm helm "v4.3.1+gabc"; tstub "$TEX" kubectl "Client Version: v1.20.0"
