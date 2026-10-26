@@ -1,10 +1,3 @@
-# The build-host image's context is exactly the scripts and the plugin-build tool it ships (BuildKit reads this file in
-# place of the root .dockerignore, which excludes .github/).
+# The build-host image reads NOTHING from its context: every source is fetched by commit inside the
+# build (see the Dockerfile's header), so the context is empty by construction.
 *
-!.github/scripts/build-run.py
-!.github/scripts/compose-gate-host.sh
-!.github/scripts/sandbox-postgres.sh
-!.github/scripts/module-build-key.py
-!.github/scripts/ci-artifact-store.py
-!artifacts/plugin-build/
-!artifacts/plugin-build/**

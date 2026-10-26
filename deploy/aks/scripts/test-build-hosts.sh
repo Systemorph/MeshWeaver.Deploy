@@ -40,23 +40,24 @@ python3 -c "import yaml" >/dev/null 2>&1 || { echo "::error::python3 with PyYAML
 
 # 1. one implementation: the runner and the composer ship INSIDE the mw-build-host image, copied
 #    from .github/scripts by deploy/build-host/Dockerfile — the chart carries no copy of either.
-#    The runner and its Dockerfile live in THIS repository (build-host.yml builds the image), so
-#    they are read from this tree; the platform's helpers they ship with are staged by
-#    deploy/build-host/stage-context.sh at the set's commit.
+#    The runner and its Dockerfile live in THIS repository; the Dockerfile fetches the runner (this
+#    repository) and the platform's helpers by commit inside the build, so the context is empty.
 DOCKERFILE="$REPO/deploy/build-host/Dockerfile"
 if [ -f "$CHART/files/build-run.py" ]; then
   report "deploy/helm/files/build-run.py exists — the chart must not carry a second copy of the runner; it ships in the mw-build-host image"
 fi
 if [ -f "$DOCKERFILE" ] \
-   && grep -q '^COPY .github/scripts/build-run.py .github/scripts/compose-gate-host.sh .github/scripts/sandbox-postgres.sh .github/scripts/module-build-key.py .github/scripts/ci-artifact-store.py /opt/build-host/$' "$DOCKERFILE" \
-   && grep -q '^COPY artifacts/plugin-build/ /opt/build-host/plugin-build/$' "$DOCKERFILE" \
+   && grep -q '^COPY --from=sources /out/scripts/build-run.py /out/scripts/compose-gate-host.sh /out/scripts/sandbox-postgres.sh /out/scripts/module-build-key.py /out/scripts/ci-artifact-store.py /opt/build-host/$' "$DOCKERFILE" \
+   && grep -q '^COPY --from=sources /out/plugin-build/ /opt/build-host/plugin-build/$' "$DOCKERFILE" \
+   && ! grep -Eq '^COPY [^-]' "$DOCKERFILE" \
+   && grep -q "grep -Eq '\^\[0-9a-f\]{40}\$'" "$DOCKERFILE" \
    && grep -q 'bubblewrap' "$DOCKERFILE" \
    && grep -q 'sandbox-postgres.sh --self-test' "$DOCKERFILE" \
    && grep -q 'build-run.py --self-test' "$DOCKERFILE" \
    && ! grep -Eq '^FROM [^ ]*:latest' "$DOCKERFILE"; then
-  ok "deploy/build-host/Dockerfile ships .github/scripts' runner, composer, sandbox-postgres and module-build-key plus the plugin-build tool, installs bubblewrap, runs both self-tests, and pins no :latest"
+  ok "deploy/build-host/Dockerfile fetches the runner, composer, sandbox-postgres, module-build-key and the plugin-build tool by 40-hex commit (nothing COPYed from the context), installs bubblewrap, runs both self-tests, and pins no :latest"
 else
-  report "deploy/build-host/Dockerfile must COPY .github/scripts/{build-run.py,compose-gate-host.sh,sandbox-postgres.sh,module-build-key.py} and artifacts/plugin-build/ to /opt/build-host/, install bubblewrap, run both self-tests, and name no :latest base"
+  report "deploy/build-host/Dockerfile must fetch its sources by 40-hex commit in the 'sources' stage, COPY only --from=sources (build-run.py, compose-gate-host.sh, sandbox-postgres.sh, module-build-key.py, ci-artifact-store.py, plugin-build) to /opt/build-host/, install bubblewrap, run both self-tests, and name no :latest base"
 fi
 if python3 "$REPO/.github/scripts/build-run.py" --self-test; then
   ok "build-run.py passes its self-test"
