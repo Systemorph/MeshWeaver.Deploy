@@ -134,6 +134,15 @@ readonly BACKLEASE_SAMPLER="$LOCAL_HOME/backlease-sampler.sh"
 readonly BACKLEASE_PLIST_LABEL="com.memex.local.backlease"
 readonly BACKLEASE_PLIST_DST="$HOME/Library/LaunchAgents/${BACKLEASE_PLIST_LABEL}.plist"
 readonly BACKLEASE_LOG="$LOCAL_HOME/backlease-sampler.log"
+# ── DEVICE RELAY — this Mac answers a cloud instance's inbox reads, live (Hosting/DeviceRelay) ───
+# `memex-local relay pair` installs the native memex-relay build under $RELAY_DIR (a STABLE path: macOS
+# Full Disk Access is granted to that binary) and a launchd login agent that runs it. The API token is
+# never handled here: memex-relay reads it from stdin and keeps it in ~/.memex-relay/token (0600).
+readonly RELAY_DIR="$LOCAL_HOME/relay"
+readonly RELAY_BIN="$RELAY_DIR/memex-relay"
+readonly RELAY_PLIST_LABEL="com.memex.local.relay"
+readonly RELAY_PLIST_DST="$HOME/Library/LaunchAgents/${RELAY_PLIST_LABEL}.plist"
+readonly RELAY_LOG="$LOCAL_HOME/relay.log"
 readonly DEFAULT_REGISTRY_URL="https://memex.meshweaver.cloud"
 readonly CERT_FILE="$LOCAL_HOME/${HOSTNAME_LOCAL}.pem"
 readonly KEY_FILE="$LOCAL_HOME/${HOSTNAME_LOCAL}-key.pem"
@@ -620,6 +629,74 @@ cmd_backlease() {
       fi
       ;;
     *) die "usage: memex-local backlease {enroll --control <url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] | status | off}" ;;
+  esac
+}
+
+
+# ---------------------------------------------------------------------------
+# DEVICE RELAY — `memex-local relay pair|status|off` (MeshWeaver.Plugins Hosting/DeviceRelay)
+# ---------------------------------------------------------------------------
+# pair --instance <https-url> --owner <user-id> --binary <dir|file>
+#   --binary is the `dotnet publish` output of src/MeshWeaver.DeviceRelay.Host (a directory holding
+#   `memex-relay`, or the file itself). It is COPIED to a stable path so Full Disk Access survives.
+#   The token is read by memex-relay itself from stdin (hidden prompt, or `< file` you create) —
+#   this command never sees, prints or stores it.
+cmd_relay() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    pair)
+      local instance="" owner="" binary=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --instance) shift; instance="${1:?--instance needs the instance https URL}" ;;
+          --owner)    shift; owner="${1:?--owner needs your user id}" ;;
+          --binary)   shift; binary="${1:?--binary needs the published relay directory or file}" ;;
+          *) die "relay pair: unknown flag '$1'" ;;
+        esac
+        shift
+      done
+      case "$instance" in https://*) ;; *) die "relay pair: --instance must be the instance's https URL (got '${instance:-<none>}')" ;; esac
+      case "$owner" in ''|*[!A-Za-z0-9._-]*) die "relay pair: --owner must be your plain user id (letters, digits, . _ -), never an email" ;; esac
+      [ -n "$binary" ] || die "relay pair: --binary <dir|file> is required (the published memex-relay; build it with: dotnet publish src/MeshWeaver.DeviceRelay.Host -c Release -r osx-arm64 --self-contained -o <dir>)"
+      local src="$binary"; [ -d "$src" ] && src="$src/memex-relay"
+      [ -f "$src" ] || die "relay pair: no memex-relay at '$src'"
+      step "Installing memex-relay under $RELAY_DIR"
+      mkdir -p "$RELAY_DIR" "$HOME/Library/LaunchAgents"
+      # the whole published folder (a self-contained build has many files), apphost last
+      if [ -d "$binary" ]; then cp -R "$binary"/. "$RELAY_DIR"/; else install -m 0755 "$src" "$RELAY_BIN"; fi
+      chmod 0755 "$RELAY_BIN"
+      # a stable ad-hoc identity keeps one Full Disk Access entry per install
+      codesign --force --sign - "$RELAY_BIN" >/dev/null 2>&1 || warn "could not ad-hoc sign $RELAY_BIN (Full Disk Access may need re-granting after an update)"
+      step "Pairing ($owner @ $instance) — paste the API token you created in the instance (Settings > API Tokens); it is stored on this Mac only"
+      "$RELAY_BIN" pair "${instance%/}" "$owner" || die "relay pair: pairing was not stored"
+      local share; share="$(resolve_share)"
+      sed -e "s|__BINARY__|${RELAY_BIN}|g" -e "s|__LOG__|${RELAY_LOG}|g" \
+          "$share/com.memex.local.relay.plist" > "$RELAY_PLIST_DST"
+      launchctl bootout "gui/$(id -u)" "$RELAY_PLIST_DST" >/dev/null 2>&1 || true
+      launchctl bootstrap "gui/$(id -u)" "$RELAY_PLIST_DST"
+      ok "launchd agent '$RELAY_PLIST_LABEL' loaded (log: $RELAY_LOG)"
+      info "ONE step only you can do: System Settings > Privacy & Security > Full Disk Access > + > $RELAY_BIN"
+      info "(then: memex-local relay status — the agent restarts itself within 30 s)"
+      ;;
+    status)
+      [ $# -eq 0 ] || die "relay status: unknown flag '$1'"
+      if [ -x "$RELAY_BIN" ]; then "$RELAY_BIN" status || true; else info "relay is not installed — memex-local relay pair --instance <url> --owner <id> --binary <dir>"; return 0; fi
+      if launchctl print "gui/$(id -u)/${RELAY_PLIST_LABEL}" >/dev/null 2>&1; then ok "launchd agent '$RELAY_PLIST_LABEL' loaded"; else warn "launchd agent '$RELAY_PLIST_LABEL' NOT loaded"; fi
+      [ -f "$RELAY_LOG" ] && { info "last log lines (no chat content is ever logged):"; tail -n 5 "$RELAY_LOG" | sed 's/^/    /'; }
+      ;;
+    off)
+      local forget=""; [ "${1:-}" = "--forget" ] && forget=1 && shift
+      [ $# -eq 0 ] || die "relay off: unknown flag '$1'"
+      if [ -f "$RELAY_PLIST_DST" ]; then
+        launchctl bootout "gui/$(id -u)" "$RELAY_PLIST_DST" >/dev/null 2>&1 || true
+        rm -f "$RELAY_PLIST_DST"
+        ok "launchd agent '$RELAY_PLIST_LABEL' removed — the cloud now states this Mac as not connected"
+      else
+        info "relay agent was not installed"
+      fi
+      if [ -n "$forget" ]; then rm -rf "$HOME/.memex-relay" "$RELAY_DIR"; ok "pairing, token and binary removed (also revoke the token in Settings > API Tokens)"; fi
+      ;;
+    *) die "usage: memex-local relay {pair --instance <https-url> --owner <id> --binary <dir|file> | status | off [--forget]}" ;;
   esac
 }
 
@@ -2699,6 +2776,12 @@ COMMANDS:
                   the plan is the registry admin's edit of this instance's grant.
                   \`off\` returns to serving a checkout (§16).
   backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] | status | off
+  relay pair --instance <https url> --owner <user id> --binary <dir|file> | status | off [--forget]
+                  DEVICE RELAY (Hosting/DeviceRelay): let a cloud instance's inbox read the
+                  chats that exist only on this Mac (iMessage, WhatsApp Desktop) LIVE —
+                  read-only, over ONE outbound connection, nothing stored in the cloud.
+                  Installs the native memex-relay and its launchd agent; the API token is
+                  read by memex-relay from stdin and kept in ~/.memex-relay/token (0600).
                   Offer THIS Mac back to the fleet (MeshWeaver.Plugins Hosting/BackLease): write
                   the back-lease values layer (Hosting__Deployment / Hosting__ReportTo / the
                   heartbeat every <s>, default 30), install the launchd host sampler that writes
@@ -3098,6 +3181,7 @@ main() {
     update)        cmd_update "$@" ;;
     registry)      cmd_registry "$@" ;;
     backlease)     cmd_backlease "$@" ;;
+    relay)         cmd_relay "$@" ;;
     verify)        cmd_verify "$@" ;;
     autoroll)      cmd_autoroll "$@" ;;
     port-forward)  cmd_port_forward "$@" ;;
