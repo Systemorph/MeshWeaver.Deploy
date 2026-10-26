@@ -199,7 +199,16 @@ tools_activate() {
     [ "$kind" = "existing" ] || [ "$kind" = "vendored" ] || continue
     ln -sfn "$path" "$sel/$(basename "$path")"
   done
-  case ":$PATH:" in *":$sel:"*) ;; *) export PATH="$sel:$PATH" ;; esac
+  # FIRST, always: a PATH that already carries the selection somewhere later (a parent's `PATH=…:$PATH`,
+  # an agent that prepended the Homebrew directories) would let a below-floor copy ahead of it win.
+  # Strip every occurrence, then prepend.
+  local rest="$PATH" dir stripped=""
+  while [ -n "$rest" ]; do
+    dir="${rest%%:*}"; if [ "$rest" = "$dir" ]; then rest=""; else rest="${rest#*:}"; fi
+    [ "$dir" = "$sel" ] && continue
+    stripped="${stripped:+$stripped:}$dir"
+  done
+  export PATH="$sel:$stripped"
   return 0
 }
 

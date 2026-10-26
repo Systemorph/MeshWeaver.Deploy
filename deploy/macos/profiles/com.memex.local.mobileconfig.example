@@ -21,10 +21,10 @@
             <string>00000000-0000-4000-8000-000000000001</string>
             <key>PayloadDisplayName</key>
             <string>Memex Local — managed settings</string>
-            <!-- The control instance this machine reports to (memex-local backlease enroll --control). -->
+            <!-- The control instance this machine reports to (the control URL `memex-local backlease enroll` takes). -->
             <key>ControlUrl</key>
             <string>https://control.example.com</string>
-            <!-- This machine's Deployments/<id> record on the control instance (--deployment). -->
+            <!-- This machine's Deployments/<id> record on the control instance (the deployment id `backlease enroll` takes). -->
             <key>DeploymentId</key>
             <string>mac-mini-01</string>
             <!-- The plugin registry the portal consumes (memex-local registry <url>). -->

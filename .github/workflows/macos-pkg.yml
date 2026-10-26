@@ -314,14 +314,15 @@ jobs:
             echo "notarized=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Remove the temporary keychain
-        env:
-          SIGNING: ${{ steps.inputs.outputs.signing }}
+      # ALWAYS — a failed import, codesign or notarization must not leave the keychain, the notary key or
+      # a decoded .p12 on the runner until its disposal. `always()` is outcome-shaped, not input-shaped.
+      - name: Remove the temporary keychain and every decoded signing file
+        if: ${{ always() }}
         run: |
           set -euo pipefail
-          [ "$SIGNING" = "true" ] || exit 0
-          security delete-keychain "$RUNNER_TEMP/memex-signing.keychain-db" || true
-          rm -f "$RUNNER_TEMP/notary.p8"
+          security delete-keychain "$RUNNER_TEMP/memex-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/app.p12" "$RUNNER_TEMP/inst.p12"
+          echo "temporary signing material removed"
 
       - name: Upload the packages (whatever their label)
         uses: actions/upload-artifact@v4

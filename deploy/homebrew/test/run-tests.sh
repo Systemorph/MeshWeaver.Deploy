@@ -745,6 +745,10 @@ child="$(sed -n 's/^child=//p' <<<"$ACT")"; parent="$(sed -n 's/^parent=//p' <<<
 if [ -n "$child" ] && [ "$child" != "$parent" ] && grep -q '/helm$' <<<"$ACT" && grep -q '^parent-kept$' <<<"$ACT"; then
   ok "a child process activating under an inherited selection owns its own dir, links to the real executable, and leaves the parent's dir alone"
 else bad "child selection ownership" "$ACT"; fi
+# The selection must be FIRST even when PATH already carries it later (an agent prepended Homebrew's dirs).
+ACT="$(env PATH="$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" bash -c '. "$1/tools.sh"; tools_activate; sel="$MEMEX_TOOLS_SELECTED"; export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; tools_activate; printf "%s|%s" "$sel" "$PATH"; rm -rf "$sel"' _ "$HERE/../share")"
+sel="${ACT%%|*}"; apath="${ACT#*|}"
+case "$apath" in "$sel:/opt/homebrew/bin:/usr/local/bin:$TEX:/usr/bin:/bin") ok "re-activation moves the selection dir back to the FRONT of PATH (once, not twice)" ;; *) bad "selection first on re-activation" "$apath" ;; esac
 # A stale fallback link in <prefix>/bin AHEAD on PATH must not win: the selection dir precedes everything.
 mkdir -p "$TPRE/bin"; ln -sfn "$TPRE/libexec/vendor/colima/bin/colima" "$TPRE/bin/colima"
 ACT="$(env PATH="$TPRE/bin:$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" bash -c '. "$1/tools.sh"; tools_activate; command -v colima; rm -rf "$MEMEX_TOOLS_SELECTED"' _ "$HERE/../share")"

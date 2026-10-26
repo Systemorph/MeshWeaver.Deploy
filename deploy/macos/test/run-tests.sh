@@ -39,6 +39,11 @@ for f in "$BREW"/share/*.plist "$MACOS"/launchd/*.plist "$MACOS"/entitlements/*.
   if plutil -lint "$f" >/dev/null 2>&1; then ok "plutil -lint $(basename "$f")"; else bad "plutil -lint $(basename "$f")" "$(plutil -lint "$f" 2>&1)"; fi
 done
 if xmllint --noout "$MACOS/Distribution.xml.in" 2>/dev/null; then ok "Distribution.xml.in is well-formed XML"; else bad "Distribution.xml.in is well-formed XML" "$(xmllint --noout "$MACOS/Distribution.xml.in" 2>&1)"; fi
+# plutil tolerates `--` inside a comment; a strict XML parser (an MDM importer) does not — xmllint is strict.
+for f in "$BREW"/share/*.plist "$MACOS"/launchd/*.plist "$MACOS"/entitlements/*.plist "$MACOS"/profiles/*.mobileconfig.example; do
+  if xmllint --noout --nonet "$f" 2>/dev/null; then ok "strict XML: $(basename "$f")"; else bad "strict XML: $(basename "$f")" "$(xmllint --noout --nonet "$f" 2>&1 | head -3)"; fi
+done
+if grep -q 'if: ${{ always() }}' "$REPO/.github/workflows/macos-pkg.yml" && grep -q 'rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/app.p12" "$RUNNER_TEMP/inst.p12"' "$REPO/.github/workflows/macos-pkg.yml"; then ok "the workflow removes the keychain, the notary key and both decoded .p12 files under always()"; else bad "signing cleanup always()" ""; fi
 for tok in __VERSION__ __HOST_ARCH__; do
   if grep -q "$tok" "$MACOS/Distribution.xml.in"; then ok "Distribution.xml.in carries $tok for build-pkg.sh to substitute"; else bad "Distribution.xml.in carries $tok" "the build would render a fixed value"; fi
 done
