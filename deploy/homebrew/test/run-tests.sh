@@ -833,7 +833,11 @@ OUT="$(env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/h
 DAEMON="$HERE/../../macos/libexec/memex-daemon.sh"
 case "$(cat "$DAEMON")" in *'export MEMEX_HEADLESS=1'*'CLI="${MEMEX_LOCAL_CLI:-/opt/memex/bin/memex-local}"'*'until "$CLI" up; do'*'port-forward.pid'*) ok "memex-daemon.sh invokes THE package's CLI (/opt/memex/bin/memex-local) with MEMEX_HEADLESS=1, retries 'up' until it succeeds, then watches port-forward.pid" ;; *) bad "memex-daemon.sh lifecycle" "" ;; esac
 case "$(cat "$DAEMON")" in *'stopped() { [ -f "$stop_marker" ]; }'*'if stopped; then'*'exit 0'*) ok "memex-daemon.sh exits 0 (no KeepAlive restart) while the stop marker from 'memex-local down' exists" ;; *) bad "daemon honours the stop marker" "" ;; esac
-[ "$(plutil -extract KeepAlive.SuccessfulExit raw "$HERE/../../macos/launchd/com.memex.local.daemon.plist" 2>/dev/null)" = "false" ] && ok "the daemon plist restarts only on a FAILED exit (KeepAlive.SuccessfulExit=false)" || bad "KeepAlive.SuccessfulExit=false" ""
+# Text form (this suite also runs on Linux, which has no plutil; the macOS suite lints the plist).
+case "$(tr -d ' \n\t' < "$HERE/../../macos/launchd/com.memex.local.daemon.plist")" in
+  *'<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>'*) ok "the daemon plist restarts only on a FAILED exit (KeepAlive.SuccessfulExit=false)" ;;
+  *) bad "KeepAlive.SuccessfulExit=false" "$(grep -n -A3 KeepAlive "$HERE/../../macos/launchd/com.memex.local.daemon.plist")" ;;
+esac
 # `down` writes the stop marker BEFORE killing the forward; an explicit `up` removes it.
 : > "$HL/home/.memex-local/port-forward.pid"; printf '%s' "$$" > "$HL/home/.memex-local/port-forward.pid"
 OUT="$(env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c '. "$1"; kill() { :; }; uninstall_launchd' _ "$CLI" 2>&1)"
