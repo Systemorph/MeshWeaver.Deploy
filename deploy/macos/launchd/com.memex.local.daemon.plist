@@ -33,6 +33,13 @@
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/memex/bin</string>
     </dict>
 
+    <!-- Disabled by default: launchd never loads this at boot unless `launchctl enable
+         system/com.memex.local.daemon` has been issued — which the daemon postinstall does ONLY when the
+         managed preference Unattended is true (and `launchctl disable`s it otherwise). The file being in
+         /Library/LaunchDaemons is therefore never enough to start a VM at boot. -->
+    <key>Disabled</key>
+    <true/>
+
     <key>RunAtLoad</key>
     <true/>
 

@@ -46,6 +46,7 @@ for f in welcome.html conclusion.html; do
   if grep -q '/opt/memex' "$MACOS/resources/$f"; then ok "$f tells the user where the files land (/opt/memex)"; else bad "$f names /opt/memex" "the welcome page must say what is installed and where"; fi
 done
 if grep -q '__USER__' "$MACOS/launchd/com.memex.local.daemon.plist"; then ok "the daemon plist carries __USER__ for the daemon postinstall"; else bad "the daemon plist carries __USER__" ""; fi
+[ "$(plutil -extract Disabled raw "$MACOS/launchd/com.memex.local.daemon.plist" 2>/dev/null)" = "true" ] && ok "the daemon plist is Disabled by default — RunAtLoad cannot fire at boot until launchctl enable (Unattended=true)" || bad "daemon plist Disabled=true" "$(plutil -extract Disabled raw "$MACOS/launchd/com.memex.local.daemon.plist" 2>&1)"
 
 echo "── the build refuses bad arguments ──────────────────────────────"
 out="$("$BUILD" --version 1.2 --arch arm64 --out "$T/o" --bogus 2>&1)"; rc=$?
