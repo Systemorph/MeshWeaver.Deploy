@@ -444,6 +444,45 @@ else
   report "templates outside templates/build-host/ that do not open with the portal.enabled gate (they would render into a build-host-only release):$ungated"
 fi
 
+# 3c. a leased-back Mac's first attach: an EXTRA channel `mac` renders its own Deployment + ScaledObject that claims
+#     and scales by channel=mac against the public build API, and its cache claim is ReadWriteOnce on the node-local class.
+if helm template build-host-mac "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-host-mac.yaml" --namespace memex \
+     > "$WORK/mac.yaml" 2> "$WORK/mac.err"; then
+  python3 - "$WORK/mac.yaml" <<'PY2' && ok "an extra channel 'mac' renders build-host-mac (claiming channel=mac at the public API) with a ReadWriteOnce cache, and nothing of the portal" || report "the mac first-attach render is wrong (above)"
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+by = {(d["kind"], d["metadata"]["name"]): d for d in docs}
+problems = []
+dep = by.get(("Deployment", "build-host-mac"))
+if not dep:
+    problems.append("no Deployment build-host-mac")
+else:
+    env = {e["name"]: e.get("value") for c in dep["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
+    if env.get("MW_BUILD_CHANNEL") != "mac": problems.append(f"MW_BUILD_CHANNEL={env.get('MW_BUILD_CHANNEL')!r}")
+    if env.get("BUILD_API") != "https://control.example.com/api/builds": problems.append(f"BUILD_API={env.get('BUILD_API')!r}")
+    if env.get("MW_REGISTRY_URL") != "https://registry.example.com" or env.get("MW_REGISTRY_KEY_FILE") != "/run/registry-key/key":
+        problems.append("the plugins layer is not read through the registry bundle index (H8)")
+    spec = dep["spec"]["template"]["spec"]
+    if spec.get("nodeSelector") or spec.get("tolerations"): problems.append(f"the CI pool selector/tolerations leaked: {spec.get('nodeSelector')} {spec.get('tolerations')}")
+    vols = {v["name"]: v for v in spec.get("volumes", [])}
+    if vols.get("registry-key", {}).get("secret", {}).get("secretName") != "build-registry-key-mac": problems.append("no registry-key volume")
+    builds = [c for c in spec["containers"] if c["name"] == "build"]
+    if not builds or builds[0]["resources"]["requests"] != {"cpu": "4", "memory": "8Gi"}: problems.append(f"requests: {builds and builds[0]['resources']}")
+    if dep["spec"]["strategy"] != {"type": "Recreate"}: problems.append(f"strategy: {dep['spec']['strategy']}")
+so = [d for d in docs if d["kind"] == "ScaledObject"]
+if len(so) != 1 or "channel=mac" not in str(so[0]): problems.append("the ScaledObject does not scale on channel=mac")
+pvc = by.get(("PersistentVolumeClaim", "build-cache-mac"))
+if not pvc or pvc["spec"]["accessModes"] != ["ReadWriteOnce"] or pvc["spec"]["storageClassName"] != "local-path":
+    problems.append(f"cache claim: {pvc and pvc['spec']}")
+kinds = sorted({d["kind"] for d in docs})
+if any(k in kinds for k in ("Service", "Ingress", "StatefulSet")): problems.append(f"portal objects rendered: {kinds}")
+for p in problems: print("   ", p)
+sys.exit(1 if problems else 0)
+PY2
+else
+  report "the mac first-attach values did not render:"; sed 's/^/    /' "$WORK/mac.err"
+fi
+
 # 4. refusals
 for entry in \
   "values.build-hosts-tag-not-digest.yaml|must be a sha256:<64 hex> digest" \
@@ -463,6 +502,9 @@ for entry in \
   "values.build-hosts-zero-replicas.yaml|maxReplicas must be at least 1" \
   "values.build-hosts-name-collision.yaml|one deployment per name" \
   "values.build-hosts-cache-no-class.yaml|buildHosts.cache.storageClass is required" \
+  "values.build-hosts-bad-extra-channel.yaml|not latest, stable or probe*" \
+  "values.build-hosts-cache-bad-access.yaml|must be ReadWriteMany or ReadWriteOnce" \
+  "values.build-hosts-extra-channel-dash.yaml|ending in a letter or digit" \
   "values.build-host-release-no-hosts.yaml|portal.enabled is false but buildHosts.enabled is not true" \
   "values.build-host-release-postgres.yaml|portal.enabled is false but postgres.enabled is true" \
   "values.build-host-release-ingress.yaml|portal.enabled is false but ingress.enabled is true"; do
