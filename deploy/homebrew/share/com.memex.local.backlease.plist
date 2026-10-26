@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  memex-local back-lease HOST SAMPLER — a launchd login agent (MeshWeaver.Plugins Hosting/BackLease §5).
+  Runs ~/.memex-local/backlease-sampler.sh at login (RunAtLoad) and restarts it if it ever exits
+  (KeepAlive); the script writes ~/.memex-local/backlease/readings.json every __INTERVAL__ s with the
+  host's load, memory, thermal state and disk, the VM's kubelet summary and the models Ollama serves —
+  the readings a pod inside the VM cannot take, which the portal's heartbeat forwards to control.
+
+  `memex-local backlease enroll` writes a copy of this file with the __TOKENS__ substituted to
+  ~/Library/LaunchAgents/com.memex.local.backlease.plist and bootstraps it; `backlease off` boots it out.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memex.local.backlease</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__SCRIPT__</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>MEMEX_BACKLEASE_INTERVAL</key>
+        <string>__INTERVAL__</string>
+        <key>MEMEX_BACKLEASE_DIR</key>
+        <string>__DIR__</string>
+        <key>MEMEX_PORT</key>
+        <string>__PORT__</string>
+        <key>MEMEX_NAMESPACE</key>
+        <string>__NAMESPACE__</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG__</string>
+</dict>
+</plist>

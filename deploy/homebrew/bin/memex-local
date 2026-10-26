@@ -122,6 +122,18 @@ readonly OVERLAY="$LOCAL_HOME/values.local.yaml"
 # registry's bundles. A separate file rather than a block inside the overlay because the overlay is
 # the user's (generated once, hand-edited) and YAML has no safe append into a nested map.
 readonly REGISTRY_FILE="$LOCAL_HOME/registry.yaml"
+# ── BACK-LEASE — this Mac is offered back to the fleet (MeshWeaver.Plugins Hosting/BackLease) ────
+# Written by `memex-local backlease enroll`, read by helm_deploy as one more values layer AFTER the
+# registry file: Hosting__Deployment + Hosting__ReportTo (the control instance) arm the portal's
+# heartbeat (Hosting__BackLease__Enabled) and its module-inventory report, the readings file the
+# host sampler writes is mounted into the portal, and the pairing secret is referenced — never
+# written here: `backlease enroll` refuses to invent a credential (see cmd_backlease).
+readonly BACKLEASE_FILE="$LOCAL_HOME/backlease.yaml"
+readonly BACKLEASE_DIR="$LOCAL_HOME/backlease"
+readonly BACKLEASE_SAMPLER="$LOCAL_HOME/backlease-sampler.sh"
+readonly BACKLEASE_PLIST_LABEL="com.memex.local.backlease"
+readonly BACKLEASE_PLIST_DST="$HOME/Library/LaunchAgents/${BACKLEASE_PLIST_LABEL}.plist"
+readonly BACKLEASE_LOG="$LOCAL_HOME/backlease-sampler.log"
 readonly DEFAULT_REGISTRY_URL="https://memex.meshweaver.cloud"
 readonly CERT_FILE="$LOCAL_HOME/${HOSTNAME_LOCAL}.pem"
 readonly KEY_FILE="$LOCAL_HOME/${HOSTNAME_LOCAL}-key.pem"
@@ -459,6 +471,154 @@ cmd_registry() {
       info "          after a platform admin accepts the privacy statement and platform terms in Settings ▸
           Instance registration, the portal registers itself and installs what it is granted)."
       ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# §18 — BACK-LEASE: offer this Mac back to the fleet (MeshWeaver.Plugins Hosting/BackLease)
+# ---------------------------------------------------------------------------
+# `backlease enroll --control <url> --deployment <id> [--interval 30] [--repo github.com/OWNER/REPO]`
+# does the machine's half of §2(a)–(b) of the design: it writes the back-lease values layer, installs
+# the host sampler (a launchd agent writing ~/.memex-local/backlease/readings.json every 30 s) and
+# prints the THREE declarations control needs for this machine — which an operator makes, never this
+# tool: a credential is minted by a person. `backlease status` reads both halves back; `backlease off`
+# removes the layer and the agent (the next `memex-local update` stops the heartbeat).
+backlease_value() { awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$BACKLEASE_FILE" 2>/dev/null; }
+backlease_control()    { backlease_value "Hosting__ReportTo"; }
+backlease_deployment() { backlease_value "Hosting__Deployment"; }
+backlease_interval()   { local v; v="$(backlease_value "Hosting__BackLease__Interval")"; printf '%s' "${v:-30}"; }
+
+write_backlease_file() {
+  local control="$1" deployment="$2" interval="$3" repo="$4"
+  mkdir -p "$LOCAL_HOME" "$BACKLEASE_DIR"
+  ( umask 077; cat > "$BACKLEASE_FILE" ) <<YAML
+# memex-local BACK-LEASE — managed by \`memex-local backlease\`; re-run \`enroll\` to change, \`off\` to
+# delete. Layered by helm_deploy after the registry file and before the overlay. This Mac is OFFERED
+# BACK TO THE FLEET (MeshWeaver.Plugins Hosting/BackLease): its portal reports to the control
+# instance below as the deployment id below (the module-inventory report, hourly) and HEARTBEATS every
+# \${interval}s (Hosting/BackLease §5) with the readings the host sampler writes to
+# ${BACKLEASE_DIR}/readings.json, mounted below. The pairing secret is NOT in this file: the portal
+# reads Hosting__ModuleReportSecret from the overlay's secrets (memex_portal), where the operator puts
+# the value control holds for this machine — see \`memex-local backlease status\`.
+config:
+  memex_portal:
+    Hosting__Deployment: "${deployment}"
+    Hosting__ReportTo: "${control}"
+    Hosting__BackLease__Enabled: "true"
+    Hosting__BackLease__Interval: "${interval}"
+    Hosting__BackLease__ReadingsPath: "/host-readings/readings.json"
+${repo:+    Hosting__BackLease__Repository: "${repo}"
+}extraVolumes:
+  - name: backlease-readings
+    hostPath:
+      path: "${BACKLEASE_DIR}"
+      type: DirectoryOrCreate
+extraVolumeMounts:
+  - name: backlease-readings
+    mountPath: /host-readings
+    readOnly: true
+YAML
+  chmod 600 "$BACKLEASE_FILE"
+}
+
+install_backlease_sampler() {
+  local share interval="$1"; share="$(resolve_share)"
+  step "Installing the back-lease host sampler (launchd, every ${interval}s -> ${BACKLEASE_DIR}/readings.json)"
+  install -m 0755 "$share/backlease-sampler.sh" "$BACKLEASE_SAMPLER"
+  mkdir -p "$HOME/Library/LaunchAgents" "$BACKLEASE_DIR"
+  sed -e "s|__SCRIPT__|${BACKLEASE_SAMPLER}|g" \
+      -e "s|__LOG__|${BACKLEASE_LOG}|g" \
+      -e "s|__INTERVAL__|${interval}|g" \
+      -e "s|__DIR__|${BACKLEASE_DIR}|g" \
+      -e "s|__PORT__|${HOST_PORT}|g" \
+      -e "s|__NAMESPACE__|${NAMESPACE}|g" \
+      "$share/com.memex.local.backlease.plist" > "$BACKLEASE_PLIST_DST"
+  launchctl bootout "gui/$(id -u)" "$BACKLEASE_PLIST_DST" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$BACKLEASE_PLIST_DST"
+  ok "launchd agent '$BACKLEASE_PLIST_LABEL' loaded (logs: $BACKLEASE_LOG)"
+  # one sample now, so `status` has something to read before the first tick
+  MEMEX_BACKLEASE_DIR="$BACKLEASE_DIR" MEMEX_PORT="$HOST_PORT" MEMEX_NAMESPACE="$NAMESPACE" bash "$BACKLEASE_SAMPLER" --once || warn "the first sample could not be taken — the agent retries every ${interval}s"
+}
+
+uninstall_backlease_sampler() {
+  if [ -f "$BACKLEASE_PLIST_DST" ]; then
+    launchctl bootout "gui/$(id -u)" "$BACKLEASE_PLIST_DST" >/dev/null 2>&1 || true
+    rm -f "$BACKLEASE_PLIST_DST"
+    ok "launchd agent '$BACKLEASE_PLIST_LABEL' removed"
+  fi
+}
+
+backlease_declarations() {
+  local control="$1" deployment="$2"
+  info "Control must DECLARE this machine (Hosting/BackLease §5; an operator does these, this tool never mints a credential):"
+  info "  1. ${control}'s deployment record: webhookInboxTargets += \"Hosting/Heartbeats\" and config"
+  info "     WebhookInbox__Targets__<n>__SecretConfigKey: \"Hosting:ModuleReportSecret\" (the chart renders targets 0–2)"
+  info "  2. a Key Vault secret for THIS machine, mounted on control as Hosting__ModuleReportSecret__${deployment}"
+  info "  3. the SAME value on this Mac: secrets.memex_portal.Hosting__ModuleReportSecret in $OVERLAY, then \`memex-local update\`"
+  info "  Until 1 is in place control answers 404 to the heartbeat and the portal log says so; until 2+3 the portal does not beat."
+}
+
+cmd_backlease() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    enroll)
+      local control="" deployment="" interval="30" repo=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --control)    shift; control="${1:?--control needs a URL}" ;;
+          --deployment) shift; deployment="${1:?--deployment needs an id}" ;;
+          --interval)   shift; interval="${1:?--interval needs seconds}" ;;
+          --repo)       shift; repo="${1:?--repo needs github.com/OWNER/REPO}" ;;
+          *) die "backlease enroll: unknown flag '$1'" ;;
+        esac
+        shift
+      done
+      case "$control" in https://*) ;; *) die "backlease enroll: --control must be the control instance's https URL (got '${control:-<none>}')" ;; esac
+      [ -n "$deployment" ] || deployment="$(registry_instance_id)"
+      [ -n "$deployment" ] || die "backlease enroll: --deployment <id> is required (the registry file names no instance id) — it MUST equal this machine's Deployments/<id> record on control"
+      case "$deployment" in *[!a-z0-9-]*) die "backlease enroll: --deployment must be lower-case letters, digits and dashes (got '$deployment')" ;; esac
+      case "$interval" in ''|*[!0-9]*) die "backlease enroll: --interval must be whole seconds" ;; esac
+      [ "$interval" -ge 10 ] && [ "$interval" -le 600 ] || die "backlease enroll: --interval must be between 10 and 600 seconds"
+      # Preconditions the design names (Hosting/BackLease §2): registry mode, Colima up, the portal reachable.
+      registry_mode || die "backlease enroll: this install is not in REGISTRY MODE — run 'memex-local registry <url>' first (a leased machine consumes the registry's bundles, it cannot be its own registry)"
+      colima_running || die "backlease enroll: Colima is not running — 'memex-local up' first"
+      write_backlease_file "${control%/}" "$deployment" "$interval" "$repo"
+      ok "back-lease layer written: $BACKLEASE_FILE (reports to ${control%/} as '$deployment', heartbeat every ${interval}s)"
+      install_backlease_sampler "$interval"
+      backlease_declarations "${control%/}" "$deployment"
+      info "Apply it: memex-local update   (re-renders the chart with the back-lease layer; the portal's heartbeat arms on its next activation)"
+      ;;
+    status)
+      [ $# -eq 0 ] || die "backlease status: unknown flag '$1'"
+      if [ -f "$BACKLEASE_FILE" ]; then
+        ok "BACK-LEASE ON — this Mac reports to $(backlease_control) as '$(backlease_deployment)', heartbeat every $(backlease_interval)s"
+        info "values file:   $BACKLEASE_FILE (layered after the registry file by helm_deploy)"
+        if launchctl print "gui/$(id -u)/${BACKLEASE_PLIST_LABEL}" >/dev/null 2>&1; then ok "host sampler '$BACKLEASE_PLIST_LABEL' loaded"; else warn "host sampler '$BACKLEASE_PLIST_LABEL' NOT loaded — re-run 'memex-local backlease enroll …'"; fi
+        if [ -f "$BACKLEASE_DIR/readings.json" ]; then
+          local sampled; sampled="$(awk -F'"sampledAt":"' 'NF>1 {split($2,a,"\""); print a[1]}' "$BACKLEASE_DIR/readings.json")"
+          info "last reading:  ${sampled:-unknown} ($BACKLEASE_DIR/readings.json)"
+          info "health:        $(awk -F'"health":' 'NF>1 {split($2,a,"}"); print a[1]"}"}' "$BACKLEASE_DIR/readings.json")"
+        else
+          warn "no readings yet at $BACKLEASE_DIR/readings.json"
+        fi
+        if grep -q 'Hosting__ModuleReportSecret' "$OVERLAY" 2>/dev/null; then ok "pairing secret present in the overlay (never printed)"; else warn "pairing secret MISSING — the portal does not beat until secrets.memex_portal.Hosting__ModuleReportSecret is in $OVERLAY"; fi
+        backlease_declarations "$(backlease_control)" "$(backlease_deployment)"
+      else
+        info "back-lease is OFF — offer this Mac with:"
+        info "  memex-local backlease enroll --control https://<control> --deployment <id> [--interval 30] [--repo github.com/OWNER/REPO]"
+      fi
+      ;;
+    off)
+      [ $# -eq 0 ] || die "backlease off: unknown flag '$1'"
+      uninstall_backlease_sampler
+      if [ -f "$BACKLEASE_FILE" ]; then
+        rm -f "$BACKLEASE_FILE"
+        ok "back-lease OFF — the next 'memex-local update' stops the heartbeat; control keeps the machine's last advertisement until its freshness rule retires it"
+      else
+        info "back-lease was not on"
+      fi
+      ;;
+    *) die "usage: memex-local backlease {enroll --control <url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] | status | off}" ;;
   esac
 }
 
@@ -803,6 +963,12 @@ helm_deploy() {
     info "REGISTRY MODE: consuming $(registry_url) as instance '$(registry_instance_id)' — no checkout is mounted"
   else
     mode_args=(-f "$share_dir/values.local.self-registry.yaml")
+  fi
+  # BACK-LEASE layer (Hosting/BackLease): the heartbeat, the report-to, the readings mount — after
+  # the mode layer, before the user's overlay, so an overlay still wins.
+  if [ -f "$BACKLEASE_FILE" ]; then
+    mode_args+=(-f "$BACKLEASE_FILE")
+    info "BACK-LEASE: this Mac reports to $(backlease_control) as '$(backlease_deployment)' and heartbeats every $(backlease_interval)s"
   fi
   for repo_path in $(registry_mode || plugin_repo_paths); do
     repo_name="$(plugin_source_name "$repo_path")"
@@ -2531,6 +2697,16 @@ COMMANDS:
                   at all (MeshWeaver#2417). Then run \`memex-local update\`. Raising
                   the plan is the registry admin's edit of this instance's grant.
                   \`off\` returns to serving a checkout (§16).
+  backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] | status | off
+                  Offer THIS Mac back to the fleet (MeshWeaver.Plugins Hosting/BackLease): write
+                  the back-lease values layer (Hosting__Deployment / Hosting__ReportTo / the
+                  heartbeat every <s>, default 30), install the launchd host sampler that writes
+                  ~/.memex-local/backlease/readings.json (host load, memory, thermal, disk, the
+                  VM's kubelet summary, the models Ollama serves) and print the THREE declarations
+                  an operator makes on control (the Hosting/Heartbeats inbox target, the machine's
+                  pairing secret in Key Vault, the same value in this install's overlay). Needs
+                  registry mode and a running Colima; 'memex-local update' applies it. Never mints
+                  a credential. 'status' reads both halves back; 'off' removes layer and agent.
   down [--purge] [--stop-colima]
                   Uninstall the release (keeps the Postgres PVC). --purge wipes
                   data (namespace + PVC + ingress-nginx); --stop-colima stops VM.
@@ -2920,6 +3096,7 @@ main() {
     logs)          cmd_logs "$@" ;;
     update)        cmd_update "$@" ;;
     registry)      cmd_registry "$@" ;;
+    backlease)     cmd_backlease "$@" ;;
     verify)        cmd_verify "$@" ;;
     autoroll)      cmd_autoroll "$@" ;;
     port-forward)  cmd_port_forward "$@" ;;
