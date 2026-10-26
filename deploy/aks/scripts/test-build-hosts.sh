@@ -511,10 +511,13 @@ for d in on:
     if build.get("securityContext", {}).get("procMount") != "Unmasked": problems.append(f"{d['metadata']['name']}: procMount not Unmasked")
     if (spec.get("nodeSelector") or {}).get("kernel-userns") != "true" or (spec.get("nodeSelector") or {}).get("workload") != "ci-build":
         problems.append(f"{d['metadata']['name']}: nodeSelector {spec.get('nodeSelector')}")
+    if {"key": "kernel-userns", "operator": "Equal", "value": "true", "effect": "NoSchedule"} not in (spec.get("tolerations") or []):
+        problems.append(f"{d['metadata']['name']}: no toleration for the kernel-userns pool's taint")
 for d in off:
     spec = d["spec"]["template"]["spec"]
     build = next(c for c in spec["containers"] if c["name"] == "build")
-    if "hostUsers" in spec or "procMount" in build.get("securityContext", {}) or "kernel-userns" in (spec.get("nodeSelector") or {}):
+    if "hostUsers" in spec or "procMount" in build.get("securityContext", {}) or "kernel-userns" in (spec.get("nodeSelector") or {}) \
+            or any(t.get("key") == "kernel-userns" for t in spec.get("tolerations") or []):
         problems.append(f"{d['metadata']['name']}: the user-namespace sandbox rendered while off")
 for p in problems: print("   ", p)
 sys.exit(1 if problems else 0)
@@ -546,6 +549,9 @@ for entry in \
   "values.build-hosts-cache-bad-access.yaml|must be ReadWriteMany or ReadWriteOnce" \
   "values.build-hosts-extra-channel-dash.yaml|ending in a letter or digit" \
   "values.build-hosts-userns-not-bool.yaml|sandbox.userNamespace" \
+  "values.build-hosts-userns-empty-0.yaml|sandbox.userNamespace" \
+  "values.build-hosts-userns-empty-string.yaml|sandbox.userNamespace" \
+  "values.build-hosts-userns-empty-list.yaml|sandbox.userNamespace" \
   "values.build-host-release-no-hosts.yaml|portal.enabled is false but buildHosts.enabled is not true" \
   "values.build-host-release-postgres.yaml|portal.enabled is false but postgres.enabled is true" \
   "values.build-host-release-ingress.yaml|portal.enabled is false but ingress.enabled is true"; do
