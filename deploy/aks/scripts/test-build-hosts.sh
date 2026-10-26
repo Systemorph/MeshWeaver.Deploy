@@ -526,6 +526,30 @@ else
   report "the user-namespace values did not render:"; sed 's/^/    /' "$WORK/userns.err"
 fi
 
+# 3e. a node-local cache (cache.medium: node): an emptyDir sized by cache.size on every host, and no cache claim at all
+#     — what a host in its own user namespace needs, since an SMB/NFS claim cannot be ID-mapped into it.
+if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.cache.medium=node \
+     --set buildHosts.cache.size=100Gi --set buildHosts.cache.create=true --set buildHosts.cache.storageClass=azurefile-memex \
+     --namespace check > "$WORK/nodecache.yaml" 2> "$WORK/nodecache.err"; then
+  python3 - "$WORK/nodecache.yaml" <<'PY4' && ok "cache.medium node renders a node-local emptyDir cache (sizeLimit) on every host and no cache claim" || report "the node-local cache render is wrong (above)"
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+problems = []
+hosts = [d for d in docs if d.get("kind") == "Deployment" and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "build-host"]
+if not hosts: problems.append("no build-host Deployment rendered")
+for d in hosts:
+    vols = {v["name"]: v for v in d["spec"]["template"]["spec"]["volumes"]}
+    if vols.get("cache", {}).get("emptyDir") != {"sizeLimit": "100Gi"} or "persistentVolumeClaim" in vols.get("cache", {}):
+        problems.append(f"{d['metadata']['name']}: cache volume {vols.get('cache')}")
+pvcs = [d["metadata"]["name"] for d in docs if d.get("kind") == "PersistentVolumeClaim"]
+if pvcs: problems.append(f"a claim rendered although the cache is node-local: {pvcs}")
+for p in problems: print("   ", p)
+sys.exit(1 if problems else 0)
+PY4
+else
+  report "the node-local cache values did not render:"; sed 's/^/    /' "$WORK/nodecache.err"
+fi
+
 # 4. refusals
 for entry in \
   "values.build-hosts-tag-not-digest.yaml|must be a sha256:<64 hex> digest" \
@@ -549,6 +573,10 @@ for entry in \
   "values.build-hosts-cache-bad-access.yaml|must be ReadWriteMany or ReadWriteOnce" \
   "values.build-hosts-extra-channel-dash.yaml|ending in a letter or digit" \
   "values.build-hosts-userns-not-bool.yaml|sandbox.userNamespace" \
+  "values.build-hosts-cache-bad-medium.yaml|must be claim or node" \
+  "values.build-hosts-cache-medium-false.yaml|must be claim or node" \
+  "values.build-hosts-cache-medium-zero.yaml|must be claim or node" \
+  "values.build-hosts-cache-medium-empty.yaml|must be claim or node" \
   "values.build-hosts-userns-empty-0.yaml|sandbox.userNamespace" \
   "values.build-hosts-userns-empty-string.yaml|sandbox.userNamespace" \
   "values.build-hosts-userns-empty-list.yaml|sandbox.userNamespace" \
