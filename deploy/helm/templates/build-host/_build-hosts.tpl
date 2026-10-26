@@ -101,8 +101,8 @@ The refusals, and why each one exists:
        and is never `latest`, `stable` or a reserved `probe*` (the build API's BuildChannel rule). */ -}}
 {{- $extra := ($b.extraChannels | default list) -}}
 {{- range $name := $extra -}}
-{{- if or (not (regexMatch "^[a-z][a-z0-9-]{0,31}$" $name)) (has $name (list "latest" "stable")) (hasPrefix "probe" $name) -}}
-{{- fail (printf "buildHosts.extraChannels names %q — a channel is lower-case [a-z][a-z0-9-]{0,31}, not latest, stable or probe*" $name) -}}
+{{- if or (not (regexMatch "^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$" $name)) (has $name (list "latest" "stable")) (hasPrefix "probe" $name) -}}
+{{- fail (printf "buildHosts.extraChannels names %q — a channel is lower-case [a-z][a-z0-9-]{0,31}, ending in a letter or digit (a Kubernetes name and label), not latest, stable or probe*" $name) -}}
 {{- end -}}
 {{- end -}}
 {{- range $name := (concat (list "latest" "stable") $extra | uniq) -}}

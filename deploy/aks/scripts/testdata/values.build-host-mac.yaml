@@ -14,6 +14,13 @@ buildHosts:
   portalRepository: "cr.example.com/memex-portal-ai"
   runnerRepository: "cr.example.com/mw-build-host"
   imagePullSecret: "build-pull"
+  # The plugins layer through the registry's bundle index with a read-only instance key (H8): a Mac has no workload identity.
+  registry: {url: "https://registry.example.com", instanceKeySecret: {name: "build-registry-key-mac", key: "key"}}
+  nodeSelector: null
+  tolerations: null
+  resources:
+    requests: { cpu: "4", memory: 8Gi }
+    limits: { cpu: "6", memory: 12Gi }
   cacheClaimName: "build-cache-mac"
   cache: {create: true, storageClass: "local-path", size: "60Gi", accessMode: "ReadWriteOnce"}
   sandbox: {appArmorProfile: "Localhost", appArmorLocalhostProfile: "mw-build-host"}

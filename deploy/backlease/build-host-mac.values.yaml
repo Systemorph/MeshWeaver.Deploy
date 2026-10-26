@@ -12,9 +12,20 @@ ingress:
 buildHosts:
   enabled: true
   imagePullSecret: "build-pull"
+  # A Mac is ONE node with no CI pool: no pool selector or taint toleration (null clears the chart default; an empty
+  # map would merge with it), and a budget that fits the Colima VM — first-attach.sh checks the node's allocatable.
+  # The plugins layer: a Mac has no workload identity and holds NO registry credential (StandingBuildHosts §2), so it
+  # reads the registry's bundle index (H8) with a READ-ONLY instance key — first-attach.sh sets registry.url and the Secret.
+  registry: {instanceKeySecret: {name: "build-registry-key-mac", key: "key"}}
+  nodeSelector: null
+  tolerations: null
+  resources:
+    requests: { cpu: "4", memory: 8Gi }
+    limits: { cpu: "6", memory: 12Gi }
+  workSizeLimit: 12Gi
   cacheClaimName: "build-cache-mac"
   # The Mac's only class is node-local; one replica owns the cache.
-  cache: {create: true, storageClass: "local-path", size: "60Gi", accessMode: "ReadWriteOnce"}
+  cache: {create: true, storageClass: "local-path", size: "20Gi", accessMode: "ReadWriteOnce"}
   # bwrap needs `userns`; first-attach.sh loads this profile into the Colima VM before the release.
   sandbox: {appArmorProfile: "Localhost", appArmorLocalhostProfile: "mw-build-host"}
   # The Mac's OWN worker token (the operations instance accepts it for channel `mac` only).

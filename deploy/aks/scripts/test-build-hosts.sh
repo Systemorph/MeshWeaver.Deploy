@@ -460,6 +460,14 @@ else:
     env = {e["name"]: e.get("value") for c in dep["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
     if env.get("MW_BUILD_CHANNEL") != "mac": problems.append(f"MW_BUILD_CHANNEL={env.get('MW_BUILD_CHANNEL')!r}")
     if env.get("BUILD_API") != "https://control.example.com/api/builds": problems.append(f"BUILD_API={env.get('BUILD_API')!r}")
+    if env.get("MW_REGISTRY_URL") != "https://registry.example.com" or env.get("MW_REGISTRY_KEY_FILE") != "/run/registry-key/key":
+        problems.append("the plugins layer is not read through the registry bundle index (H8)")
+    spec = dep["spec"]["template"]["spec"]
+    if spec.get("nodeSelector") or spec.get("tolerations"): problems.append(f"the CI pool selector/tolerations leaked: {spec.get('nodeSelector')} {spec.get('tolerations')}")
+    vols = {v["name"]: v for v in spec.get("volumes", [])}
+    if vols.get("registry-key", {}).get("secret", {}).get("secretName") != "build-registry-key-mac": problems.append("no registry-key volume")
+    builds = [c for c in spec["containers"] if c["name"] == "build"]
+    if not builds or builds[0]["resources"]["requests"] != {"cpu": "4", "memory": "8Gi"}: problems.append(f"requests: {builds and builds[0]['resources']}")
 so = [d for d in docs if d["kind"] == "ScaledObject"]
 if len(so) != 1 or "channel=mac" not in str(so[0]): problems.append("the ScaledObject does not scale on channel=mac")
 pvc = by.get(("PersistentVolumeClaim", "build-cache-mac"))
@@ -495,6 +503,7 @@ for entry in \
   "values.build-hosts-cache-no-class.yaml|buildHosts.cache.storageClass is required" \
   "values.build-hosts-bad-extra-channel.yaml|not latest, stable or probe*" \
   "values.build-hosts-cache-bad-access.yaml|must be ReadWriteMany or ReadWriteOnce" \
+  "values.build-hosts-extra-channel-dash.yaml|ending in a letter or digit" \
   "values.build-host-release-no-hosts.yaml|portal.enabled is false but buildHosts.enabled is not true" \
   "values.build-host-release-postgres.yaml|portal.enabled is false but postgres.enabled is true" \
   "values.build-host-release-ingress.yaml|portal.enabled is false but ingress.enabled is true"; do
