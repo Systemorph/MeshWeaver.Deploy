@@ -349,13 +349,25 @@ jobs:
             exit 0
           fi
           tag="memex-local/v$VERSION"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "release $tag exists — reusing"
+          assets=("$PKGDIR"/memex-local-"$VERSION"-arm64.pkg "$PKGDIR"/memex-local-"$VERSION"-x86_64.pkg
+                  "$PKGDIR"/memex-local-"$VERSION"-arm64.pkg.sha256 "$PKGDIR"/memex-local-"$VERSION"-x86_64.pkg.sha256)
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .id >/dev/null 2>&1; then
+            # An interrupted earlier run may have left the release with SOME assets: reconcile all four,
+            # uploading what is missing, and fail if any is still absent afterwards.
+            echo "release $tag exists — reconciling its assets"
+            present="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[].name')"
+            missing=()
+            for a in "${assets[@]}"; do grep -qxF "$(basename "$a")" <<<"$present" || missing+=("$a"); done
+            if [ ${#missing[@]} -gt 0 ]; then
+              echo "uploading ${#missing[@]} missing asset(s): ${missing[*]##*/}"
+              gh release upload "$tag" "${missing[@]}"
+            fi
+            present="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[].name')"
+            for a in "${assets[@]}"; do grep -qxF "$(basename "$a")" <<<"$present" || { echo "::error::release $tag still lacks $(basename "$a")"; exit 1; }; done
           else
             # --target pins the tag to THIS run's commit: without it the tag lands on main's tip, which may
             # have moved during the two notarizations and would describe a tree other than the one packed.
-            gh release create "$tag" "$PKGDIR"/memex-local-"$VERSION"-arm64.pkg "$PKGDIR"/memex-local-"$VERSION"-x86_64.pkg \
-              "$PKGDIR"/memex-local-"$VERSION"-arm64.pkg.sha256 "$PKGDIR"/memex-local-"$VERSION"-x86_64.pkg.sha256 \
+            gh release create "$tag" "${assets[@]}" \
               --target "$GITHUB_SHA" \
               --title "memex-local $VERSION (macOS installer)" \
               --notes "Signed, notarized and stapled macOS installer for memex-local $VERSION, built from ${GITHUB_REPOSITORY}@${GITHUB_SHA}. Design: deploy/macos/README.md."

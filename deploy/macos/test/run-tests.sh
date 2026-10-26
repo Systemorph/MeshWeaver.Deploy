@@ -270,7 +270,7 @@ case "$key" in ServiceUser) [ -n "${FAKE_SERVICE_USER:-}" ] && { printf '%s\n' "
   Unattended) [ -n "${FAKE_UNATTENDED:-}" ] && { printf '%s\n' "$FAKE_UNATTENDED"; exit 0; }; exit 1 ;; esac
 exit 1
 STUB
-printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "$FAKE_LAUNCHCTL_LOG"\nexit 0\n' > "$D/stubs/launchctl"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "$FAKE_LAUNCHCTL_LOG"\ncase " $* " in *" ${FAKE_LAUNCHCTL_FAIL:-never} "*) exit 1 ;; esac\nexit 0\n' > "$D/stubs/launchctl"
 chmod +x "$D/stubs/defaults" "$D/stubs/launchctl"
 DPOST="$MACOS/daemon/postinstall"
 rund() { OUT="$(env "$@" FAKE_LAUNCHCTL_LOG="$D/launchctl.log" MEMEX_PKG_DAEMON_PLIST="$D/plist" MEMEX_PKG_DAEMON_LOGDIR="$D/log" PATH="$D/stubs:/usr/libexec:/usr/bin:/bin:/usr/sbin" "$DPOST" 2>&1)"; RC=$?; }
@@ -291,9 +291,19 @@ grep -q "bootout system $D/plist" "$D/launchctl.log" && grep -q "disable system/
 rund FAKE_SERVICE_USER=memexsvc FAKE_UNATTENDED=true
 [ "$(plutil -extract UserName raw "$D/plist")" = "memexsvc" ] && case "$OUT" in *"(was memexsvc)"*) ok "a re-run finds the previous user, re-renders the same plist and re-bootstraps" ;; *) bad "re-run idempotent" "$OUT" ;; esac
 cp "$MACOS/launchd/com.memex.local.daemon.plist" "$D/plist"
+: > "$D/launchctl.log"
 rund FAKE_SERVICE_USER=root FAKE_UNATTENDED=true
-case "$RC:$OUT" in 0:*"no service user"*) ok "a root/absent service user → refuses to render, daemon stays unloaded, exit 0" ;; *) bad "no service user handled" "rc=$RC: $OUT" ;; esac
+case "$RC:$OUT" in 0:*"no service user"*"booted out and disabled"*) ok "a root/absent service user → refuses to render, exit 0" ;; *) bad "no service user handled" "rc=$RC: $OUT" ;; esac
+grep -q "bootout system $D/plist" "$D/launchctl.log" && grep -q "disable system/com.memex.local.daemon" "$D/launchctl.log" && ok "…and an EARLIER enabled job is booted out and disabled before the early return" || bad "no-user path disables the old job" "$(cat "$D/launchctl.log")"
 grep -q '__USER__' "$D/plist" && ok "the token stays in the plist when no user could be chosen" || bad "token stays" ""
+# A requested enable/bootstrap that FAILS fails the install (Installer and the MDM must hear it).
+: > "$D/launchctl.log"
+rund FAKE_SERVICE_USER=memexsvc FAKE_UNATTENDED=true FAKE_LAUNCHCTL_FAIL=bootstrap
+case "$RC:$OUT" in 0:*) bad "a failed bootstrap under Unattended=true fails the postinstall" "exited 0: $OUT" ;; *"bootstrap system $D/plist FAILED"*"NOT armed"*) ok "a failed bootstrap under Unattended=true exits non-zero and says unattended startup is NOT armed" ;; *) bad "failed bootstrap → non-zero" "rc=$RC: $OUT" ;; esac
+rund FAKE_SERVICE_USER=memexsvc FAKE_UNATTENDED=true FAKE_LAUNCHCTL_FAIL=enable
+case "$RC:$OUT" in 0:*) bad "a failed enable under Unattended=true fails the postinstall" "exited 0: $OUT" ;; *"enable system/com.memex.local.daemon FAILED"*) ok "a failed enable under Unattended=true exits non-zero" ;; *) bad "failed enable → non-zero" "rc=$RC: $OUT" ;; esac
+rund FAKE_SERVICE_USER=memexsvc FAKE_UNATTENDED=false FAKE_LAUNCHCTL_FAIL=bootout
+[ "$RC" = "0" ] && ok "an absent old job (bootout fails) is still tolerated" || bad "bootout tolerated" "rc=$RC: $OUT"
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"

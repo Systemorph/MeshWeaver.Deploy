@@ -736,6 +736,15 @@ resolve colima; case "$OUT" in colima*existing*) ok "…and colima (present) sti
 activate
 [ "$(readlink "$SEL/helm")" = "$TPRE/libexec/vendor/helm/bin/helm" ] && [ "$(readlink "$SEL/colima")" = "$TEX/colima" ] && ok "the selection links helm → VENDORED and colima → existing" || bad "selection mixes vendored + existing" "$(ls -l "$SEL")"
 rm -rf "$SEL"
+# Activating TWICE in one process (up → observability) must not turn the links into self-references.
+ACT="$(env PATH="$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" bash -c '. "$1/tools.sh"; tools_activate; tools_activate; readlink "$MEMEX_TOOLS_SELECTED/colima"; "$MEMEX_TOOLS_SELECTED/colima" version; rm -rf "$MEMEX_TOOLS_SELECTED"' _ "$HERE/../share" 2>&1)"
+case "$ACT" in "$TEX/colima"*"colima version 0.10.3"*) ok "a second tools_activate keeps the links pointing at the real executables (no self-reference)" ;; *) bad "second activation self-links" "$ACT" ;; esac
+# A CHILD inheriting the parent's selection on PATH gets its OWN directory and never removes the parent's.
+ACT="$(env PATH="$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" bash -c '. "$1/tools.sh"; tools_activate; parent="$MEMEX_TOOLS_SELECTED"; bash -c ". \"$1/tools.sh\"; tools_activate; echo child=\$MEMEX_TOOLS_SELECTED; readlink \"\$MEMEX_TOOLS_SELECTED/helm\"; tools_deactivate" _ "$1"; echo "parent=$parent"; [ -d "$parent" ] && echo parent-kept; rm -rf "$parent"' _ "$HERE/../share" 2>&1)"
+child="$(sed -n 's/^child=//p' <<<"$ACT")"; parent="$(sed -n 's/^parent=//p' <<<"$ACT")"
+if [ -n "$child" ] && [ "$child" != "$parent" ] && grep -q '/helm$' <<<"$ACT" && grep -q '^parent-kept$' <<<"$ACT"; then
+  ok "a child process activating under an inherited selection owns its own dir, links to the real executable, and leaves the parent's dir alone"
+else bad "child selection ownership" "$ACT"; fi
 # A stale fallback link in <prefix>/bin AHEAD on PATH must not win: the selection dir precedes everything.
 mkdir -p "$TPRE/bin"; ln -sfn "$TPRE/libexec/vendor/colima/bin/colima" "$TPRE/bin/colima"
 ACT="$(env PATH="$TPRE/bin:$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" bash -c '. "$1/tools.sh"; tools_activate; command -v colima; rm -rf "$MEMEX_TOOLS_SELECTED"' _ "$HERE/../share")"
@@ -822,7 +831,15 @@ OUT="$(env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/h
 [ ! -e "$HL/home/.memex-local/port-forward.pid" ] && ok "uninstall_launchd (down) removes the headless forward's pid record" || bad "down removes pid" "$OUT"
 # The daemon program drives exactly this: MEMEX_HEADLESS=1, retries `up`, then watches the pid.
 DAEMON="$HERE/../../macos/libexec/memex-daemon.sh"
-case "$(cat "$DAEMON")" in *'export MEMEX_HEADLESS=1'*'until memex-local up; do'*'port-forward.pid'*) ok "memex-daemon.sh sets MEMEX_HEADLESS=1, retries 'up' until it succeeds, then watches port-forward.pid" ;; *) bad "memex-daemon.sh lifecycle" "" ;; esac
+case "$(cat "$DAEMON")" in *'export MEMEX_HEADLESS=1'*'CLI="${MEMEX_LOCAL_CLI:-/opt/memex/bin/memex-local}"'*'until "$CLI" up; do'*'port-forward.pid'*) ok "memex-daemon.sh invokes THE package's CLI (/opt/memex/bin/memex-local) with MEMEX_HEADLESS=1, retries 'up' until it succeeds, then watches port-forward.pid" ;; *) bad "memex-daemon.sh lifecycle" "" ;; esac
+case "$(cat "$DAEMON")" in *'stopped() { [ -f "$stop_marker" ]; }'*'if stopped; then'*'exit 0'*) ok "memex-daemon.sh exits 0 (no KeepAlive restart) while the stop marker from 'memex-local down' exists" ;; *) bad "daemon honours the stop marker" "" ;; esac
+[ "$(plutil -extract KeepAlive.SuccessfulExit raw "$HERE/../../macos/launchd/com.memex.local.daemon.plist" 2>/dev/null)" = "false" ] && ok "the daemon plist restarts only on a FAILED exit (KeepAlive.SuccessfulExit=false)" || bad "KeepAlive.SuccessfulExit=false" ""
+# `down` writes the stop marker BEFORE killing the forward; an explicit `up` removes it.
+: > "$HL/home/.memex-local/port-forward.pid"; printf '%s' "$$" > "$HL/home/.memex-local/port-forward.pid"
+OUT="$(env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c '. "$1"; kill() { :; }; uninstall_launchd' _ "$CLI" 2>&1)"
+[ -f "$HL/home/.memex-local/daemon.stopped" ] && ok "'down' (uninstall_launchd) leaves the daemon.stopped marker for the daemon" || bad "down writes daemon.stopped" "$OUT"
+OUT="$(env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/home/.memex-local" MEMEX_HEADLESS=1 FAKE_LAUNCHCTL_LOG="$HL/launchctl.log" MEMEX_PF_BIND_BUDGET=2 MEMEX_LOCAL_LIB=1 bash -c '. "$1"; install_launchd' _ "$CLI" 2>&1)"
+[ ! -f "$HL/home/.memex-local/daemon.stopped" ] && ok "an explicit 'up' (install_launchd) removes the stop marker" || bad "up removes daemon.stopped" "$OUT"
 case "$(cat "$DAEMON")" in *'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/memex/bin"'*) ok "memex-daemon.sh lists /opt/memex/bin LAST (existing installations first)" ;; *) bad "daemon PATH order" "$(grep -n 'export PATH' "$DAEMON")" ;; esac
 rm -rf "$HL"
 

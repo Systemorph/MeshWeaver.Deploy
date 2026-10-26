@@ -152,6 +152,11 @@ readonly PF_LOG="$LOCAL_HOME/port-forward.log"
 # session, so no LaunchAgent can load; the port-forward is held as a background process instead and its
 # pid recorded here, for the daemon to watch and for `down` to stop.
 readonly PF_PID="$LOCAL_HOME/port-forward.pid"
+# A deliberate `down` on a headless host writes this marker before stopping the forward; the daemon
+# (memex-daemon.sh) exits SUCCESSFULLY while it exists — launchd's KeepAlive (SuccessfulExit=false) then
+# leaves the host down, across reboots too — and an explicit `up` removes it. Without it a `down` looked
+# to the daemon exactly like a dropped forward and was answered with a fresh `up` mid-teardown.
+readonly DAEMON_STOP="$LOCAL_HOME/daemon.stopped"
 readonly HEADLESS="${MEMEX_HEADLESS:-}"
 readonly PLIST_LABEL="com.memex.local"
 readonly PLIST_DST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
@@ -1224,6 +1229,7 @@ install_launchd() {
   local share; share="$(resolve_share)"
   mkdir -p "$LOCAL_HOME"
   install -m 0755 "$share/port-forward.sh" "$PF_SCRIPT"
+  rm -f "$DAEMON_STOP"   # an explicit `up` is a start: the daemon may run again
   if [ "$HEADLESS" = "1" ]; then
     # No GUI session → `launchctl bootstrap gui/…` cannot load an agent. Hold the forward as a background
     # process; the daemon (deploy/macos/libexec/memex-daemon.sh) watches its pid and launchd's KeepAlive
@@ -1290,7 +1296,10 @@ wait_port_forward() {
 
 uninstall_launchd() {
   if [ -f "$PF_PID" ]; then
-    kill "$(cat "$PF_PID")" 2>/dev/null && ok "headless port-forward (pid $(cat "$PF_PID")) stopped"
+    # The marker FIRST, then the kill: the daemon reads it when the forward ends and exits 0 instead of
+    # re-running `up` into this teardown.
+    mkdir -p "$LOCAL_HOME"; : > "$DAEMON_STOP"
+    kill "$(cat "$PF_PID")" 2>/dev/null && ok "headless port-forward (pid $(cat "$PF_PID")) stopped — the daemon stays down until 'memex-local up'"
     rm -f "$PF_PID"
   fi
   if [ -f "$PLIST_DST" ]; then

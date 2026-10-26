@@ -43,8 +43,14 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- Restart the daemon only when it FAILS (the forward dropped, `up` could not complete). A
+         successful exit means a deliberate `memex-local down` (the stop marker ~/.memex-local/daemon.stopped),
+         which must not be answered with a fresh `up` into the teardown. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <key>StandardOutPath</key>
     <string>/var/log/memex/daemon.log</string>

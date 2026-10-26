@@ -98,7 +98,9 @@ _tool_existing_on_path() {
     dir="${rest%%:*}"
     if [ "$rest" = "$dir" ]; then rest=""; else rest="${rest#*:}"; fi
     [ -n "$dir" ] || continue
-    case "$dir" in "$TOOLS_PREFIX_BIN"|"$TOOLS_VENDOR_DIR"|"$TOOLS_VENDOR_DIR"/*) continue ;; esac
+    # Never the .pkg's fallback links, never the vendored tree, never a SELECTION directory (this
+    # process's or an ancestor's: a second activation would otherwise link a selection entry to itself).
+    case "$dir" in "$TOOLS_PREFIX_BIN"|"$TOOLS_VENDOR_DIR"|"$TOOLS_VENDOR_DIR"/*|*/memex-tools.*) continue ;; esac
     if [ -x "$dir/$bin" ] && [ ! -d "$dir/$bin" ]; then printf '%s\n' "$dir/$bin"; return 0; fi
   done
   return 1
@@ -181,9 +183,14 @@ tools_report() {
 # the caller removes it on exit) and nothing on disk outside it is touched.
 tools_activate() {
   local name line kind path sel
-  sel="${MEMEX_TOOLS_SELECTED:-}"
+  # Each PROCESS owns its own selection directory: an inherited MEMEX_TOOLS_SELECTED belongs to the parent
+  # (which removes it on ITS exit), so it is never reused and never removed here. Activating twice in one
+  # process re-fills the same directory — discovery skips selection directories, so links never point at
+  # themselves.
+  sel="${_TOOLS_OWN_SELECTION:-}"
   if [ -z "$sel" ] || [ ! -d "$sel" ]; then
     sel="$(mktemp -d "${TMPDIR:-/tmp}/memex-tools.XXXXXX")" || return 1
+    _TOOLS_OWN_SELECTION="$sel"
     export MEMEX_TOOLS_SELECTED="$sel"
   fi
   for name in $(tools_list); do
@@ -198,6 +205,6 @@ tools_activate() {
 
 # tools_deactivate — remove the selection directory (the CLI's exit trap).
 tools_deactivate() {
-  [ -n "${MEMEX_TOOLS_SELECTED:-}" ] && [ -d "${MEMEX_TOOLS_SELECTED}" ] && rm -rf "${MEMEX_TOOLS_SELECTED}"
+  [ -n "${_TOOLS_OWN_SELECTION:-}" ] && [ -d "${_TOOLS_OWN_SELECTION}" ] && rm -rf "${_TOOLS_OWN_SELECTION}"
   return 0
 }

@@ -14,10 +14,15 @@ plist="${MEMEX_PKG_DAEMON_PLIST:-/Library/LaunchDaemons/com.memex.local.daemon.p
 logdir="${MEMEX_PKG_DAEMON_LOGDIR:-/var/log/memex}"
 pref() { defaults read "/Library/Managed Preferences/com.memex.local" "$1" 2>/dev/null || defaults read com.memex.local "$1" 2>/dev/null || true; }
 
+label="system/com.memex.local.daemon"
 user="$(pref ServiceUser)"
 [ -n "$user" ] || user="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
-case "$user" in ""|root|loginwindow|_*) 
-  echo "daemon postinstall: no service user — set the managed preference com.memex.local ServiceUser (or install from a logged-in session); the daemon stays unloaded with __USER__ in $plist" >&2
+case "$user" in ""|root|loginwindow|_*)
+  # No user to run as — and possibly a job from an EARLIER enabled install still running: stop it and
+  # persist the disabled state before leaving, so the previous configuration cannot outlive this one.
+  launchctl bootout system "$plist" >/dev/null 2>&1 || true
+  launchctl disable "$label" >/dev/null 2>&1 || true
+  echo "daemon postinstall: no service user — set the managed preference com.memex.local ServiceUser (or install from a logged-in session); any earlier daemon was booted out and disabled, and the plist keeps __USER__ ($plist)" >&2
   exit 0 ;;
 esac
 # Render __USER__ (a re-run finds the previous user's name instead of the token: replace either).
@@ -32,13 +37,14 @@ mkdir -p "$logdir" && chown "$user" "$logdir" 2>/dev/null || true
 # boot by itself. The preference therefore drives launchd's PERSISTED enable/disable state, both ways:
 # not true → bootout whatever an earlier Unattended=true install loaded AND `launchctl disable` (survives
 # reboots; the plist stays installed, inert, until someone enables it); true → enable + bootstrap.
-label="system/com.memex.local.daemon"
 unattended="$(pref Unattended)"
 case "$unattended" in 1|true|TRUE|yes|YES)
-  launchctl bootout system "$plist" >/dev/null 2>&1 || true
-  launchctl enable "$label" >/dev/null 2>&1 || true
-  if launchctl bootstrap system "$plist"; then echo "daemon postinstall: com.memex.local.daemon enabled + bootstrapped (Unattended=true); log: $logdir/daemon.log"
-  else echo "daemon postinstall: launchctl bootstrap failed — load it by hand: sudo launchctl enable $label && sudo launchctl bootstrap system $plist" >&2; fi ;;
+  launchctl bootout system "$plist" >/dev/null 2>&1 || true     # an absent old job is fine
+  # The REQUESTED operations must succeed, or Installer and the MDM must hear that unattended startup
+  # did not happen: a non-zero exit here fails the install.
+  launchctl enable "$label" || { echo "daemon postinstall: launchctl enable $label FAILED — unattended startup is NOT armed" >&2; exit 1; }
+  launchctl bootstrap system "$plist" || { echo "daemon postinstall: launchctl bootstrap system $plist FAILED — unattended startup is NOT armed" >&2; exit 1; }
+  echo "daemon postinstall: com.memex.local.daemon enabled + bootstrapped (Unattended=true); log: $logdir/daemon.log" ;;
 *)
   launchctl bootout system "$plist" >/dev/null 2>&1 || true
   launchctl disable "$label" >/dev/null 2>&1 || true
