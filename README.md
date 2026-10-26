@@ -8,7 +8,7 @@ The public deployment reference for [MeshWeaver](https://github.com/Systemorph/M
 | `deploy/helm-db` | the per-instance PostgreSQL chart |
 | `deploy/aks` | an example AKS overlay, the cluster manifests, and the chart / drift / observability tooling |
 | `deploy/homebrew` | `memex-local` — run the chart on a Mac (`brew tap systemorph/memex && brew install memex-local`) |
-| `deploy/build-host` | the standing build host's runner image `mw-build-host` (Dockerfile + `stage-context.sh`) |
+| `deploy/build-host` | the standing build host's runner image `mw-build-host` (a self-contained Dockerfile: it fetches its sources by commit) |
 | `.github/scripts/build-run.py` | the build host's runner (claims runs, executes stages in a `bwrap` sandbox) |
 | `.github/workflows/build-host.yml` | on every platform set the platform's CD hands over: the runner image, then the newest armed set handed to `build-latest` |
 | `.github/workflows/build-host-stable.yml` | once a day: the main-passed ceiling handed to `build-stable` |
@@ -93,7 +93,7 @@ dotnet test test/MeshWeaver.Deploy.ChartGuards -p:MeshWeaverRoot=../MeshWeaver
 python3 .github/scripts/build-run.py --self-test                 # the build host's runner
 python3 .github/scripts/platform-set-dispatch.py --self-test     # the platform's hand-over contract
 python3 .github/scripts/deploy-test-switch-trigger.py --self-test # when deploy → test → switch starts, for which set
-deploy/build-host/stage-context.sh . ../MeshWeaver /tmp/ctx && docker build -f deploy/build-host/Dockerfile /tmp/ctx
+docker build -f deploy/build-host/Dockerfile --build-arg DEPLOY_COMMIT=$(git rev-parse origin/main) --build-arg PLATFORM_COMMIT=$(git -C ../MeshWeaver rev-parse origin/main) deploy/build-host
 ```
 
 Working rules for agents and people: [AGENTS.md](AGENTS.md).
