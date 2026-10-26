@@ -946,6 +946,10 @@ data:
   # overlay is the one that must set this — otherwise the inbox keeps accepting release events
   # unverified and CD reports `signature: not-required` on every publish.
   WebhookInbox__Targets__1__SecretConfigKey: "{{ .Values.config.memex_portal.WebhookInbox__Targets__1__SecretConfigKey | default "" }}"
+  # A third target — the back-lease heartbeat inbox Hosting/Heartbeats (MeshWeaver.Plugins
+  # Hosting/BackLease §5), signed with the leased machine's module-report secret.
+  WebhookInbox__Targets__2: "{{ .Values.config.memex_portal.WebhookInbox__Targets__2 | default "" }}"
+  WebhookInbox__Targets__2__SecretConfigKey: "{{ .Values.config.memex_portal.WebhookInbox__Targets__2__SecretConfigKey | default "" }}"
   # ---- Framework-release broadcast: NO subscriber slots (retired 2026-09-03) --------------
   # FrameworkBroadcast__Subscribers__0..3 used to be rendered here as the release wave's
   # subscriber list. The set is DATA IN THE MESH now — every repository a Hosting/Deployment
