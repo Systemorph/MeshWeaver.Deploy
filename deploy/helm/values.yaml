@@ -1189,6 +1189,10 @@ buildHosts:
     seccompLocalhostProfile: ""   # with Localhost: the profile file on the node (e.g. profiles/bwrap.json)
     appArmorProfile: ""           # RuntimeDefault | Unconfined | Localhost — on a kernel with
     appArmorLocalhostProfile: ""  #   apparmor_restrict_unprivileged_userns=1, a Localhost profile granting userns
+    # true: the pod runs in its OWN user namespace (hostUsers: false) with an Unmasked /proc, which bwrap
+    # needs to mount a fresh /proc per stage. Needs kernel >= 6.3 and containerd 2 on the node; on a
+    # node pool the selector gains kernel-userns: "true" and the pods tolerate that pool's kernel-userns taint.
+    userNamespace: false
   # Egress: the cluster DNS resolver, the build API's pods on their port, and 80/443 to anything
   # OUTSIDE the excluded ranges (GitHub, the registries, NuGet, Entra). Ingress: none. The runner's
   # start-up boundary self-check refuses to run where this policy does not hold.
