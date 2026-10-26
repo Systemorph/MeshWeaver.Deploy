@@ -352,8 +352,11 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "release $tag exists — reusing"
           else
+            # --target pins the tag to THIS run's commit: without it the tag lands on main's tip, which may
+            # have moved during the two notarizations and would describe a tree other than the one packed.
             gh release create "$tag" "$PKGDIR"/memex-local-"$VERSION"-arm64.pkg "$PKGDIR"/memex-local-"$VERSION"-x86_64.pkg \
               "$PKGDIR"/memex-local-"$VERSION"-arm64.pkg.sha256 "$PKGDIR"/memex-local-"$VERSION"-x86_64.pkg.sha256 \
+              --target "$GITHUB_SHA" \
               --title "memex-local $VERSION (macOS installer)" \
               --notes "Signed, notarized and stapled macOS installer for memex-local $VERSION, built from ${GITHUB_REPOSITORY}@${GITHUB_SHA}. Design: deploy/macos/README.md."
           fi

@@ -15,8 +15,16 @@
 set -uo pipefail
 
 # launchd gives login agents a minimal PATH; make the brew tools reachable.
-# /opt/memex/bin LAST: the .pkg installer activates a vendored tool there only when nothing existing meets its floor.
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/memex/bin:${PATH:-}"
+# The SAME resolution the CLI made (share/tools.sh): an existing copy that meets its floor first, the
+# .pkg's vendored copy second — so this agent runs the colima/kubectl the CLI chose, not whatever a PATH
+# order happens to find first. MEMEX_LOCAL_SHARE is set by the launchd plist (__SHARE__) and by the CLI.
+if [ -f "${MEMEX_LOCAL_SHARE:-}/tools.sh" ]; then
+  # shellcheck source=tools.sh
+  . "${MEMEX_LOCAL_SHARE}/tools.sh"
+  tools_activate
+  trap tools_deactivate EXIT
+fi
 
 HOST_PORT="${MEMEX_PORT:-8443}"
 

@@ -45,7 +45,7 @@ out). The command reaches PATH through **`/etc/paths.d/memex`** — the mechanis
 
 | Path | What |
 |---|---|
-| `/opt/memex/bin/memex-local` | the wrapper on PATH (sets `MEMEX_LOCAL_SHARE`, `MEMEX_CHART_DIR`, `MEMEX_PREFIX` — exactly what the formula's env script sets) |
+| `/opt/memex/bin/memex-local` | the wrapper on PATH (sets `MEMEX_LOCAL_SHARE`, `MEMEX_CHART_DIR`, `MEMEX_PREFIX` — exactly what the formula's env script sets). The prefix is a literal in the postinstall, the daemon plist and the daemon program, so `build-pkg.sh` takes no `--prefix`: relocation would have to render it into all of them together |
 | `/opt/memex/bin/<tool>` | **only** a vendored fallback the postinstall ACTIVATED (§2); a symlink into `libexec/vendor` |
 | `/opt/memex/libexec/memex-local` | the CLI, byte-identical to `deploy/homebrew/bin/memex-local` |
 | `/opt/memex/libexec/vendor/<tool>/bin/<bin>` | the pinned Colima, Lima (with its `share/lima`), kubectl, helm, mkcert — inert until activated |
@@ -75,6 +75,8 @@ entitlement; Lima's own releases are ad-hoc signed with exactly it. Lima's Linux
 are left alone. The product archive is signed with the Developer ID **Installer** certificate, submitted
 with the App Store Connect API key, and stapled; `spctl -a -t install` must accept the result.
 
+The archive is built, signed, notarized, stapled and self-checked under the build's temporary directory
+and **moved to `--out` only after every check passed**, so a failure at any step leaves nothing behind.
 **The three states a package can be in are in its NAME** — an artifact listing says it:
 
 | Name | Meaning |
@@ -144,14 +146,20 @@ login session, so no LaunchAgent ever loads. The package therefore carries a sec
 `/opt/memex/libexec/memex-daemon.sh` at boot **as the service user** (`UserName` — the stack, the VM and
 `~/.memex-local` belong to a user, never to root), `KeepAlive`, logging to `/var/log/memex/daemon.log`.
 Its postinstall writes the service user (managed preference `ServiceUser`, else the console user) into the
-plist and **bootstraps the daemon only when the managed preference `Unattended` is true**; otherwise it is
-installed and left unloaded, with the one `launchctl bootstrap` command printed — a daemon that starts a VM
-at every boot is armed by a declaration, not by installing. The daemon runs `memex-local up` and then holds
-the port-forward itself in place of the per-user agent. 🚨 **Follow-up:** `memex-local up` does not yet
-know it runs headless — its launchd step needs a GUI session and `up` stops there, after the chart is
-deployed and before `verify_usable`; the forward still comes up, so the host serves, but the headless `up`
-(skip the agent, run the verification) and the first unattended boot on a real Mac mini are the next
-change set's acceptance test. Nothing here claims that run has happened.
+plist and drives launchd's **persisted** state from the managed preference `Unattended`, in both
+directions: true → `launchctl enable` + bootstrap; anything else → bootout whatever an earlier
+`Unattended=true` install loaded AND `launchctl disable`, so the installed plist (which carries
+`RunAtLoad`/`KeepAlive`) cannot start at the next boot until someone enables it — a daemon that starts a
+VM at every boot is armed by a declaration, not by installing. The daemon sets `MEMEX_HEADLESS=1` and runs
+`memex-local up`: headless, the CLI holds the port-forward as a **background process** (its pid in
+`~/.memex-local/port-forward.pid`) instead of a LaunchAgent no session exists to load, and runs its
+usability verification against it like any other `up`. A failed `up` (an image pull before the network
+settled, an unreachable registry) is **retried with a growing pause** and is never mistaken for done; once
+`up` succeeds the daemon watches the forward's pid and exits when it ends, so `KeepAlive` re-runs `up`,
+which re-creates what is missing. `memex-local down` stops the headless forward. 🚨 **Follow-up:** the
+headless path is exercised by the test suites against stubs (`install_launchd` under `MEMEX_HEADLESS=1`,
+the daemon postinstall's enable/disable) and the package's install by the CI runner; its first unattended
+boot on a real Mac mini is the next change set's acceptance test. Nothing here claims that run has happened.
 
 ### 1e. Later, optional: our own VM on the Virtualization framework
 
@@ -205,10 +213,18 @@ time **probes the machine first**. One resolver, one precedence list, one manife
 - **The precedence list.** For each tool: (1) an **existing** installation on PATH — the developer's own
   Homebrew copy, a hand install — is used when its reported version meets the floor; it is never
   overwritten and never shadowed. (2) The **vendored** copy under `/opt/memex/libexec/vendor` is used only
-  when nothing existing satisfies the floor — missing, or present but too old. (3) Otherwise the tool is
-  **missing** and the message names the floor, the formula and the installer's pinned version. The
-  package's own `/opt/memex/bin` and `libexec/vendor` are **excluded** from "existing", so an activated
-  fallback can never masquerade as the user's installation on the next probe.
+  when nothing existing satisfies the floor — missing, or present but too old — and only when it proves
+  its own version (a vendored binary that prints none is damaged or incompatible and is never activated).
+  (3) Otherwise the tool is **missing** and the message names the floor, the formula and the installer's
+  pinned version. The package's own `/opt/memex/bin` and `libexec/vendor` are **excluded** from
+  "existing", so an activated fallback can never masquerade as the user's installation on the next probe.
+- **The selection is made effective, not merely reported.** `tools_activate` builds a per-process
+  **selection directory** — one symlink per resolved tool, to the existing copy or the vendored one — and
+  prepends it to `PATH`, so the CLI and everything it runs (`colima` → `limactl`) execute exactly the
+  resolved copies whatever else `PATH` holds: a below-floor Homebrew copy ahead of the fallback, a stale
+  fallback link after a Homebrew copy appeared. The per-user agents (port-forward, sampler) and the daemon
+  run the same resolver (`MEMEX_LOCAL_SHARE` in their plists), and every agent's `PATH` lists
+  `/opt/memex/bin` last. `memex-local down` and the exit trap remove the selection directory.
 
 **The postinstall** (`scripts/postinstall`) runs that resolution as root at install time and makes it
 physical: for a tool resolved to its vendored copy it **activates** the fallback — a symlink
@@ -239,10 +255,24 @@ over:
 **What the same probe covers beyond the tools.** `memex-local up` was idempotent before this change over
 Colima's VM state (`colima_running` → start or skip) and the Helm release (`helm upgrade --install`), and
 the postinstall never touches either: re-running the installer repairs the toolchain and nothing else, and
-`up` repairs the stack and nothing else. Ollama and `socket_vmnet` are **probed and reported, not vendored**
-— Ollama ships its own installer and its own updater, `socket_vmnet` is a root daemon of its own — and the
-install never fails on them: the report names them (`NOT RESOLVED — … install it (ollama)`), and
-`MEMEX_OLLAMA_MODEL=none` runs without a local model.
+`up` repairs the stack and nothing else.
+
+**What the package does NOT supply — the external prerequisites of `up`.** Ollama and `socket_vmnet` are
+**probed and reported, not vendored** — Ollama ships its own installer and updater, `socket_vmnet` is a
+root daemon of its own — and the install never fails on them: the report names them (`NOT RESOLVED — …
+install it (ollama)`). `up` itself still requires **Ollama** (`preflight` needs it; `MEMEX_OLLAMA_MODEL=none`
+skips only the large model's pull, the small e2e model is always pulled) and, in registry mode, the
+**Docker CLI** and the **Azure CLI** with an `az login` for the image pull (`image_pull_acr`; the
+source-checkout alternative needs the .NET SDK instead). The welcome and conclusion pages say so, and
+`doctor` reports each. Vendoring the Docker CLI is a candidate for a later pin in the manifest; `az` is a
+cask with its own installer and stays external.
+
+**Privilege.** The postinstall runs as root, but the probe EXECUTES whatever `colima`/`kubectl`/… it
+finds — in user-writable Homebrew prefixes. It therefore runs the probe through `sudo -u` as the console
+user Installer is serving (else `nobody`) with the wide probe PATH, and keeps a trusted system PATH for
+everything it does itself as root (links, the report). A filesystem error in that work fails the install
+(`set -e`, an explicit check on `ln`): a report claiming a repaired toolchain that was not written is
+exactly what must not happen.
 
 **Manifest ↔ formula drift is a red test.** `deploy/homebrew/test/run-tests.sh` asserts that the
 formula's `depends_on` set *is* the manifest's set of `direct` tools (Lima is `indirect`: Homebrew's colima
@@ -282,7 +312,7 @@ Path-filtered to `deploy/macos/**`, `deploy/homebrew/**`, `deploy/helm/**` and i
 |---|---|---|---|
 | `lint` | Linux | every | parse + `shellcheck -S warning` on every shipped script; the manifest's asset rows are whole (both arches, 64-hex sha256, https) |
 | `build` | macOS | every | both suites under `/bin/bash` 3.2; both architectures built **unsigned** with the real vendored toolchain (`actions/cache` keyed on the manifest's hash); the runner-arch package **installed** with `installer` as root, `tools.report` read, `doctor` run, nothing in Homebrew's prefix touched, the daemon absent (not chosen), re-installed → `changed: 0`, the daemon chosen through `-applyChoiceChangesXML` → present and **not loaded**, uninstalled → nothing left; both packages uploaded as artifacts (`-unsigned`) |
-| `release` | macOS | `push` to `main` | the seven secrets enumerated by name (absent ones → a warning annotation + the step summary, `signing=false`); when present: a temporary keychain, identities read from it, both architectures built signed + notarized + stapled and attached to the release `memex-local/v<version>` of this repository; otherwise the same unsigned artifacts, and **no release** |
+| `release` | macOS | `push` to `main` | the seven secrets enumerated by name (absent ones → a warning annotation + the step summary, `signing=false`); when present: a temporary keychain, identities read from it, both architectures built signed + notarized + stapled and attached to the release `memex-local/v<version>` of this repository, its tag pinned to the run's commit (`--target`); otherwise the same unsigned artifacts, and **no release** |
 
 The secrets are consumed only by `release` (`if: github.event_name == 'push'`), which the platform's
 `check-pr-secret-preflight.py` excludes from pull-request reachability; every job carries a literal

@@ -148,6 +148,11 @@ readonly CERT_FILE="$LOCAL_HOME/${HOSTNAME_LOCAL}.pem"
 readonly KEY_FILE="$LOCAL_HOME/${HOSTNAME_LOCAL}-key.pem"
 readonly PF_SCRIPT="$LOCAL_HOME/port-forward.sh"
 readonly PF_LOG="$LOCAL_HOME/port-forward.log"
+# HEADLESS HOST (MEMEX_HEADLESS=1 — set by the .pkg's LaunchDaemon, deploy/macos/README.md §1d): no GUI
+# session, so no LaunchAgent can load; the port-forward is held as a background process instead and its
+# pid recorded here, for the daemon to watch and for `down` to stop.
+readonly PF_PID="$LOCAL_HOME/port-forward.pid"
+readonly HEADLESS="${MEMEX_HEADLESS:-}"
 readonly PLIST_LABEL="com.memex.local"
 readonly PLIST_DST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 # How long to wait for the launchd port-forward to actually BIND before reporting it did not.
@@ -242,6 +247,7 @@ resolve_repo() {
 # chose; `need` refuses a tool below its floor by NAME, with the floor and the remedy.
 # shellcheck source=../share/tools.sh
 . "$(resolve_share)/tools.sh"
+trap tools_deactivate EXIT
 
 need() {
   local bin="$1" brew="$2" name line floor verdict note
@@ -576,6 +582,7 @@ install_backlease_sampler() {
       -e "s|__PORT__|${HOST_PORT}|g" \
       -e "s|__HOSTNAME__|${HOSTNAME_LOCAL}|g" \
       -e "s|__NAMESPACE__|${NAMESPACE}|g" \
+      -e "s|__SHARE__|${share}|g" \
       "$share/com.memex.local.backlease.plist" > "$BACKLEASE_PLIST_DST"
   launchctl bootout "gui/$(id -u)" "$BACKLEASE_PLIST_DST" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$(id -u)" "$BACKLEASE_PLIST_DST"
@@ -1215,13 +1222,30 @@ setup_ollama() {
 # ---------------------------------------------------------------------------
 install_launchd() {
   local share; share="$(resolve_share)"
-  step "Installing durable launchd port-forward ${HOST_PORT} -> ingress :443 (§7)"
+  mkdir -p "$LOCAL_HOME"
   install -m 0755 "$share/port-forward.sh" "$PF_SCRIPT"
+  if [ "$HEADLESS" = "1" ]; then
+    # No GUI session → `launchctl bootstrap gui/…` cannot load an agent. Hold the forward as a background
+    # process; the daemon (deploy/macos/libexec/memex-daemon.sh) watches its pid and launchd's KeepAlive
+    # re-runs `up` when it ends. Idempotent: a live forward from an earlier run is kept.
+    step "Headless host: holding the port-forward ${HOST_PORT} -> ingress :443 as a background process (no LaunchAgent)"
+    if [ -f "$PF_PID" ] && kill -0 "$(cat "$PF_PID")" 2>/dev/null; then
+      ok "port-forward already running (pid $(cat "$PF_PID"))"
+    else
+      MEMEX_PORT="$HOST_PORT" MEMEX_LOCAL_SHARE="$share" nohup /bin/bash "$PF_SCRIPT" >> "$PF_LOG" 2>&1 &
+      echo $! > "$PF_PID"
+      ok "port-forward started (pid $(cat "$PF_PID"), log: $PF_LOG)"
+    fi
+    wait_port_forward || true
+    return 0
+  fi
+  step "Installing durable launchd port-forward ${HOST_PORT} -> ingress :443 (§7)"
   mkdir -p "$HOME/Library/LaunchAgents"
   # __PORT__ carries MEMEX_PORT into the agent: launchd does not inherit this shell's environment.
   sed -e "s|__SCRIPT__|${PF_SCRIPT}|g" \
       -e "s|__LOG__|${PF_LOG}|g" \
       -e "s|__PORT__|${HOST_PORT}|g" \
+      -e "s|__SHARE__|${share}|g" \
       "$share/com.memex.local.plist" > "$PLIST_DST"
   # Reload idempotently.
   launchctl bootout "gui/$(id -u)" "$PLIST_DST" >/dev/null 2>&1 || true
@@ -1265,6 +1289,10 @@ wait_port_forward() {
 }
 
 uninstall_launchd() {
+  if [ -f "$PF_PID" ]; then
+    kill "$(cat "$PF_PID")" 2>/dev/null && ok "headless port-forward (pid $(cat "$PF_PID")) stopped"
+    rm -f "$PF_PID"
+  fi
   if [ -f "$PLIST_DST" ]; then
     launchctl bootout "gui/$(id -u)" "$PLIST_DST" >/dev/null 2>&1 || true
     rm -f "$PLIST_DST"

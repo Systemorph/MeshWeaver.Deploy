@@ -15,38 +15,53 @@
 # Installer runs scripts with a minimal environment; the probe PATH is set explicitly below and covers
 # both Homebrew prefixes. The two MEMEX_PKG_* variables exist for the test suite (deploy/macos/test):
 # Installer never sets them, so the defaults are what a real install uses.
-set -uo pipefail
+set -euo pipefail
 PREFIX="${MEMEX_PKG_PREFIX:-/opt/memex}"
-export PATH="${MEMEX_PKG_PROBE_PATH:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
+# Two PATHs, deliberately. Everything THIS script does as root (mkdir, ln, rm, the report) runs with a
+# TRUSTED system PATH. The probe — which EXECUTES whatever `colima`, `kubectl`, … it finds, to read
+# their versions — searches the user-writable Homebrew prefixes too, and therefore never runs as root:
+# it runs as the console user Installer is serving (else `nobody`), through sudo, with that wider PATH.
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+PROBE_PATH="${MEMEX_PKG_PROBE_PATH:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
 export MEMEX_PREFIX="$PREFIX"
 # shellcheck source=../../homebrew/share/tools.sh
 . "$PREFIX/share/tools.sh" || { echo "postinstall: $PREFIX/share/tools.sh is not in the payload" >&2; exit 1; }
 
+console_user="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
+case "$console_user" in ""|root|loginwindow|_*) probe_user="nobody" ;; *) probe_user="$console_user" ;; esac
+# probe_all → every tool's tool_resolve line, produced by an UNPRIVILEGED process when we are root.
+probe_all() {
+  local script='. "$1/share/tools.sh"; for n in $(tools_list); do tool_resolve "$n" || true; done'
+  if [ "$(id -u)" -eq 0 ]; then
+    sudo -u "$probe_user" -H env PATH="$PROBE_PATH" MEMEX_PREFIX="$PREFIX" bash -c "$script" _ "$PREFIX"
+  else
+    env PATH="$PROBE_PATH" MEMEX_PREFIX="$PREFIX" bash -c "$script" _ "$PREFIX"
+  fi
+}
 mkdir -p "$PREFIX/etc" "$PREFIX/bin"
 report="$PREFIX/etc/tools.report"
 changed=0
 lines=""
 say() { printf '%s\n' "$*"; lines="${lines}${1}"$'\n'; }
 
-# `brew list --versions <formula>` for the report — informational, and only when brew exists. brew
-# refuses to run as root, so it runs as the console user Installer is serving.
-brew_bin="$(command -v brew 2>/dev/null || true)"   # on the probe PATH above (both Homebrew prefixes)
-console_user="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
+# `brew list --versions <formula>` for the report — informational, only when brew is on the probe PATH,
+# and as the probe user (brew refuses root).
+brew_bin="$(env PATH="$PROBE_PATH" command -v brew 2>/dev/null || true)"
 brew_version() {
   [ -n "$brew_bin" ] || return 0
-  if [ "$(id -u)" -eq 0 ] && [ -n "$console_user" ] && [ "$console_user" != "root" ]; then
-    sudo -u "$console_user" -H "$brew_bin" list --versions "$1" 2>/dev/null | head -1
+  if [ "$(id -u)" -eq 0 ]; then
+    sudo -u "$probe_user" -H "$brew_bin" list --versions "$1" 2>/dev/null | head -1 || true
   else
-    "$brew_bin" list --versions "$1" 2>/dev/null | head -1
+    "$brew_bin" list --versions "$1" 2>/dev/null | head -1 || true
   fi
   return 0
 }
 
 say "memex-local postinstall — toolchain probe ($(date -u +%Y-%m-%dT%H:%M:%SZ), prefix $PREFIX, manifest $TOOLS_MANIFEST)"
-say "existing installation first (floor met), vendored copy second, never into Homebrew's prefix"
-for name in $(tools_list); do
-  line="$(tool_resolve "$name" || true)"
-  IFS=$'\t' read -r name kind path version floor verdict note <<<"$line"
+say "existing installation first (floor met), vendored copy second, never into Homebrew's prefix (probe as $probe_user)"
+resolved="$(probe_all)" || { echo "postinstall: the toolchain probe (as $probe_user) failed" >&2; exit 1; }
+while IFS=$'\t' read -r name kind path version floor verdict note; do
+  [ -n "$name" ] || continue
   bin="$(tool_field "$name" 2)"; bin="${bin%%:*}"
   link="$PREFIX/bin/$bin"
   action=""
@@ -55,7 +70,9 @@ for name in $(tools_list); do
       if [ "$(readlink "$link" 2>/dev/null || true)" = "$path" ]; then
         action="kept the vendored fallback"
       else
-        rm -f "$link"; ln -s "$path" "$link"; changed=$((changed + 1))
+        rm -f "$link"
+        ln -s "$path" "$link" || { echo "postinstall: cannot activate $link → $path (ln failed) — the toolchain was NOT repaired" >&2; exit 1; }
+        changed=$((changed + 1))
         action="ACTIVATED the vendored fallback → $link"
       fi ;;
     existing:ok)
@@ -72,9 +89,9 @@ for name in $(tools_list); do
   bv="$(brew_version "$(tool_field "$name" 3)")"
   say "  $(printf '%-13s %-9s %-9s floor %-7s %-12s %s%s%s' "$name" "$kind" "$version" "$floor" "$verdict" "$path" "${bv:+  [brew: $bv]}" "${note:+  ($note)}")"
   say "  $(printf '%-13s → %s' "" "$action")"
-done
+done <<<"$resolved"
 say "changed: $changed"
-printf '%s' "$lines" > "$report"
+printf '%s' "$lines" > "$report" || { echo "postinstall: cannot write $report" >&2; exit 1; }
 chmod 644 "$report"
 say "report: $report"
 exit 0

@@ -6,7 +6,11 @@
 # Design: deploy/macos/README.md. Tests: deploy/macos/test/run-tests.sh.
 #
 # Usage: build-pkg.sh --version <x.y.z> --arch <arm64|x86_64> --out <dir>
-#                     [--vendor auto|none] [--cache <dir>] [--sign auto|never] [--prefix /opt/memex] [--plan]
+#                     [--vendor auto|none] [--cache <dir>] [--sign auto|never] [--plan]
+#
+# The install prefix is /opt/memex and is NOT an option: the postinstall, the daemon plist and the daemon
+# program carry it as a literal, so a relocated build would install assets that look for their resolver
+# in the wrong place. Relocation, if ever wanted, renders the prefix into every one of them together.
 #
 #   --plan           decide and print (vendor, signing, notarization, the output file name) and exit 0
 #                    without building — what the test suite uses to pin the labelling of every branch.
@@ -36,7 +40,8 @@
 set -euo pipefail
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
-version="" arch="" out="" vendor="auto" cache="" sign="auto" prefix="/opt/memex" plan=0
+version="" arch="" out="" vendor="auto" cache="" sign="auto" plan=0
+readonly prefix="/opt/memex"
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) version="${2:?--version needs x.y.z}"; shift ;;
@@ -45,7 +50,6 @@ while [ $# -gt 0 ]; do
     --vendor)  vendor="${2:?--vendor needs auto|none}"; shift ;;
     --cache)   cache="${2:?--cache needs a directory}"; shift ;;
     --sign)    sign="${2:?--sign needs auto|never}"; shift ;;
-    --prefix)  prefix="${2:?--prefix needs an absolute path}"; shift ;;
     --plan)    plan=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "build-pkg.sh: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
@@ -57,7 +61,6 @@ case "$arch" in arm64|x86_64) ;; *) echo "build-pkg.sh: --arch must be arm64 or 
 [ -n "$out" ] || { echo "build-pkg.sh: --out is required" >&2; exit 2; }
 case "$vendor" in auto|none) ;; *) echo "build-pkg.sh: --vendor must be auto or none" >&2; exit 2 ;; esac
 case "$sign" in auto|never) ;; *) echo "build-pkg.sh: --sign must be auto or never" >&2; exit 2 ;; esac
-case "$prefix" in /*) ;; *) echo "build-pkg.sh: --prefix must be absolute" >&2; exit 2 ;; esac
 for t in pkgbuild productbuild plutil pkgutil cpio shasum curl tar; do
   command -v "$t" >/dev/null 2>&1 || { echo "build-pkg.sh: '$t' is required (macOS with the command-line tools)" >&2; exit 1; }
 done
@@ -252,9 +255,12 @@ sed -e "s|__VERSION__|$version|g" -e "s|__HOST_ARCH__|$arch|g" "$here/Distributi
 if grep -q '__[A-Z_]*__' "$work/Distribution.xml"; then echo "build-pkg.sh: Distribution.xml has an unsubstituted token" >&2; exit 1; fi
 command -v xmllint >/dev/null 2>&1 && xmllint --noout "$work/Distribution.xml"
 
-name="memex-local-${version}-${arch}${label_vendor}${label_sign}.pkg"
-pkg="$out/$name"
-say "productbuild → $name"
+# The archive is built, signed, notarized, stapled and CHECKED under $work (removed by the EXIT trap), and
+# only then moved to $out — so a failure at any later step leaves nothing behind, least of all a file
+# wearing the suffix-free name that means "notarized".
+pkgname="memex-local-${version}-${arch}${label_vendor}${label_sign}.pkg"
+pkg="$work/$pkgname"
+say "productbuild → $pkgname"
 sign_args=()
 [ "$do_sign" -eq 1 ] && sign_args=(--sign "$MEMEX_SIGN_INSTALLER_IDENTITY" --timestamp)
 productbuild --distribution "$work/Distribution.xml" --resources "$res" --package-path "$work" \
@@ -307,5 +313,7 @@ if [ "$vendor" = "auto" ]; then
   done
 fi
 shasum -a 256 "$pkg" | awk '{print $1}' > "$pkg.sha256"
+mv "$pkg" "$pkg.sha256" "$out/"
+pkg="$out/$pkgname"
 say "built $(du -h "$pkg" | awk '{print $1}')  sha256 $(cat "$pkg.sha256")"
 printf '%s\n' "$pkg"

@@ -19,9 +19,16 @@ Homebrew's folders. <code>memex-local doctor</code> shows, per tool, which copy 
 to the fleet). Not selected by default; it stays unloaded until the managed preference
 <code>com.memex.local Unattended</code> is true or you load it yourself.</li>
 </ul>
+<h2>What this package does NOT install — have these before <code>memex-local up</code></h2>
+<ul>
+<li><b>Ollama</b> (the local model runtime; <code>ollama</code> on PATH) — from ollama.com or Homebrew.
+<code>MEMEX_OLLAMA_MODEL=none</code> only skips the large model download; Ollama itself is still required.</li>
+<li><b>Docker CLI</b> (<code>docker</code>) and the <b>Azure CLI</b> (<code>az</code>, then <code>az login</code>) — the
+registry mode pulls the portal image with them. The alternative, building the image from a source checkout,
+needs the .NET SDK instead.</li>
+</ul>
 <h2>After installing</h2>
-<p><code>memex-local doctor</code>, then <code>memex-local registry &lt;your registry URL&gt;</code> and
-<code>memex-local up</code>. Ollama (the local model runtime) is probed and reported but not installed
-by this package — install it from ollama.com or Homebrew, or set <code>MEMEX_OLLAMA_MODEL=none</code>.</p>
+<p><code>memex-local doctor</code> lists every tool, those above included, with where it was found;
+then <code>memex-local registry &lt;your registry URL&gt;</code> and <code>memex-local up</code>.</p>
 <p>Uninstall: <code>memex-local down</code>, then <code>sudo /opt/memex/libexec/uninstall.sh</code>.</p>
 </body></html>

@@ -670,10 +670,15 @@ case "$install_body" in
   *'-e "s|__PORT__|${HOST_PORT}|g"'*) ok "install_launchd substitutes __PORT__ with the chosen HOST_PORT" ;;
   *) bad "install_launchd substitutes __PORT__ with the chosen HOST_PORT" "not in install_launchd(): ${install_body}" ;;
 esac
-rendered="$(PF_SCRIPT=/x/pf.sh PF_LOG=/x/pf.log HOST_PORT=9443 bash -c '
-  sed -e "s|__SCRIPT__|${PF_SCRIPT}|g" -e "s|__LOG__|${PF_LOG}|g" -e "s|__PORT__|${HOST_PORT}|g" "$1"' _ "$PLIST_TEMPLATE")"
+# shellcheck disable=SC2016  # a literal '${share}' is the text being searched for
+case "$install_body" in
+  *'-e "s|__SHARE__|${share}|g"'*) ok "install_launchd substitutes __SHARE__ so the agent can run the toolchain resolver" ;;
+  *) bad "install_launchd substitutes __SHARE__" "not in install_launchd()" ;;
+esac
+rendered="$(PF_SCRIPT=/x/pf.sh PF_LOG=/x/pf.log HOST_PORT=9443 SHARE=/x/share bash -c '
+  sed -e "s|__SCRIPT__|${PF_SCRIPT}|g" -e "s|__LOG__|${PF_LOG}|g" -e "s|__PORT__|${HOST_PORT}|g" -e "s|__SHARE__|${SHARE}|g" "$1"' _ "$PLIST_TEMPLATE")"
 case "$rendered" in
-  *__SCRIPT__*|*__LOG__*|*__PORT__*) bad "the rendered launchd plist has no token left" "$(grep -n -E '__(SCRIPT|LOG|PORT)__' <<<"$rendered")" ;;
+  *__SCRIPT__*|*__LOG__*|*__PORT__*|*__SHARE__*) bad "the rendered launchd plist has no token left" "$(grep -n -E '__(SCRIPT|LOG|PORT|SHARE)__' <<<"$rendered")" ;;
   *'<key>MEMEX_PORT</key>'*'<string>9443</string>'*) ok "MEMEX_PORT=9443 reaches the rendered launchd agent" ;;
   *) bad "MEMEX_PORT=9443 reaches the rendered launchd agent" "$rendered" ;;
 esac
@@ -718,17 +723,35 @@ texisting_all
 for t in colima lima kubectl helm mkcert ollama socket_vmnet; do resolve "$t"; case "$RC:$OUT" in 0:"$t	existing	$TEX/"*"	ok	") ;; *) bad "all present and satisfying → $t resolves to the EXISTING copy" "rc=$RC: $OUT"; continue ;; esac; done
 ok "all present and satisfying → every tool resolves to the existing copy (nothing vendored chosen)"
 resolve kubectl; case "$OUT" in *"	1.37.0	1.31.0	ok	") ok "the existing kubectl reports 1.37.0 against the floor 1.31.0" ;; *) bad "kubectl version + floor" "$OUT" ;; esac
-act="$(env PATH="$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" bash -c '. "$1/tools.sh"; tools_activate; printf "%s" "$PATH"' _ "$HERE/../share")"
-[ "$act" = "$TEX:/usr/bin:/bin" ] && ok "tools_activate prepends NOTHING when every tool is existing" || bad "tools_activate prepends nothing" "$act"
+# tools_activate → "<selection dir> | <PATH>" ; the selection dir holds one link per resolved tool.
+activate() { ACT="$(env PATH="$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" bash -c '. "$1/tools.sh"; tools_activate; printf "%s|%s" "$MEMEX_TOOLS_SELECTED" "$PATH"' _ "$HERE/../share")"; SEL="${ACT%%|*}"; APATH="${ACT#*|}"; }
+activate
+[ "$APATH" = "$SEL:$TEX:/usr/bin:/bin" ] && ok "tools_activate prepends ONE selection directory to PATH" || bad "tools_activate prepends the selection dir" "$APATH"
+[ "$(readlink "$SEL/colima")" = "$TEX/colima" ] && [ "$(readlink "$SEL/kubectl")" = "$TEX/kubectl" ] && ok "every selection link points at the EXISTING copy when every tool is existing" || bad "selection links → existing" "$(ls -l "$SEL")"
+[ "$(ls "$SEL" | wc -l | tr -d ' ')" = "7" ] && ok "the selection holds exactly the 7 manifest tools" || bad "selection count" "$(ls "$SEL")"
+rm -rf "$SEL"
 rm -f "$TEX/helm"
 resolve helm; case "$RC:$OUT" in 0:"helm	vendored	$TPRE/libexec/vendor/helm/bin/helm	4.3.1	3.16.0	ok	nothing existing") ok "one missing (helm) → the VENDORED copy, 'nothing existing'" ;; *) bad "one missing → vendored" "rc=$RC: $OUT" ;; esac
 resolve colima; case "$OUT" in colima*existing*) ok "…and colima (present) still resolves to the existing copy" ;; *) bad "colima unaffected" "$OUT" ;; esac
-act="$(env PATH="$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" bash -c '. "$1/tools.sh"; tools_activate; printf "%s" "$PATH"' _ "$HERE/../share")"
-[ "$act" = "$TPRE/libexec/vendor/helm/bin:$TEX:/usr/bin:/bin" ] && ok "tools_activate prepends ONLY the vendored helm's bin" || bad "tools_activate prepends only helm" "$act"
+activate
+[ "$(readlink "$SEL/helm")" = "$TPRE/libexec/vendor/helm/bin/helm" ] && [ "$(readlink "$SEL/colima")" = "$TEX/colima" ] && ok "the selection links helm → VENDORED and colima → existing" || bad "selection mixes vendored + existing" "$(ls -l "$SEL")"
+rm -rf "$SEL"
+# A stale fallback link in <prefix>/bin AHEAD on PATH must not win: the selection dir precedes everything.
+mkdir -p "$TPRE/bin"; ln -sfn "$TPRE/libexec/vendor/colima/bin/colima" "$TPRE/bin/colima"
+ACT="$(env PATH="$TPRE/bin:$TEX:/usr/bin:/bin" MEMEX_PREFIX="$TPRE" bash -c '. "$1/tools.sh"; tools_activate; command -v colima; rm -rf "$MEMEX_TOOLS_SELECTED"' _ "$HERE/../share")"
+case "$ACT" in */memex-tools.*/colima) ok "with a stale fallback FIRST on PATH, 'colima' still resolves through the selection (→ the existing copy)" ;; *) bad "selection beats a stale fallback" "$ACT" ;; esac
+rm -rf "${TPRE:?}/bin"
 tstub "$TEX" kubectl "Client Version: v1.20.0"
 resolve kubectl; case "$RC:$OUT" in 0:"kubectl	vendored	"*"	1.37.1	1.31.0	ok	existing $TEX/kubectl is 1.20.0, below the floor 1.31.0") ok "one below the floor (kubectl 1.20.0) → the vendored copy, and the note says why" ;; *) bad "below floor → vendored with reason" "rc=$RC: $OUT" ;; esac
+activate
+[ "$(readlink "$SEL/kubectl")" = "$TPRE/libexec/vendor/kubectl/bin/kubectl" ] && ok "a below-floor existing kubectl EARLIER on PATH is overridden: the selection links the vendored one" || bad "selection overrides below-floor existing" "$(ls -l "$SEL")"
+rm -rf "$SEL"
 tstub "$TEX" kubectl "no version here"
 resolve kubectl; case "$OUT" in *"reports no version"*) ok "an existing copy that reports no version is passed over, and the note says so" ;; *) bad "no-version existing passed over" "$OUT" ;; esac
+# A VENDORED copy that prints no version is damaged: never substituted by the pin, never activated.
+tvend kubectl kubectl ""
+resolve kubectl; case "$RC:$OUT" in 1:"kubectl	existing	$TEX/kubectl	?	1.31.0	no-version	"*"vendored $TPRE/libexec/vendor/kubectl/bin/kubectl reports no version (damaged or incompatible — not activated)") ok "a vendored copy reporting NO version is refused (not read as its pin), exit 1, the note says why" ;; *) bad "vendored no-version refused" "rc=$RC: $OUT" ;; esac
+tvend kubectl kubectl "Client Version: v1.37.1"
 texisting_all; rm -f "$TEX/ollama"
 resolve ollama; case "$RC:$OUT" in 1:"ollama	missing	-	-	0.5.0	missing	not on PATH and not vendored — brew install ollama") ok "missing with nothing vendored → kind missing, exit 1, the brew formula named" ;; *) bad "missing, not vendored" "rc=$RC: $OUT" ;; esac
 tstub "$TEX" helm "v3.2.0"; rm -rf "$TPRE/libexec/vendor/helm"
@@ -783,6 +806,25 @@ case "$RC:$OUT" in 0:*"reports to https://other.example.test as 'flag-wins'"*) o
 OUT="$(env PATH="$STUBS:$PATH" HOME="$MP/home" MEMEX_LOCAL_HOME="$MP/home/.memex-local" "$CLI" backlease enroll 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "no flag and no preference → refused" "exited 0" ;; *"--control must be the control instance's https URL"*"managed preference com.memex.local ControlUrl"*) ok "no flag and no preference → refused, naming the flag AND the preference key" ;; *) bad "refusal names flag + preference" "$OUT" ;; esac
 rm -rf "$MP"
+
+echo "── headless host: install_launchd holds the forward as a process, no LaunchAgent ──"
+HL="$(mktemp -d)"; mkdir -p "$HL/stubs" "$HL/home"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "$FAKE_LAUNCHCTL_LOG"\nexit 0\n' > "$HL/stubs/launchctl"; chmod +x "$HL/stubs/launchctl"
+: > "$HL/launchctl.log"
+# The forward script runs for real against the stubs (colima ok, kubectl ok, the forward exec exits) and the curl stub answers 200.
+OUT="$(env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/home/.memex-local" MEMEX_HEADLESS=1 FAKE_LAUNCHCTL_LOG="$HL/launchctl.log" MEMEX_PF_BIND_BUDGET=2 MEMEX_LOCAL_LIB=1 \
+  bash -c '. "$1"; install_launchd' _ "$CLI" 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*"Headless host: holding the port-forward"*"port-forward started (pid "*) ok "MEMEX_HEADLESS=1: install_launchd starts the forward as a background process and says so" ;; *) bad "headless install_launchd" "rc=$RC: $OUT" ;; esac
+[ -s "$HL/home/.memex-local/port-forward.pid" ] && ok "the forward's pid is recorded in port-forward.pid for the daemon to watch" || bad "pid file written" "$(ls "$HL/home/.memex-local")"
+[ ! -s "$HL/launchctl.log" ] && ok "headless: launchctl is never called (no GUI session to bootstrap into)" || bad "headless: no launchctl" "$(cat "$HL/launchctl.log")"
+[ ! -e "$HL/home/Library/LaunchAgents/com.memex.local.plist" ] && ok "headless: no LaunchAgent plist is written" || bad "headless: no plist" ""
+OUT="$(env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/home/.memex-local" MEMEX_HEADLESS=1 MEMEX_LOCAL_LIB=1 bash -c '. "$1"; uninstall_launchd' _ "$CLI" 2>&1)"
+[ ! -e "$HL/home/.memex-local/port-forward.pid" ] && ok "uninstall_launchd (down) removes the headless forward's pid record" || bad "down removes pid" "$OUT"
+# The daemon program drives exactly this: MEMEX_HEADLESS=1, retries `up`, then watches the pid.
+DAEMON="$HERE/../../macos/libexec/memex-daemon.sh"
+case "$(cat "$DAEMON")" in *'export MEMEX_HEADLESS=1'*'until memex-local up; do'*'port-forward.pid'*) ok "memex-daemon.sh sets MEMEX_HEADLESS=1, retries 'up' until it succeeds, then watches port-forward.pid" ;; *) bad "memex-daemon.sh lifecycle" "" ;; esac
+case "$(cat "$DAEMON")" in *'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/memex/bin"'*) ok "memex-daemon.sh lists /opt/memex/bin LAST (existing installations first)" ;; *) bad "daemon PATH order" "$(grep -n 'export PATH' "$DAEMON")" ;; esac
+rm -rf "$HL"
 
 echo "── the CLI still knows every command it documents ────────────────"
 

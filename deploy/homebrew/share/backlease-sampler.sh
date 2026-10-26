@@ -21,6 +21,13 @@
 #          pod requests + `mw/run` labels of the pods in the memex namespace
 #
 set -u
+# Run the kubectl/ollama the CLI's resolver chose (share/tools.sh; MEMEX_LOCAL_SHARE from the plist's __SHARE__).
+if [ -f "${MEMEX_LOCAL_SHARE:-}/tools.sh" ]; then
+  # shellcheck source=tools.sh
+  . "${MEMEX_LOCAL_SHARE}/tools.sh"
+  tools_activate
+  trap tools_deactivate EXIT
+fi
 INTERVAL="${MEMEX_BACKLEASE_INTERVAL:-30}"
 DIR="${MEMEX_BACKLEASE_DIR:-$HOME/.memex-local/backlease}"
 NAMESPACE="${MEMEX_NAMESPACE:-memex}"

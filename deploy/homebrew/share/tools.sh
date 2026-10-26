@@ -136,11 +136,16 @@ tool_resolve() {
     fi
   fi
   if vendored="$(tool_vendored "$name" "$bin")"; then
-    vver="$(tool_version_of "$vendored" "$probe" || printf '%s' "$(tool_field "$name" 6)")"
-    if version_ge "$vver" "$floor"; then
-      printf '%s\tvendored\t%s\t%s\t%s\tok\t%s\n' "$name" "$vendored" "$vver" "$floor" "${note:-nothing existing}"; return 0
+    # A vendored copy must PROVE its version like any other: a binary that prints none is damaged or
+    # incompatible, and substituting the manifest's pin would activate it as a working fallback.
+    if vver="$(tool_version_of "$vendored" "$probe")"; then
+      if version_ge "$vver" "$floor"; then
+        printf '%s\tvendored\t%s\t%s\t%s\tok\t%s\n' "$name" "$vendored" "$vver" "$floor" "${note:-nothing existing}"; return 0
+      fi
+      note="${note:+$note; }vendored $vendored is $vver, below the floor $floor"
+    else
+      note="${note:+$note; }vendored $vendored reports no version (damaged or incompatible — not activated)"
     fi
-    note="${note:+$note; }vendored $vendored is $vver, below the floor $floor"
   fi
   if [ -n "$existing" ]; then
     kind="existing"; path="$existing"; version="${ever:-?}"
@@ -167,17 +172,32 @@ tools_report() {
   done
 }
 
-# tools_activate — prepend the bin directory of every tool resolved to its VENDORED copy, so the
-# commands this process runs (and the ones they run: colima → limactl) find the fallback. A tool
-# resolved to an existing copy gets nothing prepended, so the user's installation stays the one in use.
+# tools_activate — make the resolution EFFECTIVE for this process and everything it runs: a selection
+# directory holding one symlink per resolved tool (to the existing copy or to the vendored one) is
+# prepended to PATH, so `colima`, `limactl`, `kubectl`, `helm`, `mkcert` all run exactly the copy the
+# resolver chose — whatever else PATH holds (a below-floor Homebrew copy ahead of the fallback, a stale
+# fallback link in <prefix>/bin after a Homebrew copy appeared). A tool that does not resolve gets no
+# link, so `need` and `command -v` see it as missing. The directory is per process (MEMEX_TOOLS_SELECTED;
+# the caller removes it on exit) and nothing on disk outside it is touched.
 tools_activate() {
-  local name line kind path prepend=""
+  local name line kind path sel
+  sel="${MEMEX_TOOLS_SELECTED:-}"
+  if [ -z "$sel" ] || [ ! -d "$sel" ]; then
+    sel="$(mktemp -d "${TMPDIR:-/tmp}/memex-tools.XXXXXX")" || return 1
+    export MEMEX_TOOLS_SELECTED="$sel"
+  fi
   for name in $(tools_list); do
-    line="$(tool_resolve "$name")" || continue
+    line="$(tool_resolve "$name")" || { rm -f "$sel/$(tool_field "$name" 2 | cut -d: -f1)"; continue; }
     IFS=$'\t' read -r name kind path _ <<<"$line"
-    [ "$kind" = "vendored" ] || continue
-    case ":$prepend:" in *":$(dirname "$path"):"*) ;; *) prepend="${prepend:+$prepend:}$(dirname "$path")" ;; esac
+    [ "$kind" = "existing" ] || [ "$kind" = "vendored" ] || continue
+    ln -sfn "$path" "$sel/$(basename "$path")"
   done
-  [ -n "$prepend" ] && export PATH="$prepend:$PATH"
+  case ":$PATH:" in *":$sel:"*) ;; *) export PATH="$sel:$PATH" ;; esac
+  return 0
+}
+
+# tools_deactivate — remove the selection directory (the CLI's exit trap).
+tools_deactivate() {
+  [ -n "${MEMEX_TOOLS_SELECTED:-}" ] && [ -d "${MEMEX_TOOLS_SELECTED}" ] && rm -rf "${MEMEX_TOOLS_SELECTED}"
   return 0
 }

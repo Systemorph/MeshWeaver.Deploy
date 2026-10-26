@@ -28,13 +28,21 @@ echo "daemon postinstall: service user $user${prev:+ (was $prev)}"
 
 mkdir -p "$logdir" && chown "$user" "$logdir" 2>/dev/null || true
 
+# The plist carries RunAtLoad + KeepAlive, so a file in /Library/LaunchDaemons would start at the next
+# boot by itself. The preference therefore drives launchd's PERSISTED enable/disable state, both ways:
+# not true → bootout whatever an earlier Unattended=true install loaded AND `launchctl disable` (survives
+# reboots; the plist stays installed, inert, until someone enables it); true → enable + bootstrap.
+label="system/com.memex.local.daemon"
 unattended="$(pref Unattended)"
 case "$unattended" in 1|true|TRUE|yes|YES)
   launchctl bootout system "$plist" >/dev/null 2>&1 || true
-  if launchctl bootstrap system "$plist"; then echo "daemon postinstall: com.memex.local.daemon bootstrapped (Unattended=true); log: $logdir/daemon.log"
-  else echo "daemon postinstall: launchctl bootstrap failed — load it by hand: sudo launchctl bootstrap system $plist" >&2; fi ;;
+  launchctl enable "$label" >/dev/null 2>&1 || true
+  if launchctl bootstrap system "$plist"; then echo "daemon postinstall: com.memex.local.daemon enabled + bootstrapped (Unattended=true); log: $logdir/daemon.log"
+  else echo "daemon postinstall: launchctl bootstrap failed — load it by hand: sudo launchctl enable $label && sudo launchctl bootstrap system $plist" >&2; fi ;;
 *)
-  echo "daemon postinstall: installed, NOT loaded (managed preference Unattended is not true). Load it with:"
-  echo "  sudo launchctl bootstrap system $plist" ;;
+  launchctl bootout system "$plist" >/dev/null 2>&1 || true
+  launchctl disable "$label" >/dev/null 2>&1 || true
+  echo "daemon postinstall: installed, DISABLED and not loaded (managed preference Unattended is not true — it will not start at boot). Enable it with:"
+  echo "  sudo launchctl enable $label && sudo launchctl bootstrap system $plist" ;;
 esac
 exit 0

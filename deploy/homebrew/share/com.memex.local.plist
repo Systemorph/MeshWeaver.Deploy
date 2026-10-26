@@ -33,6 +33,10 @@
              waited for and verified the port it was asked for. -->
         <key>MEMEX_PORT</key>
         <string>__PORT__</string>
+        <!-- The share/ directory holding tools.sh + tools.manifest: the agent runs the same toolchain
+             resolution the CLI made (existing copy meeting its floor first, vendored fallback second). -->
+        <key>MEMEX_LOCAL_SHARE</key>
+        <string>__SHARE__</string>
     </dict>
 
     <key>RunAtLoad</key>

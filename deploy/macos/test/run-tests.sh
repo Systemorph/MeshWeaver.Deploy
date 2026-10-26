@@ -54,6 +54,9 @@ out="$("$BUILD" --version 1.2.x --arch arm64 --out "$T/o" --plan 2>&1)"; rc=$?
 case "$rc:$out" in 0:*) bad "a non-numeric version is refused" "exited 0" ;; *"dotted numerics"*) ok "a non-numeric version is refused" ;; *) bad "a non-numeric version is refused" "$out" ;; esac
 out="$("$BUILD" --version 1.2.3 --arch armv7 --out "$T/o" --plan 2>&1)"; rc=$?
 case "$rc:$out" in 0:*) bad "an unknown arch is refused" "exited 0" ;; *"arm64 or x86_64"*) ok "an unknown arch is refused" ;; *) bad "an unknown arch is refused" "$out" ;; esac
+out="$("$BUILD" --version 1.2.3 --arch arm64 --out "$T/o" --prefix /opt/acme --plan 2>&1)"; rc=$?
+case "$rc:$out" in 0:*) bad "--prefix is refused (the prefix is a literal in the postinstall and the daemon assets)" "exited 0" ;; *"unknown argument '--prefix'"*) ok "--prefix is refused: /opt/memex is a literal in the postinstall and the daemon assets, not an option" ;; *) bad "--prefix refused" "$out" ;; esac
+case "$(cat "$BUILD")" in *'pkg="$work/$pkgname"'*'mv "$pkg" "$pkg.sha256" "$out/"'*) ok "the archive is built, checked and only then MOVED to --out (a later failure leaves nothing behind)" ;; *) bad "stage-then-publish" "" ;; esac
 
 echo "── the signing decision is explicit in every branch (--plan) ────"
 plan() { out="$(env "$@" "$BUILD" --version 1.2.3 --arch arm64 --out "$T/o" --plan 2>&1)"; rc=$?; }
@@ -218,6 +221,9 @@ case "$RC:$OUT" in 0:*"changed: 0"*) ok "all tools present and satisfying → ex
 [ -z "$(links)" ] && ok "all present and satisfying → NOTHING vendored is activated (bin/ holds no fallback)" || bad "nothing activated when all satisfy" "links: $(links)"
 [ -f "$P/etc/tools.report" ] && grep -q 'colima        existing  0.10.3' "$P/etc/tools.report" && ok "etc/tools.report records the probe (colima existing 0.10.3)" || bad "tools.report written" "$(cat "$P/etc/tools.report" 2>/dev/null)"
 grep -q 'using the existing installation' "$P/etc/tools.report" && ok "the report says the existing installation is used" || bad "report wording" ""
+case "$(sed -n '/^probe_all()/,/^}/p' "$POST")" in *'sudo -u "$probe_user" -H env PATH="$PROBE_PATH"'*) ok "as root, the probe (which EXECUTES the found tools) runs through sudo as the console user / nobody, never as root" ;; *) bad "unprivileged probe" "" ;; esac
+grep -q '^export PATH="/usr/bin:/bin:/usr/sbin:/sbin"$' "$POST" && ok "root's own PATH in the postinstall is the trusted system PATH" || bad "trusted root PATH" "$(grep -n 'export PATH' "$POST")"
+grep -q '^set -euo pipefail' "$POST" && ok "the postinstall fails on an unhandled error (set -e)" || bad "set -e" ""
 
 rm -f "$EX/helm"; runpost
 case "$RC:$OUT" in 0:*"ACTIVATED the vendored fallback → $P/bin/helm"*"changed: 1"*) ok "one tool missing (helm) → only it is activated, changed: 1" ;; *) bad "one missing → only that one activated" "rc=$RC: $OUT" ;; esac
@@ -238,6 +244,16 @@ case "$RC:$OUT" in 0:*"removed the stale fallback $P/bin/kubectl"*"removed the s
   *) bad "stale fallbacks removed" "rc=$RC: $OUT" ;; esac
 [ -z "$(links)" ] && ok "bin/ is empty again" || bad "bin/ empty again" "links: $(links)"
 
+# A filesystem error is an install FAILURE, never a report of a repair that was not written.
+rm -f "$EX/helm"; chmod 555 "$P/bin"; runpost; chmod 755 "$P/bin"
+case "$RC:$OUT" in 0:*) bad "an unwritable bin/ fails the postinstall" "exited 0: $OUT" ;; *"cannot activate $P/bin/helm"*"NOT repaired"*) ok "an unwritable bin/ fails the postinstall (non-zero) and says the toolchain was NOT repaired" ;; *) bad "unwritable bin/ fails" "rc=$RC: $OUT" ;; esac
+existing_all; runpost
+# A vendored copy that prints no version is never activated.
+rm -f "$EX/mkcert"; stub "$P/libexec/vendor/mkcert/bin" mkcert ""; runpost
+case "$RC:$OUT" in 0:*"mkcert        existing"*|0:*"mkcert        missing"*) ;; *) bad "vendored no-version mkcert handled" "rc=$RC: $OUT" ;; esac
+[ ! -e "$P/bin/mkcert" ] && ok "a vendored copy that reports no version is NOT activated (bin/mkcert absent)" || bad "no-version vendored not activated" "$(ls -l "$P/bin")"
+grep -q 'reports no version (damaged or incompatible — not activated)' "$P/etc/tools.report" && ok "the report says the vendored copy reports no version" || bad "report no-version wording" "$(grep mkcert "$P/etc/tools.report")"
+stub "$P/libexec/vendor/mkcert/bin" mkcert "v1.4.4"; existing_all; runpost
 rm -f "$EX/ollama"; runpost
 case "$RC:$OUT" in 0:*"ollama        missing"*"NOT RESOLVED — nothing vendored for it; install it (ollama)"*) ok "a missing tool with no vendored copy (ollama) is reported, named with its formula, and the install still exits 0" ;;
   *) bad "missing, not vendored → reported, exit 0" "rc=$RC: $OUT" ;; esac
@@ -259,13 +275,18 @@ DPOST="$MACOS/daemon/postinstall"
 rund() { OUT="$(env "$@" FAKE_LAUNCHCTL_LOG="$D/launchctl.log" MEMEX_PKG_DAEMON_PLIST="$D/plist" MEMEX_PKG_DAEMON_LOGDIR="$D/log" PATH="$D/stubs:/usr/libexec:/usr/bin:/bin:/usr/sbin" "$DPOST" 2>&1)"; RC=$?; }
 : > "$D/launchctl.log"
 rund FAKE_SERVICE_USER=memexsvc FAKE_UNATTENDED=
-case "$RC:$OUT" in 0:*"service user memexsvc"*"NOT loaded"*) ok "ServiceUser preference → written into the plist; Unattended unset → installed, NOT loaded" ;; *) bad "daemon: user from preference, not loaded" "rc=$RC: $OUT" ;; esac
+case "$RC:$OUT" in 0:*"service user memexsvc"*"DISABLED and not loaded"*) ok "ServiceUser preference → written into the plist; Unattended unset → installed, DISABLED, not loaded" ;; *) bad "daemon: user from preference, disabled" "rc=$RC: $OUT" ;; esac
 [ "$(plutil -extract UserName raw "$D/plist" 2>/dev/null)" = "memexsvc" ] && ok "the plist's UserName is memexsvc" || bad "plist UserName" "$(plutil -extract UserName raw "$D/plist" 2>&1)"
 plutil -lint "$D/plist" >/dev/null 2>&1 && ok "the rendered daemon plist is valid" || bad "rendered daemon plist valid" ""
-[ ! -s "$D/launchctl.log" ] && ok "launchctl was not called while Unattended is unset" || bad "no launchctl without Unattended" "$(cat "$D/launchctl.log")"
+grep -q "bootout system $D/plist" "$D/launchctl.log" && grep -q "disable system/com.memex.local.daemon" "$D/launchctl.log" && ! grep -q "bootstrap" "$D/launchctl.log" \
+  && ok "Unattended unset → bootout (stops a daemon an earlier install loaded) + launchctl disable (persisted: no start at boot), no bootstrap" || bad "disable semantics" "$(cat "$D/launchctl.log")"
+: > "$D/launchctl.log"
 rund FAKE_SERVICE_USER=memexsvc FAKE_UNATTENDED=true
-case "$RC:$OUT" in 0:*"bootstrapped (Unattended=true)"*) ok "Unattended=true → the daemon is bootstrapped" ;; *) bad "Unattended=true → bootstrapped" "rc=$RC: $OUT" ;; esac
-grep -q "bootstrap system $D/plist" "$D/launchctl.log" && ok "launchctl bootstrap system <plist> was issued" || bad "launchctl bootstrap issued" "$(cat "$D/launchctl.log")"
+case "$RC:$OUT" in 0:*"enabled + bootstrapped (Unattended=true)"*) ok "Unattended=true → the daemon is enabled and bootstrapped" ;; *) bad "Unattended=true → enabled + bootstrapped" "rc=$RC: $OUT" ;; esac
+grep -q "enable system/com.memex.local.daemon" "$D/launchctl.log" && grep -q "bootstrap system $D/plist" "$D/launchctl.log" && ok "launchctl enable + bootstrap system <plist> were issued" || bad "launchctl enable + bootstrap issued" "$(cat "$D/launchctl.log")"
+: > "$D/launchctl.log"
+rund FAKE_SERVICE_USER=memexsvc FAKE_UNATTENDED=false
+grep -q "bootout system $D/plist" "$D/launchctl.log" && grep -q "disable system/com.memex.local.daemon" "$D/launchctl.log" && ok "Unattended=false after true → the loaded daemon is booted out and disabled" || bad "true → false unloads" "$(cat "$D/launchctl.log")"
 rund FAKE_SERVICE_USER=memexsvc FAKE_UNATTENDED=true
 [ "$(plutil -extract UserName raw "$D/plist")" = "memexsvc" ] && case "$OUT" in *"(was memexsvc)"*) ok "a re-run finds the previous user, re-renders the same plist and re-bootstraps" ;; *) bad "re-run idempotent" "$OUT" ;; esac
 cp "$MACOS/launchd/com.memex.local.daemon.plist" "$D/plist"
