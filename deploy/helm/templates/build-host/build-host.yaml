@@ -142,6 +142,13 @@ spec:
     spec:
       serviceAccountName: {{ $b.sharedName | quote }}
       automountServiceAccountToken: false
+      {{- if $b.sandbox.userNamespace }}
+      # The pod's OWN user namespace: with it the build container's /proc can be Unmasked (below), which
+      # bwrap needs to mount a fresh /proc for each stage's PID namespace. On a pod in the node's user
+      # namespace the kernel refuses that mount (the runtime's masked /proc paths) — measured on the
+      # 22.04 build pool: "bwrap: Can't mount proc on /newroot/proc: Operation not permitted".
+      hostUsers: false
+      {{- end }}
       # The runner image's unprivileged user; the shared cache and the emptyDirs are group-writable.
       securityContext:
         runAsNonRoot: true
@@ -256,6 +263,9 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
+            {{- if $b.sandbox.userNamespace }}
+            procMount: Unmasked
+            {{- end }}
             {{- with $b.sandbox.seccompProfile }}
             seccompProfile:
               type: {{ . | quote }}

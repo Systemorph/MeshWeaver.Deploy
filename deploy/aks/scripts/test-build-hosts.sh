@@ -491,6 +491,41 @@ else
   report "the mac first-attach values did not render:"; sed 's/^/    /' "$WORK/mac.err"
 fi
 
+# 3d. the opt-in user-namespace sandbox: hostUsers false on the pod, procMount Unmasked on the build container, and on a
+#     node pool the selector narrowed to kernel-userns nodes. Off (the default), none of it renders.
+if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.sandbox.userNamespace=true \
+     --namespace check > "$WORK/userns.yaml" 2> "$WORK/userns.err" \
+   && helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --namespace check > "$WORK/no-userns.yaml" 2>> "$WORK/userns.err"; then
+  python3 - "$WORK/userns.yaml" "$WORK/no-userns.yaml" <<'PY3' && ok "sandbox.userNamespace renders hostUsers false + procMount Unmasked on kernel-userns nodes, and nothing of it when off" || report "the user-namespace sandbox render is wrong (above)"
+import sys, yaml
+def hosts(path):
+    return [d for d in yaml.safe_load_all(open(path)) if d and d.get("kind") == "Deployment"
+            and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "build-host"]
+problems = []
+on, off = hosts(sys.argv[1]), hosts(sys.argv[2])
+if not on or not off: problems.append(f"no build-host Deployment rendered (on={len(on)} off={len(off)})")
+for d in on:
+    spec = d["spec"]["template"]["spec"]
+    build = next(c for c in spec["containers"] if c["name"] == "build")
+    if spec.get("hostUsers") is not False: problems.append(f"{d['metadata']['name']}: hostUsers={spec.get('hostUsers')!r}")
+    if build.get("securityContext", {}).get("procMount") != "Unmasked": problems.append(f"{d['metadata']['name']}: procMount not Unmasked")
+    if (spec.get("nodeSelector") or {}).get("kernel-userns") != "true" or (spec.get("nodeSelector") or {}).get("workload") != "ci-build":
+        problems.append(f"{d['metadata']['name']}: nodeSelector {spec.get('nodeSelector')}")
+    if {"key": "kernel-userns", "operator": "Equal", "value": "true", "effect": "NoSchedule"} not in (spec.get("tolerations") or []):
+        problems.append(f"{d['metadata']['name']}: no toleration for the kernel-userns pool's taint")
+for d in off:
+    spec = d["spec"]["template"]["spec"]
+    build = next(c for c in spec["containers"] if c["name"] == "build")
+    if "hostUsers" in spec or "procMount" in build.get("securityContext", {}) or "kernel-userns" in (spec.get("nodeSelector") or {}) \
+            or any(t.get("key") == "kernel-userns" for t in spec.get("tolerations") or []):
+        problems.append(f"{d['metadata']['name']}: the user-namespace sandbox rendered while off")
+for p in problems: print("   ", p)
+sys.exit(1 if problems else 0)
+PY3
+else
+  report "the user-namespace values did not render:"; sed 's/^/    /' "$WORK/userns.err"
+fi
+
 # 4. refusals
 for entry in \
   "values.build-hosts-tag-not-digest.yaml|must be a sha256:<64 hex> digest" \
@@ -513,6 +548,10 @@ for entry in \
   "values.build-hosts-bad-extra-channel.yaml|not latest, stable or probe*" \
   "values.build-hosts-cache-bad-access.yaml|must be ReadWriteMany or ReadWriteOnce" \
   "values.build-hosts-extra-channel-dash.yaml|ending in a letter or digit" \
+  "values.build-hosts-userns-not-bool.yaml|sandbox.userNamespace" \
+  "values.build-hosts-userns-empty-0.yaml|sandbox.userNamespace" \
+  "values.build-hosts-userns-empty-string.yaml|sandbox.userNamespace" \
+  "values.build-hosts-userns-empty-list.yaml|sandbox.userNamespace" \
   "values.build-host-release-no-hosts.yaml|portal.enabled is false but buildHosts.enabled is not true" \
   "values.build-host-release-postgres.yaml|portal.enabled is false but postgres.enabled is true" \
   "values.build-host-release-ingress.yaml|portal.enabled is false but ingress.enabled is true"; do
