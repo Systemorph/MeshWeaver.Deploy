@@ -101,6 +101,8 @@ go to stdout (the workflow appends them to GITHUB_OUTPUT); everything a person r
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -692,6 +694,33 @@ open(out, "w").write("{}"); sys.stdout.write("404")
 '''
 
 
+class _VirtualClock:
+    """The self-test's clock for a window that must PASS: time moves only when the code under test
+    sleeps, so a window is a count of polls. `probes_submit` starts its window BEFORE the
+    submissions (they are part of the deploy's budget), and against the wall clock three fake-curl
+    subprocesses outlasted a 0.1 s window on a busy runner — the negative control then read "the
+    window ended after 1 of 3 submissions", a different refusal from the one it pins."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _on_virtual_clock(fn):
+    """Runs `fn` with this module's `time` swapped for a _VirtualClock, restored whatever happens."""
+    global time
+    real, time = time, _VirtualClock()
+    try:
+        return fn()
+    finally:
+        time = real
+
+
 def self_test() -> int:
     fails: list[str] = []
     d = lambda c: "sha256:" + c * 64  # noqa: E731
@@ -1040,7 +1069,8 @@ def self_test() -> int:
 
             scenario([{"method": "POST", "match": "/probes", "answers": submits}, *pages([q], [q], [q])])
             check("NEGATIVE CONTROL: probes NO host ever claims are red — the deploy FAILED",
-                  lambda: probes_submit(api, "mw_secret", p3, window=0.1, poll=0.02), refused=True, says="no host claimed any")
+                  lambda: _on_virtual_clock(lambda: probes_submit(api, "mw_secret", p3, window=0.1, poll=0.02)),
+                  refused=True, says="no host claimed any")
             scenario([{"method": "POST", "match": "/probes", "answers": [submits[0], submits[1], [503, {"error": "busy"}]]}])
             check("NEGATIVE: a planned run whose probe was not accepted (a missing shard) is red",
                   lambda: probes_submit(api, "t", p3, window=5, poll=0.01), refused=True, says="HTTP 503")
@@ -1115,11 +1145,25 @@ def self_test() -> int:
             def cli(*args):  # the environment is read per call: each scenario names its own plan
                 return subprocess.run([sys.executable, os.path.abspath(__file__), *args], capture_output=True, text=True,
                                       env={**os.environ, PROBE_TOKEN_ENV: "mw_secret"})
-            scenario([{"method": "POST", "match": "/probes", "answers": submits}, *pages([q], [q], [q])])
-            p = cli("probes-submit", "--api", api, "--plan", os.path.join(files, "plan.json"), "--out",
-                    os.path.join(files, "runs.json"), "--window", "0.1", "--poll", "0.02")
+            def cli_in_process(*args):  # the same entry point, on the virtual clock: a window that must PASS
+                out, err, token = io.StringIO(), io.StringIO(), os.environ.get(PROBE_TOKEN_ENV)
+                os.environ[PROBE_TOKEN_ENV] = "mw_secret"
+                try:
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        rc = _on_virtual_clock(lambda: main(list(args)))
+                finally:
+                    if token is None:
+                        os.environ.pop(PROBE_TOKEN_ENV, None)
+                    else:
+                        os.environ[PROBE_TOKEN_ENV] = token
+                return subprocess.CompletedProcess(list(args), rc, out.getvalue(), err.getvalue())
+            log = scenario([{"method": "POST", "match": "/probes", "answers": submits}, *pages([q], [q], [q])])
+            p = cli_in_process("probes-submit", "--api", api, "--plan", os.path.join(files, "plan.json"), "--out",
+                               os.path.join(files, "runs.json"), "--window", "0.1", "--poll", "0.02")
             check("CLI: never claimed → exit 1, an ::error:: on stderr, nothing on stdout",
                   lambda: p, lambda p: p.returncode == 1 and p.stdout == "" and "::error::no host claimed" in p.stderr)
+            check("… after all three planned runs were submitted (the window did not end mid-submission)",
+                  lambda: [c for c in calls(log) if c["method"] == "POST"], lambda c: len(c) == 3)
             scenario([{"method": "POST", "match": "/probes", "answers": submits}, *pages([run_])])
             p = cli("probes-submit", "--api", api, "--plan", os.path.join(files, "plan.json"), "--out",
                     os.path.join(files, "runs.json"), "--window", "5", "--poll", "0.01")
