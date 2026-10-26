@@ -1,0 +1,360 @@
+name: macOS installer (memex-local .pkg)
+
+# The professional distribution of the local memex stack: a Developer ID SIGNED and NOTARIZED .pkg
+# that installs memex-local, the chart, the launchd templates, the optional unattended-host
+# LaunchDaemon and a PINNED toolchain (Colima, Lima, kubectl, helm, mkcert) used only where the Mac
+# has none that meets the floor. Design: deploy/macos/README.md. Homebrew (homebrew.yml) stays the
+# developer channel; this lane is the one an end user, an MDM and the menu-bar app's updater read.
+#
+# Three jobs, one contract:
+#   • lint     — every event: parse + shellcheck every script this lane ships (Linux, cheap).
+#   • build    — every event, macOS: the two suites under macOS's own bash 3.2, both architectures
+#                built UNSIGNED with the real vendored toolchain (cached by the manifest's hash),
+#                the arm64 package INSTALLED on the runner with `installer`, exercised, re-installed
+#                (idempotent), uninstalled; both packages uploaded as artifacts labelled -unsigned.
+#   • release  — main only, macOS: the same build SIGNED + NOTARIZED + STAPLED when the seven Apple
+#                inputs are present, attached to a release of this repository; without them the
+#                packages are built UNSIGNED, uploaded as artifacts, and the run says WHICH input is
+#                absent — loudly (a warning annotation + the step summary + the file name), never
+#                silently and never as a red (maintainer, 2026-10-26: an unsigned package is an
+#                explicit, labelled artifact; the Apple enrolment is the maintainer's action item,
+#                not a build defect). Nothing unsigned is ever attached to a release.
+#
+# 🚨 WHAT A MACOS RUNNER CAN AND CANNOT PROVE. It can install the package, probe the toolchain, run
+# the CLI's read-only commands and uninstall. It has no nested virtualisation, so Colima never starts
+# here and `memex-local up` is out of reach — that is settled by the first install on a real Mac.
+#
+# 🛡️ The path filter is deliberate and is NOT a skip-trapdoor: this check is not required by the
+# ruleset, and a pull request that touches neither the installer nor what it packs has nothing for a
+# macOS runner to measure. The secrets are consumed by `release` only (push to main), which the
+# platform's check-pr-secret-preflight guard excludes from pull-request reachability.
+
+on:
+  pull_request:
+    paths:
+      - deploy/macos/**
+      - deploy/homebrew/**
+      - deploy/helm/**
+      - .github/workflows/macos-pkg.yml
+  push:
+    branches: [main]
+    paths:
+      - deploy/macos/**
+      - deploy/homebrew/**
+      - deploy/helm/**
+      - .github/workflows/macos-pkg.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-pkg-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lint:
+    name: installer scripts (parse + shellcheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Every script parses and is shellcheck-clean
+        run: |
+          set -euo pipefail
+          files="deploy/macos/build-pkg.sh deploy/macos/scripts/postinstall deploy/macos/daemon/postinstall \
+                 deploy/macos/libexec/memex-daemon.sh deploy/macos/libexec/uninstall.sh deploy/macos/test/run-tests.sh \
+                 deploy/homebrew/share/tools.sh deploy/homebrew/bin/memex-local"
+          for f in $files; do bash -n "$f"; done
+          # shellcheck disable=SC2086
+          shellcheck -S warning $files
+      - name: The manifest's asset rows are whole (both arches, 64-hex sha256, https)
+        run: |
+          set -euo pipefail
+          m=deploy/homebrew/share/tools.manifest
+          fail=0
+          for name in $(awk '$1=="tool" && $7!="-" { print $2 }' "$m"); do
+            for a in arm64 x86_64; do
+              row="$(awk -v n="$name" -v a="$a" '$1=="asset" && $2==n && $3==a' "$m")"
+              [ -n "$row" ] || { echo "::error::$m: no $a asset for vendored tool $name"; fail=1; continue; }
+              printf '%s' "$row" | awk '{print $6}' | grep -Eq '^[0-9a-f]{64}$' || { echo "::error::$m: $name/$a sha256 is not 64 hex"; fail=1; }
+              case "$(printf '%s' "$row" | awk '{print $7}')" in https://*) ;; *) echo "::error::$m: $name/$a url is not https"; fail=1 ;; esac
+            done
+          done
+          [ "$fail" -eq 0 ]
+
+  build:
+    name: build + install (macOS, unsigned)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # the version is the commit COUNT of the tree under test
+
+      - name: Assert the tools this gate needs
+        run: |
+          set -euo pipefail
+          missing=()
+          for t in pkgbuild productbuild pkgutil plutil xmllint shasum installer; do
+            command -v "$t" >/dev/null 2>&1 || missing+=("$t")
+          done
+          [ -x /bin/bash ] || missing+=("/bin/bash (macOS's own bash 3.2)")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::the macOS installer gate cannot run — the runner image lacks: ${missing[*]}"; exit 1
+          fi
+          sw_vers; /bin/bash --version | head -1; uname -m
+
+      - name: Version = 0.3.<commit count>   (the same series as the Homebrew tap)
+        id: ver
+        run: echo "version=0.3.$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Test suites under macOS bash 3.2 (homebrew + macos)
+        run: |
+          set -euo pipefail
+          /bin/bash deploy/homebrew/test/run-tests.sh
+          /bin/bash deploy/macos/test/run-tests.sh
+
+      - name: Vendored toolchain cache (keyed by the manifest)
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vendor-cache
+          key: memex-vendor-${{ hashFiles('deploy/homebrew/share/tools.manifest') }}
+
+      - name: Build both architectures (unsigned)
+        id: build
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/pkg"
+          for arch in arm64 x86_64; do
+            pkg="$(deploy/macos/build-pkg.sh --version "$VERSION" --arch "$arch" --out "$out" --cache "$RUNNER_TEMP/vendor-cache" --sign never | tee /dev/stderr | tail -1)"
+            case "$pkg" in *"-$arch-unsigned.pkg") ;; *) echo "::error::unexpected package name $pkg"; exit 1 ;; esac
+          done
+          ls -la "$out"
+          echo "dir=$out" >> "$GITHUB_OUTPUT"
+
+      # The real thing: Installer.app's engine, as root, on this runner. Then the probe-first contract:
+      # the runner has Homebrew's kubectl/helm (satisfying) and no colima — so the report must say
+      # "existing" for what it found and "ACTIVATED the vendored fallback" only for what it did not.
+      - name: Install the arm64 package on the runner, exercise, re-install, uninstall
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          PKGDIR: ${{ steps.build.outputs.dir }}
+        run: |
+          set -euo pipefail
+          pkg="$PKGDIR/memex-local-$VERSION-$(uname -m)-unsigned.pkg"
+          [ -f "$pkg" ] || { echo "::error::no package for this runner's arch: $pkg"; ls "$PKGDIR"; exit 1; }
+          # Gatekeeper would refuse an unsigned pkg double-clicked; `installer` run as root installs it.
+          sudo installer -pkg "$pkg" -target / -verbose
+          echo "── tools.report ──"; cat /opt/memex/etc/tools.report
+          [ -x /opt/memex/bin/memex-local ] || { echo "::error::/opt/memex/bin/memex-local missing after install"; exit 1; }
+          [ "$(cat /etc/paths.d/memex)" = "/opt/memex/bin" ] || { echo "::error::/etc/paths.d/memex not written"; exit 1; }
+          export PATH="$PATH:/opt/memex/bin"
+          # Capture, then grep — never `memex-local … | grep -q` (EPIPE under pipefail, see homebrew.yml).
+          out="$(memex-local version)"; echo "$out"; grep -q "memex-local 0.3" <<<"$out"
+          out="$(memex-local doctor 2>&1 || true)"; echo "$out"
+          grep -q "TOOL          USES      VERSION   FLOOR    VERDICT     FROM" <<<"$out"
+          grep -Eq "^  colima        (existing|vendored) " <<<"$out" || { echo "::error::doctor has no colima row"; exit 1; }
+          # The daemon choice is NOT selected by default: nothing in /Library/LaunchDaemons.
+          if [ -e /Library/LaunchDaemons/com.memex.local.daemon.plist ]; then echo "::error::the daemon was installed although not chosen"; exit 1; fi
+          # Nothing was written into Homebrew's prefix.
+          brew_prefix="$(brew --prefix)"
+          for b in colima limactl kubectl helm mkcert; do
+            if [ -L "$brew_prefix/bin/$b" ] && readlink "$brew_prefix/bin/$b" | grep -q '/opt/memex/'; then echo "::error::$brew_prefix/bin/$b points into /opt/memex"; exit 1; fi
+          done
+          # Idempotent: the second install changes nothing.
+          sudo installer -pkg "$pkg" -target / >/dev/null
+          grep -q "changed: 0" /opt/memex/etc/tools.report || { echo "::error::a re-install changed the activation:"; cat /opt/memex/etc/tools.report; exit 1; }
+          echo "re-install: changed: 0"
+          # The optional daemon choice, installed deliberately through a choices file: plist present, NOT loaded (Unattended unset).
+          cat > "$RUNNER_TEMP/choices.xml" <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><array><dict><key>attributeSetting</key><integer>1</integer><key>choiceAttribute</key><string>selected</string><key>choiceIdentifier</key><string>daemon</string></dict></array></plist>
+          XML
+          sudo installer -pkg "$pkg" -target / -applyChoiceChangesXML "$RUNNER_TEMP/choices.xml" >/dev/null
+          [ -f /Library/LaunchDaemons/com.memex.local.daemon.plist ] || { echo "::error::the daemon choice did not install its plist"; exit 1; }
+          plutil -lint /Library/LaunchDaemons/com.memex.local.daemon.plist
+          if sudo launchctl print system/com.memex.local.daemon >/dev/null 2>&1; then echo "::error::the daemon was LOADED without the Unattended preference"; exit 1; fi
+          echo "daemon: installed, not loaded (as designed)"
+          sudo /opt/memex/libexec/uninstall.sh
+          if [ -e /opt/memex ] || [ -e /etc/paths.d/memex ] || [ -e /Library/LaunchDaemons/com.memex.local.daemon.plist ]; then echo "::error::uninstall left files behind"; exit 1; fi
+
+      - name: Upload the unsigned packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: memex-local-${{ steps.ver.outputs.version }}-unsigned
+          path: |
+            ${{ steps.build.outputs.dir }}/*.pkg
+            ${{ steps.build.outputs.dir }}/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Sign + notarize + release (main)
+    if: github.event_name == 'push'
+    needs: [lint, build]
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write   # the release of this repository the signed packages are attached to
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # The seven Apple inputs, by name. This step says which are absent and sets `signing`; it does
+      # NOT fail: without them the build below is an explicit, labelled UNSIGNED artifact (see the
+      # header). The warning annotation and the step summary are the loud part.
+      - name: Signing inputs — which are present, which are absent
+        id: inputs
+        env:
+          APP_P12: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12 }}
+          APP_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          INST_P12: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_P12 }}
+          INST_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "$APP_P12" ]           || missing+=("APPLE_DEVELOPER_ID_APPLICATION_P12 — the Developer ID Application certificate (.p12, base64)")
+          [ -n "$APP_P12_PASSWORD" ]  || missing+=("APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD — its export password")
+          [ -n "$INST_P12" ]          || missing+=("APPLE_DEVELOPER_ID_INSTALLER_P12 — the Developer ID Installer certificate (.p12, base64)")
+          [ -n "$INST_P12_PASSWORD" ] || missing+=("APPLE_DEVELOPER_ID_INSTALLER_P12_PASSWORD — its export password")
+          [ -n "$NOTARY_ISSUER_ID" ]  || missing+=("APPLE_NOTARY_ISSUER_ID — the App Store Connect API key's issuer id")
+          [ -n "$NOTARY_KEY_ID" ]     || missing+=("APPLE_NOTARY_KEY_ID — the App Store Connect API key's key id")
+          [ -n "$NOTARY_KEY_P8" ]     || missing+=("APPLE_NOTARY_KEY_P8 — the App Store Connect API key (.p8, base64)")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::warning title=memex-local .pkg is UNSIGNED::${#missing[@]} of 7 Apple signing inputs absent — see the step summary (deploy/macos/README.md §1f)"
+            {
+              echo "## memex-local .pkg: UNSIGNED — ${#missing[@]} of 7 Apple inputs absent"
+              echo
+              echo "The packages below are built and uploaded **unsigned** (labelled \`-unsigned\`); nothing is attached to a release. Provision, as repository secrets (deploy/macos/README.md §1f):"
+              for m in "${missing[@]}"; do echo "- \`${m%% — *}\` — ${m#* — }"; done
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "signing=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "all 7 signing inputs present"
+            echo "signing=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Version = 0.3.<commit count>
+        id: ver
+        run: echo "version=0.3.$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Vendored toolchain cache (keyed by the manifest)
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vendor-cache
+          key: memex-vendor-${{ hashFiles('deploy/homebrew/share/tools.manifest') }}
+
+      # A temporary keychain holding the two certificates for this job only; the identities' names are
+      # READ from it (never typed into the workflow). The notary key is written to a file for notarytool.
+      # Nothing here is a skip: when signing=false the step says so and exports nothing, and the build
+      # below labels its output accordingly.
+      - name: Import the signing identities (temporary keychain)
+        id: keychain
+        env:
+          SIGNING: ${{ steps.inputs.outputs.signing }}
+          APP_P12: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12 }}
+          APP_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          INST_P12: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_P12 }}
+          INST_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          if [ "$SIGNING" != "true" ]; then echo "no signing inputs — the build runs unsigned"; exit 0; fi
+          kc="$RUNNER_TEMP/memex-signing.keychain-db"
+          pw="$(openssl rand -hex 24)"
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings -lut 3600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          printf '%s' "$APP_P12"  | base64 --decode > "$RUNNER_TEMP/app.p12"
+          printf '%s' "$INST_P12" | base64 --decode > "$RUNNER_TEMP/inst.p12"
+          security import "$RUNNER_TEMP/app.p12"  -k "$kc" -P "$APP_P12_PASSWORD"  -T /usr/bin/codesign -T /usr/bin/productbuild
+          security import "$RUNNER_TEMP/inst.p12" -k "$kc" -P "$INST_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productbuild
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$RUNNER_TEMP/app.p12" "$RUNNER_TEMP/inst.p12"
+          app_id="$(security find-identity -v -p codesigning "$kc" | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+          inst_id="$(security find-identity -v "$kc" | sed -n 's/.*"\(Developer ID Installer: [^"]*\)".*/\1/p' | head -1)"
+          [ -n "$app_id" ]  || { echo "::error::the imported Application certificate yields no 'Developer ID Application' identity"; exit 1; }
+          [ -n "$inst_id" ] || { echo "::error::the imported Installer certificate yields no 'Developer ID Installer' identity"; exit 1; }
+          printf '%s' "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          echo "app_identity=$app_id" >> "$GITHUB_OUTPUT"
+          echo "installer_identity=$inst_id" >> "$GITHUB_OUTPUT"
+          echo "notary_key_path=$RUNNER_TEMP/notary.p8" >> "$GITHUB_OUTPUT"
+          echo "identities: '$app_id' / '$inst_id'"
+
+      - name: Build both architectures (signed + notarized when the inputs are present)
+        id: build
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          MEMEX_SIGN_APP_IDENTITY: ${{ steps.keychain.outputs.app_identity }}
+          MEMEX_SIGN_INSTALLER_IDENTITY: ${{ steps.keychain.outputs.installer_identity }}
+          MEMEX_NOTARY_KEY_PATH: ${{ steps.keychain.outputs.notary_key_path }}
+          MEMEX_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          MEMEX_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/pkg"
+          for arch in arm64 x86_64; do
+            deploy/macos/build-pkg.sh --version "$VERSION" --arch "$arch" --out "$out" --cache "$RUNNER_TEMP/vendor-cache"
+          done
+          ls -la "$out"
+          echo "dir=$out" >> "$GITHUB_OUTPUT"
+          # The label is the verdict: a signed+notarized package has no suffix.
+          if ls "$out"/memex-local-"$VERSION"-arm64.pkg "$out"/memex-local-"$VERSION"-x86_64.pkg >/dev/null 2>&1; then
+            echo "notarized=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "notarized=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Remove the temporary keychain
+        env:
+          SIGNING: ${{ steps.inputs.outputs.signing }}
+        run: |
+          set -euo pipefail
+          [ "$SIGNING" = "true" ] || exit 0
+          security delete-keychain "$RUNNER_TEMP/memex-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/notary.p8"
+
+      - name: Upload the packages (whatever their label)
+        uses: actions/upload-artifact@v4
+        with:
+          name: memex-local-${{ steps.ver.outputs.version }}-main
+          path: |
+            ${{ steps.build.outputs.dir }}/*.pkg
+            ${{ steps.build.outputs.dir }}/*.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+      # Only a notarized package is released: Gatekeeper refuses anything else on a user's Mac, and a
+      # release asset is what the menu-bar app's appcast and an MDM will point at.
+      - name: Release the notarized packages on this repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          NOTARIZED: ${{ steps.build.outputs.notarized }}
+          PKGDIR: ${{ steps.build.outputs.dir }}
+        run: |
+          set -euo pipefail
+          if [ "$NOTARIZED" != "true" ]; then
+            echo "not notarized — no release; the packages are workflow artifacts labelled by their state"
+            echo "- No release: the packages are not notarized (see above)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          tag="memex-local/v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag exists — reusing"
+          else
+            gh release create "$tag" "$PKGDIR"/memex-local-"$VERSION"-arm64.pkg "$PKGDIR"/memex-local-"$VERSION"-x86_64.pkg \
+              "$PKGDIR"/memex-local-"$VERSION"-arm64.pkg.sha256 "$PKGDIR"/memex-local-"$VERSION"-x86_64.pkg.sha256 \
+              --title "memex-local $VERSION (macOS installer)" \
+              --notes "Signed, notarized and stapled macOS installer for memex-local $VERSION, built from ${GITHUB_REPOSITORY}@${GITHUB_SHA}. Design: deploy/macos/README.md."
+          fi
+          echo "- Released: \`$tag\`" >> "$GITHUB_STEP_SUMMARY"

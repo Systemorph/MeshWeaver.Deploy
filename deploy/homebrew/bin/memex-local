@@ -235,7 +235,40 @@ resolve_repo() {
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
-need() { command -v "$1" >/dev/null 2>&1 || die "required tool '$1' not found — install it (see: brew install $2)"; }
+# The toolchain resolver — ONE precedence list for colima, lima, kubectl, helm, mkcert, ollama and
+# socket_vmnet (share/tools.sh over share/tools.manifest, the same files the .pkg's postinstall reads):
+# an EXISTING installation that meets the manifest's floor first, the .pkg's VENDORED copy second,
+# missing third. `doctor` prints the table; preflight activates the vendored copies the resolution
+# chose; `need` refuses a tool below its floor by NAME, with the floor and the remedy.
+# shellcheck source=../share/tools.sh
+. "$(resolve_share)/tools.sh"
+
+need() {
+  local bin="$1" brew="$2" name line floor verdict note
+  name="$(tool_name_for_binary "$bin")"
+  if [ -n "$name" ]; then
+    tool_resolve "$name" >/dev/null && return 0
+    line="$(tool_resolve "$name" || true)"
+    IFS=$'\t' read -r name _ _ _ floor verdict note <<<"$line"
+    die "required tool '$bin' is $verdict${note:+ ($note)} — floor $floor; install it (brew install $brew) or run the Memex installer, which carries $(tool_field "$name" 6)"
+  fi
+  command -v "$bin" >/dev/null 2>&1 || die "required tool '$bin' not found — install it (see: brew install $2)"
+}
+
+# A MANAGED PREFERENCE (deploy/macos/README.md §3): a fleet pre-fills the control URL, deployment id and
+# registry URL through an MDM profile in the `com.memex.local` domain, so a machine enrols without
+# anyone typing them. Read from the managed-preferences store first (what an MDM writes), then the
+# user's own domain (what `defaults write com.memex.local <Key> <value>` sets by hand). Prints the
+# value or nothing; never fails. An explicit flag always wins over a preference.
+readonly MANAGED_PREF_DOMAIN="com.memex.local"
+managed_pref() {
+  local key="$1" v
+  command -v defaults >/dev/null 2>&1 || return 0
+  v="$(defaults read "/Library/Managed Preferences/${MANAGED_PREF_DOMAIN}" "$key" 2>/dev/null)" \
+    || v="$(defaults read "$MANAGED_PREF_DOMAIN" "$key" 2>/dev/null)" || v=""
+  [ -n "$v" ] && printf '%s' "$v"
+  return 0
+}
 
 # The host profile must be one this file knows. An unknown one is refused here rather than read as
 # the default: a Mac mini told it is a `mac-studo` would otherwise size a 32 GiB VM it cannot hold.
@@ -297,6 +330,7 @@ resolve_channel() {
 
 preflight() {
   check_profile
+  tools_activate
   need colima colima
   need kubectl kubernetes-cli
   need helm helm
@@ -583,7 +617,10 @@ cmd_backlease() {
         esac
         shift
       done
-      case "$control" in https://*) ;; *) die "backlease enroll: --control must be the control instance's https URL (got '${control:-<none>}')" ;; esac
+      # A fleet pre-fills both through a managed preference (deploy/macos/README.md §3); a flag wins.
+      [ -n "$control" ]    || control="$(managed_pref ControlUrl)"
+      [ -n "$deployment" ] || deployment="$(managed_pref DeploymentId)"
+      case "$control" in https://*) ;; *) die "backlease enroll: --control must be the control instance's https URL (got '${control:-<none>}'; a fleet sets it as the managed preference $MANAGED_PREF_DOMAIN ControlUrl)" ;; esac
       [ -n "$deployment" ] || deployment="$(registry_instance_id)"
       [ -n "$deployment" ] || die "backlease enroll: --deployment <id> is required (the registry file names no instance id) — it MUST equal this machine's Deployments/<id> record on control"
       case "$deployment" in *[!a-z0-9-]*) die "backlease enroll: --deployment must be lower-case letters, digits and dashes (got '$deployment')" ;; esac
@@ -2719,12 +2756,20 @@ cmd_channel() {
 cmd_doctor() {
   step "Host profile"
   cmd_profile
-  step "Checking required tools"
-  local tools=(colima kubectl helm mkcert ollama openssl curl)
+  step "Toolchain (existing installation first, the installer's vendored copy second — $TOOLS_MANIFEST)"
+  tools_report
+  if [ "$TOOLS_UNRESOLVED" -eq 0 ]; then ok "every tool resolves at or above its floor"
+  else warn "$TOOLS_UNRESOLVED tool(s) do not resolve — see the VERDICT column (the Memex .pkg installer carries a fallback for each vendored one)"; fi
   local t
-  for t in ${tools[@]+"${tools[@]}"}; do
-    if command -v "$t" >/dev/null 2>&1; then ok "$t: $(command -v "$t")"; else warn "$t: MISSING"; fi
+  for t in openssl curl; do
+    if command -v "$t" >/dev/null 2>&1; then ok "$t: $(command -v "$t")"; else warn "$t: MISSING (ships with macOS)"; fi
   done
+  step "Managed preferences ($MANAGED_PREF_DOMAIN)"
+  local k v any=""
+  for k in ControlUrl DeploymentId RegistryUrl Channel Profile; do
+    v="$(managed_pref "$k")"; [ -n "$v" ] && { info "$k: $v"; any=1; }
+  done
+  [ -n "$any" ] || info "none set (an MDM profile or 'defaults write $MANAGED_PREF_DOMAIN <Key> <value>' pre-fills enroll/registry)"
   if command -v dotnet >/dev/null 2>&1; then
     ok "dotnet (for local build / Option B): $(command -v dotnet)"
   else

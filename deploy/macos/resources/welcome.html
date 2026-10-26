@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>body{font-family:-apple-system,Helvetica,sans-serif;font-size:13px;line-height:1.45;margin:12px}code{font-family:Menlo,monospace;font-size:12px}h2{font-size:15px}</style></head>
+<body>
+<h2>Memex Local</h2>
+<p>This installer puts the <b>memex-local</b> command on this Mac. It stands up the Memex portal
+on a local Kubernetes (k3s) VM — Colima — and keeps it running across reboots, and it can offer this
+Mac back to your organisation's fleet as a build host (<code>memex-local backlease enroll</code>).</p>
+<h2>What is installed, and where</h2>
+<ul>
+<li><code>/opt/memex/bin/memex-local</code> — the command, on your PATH through <code>/etc/paths.d/memex</code>
+(open a new terminal window after installing).</li>
+<li><code>/opt/memex/share</code> — the Helm chart and the launchd agent templates the command uses.</li>
+<li><code>/opt/memex/libexec/vendor</code> — pinned copies of Colima, Lima, kubectl, helm and mkcert.
+<b>They are used only where this Mac has nothing that meets the minimum version.</b> The installer
+probes what is already here (Homebrew included) and activates a vendored copy only for a tool that
+is missing or too old; your own installations are never touched, and nothing is written into
+Homebrew's folders. <code>memex-local doctor</code> shows, per tool, which copy is in use and why.</li>
+<li>Optional — <b>Unattended host</b>: a root LaunchDaemon for a headless Mac (a Mac mini leasing itself
+to the fleet). Not selected by default; it stays unloaded until the managed preference
+<code>com.memex.local Unattended</code> is true or you load it yourself.</li>
+</ul>
+<h2>After installing</h2>
+<p><code>memex-local doctor</code>, then <code>memex-local registry &lt;your registry URL&gt;</code> and
+<code>memex-local up</code>. Ollama (the local model runtime) is probed and reported but not installed
+by this package — install it from ollama.com or Homebrew, or set <code>MEMEX_OLLAMA_MODEL=none</code>.</p>
+<p>Uninstall: <code>memex-local down</code>, then <code>sudo /opt/memex/libexec/uninstall.sh</code>.</p>
+</body></html>

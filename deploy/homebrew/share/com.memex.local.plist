@@ -27,7 +27,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/memex/bin</string>
         <!-- The host port the CLI chose (MEMEX_PORT, default 8443). launchd does not inherit the
              invoking shell's environment, so without this the forward bound 8443 while the CLI
              waited for and verified the port it was asked for. -->

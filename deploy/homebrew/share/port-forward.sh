@@ -15,7 +15,8 @@
 set -uo pipefail
 
 # launchd gives login agents a minimal PATH; make the brew tools reachable.
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+# /opt/memex/bin LAST: the .pkg installer activates a vendored tool there only when nothing existing meets its floor.
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/memex/bin:${PATH:-}"
 
 HOST_PORT="${MEMEX_PORT:-8443}"
 

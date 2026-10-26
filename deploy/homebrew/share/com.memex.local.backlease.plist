@@ -25,7 +25,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/memex/bin</string>
         <key>MEMEX_BACKLEASE_INTERVAL</key>
         <string>__INTERVAL__</string>
         <key>MEMEX_BACKLEASE_DIR</key>

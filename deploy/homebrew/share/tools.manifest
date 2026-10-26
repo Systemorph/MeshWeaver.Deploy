@@ -1,0 +1,49 @@
+# tools.manifest — THE ONE declaration of the toolchain memex-local runs on, read by three consumers:
+#
+#   • deploy/homebrew/share/tools.sh      (the CLI's resolver: `memex-local doctor`, preflight, `need`)
+#   • deploy/macos/build-pkg.sh           (the .pkg vendors the `asset` rows, sha256-verified)
+#   • deploy/macos/scripts/postinstall    (probes the machine, activates a vendored copy only where needed)
+#
+# and pinned against the Homebrew formula by the drift test in deploy/homebrew/test/run-tests.sh: every
+# `tool` row whose brew-dep is `direct` must be a `depends_on` of Formula/memex-local.rb, and every
+# `depends_on` of the formula must be a `tool` row here. Edit the floor or the pin HERE; the test reds
+# a formula that names a tool this file does not, or the reverse.
+#
+# tool  <name>  <binary[:candidate…]>  <brew formula>  <brew-dep>  <floor>  <vendored>  <version probe args…>
+#   binary     the executable; `:`-separated candidates, an absolute one tested as is (keg-only formulae)
+#   brew-dep   direct   — the formula names it (`depends_on "<brew formula>"`)
+#              indirect — reached through another formula's dependency (lima via colima)
+#   floor      the MINIMUM version an EXISTING installation must report to be used; `-` = presence only
+#   vendored   the version the .pkg carries as the fallback; `-` = not vendored (probed and reported only)
+#   probe      the arguments that make the binary print its version (first X.Y.Z in the output is read)
+#
+# The floors are the oldest versions this stack is run on by its maintainers; the mechanism (probe,
+# compare, fall back) is what the tests assert — a floor is bumped by a pull request that edits this line.
+tool  colima        colima    colima          direct    0.8.0   0.10.3  version
+tool  lima          limactl   lima            indirect  1.0.0   2.2.1   --version
+tool  kubectl       kubectl   kubernetes-cli  direct    1.31.0  1.37.1  version --client
+tool  helm          helm      helm            direct    3.16.0  4.3.1   version --short
+tool  mkcert        mkcert    mkcert          direct    1.4.0   1.4.4   -version
+tool  ollama        ollama    ollama          direct    0.5.0   -       --version
+tool  socket_vmnet  socket_vmnet:/opt/homebrew/opt/socket_vmnet/bin/socket_vmnet:/usr/local/opt/socket_vmnet/bin/socket_vmnet  socket_vmnet  direct  -  -  -
+#
+# asset <name>  <arch>  <kind>  <member>  <sha256>  <url>
+#   arch     arm64 | x86_64 (the Mac's `uname -m`)
+#   kind     binary — the URL IS the executable; tar.gz — an archive, laid out under libexec/vendor/<name>/
+#   member   tar.gz only: the archive member that is the executable (relative), `-` for a binary or when
+#            the archive already carries bin/<binary> (lima)
+#   sha256   the publisher's checksum (colima: <asset>.sha256sum; lima: SHA256SUMS; helm: <asset>.sha256sum;
+#            kubectl: <asset>.sha256 on dl.k8s.io) — mkcert publishes none, so its two values were computed
+#            from the downloaded release assets at pin time (2026-10-26) and are the pin from here on.
+#   url      the publisher's release URL. kubectl's official binaries live on dl.k8s.io (the GitHub release
+#            carries none); every other tool is its GitHub release asset.
+asset colima   arm64   binary  -  980ad8bf61a4ca370243f4cb41401a61276dcd2c2502bee7b9b86f9250169f34  https://github.com/abiosoft/colima/releases/download/v0.10.3/colima-Darwin-arm64
+asset colima   x86_64  binary  -  3082737fe8a98afda11cba7d9a20b6e56fe80c6153464beda04bec630758770b  https://github.com/abiosoft/colima/releases/download/v0.10.3/colima-Darwin-x86_64
+asset lima     arm64   tar.gz  -  9e9eacce88f37e185c346bad73aa6136f738d8cdf8c3bb23cd42b071824bc66e  https://github.com/lima-vm/lima/releases/download/v2.2.1/lima-2.2.1-Darwin-arm64.tar.gz
+asset lima     x86_64  tar.gz  -  6b776e4bc41f358e6ee01fefcc78e2eb26f11635a0fcff632234af77a566c6c4  https://github.com/lima-vm/lima/releases/download/v2.2.1/lima-2.2.1-Darwin-x86_64.tar.gz
+asset kubectl  arm64   binary  -  fd65982c97ddad3106754b69ffa196d0e543aa591930ae52aed1adfb92f8c77f  https://dl.k8s.io/release/v1.37.1/bin/darwin/arm64/kubectl
+asset kubectl  x86_64  binary  -  6851381c486ff6edd691623e3d65c87cb9a5b02887ff8fbbb38d8a031b748387  https://dl.k8s.io/release/v1.37.1/bin/darwin/amd64/kubectl
+asset helm     arm64   tar.gz  darwin-arm64/helm  6b4e61c8cd27d99e5a801e63ff25dd5c70b36875c2cd659d3e9ce6b76fc23198  https://get.helm.sh/helm-v4.3.1-darwin-arm64.tar.gz
+asset helm     x86_64  tar.gz  darwin-amd64/helm  34bec4eba761ba5c16d1965ee6b8f5b0abe5993974a802274e2a4f0418893d89  https://get.helm.sh/helm-v4.3.1-darwin-amd64.tar.gz
+asset mkcert   arm64   binary  -  c8af0df44bce04359794dad8ea28d750437411d632748049d08644ffb66a60c6  https://github.com/FiloSottile/mkcert/releases/download/v1.4.4/mkcert-v1.4.4-darwin-arm64
+asset mkcert   x86_64  binary  -  a32dfab51f1845d51e810db8e47dcf0e6b51ae3422426514bf5a2b8302e97d4e  https://github.com/FiloSottile/mkcert/releases/download/v1.4.4/mkcert-v1.4.4-darwin-amd64
