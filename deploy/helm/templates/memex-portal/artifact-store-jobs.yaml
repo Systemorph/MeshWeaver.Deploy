@@ -174,7 +174,7 @@ spec:
             - name: "tester-app"
               image: {{ $a.build.testerImage | quote }}
               imagePullPolicy: "IfNotPresent"
-              command: ["/bin/sh", "-c", "cp -a /app/. /work/tester/"]
+              command: ["/bin/sh", "-c", "cp -R /app/. /work/tester/"]
               volumeMounts:
                 - name: "work"
                   mountPath: "/work/tester"
