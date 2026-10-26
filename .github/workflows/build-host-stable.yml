@@ -139,9 +139,10 @@ jobs:
       # `mw-build-host:<ceiling>`. Handing it over would then fail on the missing runner digest, so
       # this step BUILDS it instead: it dispatches build-host.yml for exactly that set (the same
       # image job, the same one-digest-per-version rule, the same checks of the set and its commit)
-      # and waits for the tag to appear. Only a registry that ANSWERED "not found" means absent;
-      # any other inspect failure is red, never a build.
-      - name: "The ceiling's runner: build mw-build-host:<ceiling> on demand when it is missing"
+      # and waits for that run's image job to SUCCEED (build or keep, then the fleet-registry
+      # mirror) — on every daily run, not only when the tag is missing. Only a registry that
+      # ANSWERED "not found" means absent; any other inspect failure is red.
+      - name: "The ceiling's runner: build (or keep) and mirror mw-build-host:<ceiling> before the hand-over"
         if: steps.build_host_stable.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -164,11 +165,15 @@ jobs:
             echo "::error::could not establish whether $ref exists (the registry did not answer 'not found') — build-stable was NOT handed $V_SET"
             exit 1
           }
+          # ALWAYS dispatched, even when the ACR tag exists: a tag can be there while its fleet-registry
+          # mirror failed, or before another run's image job reached the mirror. The image job is
+          # idempotent — it KEEPS an existing digest (one digest per version) and mirrors it again,
+          # digest verified — so its success is the only proof the runner is pullable everywhere.
           if present; then
-            echo "$ref exists — nothing to build"
-            exit 0
+            echo "$ref exists — re-mirroring it through build-host.yml before the hand-over"
+          else
+            echo "::notice title=build-stable ceiling has no runner::$ref is missing — dispatching build-host.yml to build it"
           fi
-          echo "::notice title=build-stable ceiling has no runner::$ref is missing — dispatching build-host.yml to build it"
           since=$(date -u -d '-5 minutes' +%Y-%m-%dT%H:%M:%SZ)
           export REQUEST_TITLE="Build host — request stable-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/build-host.yml/dispatches" \
@@ -198,7 +203,7 @@ jobs:
             case "$job" in
               "completed success")
                 present || { echo "::error::run $run's image job succeeded but $ref is not in the registry — build-stable was NOT handed $V_SET"; exit 1; }
-                echo "- build-stable: the ceiling \`$V_SET\` had no runner — built and mirrored on demand by build-host.yml run $run" >> "$GITHUB_STEP_SUMMARY"
+                echo "- build-stable: the ceiling \`$V_SET\`'s runner was built or kept, and mirrored, by build-host.yml run $run" >> "$GITHUB_STEP_SUMMARY"
                 exit 0 ;;
               "completed "*)
                 echo "::error::build-host.yml run $run's image job ended '${job#completed }' — mw-build-host:$V_SET was not built and mirrored; build-stable was NOT handed $V_SET"

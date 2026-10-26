@@ -44,9 +44,10 @@ nothing and re-sends the newest armed set to `build-latest` (idempotent at the r
 therefore reaches `build-latest` within one tick of being armed, and nothing in the platform's
 delivery waits on it.
 
-`build-host-stable.yml` does not rely on the backfill alone: when its main-passed ceiling has no
-`mw-build-host:<ceiling>` (a ceiling outside the window, or one the backfill has not reached yet),
-it dispatches `build-host.yml` for exactly that set and waits (up to 35 minutes) for that run's image
+`build-host-stable.yml` does not rely on the backfill alone: before every hand-over it dispatches
+`build-host.yml` for exactly its main-passed ceiling — which builds `mw-build-host:<ceiling>` when it
+is missing (a ceiling outside the window, or one the backfill has not reached yet) and keeps the
+existing digest when it is not — and waits (up to 35 minutes) for that run's image
 job to SUCCEED — the job that also mirrors the runner to the fleet registry, digest verified — before
 it hands the ceiling to `build-stable`, instead of failing on a missing runner digest.
 
