@@ -129,6 +129,13 @@ readonly REGISTRY_FILE="$LOCAL_HOME/registry.yaml"
 # host sampler writes is mounted into the portal, and the pairing secret is referenced — never
 # written here: `backlease enroll` refuses to invent a credential (see cmd_backlease).
 readonly BACKLEASE_FILE="$LOCAL_HOME/backlease.yaml"
+# -- LOCAL MODEL: the Mac's own Ollama serves the portal's AI (`memex-local llm use|status|off`) --
+# One values layer, after back-lease and before the overlay: the OpenAICompatible provider pointed at
+# the host's Ollama BY IP (Ollama answers 403 to an in-cluster Service name: its Host-header allowlist
+# admits only loopback/IP/.local/.internal names for a non-loopback caller), the model named, its data
+# residency declared (a model whose residency is Unknown is never used for mail triage), and the
+# utility tier mapped to it (the tier the inbox triage, reply drafting and calendar suggestions ask).
+readonly LLM_FILE="$LOCAL_HOME/llm.yaml"
 readonly BACKLEASE_DIR="$LOCAL_HOME/backlease"
 readonly BACKLEASE_SAMPLER="$LOCAL_HOME/backlease-sampler.sh"
 readonly BACKLEASE_PLIST_LABEL="com.memex.local.backlease"
@@ -633,6 +640,80 @@ cmd_backlease() {
 }
 
 
+llm_value() { awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$LLM_FILE" 2>/dev/null; }
+
+# The Colima VM's gateway to the host: where the Mac's own services answer (Ollama on :11434).
+llm_host_ip() {
+  local ip; ip="$(colima ssh -- ip route 2>/dev/null | awk '$1 == "default" { print $3; exit }')"
+  printf '%s' "${ip:-192.168.5.2}"
+}
+
+# ---------------------------------------------------------------------------
+# LOCAL MODEL -- `memex-local llm use|status|off`
+# ---------------------------------------------------------------------------
+cmd_llm() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    use)
+      local model="qwen3.6" residency="Eu" host="" port="11434"
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --model)     shift; model="${1:?--model needs an Ollama model name}" ;;
+          --residency) shift; residency="${1:?--residency needs Eu|Global}" ;;
+          --host)      shift; host="${1:?--host needs the host IP as the VM sees it}" ;;
+          --port)      shift; port="${1:?--port needs a number}" ;;
+          *) die "llm use: unknown flag '$1'" ;;
+        esac
+        shift
+      done
+      case "$residency" in Eu|Global) ;; *) die "llm use: --residency must be Eu or Global (this Mac's own model never leaves it; Eu is right for a Mac in the EU)" ;; esac
+      case "$model" in ''|*[!A-Za-z0-9._:/-]*) die "llm use: --model '$model' is not a valid Ollama model name" ;; esac
+      [ -n "$host" ] || host="$(llm_host_ip)"
+      curl -fsS -m 5 "http://127.0.0.1:${port}/v1/models" 2>/dev/null | grep -q -E "\"id\":\"${model}(:[^\"]*)?\"" \
+        || die "llm use: Ollama on this Mac does not list '$model' (ollama pull $model; is 'ollama serve' running on :${port}?)"
+      mkdir -p "$LOCAL_HOME"
+      ( umask 077; cat > "$LLM_FILE" ) <<YAML
+# memex-local LOCAL MODEL -- managed by \`memex-local llm\`; re-run \`use\` to change, \`off\` to delete.
+# Layered by helm_deploy after the back-lease file and before the overlay. The host is addressed BY IP:
+# Ollama answers 403 to a Host header it does not know ("ollama:11434" from the in-cluster Service).
+config:
+  memex_portal:
+    Features__Ai__Providers__OpenAICompatible: "true"
+    OpenAICompatible__Endpoint: "http://${host}:${port}/v1"
+    OpenAICompatible__DiscoverModels: "false"
+    OpenAICompatible__Models__0: "${model}"
+    OpenAICompatible__DataResidency: "${residency}"
+    ModelTier__Utility: "Provider/OpenAICompatible/${model}"
+  memex_migration:
+    Embedding__Endpoint: "http://${host}:${port}/v1"
+YAML
+      chmod 600 "$LLM_FILE"
+      ok "local model layer written: $LLM_FILE (utility tier -> ${model}, residency ${residency}, http://${host}:${port}/v1)"
+      info "the provider key is the placeholder OpenAICompatible__ApiKey in the overlay secrets (Ollama reads none, the factory refuses an empty one)"
+      info "Apply it: memex-local update"
+      ;;
+    status)
+      [ $# -eq 0 ] || die "llm status: unknown flag '$1'"
+      if [ -f "$LLM_FILE" ]; then
+        local endpoint; endpoint="$(llm_value OpenAICompatible__Endpoint)"
+        ok "LOCAL MODEL ON -- utility tier -> $(llm_value ModelTier__Utility), ${endpoint}, residency $(llm_value OpenAICompatible__DataResidency)"
+        if kubectl -n "$NAMESPACE" exec deploy/memex-portal-deployment -c memex-portal -- curl -fsS -m 5 -o /dev/null "${endpoint%/}/models" 2>/dev/null; then
+          ok "the portal pod reaches the model endpoint"
+        else
+          warn "the portal pod does NOT reach ${endpoint} (Ollama down, or bound to loopback only? it must listen on *:11434)"
+        fi
+      else
+        info "local model is OFF -- enable it with:  memex-local llm use [--model qwen3.6] [--residency Eu]"
+      fi
+      ;;
+    off)
+      [ $# -eq 0 ] || die "llm off: unknown flag '$1'"
+      if [ -f "$LLM_FILE" ]; then rm -f "$LLM_FILE"; ok "local model OFF -- the next 'memex-local update' drops the layer"; else info "local model was not on"; fi
+      ;;
+    *) die "usage: memex-local llm {use [--model <ollama-model>] [--residency Eu|Global] [--host <ip>] [--port <n>] | status | off}" ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # DEVICE RELAY — `memex-local relay pair|status|off` (MeshWeaver.Plugins Hosting/DeviceRelay)
 # ---------------------------------------------------------------------------
@@ -1047,6 +1128,11 @@ helm_deploy() {
   if [ -f "$BACKLEASE_FILE" ]; then
     mode_args+=(-f "$BACKLEASE_FILE")
     info "BACK-LEASE: this Mac reports to $(backlease_control) as '$(backlease_deployment)' and heartbeats every $(backlease_interval)s"
+  fi
+  # LOCAL MODEL layer (`memex-local llm use`): the host's Ollama is the portal's utility-tier model.
+  if [ -f "$LLM_FILE" ]; then
+    mode_args+=(-f "$LLM_FILE")
+    info "LOCAL MODEL: utility tier -> $(llm_value ModelTier__Utility) on $(llm_value OpenAICompatible__Endpoint)"
   fi
   for repo_path in $(registry_mode || plugin_repo_paths); do
     repo_name="$(plugin_source_name "$repo_path")"
@@ -2775,6 +2861,9 @@ COMMANDS:
                   at all (MeshWeaver#2417). Then run \`memex-local update\`. Raising
                   the plan is the registry admin's edit of this instance's grant.
                   \`off\` returns to serving a checkout (§16).
+  llm use [--model qwen3.6] [--residency Eu|Global] | status | off
+                  LOCAL MODEL: the Mac own Ollama serves the portal utility tier (inbox
+                  triage, reply drafts, calendar suggestions). Addressed by IP; apply with update.
   backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] | status | off
   relay pair --instance <https url> --owner <user id> --binary <dir|file> | status | off [--forget]
                   DEVICE RELAY (Hosting/DeviceRelay): let a cloud instance's inbox read the
@@ -3181,6 +3270,7 @@ main() {
     update)        cmd_update "$@" ;;
     registry)      cmd_registry "$@" ;;
     backlease)     cmd_backlease "$@" ;;
+    llm)           cmd_llm "$@" ;;
     relay)         cmd_relay "$@" ;;
     verify)        cmd_verify "$@" ;;
     autoroll)      cmd_autoroll "$@" ;;

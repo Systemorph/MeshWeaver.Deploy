@@ -681,7 +681,7 @@ esac
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
-for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel backlease relay; do
+for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel backlease llm relay; do
   case "$help_out" in
     *"$cmd"*) ;;
     *) bad "help documents '$cmd'" "not in the usage text"; continue ;;
