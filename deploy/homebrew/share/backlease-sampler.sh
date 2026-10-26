@@ -129,7 +129,8 @@ write_sample() {
   models="$(sample_models)"; m_rc=$?
   vm="$(sample_vm)"; v_rc=$?
   colima status >/dev/null 2>&1; colima_rc=$?
-  curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${MEMEX_PORT:-8443}/health" 2>/dev/null | grep -q '^200$'; portal_rc=$?
+  # the launchd port-forward serves TLS on MEMEX_PORT (a local certificate, hence -k)
+  curl -sk -m 3 -o /dev/null -w '%{http_code}' "https://127.0.0.1:${MEMEX_PORT:-8443}/health" 2>/dev/null | grep -q '^200$'; portal_rc=$?
   tmp="$OUT.tmp.$$"
   {
     printf '{"os":"macOS %s","machine":"%s",' "$(sw_vers -productVersion 2>/dev/null || echo unknown)" \
