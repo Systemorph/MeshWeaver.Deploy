@@ -18,7 +18,7 @@ metadata:
   annotations:
     helm.sh/resource-policy: "keep"
 spec:
-  accessModes: ["ReadWriteMany"]
+  accessModes: [{{ $b.cache.accessMode | default "ReadWriteMany" | quote }}]
   storageClassName: {{ $b.cache.storageClass | quote }}
   resources:
     requests:
