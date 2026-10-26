@@ -17,6 +17,7 @@ buildHosts:
   # The plugins layer: a Mac has no workload identity and holds NO registry credential (StandingBuildHosts §2), so it
   # reads the registry's bundle index (H8) with a READ-ONLY instance key — first-attach.sh sets registry.url and the Secret.
   registry: {instanceKeySecret: {name: "build-registry-key-mac", key: "key"}}
+  rolloutStrategy: "Recreate"
   nodeSelector: null
   tolerations: null
   resources:
@@ -32,6 +33,10 @@ buildHosts:
   workerTokenSecret: {name: "build-worker-mac", key: "token"}
   latest: {enabled: false}
   stable: {enabled: false}
+  # NO artifact store: the first attach takes only jobs routed to `mac` on purpose, and a stage that PRODUCES a module
+  # bundle or gate artifact fails its hand-over by design (build-run.py: "no artifact store is configured") — module
+  # builds stay off macos targets until arch-qualified bundle keys exist (Hosting/BackLease, core G10). The store the
+  # publishing side reads is the operations instance's shared CI artifact store; reaching it from a Mac is BackLease phase 2.
   extraChannels: ["mac"]
   mac:
     enabled: true

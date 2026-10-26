@@ -11,7 +11,7 @@
 #     --version <x.y.z> --tester sha256:… --portal sha256:… --runner sha256:…
 #
 # What it does, in order, and nothing else:
-#   0. refuses unless kubectl's CURRENT context is `colima` (never another cluster) — and never runs `memex-local up`;
+#   0. pins EVERY kubectl and helm call to the `colima` context (never the mutable current one) — and never runs `memex-local up`;
 #      CHECKS before changing anything: KEDA installed and ready, the node's allocatable covers the host's requests,
 #      both vault objects readable;
 #   1. loads the `mw-build-host` AppArmor profile (`userns` only) into the Colima VM, persisted under /etc/apparmor.d,
@@ -44,16 +44,18 @@ done
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: --version must be x.y.z" >&2; exit 2; }
 for d in "$tester" "$portal" "$runner"; do [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "ERROR: $d is not sha256:<64 hex>" >&2; exit 2; }; done
 
-ctx="$(kubectl config current-context)"
-[ "$ctx" = colima ] || { echo "ERROR: kubectl's current context is '$ctx', not colima — refusing to touch any other cluster" >&2; exit 1; }
+# EVERY Kubernetes call below names the colima context explicitly — never the mutable current context, so another
+# terminal switching contexts mid-run cannot redirect a Secret or the release into another cluster.
+kubectl config get-contexts colima >/dev/null 2>&1 || { echo "ERROR: no kubectl context named colima" >&2; exit 1; }
+k() { kubectl --context colima "$@"; }
 
 # ── preconditions: everything is CHECKED before anything is changed ──────────────────────────────────────────
 echo "== 0/4 preconditions"
-kubectl get crd scaledobjects.keda.sh -o name >/dev/null 2>&1 \
+k get crd scaledobjects.keda.sh -o name >/dev/null 2>&1 \
   || { echo "ERROR: KEDA is not installed in this cluster (no scaledobjects.keda.sh) — the host's scaler needs it; install KEDA first. Nothing was changed." >&2; exit 1; }
-kubectl -n keda wait --for=condition=Available deployment --all --timeout=20s >/dev/null 2>&1 \
+k -n keda wait --for=condition=Available deployment --all --timeout=20s >/dev/null 2>&1 \
   || { echo "ERROR: KEDA's deployments in namespace keda are not Available. Nothing was changed." >&2; exit 1; }
-alloc="$(kubectl get nodes -o jsonpath='{.items[0].status.allocatable.cpu} {.items[0].status.allocatable.memory}')"
+alloc="$(k get nodes -o jsonpath='{.items[0].status.allocatable.cpu} {.items[0].status.allocatable.memory}')"
 python3 - "$alloc" "$here/build-host-mac.values.yaml" <<'PY2' || { echo "Nothing was changed." >&2; exit 1; }
 import re, sys, yaml
 cpu, mem = sys.argv[1].split()
@@ -89,31 +91,31 @@ colima ssh -- unshare -U -r true 2>/dev/null \
   || echo "   loaded: an unprivileged user namespace starts under mw-build-host, and not without it"
 
 echo "== 2/4 namespace build-mac"
-kubectl create namespace build-mac --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+k create namespace build-mac --dry-run=client -o yaml | k apply -f - >/dev/null
 
 echo "== 3/4 secrets (values on stdin only — never in a process argument, never printed)"
 printf '%s' "$worker_value" \
-  | kubectl -n build-mac create secret generic build-worker-mac --from-file=token=/dev/stdin --dry-run=client -o yaml \
-  | kubectl apply -f - >/dev/null
+  | k -n build-mac create secret generic build-worker-mac --from-file=token=/dev/stdin --dry-run=client -o yaml \
+  | k apply -f - >/dev/null
 printf '%s' "$pull_value" | python3 -c '
 import base64, json, sys
 registry, user = sys.argv[1], sys.argv[2]
 password = sys.stdin.read()
 auth = base64.b64encode(f"{user}:{password}".encode()).decode()
 sys.stdout.write(json.dumps({"auths": {registry: {"username": user, "password": password, "auth": auth}}}))' "$registry" "$pulluser" \
-  | kubectl -n build-mac create secret generic build-pull --type=kubernetes.io/dockerconfigjson \
+  | k -n build-mac create secret generic build-pull --type=kubernetes.io/dockerconfigjson \
       --from-file=.dockerconfigjson=/dev/stdin --dry-run=client -o yaml \
-  | kubectl apply -f - >/dev/null
+  | k apply -f - >/dev/null
 # The plugins layer: a host holds NO registry credential for it (StandingBuildHosts §2); it reads the registry's bundle
 # index (H8) with the Mac's READ-ONLY instance key.
 printf '%s' "$key_value" \
-  | kubectl -n build-mac create secret generic build-registry-key-mac --from-file=key=/dev/stdin --dry-run=client -o yaml \
-  | kubectl apply -f - >/dev/null
+  | k -n build-mac create secret generic build-registry-key-mac --from-file=key=/dev/stdin --dry-run=client -o yaml \
+  | k apply -f - >/dev/null
 unset worker_value pull_value key_value
 echo "   build-worker-mac, build-pull (image pulls only) and build-registry-key-mac applied"
 
 echo "== 4/4 helm upgrade --install build-host-mac ($version)"
-helm upgrade --install build-host-mac "$chart" -n build-mac \
+helm upgrade --install build-host-mac "$chart" --kube-context colima -n build-mac \
   -f "$chart/values.yaml" -f "$here/build-host-mac.values.yaml" \
   --set-string buildHosts.apiUrl="$api" \
   --set-string buildHosts.testerRepository="$registry/mw-plugin-test" \
@@ -126,4 +128,4 @@ helm upgrade --install build-host-mac "$chart" -n build-mac \
   --set-string buildHosts.mac.portalDigest="$portal" \
   --set-string buildHosts.mac.runnerDigest="$runner" \
   --wait=false
-kubectl -n build-mac get deploy,scaledobject,pvc
+k -n build-mac get deploy,scaledobject,pvc

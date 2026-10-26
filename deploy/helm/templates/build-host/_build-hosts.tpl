@@ -99,6 +99,9 @@ The refusals, and why each one exists:
 {{- /* EXTRA channels (`buildHosts.extraChannels`): a host on an opt-in channel of its own — a leased-back Mac's `mac` —
        configured exactly like `latest`/`stable` under `buildHosts.<name>`. A channel name is lower-case, starts with a letter,
        and is never `latest`, `stable` or a reserved `probe*` (the build API's BuildChannel rule). */ -}}
+{{- if not (has ($b.rolloutStrategy | default "RollingUpdate") (list "RollingUpdate" "Recreate")) -}}
+{{- fail (printf "buildHosts.rolloutStrategy %q must be RollingUpdate or Recreate" $b.rolloutStrategy) -}}
+{{- end -}}
 {{- $extra := ($b.extraChannels | default list) -}}
 {{- range $name := $extra -}}
 {{- if or (not (regexMatch "^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$" $name)) (has $name (list "latest" "stable")) (hasPrefix "probe" $name) -}}
@@ -223,6 +226,7 @@ The refusals, and why each one exists:
                             "dnsPodSelector" ($np.dnsPodSelector | default (dict "k8s-app" "kube-dns"))
                             "apiPort" (int ($np.apiPort | default 8080)) "privateCidrs" ($np.privateCidrs | default list))
       "artifactStore" (dict "spec" $asSpec "claimName" $asClaim)
+      "rolloutStrategy" ($b.rolloutStrategy | default "RollingUpdate")
       "registry" (dict "url" $regUrl "keySecret" $regSecret "keySecretKey" ((($reg.instanceKeySecret | default dict).key) | default "key"))
       "channels" $channels) -}}
 {{- end -}}

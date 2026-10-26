@@ -1140,6 +1140,9 @@ buildHosts:
   # Opt-in channels beyond latest/stable, each configured like them under `buildHosts.<name>` (e.g. a leased-back
   # Mac's `mac`: only jobs routed to that channel land there).
   extraChannels: []
+  # RollingUpdate (default: the new host is ready before the old one leaves) or Recreate — a single-node host whose node
+  # cannot hold two hosts at once (a leased-back Mac) drains the old one first.
+  rolloutStrategy: "RollingUpdate"
   # The images, by REPOSITORY; each channel names the DIGEST it runs (written by core's CD).
   testerRepository: ""            # e.g. cr.example.com/mw-plugin-test
   portalRepository: ""            # e.g. cr.example.com/memex-portal-ai

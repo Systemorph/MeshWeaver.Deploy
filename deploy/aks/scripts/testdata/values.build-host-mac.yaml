@@ -16,6 +16,7 @@ buildHosts:
   imagePullSecret: "build-pull"
   # The plugins layer through the registry's bundle index with a read-only instance key (H8): a Mac has no workload identity.
   registry: {url: "https://registry.example.com", instanceKeySecret: {name: "build-registry-key-mac", key: "key"}}
+  rolloutStrategy: "Recreate"
   nodeSelector: null
   tolerations: null
   resources:

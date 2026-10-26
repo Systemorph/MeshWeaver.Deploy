@@ -468,6 +468,7 @@ else:
     if vols.get("registry-key", {}).get("secret", {}).get("secretName") != "build-registry-key-mac": problems.append("no registry-key volume")
     builds = [c for c in spec["containers"] if c["name"] == "build"]
     if not builds or builds[0]["resources"]["requests"] != {"cpu": "4", "memory": "8Gi"}: problems.append(f"requests: {builds and builds[0]['resources']}")
+    if dep["spec"]["strategy"] != {"type": "Recreate"}: problems.append(f"strategy: {dep['spec']['strategy']}")
 so = [d for d in docs if d["kind"] == "ScaledObject"]
 if len(so) != 1 or "channel=mac" not in str(so[0]): problems.append("the ScaledObject does not scale on channel=mac")
 pvc = by.get(("PersistentVolumeClaim", "build-cache-mac"))
