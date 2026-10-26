@@ -209,6 +209,12 @@ echo "── postinstall: probe first, activate a vendored copy only where neede
 # A staged prefix as the payload would leave it: share/tools.sh + manifest, vendored stubs; and an
 # "existing" PATH directory standing for the developer's Homebrew copies.
 P="$T/prefix"; EX="$T/existing"; mkdir -p "$P/share" "$EX"
+# Only the fixtures and the utilities the scripts need — never a system directory, whose real
+# kubectl/helm would satisfy a floor the fixture means to fail (see the homebrew suite).
+TSYS="$T/sys"; mkdir -p "$TSYS"
+for u in bash sh awk cut head tail grep sed tr mktemp ln rm mkdir dirname basename readlink ls wc cat date id uname stat sort env sleep chmod printf sudo; do
+  for d in /usr/bin /bin /usr/sbin; do [ -x "$d/$u" ] && { ln -sf "$d/$u" "$TSYS/$u"; break; }; done
+done
 cp "$BREW/share/tools.sh" "$BREW/share/tools.manifest" "$P/share/"
 stub() { printf '#!/bin/bash\nprintf "%%s\\n" "%s"\n' "$3" > "$1/$2"; chmod +x "$1/$2"; }
 vend() { mkdir -p "$P/libexec/vendor/$1/bin"; stub "$P/libexec/vendor/$1/bin" "$2" "$3"; }
@@ -220,7 +226,7 @@ existing_all() {
   stub "$EX" helm "v4.2.4+g"; stub "$EX" mkcert "v1.4.4"; stub "$EX" ollama "ollama version is 0.33.2"; stub "$EX" socket_vmnet ""
 }
 POST="$MACOS/scripts/postinstall"
-runpost() { OUT="$(env MEMEX_PKG_PREFIX="$P" MEMEX_PKG_PROBE_PATH="$EX:/usr/bin:/bin" PATH="/usr/bin:/bin" "$POST" 2>&1)"; RC=$?; }
+runpost() { OUT="$(env MEMEX_PKG_PREFIX="$P" MEMEX_PKG_PROBE_PATH="$EX:$TSYS" PATH="/usr/bin:/bin" "$POST" 2>&1)"; RC=$?; }
 links() { ls "$P/bin" 2>/dev/null | tr '\n' ' '; }
 
 existing_all; runpost
