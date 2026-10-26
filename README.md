@@ -29,11 +29,23 @@ The platform knows nothing about what consumes its sets (its policy
 Every 15 minutes `build-host.yml` (`schedule`) reads the platform's sealed sets from the registry
 they were sealed into: a set is PROMOTED when `mw-plugin-test` carries its version tag and ARMED
 when `memex-portal-ai` does, and both tags sit on the manifest whose `staging-<core7>-<run id>` tag
-names the platform commit and the CD run (`platform-set-dispatch.py discover`). The newest ARMED,
-then the newest PROMOTED, set that still has no `mw-build-host:<version>` becomes the hand-over; when
-every runner is there, the tick builds nothing and re-sends the newest armed set to `build-latest`
-(idempotent at the receiver). A set therefore reaches `build-latest` within one tick of being armed,
-and nothing in the platform's delivery waits on it.
+names the platform commit and the CD run (`platform-set-dispatch.py discover`). The newest ARMED
+set that still has no `mw-build-host:<version>` becomes the hand-over; otherwise the OLDEST retained
+set — armed or promoted — that still lacks one does (a BACKFILL). Every set the registry still
+carries a version tag for is a candidate, not only the newest: when two sets arrive between two
+ticks (A, then B), only B is ever the newest, and without the backfill A would never get a runner —
+so a `build-stable` hand-over whose main-passed ceiling is A would fail on the missing
+`mw-build-host:A`. The bounds: ONE runner image per tick, and a window of the retained sets not older
+than the oldest runner `mw-build-host` still carries (at most the 60 newest of them); a set older
+than every runner predates the lane and is not rebuilt. When every runner is there, the tick builds
+nothing and re-sends the newest armed set to `build-latest` (idempotent at the receiver). A set
+therefore reaches `build-latest` within one tick of being armed, and nothing in the platform's
+delivery waits on it.
+
+`build-host-stable.yml` does not rely on the backfill alone: when its main-passed ceiling has no
+`mw-build-host:<ceiling>` (a ceiling outside the window, or one the backfill has not reached yet),
+it dispatches `build-host.yml` for exactly that set and waits for the image (up to 35 minutes)
+before it hands the ceiling to `build-stable` — instead of failing on a missing runner digest.
 
 Two events carry the same hand-over explicitly, read through the same contract (schema 1): a
 `workflow_dispatch` (a person re-running one) and a `repository_dispatch` of type

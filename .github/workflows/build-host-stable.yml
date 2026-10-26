@@ -34,10 +34,14 @@ jobs:
     name: "Build host: hand the main-passed ceiling to build-stable (daily, record path)"
     # The daily schedule only — `stable` is refused on any other trigger (build-host-announcement.py).
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 45, not 15: when the ceiling has no runner yet, this job builds it on demand (build-host.yml,
+    # dispatched) and waits for the image — up to RUNNER_WAIT_MINUTES — before it hands it over.
+    timeout-minutes: 45
     permissions:
       contents: read
       id-token: write
+      # Dispatches build-host.yml for the ceiling's runner when mw-build-host:<ceiling> is missing.
+      actions: write
     outputs:
       enabled: ${{ steps.build_host_stable.outputs.enabled }}
       handed: ${{ steps.post.outputs.handed }}
@@ -129,6 +133,57 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      # 🚨 THE CEILING'S RUNNER, ON DEMAND (core #7196 review). The ceiling is a set Plugins' main
+      # PASSED, which is usually not the newest one: two sets arriving between two build-host.yml
+      # ticks, or a ceiling older than that lane's backfill window, can leave it without
+      # `mw-build-host:<ceiling>`. Handing it over would then fail on the missing runner digest, so
+      # this step BUILDS it instead: it dispatches build-host.yml for exactly that set (the same
+      # image job, the same one-digest-per-version rule, the same checks of the set and its commit)
+      # and waits for the tag to appear. Only a registry that ANSWERED "not found" means absent;
+      # any other inspect failure is red, never a build.
+      - name: "The ceiling's runner: build mw-build-host:<ceiling> on demand when it is missing"
+        if: steps.build_host_stable.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V_SET: ${{ steps.ceiling.outputs.set }}
+          CORE_SHA: ${{ steps.ceiling.outputs.sha }}
+          CD_RUN_URL: ${{ steps.ceiling.outputs.run-url }}
+          RUNNER_WAIT_MINUTES: "35"
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          [ -n "${V_SET:-}" ] || { echo "::error::the ceiling named no set — refusing to hand build-stable nothing"; exit 1; }
+          bash platform/.github/scripts/acr-login.sh
+          ref="meshweaver.azurecr.io/mw-build-host:$V_SET"
+          present() {
+            if docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' >/dev/null 2>"$RUNNER_TEMP/inspect.err"; then
+              return 0
+            fi
+            grep -qiE 'not found|manifest unknown|MANIFEST_UNKNOWN' "$RUNNER_TEMP/inspect.err" && return 1
+            cat "$RUNNER_TEMP/inspect.err"
+            echo "::error::could not establish whether $ref exists (the registry did not answer 'not found') — build-stable was NOT handed $V_SET"
+            exit 1
+          }
+          if present; then
+            echo "$ref exists — nothing to build"
+            exit 0
+          fi
+          echo "::notice title=build-stable ceiling has no runner::$ref is missing — dispatching build-host.yml to build it"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/build-host.yml/dispatches" \
+            -f ref="$DEFAULT_BRANCH" \
+            -f "inputs[run_url]=$CD_RUN_URL" -f "inputs[run_core_sha]=$CORE_SHA" \
+            -f "inputs[set_version]=$V_SET" -f "inputs[set_core_sha]=$CORE_SHA" \
+            || { echo "::error::could not dispatch build-host.yml for $V_SET — build-stable was NOT handed it"; exit 1; }
+          deadline=$(( $(date +%s) + RUNNER_WAIT_MINUTES * 60 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            sleep 60
+            if present; then
+              echo "- build-stable: the ceiling \`$V_SET\` had no runner — built on demand (build-host.yml dispatched)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          done
+          echo "::error::$ref did not appear within ${RUNNER_WAIT_MINUTES} min of dispatching build-host.yml — build-stable was NOT handed $V_SET; read that workflow's newest workflow_dispatch run (the image is kept, so the next daily run hands it over)"
+          exit 1
       - name: "Sign and POST build-host-update-available for build-stable"
         if: steps.build_host_stable.outputs.enabled == 'true'
         id: post
@@ -177,7 +232,7 @@ jobs:
             401) echo "::error::the inbox REFUSED the signature (HTTP 401) — build-stable was NOT handed $V_SET"; exit 1 ;;
             *)   echo "::error::the inbox refused the build-host event (HTTP $code) — build-stable was NOT handed $V_SET"; exit 1 ;;
           esac
-  # The REPORT is its own job (if: always()): a step inside the 15-minute job it monitors dies with
+  # The REPORT is its own job (if: always()): a step inside the 45-minute job it monitors dies with
   # that job on a timeout, and `failure()` excludes a cancellation. This job reads the operation's
   # RESULT and its `handed` output: a failed or cancelled roll files (or comments on) the one open
   # `build-host` issue; only an ENABLED, completed hand-over clears it (a disabled no-op is not a
