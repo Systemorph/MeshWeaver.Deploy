@@ -302,7 +302,12 @@ spec:
         - name: "work"
           emptyDir: { sizeLimit: {{ $b.workSizeLimit | quote }} }
         - name: "cache"
+          {{- if eq $b.cache.medium "node" }}
+          # Node-local (cache.medium: node): a host in its own user namespace cannot mount an SMB/NFS claim.
+          emptyDir: {{- if $b.cache.size }} { sizeLimit: {{ $b.cache.size | quote }} }{{- else }} {}{{- end }}
+          {{- else }}
           persistentVolumeClaim: { claimName: {{ $b.cacheClaim | quote }} }
+          {{- end }}
         {{- if $b.artifactStore.claimName }}
         - name: "ci-artifacts"
           persistentVolumeClaim: { claimName: {{ $b.artifactStore.claimName | quote }} }

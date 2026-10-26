@@ -1,0 +1,28 @@
+# Refusal: buildHosts.cache.medium is claim or node, nothing else.
+portal:
+  enabled: false
+postgres:
+  enabled: false
+ingress:
+  enabled: false
+buildHosts:
+  enabled: true
+  apiUrl: "https://control.example.com/api/builds"
+  testerRepository: "cr.example.com/mw-plugin-test"
+  portalRepository: "cr.example.com/memex-portal-ai"
+  runnerRepository: "cr.example.com/mw-build-host"
+  imagePullSecret: "build-pull"
+  cacheClaimName: "build-cache-mac"
+  cache: {create: true, storageClass: "local-path", size: "60Gi", accessMode: "ReadWriteOnce", medium: "tmpfs"}
+  sandbox: {appArmorProfile: "Localhost", appArmorLocalhostProfile: "mw-build-host"}
+  workerTokenSecret: {name: "build-worker-mac", key: "token"}
+  latest: {enabled: false}
+  stable: {enabled: false}
+  extraChannels: ["mac"]
+  mac:
+    enabled: true
+    maxReplicas: 1
+    platformVersion: "3.1.11641"
+    testerDigest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    portalDigest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    runnerDigest: "sha256:3333333333333333333333333333333333333333333333333333333333333333"
