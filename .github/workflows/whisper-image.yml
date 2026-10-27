@@ -156,24 +156,22 @@ jobs:
           set -euo pipefail
           short="${GITHUB_SHA::7}"
           docker push "$ACR/$REPO:${LINE}-${short}"
-      # The moving line follows main's NEWEST publication, and it is converged on EVERY publish run — a run
-      # whose image was already published included, so a line move that failed once completes on rerun.
-      # Concurrent publish runs of different commits are safe WITHOUT a lock (a job-level concurrency group
-      # would cancel a pending main run): `converge-line` puts the line on the newest published image by a
-      # byte-for-byte retag and RE-CHECKS AFTER EVERY WRITE (re-fetch main, re-derive the newest, read the
-      # line back), going round until nothing moved underneath. Whichever write lands last was followed by
-      # its writer's own re-check, so an older run that paused before its PUT corrects its own stale write.
-      # The target is the newest commit whose image IS published: an unpublished one (registry "not found")
-      # is skipped, never stopped at, so a failed newer build cannot strand the line on a stale write.
-      - name: Converge :<line> onto main's newest publication
+      # ONE INVARIANT: the moving line names the NEWEST PUBLISHED `<line>-<sha7>` tag, "newest" in main's
+      # first-parent order. `converge-line` recomputes that on EVERY publish run from the registry's own tag
+      # list (what was really published: a dispatch on any main commit, a multi-commit push's tip) and
+      # main's history (no path filter), retags byte for byte when the line differs, and RE-CHECKS AFTER
+      # EVERY WRITE until nothing moved underneath. Whichever write lands last was followed by its writer's
+      # own re-check, so concurrent runs cannot leave the line on an older image, and an unpublished or
+      # failed newer build is simply not in the tag list. No lock and no concurrency group: a job-level
+      # group would cancel a pending main run. A rerun whose image was already published converges too.
+      - name: Converge :<line> onto the newest published tag in main order
         id: line
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         run: |
           set -euo pipefail
           python3 .github/scripts/acr-data-plane.py converge-line --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
-            --repository "$REPO" --line "$LINE" --self "$GITHUB_SHA" \
-            --paths "deploy/whisper/Dockerfile .github/workflows/whisper-image.yml" | tee "$RUNNER_TEMP/converge.out"
+            --repository "$REPO" --line "$LINE" --self "$GITHUB_SHA" | tee "$RUNNER_TEMP/converge.out"
           grep -E '^(newest|digest)=' "$RUNNER_TEMP/converge.out" >> "$GITHUB_OUTPUT"
       # The immutable tag is this run's to verify. The line is NOT re-read here: by now a newer run may
       # legitimately have moved it, and converge-line has already read it back inside its own loop.

@@ -32,16 +32,17 @@ registry with that.
         `subscription-id`, and nothing in the workflow runs an `az acr` command or the platform's
         `acr-login.sh` (both take the ARM lookup above).
     acr-data-plane.py converge-line --registry <login server> --tenant <tenant id> --repository <name>
-                              --line <line tag> --self <commit> --paths "<lane paths>"
-        put <line> on the image of main's newest PUBLISHED publication — first-parent commits of
-        origin/main touching <paths>, tagged <line>-<sha7> — and RE-CHECK AFTER EVERY WRITE: re-fetch
-        main, re-derive the newest, read the line back, and write again until the line names the newest
-        published image and nothing moved underneath. That is what makes concurrent publish runs safe
-        without a lock: whichever write lands LAST was followed by its writer's own re-check, so a stale
-        write (an older run that paused before its PUT) is always corrected by the run that made it.
-        The walk goes newest first over at most 50 publications and converges to the newest whose
-        image IS published: an unpublished commit (registry "not found") is skipped, never stopped
-        at; any other lookup outcome is red, and no published image in the window is red.
+                              --line <line tag> --self <commit>
+        ONE INVARIANT: <line> names the image of the NEWEST PUBLISHED <line>-<sha7> tag, "newest" in main's
+        first-parent order. Every run recomputes that from the REGISTRY's own tag list (what was really
+        published — a dispatch on any main commit, a multi-commit push's tip, included) and main's
+        first-parent history (no path filter), writes the line by a byte-for-byte retag if it differs,
+        and RE-CHECKS AFTER EVERY WRITE (re-list, re-fetch, read the line back) until nothing moved
+        underneath. Whichever write lands LAST was followed by its writer's own re-check, so concurrent
+        runs cannot leave the line on an older image, and an unpublished or failed newer build is simply
+        not in the tag list. A tag whose commit is not on main's first-parent history (e.g. one written
+        before the lane moved here) cannot be ordered and is ignored. Red: the tag list could not be
+        read, this run's own tag is not in it, no tag can be ordered, or a 7-char prefix is ambiguous.
     acr-data-plane.py check-line-convergence <workflow.yml>
         RED unless the service-image lane moves its line tag ONLY through `converge-line` (never a raw
         `retag … --to "$LINE"`, which has no post-write re-check, and never a build or push), in a step
@@ -238,57 +239,92 @@ def tag_digest(server: str, tenant: str, repository: str, tag: str, io: Io) -> s
     return "sha256:" + hashlib.sha256(body).hexdigest()
 
 
-PUBLICATION_WINDOW = 50
+def list_tags(server: str, tenant: str, repository: str, io: Io) -> list[str]:
+    """Every tag of <repository>, from the registry's data plane (`/v2/<name>/tags/list`, Link-paged).
+    Any answer but 200 is a Refusal: an unread listing never reads as "nothing published"."""
+    if not REPOSITORY_RE.fullmatch(repository or ""):
+        raise Refusal(f"--repository is not a repository name: {repository!r}")
+    token = access_token(server, refresh_token(server, tenant, io), f"repository:{repository}:pull", io)
+    tags: list[str] = []
+    url: str | None = f"/v2/{repository}/tags/list?n={PAGE}"
+    pages = 0
+    while url:
+        pages += 1
+        if pages > 1000:
+            raise Refusal(f"{repository}: the tag listing did not end after 1000 pages")
+        full = url if url.startswith("https://") else f"https://{server}{url}"
+        status, headers, body = io.fetch("GET", full, token, {"Accept": "application/json"}, None)
+        if status != 200:
+            raise Refusal(f"GET {repository} tags answered HTTP {status} — the published set is unknown")
+        page = json.loads(body.decode() or "{}")
+        batch = page.get("tags") if isinstance(page, dict) else None
+        if not isinstance(batch, list):
+            raise Refusal(f"{server} answered no `tags` list for {repository}")
+        tags += [t for t in batch if isinstance(t, str)]
+        url = next_link(headers.get("link"))
+    return tags
 
 
-def publications(paths: list[str], io: Io) -> list[str]:
-    """main's first-parent commits touching the lane's paths, NEWEST FIRST, at most PUBLICATION_WINDOW of
-    them, from a FRESH fetch."""
+def main_first_parent(io: Io) -> list[str]:
+    """main's first-parent history, NEWEST FIRST, from a FRESH fetch — no path filter."""
     io.run(["git", "fetch", "--quiet", "origin", "main"], check=True, capture_output=True, text=True)
-    out = io.run(["git", "log", f"-{PUBLICATION_WINDOW}", "--first-parent", "--format=%H", "origin/main", "--", *paths],
+    out = io.run(["git", "rev-list", "--first-parent", "origin/main"],
                  check=True, capture_output=True, text=True).stdout.split()
     if not out or not all(re.fullmatch(r"[0-9a-f]{40}", c) for c in out):
-        raise Refusal(f"could not resolve main's publications for {paths} (got {out[:3]!r})")
+        raise Refusal(f"could not read main's first-parent history (got {out[:3]!r})")
     return out
 
 
-def newest_published(server: str, tenant: str, repository: str, line: str, self_sha: str, paths: list[str],
+def newest_published(server: str, tenant: str, repository: str, line: str, self_sha: str,
                      io: Io) -> tuple[str, str]:
-    """(commit, digest) of the newest publication on main whose immutable image IS in the registry.
-    Walks newest first and SKIPS a commit only when the registry ANSWERED "not found" (its build is still
-    running, or failed); any other lookup outcome is a Refusal. Never stops at the first commit."""
-    skipped = []
-    for commit in publications(paths, io):
-        digest = tag_digest(server, tenant, repository, f"{line}-{commit[:7]}", io)
-        if digest is not None:
-            if skipped:
-                print(f"converge-line: skipped unpublished {', '.join(c[:7] for c in skipped)} — newest published is {commit[:7]}")
-            return commit, digest
-        if commit == self_sha:
-            raise Refusal(f"{repository}:{line}-{commit[:7]} is this run's own image and the registry says it is absent")
-        skipped.append(commit)
-    raise Refusal(f"none of main's {len(skipped)} newest publications of {repository} (window {PUBLICATION_WINDOW}) "
-                  f"has a published {line}-<sha7> image — nothing to converge the line to")
+    """(commit, digest) of the newest PUBLISHED `<line>-<sha7>` tag, newest in main's first-parent order."""
+    pattern = re.compile(rf"^{re.escape(line)}-([0-9a-f]{{7}})$")
+    published = {m.group(1) for t in list_tags(server, tenant, repository, io) if (m := pattern.match(t))}
+    if self_sha[:7] not in published:
+        raise Refusal(f"{repository}:{line}-{self_sha[:7]} is this run's own image and the tag list does not have it")
+    position: dict[str, int] = {}
+    ambiguous: set[str] = set()
+    order = main_first_parent(io)
+    for i, commit in enumerate(order):
+        k = commit[:7]
+        if k in position:
+            ambiguous.add(k)
+        else:
+            position[k] = i
+    orderable = sorted((position[k], k) for k in published if k in position)
+    if not orderable:
+        raise Refusal(f"none of the {len(published)} published {line}-<sha7> tags of {repository} names a commit on "
+                      "main's first-parent history — nothing to converge the line to")
+    i, k = orderable[0]
+    if k in ambiguous:
+        raise Refusal(f"{line}-{k}: the 7-character prefix names more than one commit on main — refusing to guess")
+    digest = tag_digest(server, tenant, repository, f"{line}-{k}", io)
+    if digest is None:
+        raise Refusal(f"{repository}:{line}-{k} is in the tag list but the registry says it is absent")
+    unordered = len(published) - len(orderable)
+    if unordered:
+        print(f"converge-line: ignored {unordered} published {line}-<sha7> tag(s) whose commit is not on main's first-parent history")
+    return order[i], digest
 
 
 CONVERGE_ROUNDS = 6
 
 
-def converge_line(server: str, tenant: str, repository: str, line: str, self_sha: str, paths: list[str],
+def converge_line(server: str, tenant: str, repository: str, line: str, self_sha: str,
                   io: Io) -> tuple[str, str]:
-    """(commit, digest) the line names once converged onto main's newest PUBLISHED publication."""
+    """(commit, digest) the line names once converged onto the newest PUBLISHED tag in main order."""
     if not re.fullmatch(r"[0-9a-f]{40}", self_sha or ""):
         raise Refusal(f"--self must be a 40-hex commit, got {self_sha!r}")
-    if not paths:
-        raise Refusal("--paths is empty — the newest publication of WHAT?")
+    if not TAG_RE.fullmatch(line or ""):
+        raise Refusal(f"--line is not a tag: {line!r}")
     for round_ in range(1, CONVERGE_ROUNDS + 1):
-        target, want = newest_published(server, tenant, repository, line, self_sha, paths, io)
+        target, want = newest_published(server, tenant, repository, line, self_sha, io)
         if tag_digest(server, tenant, repository, line, io) != want:
             retag(server, tenant, repository, f"{line}-{target[:7]}", line, io)
         # The re-check that makes a stale write self-correcting: after OUR write, is the target still the
-        # newest PUBLISHED one, and does the line still name it? Anything that moved underneath (a newer
-        # image published, another writer's PUT) sends us round again.
-        again, _ = newest_published(server, tenant, repository, line, self_sha, paths, io)
+        # newest published tag in main order, and does the line still name it? Anything that moved
+        # underneath (a newer tag published, another writer's PUT) sends us round again.
+        again, _ = newest_published(server, tenant, repository, line, self_sha, io)
         if again == target and tag_digest(server, tenant, repository, line, io) == want:
             print(f"converge-line: {repository}:{line} = {want} ({line}-{target[:7]}, round {round_})")
             return target, want
@@ -436,8 +472,7 @@ def check_line_convergence(text: str) -> list[str]:
         if re.search(r"^\s*(?:-\s+)?if:", body, flags=re.M):
             problems.append(f"{where} carries an `if:` — the line must converge on EVERY publish run, a rerun whose "
                             "image was already published included, or a failed line move is never completed")
-        for flag, why in (('--line "$LINE"', "the line it moves"), ('--self "$GITHUB_SHA"', "this run's own commit"),
-                          ("--paths", "the lane's publication paths")):
+        for flag, why in (('--line "$LINE"', "the line it moves"), ('--self "$GITHUB_SHA"', "this run's own commit")):
             if flag not in body:
                 problems.append(f"{where} does not pass `{flag}` ({why})")
     if steps and not re.search(r"^\s*fetch-depth:\s*0\s*$", text, flags=re.M):
@@ -702,7 +737,7 @@ jobs:
         id: line
         run: |
           python3 .github/scripts/acr-data-plane.py converge-line --registry "$ACR" --tenant "$T" \\
-            --repository x --line "$LINE" --self "$GITHUB_SHA" --paths "deploy/x"
+            --repository x --line "$LINE" --self "$GITHUB_SHA"
 """
     check("line: the converging lane passes (positive control)", lambda: check_line_convergence(lane), lambda p: p == [])
     check("line: a converge step gated on `exists == 'false'` is red (round-2 review)",
@@ -713,9 +748,9 @@ jobs:
           lambda: check_line_convergence(lane + '      - run: |\n          python3 .github/scripts/acr-data-plane.py retag '
                                                 '--registry r --tenant t --repository x --from "a" --to "$LINE"\n'),
           lambda p: len(p) == 1 and "raw `retag" in p[0])
-    check("line: a converge step without --paths is red",
-          lambda: check_line_convergence(lane.replace(' --paths "deploy/x"', "")),
-          lambda p: len(p) == 1 and "--paths" in p[0])
+    check("line: a converge step without --self is red",
+          lambda: check_line_convergence(lane.replace(' --self "$GITHUB_SHA"', "")),
+          lambda p: len(p) == 1 and "--self" in p[0])
     check("line: pushing :$LINE with docker is red",
           lambda: check_line_convergence(lane.replace('run: docker push "$ACR/x:${LINE}-${short}"',
                                                       'run: docker push "$ACR/x:${LINE}"')),
@@ -741,31 +776,44 @@ jobs:
           lambda p: any("no step runs" in x for x in p))
 
     # ── converge-line against a fake registry + a fake main ──
-    A, B, C = "a" * 40, "b" * 40, "c" * 40
-    blob = {f"0.1-{A[:7]}": b'{"a":1}', f"0.1-{B[:7]}": b'{"b":2}', f"0.1-{C[:7]}": b'{"c":3}'}
-    dig = {k: "sha256:" + hashlib.sha256(v).hexdigest() for k, v in blob.items()}
+    A, B, C, D, S, T, X = ("a" * 40, "b" * 40, "c" * 40, "d" * 40, "5" * 40, "7" * 40, "e" * 40)
+    PRE = "0123456"     # a tag written before the lane moved here: its commit is not on this main
+    blob = {f"0.1-{c[:7]}": ('{"img":"%s"}' % c[:7]).encode() for c in (A, B, C, D, S, T, X)}
+    blob[f"0.1-{PRE}"] = b'{"img":"pre"}'
 
     def img(c):
         return blob[f"0.1-{c[:7]}"]
 
-    def converge_io(logs, reg, puts, after_put=None, fail_tag=None):
-        """logs: successive answers of `git log` (each newest-first); reg: tag -> bytes (the registry)."""
-        state = {"logs": [list(x) for x in logs]}
+    def digest_of(c):
+        return "sha256:" + hashlib.sha256(img(c)).hexdigest()
+
+    def converge_io(mains, reg, puts, after_put=None, list_status=200, page=0):
+        """mains: successive answers of `git rev-list --first-parent origin/main` (newest first);
+        reg: tag -> bytes (the registry). page > 0 splits the tag listing into pages of that size."""
+        state = {"mains": [list(x) for x in mains]}
 
         def post(url, form):
             return {"refresh_token": "r"} if url.endswith("/oauth2/exchange") else {"access_token": "t"}
 
         def run(cmd, **kw):
-            if cmd[:2] == ["git", "log"]:
-                h = state["logs"].pop(0) if len(state["logs"]) > 1 else state["logs"][0]
+            if cmd[:2] == ["git", "rev-list"]:
+                h = state["mains"].pop(0) if len(state["mains"]) > 1 else state["mains"][0]
                 return Done("\n".join(h) + "\n")
             return Done("entra-token\n" if cmd[0] == "az" else "")
 
         def fetch(method, url, token, headers, body):
+            if "/tags/list" in url:
+                if list_status != 200:
+                    return list_status, {}, b""
+                names = sorted(reg)
+                if not page:
+                    return 200, {}, json.dumps({"tags": names}).encode()
+                start = int(url.split("last=")[1]) if "last=" in url else 0
+                link = (f'</v2/x/tags/list?n={page}&last={start + page}>; rel="next"'
+                        if start + page < len(names) else None)
+                return 200, ({"link": link} if link else {}), json.dumps({"tags": names[start:start + page]}).encode()
             tag = url.rsplit("/", 1)[1]
             if method == "GET":
-                if tag == fail_tag:
-                    return 503, {}, b"throttled"
                 return (200, {"content-type": "application/vnd.oci.image.manifest.v1+json"}, reg[tag]) if tag in reg \
                     else (404, {}, b"")
             reg[tag] = body
@@ -778,64 +826,67 @@ jobs:
     def published(*cs):
         return {f"0.1-{c[:7]}": img(c) for c in cs}
 
-    reg = published(A)
-    puts: list = []
-    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([[A]], reg, puts))
+    def run_converge(self_sha, mains, reg, **kw):
+        puts: list = []
+        got = converge_line("r.io", "t", "x", "0.1", self_sha, converge_io(mains, reg, puts, **kw))
+        return got, reg.get("0.1"), puts
+
     check("converge/the newest run moves the line onto its own image and verifies it",
-          lambda: (got, puts), lambda g: g == ((A, dig[f"0.1-{A[:7]}"]), ["0.1"]))
-    # Round-3 race: A believes it is newest, B was promoted while A paused; A's PUT lands on top and A's own
-    # re-check puts the line back on B.
-    reg = dict(published(A, B), **{"0.1": img(B)})
-    puts = []
-    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([[A], [B, A]], reg, puts))
+          lambda: run_converge(A, [[A]], published(A)), lambda g: g == ((A, digest_of(A)), img(A), ["0.1"]))
+    # Round-3 race: A believes it is newest (its fetch predates B), B was promoted while A paused; A's PUT
+    # lands on top and A's own re-check puts the line back on B.
     check("converge/a stale write by an older run is corrected by that run's own re-check",
-          lambda: (got, reg["0.1"], puts),
-          lambda g: g[0] == (B, dig[f"0.1-{B[:7]}"]) and g[1] == img(B) and g[2] == ["0.1", "0.1"])
-    # Round-4 race (A/B/C): A's delayed PUT lands on B's promoted line AFTER C became newest, and C's image is
-    # not published yet. The re-check must walk PAST unpublished C to B, never stop at C and leave A.
-    reg = dict(published(A, B), **{"0.1": img(B)})
-    puts = []
-    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([[A], [C, B, A]], reg, puts))
+          lambda: run_converge(A, [[A], [B, A]], dict(published(A, B), **{"0.1": img(B)})),
+          lambda g: g == ((B, digest_of(B)), img(B), ["0.1", "0.1"]))
+    # Round-4 race (A/B/C): A's delayed PUT lands after C became newest on main, C's image unpublished.
     check("converge/A/B/C: A's stale PUT after C became newest (C unpublished) ends on B, not A",
-          lambda: (got, reg["0.1"], puts),
-          lambda g: g[0] == (B, dig[f"0.1-{B[:7]}"]) and g[1] == img(B) and g[2] == ["0.1", "0.1"])
-    # ... and C's build FAILED: C never publishes. A later converge (a rerun of B) keeps the line on B.
-    puts = []
-    got = converge_line("r.io", "t", "x", "0.1", B, ["deploy/x"], converge_io([[C, B, A]], reg, puts))
-    check("converge/A/B/C: C's build failed — the line stays on B, with no write",
-          lambda: (got, reg["0.1"], puts), lambda g: g[0] == (B, dig[f"0.1-{B[:7]}"]) and g[1] == img(B) and g[2] == [])
-    # ... and once C does publish, C's run converges onto C.
-    reg.update(published(C))
-    got = converge_line("r.io", "t", "x", "0.1", C, ["deploy/x"], converge_io([[C, B, A]], reg, []))
+          lambda: run_converge(A, [[A], [C, B, A]], dict(published(A, B), **{"0.1": img(B)})),
+          lambda g: g == ((B, digest_of(B)), img(B), ["0.1", "0.1"]))
+    check("converge/A/B/C: C's build failed — a later converge keeps the line on B, with no write",
+          lambda: run_converge(B, [[C, B, A]], dict(published(A, B), **{"0.1": img(B)})),
+          lambda g: g == ((B, digest_of(B)), img(B), []))
     check("converge/A/B/C: once C is published, C's run moves the line onto C",
-          lambda: (got, reg["0.1"]), lambda g: g[0] == (C, dig[f"0.1-{C[:7]}"]) and g[1] == img(C))
+          lambda: run_converge(C, [[C, B, A]], dict(published(A, B, C), **{"0.1": img(B)})),
+          lambda g: g == ((C, digest_of(C)), img(C), ["0.1"]))
+    # Round-5 (path-filtered history missed real publications):
+    # (1) a manual dispatch on X, a main commit that touches no service path, published `0.1-<X>`; the
+    #     newer D touches nothing either and published nothing. X IS the newest publication.
+    check("converge/a dispatch on an unrelated main commit is a real publication (line -> X)",
+          lambda: run_converge(X, [[D, X, A]], dict(published(A, X), **{"0.1": img(A)})),
+          lambda g: g == ((X, digest_of(X)), img(X), ["0.1"]))
+    # (2) a multi-commit push: S changed the service, T (the tip, GITHUB_SHA) did not; the run published
+    #     `0.1-<T>`. A path filter finds S, which has no image; the registry says T.
+    check("converge/a multi-commit push publishes its TIP, which a path filter never finds (line -> T)",
+          lambda: run_converge(T, [[T, S, A]], dict(published(A, T), **{"0.1": img(A)})),
+          lambda g: g == ((T, digest_of(T)), img(T), ["0.1"]))
     # A line moved by another writer after our write: the read-back disagrees, so we go round again.
-    reg = published(A, B)
-    puts = []
     flips = {"n": 0}
 
     def clobber(r):
         if flips["n"] == 0:
             flips["n"] = 1
             r["0.1"] = img(A)
-    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([[B, A]], reg, puts, clobber))
     check("converge/a line moved underneath after our write is re-converged, not reported green",
-          lambda: (got, reg["0.1"], len(puts)),
-          lambda g: g[0] == (B, dig[f"0.1-{B[:7]}"]) and g[1] == img(B) and g[2] == 2)
-    check("converge/an unpublished newest commit is skipped, not stopped at (line -> newest PUBLISHED)",
-          lambda: converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([[B, A]], published(A), [])),
-          lambda g: g == (A, dig[f"0.1-{A[:7]}"]))
-    check("converge/a lookup that is not 'not found' (503) is RED, never skipped",
-          lambda: converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"],
-                                converge_io([[C, B, A]], published(A, B), [], fail_tag=f"0.1-{C[:7]}")), REFUSED)
-    check("converge/no published image within the window is RED",
-          lambda: converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([[C, B]], {}, [])), REFUSED)
-    check("converge/this run's own image absent is refused",
-          lambda: converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([[A]], {}, [])), REFUSED)
+          lambda: run_converge(B, [[B, A]], published(A, B), after_put=clobber),
+          lambda g: g[0] == (B, digest_of(B)) and g[1] == img(B) and len(g[2]) == 2)
+    check("converge/a tag from before the move (commit not on this main) is ignored, not chosen",
+          lambda: run_converge(A, [[A]], dict(published(A), **{f"0.1-{PRE}": blob[f"0.1-{PRE}"]})),
+          lambda g: g[0] == (A, digest_of(A)))
+    check("converge/a Link-paged tag listing is read to the end",
+          lambda: run_converge(B, [[B, A]], published(A, B, C), page=1),
+          lambda g: g[0] == (B, digest_of(B)))
+    check("converge/an unreadable tag listing (503) is RED, never 'nothing published'",
+          lambda: run_converge(A, [[A]], published(A), list_status=503), REFUSED)
+    check("converge/this run's own tag missing from the listing is RED",
+          lambda: run_converge(A, [[A]], published(B)), REFUSED)
+    check("converge/no published tag on main's history is RED",
+          lambda: converge_line("r.io", "t", "x", "0.1", "0123456" + "8" * 33,
+                                converge_io([[A]], {f"0.1-{PRE}": blob[f"0.1-{PRE}"]}, [])), REFUSED)
+    check("converge/a 7-char prefix naming two main commits is RED, never guessed",
+          lambda: run_converge(A, [["a" * 7 + "1" * 33, A]], published(A)), REFUSED)
     check("converge/an already-converged line is not rewritten",
-          lambda: (converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"],
-                                 converge_io([[A]], dict(published(A), **{"0.1": img(A)}), (p2 := []))), p2),
-          lambda g: g[1] == [])
+          lambda: run_converge(A, [[A]], dict(published(A), **{"0.1": img(A)})),
+          lambda g: g[2] == [])
     check("converge/an unanswered lookup (500) is refused, never read as absent",
           lambda: tag_digest("r.io", "t", "x", "0.1", Io(post=lambda u, f: {"refresh_token": "r", "access_token": "t"},
                                                        run=lambda c, **k: Done("e\n"), fetch=lambda *a: (500, {}, b""))),
@@ -865,8 +916,7 @@ def main(argv: list[str]) -> int:
             return 1 if problems else 0
         if argv and argv[0] == "converge-line":
             newest, digest = converge_line(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")),
-                                           _arg(argv, "--repository"), _arg(argv, "--line"), _arg(argv, "--self"),
-                                           _arg(argv, "--paths").split(), Io())
+                                           _arg(argv, "--repository"), _arg(argv, "--line"), _arg(argv, "--self"), Io())
             print(f"newest={newest}")
             print(f"digest={digest}")
             return 0
@@ -876,7 +926,7 @@ def main(argv: list[str]) -> int:
             for p in problems:
                 print(f"::error file={argv[1]}::{p}")
             if not problems:
-                print(f"{argv[1]}: the line tag is moved only by converge-line (newest publication, re-checked after every write), on every publish run")
+                print(f"{argv[1]}: the line tag is moved only by converge-line (newest published tag in main order, re-checked after every write), on every publish run")
             return 1 if problems else 0
         if argv and argv[0] == "login":
             docker_login(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")), Io())
