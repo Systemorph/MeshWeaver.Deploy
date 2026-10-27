@@ -82,6 +82,14 @@ ask for — see
 [`PluginRegistry.md`](../../src/MeshWeaver.Documentation/Data/Architecture/PluginRegistry.md)
 → *Plans*. `memex-local registry off` returns to serving a checkout.
 
+**What installs at first boot in registry mode is the first-run wizard's decision, not the
+chart's.** `helm_deploy` clears the chart's `pluginCatalog.installByDefault` (`["Plugins/*"]`)
+in this mode: the registry source is named by its URL, so that pattern named a source the
+install does not have (`[DefaultInstall] 1 InstallByDefault pattern(s) name a source this
+installation does not have`) while overriding the packages the person ticked in the wizard.
+The instance manifest the wizard writes carries the selection instead. Self-registry mode keeps
+its per-source `<name>/*` entries.
+
 ## Use
 
 ```bash
