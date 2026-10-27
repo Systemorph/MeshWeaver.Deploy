@@ -74,26 +74,40 @@ def _post_form(url: str, fields: dict) -> dict:
         return json.loads(r.read().decode())
 
 
-def entra_token(tenant: str) -> str:
-    out = subprocess.run(["az", "account", "get-access-token", "--resource", ACR_AUDIENCE, "--tenant", tenant,
-                          "--query", "accessToken", "-o", "tsv", "--only-show-errors"],
-                         check=True, capture_output=True, text=True).stdout.strip()
+def _get_json(url: str, token: str) -> tuple[object, str | None]:
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read().decode()), r.headers.get("Link")
+
+
+class Io:
+    """The four edges this script touches — HTTP POST, HTTP GET, a process, a sleep — so the
+    self-test drives every path OFFLINE with fakes (the same seam build-run.py uses)."""
+
+    def __init__(self, post=_post_form, get=_get_json, run=subprocess.run, sleep=time.sleep):
+        self.post, self.get, self.run, self.sleep = post, get, run, sleep
+
+
+def entra_token(tenant: str, io: Io) -> str:
+    out = io.run(["az", "account", "get-access-token", "--resource", ACR_AUDIENCE, "--tenant", tenant,
+                  "--query", "accessToken", "-o", "tsv", "--only-show-errors"],
+                 check=True, capture_output=True, text=True).stdout.strip()
     if not out:
         raise Refusal(f"az account get-access-token returned no token for {ACR_AUDIENCE}")
     return out
 
 
-def refresh_token(server: str, tenant: str) -> str:
-    body = _post_form(f"https://{server}/oauth2/exchange", {
-        "grant_type": "access_token", "service": server, "tenant": tenant, "access_token": entra_token(tenant)})
+def refresh_token(server: str, tenant: str, io: Io) -> str:
+    body = io.post(f"https://{server}/oauth2/exchange", {
+        "grant_type": "access_token", "service": server, "tenant": tenant, "access_token": entra_token(tenant, io)})
     tok = body.get("refresh_token") if isinstance(body, dict) else None
     if not tok:
         raise Refusal(f"{server}/oauth2/exchange answered no refresh_token")
     return tok
 
 
-def access_token(server: str, refresh: str, scope: str) -> str:
-    body = _post_form(f"https://{server}/oauth2/token", {
+def access_token(server: str, refresh: str, scope: str, io: Io) -> str:
+    body = io.post(f"https://{server}/oauth2/token", {
         "grant_type": "refresh_token", "service": server, "scope": scope, "refresh_token": refresh})
     tok = body.get("access_token") if isinstance(body, dict) else None
     if not tok:
@@ -110,20 +124,17 @@ def next_link(header: str | None) -> str | None:
     return None
 
 
-def list_manifests(server: str, tenant: str, repository: str, top: int) -> list:
+def list_manifests(server: str, tenant: str, repository: str, top: int, io: Io) -> list:
     if not re.fullmatch(r"[a-z0-9]+(?:[._/-][a-z0-9]+)*", repository or ""):
         raise Refusal(f"--repository is not a repository name: {repository!r}")
     if top < 1:
         raise Refusal(f"--top must be positive, got {top}")
-    token = access_token(server, refresh_token(server, tenant), f"repository:{repository}:metadata_read")
+    token = access_token(server, refresh_token(server, tenant, io), f"repository:{repository}:metadata_read", io)
     rows: list = []
     url: str | None = f"/acr/v1/{repository}/_manifests?orderby=timedesc&n={min(top, PAGE)}"
     while url and len(rows) < top:
         full = url if url.startswith("https://") else f"https://{server}{url}"
-        req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            page = json.loads(r.read().decode())
-            link = r.headers.get("Link")
+        page, link = io.get(full, token)
         batch = page.get("manifests") if isinstance(page, dict) else None
         if not isinstance(batch, list):
             raise Refusal(f"{server} answered no `manifests` list for {repository}")
@@ -132,12 +143,12 @@ def list_manifests(server: str, tenant: str, repository: str, top: int) -> list:
     return rows[:top]
 
 
-def docker_login(server: str, tenant: str) -> None:
+def docker_login(server: str, tenant: str, io: Io) -> None:
     for attempt in range(1, ATTEMPTS + 1):
         try:
-            tok = refresh_token(server, tenant)
-            subprocess.run(["docker", "login", server, "--username", REFRESH_TOKEN_USER, "--password-stdin"],
-                           input=tok, text=True, check=True, capture_output=True)
+            tok = refresh_token(server, tenant, io)
+            io.run(["docker", "login", server, "--username", REFRESH_TOKEN_USER, "--password-stdin"],
+                   input=tok, text=True, check=True, capture_output=True)
             if attempt > 1:
                 print(f"acr-data-plane: reached {server} on attempt {attempt}")
             print(f"acr-data-plane: docker is signed in to {server} (data plane, no ARM lookup)")
@@ -146,7 +157,7 @@ def docker_login(server: str, tenant: str) -> None:
             detail = getattr(e, "stderr", None) or str(e)
             print(f"acr-data-plane: attempt {attempt} failed: {detail.strip()}", file=sys.stderr)
             if attempt < ATTEMPTS:
-                time.sleep(5 * 2 ** (attempt - 1))
+                io.sleep(5 * 2 ** (attempt - 1))
     raise Refusal(f"could not sign docker in to {server} after {ATTEMPTS} attempts")
 
 
@@ -159,6 +170,30 @@ def _indent(line: str) -> int:
 def _code(line: str) -> str:
     s = line.strip()
     return "" if s.startswith("#") else line
+
+
+def _with_mapping(step: list[str], dash: int) -> dict:
+    """The step's `with:` block as {key: raw value} — ONLY the action's inputs. A key under `env:`
+    or anywhere else in the step is not an input, so it never counts. A flow mapping
+    (`with: {…}`) is not read, so it cannot satisfy the check."""
+    for k, line in enumerate(step):
+        c = _code(line)
+        m = re.match(r"^(\s*)(?:-\s+)?with:\s*(#.*)?$", c)
+        if not m or _indent(c.replace("- ", "  ", 1)) <= dash:
+            continue
+        key_indent = _indent(c.replace("- ", "  ", 1))
+        out: dict = {}
+        for x in step[k + 1:]:
+            cx = _code(x)
+            if not cx.strip():
+                continue
+            if _indent(cx) <= key_indent:
+                break
+            mm = re.match(r"^\s*([A-Za-z0-9_-]+):\s*(.*?)\s*(#.*)?$", cx)
+            if mm:
+                out[mm.group(1)] = mm.group(2)
+        return out
+    return {}
 
 
 def check_workflow(text: str) -> list[str]:
@@ -179,11 +214,11 @@ def check_workflow(text: str) -> list[str]:
         end = start + 1
         while end < len(lines) and (not lines[end].strip() or _indent(lines[end]) > dash):
             end += 1
-        step = [_code(x) for x in lines[start:end]]
         where = f"the azure/login step at line {start + 1}"
-        if not any(re.match(r"^\s*allow-no-subscriptions:\s*['\"]?true['\"]?\s*(#.*)?$", x) for x in step):
-            problems.append(f"{where} lacks `allow-no-subscriptions: true` — a resource-scoped identity has no subscription to sign in to")
-        if any(re.match(r"^\s*subscription-id:", x) for x in step):
+        inputs = _with_mapping(lines[start:end], dash)
+        if inputs.get("allow-no-subscriptions", "").strip("'\"").lower() != "true":
+            problems.append(f"{where} lacks `allow-no-subscriptions: true` in its `with:` — a resource-scoped identity has no subscription to sign in to")
+        if "subscription-id" in inputs:
             problems.append(f"{where} names a `subscription-id` — the identity holds no subscription")
     if logins == 0:
         problems.append("no azure/login step found — the check has nothing to hold (wrong file?)")
@@ -270,7 +305,97 @@ def self_test() -> int:
     check("a bare registry NAME is refused (it would send the CLI to ARM)", lambda: _login_server("meshweaver"), REFUSED)
     check("an empty tenant is refused", lambda: _tenant(" "), REFUSED)
     check("a non-repository name is refused before any network call",
-          lambda: list_manifests("r.azurecr.io", "t", "../etc", 3), REFUSED)
+          lambda: list_manifests("r.azurecr.io", "t", "../etc", 3, Io()), REFUSED)
+    check("the flag under `env:` with no `with:` is red (inputs only)",
+          lambda: check_workflow("jobs:\n  a:\n    steps:\n      - uses: azure/login@v3\n        env:\n"
+                                 "          allow-no-subscriptions: true\n"),
+          lambda p: len(p) == 1 and "allow-no-subscriptions" in p[0])
+    check("the flag under `env:` while `with:` lacks it is red",
+          lambda: check_workflow("jobs:\n  a:\n    steps:\n      - uses: azure/login@v3\n        with:\n"
+                                 "          client-id: x\n        env:\n          allow-no-subscriptions: true\n"),
+          lambda p: len(p) == 1 and "allow-no-subscriptions" in p[0])
+    check("with: allow-no-subscriptions: 'false' (quoted) is red",
+          lambda: check_workflow(GOOD.replace("allow-no-subscriptions: true", "allow-no-subscriptions: 'false'", 1)),
+          lambda p: len(p) == 1 and "allow-no-subscriptions" in p[0])
+    check("with: allow-no-subscriptions: 'true' (quoted) passes",
+          lambda: check_workflow(GOOD.replace("allow-no-subscriptions: true", "allow-no-subscriptions: 'true'", 1)),
+          lambda p: p == [])
+    check("a subscription-id in `env:` is not an input and is not flagged",
+          lambda: check_workflow(GOOD.replace("      - name: list\n", "        env:\n          subscription-id: z\n      - name: list\n", 1)),
+          lambda p: p == [])
+
+    # ── OFFLINE: the token exchange, the listing and the login, against fakes ──
+    class Done:
+        def __init__(self, stdout=""):
+            self.stdout = stdout
+
+    def fake(posts, pages=None, runs=None, run_fail=0, exchange_ok=True):
+        state = {"run_fail": run_fail}
+
+        def post(url, form):
+            posts.append((url, dict(form)))
+            if url.endswith("/oauth2/exchange"):
+                return {"refresh_token": "acr-refresh"} if exchange_ok else {}
+            return {"access_token": "acr-access"}
+
+        def get(url, token):
+            posts.append(("GET", url, token))
+            return pages.pop(0)
+
+        def run(cmd, **kw):
+            (runs if runs is not None else []).append((cmd, kw))
+            if cmd[0] == "az":
+                return Done("entra-token\n")
+            if state["run_fail"] > 0:
+                state["run_fail"] -= 1
+                raise subprocess.CalledProcessError(1, cmd, stderr="registry blip")
+            return Done()
+        return Io(post=post, get=get, run=run, sleep=lambda s: sleeps.append(s))
+
+    sleeps: list = []
+    posts: list = []
+    pages = [({"manifests": [{"digest": "d1", "tags": ["3.1.2", "main"]}, {"digest": "d2", "tags": []}]},
+              '</acr/v1/mw-plugin-test/_manifests?last=d2&n=2&orderby=timedesc>; rel="next"'),
+             ({"manifests": [{"digest": "d3", "tags": ["staging-abc-1"]}, {"digest": "d4", "tags": ["x"]}]},
+              '</acr/v1/mw-plugin-test/_manifests?last=d4&n=2&orderby=timedesc>; rel="next"'),
+             ({"manifests": [{"digest": "never"}]}, None)]
+    rows = list_manifests("r.example.io", "tid", "mw-plugin-test", 3, fake(posts, pages))
+    check("offline/the Entra token is exchanged with the registry's fields",
+          lambda: posts[0], lambda p: p == ("https://r.example.io/oauth2/exchange", {
+              "grant_type": "access_token", "service": "r.example.io", "tenant": "tid", "access_token": "entra-token"}))
+    check("offline/the access token asks for metadata_read on the ONE repository",
+          lambda: posts[1], lambda p: p == ("https://r.example.io/oauth2/token", {
+              "grant_type": "refresh_token", "service": "r.example.io",
+              "scope": "repository:mw-plugin-test:metadata_read", "refresh_token": "acr-refresh"}))
+    check("offline/page 1 is newest-first with n bounded by --top, bearer the access token",
+          lambda: posts[2], lambda p: p == ("GET", "https://r.example.io/acr/v1/mw-plugin-test/_manifests?orderby=timedesc&n=3", "acr-access"))
+    check("offline/the Link's next page is followed on the same registry",
+          lambda: posts[3][1], lambda u: u == "https://r.example.io/acr/v1/mw-plugin-test/_manifests?last=d2&n=2&orderby=timedesc")
+    check("offline/--top truncates across pages and stops fetching once satisfied",
+          lambda: ([r["digest"] for r in rows], len(pages)), lambda g: g == (["d1", "d2", "d3"], 1))
+    check("offline/tags are preserved row by row",
+          lambda: [r["tags"] for r in rows], lambda t: t == [["3.1.2", "main"], [], ["staging-abc-1"]])
+    check("offline/a page with no `manifests` list is refused",
+          lambda: list_manifests("r.example.io", "tid", "a", 3, fake([], [({"errors": []}, None)])), REFUSED)
+    check("offline/an exchange answering no refresh_token is refused",
+          lambda: list_manifests("r.example.io", "tid", "a", 3, fake([], [], exchange_ok=False)), REFUSED)
+
+    runs: list = []
+    sleeps.clear()
+    docker_login("r.example.io", "tid", fake([], runs=runs, run_fail=2))
+    logins = [r for r in runs if r[0][0] == "docker"]
+    check("offline/docker_login retries a failed login and succeeds on attempt 3",
+          lambda: (len(logins), sleeps), lambda g: g == (3, [5, 10]))
+    check("offline/the refresh token reaches docker on STDIN as the empty-GUID user, never argv",
+          lambda: logins[-1], lambda r: r[0] == ["docker", "login", "r.example.io", "--username", REFRESH_TOKEN_USER,
+                                                  "--password-stdin"] and r[1].get("input") == "acr-refresh"
+          and all("acr-refresh" not in a for a in r[0]))
+    runs.clear()
+    sleeps.clear()
+    check("offline/docker_login exhausts its attempts and is refused",
+          lambda: docker_login("r.example.io", "tid", fake([], runs=runs, run_fail=99)), REFUSED)
+    check("offline/exhaustion = 5 attempts, 4 back-offs 5→40 s",
+          lambda: (len([r for r in runs if r[0][0] == "docker"]), sleeps), lambda g: g == (5, [5, 10, 20, 40]))
     print(f"acr-data-plane self-test: {'PASS' if fails == 0 else f'{fails} FAILED'}")
     return 0 if fails == 0 else 1
 
@@ -295,11 +420,11 @@ def main(argv: list[str]) -> int:
                       "and the registry is reached through its data plane only")
             return 1 if problems else 0
         if argv and argv[0] == "login":
-            docker_login(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")))
+            docker_login(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")), Io())
             return 0
         if argv and argv[0] == "manifests":
             rows = list_manifests(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")),
-                                  _arg(argv, "--repository"), int(_arg(argv, "--top")))
+                                  _arg(argv, "--repository"), int(_arg(argv, "--top")), Io())
             json.dump(rows, sys.stdout)
             sys.stdout.write("\n")
             return 0
