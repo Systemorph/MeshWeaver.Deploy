@@ -156,40 +156,34 @@ jobs:
           set -euo pipefail
           short="${GITHUB_SHA::7}"
           docker push "$ACR/$REPO:${LINE}-${short}"
-      # The moving line follows the NEWEST publication only, and it is converged on EVERY run — a run
-      # whose image was already published included. It is moved by a registry-side retag of the
-      # already-published manifest (acr-data-plane.py retag: GET by the immutable tag, PUT the same bytes
-      # under the line), so a run whose line move failed completes it on rerun, and a rerun of an OLDER
-      # commit never moves the line back over a newer one (the ollama-image.yml ordering).
-      - name: Move :<line> onto this build (only if this is the newest publication)
+      # The moving line follows main's NEWEST publication, and it is converged on EVERY publish run — a run
+      # whose image was already published included, so a line move that failed once completes on rerun.
+      # Concurrent publish runs of different commits are safe WITHOUT a lock (a job-level concurrency group
+      # would cancel a pending main run): `converge-line` puts the line on the newest published image by a
+      # byte-for-byte retag and RE-CHECKS AFTER EVERY WRITE (re-fetch main, re-derive the newest, read the
+      # line back), going round until nothing moved underneath. Whichever write lands last was followed by
+      # its writer's own re-check, so an older run that paused before its PUT corrects its own stale write.
+      # A newest commit whose image is not published yet is left to its own run (which comes later).
+      - name: Converge :<line> onto main's newest publication
         id: line
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         run: |
           set -euo pipefail
-          git fetch --quiet origin main
-          # --first-parent: main's own history, so a merged pull request answers with the MERGE commit that
-          # landed (GITHUB_SHA), never the feature-branch commit a path-filtered log would simplify to.
-          newest=$(git log -1 --first-parent --format=%H origin/main -- deploy/whisper/Dockerfile .github/workflows/whisper-image.yml)
-          if [ "$newest" != "$GITHUB_SHA" ]; then
-            echo "moved=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::$GITHUB_SHA is not the newest publication (main's is $newest) — the line stays where the newer run put it"
-            exit 0
-          fi
-          python3 .github/scripts/acr-data-plane.py retag --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
-            --repository "$REPO" --from "${LINE}-${GITHUB_SHA::7}" --to "$LINE"
-          echo "moved=true" >> "$GITHUB_OUTPUT"
-      - name: Verify the tags exist in the registry (read back, never the green tick)
+          python3 .github/scripts/acr-data-plane.py converge-line --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
+            --repository "$REPO" --line "$LINE" --self "$GITHUB_SHA" \
+            --paths "deploy/whisper/Dockerfile .github/workflows/whisper-image.yml" | tee "$RUNNER_TEMP/converge.out"
+          grep -E '^(newest|digest)=' "$RUNNER_TEMP/converge.out" >> "$GITHUB_OUTPUT"
+      # The immutable tag is this run's to verify. The line is NOT re-read here: by now a newer run may
+      # legitimately have moved it, and converge-line has already read it back inside its own loop.
+      - name: Verify the image exists in the registry (read back, never the green tick)
         run: |
           set -euo pipefail
           short="${GITHUB_SHA::7}"
           immutable=$(docker buildx imagetools inspect "$ACR/$REPO:${LINE}-${short}" --format '{{json .Manifest.Digest}}' | tr -d '"')
           [ -n "$immutable" ] || { echo "::error::$REPO:${LINE}-${short} is not in the registry"; exit 1; }
-          if [ "${{ steps.line.outputs.moved }}" = "true" ]; then
-            moving=$(docker buildx imagetools inspect "$ACR/$REPO:${LINE}" --format '{{json .Manifest.Digest}}' | tr -d '"')
-            [ "$immutable" = "$moving" ] \
-              || { echo "::error::$REPO:${LINE}-${short} (${immutable}) and :${LINE} (${moving:-absent}) do not name one manifest"; exit 1; }
-          fi
-          echo "$REPO:${LINE}-${short} = ${immutable} (built: ${{ steps.published.outputs.exists == 'false' }}, line moved: ${{ steps.line.outputs.moved }})"
+          newest="${{ steps.line.outputs.newest }}"
+          line_digest="${{ steps.line.outputs.digest }}"
+          echo "$REPO:${LINE}-${short} = ${immutable} (built: ${{ steps.published.outputs.exists == 'false' }}); :${LINE} -> ${newest::7} ${line_digest:-(left to the run of that commit)}"
           echo "### whisper published" >> "$GITHUB_STEP_SUMMARY"
           echo "\`$ACR/$REPO:${LINE}-${short}\` — \`${immutable}\`. An estate overlay names this immutable tag." >> "$GITHUB_STEP_SUMMARY"

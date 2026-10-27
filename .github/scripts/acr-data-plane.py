@@ -31,11 +31,19 @@ registry with that.
         RED unless every azure/login step signs in with `allow-no-subscriptions: true` and names no
         `subscription-id`, and nothing in the workflow runs an `az acr` command or the platform's
         `acr-login.sh` (both take the ARM lookup above).
+    acr-data-plane.py converge-line --registry <login server> --tenant <tenant id> --repository <name>
+                              --line <line tag> --self <commit> --paths "<lane paths>"
+        put <line> on the image of main's NEWEST publication — the newest first-parent commit of
+        origin/main touching <paths>, tagged <line>-<sha7> — and RE-CHECK AFTER EVERY WRITE: re-fetch
+        main, re-derive the newest, read the line back, and write again until the line names the newest
+        published image and nothing moved underneath. That is what makes concurrent publish runs safe
+        without a lock: whichever write lands LAST was followed by its writer's own re-check, so a stale
+        write (an older run that paused before its PUT) is always corrected by the run that made it. A
+        newest commit whose image is not published yet is left to its own run, which comes later.
     acr-data-plane.py check-line-convergence <workflow.yml>
-        RED unless the service-image lane moves its moving line tag ONLY by `retag`, in a step that runs
-        on EVERY publish run (no `if:` — a rerun whose image was already published still converges the
-        line), behind the newest-publication ordering check (an older rerun never moves the line back),
-        with main's history checked out for that check.
+        RED unless the service-image lane moves its line tag ONLY through `converge-line` (never a raw
+        `retag … --to "$LINE"`, which has no post-write re-check, and never a build or push), in a step
+        that runs on EVERY publish run (no `if:`), with main's history checked out.
     acr-data-plane.py --self-test
 
 Nothing here prints a token. The refresh token reaches docker on stdin only.
@@ -213,6 +221,59 @@ def retag(server: str, tenant: str, repository: str, source: str, target: str, i
     return digest
 
 
+def tag_digest(server: str, tenant: str, repository: str, tag: str, io: Io) -> str | None:
+    """The digest `<repository>:<tag>` names, or None when the registry ANSWERED that it is absent (404).
+    Any other answer is a Refusal: an unanswered lookup is never read as absence."""
+    if not REPOSITORY_RE.fullmatch(repository or "") or not TAG_RE.fullmatch(tag or ""):
+        raise Refusal(f"not a repository:tag: {repository!r}:{tag!r}")
+    token = access_token(server, refresh_token(server, tenant, io), f"repository:{repository}:pull", io)
+    status, headers, body = io.fetch("GET", f"https://{server}/v2/{repository}/manifests/{tag}", token,
+                                     {"Accept": MANIFEST_ACCEPT}, None)
+    if status == 404:
+        return None
+    if status != 200:
+        raise Refusal(f"GET {repository}:{tag} answered HTTP {status} — presence not established")
+    return "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+def newest_publication(paths: list[str], io: Io) -> str:
+    """main's newest first-parent commit touching the lane's paths, from a FRESH fetch."""
+    io.run(["git", "fetch", "--quiet", "origin", "main"], check=True, capture_output=True, text=True)
+    out = io.run(["git", "log", "-1", "--first-parent", "--format=%H", "origin/main", "--", *paths],
+                 check=True, capture_output=True, text=True).stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", out):
+        raise Refusal(f"could not resolve main's newest publication for {paths} (got {out!r})")
+    return out
+
+
+CONVERGE_ROUNDS = 6
+
+
+def converge_line(server: str, tenant: str, repository: str, line: str, self_sha: str, paths: list[str],
+                  io: Io) -> tuple[str, str | None]:
+    """(newest commit, the digest the line names) once converged; digest None = left to the newest's run."""
+    if not re.fullmatch(r"[0-9a-f]{40}", self_sha or ""):
+        raise Refusal(f"--self must be a 40-hex commit, got {self_sha!r}")
+    if not paths:
+        raise Refusal("--paths is empty — the newest publication of WHAT?")
+    for round_ in range(1, CONVERGE_ROUNDS + 1):
+        newest = newest_publication(paths, io)
+        want = tag_digest(server, tenant, repository, f"{line}-{newest[:7]}", io)
+        if want is None:
+            if newest == self_sha:
+                raise Refusal(f"{repository}:{line}-{newest[:7]} is this run's own image and the registry says it is absent")
+            print(f"converge-line: main's newest publication {newest[:7]} is not published yet — its own run moves the line")
+            return newest, None
+        if tag_digest(server, tenant, repository, line, io) != want:
+            retag(server, tenant, repository, f"{line}-{newest[:7]}", line, io)
+        # The re-check that makes a stale write self-correcting: after OUR write, is the newest still the
+        # newest, and does the line still name it? Anything that moved underneath sends us round again.
+        if newest_publication(paths, io) == newest and tag_digest(server, tenant, repository, line, io) == want:
+            print(f"converge-line: {repository}:{line} = {want} ({line}-{newest[:7]}, round {round_})")
+            return newest, want
+    raise Refusal(f"{repository}:{line} did not settle in {CONVERGE_ROUNDS} rounds — something keeps moving it")
+
+
 def docker_login(server: str, tenant: str, io: Io) -> None:
     for attempt in range(1, ATTEMPTS + 1):
         try:
@@ -328,34 +389,38 @@ def _step_around(lines: list[str], i: int) -> tuple[int, int]:
 def check_line_convergence(text: str) -> list[str]:
     lines = text.splitlines()
     problems: list[str] = []
-    retags = [i for i, ln in enumerate(lines)
-              if "acr-data-plane.py retag" in _code(ln) and not ln.strip().startswith("#")]
-    to_line = []
-    for i in retags:
-        start, end = _step_around(lines, i)
-        body = "\n".join(_code(x) for x in lines[start:end])
-        if re.search(r'--to\s+"?\$\{?LINE\}?"?', body):
-            to_line.append((start, end, body))
-    if not to_line:
-        problems.append("no step moves the line with `acr-data-plane.py retag … --to \"$LINE\"` — the line tag "
-                        "must be converged by a byte-for-byte retag of the published image")
-    for start, end, body in to_line:
-        where = f"the line-retag step at line {start + 1}"
-        if re.search(r"^\s*(?:-\s+)?if:", body, flags=re.M):
-            problems.append(f"{where} carries an `if:` — the line must converge on EVERY publish run, a rerun whose "
-                            "image was already published included, or a failed line move is never completed")
-        if "git log -1 --first-parent" not in body or '"$newest" != "$GITHUB_SHA"' not in body:
-            problems.append(f"{where} lacks the newest-publication ordering check (`git log -1 --first-parent` "
-                            "compared with $GITHUB_SHA) — an older rerun could move the line backwards")
+    steps = []
     for i, ln in enumerate(lines):
         c = _code(ln)
         if c.strip().startswith("#"):
             continue
+        if "acr-data-plane.py converge-line" in c:
+            start, end = _step_around(lines, i)
+            steps.append((start, "\n".join(_code(x) for x in lines[start:end])))
+        if "acr-data-plane.py retag" in c:
+            start, end = _step_around(lines, i)
+            body = "\n".join(_code(x) for x in lines[start:end])
+            if re.search(r'--to\s+"?\$\{?LINE\}?"?', body):
+                problems.append(f"line {i + 1}: a raw `retag … --to \"$LINE\"` moves the line with no re-check after the "
+                                "write — an older run that pauses before its PUT overwrites a newer, verified line. "
+                                "Use `converge-line`")
         if LINE_TAG_PUSH.search(c + " "):
             problems.append(f"line {i + 1}: the moving line tag is written by a build or push — it must only be "
-                            "moved by the ordered retag, or a rebuild of an older commit moves it backwards")
-    if to_line and not re.search(r"^\s*fetch-depth:\s*0\s*$", text, flags=re.M):
-        problems.append("no checkout carries `fetch-depth: 0` — the ordering check reads main's history")
+                            "moved by `converge-line`, or a rebuild of an older commit moves it backwards")
+    if not steps:
+        problems.append("no step runs `acr-data-plane.py converge-line` — the line tag must be converged to main's "
+                        "newest publication with a re-check after every write")
+    for start, body in steps:
+        where = f"the converge-line step at line {start + 1}"
+        if re.search(r"^\s*(?:-\s+)?if:", body, flags=re.M):
+            problems.append(f"{where} carries an `if:` — the line must converge on EVERY publish run, a rerun whose "
+                            "image was already published included, or a failed line move is never completed")
+        for flag, why in (('--line "$LINE"', "the line it moves"), ('--self "$GITHUB_SHA"', "this run's own commit"),
+                          ("--paths", "the lane's publication paths")):
+            if flag not in body:
+                problems.append(f"{where} does not pass `{flag}` ({why})")
+    if steps and not re.search(r"^\s*fetch-depth:\s*0\s*$", text, flags=re.M):
+        problems.append("no checkout carries `fetch-depth: 0` — converge-line reads main's history")
     return problems
 
 
@@ -612,22 +677,24 @@ jobs:
       - name: Push
         if: steps.published.outputs.exists == 'false'
         run: docker push "$ACR/x:${LINE}-${short}"
-      - name: Move the line
+      - name: Converge the line
         id: line
         run: |
-          newest=$(git log -1 --first-parent --format=%H origin/main -- deploy/x)
-          if [ "$newest" != "$GITHUB_SHA" ]; then exit 0; fi
-          python3 .github/scripts/acr-data-plane.py retag --registry "$ACR" --tenant "$T" \\
-            --repository x --from "${LINE}-${GITHUB_SHA::7}" --to "$LINE"
+          python3 .github/scripts/acr-data-plane.py converge-line --registry "$ACR" --tenant "$T" \\
+            --repository x --line "$LINE" --self "$GITHUB_SHA" --paths "deploy/x"
 """
     check("line: the converging lane passes (positive control)", lambda: check_line_convergence(lane), lambda p: p == [])
-    check("line: a retag step gated on `exists == 'false'` is red (the review-found defect)",
+    check("line: a converge step gated on `exists == 'false'` is red (round-2 review)",
           lambda: check_line_convergence(lane.replace("        id: line\n",
                                                       "        id: line\n        if: steps.published.outputs.exists == 'false'\n")),
           lambda p: len(p) == 1 and "`if:`" in p[0])
-    check("line: no ordering check is red",
-          lambda: check_line_convergence(lane.replace('if [ "$newest" != "$GITHUB_SHA" ]; then exit 0; fi', "true")),
-          lambda p: len(p) == 1 and "ordering" in p[0])
+    check("line: a raw ordered retag onto $LINE is red (round-3 review: no re-check after the write)",
+          lambda: check_line_convergence(lane + '      - run: |\n          python3 .github/scripts/acr-data-plane.py retag '
+                                                '--registry r --tenant t --repository x --from "a" --to "$LINE"\n'),
+          lambda p: len(p) == 1 and "raw `retag" in p[0])
+    check("line: a converge step without --paths is red",
+          lambda: check_line_convergence(lane.replace(' --paths "deploy/x"', "")),
+          lambda p: len(p) == 1 and "--paths" in p[0])
     check("line: pushing :$LINE with docker is red",
           lambda: check_line_convergence(lane.replace('run: docker push "$ACR/x:${LINE}-${short}"',
                                                       'run: docker push "$ACR/x:${LINE}"')),
@@ -642,15 +709,87 @@ jobs:
     check("line: imagetools create onto :$LINE is a write and red",
           lambda: check_line_convergence(lane + '      - run: docker buildx imagetools create --tag "$ACR/x:${LINE}" src\n'),
           lambda p: len(p) == 1 and "build or push" in p[0])
-    check("line: a lane with no line retag at all is red, never vacuously green",
-          lambda: check_line_convergence("jobs: {}\n"), lambda p: len(p) == 1 and "no step moves the line" in p[0])
+    check("line: a lane with no converge step is red, never vacuously green",
+          lambda: check_line_convergence("jobs: {}\n"), lambda p: len(p) == 1 and "converge-line" in p[0])
     check("line: a shallow checkout is red",
           lambda: check_line_convergence(lane.replace("        with:\n          fetch-depth: 0\n", "")),
           lambda p: len(p) == 1 and "fetch-depth" in p[0])
-    check("line: a commented-out retag does not count",
-          lambda: check_line_convergence(lane.replace("          python3 .github/scripts/acr-data-plane.py retag",
-                                                      "          # python3 .github/scripts/acr-data-plane.py retag")),
-          lambda p: any("no step moves the line" in x for x in p))
+    check("line: a commented-out converge step does not count",
+          lambda: check_line_convergence(lane.replace("          python3 .github/scripts/acr-data-plane.py converge-line",
+                                                      "          # python3 .github/scripts/acr-data-plane.py converge-line")),
+          lambda p: any("no step runs" in x for x in p))
+
+    # ── converge-line against a fake registry + a fake main: the race the review describes ──
+    A, B = "a" * 40, "b" * 40
+    blob = {f"0.1-{A[:7]}": b'{"a":1}', f"0.1-{B[:7]}": b'{"b":2}'}
+
+    def converge_io(heads, reg, puts, after_put=None):
+        """heads: successive answers of `git log` for main's newest; reg: tag -> bytes (the registry)."""
+        state = {"heads": list(heads)}
+
+        def post(url, form):
+            return {"refresh_token": "r"} if url.endswith("/oauth2/exchange") else {"access_token": "t"}
+
+        def run(cmd, **kw):
+            if cmd[:2] == ["git", "log"]:
+                h = state["heads"].pop(0) if len(state["heads"]) > 1 else state["heads"][0]
+                return Done(h + "\n")
+            return Done("entra-token\n" if cmd[0] == "az" else "")
+
+        def fetch(method, url, token, headers, body):
+            tag = url.rsplit("/", 1)[1]
+            if method == "GET":
+                return (200, {"content-type": "application/vnd.oci.image.manifest.v1+json"}, reg[tag]) if tag in reg \
+                    else (404, {}, b"")
+            reg[tag] = body
+            puts.append(tag)
+            if after_put:
+                after_put(reg)
+            return 201, {"docker-content-digest": "sha256:" + hashlib.sha256(body).hexdigest()}, b""
+        return Io(post=post, run=run, fetch=fetch, sleep=lambda s: None)
+
+    dig = {k: "sha256:" + hashlib.sha256(v).hexdigest() for k, v in blob.items()}
+    reg = dict(blob)
+    puts: list = []
+    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([A], reg, puts))
+    check("converge/the newest run moves the line onto its own image and verifies it",
+          lambda: (got, puts), lambda g: g == ((A, dig[f"0.1-{A[:7]}"]), ["0.1"]))
+    # THE RACE: run A believes it is newest, but B was promoted and verified while A paused; A's PUT
+    # lands on top. A's re-check after its own write sees B and puts the line back on B.
+    reg = dict(blob)
+    reg["0.1"] = blob[f"0.1-{B[:7]}"]
+    puts = []
+    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"],
+                        converge_io([A, B, B, B], reg, puts))
+    check("converge/a stale write by an older run is corrected by that run's own re-check (the review's race)",
+          lambda: (got, reg["0.1"]), lambda g: g[0] == (B, dig[f"0.1-{B[:7]}"]) and g[1] == blob[f"0.1-{B[:7]}"])
+    # Another writer moves the line after our PUT: the read-back disagrees, so we go round again.
+    reg = {k: v for k, v in blob.items()}
+    puts = []
+    flips = {"n": 0}
+
+    def clobber(r):
+        if flips["n"] == 0:
+            flips["n"] = 1
+            r["0.1"] = blob[f"0.1-{A[:7]}"]
+    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([B], reg, puts, clobber))
+    check("converge/a line moved underneath after our write is re-converged, not reported green",
+          lambda: (got, reg["0.1"], len(puts)), lambda g: g[0] == (B, dig[f"0.1-{B[:7]}"]) and g[1] == blob[f"0.1-{B[:7]}"] and g[2] == 2)
+    reg = {f"0.1-{A[:7]}": blob[f"0.1-{A[:7]}"]}
+    puts = []
+    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([B], reg, puts))
+    check("converge/a newest commit not yet published is left to its own run (no write)",
+          lambda: (got, puts), lambda g: g == ((B, None), []))
+    check("converge/this run's own image absent is refused",
+          lambda: converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([A], {}, [])), REFUSED)
+    check("converge/an already-converged line is not rewritten",
+          lambda: (converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"],
+                                 converge_io([A], dict(blob, **{"0.1": blob[f"0.1-{A[:7]}"]}), (p2 := []))), p2),
+          lambda g: g[1] == [])
+    check("converge/an unanswered lookup (500) is refused, never read as absent",
+          lambda: tag_digest("r.io", "t", "x", "0.1", Io(post=lambda u, f: {"refresh_token": "r", "access_token": "t"},
+                                                       run=lambda c, **k: Done("e\n"), fetch=lambda *a: (500, {}, b""))),
+          REFUSED)
     print(f"acr-data-plane self-test: {'PASS' if fails == 0 else f'{fails} FAILED'}")
     return 0 if fails == 0 else 1
 
@@ -674,13 +813,20 @@ def main(argv: list[str]) -> int:
                 print(f"{argv[1]}: every azure/login is tenant-level (allow-no-subscriptions, no subscription-id) "
                       "and the registry is reached through its data plane only")
             return 1 if problems else 0
+        if argv and argv[0] == "converge-line":
+            newest, digest = converge_line(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")),
+                                           _arg(argv, "--repository"), _arg(argv, "--line"), _arg(argv, "--self"),
+                                           _arg(argv, "--paths").split(), Io())
+            print(f"newest={newest}")
+            print(f"digest={digest or ''}")
+            return 0
         if len(argv) == 2 and argv[0] == "check-line-convergence":
             with open(argv[1], encoding="utf-8") as f:
                 problems = check_line_convergence(f.read())
             for p in problems:
                 print(f"::error file={argv[1]}::{p}")
             if not problems:
-                print(f"{argv[1]}: the line tag is moved only by the ordered retag, on every publish run")
+                print(f"{argv[1]}: the line tag is moved only by converge-line (newest publication, re-checked after every write), on every publish run")
             return 1 if problems else 0
         if argv and argv[0] == "login":
             docker_login(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")), Io())
