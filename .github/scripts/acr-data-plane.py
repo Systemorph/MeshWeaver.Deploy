@@ -540,6 +540,11 @@ def check_cache_handover(text: str) -> list[str]:
                             "export per target CONCURRENTLY and each uploads every new blob (run 40559129837 paid the "
                             "~24 GB weights twice and was cut at 45 min). Export ONCE, then move other tags onto that "
                             "manifest with `acr-data-plane.py retag` (a manifest PUT)")
+        if "acr-data-plane.py tags" not in body or not re.search(r'"\$\{from\[@\]\}"', body):
+            problems.append(f"the cache build at line {start + 1} does not import the COMPLETED run caches (list them "
+                            "with `acr-data-plane.py tags` and pass each as `--cache-from` via \"${from[@]}\") — a "
+                            "finished export whose job was cut before the shared tag moved would be lost (runs "
+                            "40559129837 -> 40571543897 re-uploaded 24 GB the registry already held)")
         published = [k for k in range(job, start) if re.search(r"^\s*id:\s*published\s*$", code[k])]
         if not published:
             problems.append(f"the cache build at line {start + 1} is not preceded, in its job, by the `id: published` "
@@ -995,7 +1000,9 @@ jobs:
       - name: Build into the registry cache
         if: steps.published.outputs.exists == 'false'
         run: |
-          docker buildx build --cache-from "type=registry,ref=$ACR/$REPO:$BUILD_CACHE" \\
+          python3 .github/scripts/acr-data-plane.py tags --registry r --tenant t --repository x > tags
+          from=(--cache-from "type=registry,ref=$ACR/$REPO:$BUILD_CACHE")
+          docker buildx build "${from[@]}" \\
             --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE-run-1,mode=max" --output type=cacheonly x
   publish:
     needs: cache
@@ -1049,6 +1056,11 @@ jobs:
               '            --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE,mode=max" \\\\\n'
               '            --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE-run-1,mode=max"')),
           lambda p: len(p) == 1 and "2 `--cache-to` targets" in p[0])
+    check("cache: a cache build importing ONLY the shared tag is red (runs 40559129837 -> 40571543897)",
+          lambda: check_cache_handover(handover.replace(
+              "          python3 .github/scripts/acr-data-plane.py tags --registry r --tenant t --repository x > tags\n", "")
+              .replace('docker buildx build "${from[@]}"', 'docker buildx build --cache-from "type=registry,ref=$ACR/$REPO:$BUILD_CACHE"')),
+          lambda p: len(p) == 1 and "COMPLETED run caches" in p[0])
     check("cache: an ungated cache build is red",
           lambda: check_cache_handover(handover.replace(
               "      - name: Build into the registry cache\n        if: steps.published.outputs.exists == 'false'\n",
@@ -1110,6 +1122,11 @@ def main(argv: list[str]) -> int:
                                   _arg(argv, "--repository"), int(_arg(argv, "--top")), Io())
             json.dump(rows, sys.stdout)
             sys.stdout.write("\n")
+            return 0
+        if argv and argv[0] == "tags":
+            for tag in sorted(list_tags(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")),
+                                        _arg(argv, "--repository"), Io())):
+                print(tag)
             return 0
         if argv and argv[0] == "retag":
             digest = retag(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")),
