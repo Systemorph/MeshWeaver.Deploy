@@ -549,6 +549,40 @@ case "$body" in
     ok "helm_deploy layers the registry file OR the self-registry defaults, by mode" ;;
   *) bad "helm_deploy layers the registry file OR the self-registry defaults, by mode" "$body" ;;
 esac
+# 🚨 In registry mode the chart's installByDefault ["Plugins/*"] must be CLEARED (2026-10-27, the
+# maintainer's laptop): the registry source is named by its URL, so the chart's pattern names a
+# source the install does not have — `[DefaultInstall] 1 InstallByDefault pattern(s) name a source
+# this installation does not have: [Plugins/*]` — while overriding the wizard's own selection with a
+# wildcard. The wizard's manifest decides; self-registry mode keeps its per-source "<name>/*" entries.
+# shellcheck disable=SC2016  # the single-quoted text is the source being searched for
+case "$body" in
+  *'mode_args=(-f "$REGISTRY_FILE" --set-json '"'"'pluginCatalog.installByDefault=[]'"'"')'*)
+    ok "helm_deploy clears the chart's installByDefault in registry mode (the wizard decides)" ;;
+  *) bad "helm_deploy clears the chart's installByDefault in registry mode (the wizard decides)" "no --set-json clear in the registry_mode arm: $body" ;;
+esac
+# shellcheck disable=SC2016  # the single-quoted text is the source being searched for
+case "$body" in
+  *'--set "pluginCatalog.installByDefault[$i]=$n/*"'*)
+    ok "helm_deploy still assembles the per-source installByDefault entries for self-registry mode" ;;
+  *) bad "helm_deploy still assembles the per-source installByDefault entries for self-registry mode" "$body" ;;
+esac
+# The rendered proof, when helm is on PATH (the Linux CI lane installs it; a Mac without helm says
+# so rather than passing): with the clear, NO PluginCatalog__InstallByDefault__N key reaches the
+# ConfigMap; without it, the chart's own entry does — so the control proves the probe can see one.
+if command -v helm >/dev/null 2>&1; then
+  CHART="$HERE/../../helm"; REGTEST="$STUBS/registry-mode-values.yaml"
+  printf 'pluginCatalog:\n  registryUrl: "https://registry.example"\n' > "$REGTEST"
+  render() { helm template memex "$CHART" -f "$CHART/values.yaml" -f "$HERE/../share/values.local.defaults.yaml" -f "$REGTEST" "$@" 2>&1; }
+  with_clear="$(render --set-json 'pluginCatalog.installByDefault=[]' | grep -c 'PluginCatalog__InstallByDefault__' || true)"
+  without_clear="$(render | grep -c 'PluginCatalog__InstallByDefault__' || true)"
+  if [ "$without_clear" -ge 1 ] && [ "$with_clear" -eq 0 ]; then
+    ok "rendered: registry mode with the clear emits no InstallByDefault key (control without it: $without_clear)"
+  else
+    bad "rendered: registry mode with the clear emits no InstallByDefault key" "with clear: $with_clear key(s); without: $without_clear"
+  fi
+else
+  printf '  skip  rendered registry-mode InstallByDefault check — helm is not on PATH here (the static check above still ran)\n'
+fi
 for c in cmd_up cmd_update; do
   body="$(awk -v f="^${c}\\\\(\\\\)" '$0 ~ f { on=1 } on { print } on && /^}$/ { exit }' "$CLI")"
   case "$body" in
