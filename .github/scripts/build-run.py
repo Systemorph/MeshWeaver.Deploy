@@ -54,8 +54,11 @@ THE LOOP, and the order that matters:
      ONLY for a succeeded BUILD stage of a trunk run, and ONLY when it recomputes the key itself
      (module: core's module-build-key.py; NodeType: sources + reference set + compile-check options
      + compiler). Never a test verdict; never a pull request's output. A stage needing PostgreSQL
-     starts a disposable one inside its sandbox (sandbox-postgres.sh: tmpfs, random password, Unix
-     socket only).
+     starts a COPY of the image's PREPARED cluster inside its own sandbox (host-postgres.sh: UTF8, a
+     pgvector template every suite database is cloned from; MW_TEST_PG_SNAPSHOT, MW_TEST_PG_SERVER) —
+     never an initdb, never a container. The prepared host's other facts — core's source at the set's
+     commit, the portal chart, the tester /app — are handed when the image carries them (prepared_env:
+     MW_PLATFORM_SOURCE, MW_DEPLOY_SOURCE, MW_BUILD_TESTER_APP).
   5. 409 on an event POST = the run is claimed by another host: the child is killed, nothing more
      is posted for that run.
 
@@ -1056,6 +1059,37 @@ def sandbox_env(host_env: dict, extra: dict, cache: str) -> dict:
     return env
 
 
+# ─── THE PREPARED HOST, not a prepared run (MeshWeaver.Plugins Hosting/StandingBuildHosts.md) ─────────
+# What the portal-host lane reads besides the reference set, installed in the image BY COMMIT
+# (deploy/build-host/Dockerfile) and bound read-only into every stage (/opt is system, /tester a staged
+# image root): core's source at the set's commit (the test-support projects no image ships), this
+# repository's portal chart (the chart guards) and the tester's own /app (its deps.json). A fact the
+# image does not carry is simply not handed — the stage that needs it is red naming the variable.
+PREPARED_ROOT = "/opt/build-host"
+TESTER_APP = "/tester"
+
+
+def prepared_env(root: str = PREPARED_ROOT, tester: str = TESTER_APP) -> dict:
+    env = {}
+    platform_src = os.path.join(root, "platform-src")
+    if os.path.isfile(os.path.join(platform_src, ".source-commit")) and os.path.isfile(os.path.join(platform_src, "Directory.Build.props")):
+        env["MW_PLATFORM_SOURCE"] = platform_src
+    deploy_src = os.path.join(root, "deploy-src")
+    if os.path.isfile(os.path.join(deploy_src, "deploy", "helm", "Chart.yaml")):
+        env["MW_DEPLOY_SOURCE"] = deploy_src
+    if os.path.isfile(os.path.join(tester, "mw-plugin-test.dll")):
+        env["MW_BUILD_TESTER_APP"] = tester
+    # THE PREPARED TEST CLUSTER (deploy/build-host/host-postgres.sh, built at image build): UTF8 with a
+    # pgvector template. A stage that needs PostgreSQL starts a COPY of it inside its own sandbox —
+    # `eval "$(bash "$MW_TEST_PG_SERVER" start "$MW_TEST_PG_SNAPSHOT" <dir>)"` — never an initdb, never
+    # a container; every suite database is a clone of the template (MW_TEST_PG_TEMPLATE).
+    snapshot, server = os.path.join(root, "pg-snapshot"), os.path.join(root, "host-postgres.sh")
+    if os.path.isfile(os.path.join(snapshot, "ready")) and os.path.isfile(server):
+        env["MW_TEST_PG_SNAPSHOT"] = snapshot
+        env["MW_TEST_PG_SERVER"] = server
+    return env
+
+
 class Sandbox:
     """`bwrap` per stage: user, PID, mount, IPC and UTS namespaces; `--die-with-parent`; a fresh
     /proc; `--clearenv` + the allow-list; the system and the caches bound READ-ONLY; writable only
@@ -1622,6 +1656,7 @@ class Host:
         self.plugins_known = False
         self.held: list[EventSink] = []
         self.artifacts_dir = ""
+        self.run_env: dict = {}
         self.plugins_key: Optional[str] = None
         self.heartbeat: Optional[Heartbeat] = None
         self.run_sinks: dict[str, EventSink] = {}
@@ -1860,6 +1895,7 @@ class Host:
         self.run_scope = {"channel": claimed.strip()} if isinstance(claimed, str) and claimed.strip() else {"channel": self.channel}
         if claim.get("claimId"):
             self.claim_id = str(claim["claimId"])
+        self.run_env = prepared_env()
         with Heartbeat() as hb:
             self.heartbeat = hb
             outcome = "lost"
@@ -1869,6 +1905,7 @@ class Host:
                 return outcome
             finally:
                 self.heartbeat = None
+                self.run_env = {}
                 # A run refused before any stage never created its artifacts directory: nothing was
                 # handed over, so there is no receipt to keep the workspace for.
                 if (outcome == "undelivered" and os.path.isdir(self.artifacts_dir)
@@ -1958,6 +1995,7 @@ class Host:
                 "MW_PLUGINS_KEY": self.effective_plugins_key(),
                 "MW_BUILD_REFSET_KEY": self.env.get("MW_BUILD_REFSET_KEY", ""),
                 **platform_scripts_env(os.path.dirname(os.path.abspath(__file__))),
+                **self.run_env,
             }
             failed_at = None
             why = ""
@@ -2656,6 +2694,31 @@ def self_test() -> int:
           [av[i + 1] for i, a in enumerate(av) if a == "--bind"] == ["/work/r/src", "/work/r/out"]
           and "--tmpfs /scratch" in joined, joined)
     check("bwrap/env only via --setenv", av.count("--setenv") == 2 and av.index("--clearenv") < av.index("--setenv"), av)
+    # THE PREPARED HOST: each fact is handed only when the image carries it (never an empty value).
+    with tempfile.TemporaryDirectory() as pr:
+        check("prepared/nothing installed: nothing handed", prepared_env(pr, os.path.join(pr, "tester")) == {}, pr)
+        os.makedirs(os.path.join(pr, "platform-src"))
+        open(os.path.join(pr, "platform-src", "Directory.Build.props"), "w").close()
+        check("prepared/core source without its commit marker is NOT handed", "MW_PLATFORM_SOURCE" not in prepared_env(pr, pr), pr)
+        open(os.path.join(pr, "platform-src", ".source-commit"), "w").write("a" * 40)
+        os.makedirs(os.path.join(pr, "deploy-src", "deploy", "helm"))
+        open(os.path.join(pr, "deploy-src", "deploy", "helm", "Chart.yaml"), "w").close()
+        os.makedirs(os.path.join(pr, "tester"))
+        open(os.path.join(pr, "tester", "mw-plugin-test.dll"), "w").close()
+        pe = prepared_env(pr, os.path.join(pr, "tester"))
+        check("prepared/all three handed", pe == {"MW_PLATFORM_SOURCE": os.path.join(pr, "platform-src"),
+                                                    "MW_DEPLOY_SOURCE": os.path.join(pr, "deploy-src"),
+                                                    "MW_BUILD_TESTER_APP": os.path.join(pr, "tester")}, pe)
+        check("prepared/reaches a stage through the allow-list", sandbox_env({"PATH": "/usr/bin"}, pe, "/cache").get("MW_DEPLOY_SOURCE") == pe["MW_DEPLOY_SOURCE"], pe)
+        # THE PREPARED TEST CLUSTER: handed only with its ready marker AND its starter.
+        os.makedirs(os.path.join(pr, "pg-snapshot"))
+        check("prepared/a snapshot without its ready marker is NOT handed", "MW_TEST_PG_SNAPSHOT" not in prepared_env(pr, pr), pr)
+        open(os.path.join(pr, "pg-snapshot", "ready"), "w").write("template=mw_test_template\n")
+        check("prepared/a snapshot without its starter is NOT handed", "MW_TEST_PG_SNAPSHOT" not in prepared_env(pr, pr), pr)
+        open(os.path.join(pr, "host-postgres.sh"), "w").close()
+        pe = prepared_env(pr, pr)
+        check("prepared/the snapshot and its starter are handed together",
+              pe.get("MW_TEST_PG_SNAPSHOT") == os.path.join(pr, "pg-snapshot") and pe.get("MW_TEST_PG_SERVER") == os.path.join(pr, "host-postgres.sh"), pe)
     with tempfile.TemporaryDirectory() as ps:
         check("platform scripts/absent: no MW_PLATFORM_SCRIPTS at all (never an empty value)", platform_scripts_env(ps) == {}, ps)
         for n in PLATFORM_SCRIPTS:
