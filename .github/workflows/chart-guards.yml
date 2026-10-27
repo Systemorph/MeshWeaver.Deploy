@@ -14,7 +14,8 @@ name: Chart guards
 # 🛡️ NO SKIP-TRAPDOOR: every input is a checkout — this repository, the PUBLIC platform repository
 # (no token), and the PRIVATE MeshWeaver.Plugins repository, read with a contents:read token minted
 # from the meshweaver-cloud App (MESHWEAVER_APP_ID / MESHWEAVER_APP_PRIVATE_KEY). The `preflight` job
-# asserts that App's secrets and fails RED naming them; nothing skips on their absence. No cluster,
+# asserts that App's secrets and fails RED naming them; nothing skips on their absence — the guards
+# job runs after a failed preflight and fails RED itself, since it is the required context. No cluster,
 # no `continue-on-error:`, no input-shaped `if:`, no path filter. The run must PRINT its verdict line
 # with a non-zero total and zero failures; an exit code alone is not a verdict.
 #
@@ -53,7 +54,7 @@ env:
 
 jobs:
   # Asserts every external input the guards need, and fails RED naming what to provision. The
-  # guards job needs it and runs unconditionally after it — an absent secret is never a skip.
+  # guards job needs it and runs after it whatever it concluded — an absent secret is never a skip.
   # 🚨 A Dependabot run resolves `secrets.` against the DEPENDABOT store, so these two must be
   # provisioned there as well as under Actions.
   preflight:
@@ -77,12 +78,26 @@ jobs:
           fi
           echo "MeshWeaver.Plugins read credential present"
 
+  # 🚨 This job, not `preflight`, is the REQUIRED context — and GitHub accepts a SKIPPED required
+  # check as satisfied. So it must never be skipped because its dependency failed: it runs after
+  # any preflight outcome (`!cancelled()`) and asserts that outcome INSIDE the job, going RED
+  # before checkout when the inputs were not present.
   guards:
     name: Chart guards (vs platform)
     needs: [preflight]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Assert the preflight passed
+        env:
+          PREFLIGHT: ${{ needs.preflight.result }}
+        run: |
+          set -euo pipefail
+          if [ "$PREFLIGHT" != "success" ]; then
+            echo "::error title=Chart guards did not run::preflight concluded '$PREFLIGHT' — its log names the input to provision. This required check is red, never skipped."
+            exit 1
+          fi
       - uses: actions/checkout@v7
       - name: Resolve the platform and Plugins refs the guards compile against
         id: platform-ref
