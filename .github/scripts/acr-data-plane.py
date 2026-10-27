@@ -519,6 +519,60 @@ def digest_refusal_problem(body: str) -> str | None:
     return None
 
 
+def _shell_commands(body: str) -> list[str]:
+    """The step's shell, one entry per COMMAND: `\\`-continued lines and lines starting with `|` are joined."""
+    out: list[str] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if out and (out[-1].endswith("\\") or line.startswith("|")):
+            out[-1] = out[-1].rstrip("\\").rstrip() + " " + line
+        else:
+            out.append(line)
+    return out
+
+
+def _redirect_target(command: str) -> str | None:
+    m = re.search(r'>\s*"?([^"\s;|&]+)"?\s*$', command)
+    return m.group(1) if m else None
+
+
+def run_cache_import_problem(body: str) -> str | None:
+    """None when the LISTED run caches actually reach the build: the tag listing is written to a file, a
+    command derived from that file writes the selection (or the listing itself is read), a `while read -r V`
+    loop over that selection APPENDS `--cache-from "type=registry,ref=…$V"` to `from`, and the build expands
+    "${from[@]}". Presence of the listing and of the expansion alone proves nothing: delete the loop and
+    both remain while only the shared tag is imported."""
+    cmds = _shell_commands(body)
+    listing = next((c for c in cmds if "acr-data-plane.py tags" in c), None)
+    if not listing:
+        return "no `acr-data-plane.py tags` listing"
+    listed = _redirect_target(listing)
+    if not listed:
+        return "the tag listing is not written to a file the selection can read"
+    sources = {listed}
+    for c in cmds:
+        if c is listing:
+            continue
+        target = _redirect_target(c)
+        if target and any(src in c.rsplit(">", 1)[0] for src in sources):
+            sources.add(target)
+    loops = re.finditer(r"while\s+read\s+-r\s+(\w+)\s*;\s*do(?P<loop>.*?)\bdone\s*<\s*\"?([^\"\s]+)\"?",
+                        "\n".join(cmds), flags=re.S)
+    consuming = []
+    for m in loops:
+        var, feed = m.group(1), m.group(3)
+        appends = re.search(rf'\bfrom\+=\(\s*--cache-from\s+"type=registry,ref=[^"]*\$\{{?{var}\}}?[^"]*"\s*\)',
+                            m.group("loop"))
+        if appends and feed in sources:
+            consuming.append(m)
+    if not consuming:
+        return ("nothing appends the listed run caches to `from` (a `while read -r V … from+=(--cache-from "
+                "\"type=registry,ref=…$V\") … done < <file derived from the listing>` loop)")
+    if not re.search(r'docker\s+buildx\s+build\b[^\n]*"\$\{from\[@\]\}"', "\n".join(cmds)):
+        return "the build does not expand \"${from[@]}\""
+    return None
+
+
 def check_cache_handover(text: str) -> list[str]:
     lines = text.splitlines()
     code = [_code(x) for x in lines]
@@ -540,9 +594,9 @@ def check_cache_handover(text: str) -> list[str]:
                             "export per target CONCURRENTLY and each uploads every new blob (run 40559129837 paid the "
                             "~24 GB weights twice and was cut at 45 min). Export ONCE, then move other tags onto that "
                             "manifest with `acr-data-plane.py retag` (a manifest PUT)")
-        if "acr-data-plane.py tags" not in body or not re.search(r'"\$\{from\[@\]\}"', body):
-            problems.append(f"the cache build at line {start + 1} does not import the COMPLETED run caches (list them "
-                            "with `acr-data-plane.py tags` and pass each as `--cache-from` via \"${from[@]}\") — a "
+        flow = run_cache_import_problem(body)
+        if flow:
+            problems.append(f"the cache build at line {start + 1} does not import the COMPLETED run caches: {flow} — a "
                             "finished export whose job was cut before the shared tag moved would be lost (runs "
                             "40559129837 -> 40571543897 re-uploaded 24 GB the registry already held)")
         published = [k for k in range(job, start) if re.search(r"^\s*id:\s*published\s*$", code[k])]
@@ -1000,8 +1054,13 @@ jobs:
       - name: Build into the registry cache
         if: steps.published.outputs.exists == 'false'
         run: |
-          python3 .github/scripts/acr-data-plane.py tags --registry r --tenant t --repository x > tags
+          python3 .github/scripts/acr-data-plane.py tags --registry r --tenant t --repository x > "$RUNNER_TEMP/tags"
+          { grep -E "^$BUILD_CACHE-run-" "$RUNNER_TEMP/tags" || true; } \\
+            | sort -r > "$RUNNER_TEMP/run-caches"
           from=(--cache-from "type=registry,ref=$ACR/$REPO:$BUILD_CACHE")
+          while read -r tag; do
+            from+=(--cache-from "type=registry,ref=$ACR/$REPO:$tag")
+          done < "$RUNNER_TEMP/run-caches"
           docker buildx build "${from[@]}" \\
             --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE-run-1,mode=max" --output type=cacheonly x
   publish:
@@ -1056,11 +1115,28 @@ jobs:
               '            --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE,mode=max" \\\\\n'
               '            --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE-run-1,mode=max"')),
           lambda p: len(p) == 1 and "2 `--cache-to` targets" in p[0])
+    loop = ('          while read -r tag; do\n'
+            '            from+=(--cache-from "type=registry,ref=$ACR/$REPO:$tag")\n'
+            '          done < "$RUNNER_TEMP/run-caches"\n')
     check("cache: a cache build importing ONLY the shared tag is red (runs 40559129837 -> 40571543897)",
-          lambda: check_cache_handover(handover.replace(
-              "          python3 .github/scripts/acr-data-plane.py tags --registry r --tenant t --repository x > tags\n", "")
+          lambda: check_cache_handover(handover.replace(loop, "")
               .replace('docker buildx build "${from[@]}"', 'docker buildx build --cache-from "type=registry,ref=$ACR/$REPO:$BUILD_CACHE"')),
           lambda p: len(p) == 1 and "COMPLETED run caches" in p[0])
+    check("cache: ONLY the consuming loop removed (listing + \"${from[@]}\" kept) is red (review of #54)",
+          lambda: check_cache_handover(handover.replace(loop, "")),
+          lambda p: len(p) == 1 and "nothing appends the listed run caches" in p[0])
+    check("cache: a loop appending a CONSTANT instead of the listed tag is red",
+          lambda: check_cache_handover(handover.replace('ref=$ACR/$REPO:$tag")', 'ref=$ACR/$REPO:$BUILD_CACHE")')),
+          lambda p: len(p) == 1 and "nothing appends" in p[0])
+    check("cache: a loop over a file NOT derived from the listing is red",
+          lambda: check_cache_handover(handover.replace('done < "$RUNNER_TEMP/run-caches"', 'done < "$RUNNER_TEMP/elsewhere"')),
+          lambda p: len(p) == 1 and "nothing appends" in p[0])
+    check("cache: the listing not written to a file is red",
+          lambda: check_cache_handover(handover.replace('--repository x > "$RUNNER_TEMP/tags"', "--repository x")),
+          lambda p: len(p) == 1 and "not written to a file" in p[0])
+    check("cache: the array built but the build not expanding it is red",
+          lambda: check_cache_handover(handover.replace('docker buildx build "${from[@]}"', 'docker buildx build')),
+          lambda p: len(p) == 1 and "does not expand" in p[0])
     check("cache: an ungated cache build is red",
           lambda: check_cache_handover(handover.replace(
               "      - name: Build into the registry cache\n        if: steps.published.outputs.exists == 'false'\n",
