@@ -540,6 +540,7 @@ PREPARE_STEPS = (
     (re.compile(r"\bdotnet" + _OPTS + r"\s+restore\b"), "dotnet restore — packages come from the host's warm NuGet cache (stage `needs: [\"nuget\"]`)"),
     (re.compile(r"\b(?:nuget|dotnet" + _OPTS + r"\s+nuget)" + _OPTS + r"\s+(?:install|restore)\b"), "a NuGet install — packages come from the host's warm NuGet cache"),
     (re.compile(r"\b(?:apt-get|apt|apk|dnf|yum)\s+(?:-\S+\s+)*install\b"), "a system package install — the host image carries its tools"),
+    (re.compile(r"\bapk" + _OPTS + r"\s+add\b"), "a system package install (apk add) — the host image carries its tools"),
     (re.compile(r"\b(?:pip3?|python3?(?:\s+-\S+)*\s+-m\s+pip)" + _OPTS + r"\s+install\b"), "a pip install — the host image carries its tools"),
     (re.compile(r"\bnpm" + _OPTS + r"\s+(?:ci|install|i)\b"), "an npm install — the host image carries its tools"),
     (re.compile(r"\bactions/(?:setup-|cache)"), "a GitHub Actions setup/cache step — the host is already set up"),
@@ -572,6 +573,14 @@ NUGET_SIGNATURE = ".signature.p7s"
 
 
 def nupkg_content_hash(data: bytes) -> Optional[str]:
+    """See `_nupkg_content_hash`; a directory it cannot parse (truncated records) is None, never an exception."""
+    try:
+        return _nupkg_content_hash(data)
+    except (struct.error, IndexError, ValueError):
+        return None
+
+
+def _nupkg_content_hash(data: bytes) -> Optional[str]:
     """NuGet's CONTENT hash of a .nupkg (base64 SHA-512): the archive's own hash when it is unsigned; for a signed
     package the hash of the package WITHOUT its signature entry — the bytes NuGet's
     SignedPackageArchiveUtility.GetPackageContentHash feeds SHA-512: every local entry but the signature's, every
@@ -645,7 +654,10 @@ def nuget_package_problem(pkg_dir: str, pid: str, ver: str) -> Optional[str]:
         return f"unreadable ({e})"
     if base64.b64encode(hashlib.sha512(data).digest()).decode() != stated:
         return "its archive hash does not match what NuGet recorded"
-    if not isinstance(meta, dict) or meta.get("contentHash") != nupkg_content_hash(data):
+    content = nupkg_content_hash(data)
+    if content is None:
+        return "its archive cannot be read as NuGet hashes it (malformed or ZIP64)"
+    if not isinstance(meta, dict) or meta.get("contentHash") != content:
         return "its content hash does not match what NuGet recorded"
     return None
 
@@ -2319,6 +2331,9 @@ class Host:
         ro: list[str] = []
         mirror = os.path.join(self.cache, "git", f"{repo}.git")
         platform_src = self.env.get("MW_PLATFORM_SOURCE", "")
+        # NUGET_FALLBACK_PACKAGES names <cache>/nuget; NuGet refuses a fallback folder that does not exist, and
+        # --ro-bind-try would silently skip it — so a fresh host creates it before the first preparation.
+        os.makedirs(os.path.join(self.cache, "nuget"), exist_ok=True)
 
         def sandboxed(command: str, out: str, extra: dict, readonly: list, writable: list, timeout: float) -> tuple[int, str]:
             argv = self.sandbox.argv(command, checkout, out, sandbox_env(self.env, extra, self.cache),
@@ -2331,7 +2346,7 @@ class Host:
                 return 124, "timed out"
             except OSError as e:
                 return 127, str(e)
-            return r.returncode, (r.stdout or "") + (r.stderr or "")
+            return r.returncode, (r.stderr or "") + (r.stdout or "")      # stdout LAST: the key is its final line
 
         base_extra = {"MW_BUILD_PLATFORM_VERSION": self.platform_version, "MW_BUILD_REPO": repo}
         for p in inputs:
@@ -2374,11 +2389,20 @@ class Host:
                                  [mirror, os.path.join(self.cache, "nuget")], [nuget, psrc],
                                  min(left, p["timeoutMinutes"] * 60))
             shutil.rmtree(psrc, ignore_errors=True)
-            if rc != 0 or not [n for n in os.listdir(out) if not n.startswith(".")]:
+            # The build controls `out` (it may leave it unreadable): every host-side I/O on it is a Refusal NAMING
+            # the input, never an exception that leaves the run without a verdict.
+            try:
+                wrote = [n for n in os.listdir(out) if not n.startswith(".")]
+            except OSError as e:
+                raise Refusal(f"{name}: its output cannot be read ({e})")
+            if rc != 0 or not wrote:
                 raise Refusal(f"{name}: building it failed (exit {rc}{', it wrote nothing' if rc == 0 else ''}): {text.strip()[-600:]}")
             # Host-side marker writes never follow what the build left: the build controls `out`, so a
             # `.source-key` (or, in the copy, a `.complete`) it planted as a symlink would redirect the write.
-            write_marker(out, ".source-key", key)
+            try:
+                write_marker(out, ".source-key", key)
+            except OSError as e:
+                raise Refusal(f"{name}: its output cannot be marked ({e})")
             secs = int(self.clock() - started)
             if trunk:
                 os.makedirs(os.path.dirname(store), exist_ok=True)
@@ -2387,7 +2411,7 @@ class Host:
                     shutil.copytree(out, os.path.join(tmp, "p"), symlinks=True)
                     write_marker(os.path.join(tmp, "p"), ".complete", key)
                     os.rename(os.path.join(tmp, "p"), store)
-                except OSError:
+                except (OSError, shutil.Error):
                     if not os.path.isfile(os.path.join(store, ".complete")):
                         raise Refusal(f"{name}: built, but could not be installed at {store}")
                 finally:
@@ -3351,7 +3375,8 @@ def self_test() -> int:
                            ("npm ci", "npm"), ("python3 -m pip --no-cache-dir install pyyaml", "pip"),
                            ("pip3 --disable-pip-version-check install x", "pip"), ("npm --prefix ./app ci", "npm"),
                            ("npm --prefix=./app install", "npm"), ("dotnet --diagnostics restore X.sln", "dotnet restore"),
-                           ("docker --context remote pull x", "image pull")):
+                           ("docker --context remote pull x", "image pull"), ("apk add --no-cache git", "apk add"),
+                           ("apk --no-cache add git", "apk add")):
             try:
                 validate_stages({"stages": [{"name": "x", "kind": "build", "command": cmd_}]})
                 check(f"prepared/refuses a stage that prepares per run: {cmd_}", False, "accepted")
@@ -3385,6 +3410,16 @@ def self_test() -> int:
               nupkg_content_hash(signed_zip) == b64sha(unsigned_) != b64sha(signed_zip), nupkg_content_hash(signed_zip))
         check("nuget/an unsigned package's content hash is its archive hash", nupkg_content_hash(unsigned_) == b64sha(unsigned_))
         check("nuget/not a zip: no content hash (never promoted)", nupkg_content_hash(b"nupkg-bytes") is None)
+        eocd_ = signed_zip[signed_zip.rfind(b"PK\x05\x06"):]
+        truncated_ = b"PK\x01\x02" + b"\0" * 10 + eocd_[:8] + struct.pack("<HHII", 1, 1, 14, 0) + eocd_[20:]
+        check("nuget/a TRUNCATED central-directory record: no content hash, never an exception", nupkg_content_hash(truncated_) is None)
+        nulld_ = os.path.join(tmp, "pkg-null", "demo.pkg", "1.0.0")
+        os.makedirs(nulld_)
+        open(os.path.join(nulld_, "demo.pkg.1.0.0.nupkg"), "wb").write(truncated_)
+        open(os.path.join(nulld_, "demo.pkg.1.0.0.nupkg.sha512"), "w").write(b64sha(truncated_))
+        open(os.path.join(nulld_, ".nupkg.metadata"), "w").write(json.dumps({"version": 2, "contentHash": None}))
+        check("nuget/negative control: a null contentHash over an unreadable archive is refused, not matched",
+              nuget_package_problem(nulld_, "demo.pkg", "1.0.0") is not None, nuget_package_problem(nulld_, "demo.pkg", "1.0.0"))
 
         def pkg_fixture(kind_: str) -> str:
             root_ = os.path.join(tmp, f"pkg-{kind_}")
@@ -3518,6 +3553,25 @@ def self_test() -> int:
         host(api_ev(), env=penv, checkout=checkout_with(dict(prep_doc(k1), prepared=[dict(prep_doc(k1)["prepared"][0], key="echo not-a-key")]))).run(claim)
         rf3 = last_verdict()
         check("prepared-inputs/a key command that answers no key is RED", rf3 and rf3[0]["succeeded"] is False and "source key" in (rf3[0]["error"] or ""), rf3)
+        posted.clear()
+        host(api_ev(), env=penv, checkout=checkout_with(dict(prep_doc(k1), prepared=[dict(prep_doc(k1)["prepared"][0], key=f"echo {k1}; echo a-diagnostic >&2")]))).run(claim)
+        check("prepared-inputs/a key command that also writes stderr still answers its stdout key (installed, nothing built)",
+              n_builds() == 2 and last_verdict() == [{"kind": "run-finished", "succeeded": True, "error": None}], (n_builds(), last_verdict()))
+        fresh_ = os.path.join(tmp, "fresh-cache")
+        posted.clear()
+        host(api_ev(), env=dict(penv, MW_BUILD_CACHE=fresh_), checkout=checkout_with(prep_doc(k2))).run(claim)
+        check("prepared-inputs/a FRESH host creates the NuGet fallback folder before the first preparation",
+              os.path.isdir(os.path.join(fresh_, "nuget")) and n_builds() == 3, (n_builds(), last_verdict()))
+        posted.clear()
+        host(api_ev(), env=penv, checkout=checkout_with(dict(prep_doc("4" * 64), prepared=[dict(prep_doc("4" * 64)["prepared"][0],
+             build="echo dll > \"$MW_PREPARE_OUT/Shelf.dll\"; chmod 000 \"$MW_PREPARE_OUT\"")]))).run(dict(claim, isTrunk=True))
+        rf5 = last_verdict()
+        for r_, ds_, _ in os.walk(tmp):
+            for d_ in ds_:
+                if not os.access(os.path.join(r_, d_), os.R_OK | os.X_OK):
+                    os.chmod(os.path.join(r_, d_), 0o700)
+        check("prepared-inputs/a build that leaves its output UNREADABLE is a RED verdict naming it, never a crash",
+              rf5 and rf5[0]["succeeded"] is False and "shelf" in (rf5[0]["error"] or "") and "cannot be" in (rf5[0]["error"] or ""), rf5)
         posted.clear()
         host(api_ev(), env=penv, checkout=checkout_with(dict(prep_doc("3" * 64), prepared=[dict(prep_doc("3" * 64)["prepared"][0], build="exit 7")]))).run(dict(claim, isTrunk=True))
         rf4 = last_verdict()
