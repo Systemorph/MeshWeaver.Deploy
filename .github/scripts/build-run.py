@@ -124,6 +124,7 @@ import re
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -131,10 +132,12 @@ import threading
 import time
 import uuid
 import hashlib
+import io
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Callable, Iterable, Optional
+import zipfile
+from typing import Callable, Iterable, Optional, Sequence
 
 STAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 CHANNEL = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
@@ -470,6 +473,24 @@ def validate_prepared(doc: object) -> list[dict]:
     return out
 
 
+def write_marker(directory: str, name: str, text: str) -> None:
+    """Write `<directory>/<name>` as a FRESH regular file, never through what is already there: whatever a sandboxed
+    build left under that name (a symlink to a host file, a directory) is removed first, and the new file is created
+    beside it (mkstemp: O_CREAT|O_EXCL, which never follows a link) and renamed over the entry — so a host-side write cannot be redirected."""
+    target = os.path.join(directory, name)
+    if os.path.isdir(target) and not os.path.islink(target):
+        shutil.rmtree(target)
+    fd, tmp = tempfile.mkstemp(prefix=f".{name.lstrip('.')}-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text + "\n")
+        os.replace(tmp, target)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
+
+
 def prepared_store(cache: str, repo: str, name: str, platform: str, key: str) -> str:
     """Where an installed prepared input lives: one directory per (repository, input, platform, source key)."""
     return os.path.join(cache, "prepared", repo, name, hashlib.sha256(f"{platform}|{key}".encode()).hexdigest()[:32])
@@ -506,18 +527,21 @@ STAGE_NEEDS = {"plugins", "outputs", "nuget"}
 # that stages, resolves, pulls or restores per run is REFUSED — the step belongs in the host image, its init
 # containers or its persistent caches, and the refusal names which. Matched as whole words on the command text; a
 # stage that legitimately needs one of these is a server that is not prepared yet, never an exception to grant here.
+# A tool's GLOBAL options may stand between it and its subcommand (`pip --no-cache-dir install`, `npm --prefix ./app
+# ci`, `docker --context x pull`): each is skipped as an option word with an optional value word.
+_OPTS = r"(?:\s+-{1,2}[A-Za-z][\w.-]*(?:=\S*|\s+[^-\s;&|]\S*)?)*"
 PREPARE_STEPS = (
     (re.compile(r"\bresolve-platform\.py\b"), "resolve-platform.py — the host's set IS the platform (the claim stamps it); nothing resolves one per run"),
     (re.compile(r"\bfetch-refs\.py\b"), "fetch-refs.py — the reference set is staged by the host's init containers, $MeshWeaverRefs"),
     (re.compile(r"\bplatform-mount(?:\.py|-reference-set)?\b"), "platform-mount — the platform is mounted once per roll, by digest"),
     (re.compile(r"\bmodule-fetch\b"), "module-fetch — the plugins layer is installed by the host on the module hand-over"),
-    (re.compile(r"\b(?:docker|podman|crane|skopeo|oras)\s+(?:image\s+)?(?:pull|copy|cp)\b"), "an image pull — images are pre-pulled into the host image or its node-local cache"),
+    (re.compile(r"\b(?:docker|podman|crane|skopeo|oras)" + _OPTS + r"\s+(?:image\s+)?(?:pull|copy|cp)\b"), "an image pull — images are pre-pulled into the host image or its node-local cache"),
     (re.compile(r"\bprepull\b"), "an image pre-pull — done by the host image, not per run"),
-    (re.compile(r"\bdotnet\s+restore\b"), "dotnet restore — packages come from the host's warm NuGet cache (stage `needs: [\"nuget\"]`)"),
-    (re.compile(r"\b(?:nuget|dotnet\s+nuget)\s+(?:install|restore)\b"), "a NuGet install — packages come from the host's warm NuGet cache"),
+    (re.compile(r"\bdotnet" + _OPTS + r"\s+restore\b"), "dotnet restore — packages come from the host's warm NuGet cache (stage `needs: [\"nuget\"]`)"),
+    (re.compile(r"\b(?:nuget|dotnet" + _OPTS + r"\s+nuget)" + _OPTS + r"\s+(?:install|restore)\b"), "a NuGet install — packages come from the host's warm NuGet cache"),
     (re.compile(r"\b(?:apt-get|apt|apk|dnf|yum)\s+(?:-\S+\s+)*install\b"), "a system package install — the host image carries its tools"),
-    (re.compile(r"\bpip3?\s+install\b|\bpython3?\s+-m\s+pip\s+install\b"), "a pip install — the host image carries its tools"),
-    (re.compile(r"\bnpm\s+(?:ci|install|i)\b"), "an npm install — the host image carries its tools"),
+    (re.compile(r"\b(?:pip3?|python3?(?:\s+-\S+)*\s+-m\s+pip)" + _OPTS + r"\s+install\b"), "a pip install — the host image carries its tools"),
+    (re.compile(r"\bnpm" + _OPTS + r"\s+(?:ci|install|i)\b"), "an npm install — the host image carries its tools"),
     (re.compile(r"\bactions/(?:setup-|cache)"), "a GitHub Actions setup/cache step — the host is already set up"),
 )
 
@@ -544,35 +568,128 @@ def nuget_packages(folder: str) -> set[str]:
     return found
 
 
+NUGET_SIGNATURE = ".signature.p7s"
+
+
+def nupkg_content_hash(data: bytes) -> Optional[str]:
+    """NuGet's CONTENT hash of a .nupkg (base64 SHA-512): the archive's own hash when it is unsigned; for a signed
+    package the hash of the package WITHOUT its signature entry — the bytes NuGet's
+    SignedPackageArchiveUtility.GetPackageContentHash feeds SHA-512: every local entry but the signature's, every
+    central-directory record but the signature's (with local-header offsets shifted past the removed entry), and the
+    end record with one entry fewer and the directory's size and offset adjusted. None when the archive cannot be
+    read that way (ZIP64, a malformed directory) — the package is then NOT promoted."""
+    eocd = data.rfind(b"PK\x05\x06")
+    if eocd < 0 or len(data) < eocd + 22:
+        return None
+    _, _, _, n_disk, n_total, cd_size, cd_off = struct.unpack_from("<IHHHHII", data, eocd)
+    if n_disk != n_total or cd_off == 0xFFFFFFFF or n_total == 0xFFFF or cd_off + cd_size > eocd:
+        return None
+    records, pos = [], cd_off
+    for _ in range(n_total):
+        if data[pos:pos + 4] != b"PK\x01\x02":
+            return None
+        name_len, extra_len, comment_len = struct.unpack_from("<HHH", data, pos + 28)
+        local_off = struct.unpack_from("<I", data, pos + 42)[0]
+        size = 46 + name_len + extra_len + comment_len
+        records.append({"pos": pos, "size": size, "local": local_off, "name": data[pos + 46:pos + 46 + name_len]})
+        pos += size
+    sig = [r for r in records if r["name"] == NUGET_SIGNATURE.encode()]
+    if not sig:
+        return base64.b64encode(hashlib.sha512(data).digest()).decode()
+    if len(sig) > 1:
+        return None
+    sig = sig[0]
+    by_local = sorted(records, key=lambda r: r["local"])
+    for i, r in enumerate(by_local):
+        r["entry"] = (by_local[i + 1]["local"] if i + 1 < len(by_local) else cd_off) - r["local"]
+    h = hashlib.sha512()
+    rest = [r for r in by_local if r is not sig]
+    if not rest:
+        return None
+    h.update(data[0:rest[0]["local"]])
+    for r in rest:
+        h.update(data[r["local"]:r["local"] + r["entry"]])
+    for r in sorted(rest, key=lambda r: r["pos"]):
+        h.update(data[r["pos"]:r["pos"] + 42])
+        shift = sig["entry"] if r["local"] > sig["local"] else 0
+        h.update(struct.pack("<I", r["local"] - shift))
+        h.update(data[r["pos"] + 46:r["pos"] + r["size"]])
+    h.update(data[eocd:eocd + 8])
+    h.update(struct.pack("<HHII", n_disk - 1, n_total - 1, cd_size - sig["size"], cd_off - sig["entry"]))
+    h.update(data[eocd + 20:])
+    return base64.b64encode(h.digest()).decode()
+
+
+# What NuGet does NOT extract from a .nupkg into its global-packages folder (OPC plumbing).
+NUGET_NOT_EXTRACTED = re.compile(r"^(?:\[Content_Types\]\.xml$|_rels/|package/)", re.I)
+
+
 def nuget_package_problem(pkg_dir: str, pid: str, ver: str) -> Optional[str]:
-    """Why a restored package folder may NOT enter the shared warm cache, or None. The `.nupkg` must
-    hash (SHA-512, base64) to the `.nupkg.sha512` NuGet wrote beside it AND to the metadata's
-    `contentHash`, and the folder must hold no symlink — a package is promoted only when it is the
-    package NuGet verified, never whatever a stage left in the folder."""
-    nupkg = next((f for f in os.listdir(pkg_dir) if f.lower() == f"{pid}.{ver}.nupkg".lower()), None)
-    if not nupkg:
-        return "no .nupkg"
+    """Why a restored package folder may NOT enter the shared warm cache, or None. The folder must hold no symlink, its
+    `.nupkg` must hash (SHA-512, base64) to the `.nupkg.sha512` NuGet wrote beside it, and the metadata's
+    `contentHash` must be the archive's NuGet CONTENT hash (`nupkg_content_hash` — a signed package's differs from its
+    archive hash). What is promoted is then REBUILT from that verified archive (`promote_nuget`), never copied from
+    the stage-writable extracted files."""
+    for root, dirs, files in os.walk(pkg_dir):
+        if any(os.path.islink(os.path.join(root, n)) for n in dirs + files):
+            return "it contains a symlink"
+    nupkg = f"{pid}.{ver}.nupkg"
     try:
         with open(os.path.join(pkg_dir, nupkg), "rb") as fh:
-            digest = base64.b64encode(hashlib.sha512(fh.read()).digest()).decode()
+            data = fh.read()
         with open(os.path.join(pkg_dir, nupkg + ".sha512")) as fh:
             stated = fh.read().strip()
         with open(os.path.join(pkg_dir, ".nupkg.metadata")) as fh:
             meta = json.load(fh)
     except (OSError, ValueError) as e:
         return f"unreadable ({e})"
-    if digest != stated or not isinstance(meta, dict) or meta.get("contentHash") != digest:
-        return "its hash does not match what NuGet recorded"
-    for root, dirs, files in os.walk(pkg_dir):
-        if any(os.path.islink(os.path.join(root, n)) for n in dirs + files):
-            return "it contains a symlink"
+    if base64.b64encode(hashlib.sha512(data).digest()).decode() != stated:
+        return "its archive hash does not match what NuGet recorded"
+    if not isinstance(meta, dict) or meta.get("contentHash") != nupkg_content_hash(data):
+        return "its content hash does not match what NuGet recorded"
     return None
+
+
+def materialize_nuget_package(pkg_dir: str, pid: str, ver: str, dest: str) -> None:
+    """Rebuild a VERIFIED package folder at `dest` from its archive alone: the .nupkg, its .sha512 and .nupkg.metadata
+    (re-written from the verified values), and every archive entry NuGet extracts (the nuspec under its lower-case
+    id) — nothing a stage left beside them. Raises ValueError for an entry that would leave `dest`."""
+    nupkg = f"{pid}.{ver}.nupkg"
+    with open(os.path.join(pkg_dir, nupkg), "rb") as fh:
+        data = fh.read()
+    with open(os.path.join(pkg_dir, ".nupkg.metadata")) as fh:
+        meta = json.load(fh)
+    os.makedirs(dest)
+    with open(os.path.join(dest, nupkg), "wb") as fh:
+        fh.write(data)
+    with open(os.path.join(dest, nupkg + ".sha512"), "w") as fh:
+        fh.write(base64.b64encode(hashlib.sha512(data).digest()).decode())
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        for info in z.infolist():
+            name = urllib.parse.unquote(info.filename)
+            if info.is_dir() or NUGET_NOT_EXTRACTED.match(name):
+                continue
+            if "/" not in name and name.lower().endswith(".nuspec"):
+                name = f"{pid}.nuspec"
+            parts = name.split("/")
+            if name.startswith("/") or "\\" in name or any(x in ("", ".", "..") for x in parts):
+                raise ValueError(f"archive entry {info.filename!r} would leave the package folder")
+            target = os.path.join(dest, *parts)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with z.open(info) as src, open(target, "xb") as out:
+                shutil.copyfileobj(src, out)
+    out_meta = {"version": meta.get("version", 2), "contentHash": meta["contentHash"]}
+    if isinstance(meta.get("source"), str):
+        out_meta["source"] = meta["source"]
+    with open(os.path.join(dest, ".nupkg.metadata"), "w") as fh:
+        json.dump(out_meta, fh, indent=2)
 
 
 def promote_nuget(restored: str, cache: str, log: Callable[[str], None]) -> tuple[int, int, list[str]]:
     """Promote the packages a TRUNK build stage restored into the shared warm NuGet cache
     (`<cache>/nuget/<id>/<version>/`, the stages' read-only fallback folder), so the next run restores
-    nothing. Each verified (`nuget_package_problem`), copied to a temp dir and renamed into place; a
+    nothing. Each verified (`nuget_package_problem`), REBUILT from its verified archive in a temp dir
+    (`materialize_nuget_package`) and renamed into place; a
     package already present is kept (a NuGet id/version is immutable). Returns (promoted, kept, refused)."""
     root = os.path.join(cache, "nuget")
     os.makedirs(root, exist_ok=True)
@@ -590,10 +707,10 @@ def promote_nuget(restored: str, cache: str, log: Callable[[str], None]) -> tupl
         os.makedirs(os.path.join(root, pid), exist_ok=True)
         tmp = tempfile.mkdtemp(prefix=f".{ver}-", dir=os.path.join(root, pid))
         try:
-            shutil.copytree(os.path.join(restored, pid, ver), os.path.join(tmp, "p"), symlinks=True)
+            materialize_nuget_package(os.path.join(restored, pid, ver), pid, ver, os.path.join(tmp, "p"))
             os.rename(os.path.join(tmp, "p"), final)
             promoted += 1
-        except OSError as e:
+        except (OSError, ValueError, zipfile.BadZipFile, KeyError) as e:
             if not os.path.isfile(os.path.join(final, ".nupkg.metadata")):
                 refused.append(f"{entry} (could not be moved into place: {e})")
             else:
@@ -724,9 +841,14 @@ DEFAULT_RUN_DEADLINE = 7200
 RUN_MARGIN_SECONDS = 600
 
 
-def run_budget_seconds(stages: list[dict], deadline: float) -> int:
-    """The run's effective budget: the selected stages' summed caps + a margin, never past the deadline."""
+PREPARED_KEY_SECONDS = 300
+
+
+def run_budget_seconds(stages: list[dict], deadline: float, prepared: Sequence[dict] = ()) -> int:
+    """The run's effective budget: the selected stages' summed caps + each declared prepared input's build cap
+    and key-command allowance (a cache miss builds it inside the run) + a margin, never past the deadline."""
     total = sum(float(st.get("timeoutMinutes", DEFAULT_STAGE_TIMEOUT_MINUTES)) * 60 for st in stages) + RUN_MARGIN_SECONDS
+    total += sum(float(p.get("timeoutMinutes", 20)) * 60 + PREPARED_KEY_SECONDS for p in prepared)
     return int(min(deadline, total))
 
 
@@ -1969,7 +2091,7 @@ class Host:
             plan = self._sink_for(repo, sha, stages[0]["name"])
             # The run's declared execution budget: the instance sets the attempt's deadline to claim
             # time + budget + 15 min. The host enforces the same number (`budget`, below).
-            budget = run_budget_seconds(stages, self.run_deadline - (self.clock() - started))
+            budget = run_budget_seconds(stages, self.run_deadline - (self.clock() - started), prepared_inputs)
             plan_event = {"kind": "plan", "stages": [st["name"] for st in stages], "budgetMinutes": budget_minutes(budget)}
             if merge_base:
                 plan_event["mergeBase"] = merge_base
@@ -2043,7 +2165,10 @@ class Host:
                                           + ("" if trunk else " (a trunk build promotes them)")},
                               {"kind": "line", "text": f"prepared server: {len(restored)} package(s) restored per run"}])
                     self.deliver(sink)
-                if ok and trunk and st["kind"] == "build" and restored:
+                # The folder accumulates what the prepared builds and earlier stages restored too (already present
+                # before this stage, so not in `restored`): promote ALL of it after every successful trunk build —
+                # promote_nuget keeps a package the warm cache already holds.
+                if ok and trunk and st["kind"] == "build" and nuget_packages(nuget_dir):
                     np_, nk, nr = promote_nuget(nuget_dir, self.cache, self.log)
                     sink.add([{"kind": "line", "text": f"warm NuGet cache: {np_} package(s) promoted, {nk} already present"
                                                        + (f", {len(nr)} NOT promoted (unverified)" if nr else "")}])
@@ -2216,7 +2341,7 @@ class Host:
                 raise Refusal(f"{name}: the run deadline passed before it was prepared")
             keydir = os.path.join(workdir, "prepared-key", name)
             os.makedirs(keydir, exist_ok=True)
-            rc, text = sandboxed(p["key"], keydir, base_extra, [mirror], [], min(left, 300.0))
+            rc, text = sandboxed(p["key"], keydir, base_extra, [mirror], [], min(left, float(PREPARED_KEY_SECONDS)))
             key = (text.strip().splitlines() or [""])[-1].strip() if rc == 0 else ""
             if rc != 0 or not SOURCE_KEY.match(key):
                 raise Refusal(f"{name}: its key command did not answer a source key (exit {rc}): {text.strip()[-300:]}")
@@ -2234,23 +2359,33 @@ class Host:
             os.makedirs(out)
             nuget = os.path.join(workdir, "nuget")
             os.makedirs(nuget, exist_ok=True)
+            # The build gets its OWN writable copy of the platform source: a `dotnet publish` that references
+            # platform projects writes their obj/ and bin/ into that tree, and the image's copy is read-only.
+            # A miss is rare (once per key on main), so the copy is paid once per prepared build.
+            psrc = os.path.join(workdir, "prepared-platform", name)
+            shutil.rmtree(psrc, ignore_errors=True)
+            shutil.copytree(platform_src, psrc, symlinks=True)
+            left = run_end - self.clock()
+            if left <= 0:
+                raise Refusal(f"{name}: the run deadline passed before it was built")
             started = self.clock()
-            rc, text = sandboxed(p["build"], out, {**base_extra, "MW_PREPARE_OUT": out, "MW_PLATFORM_SOURCE": platform_src,
+            rc, text = sandboxed(p["build"], out, {**base_extra, "MW_PREPARE_OUT": out, "MW_PLATFORM_SOURCE": psrc,
                                                    "NUGET_PACKAGES": nuget},
-                                 [mirror, platform_src, os.path.join(self.cache, "nuget")], [nuget],
+                                 [mirror, os.path.join(self.cache, "nuget")], [nuget, psrc],
                                  min(left, p["timeoutMinutes"] * 60))
+            shutil.rmtree(psrc, ignore_errors=True)
             if rc != 0 or not [n for n in os.listdir(out) if not n.startswith(".")]:
                 raise Refusal(f"{name}: building it failed (exit {rc}{', it wrote nothing' if rc == 0 else ''}): {text.strip()[-600:]}")
-            with open(os.path.join(out, ".source-key"), "w") as fh:
-                fh.write(key + "\n")
+            # Host-side marker writes never follow what the build left: the build controls `out`, so a
+            # `.source-key` (or, in the copy, a `.complete`) it planted as a symlink would redirect the write.
+            write_marker(out, ".source-key", key)
             secs = int(self.clock() - started)
             if trunk:
                 os.makedirs(os.path.dirname(store), exist_ok=True)
                 tmp = tempfile.mkdtemp(prefix=".prep-", dir=os.path.dirname(store))
                 try:
                     shutil.copytree(out, os.path.join(tmp, "p"), symlinks=True)
-                    with open(os.path.join(tmp, "p", ".complete"), "w") as fh:
-                        fh.write(key + "\n")
+                    write_marker(os.path.join(tmp, "p"), ".complete", key)
                     os.rename(os.path.join(tmp, "p"), store)
                 except OSError:
                     if not os.path.isfile(os.path.join(store, ".complete")):
@@ -3213,7 +3348,10 @@ def self_test() -> int:
                            ("docker image pull x", "image pull"), ("bash scripts/prepull-testcontainers-images.sh", "pre-pull"),
                            ("set -e; dotnet restore src/X.csproj", "dotnet restore"), ("nuget install X", "NuGet install"),
                            ("apt-get -y install jq", "system package"), ("python3 -m pip install pyyaml", "pip"),
-                           ("npm ci", "npm")):
+                           ("npm ci", "npm"), ("python3 -m pip --no-cache-dir install pyyaml", "pip"),
+                           ("pip3 --disable-pip-version-check install x", "pip"), ("npm --prefix ./app ci", "npm"),
+                           ("npm --prefix=./app install", "npm"), ("dotnet --diagnostics restore X.sln", "dotnet restore"),
+                           ("docker --context remote pull x", "image pull")):
             try:
                 validate_stages({"stages": [{"name": "x", "kind": "build", "command": cmd_}]})
                 check(f"prepared/refuses a stage that prepares per run: {cmd_}", False, "accepted")
@@ -3223,28 +3361,89 @@ def self_test() -> int:
         for cmd_ in ("python3 scripts/canonical-compile-check.py --refs \"$refs\"; python3 scripts/check-scripts.py --refs \"$refs\"",
                      "\"$dn\" \"$tester\" compile . --app \"$app\" --allow plugin-gate.allow",
                      "python3 /core-tests/core-tests.py shard 3", "dotnet build -c Release --no-restore src/X.csproj",
-                     "echo restored-by-the-server; grep -c pull log.txt"):
+                     "echo restored-by-the-server; grep -c pull log.txt", "npm --prefix ./app run build",
+                     "dotnet --info; dotnet build --no-restore -c Release X.csproj", "python3 -m pip --version"):
             check(f"prepared/accepts a prepared stage: {cmd_[:40]}", per_run_prepare_steps(cmd_) == [], per_run_prepare_steps(cmd_))
-        mk_pkg = ("python3 -c \"import os,hashlib,base64,json,sys;d=os.path.join(os.environ['NUGET_PACKAGES'],'demo.pkg','1.0.0');"
-                  "os.makedirs(d,exist_ok=True);b=b'nupkg-bytes';open(os.path.join(d,'demo.pkg.1.0.0.nupkg'),'wb').write(b);"
-                  "h=base64.b64encode(hashlib.sha512(b).digest()).decode();open(os.path.join(d,'demo.pkg.1.0.0.nupkg.sha512'),'w').write(h);"
-                  "json.dump({'version':2,'contentHash':h if sys.argv[1]=='good' else 'forged'},open(os.path.join(d,'.nupkg.metadata'),'w'))\" ")
+        # A REAL package fixture (a zip with a nuspec, a lib and OPC plumbing), restored by the stage from a folder the
+        # self-test writes: `good` (unsigned), `signed` (a `.signature.p7s` entry appended — its content hash is the
+        # UNSIGNED package's, not the archive's), `forged` (metadata naming another hash) and `tamper` (good hashes,
+        # but the extracted DLL altered and an extra file planted after NuGet extracted it).
+        def fixture_zip(signed_: bool) -> bytes:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net10.0/Demo.dll", b"the-real-dll"),
+                               ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
+                    z.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_)
+                if signed_:
+                    z.writestr(zipfile.ZipInfo(NUGET_SIGNATURE, (2020, 1, 1, 0, 0, 0)), b"pkcs7-signature")
+            return buf.getvalue()
+
+        def b64sha(b_: bytes) -> str:
+            return base64.b64encode(hashlib.sha512(b_).digest()).decode()
+        unsigned_, signed_zip = fixture_zip(False), fixture_zip(True)
+        check("nuget/a signed package's content hash is the UNSIGNED package's, not its archive hash",
+              nupkg_content_hash(signed_zip) == b64sha(unsigned_) != b64sha(signed_zip), nupkg_content_hash(signed_zip))
+        check("nuget/an unsigned package's content hash is its archive hash", nupkg_content_hash(unsigned_) == b64sha(unsigned_))
+        check("nuget/not a zip: no content hash (never promoted)", nupkg_content_hash(b"nupkg-bytes") is None)
+
+        def pkg_fixture(kind_: str) -> str:
+            root_ = os.path.join(tmp, f"pkg-{kind_}")
+            d_ = os.path.join(root_, "demo.pkg", "1.0.0")
+            shutil.rmtree(root_, ignore_errors=True)
+            os.makedirs(os.path.join(d_, "lib", "net10.0"))
+            b_ = signed_zip if kind_ == "signed" else unsigned_
+            open(os.path.join(d_, "demo.pkg.1.0.0.nupkg"), "wb").write(b_)
+            open(os.path.join(d_, "demo.pkg.1.0.0.nupkg.sha512"), "w").write(b64sha(b_))
+            open(os.path.join(d_, "demo.pkg.nuspec"), "wb").write(b"<package/>")
+            open(os.path.join(d_, "lib", "net10.0", "Demo.dll"), "wb").write(b"POISONED" if kind_ == "tamper" else b"the-real-dll")
+            if kind_ == "tamper":
+                open(os.path.join(d_, "lib", "net10.0", "Extra.targets"), "w").write("<Project/>")
+            json.dump({"version": 2, "contentHash": "forged" if kind_ == "forged" else nupkg_content_hash(b_)},
+                      open(os.path.join(d_, ".nupkg.metadata"), "w"))
+            return f"cp -R {root_}/. \"$NUGET_PACKAGES\"/"
         warm = os.path.join(cache, "nuget", "demo.pkg", "1.0.0")
         posted.clear()
-        hpr = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": mk_pkg + "good"}]}))
+        hpr = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("good")}]}))
         hpr.run(claim)
         warns = [e for _, evs in posted for e in evs if e["kind"] == "diagnostic" and e.get("code") == "MWPREP001"]
         check("prepared/a package restored per run is SAID (a warning naming it)", len(warns) == 1 and "demo.pkg/1.0.0" in warns[0]["message"], warns)
         check("prepared/a PR run's restore never enters the warm cache", not os.path.exists(warm))
         posted.clear()
-        htr = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": mk_pkg + "good"}]}))
+        htr = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("good")}]}))
         htr.run(dict(claim, isTrunk=True))
         check("prepared/a trunk build's verified restore is promoted into the warm cache",
-              os.path.isfile(os.path.join(warm, ".nupkg.metadata")) and nuget_packages(os.path.join(cache, "nuget")) == {"demo.pkg/1.0.0"})
+              os.path.isfile(os.path.join(warm, ".nupkg.metadata")) and nuget_packages(os.path.join(cache, "nuget")) == {"demo.pkg/1.0.0"}
+              and sorted(os.listdir(warm)) == [".nupkg.metadata", "demo.pkg.1.0.0.nupkg", "demo.pkg.1.0.0.nupkg.sha512", "demo.pkg.nuspec", "lib"],
+              sorted(os.listdir(warm)) if os.path.isdir(warm) else None)
         shutil.rmtree(os.path.join(cache, "nuget"))
-        htf = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": mk_pkg + "forged"}]}))
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("signed")}]})).run(dict(claim, isTrunk=True))
+        check("prepared/a SIGNED package (content hash != archive hash) is promoted, its signature extracted as NuGet does",
+              os.path.isfile(os.path.join(warm, ".nupkg.metadata")) and os.path.isfile(os.path.join(warm, NUGET_SIGNATURE)))
+        shutil.rmtree(os.path.join(cache, "nuget"))
+        htf = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("forged")}]}))
         htf.run(dict(claim, isTrunk=True))
         check("prepared/negative control: a package whose hash is not what NuGet recorded is NOT promoted", not os.path.exists(warm))
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("tamper")}]})).run(dict(claim, isTrunk=True))
+        check("prepared/negative control: an ALTERED extracted file never reaches the warm cache — it is rebuilt from the verified archive",
+              os.path.isfile(os.path.join(warm, "lib", "net10.0", "Demo.dll"))
+              and open(os.path.join(warm, "lib", "net10.0", "Demo.dll"), "rb").read() == b"the-real-dll"
+              and not os.path.exists(os.path.join(warm, "lib", "net10.0", "Extra.targets")))
+        shutil.rmtree(os.path.join(cache, "nuget"))
+        # what an EARLIER stage restored (present before the build stage started) is promoted by the build stage too
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [
+            {"name": "t", "kind": "test", "command": pkg_fixture("good")},
+            {"name": "a", "kind": "build", "command": "true"}]})).run(dict(claim, isTrunk=True))
+        check("prepared/a later trunk build promotes what an earlier stage restored", os.path.isfile(os.path.join(warm, ".nupkg.metadata")))
+        shutil.rmtree(os.path.join(cache, "nuget"))
+        w_dir = os.path.join(tmp, "marker")
+        os.makedirs(w_dir)
+        victim = os.path.join(tmp, "victim")
+        open(victim, "w").write("host file")
+        os.symlink(victim, os.path.join(w_dir, ".source-key"))
+        write_marker(w_dir, ".source-key", "k")
+        check("prepared-inputs/a marker planted as a symlink is REPLACED, never written through",
+              open(victim).read() == "host file" and not os.path.islink(os.path.join(w_dir, ".source-key"))
+              and open(os.path.join(w_dir, ".source-key")).read() == "k\n")
         posted.clear()
         hnone = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": "true"}]}))
         hnone.run(dict(claim, isTrunk=True))
@@ -3273,7 +3472,7 @@ def self_test() -> int:
         def prep_doc(key):
             return {"prepared": [{"name": "shelf", "env": "MW_BUILD_MODULE_LIBS", "key": f"echo noise; echo {key}",
                                   "build": f"echo built >> {builds}; echo dll > \"$MW_PREPARE_OUT/Shelf.dll\"; "
-                                           "test -d \"$MW_PLATFORM_SOURCE\""}],
+                                           "test -d \"$MW_PLATFORM_SOURCE\" && mkdir -p \"$MW_PLATFORM_SOURCE/src/obj\""}],
                     "stages": [{"name": "a", "kind": "build",
                                 "command": f"cat \"$MW_BUILD_MODULE_LIBS/.source-key\" > {seen_in}; echo \"$MW_BUILD_MODULE_LIBS\" >> {seen_in}; "
                                            "test -f \"$MW_BUILD_MODULE_LIBS/Shelf.dll\""}]}
@@ -3290,6 +3489,8 @@ def self_test() -> int:
         seen_ = open(seen_in).read().split()
         check("prepared-inputs/main moved: a TRUNK run builds it ONCE and installs it persistently",
               n_builds() == 1 and os.path.isfile(os.path.join(store1, ".complete")) and seen_ == [k1, store1], (n_builds(), seen_))
+        check("prepared-inputs/the build writes obj/ into its OWN copy of the platform source, never the image's",
+              not os.path.exists(os.path.join(psrc, "src")))
         check("prepared-inputs/the run is green on the installed input", last_verdict() == [{"kind": "run-finished", "succeeded": True, "error": None}], last_verdict())
         posted.clear()
         host(api_ev(), env=penv, checkout=checkout_with(prep_doc(k1))).run(claim)
@@ -3545,6 +3746,9 @@ def self_test() -> int:
             run_budget_seconds([{"timeoutMinutes": 45}, {"timeoutMinutes": 45}], hp.run_deadline)), kinds)
         check("budget/two 40+45-minute stages fit the default deadline",
               run_budget_seconds([{"timeoutMinutes": 40}, {"timeoutMinutes": 45}], DEFAULT_RUN_DEADLINE) == 85 * 60 + RUN_MARGIN_SECONDS)
+        check("budget/a declared prepared input's build cap and key allowance are inside the budget",
+              run_budget_seconds([{"timeoutMinutes": 1}], DEFAULT_RUN_DEADLINE, [{"timeoutMinutes": 20}])
+              == 60 + RUN_MARGIN_SECONDS + 20 * 60 + PREPARED_KEY_SECONDS)
         check("budget/capped by the deadline", run_budget_seconds([{"timeoutMinutes": 45}] * 4, 2100) == 2100)
         check("budget/2100 s declares 35 minutes", budget_minutes(2100) == 35)
         check("budget/minutes round up and stay in 10..720",
