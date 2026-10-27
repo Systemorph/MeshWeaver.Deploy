@@ -526,10 +526,20 @@ def check_cache_handover(text: str) -> list[str]:
     exporters = [i for i, c in enumerate(code) if "--cache-to" in c and not c.strip().startswith("#")]
     if not exporters:
         return []
+    seen_steps: set[int] = set()
     for i in exporters:
         start, end = _step_around(lines, i)
         body = "\n".join(code[start:end])
         job = _job_of(lines, i)
+        if start in seen_steps:
+            continue
+        seen_steps.add(start)
+        exports = len(re.findall(r"--cache-to\b", body))
+        if exports > 1:
+            problems.append(f"the cache build at line {start + 1} has {exports} `--cache-to` targets — BuildKit runs one "
+                            "export per target CONCURRENTLY and each uploads every new blob (run 40559129837 paid the "
+                            "~24 GB weights twice and was cut at 45 min). Export ONCE, then move other tags onto that "
+                            "manifest with `acr-data-plane.py retag` (a manifest PUT)")
         published = [k for k in range(job, start) if re.search(r"^\s*id:\s*published\s*$", code[k])]
         if not published:
             problems.append(f"the cache build at line {start + 1} is not preceded, in its job, by the `id: published` "
@@ -1033,6 +1043,12 @@ jobs:
               .replace("    needs: cache\n    steps:\n",
                        "    needs: cache\n    steps:\n      - name: Is this commit already published?\n        id: published\n        run: echo x\n")),
           lambda p: any("not preceded" in x for x in p))
+    check("cache: two `--cache-to` targets in one build are red (run 40559129837 uploaded the weights twice)",
+          lambda: check_cache_handover(handover.replace(
+              '            --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE-run-1,mode=max"',
+              '            --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE,mode=max" \\\\\n'
+              '            --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE-run-1,mode=max"')),
+          lambda p: len(p) == 1 and "2 `--cache-to` targets" in p[0])
     check("cache: an ungated cache build is red",
           lambda: check_cache_handover(handover.replace(
               "      - name: Build into the registry cache\n        if: steps.published.outputs.exists == 'false'\n",

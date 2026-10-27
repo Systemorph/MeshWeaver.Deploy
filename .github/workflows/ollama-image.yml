@@ -256,9 +256,12 @@ jobs:
           status=$(docker info --format '{{json .DriverStatus}}')
           grep -q 'io.containerd.snapshotter' <<<"$status" \
             || { echo "::error::Docker is not on the containerd image store — the zstd push needs it"; exit 1; }
-      # Reads the SHARED tag only as a warm start, and writes this run's cache twice: to the shared tag (the
-      # next run's warm start) and to a RUN-SPECIFIC tag, whose digest is what `publish` imports.
-      - name: Build into the registry cache (cache-from first, cache-to; no image)
+      # Reads the SHARED tag only as a warm start, and exports this run's cache ONCE, to a RUN-SPECIFIC tag.
+      # 🚨 ONE `--cache-to`. Two (shared + run tag) made BuildKit run two concurrent exports that each
+      # uploaded the ~24 GB weights layer, neither seeing the other's blob: run 40559129837 finished one in
+      # 1560.7 s and was cut at 45 min still uploading the other. The shared tag is moved afterwards by a
+      # manifest PUT (next step), which uploads no blob.
+      - name: Build into the registry cache (cache-from first, cache-to once; no image)
         if: steps.published.outputs.exists == 'false'
         run: |
           set -euo pipefail
@@ -266,24 +269,31 @@ jobs:
           opts="mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,compression-level=1,force-compression=true"
           docker buildx build --builder "$(docker context show)" --progress=plain --provenance=false --sbom=false \
             --cache-from "type=registry,ref=$ACR/$REPO:$BUILD_CACHE" \
-            --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE,$opts" \
             --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE-run-${GITHUB_SHA::7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT},$opts" \
             --output type=cacheonly \
             deploy/ollama
           echo "build cache written in $(( $(date +%s) - start ))s"
           echo "### ollama build cache: $(( $(date +%s) - start ))s" >> "$GITHUB_STEP_SUMMARY"
       # The hand-over is the run-specific cache manifest's DIGEST, hashed from the bytes the registry serves.
-      - name: Hand the cache to publish by digest (immutable)
+      # Then the SHARED tag (the next run's warm start) is pointed at that same manifest, byte for byte: a
+      # manifest PUT whose blobs the repository already holds — no second upload.
+      - name: Hand the cache to publish by digest (immutable); move the shared warm-start tag onto it
         id: handover
         if: steps.published.outputs.exists == 'false'
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         run: |
           set -euo pipefail
           run_tag="$BUILD_CACHE-run-${GITHUB_SHA::7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          docker buildx imagetools inspect --raw "$ACR/$REPO:$run_tag" > "$RUNNER_TEMP/cache-manifest.json"
-          digest="sha256:$(sha256sum "$RUNNER_TEMP/cache-manifest.json" | cut -d' ' -f1)"
-          [ -s "$RUNNER_TEMP/cache-manifest.json" ] || { echo "::error::$REPO:$run_tag read back empty"; exit 1; }
+          # `retag` GETs the run tag's manifest over the data plane, hashes the EXACT bytes served (refusing a
+          # served digest that disagrees), PUTs them under the shared tag and refuses a PUT stored under any
+          # other digest — so the digest it prints is both the hand-over and the shared tag's new target.
+          # (Not `imagetools inspect --raw | sha256sum`: that hashes a re-printed manifest, not the stored one.)
+          digest=$(python3 .github/scripts/acr-data-plane.py retag --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
+            --repository "$REPO" --from "$run_tag" --to "$BUILD_CACHE")
+          case "$digest" in sha256:*) ;; *) echo "::error::retag of $REPO:$run_tag printed no digest ('$digest')"; exit 1 ;; esac
           echo "cache_ref=$ACR/$REPO@$digest" >> "$GITHUB_OUTPUT"
-          echo "publish imports $ACR/$REPO@$digest ($run_tag)"
+          echo "publish imports $ACR/$REPO@$digest ($run_tag); $REPO:$BUILD_CACHE -> the same manifest (manifest PUT, no blob upload)"
 
   # main (push or dispatch): build the same way, push both tags, read them back.
   publish:
