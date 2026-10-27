@@ -33,13 +33,15 @@ registry with that.
         `acr-login.sh` (both take the ARM lookup above).
     acr-data-plane.py converge-line --registry <login server> --tenant <tenant id> --repository <name>
                               --line <line tag> --self <commit> --paths "<lane paths>"
-        put <line> on the image of main's NEWEST publication — the newest first-parent commit of
+        put <line> on the image of main's newest PUBLISHED publication — first-parent commits of
         origin/main touching <paths>, tagged <line>-<sha7> — and RE-CHECK AFTER EVERY WRITE: re-fetch
         main, re-derive the newest, read the line back, and write again until the line names the newest
         published image and nothing moved underneath. That is what makes concurrent publish runs safe
         without a lock: whichever write lands LAST was followed by its writer's own re-check, so a stale
-        write (an older run that paused before its PUT) is always corrected by the run that made it. A
-        newest commit whose image is not published yet is left to its own run, which comes later.
+        write (an older run that paused before its PUT) is always corrected by the run that made it.
+        The walk goes newest first over at most 50 publications and converges to the newest whose
+        image IS published: an unpublished commit (registry "not found") is skipped, never stopped
+        at; any other lookup outcome is red, and no published image in the window is red.
     acr-data-plane.py check-line-convergence <workflow.yml>
         RED unless the service-image lane moves its line tag ONLY through `converge-line` (never a raw
         `retag … --to "$LINE"`, which has no post-write re-check, and never a build or push), in a step
@@ -236,41 +238,60 @@ def tag_digest(server: str, tenant: str, repository: str, tag: str, io: Io) -> s
     return "sha256:" + hashlib.sha256(body).hexdigest()
 
 
-def newest_publication(paths: list[str], io: Io) -> str:
-    """main's newest first-parent commit touching the lane's paths, from a FRESH fetch."""
+PUBLICATION_WINDOW = 50
+
+
+def publications(paths: list[str], io: Io) -> list[str]:
+    """main's first-parent commits touching the lane's paths, NEWEST FIRST, at most PUBLICATION_WINDOW of
+    them, from a FRESH fetch."""
     io.run(["git", "fetch", "--quiet", "origin", "main"], check=True, capture_output=True, text=True)
-    out = io.run(["git", "log", "-1", "--first-parent", "--format=%H", "origin/main", "--", *paths],
-                 check=True, capture_output=True, text=True).stdout.strip()
-    if not re.fullmatch(r"[0-9a-f]{40}", out):
-        raise Refusal(f"could not resolve main's newest publication for {paths} (got {out!r})")
+    out = io.run(["git", "log", f"-{PUBLICATION_WINDOW}", "--first-parent", "--format=%H", "origin/main", "--", *paths],
+                 check=True, capture_output=True, text=True).stdout.split()
+    if not out or not all(re.fullmatch(r"[0-9a-f]{40}", c) for c in out):
+        raise Refusal(f"could not resolve main's publications for {paths} (got {out[:3]!r})")
     return out
+
+
+def newest_published(server: str, tenant: str, repository: str, line: str, self_sha: str, paths: list[str],
+                     io: Io) -> tuple[str, str]:
+    """(commit, digest) of the newest publication on main whose immutable image IS in the registry.
+    Walks newest first and SKIPS a commit only when the registry ANSWERED "not found" (its build is still
+    running, or failed); any other lookup outcome is a Refusal. Never stops at the first commit."""
+    skipped = []
+    for commit in publications(paths, io):
+        digest = tag_digest(server, tenant, repository, f"{line}-{commit[:7]}", io)
+        if digest is not None:
+            if skipped:
+                print(f"converge-line: skipped unpublished {', '.join(c[:7] for c in skipped)} — newest published is {commit[:7]}")
+            return commit, digest
+        if commit == self_sha:
+            raise Refusal(f"{repository}:{line}-{commit[:7]} is this run's own image and the registry says it is absent")
+        skipped.append(commit)
+    raise Refusal(f"none of main's {len(skipped)} newest publications of {repository} (window {PUBLICATION_WINDOW}) "
+                  f"has a published {line}-<sha7> image — nothing to converge the line to")
 
 
 CONVERGE_ROUNDS = 6
 
 
 def converge_line(server: str, tenant: str, repository: str, line: str, self_sha: str, paths: list[str],
-                  io: Io) -> tuple[str, str | None]:
-    """(newest commit, the digest the line names) once converged; digest None = left to the newest's run."""
+                  io: Io) -> tuple[str, str]:
+    """(commit, digest) the line names once converged onto main's newest PUBLISHED publication."""
     if not re.fullmatch(r"[0-9a-f]{40}", self_sha or ""):
         raise Refusal(f"--self must be a 40-hex commit, got {self_sha!r}")
     if not paths:
         raise Refusal("--paths is empty — the newest publication of WHAT?")
     for round_ in range(1, CONVERGE_ROUNDS + 1):
-        newest = newest_publication(paths, io)
-        want = tag_digest(server, tenant, repository, f"{line}-{newest[:7]}", io)
-        if want is None:
-            if newest == self_sha:
-                raise Refusal(f"{repository}:{line}-{newest[:7]} is this run's own image and the registry says it is absent")
-            print(f"converge-line: main's newest publication {newest[:7]} is not published yet — its own run moves the line")
-            return newest, None
+        target, want = newest_published(server, tenant, repository, line, self_sha, paths, io)
         if tag_digest(server, tenant, repository, line, io) != want:
-            retag(server, tenant, repository, f"{line}-{newest[:7]}", line, io)
-        # The re-check that makes a stale write self-correcting: after OUR write, is the newest still the
-        # newest, and does the line still name it? Anything that moved underneath sends us round again.
-        if newest_publication(paths, io) == newest and tag_digest(server, tenant, repository, line, io) == want:
-            print(f"converge-line: {repository}:{line} = {want} ({line}-{newest[:7]}, round {round_})")
-            return newest, want
+            retag(server, tenant, repository, f"{line}-{target[:7]}", line, io)
+        # The re-check that makes a stale write self-correcting: after OUR write, is the target still the
+        # newest PUBLISHED one, and does the line still name it? Anything that moved underneath (a newer
+        # image published, another writer's PUT) sends us round again.
+        again, _ = newest_published(server, tenant, repository, line, self_sha, paths, io)
+        if again == target and tag_digest(server, tenant, repository, line, io) == want:
+            print(f"converge-line: {repository}:{line} = {want} ({line}-{target[:7]}, round {round_})")
+            return target, want
     raise Refusal(f"{repository}:{line} did not settle in {CONVERGE_ROUNDS} rounds — something keeps moving it")
 
 
@@ -719,26 +740,32 @@ jobs:
                                                       "          # python3 .github/scripts/acr-data-plane.py converge-line")),
           lambda p: any("no step runs" in x for x in p))
 
-    # ── converge-line against a fake registry + a fake main: the race the review describes ──
-    A, B = "a" * 40, "b" * 40
-    blob = {f"0.1-{A[:7]}": b'{"a":1}', f"0.1-{B[:7]}": b'{"b":2}'}
+    # ── converge-line against a fake registry + a fake main ──
+    A, B, C = "a" * 40, "b" * 40, "c" * 40
+    blob = {f"0.1-{A[:7]}": b'{"a":1}', f"0.1-{B[:7]}": b'{"b":2}', f"0.1-{C[:7]}": b'{"c":3}'}
+    dig = {k: "sha256:" + hashlib.sha256(v).hexdigest() for k, v in blob.items()}
 
-    def converge_io(heads, reg, puts, after_put=None):
-        """heads: successive answers of `git log` for main's newest; reg: tag -> bytes (the registry)."""
-        state = {"heads": list(heads)}
+    def img(c):
+        return blob[f"0.1-{c[:7]}"]
+
+    def converge_io(logs, reg, puts, after_put=None, fail_tag=None):
+        """logs: successive answers of `git log` (each newest-first); reg: tag -> bytes (the registry)."""
+        state = {"logs": [list(x) for x in logs]}
 
         def post(url, form):
             return {"refresh_token": "r"} if url.endswith("/oauth2/exchange") else {"access_token": "t"}
 
         def run(cmd, **kw):
             if cmd[:2] == ["git", "log"]:
-                h = state["heads"].pop(0) if len(state["heads"]) > 1 else state["heads"][0]
-                return Done(h + "\n")
+                h = state["logs"].pop(0) if len(state["logs"]) > 1 else state["logs"][0]
+                return Done("\n".join(h) + "\n")
             return Done("entra-token\n" if cmd[0] == "az" else "")
 
         def fetch(method, url, token, headers, body):
             tag = url.rsplit("/", 1)[1]
             if method == "GET":
+                if tag == fail_tag:
+                    return 503, {}, b"throttled"
                 return (200, {"content-type": "application/vnd.oci.image.manifest.v1+json"}, reg[tag]) if tag in reg \
                     else (404, {}, b"")
             reg[tag] = body
@@ -748,43 +775,66 @@ jobs:
             return 201, {"docker-content-digest": "sha256:" + hashlib.sha256(body).hexdigest()}, b""
         return Io(post=post, run=run, fetch=fetch, sleep=lambda s: None)
 
-    dig = {k: "sha256:" + hashlib.sha256(v).hexdigest() for k, v in blob.items()}
-    reg = dict(blob)
+    def published(*cs):
+        return {f"0.1-{c[:7]}": img(c) for c in cs}
+
+    reg = published(A)
     puts: list = []
-    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([A], reg, puts))
+    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([[A]], reg, puts))
     check("converge/the newest run moves the line onto its own image and verifies it",
           lambda: (got, puts), lambda g: g == ((A, dig[f"0.1-{A[:7]}"]), ["0.1"]))
-    # THE RACE: run A believes it is newest, but B was promoted and verified while A paused; A's PUT
-    # lands on top. A's re-check after its own write sees B and puts the line back on B.
-    reg = dict(blob)
-    reg["0.1"] = blob[f"0.1-{B[:7]}"]
+    # Round-3 race: A believes it is newest, B was promoted while A paused; A's PUT lands on top and A's own
+    # re-check puts the line back on B.
+    reg = dict(published(A, B), **{"0.1": img(B)})
     puts = []
-    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"],
-                        converge_io([A, B, B, B], reg, puts))
-    check("converge/a stale write by an older run is corrected by that run's own re-check (the review's race)",
-          lambda: (got, reg["0.1"]), lambda g: g[0] == (B, dig[f"0.1-{B[:7]}"]) and g[1] == blob[f"0.1-{B[:7]}"])
-    # Another writer moves the line after our PUT: the read-back disagrees, so we go round again.
-    reg = {k: v for k, v in blob.items()}
+    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([[A], [B, A]], reg, puts))
+    check("converge/a stale write by an older run is corrected by that run's own re-check",
+          lambda: (got, reg["0.1"], puts),
+          lambda g: g[0] == (B, dig[f"0.1-{B[:7]}"]) and g[1] == img(B) and g[2] == ["0.1", "0.1"])
+    # Round-4 race (A/B/C): A's delayed PUT lands on B's promoted line AFTER C became newest, and C's image is
+    # not published yet. The re-check must walk PAST unpublished C to B, never stop at C and leave A.
+    reg = dict(published(A, B), **{"0.1": img(B)})
+    puts = []
+    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([[A], [C, B, A]], reg, puts))
+    check("converge/A/B/C: A's stale PUT after C became newest (C unpublished) ends on B, not A",
+          lambda: (got, reg["0.1"], puts),
+          lambda g: g[0] == (B, dig[f"0.1-{B[:7]}"]) and g[1] == img(B) and g[2] == ["0.1", "0.1"])
+    # ... and C's build FAILED: C never publishes. A later converge (a rerun of B) keeps the line on B.
+    puts = []
+    got = converge_line("r.io", "t", "x", "0.1", B, ["deploy/x"], converge_io([[C, B, A]], reg, puts))
+    check("converge/A/B/C: C's build failed — the line stays on B, with no write",
+          lambda: (got, reg["0.1"], puts), lambda g: g[0] == (B, dig[f"0.1-{B[:7]}"]) and g[1] == img(B) and g[2] == [])
+    # ... and once C does publish, C's run converges onto C.
+    reg.update(published(C))
+    got = converge_line("r.io", "t", "x", "0.1", C, ["deploy/x"], converge_io([[C, B, A]], reg, []))
+    check("converge/A/B/C: once C is published, C's run moves the line onto C",
+          lambda: (got, reg["0.1"]), lambda g: g[0] == (C, dig[f"0.1-{C[:7]}"]) and g[1] == img(C))
+    # A line moved by another writer after our write: the read-back disagrees, so we go round again.
+    reg = published(A, B)
     puts = []
     flips = {"n": 0}
 
     def clobber(r):
         if flips["n"] == 0:
             flips["n"] = 1
-            r["0.1"] = blob[f"0.1-{A[:7]}"]
-    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([B], reg, puts, clobber))
+            r["0.1"] = img(A)
+    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([[B, A]], reg, puts, clobber))
     check("converge/a line moved underneath after our write is re-converged, not reported green",
-          lambda: (got, reg["0.1"], len(puts)), lambda g: g[0] == (B, dig[f"0.1-{B[:7]}"]) and g[1] == blob[f"0.1-{B[:7]}"] and g[2] == 2)
-    reg = {f"0.1-{A[:7]}": blob[f"0.1-{A[:7]}"]}
-    puts = []
-    got = converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([B], reg, puts))
-    check("converge/a newest commit not yet published is left to its own run (no write)",
-          lambda: (got, puts), lambda g: g == ((B, None), []))
+          lambda: (got, reg["0.1"], len(puts)),
+          lambda g: g[0] == (B, dig[f"0.1-{B[:7]}"]) and g[1] == img(B) and g[2] == 2)
+    check("converge/an unpublished newest commit is skipped, not stopped at (line -> newest PUBLISHED)",
+          lambda: converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([[B, A]], published(A), [])),
+          lambda g: g == (A, dig[f"0.1-{A[:7]}"]))
+    check("converge/a lookup that is not 'not found' (503) is RED, never skipped",
+          lambda: converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"],
+                                converge_io([[C, B, A]], published(A, B), [], fail_tag=f"0.1-{C[:7]}")), REFUSED)
+    check("converge/no published image within the window is RED",
+          lambda: converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([[C, B]], {}, [])), REFUSED)
     check("converge/this run's own image absent is refused",
-          lambda: converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([A], {}, [])), REFUSED)
+          lambda: converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"], converge_io([[A]], {}, [])), REFUSED)
     check("converge/an already-converged line is not rewritten",
           lambda: (converge_line("r.io", "t", "x", "0.1", A, ["deploy/x"],
-                                 converge_io([A], dict(blob, **{"0.1": blob[f"0.1-{A[:7]}"]}), (p2 := []))), p2),
+                                 converge_io([[A]], dict(published(A), **{"0.1": img(A)}), (p2 := []))), p2),
           lambda g: g[1] == [])
     check("converge/an unanswered lookup (500) is refused, never read as absent",
           lambda: tag_digest("r.io", "t", "x", "0.1", Io(post=lambda u, f: {"refresh_token": "r", "access_token": "t"},
@@ -818,7 +868,7 @@ def main(argv: list[str]) -> int:
                                            _arg(argv, "--repository"), _arg(argv, "--line"), _arg(argv, "--self"),
                                            _arg(argv, "--paths").split(), Io())
             print(f"newest={newest}")
-            print(f"digest={digest or ''}")
+            print(f"digest={digest}")
             return 0
         if len(argv) == 2 and argv[0] == "check-line-convergence":
             with open(argv[1], encoding="utf-8") as f:

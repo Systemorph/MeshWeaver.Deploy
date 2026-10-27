@@ -163,7 +163,8 @@ jobs:
       # byte-for-byte retag and RE-CHECKS AFTER EVERY WRITE (re-fetch main, re-derive the newest, read the
       # line back), going round until nothing moved underneath. Whichever write lands last was followed by
       # its writer's own re-check, so an older run that paused before its PUT corrects its own stale write.
-      # A newest commit whose image is not published yet is left to its own run (which comes later).
+      # The target is the newest commit whose image IS published: an unpublished one (registry "not found")
+      # is skipped, never stopped at, so a failed newer build cannot strand the line on a stale write.
       - name: Converge :<line> onto main's newest publication
         id: line
         env:
@@ -184,6 +185,6 @@ jobs:
           [ -n "$immutable" ] || { echo "::error::$REPO:${LINE}-${short} is not in the registry"; exit 1; }
           newest="${{ steps.line.outputs.newest }}"
           line_digest="${{ steps.line.outputs.digest }}"
-          echo "$REPO:${LINE}-${short} = ${immutable} (built: ${{ steps.published.outputs.exists == 'false' }}); :${LINE} -> ${newest::7} ${line_digest:-(left to the run of that commit)}"
+          echo "$REPO:${LINE}-${short} = ${immutable} (built: ${{ steps.published.outputs.exists == 'false' }}); :${LINE} -> ${newest::7} ${line_digest}"
           echo "### whisper published" >> "$GITHUB_STEP_SUMMARY"
           echo "\`$ACR/$REPO:${LINE}-${short}\` — \`${immutable}\`. An estate overlay names this immutable tag." >> "$GITHUB_STEP_SUMMARY"
