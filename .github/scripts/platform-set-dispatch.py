@@ -46,7 +46,7 @@ a hand-over) goes through the same reader with the same rules.
         → GITHUB_OUTPUT lines: run_url, run_core_sha, set_version, set_core_sha, armed,
           armed_version, armed_core_sha, armed_plugins_sha, shas (space-separated, de-duplicated)
     platform-set-dispatch.py discover --tester t.json --portal p.json --runner r.json
-        (each `az acr manifest list-metadata -o json` of mw-plugin-test / memex-portal-ai /
+        (each `acr-data-plane.py manifests` JSON — the rows `az acr manifest list-metadata -o json` prints — of mw-plugin-test / memex-portal-ai /
         mw-build-host) → lines: promoted_version, promoted_core7, promoted_run_id, need_version,
         need_core7, need_run_id, backlog (retained sets in the window still lacking a runner), why
     platform-set-dispatch.py claim --run-url U --run-core-sha S [--set-version V --set-core-sha S]
