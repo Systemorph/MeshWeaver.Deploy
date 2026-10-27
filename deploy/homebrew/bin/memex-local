@@ -383,7 +383,7 @@ ensure_overlay() {
   # configuration outranks the instance manifest), which is how an unattended install pins
   # its answers.
   info "Secrets generated. The portal will ask for the database, logins and model keys:"
-  info "  memex-local up  →  memex-local setup"
+  info "  memex-local up opens the setup wizard for you (memex-local setup re-prints its link)"
 }
 
 # ---------------------------------------------------------------------------
@@ -1591,6 +1591,13 @@ probe_http() {
   esac
 }
 
+# Exit status is a THREE-WAY answer, and callers read all three:
+#   0 — usable (or awaiting first-run setup, which is a state with an instruction, not a fault)
+#   1 — NOT usable, and nothing further will fix itself; every line above names its remedy
+#   2 — not usable YET: the boot reconcile is still installing packages (with --wait, the budget
+#       ran out before `[DefaultInstall] reconciled` appeared). Honest and non-fatal — the portal
+#       finishes by itself. `up` and `update` print one calm line and exit 0 on it; a script
+#       composing `memex-local verify` reads 2 as "not yet", never as "broken".
 verify_usable() {
   local budget=0 repair="no"
   while [ $# -gt 0 ]; do
@@ -1683,7 +1690,9 @@ verify_usable() {
      not there yet — the portal is not usable at this moment. This is 'still installing', not
      'failed': a first boot compiles as it installs.
      Remedy: watch it with 'memex-local logs | grep DefaultInstall', then 'memex-local verify'."
-    return 1
+    # 2, not 1 — see the function header. A caller that dies on this is calling a portal that is
+    # honestly still working "NOT USABLE / err", which is the lie the first-run walk-through met.
+    return 2
   fi
 
   if [ -z "$probe" ]; then
@@ -2506,7 +2515,7 @@ cmd_e2e() {
 cmd_up() {
   # Registry mode runs the CI-built image — the whole point is consuming what the registry bakes
   # against — so ACR is the default there; a source build stays one flag away (--build).
-  local image_source="build" acr_tag="$ACR_DEFAULT_TAG" with_obs="no" rebuild_base="" channel="$CHANNEL"
+  local image_source="build" acr_tag="$ACR_DEFAULT_TAG" with_obs="no" rebuild_base="" channel="$CHANNEL" verdict
   registry_mode && image_source="acr"
   [ -n "$channel" ] && image_source="acr"
   while [ $# -gt 0 ]; do
@@ -2547,9 +2556,13 @@ cmd_up() {
   [ "$with_obs" = "yes" ] && cmd_observability    # §11 (opt-in)
   # §14 — and it can FAIL. `up` used to end green on a portal with no sign-in page and no view
   # packs (MeshWeaver#2367); a command that cannot report that is not a verification.
-  verify_usable --wait 600 --repair || \
-    die "memex is deployed but NOT USABLE — see the checks above. Nothing further will fix itself: \
-each line names its own remedy."
+  verify_usable --wait 600 --repair; verdict=$?
+  case "$verdict" in
+    0) ;;
+    2) still_installing_note; return 0 ;;
+    *) die "memex is deployed but NOT USABLE — see the checks above. Nothing further will fix itself: \
+each line names its own remedy." ;;
+  esac
 
   echo
   # A fresh install is NOT finished at this point, and saying "open the portal" would be
@@ -2557,8 +2570,7 @@ each line names its own remedy."
   # nobody has answered. Probed over the wire, for the same reason verify_usable probes it —
   # one source of truth for one fact, and one that a rotated log cannot invalidate.
   if awaiting_setup; then
-    ok "memex is up and waiting to be SET UP — it has no database yet."
-    cmd_setup
+    hand_into_setup "memex is up"
   else
     ok "memex is up — open https://${HOSTNAME_LOCAL}:${HOST_PORT}"
   fi
@@ -2622,8 +2634,26 @@ cmd_status() {
   verify_usable || true
 }
 
+# The ONE calm line `up` and `update` print when verify_usable answered 2 ("still installing").
+# Not a warning and not a die: a first boot installs and compiles packages for minutes, the portal
+# finishes by itself, and the first-run walk-through (2026-10-27) met exactly this state reported
+# as "NOT USABLE / err" by a command that had in fact succeeded.
+still_installing_note() {
+  echo
+  ok "memex is up and still installing its packages — this finishes by itself."
+  info "Follow it with 'memex-local logs | grep DefaultInstall'; re-check with 'memex-local verify'."
+}
+
+# The ONE line that hands a person into the first-run wizard, then the wizard itself (URL with the
+# token already in it, opened in the browser). Shared by `up` and `update` so the two cannot drift.
+hand_into_setup() {
+  ok "$1 — this instance has no database yet, opening the first-run setup wizard with its token."
+  cmd_setup
+}
+
 # `memex-local verify` — ask the running install the ONE question `status` used to be unable to
-# answer: is this portal usable? Exits non-zero when it is not, so it composes in a script.
+# answer: is this portal usable? Exits non-zero when it is not, so it composes in a script —
+# 1 means broken (with remedies), 2 means still installing (see verify_usable's header).
 cmd_verify() {
   colima_running || die "Colima is not running — run 'memex-local up' first"
   verify_usable "$@"
@@ -2684,15 +2714,23 @@ cmd_setup() {
   echo "  URL:   ${url}?token=${token}"
   echo "  Token: ${token}"
   echo
+  info "The 'Setup token' the page asks for is already in that URL — open it and the field is filled."
+  info "If you land on the page without it, this command prints it again: memex-local setup"
+  echo
   info "The wizard asks in two steps:"
-  info "  1. a NAME for this instance. Its id is a guid the portal mints and registers for you —"
-  info "     ids are claimed permanently, so it does not ask you to invent one."
+  info "  1. a NAME for this instance, your organisation and your email. Its id is a guid the portal"
+  info "     mints and registers for you — ids are claimed permanently, so it never asks you to invent one."
+  info "     The 'Registration key' is OPTIONAL: leave it empty and this instance registers on the"
+  info "     free plan. A key is a pre-minted coupon a registry administrator hands a customer for a"
+  info "     paid plan; the administrator can raise your plan later without one."
   info "  2. everything else, chosen from what your plan grants: plugins, database, sign-in,"
   info "     model keys, modules. Then it restarts configured."
   echo
-  info "SQLite is pre-selected and needs nothing else running — it lands at"
+  info "Database: 'PostgreSQL — the database this deployment already runs' is offered pre-selected"
+  info "(the chart's in-cluster Postgres; the connection string is never shown, nothing to paste)."
+  info "SQLite needs nothing else running either — it lands at"
   info "  Data Source=/data/memex.db   (on the same PVC that survives 'memex-local update')."
-  info "To use the in-cluster Postgres this chart already deploys, choose PostgreSQL and paste:"
+  info "Pasting a connection string is only for a Postgres server of your own; this chart's is:"
   local pg_pw
   pg_pw="$(awk '/memex_postgres_password:/ { gsub(/"/, "", $2); print $2; exit }' "$OVERLAY" 2>/dev/null)"
   if [ -n "$pg_pw" ]; then
@@ -2732,7 +2770,7 @@ cmd_logs() {
 }
 
 cmd_update() {
-  local image_source="build" acr_tag="$ACR_DEFAULT_TAG" rebuild_base="" channel="$CHANNEL"
+  local image_source="build" acr_tag="$ACR_DEFAULT_TAG" rebuild_base="" channel="$CHANNEL" verdict
   registry_mode && image_source="acr"              # §17 — same default as `up`
   [ -n "$channel" ] && image_source="acr"
   while [ $# -gt 0 ]; do
@@ -2810,10 +2848,21 @@ cmd_update() {
   install_launchd
   # §14 — `update` verified NOTHING before this: it printed "update complete" straight after the
   # rollout, which is exactly how MeshWeaver#2367's portal reported success while unusable.
-  verify_usable --wait 600 --repair || \
-    die "the roll completed but the portal is NOT USABLE — see the checks above; each names its \
-own remedy."
+  verify_usable --wait 600 --repair; verdict=$?
+  case "$verdict" in
+    0) ;;
+    2) still_installing_note; return 0 ;;
+    *) die "the roll completed but the portal is NOT USABLE — see the checks above; each names its \
+own remedy." ;;
+  esac
   ok "update complete"
+  # The same hand-off `up` makes: a roll onto an instance that has not been set up yet (or whose
+  # manifest was removed to re-run setup) lands on the wizard, and "update complete — open the
+  # portal" would send the person to a page that only asks for a token they have not been given.
+  if awaiting_setup; then
+    hand_into_setup "the roll completed"
+    return 0
+  fi
   echo
   info "Self-update note: this same chart carries the in-pod self-updater. With"
   info "Admin/UpdatePolicy = Continuous (default), a Continuous/RELEASE install"
@@ -2996,8 +3045,10 @@ COMMANDS:
                   and that the DefaultViews/GraphViews packs are present — without
                   them every control renders as its ToString() and the Plugin
                   Catalog that would repair it is one of the missing views.
-                  Exits non-zero when it is not, naming each remedy. \`up\` and
-                  \`update\` run this for you (--wait 600 --repair).
+                  Exits 1 when it is not, naming each remedy; exits 2 while the boot
+                  reconcile is still installing packages — a state, not a fault, which
+                  \`up\` and \`update\` (they run this with --wait 600 --repair) report
+                  in one calm line and finish on.
   autoroll <up [--acr]|down|status>
                   Auto-redeploy the portal whenever a fresh local image is built
                   (launchd watcher → rollout restart on a new :latest digest).
@@ -3008,8 +3059,11 @@ COMMANDS:
                   plugin content auto-roll too (restart-as-fan-out, as in prod).
                   The local equivalent of the AKS in-pod self-update.
   setup [--no-open]
-                  Print the FIRST-RUN WIZARD's URL and its one-time token, and open
-                  it. A portal with no database serves that wizard and nothing else;
+                  Print the FIRST-RUN WIZARD's URL (the one-time token already in it)
+                  and open it; \`up\` and \`update\` do this for you when the portal is
+                  waiting to be set up. The wizard's Registration key is optional —
+                  empty registers on the free plan. A portal with no database serves
+                  that wizard and nothing else;
                   the token is minted into the pod's own log, so being able to read
                   the instance's output is the proof of access that gates a form
                   collecting a connection string, model keys and the platform-admin

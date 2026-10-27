@@ -65,6 +65,15 @@ config:
     # the previous behaviour rather than a slower variant of it.
     PreWarm__BatchBake: "true"
     PreWarm__BetweenTypes: "00:00:00"
+    # ---- First-run setup: name the command that re-prints the wizard link -------
+    # The portal's setup page is gated by a one-time token printed to the pod log. A
+    # person who reaches the page WITHOUT it (a stale tab, a typed URL) is told where
+    # the token is, and — when this key is set — exactly what to run on THIS install:
+    # "On this install, run `memex-local setup`". Read by Memex.Portal.Shared/Setup in
+    # MeshWeaver.Plugins as the configuration key InstanceSetup:TokenCommand; reaches
+    # the container through the ConfigMap's pass-through half (any config.memex_portal
+    # key with a value is rendered — _portal-config-passthrough.tpl).
+    InstanceSetup__TokenCommand: "memex-local setup"
 
 # ---- Portal Ingress: the TLS Secret is minted by `memex-local up`, not issued -------------------
 # The chart refuses an ingress that names a `tlsSecret` with no issuer reaching it (an ingress
