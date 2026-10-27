@@ -59,7 +59,8 @@ RUN set -eu \
  && test -f /out/deploy-src/deploy/helm/Chart.yaml \
  && cd /src/platform \
  && dotnet publish src/MeshWeaver.Plugin.Build/MeshWeaver.Plugin.Build.csproj -c Release -o /out/plugin-build -nologo \
- && test -f /out/plugin-build/MeshWeaver.Plugin.Build.dll
+ && test -f /out/plugin-build/MeshWeaver.Plugin.Build.dll \
+ && test -d /out/platform-src/src && test -d /out/platform-src/tools
 
 # The headless browser's VERSION and the font defaults come from the PLATFORM at the set's commit —
 # the portal image's own declaration (deploy/base-images/portal-ai/Dockerfile `ARG PLAYWRIGHT_VERSION=`
@@ -128,17 +129,23 @@ ENV CHROME_BIN=/usr/bin/chromium
 COPY --from=sources /out/scripts/build-run.py /out/scripts/compose-gate-host.sh /out/scripts/sandbox-postgres.sh /out/scripts/module-build-key.py /out/scripts/node-repo-scope.py /out/scripts/ci-artifact-store.py /out/scripts/compile-check.py /opt/build-host/
 COPY --from=sources /out/scripts/host-postgres.sh /opt/build-host/
 COPY --from=sources /out/plugin-build/ /opt/build-host/plugin-build/
+# THE PLATFORM'S SOURCE at the set's commit (its tracked tree, stamped with .source-commit): the MeshWeaverRoot a
+# repository's PREPARED inputs — its module-libraries shelf, its Razor build extension — are published against, once
+# per (platform, source key), by build-run.py's prepare_inputs, never per run (MW_PLATFORM_SOURCE); the portal-host
+# lane reads its test-support projects from the same tree.
 COPY --from=sources /out/platform-src/ /opt/build-host/platform-src/
 COPY --from=sources /out/deploy-src/ /opt/build-host/deploy-src/
 RUN chmod 0555 /opt/build-host/*.py /opt/build-host/*.sh \
  && test -f /opt/build-host/plugin-build/MeshWeaver.Plugin.Build.dll \
- && python3 /opt/build-host/build-run.py --self-test \
  && python3 /opt/build-host/module-build-key.py --self-test \
  && python3 /opt/build-host/compile-check.py --help > /dev/null \
  && bash /opt/build-host/sandbox-postgres.sh --self-test
 
 # The SDK image's unprivileged `app` user (uid 1654). bwrap creates its namespaces unprivileged.
 USER 1654
+# The runner's self-test runs as the uid the host RUNS as, never as root: root reads past file modes, so a case
+# whose subject is what an unprivileged host meets (a build that leaves its output unreadable) cannot be built as root.
+RUN python3 /opt/build-host/build-run.py --self-test
 # The PREPARED test cluster (UTF8, a pgvector template) is built HERE, once per image, as the
 # unprivileged user (initdb refuses root); a stage starts a copy of it inside its sandbox. The
 # self-test is a REAL server: two stage servers from copies, the suites' superuser operations,
@@ -146,7 +153,8 @@ USER 1654
 RUN bash /opt/build-host/host-postgres.sh --self-test \
  && bash /opt/build-host/host-postgres.sh prepare /opt/build-host/pg-snapshot
 WORKDIR /work
-ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
+    MW_PLATFORM_SOURCE=/opt/build-host/platform-src
 ARG DEPLOY_COMMIT
 ARG PLATFORM_COMMIT
 LABEL org.opencontainers.image.source="https://github.com/Systemorph/MeshWeaver.Deploy" \

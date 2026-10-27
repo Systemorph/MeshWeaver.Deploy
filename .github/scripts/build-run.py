@@ -75,6 +75,21 @@ THE LOOP, and the order that matters:
     on latest and `build-<channel>/<name>` otherwise; the run's AGGREGATE check is `build` /
     `build-<channel>` (no slash), so no stage — not even one named `verdict` — can publish under it.
   * `kind` is `build` or `test`; `timeoutMinutes` defaults to 45.
+  * a PREPARED server, never a prepared run: a command that stages, resolves, pulls or restores per
+    run (resolve-platform.py, fetch-refs.py, platform-mount, module-fetch, an image pull, dotnet
+    restore, a NuGet/pip/npm/system install) is REFUSED, naming where the step belongs. A NuGet
+    package a build still had to restore (the warm cache lacked it) is SAID as a warning
+    (MWPREP001); on a trunk build it is verified (the .nupkg's SHA-512 against what NuGet recorded)
+    and promoted into `<cache>/nuget`, the stages' read-only fallback folder, so the next run
+    restores nothing.
+  * `prepared` (optional, beside `stages`): inputs built from the repository's OWN sources that are
+    not the run's subject (MeshWeaver.Plugins' module-libraries shelf and Razor build extension,
+    `MW_BUILD_MODULE_LIBS` / `MW_BUILD_EXTENSIONS`). The host keys each with the repository's own
+    `key` command and installs it once per (repository, input, platform, key) under
+    `<cache>/prepared/`, stamped `.source-key`; a run whose key is installed prepares nothing. A
+    trunk run whose key is not installed builds it (`build`, against the image's platform source
+    `MW_PLATFORM_SOURCE`) and installs it — every push to main queues one, so the server follows
+    main. A pull request with other sources builds it for that run only (MWPREP002), never installs.
   * stages run in declaration order, fail-fast: after a failed stage the rest are finished
     `failed` with "not run" — never left open, never silently skipped. When the claim names
     `stages`, only those run, and a claimed stage the repository does not declare is RED.
@@ -115,6 +130,8 @@ import re
 import shutil
 import signal
 import socket
+import struct
+import zlib
 import subprocess
 import sys
 import tempfile
@@ -122,10 +139,12 @@ import threading
 import time
 import uuid
 import hashlib
+import io
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Callable, Iterable, Optional
+import zipfile
+from typing import Callable, Iterable, Optional, Sequence
 
 STAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 CHANNEL = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
@@ -417,6 +436,81 @@ class Refusal(Exception):
     """A run that cannot proceed, with the reason it is red."""
 
 
+# PREPARED INPUTS (MeshWeaver.Plugins Hosting/StandingBuildHosts §7, "A prepared server"): what a repository's stages
+# read that is BUILT FROM ITS OWN SOURCES but is not the run's subject — MeshWeaver.Plugins' module-libraries shelf and
+# Razor build extension. Declared beside the stages:
+#   "prepared": [{"name": "shelf", "env": "MW_BUILD_MODULE_LIBS",
+#                 "key": "python3 scripts/host-in-mesh-modules.py source-key shelf",
+#                 "build": "dotnet publish src/…/X.csproj -c Release -o \"$MW_PREPARE_OUT\" -p:MeshWeaverRoot=\"$MW_PLATFORM_SOURCE\"",
+#                 "timeoutMinutes": 20}]
+# The host computes each input's source key from the run's tree (the repository's OWN `key` command, so the stage's own
+# check agrees by construction), and installs it PERSISTENTLY per (repository, input, platform, key) under
+# `<cache>/prepared/`. A run whose key is installed reads it, read-only, and prepares nothing. A TRUNK run whose key is not
+# installed builds it once and installs it — every push to main queues a trunk run, so the server follows main. A pull
+# request whose sources differ from every installed copy builds it for that run only (said, MWPREP002), and never writes
+# the shared copy. Only the names below may carry a prepared input: a stage's environment is an allow-list.
+PREPARED_ENV = ("MW_BUILD_MODULE_LIBS", "MW_BUILD_EXTENSIONS")
+PREPARED_NAME = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
+SOURCE_KEY = re.compile(r"^[0-9a-f]{64}$")
+
+
+def validate_prepared(doc: object) -> list[dict]:
+    items = doc.get("prepared", []) if isinstance(doc, dict) else []
+    if not isinstance(items, list):
+        raise Refusal("`prepared` in .github/build-stages.json must be a list")
+    out, names, envs = [], set(), set()
+    for i, p in enumerate(items):
+        if not isinstance(p, dict):
+            raise Refusal(f"prepared input #{i} is not an object")
+        name, env = str(p.get("name") or ""), str(p.get("env") or "")
+        if not PREPARED_NAME.match(name) or name in names:
+            raise Refusal(f"prepared input #{i} name {name!r} must be [a-z][a-z0-9-]* and unique")
+        if env not in PREPARED_ENV or env in envs:
+            raise Refusal(f"prepared input {name!r} env {env!r} must be one of {list(PREPARED_ENV)}, once each — "
+                          "a stage's environment is an allow-list")
+        for f in ("key", "build"):
+            if not isinstance(p.get(f), str) or not p[f].strip():
+                raise Refusal(f"prepared input {name!r} has no `{f}` command")
+        tmo = p.get("timeoutMinutes", 20)
+        if not isinstance(tmo, (int, float)) or not (0 < tmo <= DEFAULT_STAGE_TIMEOUT_MINUTES):
+            raise Refusal(f"prepared input {name!r} timeoutMinutes {tmo!r} must be in (0, {DEFAULT_STAGE_TIMEOUT_MINUTES}]")
+        names.add(name)
+        envs.add(env)
+        out.append({"name": name, "env": env, "key": p["key"], "build": p["build"], "timeoutMinutes": float(tmo)})
+    return out
+
+
+def write_marker(directory: str, name: str, text: str) -> None:
+    """Write `<directory>/<name>` as a FRESH regular file, never through what is already there: whatever a sandboxed
+    build left under that name (a symlink to a host file, a directory) is removed first, and the new file is created
+    beside it (mkstemp: O_CREAT|O_EXCL, which never follows a link) and renamed over the entry — so a host-side write cannot be redirected."""
+    target = os.path.join(directory, name)
+    if os.path.isdir(target) and not os.path.islink(target):
+        shutil.rmtree(target)
+    fd, tmp = tempfile.mkstemp(prefix=f".{name.lstrip('.')}-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text + "\n")
+        os.replace(tmp, target)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def prepared_store(cache: str, repo: str, name: str, platform: str, key: str) -> str:
+    """Where an installed prepared input lives: one directory per (repository, input, platform, source key)."""
+    return os.path.join(cache, "prepared", repo, name, hashlib.sha256(f"{platform}|{key}".encode()).hexdigest()[:32])
+
+
+def load_prepared(path: str) -> list[dict]:
+    try:
+        with open(path) as fh:
+            return validate_prepared(json.load(fh))
+    except (OSError, ValueError) as e:
+        raise Refusal(f".github/build-stages.json is unreadable: {e}")
+
+
 def load_stages(path: str) -> list[dict]:
     try:
         with open(path) as fh:
@@ -432,6 +526,232 @@ def load_stages(path: str) -> list[dict]:
 # The shared-cache entries a stage may DECLARE it reads (`needs`), each bound read-only into its
 # sandbox: the plugins layer, its repository's own compile outputs, the NuGet package cache.
 STAGE_NEEDS = {"plugins", "outputs", "nuget"}
+
+
+# 🚨 A PREPARED SERVER, NEVER A PREPARED RUN (MeshWeaver.Plugins Hosting/StandingBuildHosts §H7 → "A prepared
+# server"; owner: "nothing should ever run this prepare step"). A run arrives on a host that already holds the
+# platform it was rolled to, the reference set, the installed plugins layer and the warm NuGet cache. A declared stage
+# that stages, resolves, pulls or restores per run is REFUSED — the step belongs in the host image, its init
+# containers or its persistent caches, and the refusal names which. Matched as whole words on the command text; a
+# stage that legitimately needs one of these is a server that is not prepared yet, never an exception to grant here.
+# A tool's GLOBAL options may stand between it and its subcommand (`pip --no-cache-dir install`, `npm --prefix ./app
+# ci`, `docker --context x pull`): each is skipped as an option word with an optional value word.
+_OPTS = r"(?:\s+-{1,2}[A-Za-z][\w.-]*(?:=\S*|\s+[^-\s;&|]\S*)?)*"
+PREPARE_STEPS = (
+    (re.compile(r"\bresolve-platform\.py\b"), "resolve-platform.py — the host's set IS the platform (the claim stamps it); nothing resolves one per run"),
+    (re.compile(r"\bfetch-refs\.py\b"), "fetch-refs.py — the reference set is staged by the host's init containers, $MeshWeaverRefs"),
+    (re.compile(r"\bplatform-mount(?:\.py|-reference-set)?\b"), "platform-mount — the platform is mounted once per roll, by digest"),
+    (re.compile(r"\bmodule-fetch\b"), "module-fetch — the plugins layer is installed by the host on the module hand-over"),
+    (re.compile(r"\b(?:docker|podman|crane|skopeo|oras)" + _OPTS + r"\s+(?:image\s+)?(?:pull|copy|cp)\b"), "an image pull — images are pre-pulled into the host image or its node-local cache"),
+    (re.compile(r"\bprepull\b"), "an image pre-pull — done by the host image, not per run"),
+    (re.compile(r"\bdotnet" + _OPTS + r"\s+restore\b"), "dotnet restore — packages come from the host's warm NuGet cache (stage `needs: [\"nuget\"]`)"),
+    (re.compile(r"\b(?:nuget|dotnet" + _OPTS + r"\s+nuget)" + _OPTS + r"\s+(?:install|restore)\b"), "a NuGet install — packages come from the host's warm NuGet cache"),
+    (re.compile(r"\b(?:apt-get|apt|apk|dnf|yum)\s+(?:-\S+\s+)*install\b"), "a system package install — the host image carries its tools"),
+    (re.compile(r"\bapk" + _OPTS + r"\s+add\b"), "a system package install (apk add) — the host image carries its tools"),
+    (re.compile(r"\b(?:pip3?|python3?(?:\s+-\S+)*\s+-m\s+pip)" + _OPTS + r"\s+install\b"), "a pip install — the host image carries its tools"),
+    (re.compile(r"\bnpm" + _OPTS + r"\s+(?:ci|install|i)\b"), "an npm install — the host image carries its tools"),
+    (re.compile(r"\bactions/(?:setup-|cache)"), "a GitHub Actions setup/cache step — the host is already set up"),
+)
+
+
+def per_run_prepare_steps(command: str) -> list[str]:
+    """Why `command` would prepare per run — one entry per prepare step it contains; empty = prepared."""
+    return [why for rx, why in PREPARE_STEPS if rx.search(command)]
+
+
+def nuget_packages(folder: str) -> set[str]:
+    """`id/version` of every COMPLETE package in a NuGet global-packages folder (one with its
+    `.nupkg.metadata`, which NuGet writes last)."""
+    found: set[str] = set()
+    try:
+        for pid in os.listdir(folder):
+            pdir = os.path.join(folder, pid)
+            if pid.startswith(".") or not os.path.isdir(pdir) or os.path.islink(pdir):
+                continue
+            for ver in os.listdir(pdir):
+                if os.path.isfile(os.path.join(pdir, ver, ".nupkg.metadata")):
+                    found.add(f"{pid}/{ver}")
+    except OSError:
+        pass
+    return found
+
+
+NUGET_SIGNATURE = ".signature.p7s"
+
+
+def nupkg_content_hash(data: bytes) -> Optional[str]:
+    """See `_nupkg_content_hash`; a directory it cannot parse (truncated records) is None, never an exception."""
+    try:
+        return _nupkg_content_hash(data)
+    except (struct.error, IndexError, ValueError):
+        return None
+
+
+def _nupkg_content_hash(data: bytes) -> Optional[str]:
+    """NuGet's CONTENT hash of a .nupkg (base64 SHA-512): the archive's own hash when it is unsigned; for a signed
+    package the hash of the package WITHOUT its signature entry — the bytes NuGet's
+    SignedPackageArchiveUtility.GetPackageContentHash feeds SHA-512: every local entry but the signature's, every
+    central-directory record but the signature's (with local-header offsets shifted past the removed entry), and the
+    end record with one entry fewer and the directory's size and offset adjusted. None when the archive cannot be
+    read that way (ZIP64, a malformed directory) — the package is then NOT promoted."""
+    eocd = data.rfind(b"PK\x05\x06")
+    if eocd < 0 or len(data) < eocd + 22:
+        return None
+    _, _, _, n_disk, n_total, cd_size, cd_off = struct.unpack_from("<IHHHHII", data, eocd)
+    if n_disk != n_total or cd_off == 0xFFFFFFFF or n_total == 0xFFFF or cd_off + cd_size > eocd:
+        return None
+    records, pos = [], cd_off
+    for _ in range(n_total):
+        if data[pos:pos + 4] != b"PK\x01\x02":
+            return None
+        name_len, extra_len, comment_len = struct.unpack_from("<HHH", data, pos + 28)
+        local_off = struct.unpack_from("<I", data, pos + 42)[0]
+        size = 46 + name_len + extra_len + comment_len
+        records.append({"pos": pos, "size": size, "local": local_off, "name": data[pos + 46:pos + 46 + name_len]})
+        pos += size
+    sig = [r for r in records if r["name"] == NUGET_SIGNATURE.encode()]
+    if not sig:
+        return base64.b64encode(hashlib.sha512(data).digest()).decode()
+    if len(sig) > 1:
+        return None
+    sig = sig[0]
+    by_local = sorted(records, key=lambda r: r["local"])
+    for i, r in enumerate(by_local):
+        r["entry"] = (by_local[i + 1]["local"] if i + 1 < len(by_local) else cd_off) - r["local"]
+    h = hashlib.sha512()
+    rest = [r for r in by_local if r is not sig]
+    if not rest:
+        return None
+    h.update(data[0:rest[0]["local"]])
+    for r in rest:
+        h.update(data[r["local"]:r["local"] + r["entry"]])
+    for r in sorted(rest, key=lambda r: r["pos"]):
+        h.update(data[r["pos"]:r["pos"] + 42])
+        shift = sig["entry"] if r["local"] > sig["local"] else 0
+        h.update(struct.pack("<I", r["local"] - shift))
+        h.update(data[r["pos"] + 46:r["pos"] + r["size"]])
+    h.update(data[eocd:eocd + 8])
+    h.update(struct.pack("<HHII", n_disk - 1, n_total - 1, cd_size - sig["size"], cd_off - sig["entry"]))
+    h.update(data[eocd + 20:])
+    return base64.b64encode(h.digest()).decode()
+
+
+# What NuGet does NOT extract from a .nupkg into its global-packages folder (OPC plumbing).
+NUGET_NOT_EXTRACTED = re.compile(r"^(?:\[Content_Types\]\.xml$|_rels/|package/)", re.I)
+
+
+def nuget_package_problem(pkg_dir: str, pid: str, ver: str) -> Optional[str]:
+    """Why a restored package folder may NOT enter the shared warm cache, or None. The folder must hold no symlink, its
+    `.nupkg` must hash (SHA-512, base64) to the `.nupkg.sha512` NuGet wrote beside it, and the metadata's
+    `contentHash` must be the archive's NuGet CONTENT hash (`nupkg_content_hash` — a signed package's differs from its
+    archive hash). What is promoted is then REBUILT from that verified archive (`promote_nuget`), never copied from
+    the stage-writable extracted files."""
+    for root, dirs, files in os.walk(pkg_dir):
+        if any(os.path.islink(os.path.join(root, n)) for n in dirs + files):
+            return "it contains a symlink"
+    nupkg = f"{pid}.{ver}.nupkg"
+    try:
+        with open(os.path.join(pkg_dir, nupkg), "rb") as fh:
+            data = fh.read()
+        with open(os.path.join(pkg_dir, nupkg + ".sha512")) as fh:
+            stated = fh.read().strip()
+        with open(os.path.join(pkg_dir, ".nupkg.metadata")) as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError) as e:
+        return f"unreadable ({e})"
+    if base64.b64encode(hashlib.sha512(data).digest()).decode() != stated:
+        return "its archive hash does not match what NuGet recorded"
+    content = nupkg_content_hash(data)
+    if content is None:
+        return "its archive cannot be read as NuGet hashes it (malformed or ZIP64)"
+    if not isinstance(meta, dict) or meta.get("contentHash") != content:
+        return "its content hash does not match what NuGet recorded"
+    return None
+
+
+def materialize_nuget_package(pkg_dir: str, pid: str, ver: str, dest: str) -> None:
+    """Rebuild a VERIFIED package folder at `dest` from its archive alone: the .nupkg, its .sha512 and .nupkg.metadata
+    (re-written from the verified values), and every archive entry NuGet extracts (the nuspec under its lower-case
+    id) — nothing a stage left beside them. Raises ValueError for an entry that would leave `dest`."""
+    nupkg = f"{pid}.{ver}.nupkg"
+    with open(os.path.join(pkg_dir, nupkg), "rb") as fh:
+        data = fh.read()
+    with open(os.path.join(pkg_dir, ".nupkg.metadata")) as fh:
+        meta = json.load(fh)
+    os.makedirs(dest)
+    with open(os.path.join(dest, nupkg), "wb") as fh:
+        fh.write(data)
+    with open(os.path.join(dest, nupkg + ".sha512"), "w") as fh:
+        fh.write(base64.b64encode(hashlib.sha512(data).digest()).decode())
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        for info in z.infolist():
+            name = urllib.parse.unquote(info.filename)
+            if info.is_dir() or NUGET_NOT_EXTRACTED.match(name):
+                continue
+            if "/" not in name and name.lower().endswith(".nuspec"):
+                name = f"{pid}.nuspec"
+            parts = name.split("/")
+            if name.startswith("/") or "\\" in name or any(x in ("", ".", "..") for x in parts):
+                raise ValueError(f"archive entry {info.filename!r} would leave the package folder")
+            target = os.path.join(dest, *parts)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with z.open(info) as src, open(target, "xb") as out:
+                shutil.copyfileobj(src, out)
+    out_meta = {"version": meta.get("version", 2), "contentHash": meta["contentHash"]}
+    if isinstance(meta.get("source"), str):
+        out_meta["source"] = meta["source"]
+    with open(os.path.join(dest, ".nupkg.metadata"), "w") as fh:
+        json.dump(out_meta, fh, indent=2)
+
+
+PREPARED_OUTPUT_TAIL = 64 * 1024
+
+
+def file_tail(fh, limit: int) -> str:
+    """The last `limit` bytes of an open binary file, decoded leniently — a bounded read of untrusted output."""
+    fh.flush()
+    size = fh.seek(0, os.SEEK_END)
+    fh.seek(max(0, size - limit))
+    return fh.read().decode("utf-8", errors="replace")
+
+
+def promote_nuget(restored: str, cache: str, log: Callable[[str], None]) -> tuple[int, int, list[str]]:
+    """Promote the packages a TRUNK build stage restored into the shared warm NuGet cache
+    (`<cache>/nuget/<id>/<version>/`, the stages' read-only fallback folder), so the next run restores
+    nothing. Each verified (`nuget_package_problem`), REBUILT from its verified archive in a temp dir
+    (`materialize_nuget_package`) and renamed into place; a
+    package already present is kept (a NuGet id/version is immutable). Returns (promoted, kept, refused)."""
+    root = os.path.join(cache, "nuget")
+    os.makedirs(root, exist_ok=True)
+    promoted, kept, refused = 0, 0, []
+    for entry in sorted(nuget_packages(restored)):
+        pid, ver = entry.split("/", 1)
+        final = os.path.join(root, pid, ver)
+        if os.path.isfile(os.path.join(final, ".nupkg.metadata")):
+            kept += 1
+            continue
+        why = nuget_package_problem(os.path.join(restored, pid, ver), pid, ver)
+        if why:
+            refused.append(f"{entry} ({why})")
+            continue
+        os.makedirs(os.path.join(root, pid), exist_ok=True)
+        tmp = tempfile.mkdtemp(prefix=f".{ver}-", dir=os.path.join(root, pid))
+        try:
+            materialize_nuget_package(os.path.join(restored, pid, ver), pid, ver, os.path.join(tmp, "p"))
+            os.rename(os.path.join(tmp, "p"), final)
+            promoted += 1
+        except (OSError, ValueError, zipfile.BadZipFile, KeyError, RuntimeError, zlib.error, EOFError) as e:
+            # RuntimeError: an ENCRYPTED entry (zipfile asks for a password) and NotImplementedError (an unsupported
+            # compression method, a RuntimeError subclass) — the package is refused, never an unverdicted host.
+            if not os.path.isfile(os.path.join(final, ".nupkg.metadata")):
+                refused.append(f"{entry} (could not be moved into place: {e})")
+            else:
+                kept += 1
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if refused:
+        log(f"NuGet packages NOT promoted into the warm cache: {refused[:5]}")
+    return promoted, kept, refused
 
 
 def validate_stages(doc: object) -> list[dict]:
@@ -456,6 +776,10 @@ def validate_stages(doc: object) -> list[dict]:
         cmd = s.get("command")
         if not isinstance(cmd, str) or not cmd.strip():
             raise Refusal(f"stage {name!r} has no command")
+        prepares = per_run_prepare_steps(cmd)
+        if prepares:
+            raise Refusal(f"stage {name!r} prepares per run — a host stage runs on a PREPARED server, so it may not "
+                          f"stage, resolve, pull or restore: " + "; ".join(prepares))
         tmo = s.get("timeoutMinutes", DEFAULT_STAGE_TIMEOUT_MINUTES)
         if not isinstance(tmo, (int, float)) or not (0 < tmo <= DEFAULT_STAGE_TIMEOUT_MINUTES):
             raise Refusal(f"stage {name!r} timeoutMinutes {tmo!r} must be in (0, {DEFAULT_STAGE_TIMEOUT_MINUTES}]")
@@ -549,9 +873,14 @@ DEFAULT_RUN_DEADLINE = 7200
 RUN_MARGIN_SECONDS = 600
 
 
-def run_budget_seconds(stages: list[dict], deadline: float) -> int:
-    """The run's effective budget: the selected stages' summed caps + a margin, never past the deadline."""
+PREPARED_KEY_SECONDS = 300
+
+
+def run_budget_seconds(stages: list[dict], deadline: float, prepared: Sequence[dict] = ()) -> int:
+    """The run's effective budget: the selected stages' summed caps + each declared prepared input's build cap
+    and key-command allowance (a cache miss builds it inside the run) + a margin, never past the deadline."""
     total = sum(float(st.get("timeoutMinutes", DEFAULT_STAGE_TIMEOUT_MINUTES)) * 60 for st in stages) + RUN_MARGIN_SECONDS
+    total += sum(float(p.get("timeoutMinutes", 20)) * 60 + PREPARED_KEY_SECONDS for p in prepared)
     return int(min(deadline, total))
 
 
@@ -962,7 +1291,7 @@ def read_worker_token(env: dict) -> str:
 # (`bwrap --clearenv`); the run's own facts are added explicitly by the host.
 ENV_ALLOW = ("PATH", "LANG", "LC_ALL", "TZ", "DOTNET_ROOT", "DOTNET_CLI_TELEMETRY_OPTOUT", "DOTNET_NOLOGO",
              "DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "SSL_CERT_FILE", "SSL_CERT_DIR", "MeshWeaverRefs",
-             "MW_BUILD_GATE_HOST", "MW_BUILD_PORTAL_DOTNET")
+             "MW_BUILD_GATE_HOST", "MW_BUILD_PORTAL_DOTNET", "MW_BUILD_MODULE_LIBS", "MW_BUILD_EXTENSIONS")
 SCRATCH = "/scratch"
 
 # The platform's canonical checkers a repository's stages run (MeshWeaver.Plugins
@@ -1931,6 +2260,7 @@ class Host:
                 if not trunk and not probe:
                     merge_base = self.merge_onto_base(repo, checkout_dir, claim.get("mergeBaseSha"), token)
                 declared = load_stages(os.path.join(checkout_dir, ".github", "build-stages.json"))
+                prepared_inputs = load_prepared(os.path.join(checkout_dir, ".github", "build-stages.json"))
                 stages = select_stages(declared, claim.get("stages"))
                 if probe and claim.get("requestedStages"):
                     # A PROBE runs EXACTLY the stages it asked for (`requestedStages`; empty = every
@@ -1947,7 +2277,7 @@ class Host:
             plan = self._sink_for(repo, sha, stages[0]["name"])
             # The run's declared execution budget: the instance sets the attempt's deadline to claim
             # time + budget + 15 min. The host enforces the same number (`budget`, below).
-            budget = run_budget_seconds(stages, self.run_deadline - (self.clock() - started))
+            budget = run_budget_seconds(stages, self.run_deadline - (self.clock() - started), prepared_inputs)
             plan_event = {"kind": "plan", "stages": [st["name"] for st in stages], "budgetMinutes": budget_minutes(budget)}
             if merge_base:
                 plan_event["mergeBase"] = merge_base
@@ -1978,6 +2308,20 @@ class Host:
             failed_at = None
             why = ""
             run_end = self.clock() + budget
+            prepared_ro: list[str] = []
+            # NUGET_FALLBACK_PACKAGES names <cache>/nuget for EVERY stage that needs `nuget`, prepared inputs or not;
+            # NuGet refuses a fallback folder that does not exist, so a fresh host creates it before any stage runs
+            # (else the first trunk build — the one that warms it — could never restore).
+            os.makedirs(os.path.join(self.cache, "nuget"), exist_ok=True)
+            if prepared_inputs:
+                psink = self._sink_for(repo, sha, stages[0]["name"])
+                try:
+                    penv, prepared_ro = self.prepare_inputs(repo, checkout_dir, workdir, trunk, prepared_inputs, psink, run_end)
+                    extra.update(penv)
+                except Refusal as r:
+                    failed_at, why = stages[0]["name"], f"a prepared input could not be provided: {r}"
+                    psink.add([{"kind": "line", "text": why[:MAX_LINE]}])
+                    self.deliver(psink)
             for st in stages:
                 last_stage = st["name"]
                 sink = self._sink_for(repo, sha, st["name"])
@@ -1990,12 +2334,35 @@ class Host:
                     self.deliver(sink)
                     continue
                 self.drain_held(attempts=2)
+                # The stage's OWN package folder lives in the run's workspace (not the sandbox's tmpfs), so the
+                # host can SEE what a run restored: a package missing from the warm cache is a server that was
+                # not prepared for it — said, and on a trunk build promoted, so the next run restores nothing.
+                nuget_dir = os.path.join(workdir, "nuget")
+                os.makedirs(nuget_dir, exist_ok=True)
+                nuget_before = nuget_packages(nuget_dir)
                 ok = self.run_stage(dict(st, timeoutMinutes=min(st["timeoutMinutes"], remaining / 60)),
-                                    checkout_dir, outputs_dir, sink, {**extra, "MW_BUILD_STAGE": st["name"]},
-                                    readonly=self.stage_readonly(repo, st), writable=[artifacts_dir],
+                                    checkout_dir, outputs_dir, sink,
+                                    {**extra, "MW_BUILD_STAGE": st["name"], "NUGET_PACKAGES": nuget_dir},
+                                    readonly=self.stage_readonly(repo, st) + prepared_ro, writable=[artifacts_dir, nuget_dir],
                                     hand_over=lambda: self.hand_over_artifacts(repo, sha, st["name"], artifacts_dir,
                                                                                deadline=run_end))
                 self.assert_clean()
+                restored = sorted(nuget_packages(nuget_dir) - nuget_before)
+                if restored:
+                    sink.add([{"kind": "diagnostic", "severity": "warning", "code": "MWPREP001",
+                               "message": f"{len(restored)} NuGet package(s) restored PER RUN — the server's warm cache "
+                                          f"did not hold them: {', '.join(restored[:10])}"
+                                          + ("" if trunk else " (a trunk build promotes them)")},
+                              {"kind": "line", "text": f"prepared server: {len(restored)} package(s) restored per run"}])
+                    self.deliver(sink)
+                # The folder accumulates what the prepared builds and earlier stages restored too (already present
+                # before this stage, so not in `restored`): promote ALL of it after every successful trunk build —
+                # promote_nuget keeps a package the warm cache already holds.
+                if ok and trunk and st["kind"] == "build" and nuget_packages(nuget_dir):
+                    np_, nk, nr = promote_nuget(nuget_dir, self.cache, self.log)
+                    sink.add([{"kind": "line", "text": f"warm NuGet cache: {np_} package(s) promoted, {nk} already present"
+                                                       + (f", {len(nr)} NOT promoted (unverified)" if nr else "")}])
+                    self.deliver(sink)
                 if not ok:
                     failed_at = st["name"]
                 elif trunk and st["kind"] == "build":
@@ -2132,6 +2499,121 @@ class Host:
             except OSError:
                 continue
         return gone
+
+    def prepare_inputs(self, repo: str, checkout: str, workdir: str, trunk: bool, inputs: list[dict],
+                       sink: "EventSink", run_end: float) -> tuple[dict, list[str]]:
+        """Provide every PREPARED input the repository declares (see PREPARED_ENV): the installed copy for this
+        run's source key, or — once — a build of it, installed for every later run when this is a trunk run.
+        Returns (the stage environment additions, the read-only binds). Raises Refusal, naming the input."""
+        env_add: dict = {}
+        ro: list[str] = []
+        mirror = os.path.join(self.cache, "git", f"{repo}.git")
+        platform_src = self.env.get("MW_PLATFORM_SOURCE", "")
+        # NUGET_FALLBACK_PACKAGES names <cache>/nuget; NuGet refuses a fallback folder that does not exist, and
+        # --ro-bind-try would silently skip it — so a fresh host creates it before the first preparation.
+        os.makedirs(os.path.join(self.cache, "nuget"), exist_ok=True)
+
+        def sandboxed(command: str, out: str, extra: dict, readonly: list, writable: list, timeout: float) -> tuple[int, str]:
+            argv = self.sandbox.argv(command, checkout, out, sandbox_env(self.env, extra, self.cache),
+                                     readonly=readonly, writable=writable)
+            # The command is repository-controlled: its output goes to host-owned FILES (outside the sandbox's
+            # writable binds) and only a bounded tail of each is read back, so a noisy key or build command can
+            # never exhaust the host's memory and end the worker without a verdict.
+            logs = tempfile.mkdtemp(prefix=".prep-log-", dir=workdir)
+            try:
+                with open(os.path.join(logs, "out"), "w+b") as so, open(os.path.join(logs, "err"), "w+b") as se:
+                    try:
+                        r = subprocess.run(argv, cwd=checkout, env={"PATH": self.env.get("PATH", "/usr/bin:/bin")},
+                                           stdout=so, stderr=se, timeout=max(1.0, timeout), stdin=subprocess.DEVNULL)
+                    except subprocess.TimeoutExpired:
+                        return 124, "timed out"
+                    except OSError as e:
+                        return 127, str(e)
+                    # stdout LAST: the key is its final line
+                    return r.returncode, file_tail(se, PREPARED_OUTPUT_TAIL) + file_tail(so, PREPARED_OUTPUT_TAIL)
+            finally:
+                shutil.rmtree(logs, ignore_errors=True)
+
+        base_extra = {"MW_BUILD_PLATFORM_VERSION": self.platform_version, "MW_BUILD_REPO": repo}
+        for p in inputs:
+            name = p["name"]
+            left = run_end - self.clock()
+            if left <= 0:
+                raise Refusal(f"{name}: the run deadline passed before it was prepared")
+            keydir = os.path.join(workdir, "prepared-key", name)
+            os.makedirs(keydir, exist_ok=True)
+            rc, text = sandboxed(p["key"], keydir, base_extra, [mirror], [], min(left, float(PREPARED_KEY_SECONDS)))
+            key = (text.strip().splitlines() or [""])[-1].strip() if rc == 0 else ""
+            if rc != 0 or not SOURCE_KEY.match(key):
+                raise Refusal(f"{name}: its key command did not answer a source key (exit {rc}): {text.strip()[-300:]}")
+            store = prepared_store(self.cache, repo, name, self.platform_version, key)
+            if os.path.isfile(os.path.join(store, ".complete")):
+                env_add[p["env"]] = store
+                ro.append(store)
+                sink.add([{"kind": "line", "text": f"prepared {name}: installed on this server (key {key[:12]}) — nothing prepared for this run"}])
+                continue
+            if not platform_src or not os.path.isdir(platform_src):
+                raise Refusal(f"{name} (key {key[:12]}) is not installed and this host has no platform source to build it "
+                              f"with (MW_PLATFORM_SOURCE is {'unset' if not platform_src else 'not a directory: ' + platform_src})")
+            out = os.path.join(workdir, "prepared", name)
+            shutil.rmtree(out, ignore_errors=True)
+            os.makedirs(out)
+            nuget = os.path.join(workdir, "nuget")
+            os.makedirs(nuget, exist_ok=True)
+            # The build gets its OWN writable copy of the platform source: a `dotnet publish` that references
+            # platform projects writes their obj/ and bin/ into that tree, and the image's copy is read-only.
+            # A miss is rare (once per key on main), so the copy is paid once per prepared build.
+            psrc = os.path.join(workdir, "prepared-platform", name)
+            shutil.rmtree(psrc, ignore_errors=True)
+            shutil.copytree(platform_src, psrc, symlinks=True)
+            left = run_end - self.clock()
+            if left <= 0:
+                raise Refusal(f"{name}: the run deadline passed before it was built")
+            started = self.clock()
+            rc, text = sandboxed(p["build"], out, {**base_extra, "MW_PREPARE_OUT": out, "MW_PLATFORM_SOURCE": psrc,
+                                                   "NUGET_PACKAGES": nuget},
+                                 [mirror, os.path.join(self.cache, "nuget")], [nuget, psrc],
+                                 min(left, p["timeoutMinutes"] * 60))
+            shutil.rmtree(psrc, ignore_errors=True)
+            # The build controls `out` (it may leave it unreadable): every host-side I/O on it is a Refusal NAMING
+            # the input, never an exception that leaves the run without a verdict.
+            try:
+                wrote = [n for n in os.listdir(out) if not n.startswith(".")]
+            except OSError as e:
+                raise Refusal(f"{name}: its output cannot be read ({e})")
+            if rc != 0 or not wrote:
+                raise Refusal(f"{name}: building it failed (exit {rc}{', it wrote nothing' if rc == 0 else ''}): {text.strip()[-600:]}")
+            # Host-side marker writes never follow what the build left: the build controls `out`, so a
+            # `.source-key` (or, in the copy, a `.complete`) it planted as a symlink would redirect the write.
+            try:
+                write_marker(out, ".source-key", key)
+            except OSError as e:
+                raise Refusal(f"{name}: its output cannot be marked ({e})")
+            secs = int(self.clock() - started)
+            if trunk:
+                os.makedirs(os.path.dirname(store), exist_ok=True)
+                tmp = tempfile.mkdtemp(prefix=".prep-", dir=os.path.dirname(store))
+                try:
+                    shutil.copytree(out, os.path.join(tmp, "p"), symlinks=True)
+                    write_marker(os.path.join(tmp, "p"), ".complete", key)
+                    os.rename(os.path.join(tmp, "p"), store)
+                except (OSError, shutil.Error):
+                    if not os.path.isfile(os.path.join(store, ".complete")):
+                        raise Refusal(f"{name}: built, but could not be installed at {store}")
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                env_add[p["env"]] = store
+                ro.append(store)
+                sink.add([{"kind": "line", "text": f"prepared {name}: main moved its sources — built once ({secs} s) and "
+                                                   f"installed on this server (key {key[:12]}); later runs prepare nothing"}])
+            else:
+                env_add[p["env"]] = out
+                ro.append(out)
+                sink.add([{"kind": "diagnostic", "severity": "warning", "code": "MWPREP002",
+                           "message": f"prepared input {name} built PER RUN ({secs} s): this change's sources (key {key[:12]}) "
+                                      "differ from every copy installed on the server; a trunk run installs it"}])
+        self.deliver(sink)
+        return env_add, ro
 
     def stage_readonly(self, repo: str, st: dict) -> list[str]:
         """What of the SHARED cache this stage may read, read-only: its own repository's git mirror
@@ -3215,6 +3697,264 @@ def self_test() -> int:
              f"mkdir -p $MW_BUILD_OUTPUTS/{lie} && cp s.json $MW_BUILD_OUTPUTS/{lie}/.cache-key.json"}]}))
         h6l.run(dict(claim, isTrunk=True))
         check("run/an output whose name is not its recomputed key is refused", not os.path.exists(os.path.join(cache, "outputs", "MeshWeaver.Plugins", lie)))
+
+        # ── 7b. a PREPARED server: no stage prepares per run; what a run had to restore warms the server ──
+        for cmd_, why_ in (("python3 .github/scripts/resolve-platform.py --passed-on-main", "resolve-platform"),
+                           ("python3 scripts/fetch-refs.py --digest x", "fetch-refs"),
+                           ("python3 scripts/platform-mount.py", "platform-mount"),
+                           ("dotnet /opt/x.dll module-fetch AI --registry r", "module-fetch"),
+                           ("docker pull postgres:17", "image pull"), ("oras pull cr/x@sha256:1", "image pull"),
+                           ("docker image pull x", "image pull"), ("bash scripts/prepull-testcontainers-images.sh", "pre-pull"),
+                           ("set -e; dotnet restore src/X.csproj", "dotnet restore"), ("nuget install X", "NuGet install"),
+                           ("apt-get -y install jq", "system package"), ("python3 -m pip install pyyaml", "pip"),
+                           ("npm ci", "npm"), ("python3 -m pip --no-cache-dir install pyyaml", "pip"),
+                           ("pip3 --disable-pip-version-check install x", "pip"), ("npm --prefix ./app ci", "npm"),
+                           ("npm --prefix=./app install", "npm"), ("dotnet --diagnostics restore X.sln", "dotnet restore"),
+                           ("docker --context remote pull x", "image pull"), ("apk add --no-cache git", "apk add"),
+                           ("apk --no-cache add git", "apk add")):
+            try:
+                validate_stages({"stages": [{"name": "x", "kind": "build", "command": cmd_}]})
+                check(f"prepared/refuses a stage that prepares per run: {cmd_}", False, "accepted")
+            except Refusal as r:
+                check(f"prepared/the refusal names what to move into the server ({why_})", why_ in str(r) and "PREPARED" in str(r), str(r))
+        # negative controls: what the fleet's stages run today is NOT a prepare step
+        for cmd_ in ("python3 scripts/canonical-compile-check.py --refs \"$refs\"; python3 scripts/check-scripts.py --refs \"$refs\"",
+                     "\"$dn\" \"$tester\" compile . --app \"$app\" --allow plugin-gate.allow",
+                     "python3 /core-tests/core-tests.py shard 3", "dotnet build -c Release --no-restore src/X.csproj",
+                     "echo restored-by-the-server; grep -c pull log.txt", "npm --prefix ./app run build",
+                     "dotnet --info; dotnet build --no-restore -c Release X.csproj", "python3 -m pip --version"):
+            check(f"prepared/accepts a prepared stage: {cmd_[:40]}", per_run_prepare_steps(cmd_) == [], per_run_prepare_steps(cmd_))
+        # A REAL package fixture (a zip with a nuspec, a lib and OPC plumbing), restored by the stage from a folder the
+        # self-test writes: `good` (unsigned), `signed` (a `.signature.p7s` entry appended — its content hash is the
+        # UNSIGNED package's, not the archive's), `forged` (metadata naming another hash) and `tamper` (good hashes,
+        # but the extracted DLL altered and an extra file planted after NuGet extracted it).
+        def fixture_zip(signed_: bool, encrypted_: bool = False) -> bytes:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net10.0/Demo.dll", b"the-real-dll"),
+                               ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
+                    z.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_)
+                if signed_:
+                    z.writestr(zipfile.ZipInfo(NUGET_SIGNATURE, (2020, 1, 1, 0, 0, 0)), b"pkcs7-signature")
+            if not encrypted_:
+                return buf.getvalue()
+            # zipfile resets flag_bits on write, so set the ENCRYPTED bit (0x1) in the bytes: on the DLL's local header
+            # (flags at +6) and its central-directory record (flags at +8) — zipfile then refuses to read it.
+            raw_ = bytearray(buf.getvalue())
+            for sig_, off_ in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+                at_ = raw_.find(sig_)
+                while at_ >= 0:
+                    nl_ = struct.unpack_from("<H", raw_, at_ + (26 if off_ == 6 else 28))[0]
+                    name_at_ = at_ + (30 if off_ == 6 else 46)
+                    if bytes(raw_[name_at_:name_at_ + nl_]).endswith(b".dll"):
+                        raw_[at_ + off_] |= 0x1
+                    at_ = raw_.find(sig_, at_ + 4)
+            return bytes(raw_)
+
+        def b64sha(b_: bytes) -> str:
+            return base64.b64encode(hashlib.sha512(b_).digest()).decode()
+        unsigned_, signed_zip, encrypted_zip = fixture_zip(False), fixture_zip(True), fixture_zip(False, True)
+        # CORRUPT DEFLATE: the DLL entry's compressed bytes are garbage (valid zip structure, so its hashes still
+        # match what the fixture records) — extraction raises zlib.error, which must be a refusal, never a crash.
+        _cz = io.BytesIO()
+        with zipfile.ZipFile(_cz, "w", zipfile.ZIP_DEFLATED) as z:
+            for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net10.0/Demo.dll", b"the-real-dll" * 64),
+                           ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
+                z.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_, compress_type=zipfile.ZIP_DEFLATED)
+        corrupt_zip = bytearray(_cz.getvalue())
+        _at = corrupt_zip.find(b"PK\x03\x04", corrupt_zip.find(b"lib/net10.0/Demo.dll") - 30)
+        _data = _at + 30 + struct.unpack_from("<H", corrupt_zip, _at + 26)[0] + struct.unpack_from("<H", corrupt_zip, _at + 28)[0]
+        corrupt_zip[_data:_data + 4] = b"\xff\xff\xff\xff"
+        corrupt_zip = bytes(corrupt_zip)
+        check("nuget/a signed package's content hash is the UNSIGNED package's, not its archive hash",
+              nupkg_content_hash(signed_zip) == b64sha(unsigned_) != b64sha(signed_zip), nupkg_content_hash(signed_zip))
+        check("nuget/an unsigned package's content hash is its archive hash", nupkg_content_hash(unsigned_) == b64sha(unsigned_))
+        check("nuget/not a zip: no content hash (never promoted)", nupkg_content_hash(b"nupkg-bytes") is None)
+        eocd_ = signed_zip[signed_zip.rfind(b"PK\x05\x06"):]
+        truncated_ = b"PK\x01\x02" + b"\0" * 10 + eocd_[:8] + struct.pack("<HHII", 1, 1, 14, 0) + eocd_[20:]
+        check("nuget/a TRUNCATED central-directory record: no content hash, never an exception", nupkg_content_hash(truncated_) is None)
+        nulld_ = os.path.join(tmp, "pkg-null", "demo.pkg", "1.0.0")
+        os.makedirs(nulld_)
+        open(os.path.join(nulld_, "demo.pkg.1.0.0.nupkg"), "wb").write(truncated_)
+        open(os.path.join(nulld_, "demo.pkg.1.0.0.nupkg.sha512"), "w").write(b64sha(truncated_))
+        open(os.path.join(nulld_, ".nupkg.metadata"), "w").write(json.dumps({"version": 2, "contentHash": None}))
+        check("nuget/negative control: a null contentHash over an unreadable archive is refused, not matched",
+              nuget_package_problem(nulld_, "demo.pkg", "1.0.0") is not None, nuget_package_problem(nulld_, "demo.pkg", "1.0.0"))
+
+        def pkg_fixture(kind_: str) -> str:
+            root_ = os.path.join(tmp, f"pkg-{kind_}")
+            d_ = os.path.join(root_, "demo.pkg", "1.0.0")
+            shutil.rmtree(root_, ignore_errors=True)
+            os.makedirs(os.path.join(d_, "lib", "net10.0"))
+            b_ = (signed_zip if kind_ == "signed" else encrypted_zip if kind_ == "encrypted"
+                  else corrupt_zip if kind_ == "corrupt" else unsigned_)
+            open(os.path.join(d_, "demo.pkg.1.0.0.nupkg"), "wb").write(b_)
+            open(os.path.join(d_, "demo.pkg.1.0.0.nupkg.sha512"), "w").write(b64sha(b_))
+            open(os.path.join(d_, "demo.pkg.nuspec"), "wb").write(b"<package/>")
+            open(os.path.join(d_, "lib", "net10.0", "Demo.dll"), "wb").write(b"POISONED" if kind_ == "tamper" else b"the-real-dll")
+            if kind_ == "tamper":
+                open(os.path.join(d_, "lib", "net10.0", "Extra.targets"), "w").write("<Project/>")
+            json.dump({"version": 2, "contentHash": "forged" if kind_ == "forged" else nupkg_content_hash(b_)},
+                      open(os.path.join(d_, ".nupkg.metadata"), "w"))
+            return f"cp -R {root_}/. \"$NUGET_PACKAGES\"/"
+        warm = os.path.join(cache, "nuget", "demo.pkg", "1.0.0")
+        posted.clear()
+        hpr = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("good")}]}))
+        hpr.run(claim)
+        warns = [e for _, evs in posted for e in evs if e["kind"] == "diagnostic" and e.get("code") == "MWPREP001"]
+        check("prepared/a package restored per run is SAID (a warning naming it)", len(warns) == 1 and "demo.pkg/1.0.0" in warns[0]["message"], warns)
+        check("prepared/a PR run's restore never enters the warm cache", not os.path.exists(warm))
+        posted.clear()
+        htr = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("good")}]}))
+        htr.run(dict(claim, isTrunk=True))
+        check("prepared/a trunk build's verified restore is promoted into the warm cache",
+              os.path.isfile(os.path.join(warm, ".nupkg.metadata")) and nuget_packages(os.path.join(cache, "nuget")) == {"demo.pkg/1.0.0"}
+              and sorted(os.listdir(warm)) == [".nupkg.metadata", "demo.pkg.1.0.0.nupkg", "demo.pkg.1.0.0.nupkg.sha512", "demo.pkg.nuspec", "lib"],
+              sorted(os.listdir(warm)) if os.path.isdir(warm) else None)
+        shutil.rmtree(os.path.join(cache, "nuget"))
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("signed")}]})).run(dict(claim, isTrunk=True))
+        check("prepared/a SIGNED package (content hash != archive hash) is promoted, its signature extracted as NuGet does",
+              os.path.isfile(os.path.join(warm, ".nupkg.metadata")) and os.path.isfile(os.path.join(warm, NUGET_SIGNATURE)))
+        shutil.rmtree(os.path.join(cache, "nuget"))
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("encrypted")}]})).run(dict(claim, isTrunk=True))
+        check("prepared/negative control: an ENCRYPTED package (valid hashes, unreadable entry) is refused, never a crash",
+              not os.path.exists(warm))
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("corrupt")}]})).run(dict(claim, isTrunk=True))
+        check("prepared/negative control: a CORRUPT-DEFLATE package (valid hashes) is refused, never a crash", not os.path.exists(warm))
+        shutil.rmtree(os.path.join(cache, "nuget"), ignore_errors=True)
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": "true"}]})).run(dict(claim, isTrunk=True))
+        check("prepared/a fresh cache gets <cache>/nuget before any stage runs, with NO prepared inputs declared",
+              os.path.isdir(os.path.join(cache, "nuget")))
+        big_ = tempfile.TemporaryFile()
+        big_.write(b"x" * (3 * PREPARED_OUTPUT_TAIL) + b"\nKEY")
+        check("prepared/a command's output is read back as a BOUNDED tail, its final line intact",
+              len(file_tail(big_, PREPARED_OUTPUT_TAIL)) == PREPARED_OUTPUT_TAIL and file_tail(big_, PREPARED_OUTPUT_TAIL).endswith("\nKEY"))
+        big_.close()
+        htf = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("forged")}]}))
+        htf.run(dict(claim, isTrunk=True))
+        check("prepared/negative control: a package whose hash is not what NuGet recorded is NOT promoted", not os.path.exists(warm))
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("tamper")}]})).run(dict(claim, isTrunk=True))
+        check("prepared/negative control: an ALTERED extracted file never reaches the warm cache — it is rebuilt from the verified archive",
+              os.path.isfile(os.path.join(warm, "lib", "net10.0", "Demo.dll"))
+              and open(os.path.join(warm, "lib", "net10.0", "Demo.dll"), "rb").read() == b"the-real-dll"
+              and not os.path.exists(os.path.join(warm, "lib", "net10.0", "Extra.targets")))
+        shutil.rmtree(os.path.join(cache, "nuget"))
+        # what an EARLIER stage restored (present before the build stage started) is promoted by the build stage too
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [
+            {"name": "t", "kind": "test", "command": pkg_fixture("good")},
+            {"name": "a", "kind": "build", "command": "true"}]})).run(dict(claim, isTrunk=True))
+        check("prepared/a later trunk build promotes what an earlier stage restored", os.path.isfile(os.path.join(warm, ".nupkg.metadata")))
+        shutil.rmtree(os.path.join(cache, "nuget"))
+        w_dir = os.path.join(tmp, "marker")
+        os.makedirs(w_dir)
+        victim = os.path.join(tmp, "victim")
+        open(victim, "w").write("host file")
+        os.symlink(victim, os.path.join(w_dir, ".source-key"))
+        write_marker(w_dir, ".source-key", "k")
+        check("prepared-inputs/a marker planted as a symlink is REPLACED, never written through",
+              open(victim).read() == "host file" and not os.path.islink(os.path.join(w_dir, ".source-key"))
+              and open(os.path.join(w_dir, ".source-key")).read() == "k\n")
+        posted.clear()
+        hnone = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": "true"}]}))
+        hnone.run(dict(claim, isTrunk=True))
+        check("prepared/a run that restored nothing says nothing", not [e for _, evs in posted for e in evs if e.get("code") == "MWPREP001"])
+
+        # ── 7c. PREPARED INPUTS: built from the repository's own sources ONCE per (platform, key), installed persistently ──
+        for bad_ in ({"prepared": {}}, {"prepared": [{"name": "shelf", "env": "MW_SECRET", "key": "k", "build": "b"}]},
+                     {"prepared": [{"name": "Shelf", "env": "MW_BUILD_MODULE_LIBS", "key": "k", "build": "b"}]},
+                     {"prepared": [{"name": "a", "env": "MW_BUILD_MODULE_LIBS", "key": "k", "build": "b"},
+                                   {"name": "b", "env": "MW_BUILD_MODULE_LIBS", "key": "k", "build": "b"}]},
+                     {"prepared": [{"name": "shelf", "env": "MW_BUILD_MODULE_LIBS", "key": "k"}]},
+                     {"prepared": [{"name": "shelf", "env": "MW_BUILD_MODULE_LIBS", "key": "k", "build": "b", "timeoutMinutes": 90}]}):
+            try:
+                validate_prepared(bad_)
+                check(f"prepared-inputs/refuses the declaration {bad_}", False, "accepted")
+            except Refusal:
+                pass
+        check("prepared-inputs/both names reach a stage through the allow-list",
+              set(PREPARED_ENV) <= set(sandbox_env({k: "/x" for k in PREPARED_ENV}, {}, "/cache")))
+        psrc = os.path.join(tmp, "platform-src")
+        os.makedirs(psrc, exist_ok=True)
+        builds = os.path.join(tmp, "prep-builds")
+        seen_in = os.path.join(tmp, "prep-seen")
+        k1, k2 = "1" * 64, "2" * 64
+
+        def prep_doc(key):
+            return {"prepared": [{"name": "shelf", "env": "MW_BUILD_MODULE_LIBS", "key": f"echo noise; echo {key}",
+                                  "build": f"echo built >> {builds}; echo dll > \"$MW_PREPARE_OUT/Shelf.dll\"; "
+                                           "test -d \"$MW_PLATFORM_SOURCE\" && mkdir -p \"$MW_PLATFORM_SOURCE/src/obj\""}],
+                    "stages": [{"name": "a", "kind": "build",
+                                "command": f"cat \"$MW_BUILD_MODULE_LIBS/.source-key\" > {seen_in}; echo \"$MW_BUILD_MODULE_LIBS\" >> {seen_in}; "
+                                           "test -f \"$MW_BUILD_MODULE_LIBS/Shelf.dll\""}]}
+        penv = dict(keyed_env, MW_PLATFORM_SOURCE=psrc)
+
+        def n_builds():
+            return len(open(builds).read().splitlines()) if os.path.exists(builds) else 0
+
+        def last_verdict():
+            return [e for _, evs in posted for e in evs if e["kind"] == "run-finished"][-1:]
+        store1 = prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], k1)
+        posted.clear()
+        host(api_ev(), env=penv, checkout=checkout_with(prep_doc(k1))).run(dict(claim, isTrunk=True))
+        seen_ = open(seen_in).read().split()
+        check("prepared-inputs/main moved: a TRUNK run builds it ONCE and installs it persistently",
+              n_builds() == 1 and os.path.isfile(os.path.join(store1, ".complete")) and seen_ == [k1, store1], (n_builds(), seen_))
+        check("prepared-inputs/the build writes obj/ into its OWN copy of the platform source, never the image's",
+              not os.path.exists(os.path.join(psrc, "src")))
+        check("prepared-inputs/the run is green on the installed input", last_verdict() == [{"kind": "run-finished", "succeeded": True, "error": None}], last_verdict())
+        posted.clear()
+        host(api_ev(), env=penv, checkout=checkout_with(prep_doc(k1))).run(claim)
+        check("prepared-inputs/the next run (a PR, same sources) prepares NOTHING and reads the installed copy",
+              n_builds() == 1 and open(seen_in).read().split() == [k1, store1], (n_builds(), open(seen_in).read()))
+        posted.clear()
+        host(api_ev(), env=dict(keyed_env), checkout=checkout_with(prep_doc(k1))).run(claim)
+        check("prepared-inputs/an installed input needs no platform source", n_builds() == 1
+              and last_verdict() == [{"kind": "run-finished", "succeeded": True, "error": None}], last_verdict())
+        posted.clear()
+        host(api_ev(), env=penv, checkout=checkout_with(prep_doc(k2))).run(claim)
+        warn2 = [e for _, evs in posted for e in evs if e.get("code") == "MWPREP002"]
+        check("prepared-inputs/a PR that changes its sources builds it for THIS run only, said",
+              n_builds() == 2 and len(warn2) == 1 and open(seen_in).read().split()[0] == k2, (n_builds(), warn2))
+        check("prepared-inputs/negative control: a PR never installs into the shared store",
+              not os.path.exists(prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], k2)))
+        check("prepared-inputs/another platform is another install",
+              prepared_store(cache, "r", "shelf", "3.1.1", k1) != prepared_store(cache, "r", "shelf", "3.1.2", k1))
+        posted.clear()
+        host(api_ev(), env=dict(keyed_env), checkout=checkout_with(prep_doc(k2))).run(dict(claim, isTrunk=True))
+        rf2 = last_verdict()
+        check("prepared-inputs/not installed and no platform source: RED, naming it — never a stage run against nothing",
+              rf2 and rf2[0]["succeeded"] is False and "MW_PLATFORM_SOURCE" in (rf2[0]["error"] or ""), rf2)
+        posted.clear()
+        host(api_ev(), env=penv, checkout=checkout_with(dict(prep_doc(k1), prepared=[dict(prep_doc(k1)["prepared"][0], key="echo not-a-key")]))).run(claim)
+        rf3 = last_verdict()
+        check("prepared-inputs/a key command that answers no key is RED", rf3 and rf3[0]["succeeded"] is False and "source key" in (rf3[0]["error"] or ""), rf3)
+        posted.clear()
+        host(api_ev(), env=penv, checkout=checkout_with(dict(prep_doc(k1), prepared=[dict(prep_doc(k1)["prepared"][0], key=f"echo {k1}; echo a-diagnostic >&2")]))).run(claim)
+        check("prepared-inputs/a key command that also writes stderr still answers its stdout key (installed, nothing built)",
+              n_builds() == 2 and last_verdict() == [{"kind": "run-finished", "succeeded": True, "error": None}], (n_builds(), last_verdict()))
+        fresh_ = os.path.join(tmp, "fresh-cache")
+        posted.clear()
+        host(api_ev(), env=dict(penv, MW_BUILD_CACHE=fresh_), checkout=checkout_with(prep_doc(k2))).run(claim)
+        check("prepared-inputs/a FRESH host creates the NuGet fallback folder before the first preparation",
+              os.path.isdir(os.path.join(fresh_, "nuget")) and n_builds() == 3, (n_builds(), last_verdict()))
+        posted.clear()
+        host(api_ev(), env=penv, checkout=checkout_with(dict(prep_doc("4" * 64), prepared=[dict(prep_doc("4" * 64)["prepared"][0],
+             build="echo dll > \"$MW_PREPARE_OUT/Shelf.dll\"; chmod 000 \"$MW_PREPARE_OUT\"")]))).run(dict(claim, isTrunk=True))
+        rf5 = last_verdict()
+        for r_, ds_, _ in os.walk(tmp):
+            for d_ in ds_:
+                if not os.access(os.path.join(r_, d_), os.R_OK | os.X_OK):
+                    os.chmod(os.path.join(r_, d_), 0o700)
+        # Root reads past file modes, so as root the build CANNOT leave its output unreadable and this case has no
+        # subject: it is red there, naming why, never a vacuous pass (the image runs this self-test as uid 1654).
+        check("prepared-inputs/a build that leaves its output UNREADABLE is a RED verdict naming it, never a crash",
+              os.geteuid() != 0 and rf5 and rf5[0]["succeeded"] is False and "shelf" in (rf5[0]["error"] or "") and "cannot be" in (rf5[0]["error"] or ""),
+              "run this self-test as an unprivileged uid: root reads a chmod-000 directory" if os.geteuid() == 0 else rf5)
+        posted.clear()
+        host(api_ev(), env=penv, checkout=checkout_with(dict(prep_doc("3" * 64), prepared=[dict(prep_doc("3" * 64)["prepared"][0], build="exit 7")]))).run(dict(claim, isTrunk=True))
+        rf4 = last_verdict()
+        check("prepared-inputs/a failed build is RED and installs nothing", rf4 and rf4[0]["succeeded"] is False
+              and not os.path.exists(prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], "3" * 64)), rf4)
         # the key covers sources, reference set, options and compiler
         kd = os.path.join(tmp, "keydir")
         os.makedirs(kd)
@@ -3438,6 +4178,9 @@ def self_test() -> int:
             run_budget_seconds([{"timeoutMinutes": 45}, {"timeoutMinutes": 45}], hp.run_deadline)), kinds)
         check("budget/two 40+45-minute stages fit the default deadline",
               run_budget_seconds([{"timeoutMinutes": 40}, {"timeoutMinutes": 45}], DEFAULT_RUN_DEADLINE) == 85 * 60 + RUN_MARGIN_SECONDS)
+        check("budget/a declared prepared input's build cap and key allowance are inside the budget",
+              run_budget_seconds([{"timeoutMinutes": 1}], DEFAULT_RUN_DEADLINE, [{"timeoutMinutes": 20}])
+              == 60 + RUN_MARGIN_SECONDS + 20 * 60 + PREPARED_KEY_SECONDS)
         check("budget/capped by the deadline", run_budget_seconds([{"timeoutMinutes": 45}] * 4, 2100) == 2100)
         check("budget/2100 s declares 35 minutes", budget_minutes(2100) == 35)
         check("budget/minutes round up and stay in 10..720",
