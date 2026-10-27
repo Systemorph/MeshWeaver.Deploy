@@ -864,6 +864,7 @@ SCRATCH = "/scratch"
 # START — a stage never prepares it per run.
 COMPILE_REFS_MARKER = "System.Private.CoreLib.dll"
 COMPILE_REFS_SHARED = "shared-frameworks"
+COMPILE_REFS_RX = "System.Reactive.dll"
 
 
 def compile_refs_refusal(refs: str) -> Optional[str]:
@@ -875,12 +876,15 @@ def compile_refs_refusal(refs: str) -> Optional[str]:
     if not any(n.startswith("MeshWeaver.") and n.endswith(".dll") for n in os.listdir(refs)):
         return f"MW_BUILD_COMPILE_REFS={refs} carries no MeshWeaver.*.dll — it is not the portal's /app"
     shared = os.path.join(refs, COMPILE_REFS_SHARED)
-    for _dir, _subdirs, files in os.walk(shared):
-        if COMPILE_REFS_MARKER in files:
-            return None
-    return (f"MW_BUILD_COMPILE_REFS={refs} carries NO shared frameworks ({COMPILE_REFS_SHARED}/**/{COMPILE_REFS_MARKER} "
-            f"is missing) — core's compile-check.py refuses such a set (exit 4); the portal init container must "
-            f"stage /usr/share/dotnet/shared beside /app")
+    if not any(COMPILE_REFS_MARKER in files for _dir, _subdirs, files in os.walk(shared)):
+        return (f"MW_BUILD_COMPILE_REFS={refs} carries NO shared frameworks ({COMPILE_REFS_SHARED}/**/{COMPILE_REFS_MARKER} "
+                f"is missing) — core's compile-check.py refuses such a set (exit 4); the portal init container must "
+                f"stage /usr/share/dotnet/shared beside /app")
+    # core's short_reference_set_refusal ALSO refuses a set without Rx (every MeshWeaver assembly binds it).
+    if not any(COMPILE_REFS_RX in files for _dir, _subdirs, files in os.walk(refs)):
+        return (f"MW_BUILD_COMPILE_REFS={refs} carries NO {COMPILE_REFS_RX} — core's compile-check.py refuses such a set "
+                f"(exit 4): every MeshWeaver assembly binds Rx, and the portal's /app ships it")
+    return None
 
 # The platform's canonical checkers a repository's stages run (MeshWeaver.Plugins
 # `scripts/canonical-compile-check.py`, `scripts/check-scripts.py`): the image ships core's
@@ -941,6 +945,14 @@ def prepared_env(root: str = PREPARED_ROOT, tester: str = TESTER_APP) -> dict:
         env["MW_TEST_PG_SNAPSHOT"] = snapshot
         env["MW_TEST_PG_SERVER"] = server
     return env
+
+
+def sandbox_readonly_roots(env: dict) -> list[str]:
+    """The host-side roots every stage's sandbox binds READ-ONLY: the tester, the portal's /app, the compile
+    reference set (wherever MW_BUILD_COMPILE_REFS points — a path handed to a stage must be visible in it),
+    and the staged image roots."""
+    return [p for p in (env.get("MW_BUILD_GATE_HOST"), env.get("MeshWeaverRefs"), env.get("MW_BUILD_COMPILE_REFS"),
+                        "/portal", "/tester", "/tools", "/core-tests") if p]
 
 
 class Sandbox:
@@ -1464,9 +1476,7 @@ class Host:
         # The staged image roots are bound read-only, `--ro-bind-try` (absent on a set that names no
         # such image): /core-tests is where a set's mw-core-tests image is staged, and core's shard and
         # doc-gate stages run `python3 /core-tests/core-tests.py …` from it.
-        self.sandbox = sandbox or Sandbox(env.get("BWRAP", "bwrap"), [
-            p for p in (env.get("MW_BUILD_GATE_HOST"), env.get("MeshWeaverRefs"),
-                        "/portal", "/tester", "/tools", "/core-tests") if p])
+        self.sandbox = sandbox or Sandbox(env.get("BWRAP", "bwrap"), sandbox_readonly_roots(env))
         self.leftovers = leftovers or pid_namespace_leftovers
         self.reap = reap or reap_children
         self.registry_get = registry_get or _registry_get
@@ -3395,7 +3405,14 @@ def self_test() -> int:
             fx = os.path.join(cr, "shared-frameworks", "Microsoft.NETCore.App", "10.0.0")
             os.makedirs(fx)
             open(os.path.join(fx, "System.Private.CoreLib.dll"), "wb").close()
+            check("compile refs/NEGATIVE CONTROL: a set without System.Reactive.dll is refused (core's checker refuses it too)",
+                  "System.Reactive.dll" in (compile_refs_refusal(cr) or ""), compile_refs_refusal(cr))
+            open(os.path.join(cr, "System.Reactive.dll"), "wb").close()
             host(_FakeApi({}), env=dict(env_v, MW_BUILD_COMPILE_REFS=cr)).preflight()
+            check("compile refs/the configured directory is bound read-only into every stage's sandbox",
+                  cr in sandbox_readonly_roots({"MW_BUILD_COMPILE_REFS": cr})
+                  and f"--ro-bind-try {cr} {cr}" in " ".join(Sandbox("bwrap", sandbox_readonly_roots({"MW_BUILD_COMPILE_REFS": cr})).argv("true", "/w", "/o", {})),
+                  sandbox_readonly_roots({"MW_BUILD_COMPILE_REFS": cr}))
             check("compile refs/the prepared set (/app + shared-frameworks) starts", compile_refs_refusal(cr) is None)
             os.remove(os.path.join(cr, "MeshWeaver.Messaging.Hub.dll"))
             check("compile refs/a set without the portal's MeshWeaver assemblies is refused",
