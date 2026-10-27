@@ -1047,7 +1047,10 @@ def _is_zombie(proc_root: str, pid: str) -> bool:
     try:
         # errors="replace": a task name may hold non-UTF-8 bytes, and the name is read before State
         # — a decode error must never abort cleanup (review of #7287).
-        with open(os.path.join(proc_root, pid, "status"), encoding="utf-8", errors="replace") as fh:
+        # newline="\n": the kernel ends lines with "\n" only, while a task name is chosen by the process
+        # (PR_SET_NAME) and may hold "\r" — universal newlines would turn "\rState:\tZ\r" into a forged
+        # State line ahead of the real one, and a live survivor would pass as a zombie (review of Deploy#28).
+        with open(os.path.join(proc_root, pid, "status"), encoding="utf-8", errors="replace", newline="\n") as fh:
             for line in fh:
                 if line.startswith("State:"):
                     return line.split()[1:2] == ["Z"]
@@ -2437,6 +2440,10 @@ def self_test() -> int:
             fh.write(b"Name:\tbw\xff\xferap\nState:\tZ (zombie)\nPPid:\t1\n")
         check("leftovers/a non-UTF-8 task name neither raises nor hides a zombie", pid_namespace_leftovers(fake) == [11],
               pid_namespace_leftovers(fake))
+        with open(os.path.join(fake, "11", "status"), "w", newline="") as fh:
+            fh.write("Name:\t\rState:\tZ\r\nState:\tS (sleeping)\nPPid:\t1\n")
+        check("leftovers/a task name forging a carriage-return State line does not hide a live survivor",
+              pid_namespace_leftovers(fake) == [11], pid_namespace_leftovers(fake))
         # reap_children really reaps: a child that exited is collected without blocking.
         child = subprocess.Popen(["true"])
         # Wait for the child to EXIT without consuming its status (Popen waits only for exec), so the
