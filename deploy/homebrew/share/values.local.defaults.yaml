@@ -70,12 +70,12 @@ config:
     # person who reaches the page WITHOUT it (a stale tab, a typed URL) is told where
     # the token is, and — when this key is set — exactly what to run on THIS install:
     # "On this install, run `memex-local setup`". Read by Memex.Portal.Shared/Setup in
-    # MeshWeaver.Plugins as the configuration key InstanceSetup:TokenCommand; reaches
-    # the container through the ConfigMap's pass-through half (any config.memex_portal
-    # key with a value is rendered — _portal-config-passthrough.tpl).
+    # MeshWeaver.Plugins as the configuration key InstanceSetup:TokenCommand. Bound by name in
+    # the ConfigMap's literal half (deploy/helm/templates/memex-portal/config.yaml, rendered
+    # only when set) — the binding guard requires every values key to be templated there.
     InstanceSetup__TokenCommand: "memex-local setup"
     # This install runs on a Mac: the wizard's package step pre-checks the Mac-only packages
-    # (Google, iMessage, WhatsApp) from InstanceSetup:HostPlatform; same pass-through delivery.
+    # (Google, iMessage, WhatsApp) from InstanceSetup:HostPlatform; bound the same way.
     InstanceSetup__HostPlatform: "mac"
 
 # ---- Portal Ingress: the TLS Secret is minted by `memex-local up`, not issued -------------------
