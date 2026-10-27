@@ -74,7 +74,7 @@ The refusals, and why each one exists:
 {{- end -}}
 {{- end -}}
 {{- if ($b.postgres | default dict).enabled -}}
-{{- fail "buildHosts.postgres is not supported — a build host runs NO shared database; a stage that needs PostgreSQL starts a disposable one inside its own sandbox (sandbox-postgres.sh)" -}}
+{{- fail "buildHosts.postgres is not supported — a build host runs NO shared database sidecar; its runner image starts ONE prepared test server per pod (host-postgres.sh: pgvector, a template every run clones under its own role, Unix socket only), and a stage may start a disposable one in its sandbox (sandbox-postgres.sh)" -}}
 {{- end -}}
 {{- /* hasKey, not `default`: Sprig's default treats an explicit 0 as empty and would turn it into 7200 */ -}}
 {{- $runDeadline := 7200 -}}

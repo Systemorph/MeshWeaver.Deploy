@@ -61,6 +61,22 @@ if [ -f "$DOCKERFILE" ] \
 else
   report "deploy/build-host/Dockerfile must fetch its sources by 40-hex commit in the 'sources' stage, COPY only --from=sources (build-run.py, compose-gate-host.sh, sandbox-postgres.sh, module-build-key.py, node-repo-scope.py — module-build-key imports it, core #7270 —, ci-artifact-store.py, plugin-build) to /opt/build-host/, install bubblewrap, run the self-tests incl. module-build-key.py's, and name no :latest base"
 fi
+# 1b. the PREPARED host (MeshWeaver.Plugins Hosting/StandingBuildHosts.md, "a prepared server, never a
+#     prepared run"): the image carries core's source at the set's commit and the portal chart (both by
+#     commit, from the sources stage), PostgreSQL with pgvector, and the prepared test-database server,
+#     whose REAL self-test runs as the unprivileged user and which the entrypoint starts before the loop.
+if [ -f "$DOCKERFILE" ] \
+   && grep -q '^COPY --from=sources /out/platform-src/ /opt/build-host/platform-src/$' "$DOCKERFILE" \
+   && grep -q '^COPY --from=sources /out/deploy-src/ /opt/build-host/deploy-src/$' "$DOCKERFILE" \
+   && grep -q '^COPY --from=sources /out/scripts/host-postgres.sh /opt/build-host/$' "$DOCKERFILE" \
+   && grep -q 'postgresql-${PG_MAJOR}-pgvector' "$DOCKERFILE" \
+   && grep -q '^RUN bash /opt/build-host/host-postgres.sh --self-test$' "$DOCKERFILE" \
+   && grep -q 'bash /opt/build-host/host-postgres.sh start; exec python3 /opt/build-host/build-run.py --host' "$DOCKERFILE" \
+   && [ "$(grep -n '^USER 1654' "$DOCKERFILE" | head -1 | cut -d: -f1)" -lt "$(grep -n 'host-postgres.sh --self-test' "$DOCKERFILE" | head -1 | cut -d: -f1)" ]; then
+  ok "deploy/build-host/Dockerfile carries core's source and the chart by commit, PostgreSQL with pgvector, runs the prepared server's REAL self-test as the unprivileged user, and starts it before the claim loop"
+else
+  report "deploy/build-host/Dockerfile must COPY --from=sources platform-src/, deploy-src/ and host-postgres.sh, install postgresql-\${PG_MAJOR}-pgvector, run host-postgres.sh --self-test AFTER 'USER 1654' (initdb refuses root), and start it in the ENTRYPOINT before build-run.py --host"
+fi
 if python3 "$REPO/.github/scripts/build-run.py" --self-test; then
   ok "build-run.py passes its self-test"
 else
