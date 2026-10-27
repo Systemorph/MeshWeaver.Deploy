@@ -194,7 +194,9 @@ spec:
           # into the same emptyDir (no second copy of the bytes). core's compile-check.py refuses a flat
           # image set without System.Private.CoreLib.dll (exit 4: the first probe on build-latest handed
           # it /portal/app alone). /portal/app stays the app as shipped — a stage's --app.
-          command: ["/bin/sh", "-c", "set -e; mkdir -p /portal/app /portal/dotnet /portal/refs/shared-frameworks && cp -a /app/. /portal/app/ && cp -a /usr/share/dotnet/. /portal/dotnet/ && cp -al /portal/app/. /portal/refs/ && cp -al /portal/dotnet/shared/. /portal/refs/shared-frameworks/ && ls /portal/refs/shared-frameworks/Microsoft.NETCore.App/*/System.Private.CoreLib.dll >/dev/null"]
+          # RE-RUNNABLE: a retried init container meets the same emptyDir, and `cp -al` onto existing
+          # links fails — so the reference tree is removed first and rebuilt whole.
+          command: ["/bin/sh", "-c", "set -e; rm -rf /portal/refs; mkdir -p /portal/app /portal/dotnet /portal/refs/shared-frameworks && cp -a /app/. /portal/app/ && cp -a /usr/share/dotnet/. /portal/dotnet/ && cp -al /portal/app/. /portal/refs/ && cp -al /portal/dotnet/shared/. /portal/refs/shared-frameworks/ && ls /portal/refs/shared-frameworks/Microsoft.NETCore.App/*/System.Private.CoreLib.dll >/dev/null"]
           volumeMounts:
             - { name: "portal", mountPath: "/portal" }
           securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
