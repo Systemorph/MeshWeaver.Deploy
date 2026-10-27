@@ -769,18 +769,54 @@ def plugins_key_of(lines: list[str]) -> str:
     return "sha256:" + hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
 
+def _swap_into_place(tmp: str, final: str) -> None:
+    """Move a freshly built `tmp` to `final`, REPLACING a damaged `final` (a populated directory a plain rename
+    cannot overwrite): the damaged one is renamed aside first and removed after. A concurrent host that put a
+    valid `final` in place first wins — the caller re-validates what is there."""
+    try:
+        os.rename(tmp, final)
+        return
+    except OSError:
+        pass
+    stale = tempfile.mkdtemp(prefix=".stale-", dir=os.path.dirname(final))
+    os.rmdir(stale)
+    try:
+        os.rename(final, stale)
+    except OSError:
+        pass
+    try:
+        os.rename(tmp, final)
+    except OSError:
+        shutil.rmtree(tmp, ignore_errors=True)
+    shutil.rmtree(stale, ignore_errors=True)
+
+
+def bundle_intact(final: str, line: str) -> bool:
+    """A cached bundle is still INSTALLED: its `.complete` names this very line and its package directory exists."""
+    pkg = line.split("@")[0]
+    try:
+        with open(os.path.join(final, ".complete")) as fh:
+            marked = fh.read().strip()
+    except OSError:
+        return False
+    return marked == line and os.path.isdir(os.path.join(final, pkg)) and not os.path.islink(os.path.join(final, pkg))
+
+
 def stage_bundle_set(lines: list[str], cache: str, fetch: Callable[[str, str, str], int]) -> str:
     """Every bundle the index names, in the content-addressed cache `<cache>/bundles/<h>/<package>/`
     (h = the line's digest, so a re-published version with a new hash is a new entry and an unchanged
     one is never fetched again), and the SET as `<cache>/plugin-sets/<key-hex>/<package>` links.
-    `fetch(package, version, out)` is `module-fetch`; returns the set directory."""
+    `fetch(package, version, out)` is `module-fetch`; returns the set directory. A damaged bundle or set on
+    the shared cache (a missing package directory, link or `.complete`) is REPAIRED — fetched or linked
+    again and swapped into place — and the returned layer is validated (`layer_intact`): a layer that
+    is still not intact is a Refusal, never recorded and never claimed on."""
     root = os.path.join(cache, "bundles")
     os.makedirs(root, exist_ok=True)
     places = {}
     for line in lines:
         pkg, ver = line.split("@")[0], line.split("@")[1]
         final = os.path.join(root, hashlib.sha256(line.encode()).hexdigest()[:32])
-        if not os.path.isfile(os.path.join(final, ".complete")):
+        if not bundle_intact(final, line):
             tmp = tempfile.mkdtemp(prefix=".fetch-", dir=root)
             rc = fetch(pkg, ver, tmp)
             if rc != 0 or not os.path.isdir(os.path.join(tmp, pkg)):
@@ -788,46 +824,54 @@ def stage_bundle_set(lines: list[str], cache: str, fetch: Callable[[str, str, st
                 raise Refusal(f"module-fetch {pkg}@{ver} failed (exit {rc}) — not claiming on a partial plugins layer")
             with open(os.path.join(tmp, ".complete"), "w") as fh:
                 fh.write(line + "\n")
-            try:
-                os.rename(tmp, final)
-            except OSError:
-                shutil.rmtree(tmp, ignore_errors=True)
-                if not os.path.isfile(os.path.join(final, ".complete")):
-                    raise Refusal(f"could not move the fetched bundle {line} into the cache")
+            _swap_into_place(tmp, final)
+            if not bundle_intact(final, line):
+                raise Refusal(f"could not move the fetched bundle {line} into the cache")
         places[pkg] = os.path.join(final, pkg)
     key = plugins_key_of(lines)
     sets = os.path.join(cache, "plugin-sets")
     os.makedirs(sets, exist_ok=True)
     set_dir = os.path.join(sets, key.split(":", 1)[1])
-    if not os.path.isfile(os.path.join(set_dir, ".complete")):
+    if not layer_intact(set_dir, cache):
         tmp = tempfile.mkdtemp(prefix=".set-", dir=sets)
         for pkg, place in places.items():
             os.symlink(place, os.path.join(tmp, pkg))
         with open(os.path.join(tmp, ".complete"), "w") as fh:
             fh.write("\n".join(lines) + "\n")
-        try:
-            os.rename(tmp, set_dir)
-        except OSError:
-            shutil.rmtree(tmp, ignore_errors=True)
+        _swap_into_place(tmp, set_dir)
+    if not layer_intact(set_dir, cache):
+        raise Refusal(f"the plugins layer {key[:19]}… is not intact on the cache after staging — not claiming on it")
     return set_dir
 
 
-def layer_intact(set_dir: Optional[str]) -> bool:
-    """A staged plugins layer is still INSTALLED: its set is complete and every package link resolves
-    into a complete bundle on the cache. A layer evicted from the cache, or a volume that was
-    replaced, is not — and is installed again from the index whatever the hand-over key says."""
-    if not set_dir or not os.path.isfile(os.path.join(set_dir, ".complete")):
+def layer_intact(set_dir: Optional[str], cache: Optional[str] = None) -> bool:
+    """A staged plugins layer is still INSTALLED: its set's `.complete` manifest lists the bundle lines, and for
+    EVERY line the set holds the package link, resolving to that line's own content-addressed bundle
+    (`<cache>/bundles/<digest>/<package>`) whose `.complete` names the line — and the set holds nothing else. A
+    layer missing a plugin (a removed link, a removed package directory, an evicted bundle) or a replaced
+    volume is not, and is installed again from the index whatever the hand-over key says."""
+    if not set_dir:
         return False
     try:
-        for name in os.listdir(set_dir):
-            if name.startswith("."):
-                continue
-            target = os.path.realpath(os.path.join(set_dir, name))
-            if not os.path.isfile(os.path.join(os.path.dirname(target), ".complete")):
-                return False
+        with open(os.path.join(set_dir, ".complete")) as fh:
+            lines = [ln.strip() for ln in fh.read().splitlines() if ln.strip()]
+        present = {n for n in os.listdir(set_dir) if not n.startswith(".")}
     except OSError:
         return False
-    return True
+    if not lines:
+        return False
+    root = os.path.realpath(os.path.join(cache or os.path.dirname(os.path.dirname(set_dir)), "bundles"))
+    pkgs = set()
+    for line in lines:
+        pkg = line.split("@")[0]
+        pkgs.add(pkg)
+        link = os.path.join(set_dir, pkg)
+        final = os.path.join(root, hashlib.sha256(line.encode()).hexdigest()[:32])
+        if not os.path.islink(link) or os.path.realpath(link) != os.path.realpath(os.path.join(final, pkg)):
+            return False
+        if not bundle_intact(final, line):
+            return False
+    return present == pkgs
 
 
 def layer_record_path(cache: str, identity: str) -> str:
@@ -849,7 +893,7 @@ def read_layer_record(cache: str, identity: str) -> Optional[dict]:
     d = rec.get("dir")
     if not isinstance(d, str) or os.path.realpath(d) != os.path.realpath(os.path.join(cache, "plugin-sets", rec["key"].split(":", 1)[-1])):
         return None
-    return rec if layer_intact(d) else None
+    return rec if layer_intact(d, cache) else None
 
 
 def write_layer_record(cache: str, identity: str, key: str, set_dir: str, modules_key: Optional[str]) -> None:
@@ -1634,7 +1678,7 @@ class Host:
                 self.modules_seen = rec.get("modulesKey") if isinstance(rec.get("modulesKey"), str) else None
                 self.log(f"plugins layer already installed on the cache: {rec['key'][:19]}…")
         signal = self.modules_signal()
-        if signal is not None and signal == self.modules_seen and self.plugins_key and layer_intact(self.plugins_dir):
+        if signal is not None and signal == self.modules_seen and self.plugins_key and layer_intact(self.plugins_dir, self.cache):
             return True                     # nothing handed over since the layer was staged
         url = self.env["MW_REGISTRY_URL"].rstrip("/")
         key_file = self.env.get("MW_REGISTRY_KEY_FILE", "/run/registry-key/key")
@@ -1661,7 +1705,7 @@ class Host:
         try:
             lines = bundle_lines(index)
             key = plugins_key_of(lines)
-            if key != self.plugins_key or not layer_intact(self.plugins_dir):
+            if key != self.plugins_key or not layer_intact(self.plugins_dir, self.cache):
                 d = stage_bundle_set(lines, self.cache, lambda pkg, ver, out: self.module_fetch(url, instance_key, pkg, ver, out))
                 self.log(f"plugins layer staged from the registry index: {key[:19]}… ({len(lines)} bundle(s))")
                 self.plugins_dir = d
@@ -2966,6 +3010,35 @@ def self_test() -> int:
         shutil.rmtree(evicted)
         ho2.cycle()
         check("handover/install-on-miss: a layer no longer intact is installed again from the index", len(index_reads) == 3, index_reads)
+        # The layer must be intact PER PLUGIN, not per marker: each damage below leaves every `.complete` it can in place.
+        hc = hoenv["MW_BUILD_CACHE"]
+        check("handover/the reinstalled layer is intact", layer_intact(ho2.plugins_dir, hc), ho2.plugins_dir)
+        os.unlink(os.path.join(ho2.plugins_dir, "Store"))
+        check("handover/a set missing a package LINK is not intact", not layer_intact(ho2.plugins_dir, hc))
+        ho2.cycle()
+        check("handover/a removed package link is repaired (index read, link back)", len(index_reads) == 4
+              and layer_intact(ho2.plugins_dir, hc) and os.path.islink(os.path.join(ho2.plugins_dir, "Store")), index_reads)
+        store_bundle = os.path.dirname(os.path.realpath(os.path.join(ho2.plugins_dir, "Store")))
+        shutil.rmtree(os.path.join(store_bundle, "Store"))
+        check("handover/a bundle whose package directory is gone (its .complete kept) is not intact",
+              os.path.isfile(os.path.join(store_bundle, ".complete")) and not layer_intact(ho2.plugins_dir, hc))
+        fetched.clear()
+        ho2.cycle()
+        check("handover/the missing package directory is fetched again and swapped into place",
+              [a[a.index("module-fetch") + 1] for a in fetched] == ["Store"] and layer_intact(ho2.plugins_dir, hc), fetched)
+        os.unlink(os.path.join(ho2.plugins_dir, ".complete"))
+        ho2.cycle()
+        check("handover/a populated set that lost its .complete is rebuilt, not returned unchanged",
+              len(index_reads) == 6 and layer_intact(ho2.plugins_dir, hc), index_reads)
+        with open(os.path.join(ho2.plugins_dir, ".complete"), "a") as fh_:
+            fh_.write("Ghost@1.0.0\n")
+        check("handover/a manifest naming a plugin the set does not hold is not intact", not layer_intact(ho2.plugins_dir, hc))
+        ho2.cycle()
+        check("handover/...and is repaired from the index", layer_intact(ho2.plugins_dir, hc))
+        os.symlink(store_bundle, os.path.join(ho2.plugins_dir, "Stray"))
+        check("handover/a set holding a plugin its manifest does not name is not intact", not layer_intact(ho2.plugins_dir, hc))
+        ho2.cycle()
+        check("handover/...and is rebuilt without it", layer_intact(ho2.plugins_dir, hc) and not os.path.lexists(os.path.join(ho2.plugins_dir, "Stray")))
         # No signal (an older operations instance, an unreadable ledger): the index is read every turn, as before.
         nosig = host(_FakeApi({("GET", "/hosts/inputs"): lambda p_, b: (200, {"modules": None}),
                                ("POST", "/claim"): lambda p_, b: (204, None)}), env=hoenv, registry_get=reg_get, fetch_runner=fetch_runner)
