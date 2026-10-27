@@ -48,7 +48,9 @@ start() {
   chmod 0700 "$root" "$sock"
   pw="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
   ( umask 077; printf '%s' "$pw" > "$root/admin.pw" )
-  "$bin/initdb" -D "$root/data" -U "$ADMIN" -A scram-sha-256 --pwfile="$root/admin.pw" >"$root/initdb.log" 2>&1 \
+  # UTF8, as pgvector/pgvector:pg17 initialises: under the C locale initdb picks SQL_ASCII, where
+  # jsonb refuses every non-ASCII \u escape (22P05) — measured: 5 ToolResultStorabilityTests red.
+  "$bin/initdb" -D "$root/data" -U "$ADMIN" -A scram-sha-256 --pwfile="$root/admin.pw" -E UTF8 --locale=C.UTF-8 >"$root/initdb.log" 2>&1 \
     || { echo "host-postgres: initdb failed:" >&2; tail -n 20 "$root/initdb.log" >&2; return 1; }
   # Tests open many short databases and LISTEN sessions in parallel lanes: a roomy connection limit;
   # durability is irrelevant for throwaway clones (the data directory dies with the pod).
@@ -88,6 +90,8 @@ if [ "${1:-}" = "--self-test" ]; then
     || fail "the clone carries no pgvector"
   PGPASSWORD=p4ss "${run[@]}" -d suite_a -c "CREATE EXTENSION IF NOT EXISTS vector; CREATE TABLE t (v vector(3)); INSERT INTO t VALUES ('[1,2,3]')" \
     || fail "a suite's own DDL does not run on its clone"
+  [ "$(PGPASSWORD=p4ss "${run[@]}" -d suite_a -c "SHOW server_encoding")" = UTF8 ] || fail "the clone is not UTF8 (jsonb would refuse non-ASCII escapes)"
+  [ "$(PGPASSWORD=p4ss "${run[@]}" -d suite_a -c "SELECT '{\"a\":\"\\u00e9\"}'::jsonb ->> 'a'")" = "é" ] || fail "jsonb does not decode a non-ASCII \\u escape"
   # Negative controls — each MUST be refused.
   if PGPASSWORD=p4ss "${run[@]}" -d "$TEMPLATE" -c "SELECT 1" >/dev/null 2>&1; then fail "the run role connected to the template"; fi
   if PGPASSWORD=p4ss "${run[@]}" -d postgres -c "CREATE ROLE intruder" >/dev/null 2>&1; then fail "the run role created a role"; fi
