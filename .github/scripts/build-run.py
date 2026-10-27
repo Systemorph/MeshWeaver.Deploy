@@ -73,6 +73,14 @@ THE LOOP, and the order that matters:
     (MWPREP001); on a trunk build it is verified (the .nupkg's SHA-512 against what NuGet recorded)
     and promoted into `<cache>/nuget`, the stages' read-only fallback folder, so the next run
     restores nothing.
+  * `prepared` (optional, beside `stages`): inputs built from the repository's OWN sources that are
+    not the run's subject (MeshWeaver.Plugins' module-libraries shelf and Razor build extension,
+    `MW_BUILD_MODULE_LIBS` / `MW_BUILD_EXTENSIONS`). The host keys each with the repository's own
+    `key` command and installs it once per (repository, input, platform, key) under
+    `<cache>/prepared/`, stamped `.source-key`; a run whose key is installed prepares nothing. A
+    trunk run whose key is not installed builds it (`build`, against the image's platform source
+    `MW_PLATFORM_SOURCE`) and installs it — every push to main queues one, so the server follows
+    main. A pull request with other sources builds it for that run only (MWPREP002), never installs.
   * stages run in declaration order, fail-fast: after a failed stage the rest are finished
     `failed` with "not run" — never left open, never silently skipped. When the claim names
     `stages`, only those run, and a claimed stage the repository does not declare is RED.
@@ -413,6 +421,63 @@ def _hms(seconds: float) -> str:
 
 class Refusal(Exception):
     """A run that cannot proceed, with the reason it is red."""
+
+
+# PREPARED INPUTS (MeshWeaver.Plugins Hosting/StandingBuildHosts §7, "A prepared server"): what a repository's stages
+# read that is BUILT FROM ITS OWN SOURCES but is not the run's subject — MeshWeaver.Plugins' module-libraries shelf and
+# Razor build extension. Declared beside the stages:
+#   "prepared": [{"name": "shelf", "env": "MW_BUILD_MODULE_LIBS",
+#                 "key": "python3 scripts/host-in-mesh-modules.py source-key shelf",
+#                 "build": "dotnet publish src/…/X.csproj -c Release -o \"$MW_PREPARE_OUT\" -p:MeshWeaverRoot=\"$MW_PLATFORM_SOURCE\"",
+#                 "timeoutMinutes": 20}]
+# The host computes each input's source key from the run's tree (the repository's OWN `key` command, so the stage's own
+# check agrees by construction), and installs it PERSISTENTLY per (repository, input, platform, key) under
+# `<cache>/prepared/`. A run whose key is installed reads it, read-only, and prepares nothing. A TRUNK run whose key is not
+# installed builds it once and installs it — every push to main queues a trunk run, so the server follows main. A pull
+# request whose sources differ from every installed copy builds it for that run only (said, MWPREP002), and never writes
+# the shared copy. Only the names below may carry a prepared input: a stage's environment is an allow-list.
+PREPARED_ENV = ("MW_BUILD_MODULE_LIBS", "MW_BUILD_EXTENSIONS")
+PREPARED_NAME = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
+SOURCE_KEY = re.compile(r"^[0-9a-f]{64}$")
+
+
+def validate_prepared(doc: object) -> list[dict]:
+    items = doc.get("prepared", []) if isinstance(doc, dict) else []
+    if not isinstance(items, list):
+        raise Refusal("`prepared` in .github/build-stages.json must be a list")
+    out, names, envs = [], set(), set()
+    for i, p in enumerate(items):
+        if not isinstance(p, dict):
+            raise Refusal(f"prepared input #{i} is not an object")
+        name, env = str(p.get("name") or ""), str(p.get("env") or "")
+        if not PREPARED_NAME.match(name) or name in names:
+            raise Refusal(f"prepared input #{i} name {name!r} must be [a-z][a-z0-9-]* and unique")
+        if env not in PREPARED_ENV or env in envs:
+            raise Refusal(f"prepared input {name!r} env {env!r} must be one of {list(PREPARED_ENV)}, once each — "
+                          "a stage's environment is an allow-list")
+        for f in ("key", "build"):
+            if not isinstance(p.get(f), str) or not p[f].strip():
+                raise Refusal(f"prepared input {name!r} has no `{f}` command")
+        tmo = p.get("timeoutMinutes", 20)
+        if not isinstance(tmo, (int, float)) or not (0 < tmo <= DEFAULT_STAGE_TIMEOUT_MINUTES):
+            raise Refusal(f"prepared input {name!r} timeoutMinutes {tmo!r} must be in (0, {DEFAULT_STAGE_TIMEOUT_MINUTES}]")
+        names.add(name)
+        envs.add(env)
+        out.append({"name": name, "env": env, "key": p["key"], "build": p["build"], "timeoutMinutes": float(tmo)})
+    return out
+
+
+def prepared_store(cache: str, repo: str, name: str, platform: str, key: str) -> str:
+    """Where an installed prepared input lives: one directory per (repository, input, platform, source key)."""
+    return os.path.join(cache, "prepared", repo, name, hashlib.sha256(f"{platform}|{key}".encode()).hexdigest()[:32])
+
+
+def load_prepared(path: str) -> list[dict]:
+    try:
+        with open(path) as fh:
+            return validate_prepared(json.load(fh))
+    except (OSError, ValueError) as e:
+        raise Refusal(f".github/build-stages.json is unreadable: {e}")
 
 
 def load_stages(path: str) -> list[dict]:
@@ -958,7 +1023,7 @@ def read_worker_token(env: dict) -> str:
 # (`bwrap --clearenv`); the run's own facts are added explicitly by the host.
 ENV_ALLOW = ("PATH", "LANG", "LC_ALL", "TZ", "DOTNET_ROOT", "DOTNET_CLI_TELEMETRY_OPTOUT", "DOTNET_NOLOGO",
              "DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "SSL_CERT_FILE", "SSL_CERT_DIR", "MeshWeaverRefs",
-             "MW_BUILD_GATE_HOST", "MW_BUILD_PORTAL_DOTNET")
+             "MW_BUILD_GATE_HOST", "MW_BUILD_PORTAL_DOTNET", "MW_BUILD_MODULE_LIBS", "MW_BUILD_EXTENSIONS")
 SCRATCH = "/scratch"
 
 # The platform's canonical checkers a repository's stages run (MeshWeaver.Plugins
@@ -1850,6 +1915,7 @@ class Host:
                 if not trunk and not probe:
                     merge_base = self.merge_onto_base(repo, checkout_dir, claim.get("mergeBaseSha"), token)
                 declared = load_stages(os.path.join(checkout_dir, ".github", "build-stages.json"))
+                prepared_inputs = load_prepared(os.path.join(checkout_dir, ".github", "build-stages.json"))
                 stages = select_stages(declared, claim.get("stages"))
                 if probe and claim.get("requestedStages"):
                     # A PROBE runs EXACTLY the stages it asked for (`requestedStages`; empty = every
@@ -1896,6 +1962,16 @@ class Host:
             failed_at = None
             why = ""
             run_end = self.clock() + budget
+            prepared_ro: list[str] = []
+            if prepared_inputs:
+                psink = self._sink_for(repo, sha, stages[0]["name"])
+                try:
+                    penv, prepared_ro = self.prepare_inputs(repo, checkout_dir, workdir, trunk, prepared_inputs, psink, run_end)
+                    extra.update(penv)
+                except Refusal as r:
+                    failed_at, why = stages[0]["name"], f"a prepared input could not be provided: {r}"
+                    psink.add([{"kind": "line", "text": why[:MAX_LINE]}])
+                    self.deliver(psink)
             for st in stages:
                 last_stage = st["name"]
                 sink = self._sink_for(repo, sha, st["name"])
@@ -1917,7 +1993,7 @@ class Host:
                 ok = self.run_stage(dict(st, timeoutMinutes=min(st["timeoutMinutes"], remaining / 60)),
                                     checkout_dir, outputs_dir, sink,
                                     {**extra, "MW_BUILD_STAGE": st["name"], "NUGET_PACKAGES": nuget_dir},
-                                    readonly=self.stage_readonly(repo, st), writable=[artifacts_dir, nuget_dir],
+                                    readonly=self.stage_readonly(repo, st) + prepared_ro, writable=[artifacts_dir, nuget_dir],
                                     hand_over=lambda: self.hand_over_artifacts(repo, sha, st["name"], artifacts_dir,
                                                                                deadline=run_end))
                 self.assert_clean()
@@ -2070,6 +2146,91 @@ class Host:
             except OSError:
                 continue
         return gone
+
+    def prepare_inputs(self, repo: str, checkout: str, workdir: str, trunk: bool, inputs: list[dict],
+                       sink: "EventSink", run_end: float) -> tuple[dict, list[str]]:
+        """Provide every PREPARED input the repository declares (see PREPARED_ENV): the installed copy for this
+        run's source key, or — once — a build of it, installed for every later run when this is a trunk run.
+        Returns (the stage environment additions, the read-only binds). Raises Refusal, naming the input."""
+        env_add: dict = {}
+        ro: list[str] = []
+        mirror = os.path.join(self.cache, "git", f"{repo}.git")
+        platform_src = self.env.get("MW_PLATFORM_SOURCE", "")
+
+        def sandboxed(command: str, out: str, extra: dict, readonly: list, writable: list, timeout: float) -> tuple[int, str]:
+            argv = self.sandbox.argv(command, checkout, out, sandbox_env(self.env, extra, self.cache),
+                                     readonly=readonly, writable=writable)
+            try:
+                r = subprocess.run(argv, cwd=checkout, env={"PATH": self.env.get("PATH", "/usr/bin:/bin")},
+                                   capture_output=True, text=True, errors="replace", timeout=max(1.0, timeout),
+                                   stdin=subprocess.DEVNULL)
+            except subprocess.TimeoutExpired:
+                return 124, "timed out"
+            except OSError as e:
+                return 127, str(e)
+            return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+        base_extra = {"MW_BUILD_PLATFORM_VERSION": self.platform_version, "MW_BUILD_REPO": repo}
+        for p in inputs:
+            name = p["name"]
+            left = run_end - self.clock()
+            if left <= 0:
+                raise Refusal(f"{name}: the run deadline passed before it was prepared")
+            keydir = os.path.join(workdir, "prepared-key", name)
+            os.makedirs(keydir, exist_ok=True)
+            rc, text = sandboxed(p["key"], keydir, base_extra, [mirror], [], min(left, 300.0))
+            key = (text.strip().splitlines() or [""])[-1].strip() if rc == 0 else ""
+            if rc != 0 or not SOURCE_KEY.match(key):
+                raise Refusal(f"{name}: its key command did not answer a source key (exit {rc}): {text.strip()[-300:]}")
+            store = prepared_store(self.cache, repo, name, self.platform_version, key)
+            if os.path.isfile(os.path.join(store, ".complete")):
+                env_add[p["env"]] = store
+                ro.append(store)
+                sink.add([{"kind": "line", "text": f"prepared {name}: installed on this server (key {key[:12]}) — nothing prepared for this run"}])
+                continue
+            if not platform_src or not os.path.isdir(platform_src):
+                raise Refusal(f"{name} (key {key[:12]}) is not installed and this host has no platform source to build it "
+                              f"with (MW_PLATFORM_SOURCE is {'unset' if not platform_src else 'not a directory: ' + platform_src})")
+            out = os.path.join(workdir, "prepared", name)
+            shutil.rmtree(out, ignore_errors=True)
+            os.makedirs(out)
+            nuget = os.path.join(workdir, "nuget")
+            os.makedirs(nuget, exist_ok=True)
+            started = self.clock()
+            rc, text = sandboxed(p["build"], out, {**base_extra, "MW_PREPARE_OUT": out, "MW_PLATFORM_SOURCE": platform_src,
+                                                   "NUGET_PACKAGES": nuget},
+                                 [mirror, platform_src, os.path.join(self.cache, "nuget")], [nuget],
+                                 min(left, p["timeoutMinutes"] * 60))
+            if rc != 0 or not [n for n in os.listdir(out) if not n.startswith(".")]:
+                raise Refusal(f"{name}: building it failed (exit {rc}{', it wrote nothing' if rc == 0 else ''}): {text.strip()[-600:]}")
+            with open(os.path.join(out, ".source-key"), "w") as fh:
+                fh.write(key + "\n")
+            secs = int(self.clock() - started)
+            if trunk:
+                os.makedirs(os.path.dirname(store), exist_ok=True)
+                tmp = tempfile.mkdtemp(prefix=".prep-", dir=os.path.dirname(store))
+                try:
+                    shutil.copytree(out, os.path.join(tmp, "p"), symlinks=True)
+                    with open(os.path.join(tmp, "p", ".complete"), "w") as fh:
+                        fh.write(key + "\n")
+                    os.rename(os.path.join(tmp, "p"), store)
+                except OSError:
+                    if not os.path.isfile(os.path.join(store, ".complete")):
+                        raise Refusal(f"{name}: built, but could not be installed at {store}")
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                env_add[p["env"]] = store
+                ro.append(store)
+                sink.add([{"kind": "line", "text": f"prepared {name}: main moved its sources — built once ({secs} s) and "
+                                                   f"installed on this server (key {key[:12]}); later runs prepare nothing"}])
+            else:
+                env_add[p["env"]] = out
+                ro.append(out)
+                sink.add([{"kind": "diagnostic", "severity": "warning", "code": "MWPREP002",
+                           "message": f"prepared input {name} built PER RUN ({secs} s): this change's sources (key {key[:12]}) "
+                                      "differ from every copy installed on the server; a trunk run installs it"}])
+        self.deliver(sink)
+        return env_add, ro
 
     def stage_readonly(self, repo: str, st: dict) -> list[str]:
         """What of the SHARED cache this stage may read, read-only: its own repository's git mirror
@@ -3025,6 +3186,79 @@ def self_test() -> int:
         hnone = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": "true"}]}))
         hnone.run(dict(claim, isTrunk=True))
         check("prepared/a run that restored nothing says nothing", not [e for _, evs in posted for e in evs if e.get("code") == "MWPREP001"])
+
+        # ── 7c. PREPARED INPUTS: built from the repository's own sources ONCE per (platform, key), installed persistently ──
+        for bad_ in ({"prepared": {}}, {"prepared": [{"name": "shelf", "env": "MW_SECRET", "key": "k", "build": "b"}]},
+                     {"prepared": [{"name": "Shelf", "env": "MW_BUILD_MODULE_LIBS", "key": "k", "build": "b"}]},
+                     {"prepared": [{"name": "a", "env": "MW_BUILD_MODULE_LIBS", "key": "k", "build": "b"},
+                                   {"name": "b", "env": "MW_BUILD_MODULE_LIBS", "key": "k", "build": "b"}]},
+                     {"prepared": [{"name": "shelf", "env": "MW_BUILD_MODULE_LIBS", "key": "k"}]},
+                     {"prepared": [{"name": "shelf", "env": "MW_BUILD_MODULE_LIBS", "key": "k", "build": "b", "timeoutMinutes": 90}]}):
+            try:
+                validate_prepared(bad_)
+                check(f"prepared-inputs/refuses the declaration {bad_}", False, "accepted")
+            except Refusal:
+                pass
+        check("prepared-inputs/both names reach a stage through the allow-list",
+              set(PREPARED_ENV) <= set(sandbox_env({k: "/x" for k in PREPARED_ENV}, {}, "/cache")))
+        psrc = os.path.join(tmp, "platform-src")
+        os.makedirs(psrc, exist_ok=True)
+        builds = os.path.join(tmp, "prep-builds")
+        seen_in = os.path.join(tmp, "prep-seen")
+        k1, k2 = "1" * 64, "2" * 64
+
+        def prep_doc(key):
+            return {"prepared": [{"name": "shelf", "env": "MW_BUILD_MODULE_LIBS", "key": f"echo noise; echo {key}",
+                                  "build": f"echo built >> {builds}; echo dll > \"$MW_PREPARE_OUT/Shelf.dll\"; "
+                                           "test -d \"$MW_PLATFORM_SOURCE\""}],
+                    "stages": [{"name": "a", "kind": "build",
+                                "command": f"cat \"$MW_BUILD_MODULE_LIBS/.source-key\" > {seen_in}; echo \"$MW_BUILD_MODULE_LIBS\" >> {seen_in}; "
+                                           "test -f \"$MW_BUILD_MODULE_LIBS/Shelf.dll\""}]}
+        penv = dict(keyed_env, MW_PLATFORM_SOURCE=psrc)
+
+        def n_builds():
+            return len(open(builds).read().splitlines()) if os.path.exists(builds) else 0
+
+        def last_verdict():
+            return [e for _, evs in posted for e in evs if e["kind"] == "run-finished"][-1:]
+        store1 = prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], k1)
+        posted.clear()
+        host(api_ev(), env=penv, checkout=checkout_with(prep_doc(k1))).run(dict(claim, isTrunk=True))
+        seen_ = open(seen_in).read().split()
+        check("prepared-inputs/main moved: a TRUNK run builds it ONCE and installs it persistently",
+              n_builds() == 1 and os.path.isfile(os.path.join(store1, ".complete")) and seen_ == [k1, store1], (n_builds(), seen_))
+        check("prepared-inputs/the run is green on the installed input", last_verdict() == [{"kind": "run-finished", "succeeded": True, "error": None}], last_verdict())
+        posted.clear()
+        host(api_ev(), env=penv, checkout=checkout_with(prep_doc(k1))).run(claim)
+        check("prepared-inputs/the next run (a PR, same sources) prepares NOTHING and reads the installed copy",
+              n_builds() == 1 and open(seen_in).read().split() == [k1, store1], (n_builds(), open(seen_in).read()))
+        posted.clear()
+        host(api_ev(), env=dict(keyed_env), checkout=checkout_with(prep_doc(k1))).run(claim)
+        check("prepared-inputs/an installed input needs no platform source", n_builds() == 1
+              and last_verdict() == [{"kind": "run-finished", "succeeded": True, "error": None}], last_verdict())
+        posted.clear()
+        host(api_ev(), env=penv, checkout=checkout_with(prep_doc(k2))).run(claim)
+        warn2 = [e for _, evs in posted for e in evs if e.get("code") == "MWPREP002"]
+        check("prepared-inputs/a PR that changes its sources builds it for THIS run only, said",
+              n_builds() == 2 and len(warn2) == 1 and open(seen_in).read().split()[0] == k2, (n_builds(), warn2))
+        check("prepared-inputs/negative control: a PR never installs into the shared store",
+              not os.path.exists(prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], k2)))
+        check("prepared-inputs/another platform is another install",
+              prepared_store(cache, "r", "shelf", "3.1.1", k1) != prepared_store(cache, "r", "shelf", "3.1.2", k1))
+        posted.clear()
+        host(api_ev(), env=dict(keyed_env), checkout=checkout_with(prep_doc(k2))).run(dict(claim, isTrunk=True))
+        rf2 = last_verdict()
+        check("prepared-inputs/not installed and no platform source: RED, naming it — never a stage run against nothing",
+              rf2 and rf2[0]["succeeded"] is False and "MW_PLATFORM_SOURCE" in (rf2[0]["error"] or ""), rf2)
+        posted.clear()
+        host(api_ev(), env=penv, checkout=checkout_with(dict(prep_doc(k1), prepared=[dict(prep_doc(k1)["prepared"][0], key="echo not-a-key")]))).run(claim)
+        rf3 = last_verdict()
+        check("prepared-inputs/a key command that answers no key is RED", rf3 and rf3[0]["succeeded"] is False and "source key" in (rf3[0]["error"] or ""), rf3)
+        posted.clear()
+        host(api_ev(), env=penv, checkout=checkout_with(dict(prep_doc("3" * 64), prepared=[dict(prep_doc("3" * 64)["prepared"][0], build="exit 7")]))).run(dict(claim, isTrunk=True))
+        rf4 = last_verdict()
+        check("prepared-inputs/a failed build is RED and installs nothing", rf4 and rf4[0]["succeeded"] is False
+              and not os.path.exists(prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], "3" * 64)), rf4)
         # the key covers sources, reference set, options and compiler
         kd = os.path.join(tmp, "keydir")
         os.makedirs(kd)

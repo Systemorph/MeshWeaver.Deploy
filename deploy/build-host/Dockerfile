@@ -48,7 +48,12 @@ RUN set -eu \
     done \
  && cd /src/platform \
  && dotnet publish src/MeshWeaver.Plugin.Build/MeshWeaver.Plugin.Build.csproj -c Release -o /out/plugin-build -nologo \
- && test -f /out/plugin-build/MeshWeaver.Plugin.Build.dll
+ && test -f /out/plugin-build/MeshWeaver.Plugin.Build.dll \
+ && mkdir -p /out/platform-src \
+ && git -C /src/platform archive --format=tar HEAD src tools \
+      $(git -C /src/platform ls-tree --name-only HEAD | grep -E '\.(props|targets)$|^global\.json$|^nuget\.config$') \
+    | tar -x -C /out/platform-src \
+ && test -f /out/platform-src/Directory.Build.props && test -d /out/platform-src/src && test -d /out/platform-src/tools
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0
 
@@ -62,6 +67,10 @@ RUN apt-get update \
 # implementation each, versioned with the image (the chart ships no copy).
 COPY --from=sources /out/scripts/build-run.py /out/scripts/compose-gate-host.sh /out/scripts/sandbox-postgres.sh /out/scripts/module-build-key.py /out/scripts/node-repo-scope.py /out/scripts/ci-artifact-store.py /out/scripts/compile-check.py /opt/build-host/
 COPY --from=sources /out/plugin-build/ /opt/build-host/plugin-build/
+# THE PLATFORM'S SOURCE at the set's commit (tracked src/, tools/ and the root build files; no tests, no samples): the
+# MeshWeaverRoot a repository's PREPARED inputs — its module-libraries shelf, its Razor build extension — are published
+# against, once per (platform, source key), by build-run.py's prepare_inputs, never per run (MW_PLATFORM_SOURCE).
+COPY --from=sources /out/platform-src/ /opt/build-host/platform-src/
 RUN chmod 0555 /opt/build-host/*.py /opt/build-host/*.sh \
  && test -f /opt/build-host/plugin-build/MeshWeaver.Plugin.Build.dll \
  && python3 /opt/build-host/build-run.py --self-test \
@@ -72,7 +81,8 @@ RUN chmod 0555 /opt/build-host/*.py /opt/build-host/*.sh \
 # The SDK image's unprivileged `app` user (uid 1654). bwrap creates its namespaces unprivileged.
 USER 1654
 WORKDIR /work
-ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
+    MW_PLATFORM_SOURCE=/opt/build-host/platform-src
 ARG DEPLOY_COMMIT
 ARG PLATFORM_COMMIT
 LABEL org.opencontainers.image.source="https://github.com/Systemorph/MeshWeaver.Deploy" \
