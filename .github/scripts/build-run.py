@@ -19,7 +19,13 @@ THE LOOP, and the order that matters:
      host's `pluginsDigest` on the run, and a run must record exactly what compiled it.
      With MW_REGISTRY_URL set (H8) the layer is the registry's BUNDLE INDEX instead (read with the
      host's mwi_ instance key, a host-only file), keyed by the digest of its sorted
-     `package@version[@hash]` list, changed bundles fetched with core's `module-fetch`.
+     `package@version[@hash]` list, changed bundles fetched with core's `module-fetch`. The index is
+     read when the module HAND-OVER signal moved (`inputs` → `modules.key`: the registry's
+     module-published broadcast as the operations instance reconciled it), so an IDLE host installs a
+     handed-over module on its next loop turn, ahead of the next build; it is read on every turn while
+     there is no signal, and whenever the staged layer is no longer intact on the cache
+     (install-on-miss). The installed layer is recorded on the shared cache
+     (`<cache>/plugin-sets/current-<identity digest>.json`), so the next host starts with it installed.
   2. `POST {api}/claim` with the host's channel, platform set, framework identity, plugins digest
      or key, and a fresh `claimId` (the SAME one on a network-error retry). 204 = nothing
      claimable → sleep. 200 = a run: `{path, repo, sha, refs, isTrunk, publish, stages}` — `path`
@@ -766,18 +772,69 @@ def plugins_key_of(lines: list[str]) -> str:
     return "sha256:" + hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
 
+def _swap_into_place(tmp: str, final: str, intact: Callable[[str], bool], lock_fn: Optional[Callable] = None) -> None:
+    """Move a freshly built `tmp` to `final`, REPLACING a damaged `final` (a populated directory a plain rename
+    cannot overwrite): the damaged one is renamed aside first and removed after. Validation and publication are
+    SERIALISED per cache entry (an exclusive lock on `.<name>.lock` beside it), and `final` is re-validated under
+    that lock: when another replica installed an intact entry while this one fetched, `tmp` is discarded and the
+    installed entry is never moved aside — a running sandbox may bind-mount it. When the lock CANNOT be taken
+    (a shared-cache filesystem without flock), only the non-destructive steps run: an intact entry is kept and an
+    absent one is renamed into place, but a damaged one is never moved aside — that is a Refusal, because without
+    exclusion two replicas could each judge it damaged and the slower would remove the faster one's install."""
+    lock = os.path.join(os.path.dirname(final), "." + os.path.basename(final) + ".lock")
+    with open(lock, "a") as lk:
+        locked = (lock_fn or _flock)(lk)
+        if intact(final):
+            shutil.rmtree(tmp, ignore_errors=True)
+            return
+        try:
+            os.rename(tmp, final)
+            return
+        except OSError:
+            pass
+        if not locked:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise Refusal(f"{final} is damaged, and its lock could not be taken on this cache: not replacing it "
+                          "without exclusion (another replica may be installing it)")
+        stale = tempfile.mkdtemp(prefix=".stale-", dir=os.path.dirname(final))
+        os.rmdir(stale)
+        try:
+            os.rename(final, stale)
+        except OSError:
+            pass
+        try:
+            os.rename(tmp, final)
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(stale, ignore_errors=True)
+
+
+def bundle_intact(final: str, line: str) -> bool:
+    """A cached bundle is still INSTALLED: its `.complete` names this very line and its package directory exists."""
+    pkg = line.split("@")[0]
+    try:
+        with open(os.path.join(final, ".complete")) as fh:
+            marked = fh.read().strip()
+    except OSError:
+        return False
+    return marked == line and os.path.isdir(os.path.join(final, pkg)) and not os.path.islink(os.path.join(final, pkg))
+
+
 def stage_bundle_set(lines: list[str], cache: str, fetch: Callable[[str, str, str], int]) -> str:
     """Every bundle the index names, in the content-addressed cache `<cache>/bundles/<h>/<package>/`
     (h = the line's digest, so a re-published version with a new hash is a new entry and an unchanged
     one is never fetched again), and the SET as `<cache>/plugin-sets/<key-hex>/<package>` links.
-    `fetch(package, version, out)` is `module-fetch`; returns the set directory."""
+    `fetch(package, version, out)` is `module-fetch`; returns the set directory. A damaged bundle or set on
+    the shared cache (a missing package directory, link or `.complete`) is REPAIRED — fetched or linked
+    again and swapped into place — and the returned layer is validated (`layer_intact`): a layer that
+    is still not intact is a Refusal, never recorded and never claimed on."""
     root = os.path.join(cache, "bundles")
     os.makedirs(root, exist_ok=True)
     places = {}
     for line in lines:
         pkg, ver = line.split("@")[0], line.split("@")[1]
         final = os.path.join(root, hashlib.sha256(line.encode()).hexdigest()[:32])
-        if not os.path.isfile(os.path.join(final, ".complete")):
+        if not bundle_intact(final, line):
             tmp = tempfile.mkdtemp(prefix=".fetch-", dir=root)
             rc = fetch(pkg, ver, tmp)
             if rc != 0 or not os.path.isdir(os.path.join(tmp, pkg)):
@@ -785,28 +842,88 @@ def stage_bundle_set(lines: list[str], cache: str, fetch: Callable[[str, str, st
                 raise Refusal(f"module-fetch {pkg}@{ver} failed (exit {rc}) — not claiming on a partial plugins layer")
             with open(os.path.join(tmp, ".complete"), "w") as fh:
                 fh.write(line + "\n")
-            try:
-                os.rename(tmp, final)
-            except OSError:
-                shutil.rmtree(tmp, ignore_errors=True)
-                if not os.path.isfile(os.path.join(final, ".complete")):
-                    raise Refusal(f"could not move the fetched bundle {line} into the cache")
+            _swap_into_place(tmp, final, lambda f, ln=line: bundle_intact(f, ln))
+            if not bundle_intact(final, line):
+                raise Refusal(f"could not move the fetched bundle {line} into the cache")
         places[pkg] = os.path.join(final, pkg)
     key = plugins_key_of(lines)
     sets = os.path.join(cache, "plugin-sets")
     os.makedirs(sets, exist_ok=True)
     set_dir = os.path.join(sets, key.split(":", 1)[1])
-    if not os.path.isfile(os.path.join(set_dir, ".complete")):
+    if not layer_intact(set_dir, cache):
         tmp = tempfile.mkdtemp(prefix=".set-", dir=sets)
         for pkg, place in places.items():
             os.symlink(place, os.path.join(tmp, pkg))
         with open(os.path.join(tmp, ".complete"), "w") as fh:
             fh.write("\n".join(lines) + "\n")
-        try:
-            os.rename(tmp, set_dir)
-        except OSError:
-            shutil.rmtree(tmp, ignore_errors=True)
+        _swap_into_place(tmp, set_dir, lambda d: layer_intact(d, cache))
+    if not layer_intact(set_dir, cache):
+        raise Refusal(f"the plugins layer {key[:19]}… is not intact on the cache after staging — not claiming on it")
     return set_dir
+
+
+def layer_intact(set_dir: Optional[str], cache: Optional[str] = None) -> bool:
+    """A staged plugins layer is still INSTALLED: its set's `.complete` manifest lists the bundle lines, and for
+    EVERY line the set holds the package link, resolving to that line's own content-addressed bundle
+    (`<cache>/bundles/<digest>/<package>`) whose `.complete` names the line — and the set holds nothing else. A
+    layer missing a plugin (a removed link, a removed package directory, an evicted bundle) or a replaced
+    volume is not, and is installed again from the index whatever the hand-over key says."""
+    if not set_dir:
+        return False
+    try:
+        with open(os.path.join(set_dir, ".complete")) as fh:
+            lines = [ln.strip() for ln in fh.read().splitlines() if ln.strip()]
+        present = {n for n in os.listdir(set_dir) if not n.startswith(".")}
+    except OSError:
+        return False
+    # The manifest must be the one this set's content-addressed NAME is the key of: an emptied (or edited) manifest
+    # of a non-empty set is not intact, while the legitimate EMPTY set (an index with `bundles: []`) is.
+    if os.path.basename(os.path.normpath(set_dir)) != plugins_key_of(lines).split(":", 1)[1]:
+        return False
+    root = os.path.realpath(os.path.join(cache or os.path.dirname(os.path.dirname(set_dir)), "bundles"))
+    pkgs = set()
+    for line in lines:
+        pkg = line.split("@")[0]
+        pkgs.add(pkg)
+        link = os.path.join(set_dir, pkg)
+        final = os.path.join(root, hashlib.sha256(line.encode()).hexdigest()[:32])
+        if not os.path.islink(link) or os.path.realpath(link) != os.path.realpath(os.path.join(final, pkg)):
+            return False
+        if not bundle_intact(final, line):
+            return False
+    return present == pkgs
+
+
+def layer_record_path(cache: str, identity: str) -> str:
+    """Where the INSTALLED plugins layer for one framework identity is recorded on the shared cache, so
+    the next host (a new replica, a restart, a scale-up from zero) starts with it installed."""
+    return os.path.join(cache, "plugin-sets", "current-" + hashlib.sha256(identity.encode()).hexdigest()[:16] + ".json")
+
+
+def read_layer_record(cache: str, identity: str) -> Optional[dict]:
+    """The recorded layer for `identity`, or None when there is none, it is unreadable, it names
+    another identity, or the layer it names is no longer intact on the cache."""
+    try:
+        with open(layer_record_path(cache, identity)) as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or rec.get("identity") != identity or not isinstance(rec.get("key"), str):
+        return None
+    d = rec.get("dir")
+    if not isinstance(d, str) or os.path.realpath(d) != os.path.realpath(os.path.join(cache, "plugin-sets", rec["key"].split(":", 1)[-1])):
+        return None
+    return rec if layer_intact(d, cache) else None
+
+
+def write_layer_record(cache: str, identity: str, key: str, set_dir: str, modules_key: Optional[str]) -> None:
+    """Record the installed layer atomically (write + rename): a reader sees the old record or the new."""
+    path = layer_record_path(cache, identity)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".current-", dir=os.path.dirname(path))
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"identity": identity, "key": key, "dir": set_dir, "modulesKey": modules_key}, fh)
+    os.replace(tmp, path)
 
 
 # ───────────────────────────────── the host ───────────────────────────────────────────────
@@ -1356,12 +1473,15 @@ def default_checkout(repo: str, sha: str, refs: list, dest: str, token: Optional
     git("-C", dest, "checkout", "--quiet", "--detach", sha)
 
 
-def _flock(fh) -> None:
+def _flock(fh) -> bool:
+    """An exclusive lock on `fh`; False when it cannot be taken (no fcntl, or a filesystem without flock) —
+    a caller whose next step is DESTRUCTIVE must refuse it then (`_swap_into_place`)."""
     try:
         import fcntl
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        return True
     except (ImportError, OSError):
-        pass
+        return False
 
 
 # ───────────────────────────────── the one credential: AcrPull by workload identity ───────
@@ -1521,6 +1641,11 @@ class Host:
         self.artifacts_dir = ""
         self.run_env: dict = {}
         self.plugins_key: Optional[str] = None
+        # The module hand-over signal the layer was staged at (`/hosts/inputs` → `modules.key`), and whether
+        # the persistent layer record was consulted yet (once per process).
+        self.modules_seen: Optional[str] = None
+        self.layer_record_read = False
+        self.modules_signal_said: Optional[str] = None
         self.heartbeat: Optional[Heartbeat] = None
         self.run_sinks: dict[str, EventSink] = {}
         self.claim_id = ""
@@ -1589,10 +1714,40 @@ class Host:
             return self.refresh_bundles()
         return self.refresh_seal()
 
+    def modules_signal(self) -> Optional[str]:
+        """The module hand-over signal: `/hosts/inputs` → `modules.key` (MeshWeaver.Plugins
+        Hosting/StandingBuildHosts §2). It MOVES when a module is handed over to the registry (the
+        registry's module-published broadcast, reconciled on the operations instance), so the index is
+        read when something was handed over — not on every loop turn. None = no signal (unreadable inputs,
+        a null `modules`): the caller then reads the index every turn, as before the signal existed."""
+        status, body = self.api.call("GET", "/hosts/inputs", query=self.scope)
+        modules = body.get("modules") if status == 200 and isinstance(body, dict) else None
+        key = modules.get("key") if isinstance(modules, dict) else None
+        key = key if isinstance(key, str) and key.strip() else None
+        said = key and "signal" or f"none (HTTP {status})"
+        if said != self.modules_signal_said:
+            self.modules_signal_said = said
+            self.log("the operations instance reports the module hand-over signal — the bundle index is read when it moves"
+                     if key else f"no module hand-over signal ({said}) — reading the bundle index every turn")
+        return key
+
     def refresh_bundles(self) -> bool:
         """H8: the plugins layer from the REGISTRY's bundle index — what an instance on this framework
-        identity would install — read before every claim with the host's read-only `mwi_` instance
-        key (a file in the host container, never bound into a sandbox)."""
+        identity would install — read with the host's read-only `mwi_` instance key (a file in the host
+        container, never bound into a sandbox). The index is read when the module HAND-OVER signal moved
+        (`modules_signal`), when the staged layer is not intact on the cache (install-on-miss), or on every
+        turn while there is no signal. The installed layer is recorded on the shared cache, so the next
+        host starts with it installed."""
+        if not self.layer_record_read:
+            self.layer_record_read = True
+            rec = read_layer_record(self.cache, self.identity) if self.identity else None
+            if rec:
+                self.plugins_dir, self.plugins_key, self.plugins_digest, self.plugins_known = rec["dir"], rec["key"], None, True
+                self.modules_seen = rec.get("modulesKey") if isinstance(rec.get("modulesKey"), str) else None
+                self.log(f"plugins layer already installed on the cache: {rec['key'][:19]}…")
+        signal = self.modules_signal()
+        if signal is not None and signal == self.modules_seen and self.plugins_key and layer_intact(self.plugins_dir, self.cache):
+            return True                     # nothing handed over since the layer was staged
         url = self.env["MW_REGISTRY_URL"].rstrip("/")
         key_file = self.env.get("MW_REGISTRY_KEY_FILE", "/run/registry-key/key")
         try:
@@ -1618,7 +1773,7 @@ class Host:
         try:
             lines = bundle_lines(index)
             key = plugins_key_of(lines)
-            if key != self.plugins_key or not self.plugins_dir:
+            if key != self.plugins_key or not layer_intact(self.plugins_dir, self.cache):
                 d = stage_bundle_set(lines, self.cache, lambda pkg, ver, out: self.module_fetch(url, instance_key, pkg, ver, out))
                 self.log(f"plugins layer staged from the registry index: {key[:19]}… ({len(lines)} bundle(s))")
                 self.plugins_dir = d
@@ -1626,6 +1781,11 @@ class Host:
             self.log(f"{r} — NOT claiming this cycle")
             return False
         self.plugins_key, self.plugins_digest, self.plugins_known = key, None, True
+        self.modules_seen = signal
+        try:
+            write_layer_record(self.cache, self.identity, key, self.plugins_dir, signal)
+        except OSError as e:
+            self.log(f"could not record the installed plugins layer on the cache ({e}) — the next host reads the index")
         return True
 
     def module_fetch(self, registry: str, instance_key: str, package: str, version: str, out: str) -> int:
@@ -2868,6 +3028,155 @@ def self_test() -> int:
                 pass
         check("h8/the instance key never reaches a sandbox",
               not any("REGISTRY" in k for k in sandbox_env(dict(h8env, MW_REGISTRY_INSTANCE_KEY="x"), {}, "/cache")))
+
+        # ── 6c. the plugins layer follows the module HAND-OVER signal, and stays installed ─────
+        sig = {"key": "sha256:" + "1" * 64}
+        index_reads: list[str] = []
+        idx2 = {"frameworkMvid": "c3e1", "bundles": [{"plugin": "AI", "version": "1.40.1"}, {"plugin": "Store", "version": "1.36.20"}]}
+
+        def reg_get(u, k):
+            index_reads.append(u)
+            return (200, json.loads(json.dumps(idx2)))
+        fetched.clear()
+        hoenv = dict(h8env, MW_BUILD_CACHE=os.path.join(tmp, "hocache"))
+        claims2: list[dict] = []
+        ho_api = _FakeApi({("GET", "/hosts/inputs"): lambda p_, b: (200, {"plugins": None, "platformVersion": "3.1.10412", "modules": dict(sig)}),
+                           ("POST", "/claim"): lambda p_, b: (claims2.append(b), (204, None))[1]})
+        ho = host(ho_api, env=hoenv, registry_get=reg_get, fetch_runner=fetch_runner)
+        check("handover/first turn installs the layer", ho.cycle() == "idle" and len(index_reads) == 1
+              and sorted(a[a.index("module-fetch") + 1] for a in fetched) == ["AI", "Store"], (index_reads, fetched))
+        for _ in range(3):
+            ho.cycle()
+        check("handover/IDLE turns with an unchanged signal read NO index and fetch nothing", len(index_reads) == 1 and len(fetched) == 2, index_reads)
+        check("handover/idle turns still claim on the installed layer", claims2[-1]["pluginsKey"] == plugins_key_of(["AI@1.40.1", "Store@1.36.20"]), claims2[-1:])
+        # A module is handed over: the registry now serves AI 1.40.2 and the signal moved — the IDLE host installs it on
+        # its next turn, before any run is claimed on it.
+        idx2["bundles"][0] = {"plugin": "AI", "version": "1.40.2"}
+        sig["key"] = "sha256:" + "2" * 64
+        fetched.clear()
+        ho.cycle()
+        check("handover/a moved signal reads the index once and fetches ONLY the handed-over module",
+              len(index_reads) == 2 and [a[a.index("module-fetch") + 1] for a in fetched] == ["AI"], (index_reads, fetched))
+        check("handover/the next claim presents the new layer", claims2[-1]["pluginsKey"] == plugins_key_of(["AI@1.40.2", "Store@1.36.20"]))
+        # Negative control: the registry moved but the signal did NOT — the host must not have read it (proves the
+        # skip is the signal's doing, not an accident of the fake).
+        idx2["bundles"][1] = {"plugin": "Store", "version": "1.36.21"}
+        ho.cycle()
+        check("handover/negative control: no signal move, no index read", len(index_reads) == 2, index_reads)
+        # Persistent install: a NEW host on the same cache (a restart, a new replica) starts installed — no fetch, no
+        # index read while the signal is the one the layer was staged at.
+        fetched.clear()
+        ho2 = host(_FakeApi({("GET", "/hosts/inputs"): lambda p_, b: (200, {"modules": dict(sig)}),
+                             ("POST", "/claim"): lambda p_, b: (claims2.append(b), (204, None))[1]}),
+                   env=hoenv, registry_get=reg_get, fetch_runner=fetch_runner)
+        check("handover/the next host finds the layer installed (no index read, no fetch)",
+              ho2.cycle() == "idle" and len(index_reads) == 2 and fetched == []
+              and claims2[-1]["pluginsKey"] == plugins_key_of(["AI@1.40.2", "Store@1.36.20"]), (index_reads, fetched))
+        # Install-on-miss: the layer was evicted from the cache — reinstalled whatever the signal says.
+        evicted = os.path.join(hoenv["MW_BUILD_CACHE"], "bundles", hashlib.sha256(b"AI@1.40.2").hexdigest()[:32])
+        check("handover/the fixture names the installed AI bundle", os.path.isfile(os.path.join(evicted, ".complete")), evicted)
+        shutil.rmtree(evicted)
+        ho2.cycle()
+        check("handover/install-on-miss: a layer no longer intact is installed again from the index", len(index_reads) == 3, index_reads)
+        # The layer must be intact PER PLUGIN, not per marker: each damage below leaves every `.complete` it can in place.
+        hc = hoenv["MW_BUILD_CACHE"]
+        check("handover/the reinstalled layer is intact", layer_intact(ho2.plugins_dir, hc), ho2.plugins_dir)
+        os.unlink(os.path.join(ho2.plugins_dir, "Store"))
+        check("handover/a set missing a package LINK is not intact", not layer_intact(ho2.plugins_dir, hc))
+        ho2.cycle()
+        check("handover/a removed package link is repaired (index read, link back)", len(index_reads) == 4
+              and layer_intact(ho2.plugins_dir, hc) and os.path.islink(os.path.join(ho2.plugins_dir, "Store")), index_reads)
+        store_bundle = os.path.dirname(os.path.realpath(os.path.join(ho2.plugins_dir, "Store")))
+        shutil.rmtree(os.path.join(store_bundle, "Store"))
+        check("handover/a bundle whose package directory is gone (its .complete kept) is not intact",
+              os.path.isfile(os.path.join(store_bundle, ".complete")) and not layer_intact(ho2.plugins_dir, hc))
+        fetched.clear()
+        ho2.cycle()
+        check("handover/the missing package directory is fetched again and swapped into place",
+              [a[a.index("module-fetch") + 1] for a in fetched] == ["Store"] and layer_intact(ho2.plugins_dir, hc), fetched)
+        os.unlink(os.path.join(ho2.plugins_dir, ".complete"))
+        ho2.cycle()
+        check("handover/a populated set that lost its .complete is rebuilt, not returned unchanged",
+              len(index_reads) == 6 and layer_intact(ho2.plugins_dir, hc), index_reads)
+        with open(os.path.join(ho2.plugins_dir, ".complete"), "a") as fh_:
+            fh_.write("Ghost@1.0.0\n")
+        check("handover/a manifest naming a plugin the set does not hold is not intact", not layer_intact(ho2.plugins_dir, hc))
+        ho2.cycle()
+        check("handover/...and is repaired from the index", layer_intact(ho2.plugins_dir, hc))
+        os.symlink(store_bundle, os.path.join(ho2.plugins_dir, "Stray"))
+        check("handover/a set holding a plugin its manifest does not name is not intact", not layer_intact(ho2.plugins_dir, hc))
+        ho2.cycle()
+        check("handover/...and is rebuilt without it", layer_intact(ho2.plugins_dir, hc) and not os.path.lexists(os.path.join(ho2.plugins_dir, "Stray")))
+        # The EMPTY set (an index with `bundles: []`) is a legitimate layer; an emptied manifest of a non-empty set is not.
+        ec = os.path.join(tmp, "emptycache")
+        empty_dir = stage_bundle_set([], ec, lambda pkg, ver, out: 1)
+        check("handover/an index with no bundles stages a valid EMPTY layer (the host claims, never stuck in no-inputs)",
+              layer_intact(empty_dir, ec) and os.path.basename(empty_dir) == plugins_key_of([]).split(":", 1)[1], empty_dir)
+        with open(os.path.join(ho2.plugins_dir, ".complete"), "w") as fh_:
+            fh_.write("\n")
+        check("handover/an EMPTIED manifest of a non-empty set is not intact", not layer_intact(ho2.plugins_dir, hc))
+        ho2.cycle()
+        check("handover/...and is repaired from the index", layer_intact(ho2.plugins_dir, hc))
+        # Two replicas fetch the same missing bundle: the slower one must NOT move the faster one's intact install
+        # aside (a running sandbox may bind-mount it) — it discards its own fetch. Same for the set.
+        rc_ = os.path.join(tmp, "racecache")
+        race_line = "Race@1.0.0"
+        race_final = os.path.join(rc_, "bundles", hashlib.sha256(race_line.encode()).hexdigest()[:32])
+
+        def racing_fetch(pkg, ver, out):
+            os.makedirs(os.path.join(out, pkg))
+            os.makedirs(os.path.join(race_final, pkg))              # the faster replica installs meanwhile
+            with open(os.path.join(race_final, pkg, "in-use.dll"), "w") as fh_:
+                fh_.write("mounted")
+            with open(os.path.join(race_final, ".complete"), "w") as fh_:
+                fh_.write(race_line + "\n")
+            return 0
+        race_ino = None
+        race_set = stage_bundle_set([race_line], rc_, racing_fetch)
+        race_ino = os.stat(os.path.join(race_final, "Race")).st_ino
+        check("handover/a concurrent replica's intact bundle is kept in place (its files survive, no tmp left behind)",
+              os.path.isfile(os.path.join(race_final, "Race", "in-use.dll")) and layer_intact(race_set, rc_)
+              and not [n for n in os.listdir(os.path.join(rc_, "bundles")) if n.startswith((".fetch-", ".stale-"))],
+              os.listdir(os.path.join(rc_, "bundles")))
+        set_ino = os.stat(race_set).st_ino
+        dup = tempfile.mkdtemp(prefix=".set-", dir=os.path.dirname(race_set))
+        _swap_into_place(dup, race_set, lambda d: layer_intact(d, rc_))
+        check("handover/publishing over an INTACT set discards the new copy and leaves the installed one",
+              os.stat(race_set).st_ino == set_ino and not os.path.exists(dup)
+              and os.stat(os.path.join(race_final, "Race")).st_ino == race_ino)
+        # Negative control: over a DAMAGED entry the swap still replaces it.
+        os.unlink(os.path.join(race_set, ".complete"))
+        dup = tempfile.mkdtemp(prefix=".set-", dir=os.path.dirname(race_set))
+        os.symlink(os.path.join(race_final, "Race"), os.path.join(dup, "Race"))
+        with open(os.path.join(dup, ".complete"), "w") as fh_:
+            fh_.write(race_line + "\n")
+        _swap_into_place(dup, race_set, lambda d: layer_intact(d, rc_))
+        check("handover/negative control: a DAMAGED set is still replaced", layer_intact(race_set, rc_) and os.stat(race_set).st_ino != set_ino)
+        # Without exclusion (the lock cannot be taken) a damaged entry is NEVER moved aside: Refusal, tmp discarded,
+        # the damaged entry's files left as they are. An absent entry is still installed (a rename is not destructive).
+        os.unlink(os.path.join(race_set, ".complete"))
+        nolock_ino = os.stat(race_set).st_ino
+        dup = tempfile.mkdtemp(prefix=".set-", dir=os.path.dirname(race_set))
+        try:
+            _swap_into_place(dup, race_set, lambda d: layer_intact(d, rc_), lock_fn=lambda fh: False)
+            nolock_refused = False
+        except Refusal:
+            nolock_refused = True
+        check("handover/a damaged entry is NOT replaced when its lock cannot be taken (Refusal, never a blind swap)",
+              nolock_refused and os.stat(race_set).st_ino == nolock_ino and not os.path.exists(dup)
+              and os.path.islink(os.path.join(race_set, "Race")), (nolock_refused, os.listdir(os.path.dirname(race_set))))
+        absent = os.path.join(os.path.dirname(race_set), "absent-entry")
+        dup = tempfile.mkdtemp(prefix=".set-", dir=os.path.dirname(race_set))
+        _swap_into_place(dup, absent, lambda d: False, lock_fn=lambda fh: False)
+        check("handover/...while an ABSENT entry is still installed without the lock", os.path.isdir(absent) and not os.path.exists(dup))
+        # No signal (an older operations instance, an unreadable ledger): the index is read every turn, as before.
+        nosig = host(_FakeApi({("GET", "/hosts/inputs"): lambda p_, b: (200, {"modules": None}),
+                               ("POST", "/claim"): lambda p_, b: (204, None)}), env=hoenv, registry_get=reg_get, fetch_runner=fetch_runner)
+        before = len(index_reads)
+        nosig.cycle()
+        nosig.cycle()
+        check("handover/no signal: the index is read on EVERY turn (never 'nothing handed over')", len(index_reads) == before + 2, index_reads)
+        check("handover/a record for another identity is never adopted", read_layer_record(hoenv["MW_BUILD_CACHE"], "other-identity") is None)
 
         # ── 7. whole runs ─────────────────────────────────────────────────────────────────
         posted: list[tuple] = []
