@@ -114,6 +114,11 @@ The refusals, and why each one exists:
 {{- fail "buildHosts.artifactStore.upload uploads through the build API — it takes neither a claimName nor a spec (one store per host)" -}}
 {{- end -}}
 {{- $asSpec := ternary "api:" ($as.spec | default (ternary "file:/ci-artifacts" "" (ne $asClaim ""))) (eq ($as.upload | default false) true) -}}
+{{- /* `spec: api:` spelled out is the same no-mount store as `upload: true`: a claim beside it would still be mounted
+       at /ci-artifacts, and a user-namespaced host cannot start on that mount. */ -}}
+{{- if and $asClaim (eq $asSpec "api:") -}}
+{{- fail "buildHosts.artifactStore.spec 'api:' uploads through the build API — it takes no claimName (nothing is mounted; one store per host)" -}}
+{{- end -}}
 {{- if and $asSpec (not (hasPrefix "file:" $asSpec)) (ne $asSpec "api:") -}}
 {{- fail (printf "buildHosts.artifactStore.spec %q must be a file: store, or set artifactStore.upload — the runner image carries no az CLI, and the host holds no cloud credential to write a blob container" $asSpec) -}}
 {{- end -}}

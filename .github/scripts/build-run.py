@@ -142,6 +142,7 @@ import threading
 import time
 import uuid
 import hashlib
+import http.client
 import io
 import urllib.error
 import urllib.parse
@@ -848,9 +849,12 @@ class Api:
             try:
                 raw = e.read().decode()
                 return e.code, (json.loads(raw) if raw.strip() else None)
-            except (OSError, ValueError):
+            except (OSError, ValueError, http.client.HTTPException):
+                # A refusal whose body was cut short is still that refusal: keep its status.
                 return e.code, None
-        except (urllib.error.URLError, OSError, ValueError) as e:
+        # http.client.HTTPException covers IncompleteRead: a response closed before its Content-Length
+        # arrived is a transport failure (status 0, retried inside the budget), never an escaping traceback.
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
             return 0, str(e)
 
 
@@ -870,9 +874,12 @@ class Api:
             try:
                 raw = e.read().decode()
                 return e.code, (json.loads(raw) if raw.strip() else None)
-            except (OSError, ValueError):
+            except (OSError, ValueError, http.client.HTTPException):
+                # A refusal whose body was cut short is still that refusal: keep its status.
                 return e.code, None
-        except (urllib.error.URLError, OSError, ValueError) as e:
+        # http.client.HTTPException covers IncompleteRead: a response closed before its Content-Length
+        # arrived is a transport failure (status 0, retried inside the budget), never an escaping traceback.
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
             return 0, str(e)
 
 
@@ -4437,6 +4444,39 @@ def self_test() -> int:
             server.server_close()
         status, answer = Api("http://127.0.0.1:9/api/builds", "t").upload("/x", {}, blob, 1, timeout=5)
         check("h9-api/transport: an unreachable API is status 0, never a pass", status == 0, (status, answer))
+
+        # a response closed before its Content-Length arrived (IncompleteRead) is status 0 on BOTH paths — a
+        # transport failure the bounded retry handles — never an exception escaping before the verdict is posted
+        class _Truncated(http.server.BaseHTTPRequestHandler):
+            def _cut(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                if n:
+                    self.rfile.read(n)
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b'{"ok":')
+                self.wfile.flush()
+                self.close_connection = True
+
+            do_PUT = _cut
+            do_POST = _cut
+
+            def log_message(self, *a):
+                pass
+
+        cut = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Truncated)
+        threading.Thread(target=cut.serve_forever, daemon=True).start()
+        try:
+            api = Api(f"http://127.0.0.1:{cut.server_address[1]}/api/builds", "t")
+            status, answer = api.upload("/x", {}, blob, 1, timeout=10)
+            check("h9-api/transport: a truncated upload answer is status 0, never an escaping IncompleteRead", status == 0, (status, answer))
+            status, answer = api.call("POST", "/y", {"a": 1})
+            check("h9-api/transport: a truncated call answer is status 0, never an escaping IncompleteRead", status == 0, (status, answer))
+        finally:
+            cut.shutdown()
+            cut.server_close()
 
         # the workspace stays until every receipt was acknowledged
         hk = host(_FakeApi({("POST", "/token"): [(404, None)], ("POST", "/MeshWeaver.Plugins/"): [(503, None)]}),

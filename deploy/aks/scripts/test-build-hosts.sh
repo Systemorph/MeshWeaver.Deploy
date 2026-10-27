@@ -678,6 +678,14 @@ elif grep -qF -- "takes neither a claimName nor a spec" "$WORK/upload-claim.err"
 else
   report "artifactStore.upload + claimName failed, but not for the stated reason:"; sed 's/^/    /' "$WORK/upload-claim.err"
 fi
+if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set-string 'buildHosts.artifactStore.spec=api:' \
+     --namespace check > "$WORK/api-spec-claim.yaml" 2> "$WORK/api-spec-claim.err"; then
+  report "artifactStore.spec 'api:' beside a claimName RENDERED — it would mount /ci-artifacts on a host that uploads (and a user-namespaced host cannot start)"
+elif grep -qF -- "it takes no claimName" "$WORK/api-spec-claim.err"; then
+  ok "refusal artifactStore.spec 'api:' + claimName holds (both spellings of the API store mount nothing)"
+else
+  report "artifactStore.spec 'api:' + claimName failed, but not for the stated reason:"; sed 's/^/    /' "$WORK/api-spec-claim.err"
+fi
 if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.artifactStore.claimName= \
      --set buildHosts.artifactStore.spec=api: --namespace check > "$WORK/upload-spec.yaml" 2> "$WORK/upload-spec.err"; then
   python3 - "$WORK/upload-spec.yaml" <<'PY6' && ok "spec api: renders like upload (the runner's own spelling of the mode)" || report "spec api: rendered wrong (above)"
