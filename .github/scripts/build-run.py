@@ -769,26 +769,34 @@ def plugins_key_of(lines: list[str]) -> str:
     return "sha256:" + hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
 
-def _swap_into_place(tmp: str, final: str) -> None:
+def _swap_into_place(tmp: str, final: str, intact: Callable[[str], bool]) -> None:
     """Move a freshly built `tmp` to `final`, REPLACING a damaged `final` (a populated directory a plain rename
-    cannot overwrite): the damaged one is renamed aside first and removed after. A concurrent host that put a
-    valid `final` in place first wins — the caller re-validates what is there."""
-    try:
-        os.rename(tmp, final)
-        return
-    except OSError:
-        pass
-    stale = tempfile.mkdtemp(prefix=".stale-", dir=os.path.dirname(final))
-    os.rmdir(stale)
-    try:
-        os.rename(final, stale)
-    except OSError:
-        pass
-    try:
-        os.rename(tmp, final)
-    except OSError:
-        shutil.rmtree(tmp, ignore_errors=True)
-    shutil.rmtree(stale, ignore_errors=True)
+    cannot overwrite): the damaged one is renamed aside first and removed after. Validation and publication are
+    SERIALISED per cache entry (an exclusive lock on `.<name>.lock` beside it), and `final` is re-validated under
+    that lock: when another replica installed an intact entry while this one fetched, `tmp` is discarded and the
+    installed entry is never moved aside — a running sandbox may bind-mount it."""
+    lock = os.path.join(os.path.dirname(final), "." + os.path.basename(final) + ".lock")
+    with open(lock, "a") as lk:
+        _flock(lk)
+        if intact(final):
+            shutil.rmtree(tmp, ignore_errors=True)
+            return
+        try:
+            os.rename(tmp, final)
+            return
+        except OSError:
+            pass
+        stale = tempfile.mkdtemp(prefix=".stale-", dir=os.path.dirname(final))
+        os.rmdir(stale)
+        try:
+            os.rename(final, stale)
+        except OSError:
+            pass
+        try:
+            os.rename(tmp, final)
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(stale, ignore_errors=True)
 
 
 def bundle_intact(final: str, line: str) -> bool:
@@ -824,7 +832,7 @@ def stage_bundle_set(lines: list[str], cache: str, fetch: Callable[[str, str, st
                 raise Refusal(f"module-fetch {pkg}@{ver} failed (exit {rc}) — not claiming on a partial plugins layer")
             with open(os.path.join(tmp, ".complete"), "w") as fh:
                 fh.write(line + "\n")
-            _swap_into_place(tmp, final)
+            _swap_into_place(tmp, final, lambda f, ln=line: bundle_intact(f, ln))
             if not bundle_intact(final, line):
                 raise Refusal(f"could not move the fetched bundle {line} into the cache")
         places[pkg] = os.path.join(final, pkg)
@@ -838,7 +846,7 @@ def stage_bundle_set(lines: list[str], cache: str, fetch: Callable[[str, str, st
             os.symlink(place, os.path.join(tmp, pkg))
         with open(os.path.join(tmp, ".complete"), "w") as fh:
             fh.write("\n".join(lines) + "\n")
-        _swap_into_place(tmp, set_dir)
+        _swap_into_place(tmp, set_dir, lambda d: layer_intact(d, cache))
     if not layer_intact(set_dir, cache):
         raise Refusal(f"the plugins layer {key[:19]}… is not intact on the cache after staging — not claiming on it")
     return set_dir
@@ -858,7 +866,9 @@ def layer_intact(set_dir: Optional[str], cache: Optional[str] = None) -> bool:
         present = {n for n in os.listdir(set_dir) if not n.startswith(".")}
     except OSError:
         return False
-    if not lines:
+    # The manifest must be the one this set's content-addressed NAME is the key of: an emptied (or edited) manifest
+    # of a non-empty set is not intact, while the legitimate EMPTY set (an index with `bundles: []`) is.
+    if os.path.basename(os.path.normpath(set_dir)) != plugins_key_of(lines).split(":", 1)[1]:
         return False
     root = os.path.realpath(os.path.join(cache or os.path.dirname(os.path.dirname(set_dir)), "bundles"))
     pkgs = set()
@@ -3039,6 +3049,51 @@ def self_test() -> int:
         check("handover/a set holding a plugin its manifest does not name is not intact", not layer_intact(ho2.plugins_dir, hc))
         ho2.cycle()
         check("handover/...and is rebuilt without it", layer_intact(ho2.plugins_dir, hc) and not os.path.lexists(os.path.join(ho2.plugins_dir, "Stray")))
+        # The EMPTY set (an index with `bundles: []`) is a legitimate layer; an emptied manifest of a non-empty set is not.
+        ec = os.path.join(tmp, "emptycache")
+        empty_dir = stage_bundle_set([], ec, lambda pkg, ver, out: 1)
+        check("handover/an index with no bundles stages a valid EMPTY layer (the host claims, never stuck in no-inputs)",
+              layer_intact(empty_dir, ec) and os.path.basename(empty_dir) == plugins_key_of([]).split(":", 1)[1], empty_dir)
+        with open(os.path.join(ho2.plugins_dir, ".complete"), "w") as fh_:
+            fh_.write("\n")
+        check("handover/an EMPTIED manifest of a non-empty set is not intact", not layer_intact(ho2.plugins_dir, hc))
+        ho2.cycle()
+        check("handover/...and is repaired from the index", layer_intact(ho2.plugins_dir, hc))
+        # Two replicas fetch the same missing bundle: the slower one must NOT move the faster one's intact install
+        # aside (a running sandbox may bind-mount it) — it discards its own fetch. Same for the set.
+        rc_ = os.path.join(tmp, "racecache")
+        race_line = "Race@1.0.0"
+        race_final = os.path.join(rc_, "bundles", hashlib.sha256(race_line.encode()).hexdigest()[:32])
+
+        def racing_fetch(pkg, ver, out):
+            os.makedirs(os.path.join(out, pkg))
+            os.makedirs(os.path.join(race_final, pkg))              # the faster replica installs meanwhile
+            with open(os.path.join(race_final, pkg, "in-use.dll"), "w") as fh_:
+                fh_.write("mounted")
+            with open(os.path.join(race_final, ".complete"), "w") as fh_:
+                fh_.write(race_line + "\n")
+            return 0
+        race_ino = None
+        race_set = stage_bundle_set([race_line], rc_, racing_fetch)
+        race_ino = os.stat(os.path.join(race_final, "Race")).st_ino
+        check("handover/a concurrent replica's intact bundle is kept in place (its files survive, no tmp left behind)",
+              os.path.isfile(os.path.join(race_final, "Race", "in-use.dll")) and layer_intact(race_set, rc_)
+              and not [n for n in os.listdir(os.path.join(rc_, "bundles")) if n.startswith((".fetch-", ".stale-"))],
+              os.listdir(os.path.join(rc_, "bundles")))
+        set_ino = os.stat(race_set).st_ino
+        dup = tempfile.mkdtemp(prefix=".set-", dir=os.path.dirname(race_set))
+        _swap_into_place(dup, race_set, lambda d: layer_intact(d, rc_))
+        check("handover/publishing over an INTACT set discards the new copy and leaves the installed one",
+              os.stat(race_set).st_ino == set_ino and not os.path.exists(dup)
+              and os.stat(os.path.join(race_final, "Race")).st_ino == race_ino)
+        # Negative control: over a DAMAGED entry the swap still replaces it.
+        os.unlink(os.path.join(race_set, ".complete"))
+        dup = tempfile.mkdtemp(prefix=".set-", dir=os.path.dirname(race_set))
+        os.symlink(os.path.join(race_final, "Race"), os.path.join(dup, "Race"))
+        with open(os.path.join(dup, ".complete"), "w") as fh_:
+            fh_.write(race_line + "\n")
+        _swap_into_place(dup, race_set, lambda d: layer_intact(d, rc_))
+        check("handover/negative control: a DAMAGED set is still replaced", layer_intact(race_set, rc_) and os.stat(race_set).st_ino != set_ino)
         # No signal (an older operations instance, an unreadable ledger): the index is read every turn, as before.
         nosig = host(_FakeApi({("GET", "/hosts/inputs"): lambda p_, b: (200, {"modules": None}),
                                ("POST", "/claim"): lambda p_, b: (204, None)}), env=hoenv, registry_get=reg_get, fetch_runner=fetch_runner)
