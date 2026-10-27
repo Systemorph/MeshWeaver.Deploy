@@ -102,11 +102,6 @@ jobs:
           large-packages: true
           docker-images: true
           swap-storage: true
-      - name: Build
-        run: |
-          set -euo pipefail
-          short="${GITHUB_SHA::7}"
-          docker build --progress=plain -t "$ACR/$REPO:${LINE}-${short}" -t "$ACR/$REPO:${LINE}" deploy/whisper
       - name: Ensure Azure CLI
         run: command -v az >/dev/null || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
       - name: Azure login (OIDC)
@@ -122,7 +117,39 @@ jobs:
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         run: python3 .github/scripts/acr-data-plane.py login --registry "$ACR" --tenant "$AZURE_TENANT_ID"
+      # 🚨 WRITE-ONCE. The <line>-<sha> tag is what an approved ApplyChart binds, and pods pull it with
+      # IfNotPresent. A rerun or a dispatch on an already-published commit must never rebuild over it: the
+      # base image and the package installs are not reproducible, so a second push would put different
+      # bytes under the approved name. Only a registry that ANSWERED "not found" means absent; a timeout,
+      # a throttle or an auth failure is RED (the same rule as ollama-image.yml and build-host.yml).
+      - name: Is this commit already published?
+        id: published
+        run: |
+          set -euo pipefail
+          tag="${LINE}-${GITHUB_SHA::7}"
+          exists=false
+          if docker buildx imagetools inspect "$ACR/$REPO:$tag" --format '{{json .Manifest.Digest}}' \
+               >/dev/null 2>"$RUNNER_TEMP/inspect.err"; then
+            exists=true
+          elif ! grep -qiE 'not found|manifest unknown|MANIFEST_UNKNOWN|NAME_UNKNOWN' "$RUNNER_TEMP/inspect.err"; then
+            cat "$RUNNER_TEMP/inspect.err"
+            echo "::error::could not establish whether $REPO:$tag exists (the registry did not answer 'not found') — refusing to rebuild over a tag that may be there"
+            exit 1
+          fi
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+          if [ "$exists" = true ]; then
+            echo "$REPO:$tag is already published — not rebuilt, not re-pushed (write-once)"
+          else
+            echo "$REPO:$tag is confirmed absent (the registry answered not found) — building it"
+          fi
+      - name: Build
+        if: steps.published.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA::7}"
+          docker build --progress=plain -t "$ACR/$REPO:${LINE}-${short}" -t "$ACR/$REPO:${LINE}" deploy/whisper
       - name: Push whisper-swiss-german:<line>-<sha> and :<line>
+        if: steps.published.outputs.exists == 'false'
         run: |
           set -euo pipefail
           short="${GITHUB_SHA::7}"
@@ -133,6 +160,11 @@ jobs:
           set -euo pipefail
           short="${GITHUB_SHA::7}"
           immutable=$(docker buildx imagetools inspect "$ACR/$REPO:${LINE}-${short}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          if [ "${{ steps.published.outputs.exists }}" = "true" ]; then
+            [ -n "$immutable" ] || { echo "::error::$REPO:${LINE}-${short} was reported published but does not resolve"; exit 1; }
+            echo "kept $ACR/$REPO:${LINE}-${short} = ${immutable} (write-once: not rebuilt, the line not moved)"
+            exit 0
+          fi
           moving=$(docker buildx imagetools inspect "$ACR/$REPO:${LINE}" --format '{{json .Manifest.Digest}}' | tr -d '"')
           [ -n "$immutable" ] && [ "$immutable" = "$moving" ] \
             || { echo "::error::$REPO:${LINE}-${short} (${immutable:-absent}) and :${LINE} (${moving:-absent}) do not name one pushed manifest"; exit 1; }
