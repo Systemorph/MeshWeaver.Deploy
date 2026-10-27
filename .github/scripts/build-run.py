@@ -769,15 +769,18 @@ def plugins_key_of(lines: list[str]) -> str:
     return "sha256:" + hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
 
-def _swap_into_place(tmp: str, final: str, intact: Callable[[str], bool]) -> None:
+def _swap_into_place(tmp: str, final: str, intact: Callable[[str], bool], lock_fn: Optional[Callable] = None) -> None:
     """Move a freshly built `tmp` to `final`, REPLACING a damaged `final` (a populated directory a plain rename
     cannot overwrite): the damaged one is renamed aside first and removed after. Validation and publication are
     SERIALISED per cache entry (an exclusive lock on `.<name>.lock` beside it), and `final` is re-validated under
     that lock: when another replica installed an intact entry while this one fetched, `tmp` is discarded and the
-    installed entry is never moved aside — a running sandbox may bind-mount it."""
+    installed entry is never moved aside — a running sandbox may bind-mount it. When the lock CANNOT be taken
+    (a shared-cache filesystem without flock), only the non-destructive steps run: an intact entry is kept and an
+    absent one is renamed into place, but a damaged one is never moved aside — that is a Refusal, because without
+    exclusion two replicas could each judge it damaged and the slower would remove the faster one's install."""
     lock = os.path.join(os.path.dirname(final), "." + os.path.basename(final) + ".lock")
     with open(lock, "a") as lk:
-        _flock(lk)
+        locked = (lock_fn or _flock)(lk)
         if intact(final):
             shutil.rmtree(tmp, ignore_errors=True)
             return
@@ -786,6 +789,10 @@ def _swap_into_place(tmp: str, final: str, intact: Callable[[str], bool]) -> Non
             return
         except OSError:
             pass
+        if not locked:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise Refusal(f"{final} is damaged, and its lock could not be taken on this cache: not replacing it "
+                          "without exclusion (another replica may be installing it)")
         stale = tempfile.mkdtemp(prefix=".stale-", dir=os.path.dirname(final))
         os.rmdir(stale)
         try:
@@ -1420,12 +1427,15 @@ def default_checkout(repo: str, sha: str, refs: list, dest: str, token: Optional
     git("-C", dest, "checkout", "--quiet", "--detach", sha)
 
 
-def _flock(fh) -> None:
+def _flock(fh) -> bool:
+    """An exclusive lock on `fh`; False when it cannot be taken (no fcntl, or a filesystem without flock) —
+    a caller whose next step is DESTRUCTIVE must refuse it then (`_swap_into_place`)."""
     try:
         import fcntl
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        return True
     except (ImportError, OSError):
-        pass
+        return False
 
 
 # ───────────────────────────────── the one credential: AcrPull by workload identity ───────
@@ -3094,6 +3104,23 @@ def self_test() -> int:
             fh_.write(race_line + "\n")
         _swap_into_place(dup, race_set, lambda d: layer_intact(d, rc_))
         check("handover/negative control: a DAMAGED set is still replaced", layer_intact(race_set, rc_) and os.stat(race_set).st_ino != set_ino)
+        # Without exclusion (the lock cannot be taken) a damaged entry is NEVER moved aside: Refusal, tmp discarded,
+        # the damaged entry's files left as they are. An absent entry is still installed (a rename is not destructive).
+        os.unlink(os.path.join(race_set, ".complete"))
+        nolock_ino = os.stat(race_set).st_ino
+        dup = tempfile.mkdtemp(prefix=".set-", dir=os.path.dirname(race_set))
+        try:
+            _swap_into_place(dup, race_set, lambda d: layer_intact(d, rc_), lock_fn=lambda fh: False)
+            nolock_refused = False
+        except Refusal:
+            nolock_refused = True
+        check("handover/a damaged entry is NOT replaced when its lock cannot be taken (Refusal, never a blind swap)",
+              nolock_refused and os.stat(race_set).st_ino == nolock_ino and not os.path.exists(dup)
+              and os.path.islink(os.path.join(race_set, "Race")), (nolock_refused, os.listdir(os.path.dirname(race_set))))
+        absent = os.path.join(os.path.dirname(race_set), "absent-entry")
+        dup = tempfile.mkdtemp(prefix=".set-", dir=os.path.dirname(race_set))
+        _swap_into_place(dup, absent, lambda d: False, lock_fn=lambda fh: False)
+        check("handover/...while an ABSENT entry is still installed without the lock", os.path.isdir(absent) and not os.path.exists(dup))
         # No signal (an older operations instance, an unreadable ledger): the index is read every turn, as before.
         nosig = host(_FakeApi({("GET", "/hosts/inputs"): lambda p_, b: (200, {"modules": None}),
                                ("POST", "/claim"): lambda p_, b: (204, None)}), env=hoenv, registry_get=reg_get, fetch_runner=fetch_runner)
