@@ -154,7 +154,7 @@ fi
 if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --namespace check \
      > "$WORK/hosts.yaml" 2> "$WORK/hosts.err"; then
   if python3 - "$WORK/hosts.yaml" <<'PY'
-import re, sys, yaml
+import os, re, shutil, subprocess, sys, tempfile, yaml
 docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
 mine = [d for d in docs if (d.get("metadata", {}).get("labels") or {}).get("app.kubernetes.io/component") == "build-host"]
 problems = []
@@ -216,6 +216,36 @@ for ch, (tester, portal, runner, mx, pv) in want.items():
     cmd = " ".join(build.get("command", []))
     if "compose-gate-host.sh /portal/app /tester /host/app" not in cmd or env.get("MW_BUILD_GATE_HOST", {}).get("value") != "/host/app":
         problems.append(f"{ch}: the gate host must be composed into /host/app (the composer removes its output; /host is a mount point)")
+    # THE COMPILE REFERENCE SET is prepared ONCE per roll, in CI's refs/ shape (/app + shared-frameworks/),
+    # and named to the runner — never composed by a stage. NEGATIVE CONTROL: the staging the first probe
+    # met (/portal/app alone, MeshWeaverRefs as the compile-check's --refs) fails here.
+    _pc = " ".join(inits.get("portal", {}).get("command", []))
+    if not ("cp -al /portal/app/. /portal/refs/" in _pc and "cp -al /portal/dotnet/shared/. /portal/refs/shared-frameworks/" in _pc
+            and "/portal/refs/shared-frameworks/Microsoft.NETCore.App/*/System.Private.CoreLib.dll" in _pc
+            and _pc.split(" -c ", 1)[-1].lstrip().startswith("set -e")):
+        problems.append(f"{ch}: the portal init container does not prepare /portal/refs (/app + shared-frameworks/, CoreLib asserted): {_pc}")
+    # RE-RUNNABLE: Kubernetes retries an interrupted init container on the SAME emptyDir, and `cp -al` onto the
+    # links a first attempt made fails ("File exists" / "identical") — the pod would sit in Init forever. Run the
+    # rendered command TWICE against a stand-in tree; NEGATIVE CONTROL: without its `rm -rf` the second run fails.
+    def _stage_twice(_cmd):
+        _t = tempfile.mkdtemp(prefix="portal-init-")
+        try:
+            for _d in ("app", "usr/share/dotnet/shared/Microsoft.NETCore.App/10.0.0"):
+                os.makedirs(os.path.join(_t, _d))
+            open(os.path.join(_t, "app", "MeshWeaver.Messaging.Hub.dll"), "w").close()
+            open(os.path.join(_t, "usr/share/dotnet/shared/Microsoft.NETCore.App/10.0.0/System.Private.CoreLib.dll"), "w").close()
+            _c = _cmd.replace("/usr/share/dotnet", _t + "/usr/share/dotnet").replace("/portal/", _t + "/portal/").replace(" /app/", " " + _t + "/app/")
+            return [subprocess.run(["/bin/sh", "-c", _c], capture_output=True, text=True).returncode for _ in range(2)]
+        finally:
+            shutil.rmtree(_t, ignore_errors=True)
+    _script = _pc.split(" -c ", 1)[-1]
+    if _stage_twice(_script) != [0, 0]:
+        problems.append(f"{ch}: the portal init container is not re-runnable on its own emptyDir (a retry would wedge Init): {_stage_twice(_script)}")
+    if _stage_twice(_script.replace("rm -rf /portal/refs; ", ""))[1] == 0:
+        problems.append(f"{ch}: NEGATIVE CONTROL — staging twice WITHOUT removing /portal/refs succeeded, so the re-run check measures nothing")
+    if env.get("MW_BUILD_COMPILE_REFS", {}).get("value") != "/portal/refs" or env.get("MeshWeaverRefs", {}).get("value") != "/portal/app":
+        problems.append(f"{ch}: MW_BUILD_COMPILE_REFS must name /portal/refs and MeshWeaverRefs stay the shipped /app: "
+                        f"{env.get('MW_BUILD_COMPILE_REFS')} / {env.get('MeshWeaverRefs')}")
     # An init container copying into the ROOT of a mount it does not own must not preserve
     # attributes: `cp -a` sets the mount's own times/mode and fails EPERM as the unprivileged user
     # (measured on control 2026-10-26: the tester copy crash-looped, the host never started).
@@ -296,7 +326,7 @@ if not np or np["spec"].get("ingress") != [] or "Ingress" not in np["spec"].get(
 if problems:
     print("\n".join(problems)); sys.exit(1)
 PY
-  then ok "the fixture renders both channels' hosts: tester/portal/runner digests, non-root, workload identity (AcrPull, host only), pool, token as a file, grace = run deadline, cache, readiness, KEDA 0..max on demand with a scale-down window, no other credential, no bake share, no SA token, no ingress"
+  then ok "the fixture renders both channels' hosts: tester/portal/runner digests, the compile reference set prepared once per roll (/portal/refs = /app + shared-frameworks/), non-root, workload identity (AcrPull, host only), pool, token as a file, grace = run deadline, cache, readiness, KEDA 0..max on demand with a scale-down window, no other credential, no bake share, no SA token, no ingress"
   else report "the build-host fixture renders a wrong shape (see above)"
   fi
 else

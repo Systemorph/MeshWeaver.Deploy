@@ -189,7 +189,14 @@ spec:
         - name: "portal"
           image: {{ $c.portal | quote }}
           imagePullPolicy: "IfNotPresent"
-          command: ["/bin/sh", "-c", "mkdir -p /portal/app /portal/dotnet && cp -a /app/. /portal/app/ && cp -a /usr/share/dotnet/. /portal/dotnet/"]
+          # /portal/refs is the compile REFERENCE SET in CI's `refs/` shape — the portal's /app plus the
+          # image's shared frameworks under shared-frameworks/ — prepared ONCE per roll as hard links
+          # into the same emptyDir (no second copy of the bytes). core's compile-check.py refuses a flat
+          # image set without System.Private.CoreLib.dll (exit 4: the first probe on build-latest handed
+          # it /portal/app alone). /portal/app stays the app as shipped — a stage's --app.
+          # RE-RUNNABLE: a retried init container meets the same emptyDir, and `cp -al` onto existing
+          # links fails — so the reference tree is removed first and rebuilt whole.
+          command: ["/bin/sh", "-c", "set -e; rm -rf /portal/refs; mkdir -p /portal/app /portal/dotnet /portal/refs/shared-frameworks && cp -a /app/. /portal/app/ && cp -a /usr/share/dotnet/. /portal/dotnet/ && cp -al /portal/app/. /portal/refs/ && cp -al /portal/dotnet/shared/. /portal/refs/shared-frameworks/ && ls /portal/refs/shared-frameworks/Microsoft.NETCore.App/*/System.Private.CoreLib.dll >/dev/null"]
           volumeMounts:
             - { name: "portal", mountPath: "/portal" }
           securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
@@ -236,6 +243,9 @@ spec:
             - { name: MW_BUILD_GATE_HOST, value: "/host/app" }
             - { name: MW_BUILD_PORTAL_DOTNET, value: "/portal/dotnet/dotnet" }
             - { name: MeshWeaverRefs, value: "/portal/app" }
+            # The compile-check's --refs: /app + shared-frameworks/ (the init container above). The
+            # runner refuses to START on a set without System.Private.CoreLib.dll.
+            - { name: MW_BUILD_COMPILE_REFS, value: "/portal/refs" }
             - { name: NUGET_PACKAGES, value: "/cache/nuget" }
             - { name: ORAS, value: "/tools/oras" }
             - { name: MW_PLUGINS_REGISTRY, value: {{ $b.pluginsRegistry | quote }} }

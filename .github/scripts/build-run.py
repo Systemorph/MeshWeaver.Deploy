@@ -108,6 +108,9 @@ Environment (rendered by the chart from `buildHosts.*`):
   MW_BUILD_CACHE               the shared cache volume                    default /cache
   MW_BUILD_WORK                the per-run work root                       default /work
   MW_BUILD_READY_FILE          written once the host is staged (readiness) default /tmp/build-host-ready
+  MW_BUILD_COMPILE_REFS        the compile-check's reference set, prepared once per roll: the portal's
+                               /app + shared-frameworks/ (CI's refs/ shape); handed to stages; the host
+                               refuses to START when it carries no System.Private.CoreLib.dll
   MW_BUILD_GIT_BASE            clone base                                  default https://github.com/Systemorph
   MW_BUILD_IDLE_SECONDS        sleep after a 204                           default 15
   MW_BUILD_RUN_DEADLINE_SECONDS  the whole run's deadline (= the pod's grace) default 3600
@@ -1325,8 +1328,44 @@ def read_worker_token(env: dict) -> str:
 # (`bwrap --clearenv`); the run's own facts are added explicitly by the host.
 ENV_ALLOW = ("PATH", "LANG", "LC_ALL", "TZ", "DOTNET_ROOT", "DOTNET_CLI_TELEMETRY_OPTOUT", "DOTNET_NOLOGO",
              "DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "SSL_CERT_FILE", "SSL_CERT_DIR", "MeshWeaverRefs",
-             "MW_BUILD_GATE_HOST", "MW_BUILD_PORTAL_DOTNET", "MW_BUILD_MODULE_LIBS", "MW_BUILD_EXTENSIONS")
+             "MW_BUILD_GATE_HOST", "MW_BUILD_PORTAL_DOTNET", "MW_BUILD_MODULE_LIBS", "MW_BUILD_EXTENSIONS",
+             "MW_BUILD_COMPILE_REFS")
 SCRATCH = "/scratch"
+
+# THE COMPILE REFERENCE SET, PREPARED ONCE PER ROLL (the `portal` init container of
+# deploy/helm/templates/build-host/build-host.yaml): the portal's /app plus the image's SHARED
+# FRAMEWORKS under `shared-frameworks/` — the exact shape of CI's `refs/` (MeshWeaver.Plugins ci.yml,
+# "Take the framework assemblies from the platform image") and of `fetch-refs.py`'s cache. core's
+# compile-check.py REFUSES (exit 4) a flat image set without System.Private.CoreLib.dll: /app's
+# assemblies are container-built and bind CoreLib's identity directly, which the SDK ref pack cannot
+# resolve, so every NodeType would fail CS0012 naming the CONTENT (#1032, #1911). `MeshWeaverRefs`
+# stays the portal's /app as shipped (a stage's `--app`); this is the compile-check's `--refs`.
+# Measured: the first probe of MeshWeaver.Plugins on build-latest (platform 3.1.11832) handed
+# `--refs /portal/app` and compile-check was refused in 0 s. A host whose set is incomplete does not
+# START — a stage never prepares it per run.
+COMPILE_REFS_MARKER = "System.Private.CoreLib.dll"
+COMPILE_REFS_SHARED = "shared-frameworks"
+COMPILE_REFS_RX = "System.Reactive.dll"
+
+
+def compile_refs_refusal(refs: str) -> Optional[str]:
+    """Why `refs` is not a complete compile reference set, or None. The same test core's
+    compile-check.py applies (`short_reference_set_refusal`): the image's MeshWeaver assemblies AND
+    System.Private.CoreLib.dll under `shared-frameworks/`. Pure apart from reading the tree."""
+    if not os.path.isdir(refs):
+        return f"MW_BUILD_COMPILE_REFS={refs} is not a directory"
+    if not any(n.startswith("MeshWeaver.") and n.endswith(".dll") for n in os.listdir(refs)):
+        return f"MW_BUILD_COMPILE_REFS={refs} carries no MeshWeaver.*.dll — it is not the portal's /app"
+    shared = os.path.join(refs, COMPILE_REFS_SHARED)
+    if not any(COMPILE_REFS_MARKER in files for _dir, _subdirs, files in os.walk(shared)):
+        return (f"MW_BUILD_COMPILE_REFS={refs} carries NO shared frameworks ({COMPILE_REFS_SHARED}/**/{COMPILE_REFS_MARKER} "
+                f"is missing) — core's compile-check.py refuses such a set (exit 4); the portal init container must "
+                f"stage /usr/share/dotnet/shared beside /app")
+    # core's short_reference_set_refusal ALSO refuses a set without Rx (every MeshWeaver assembly binds it).
+    if not any(COMPILE_REFS_RX in files for _dir, _subdirs, files in os.walk(refs)):
+        return (f"MW_BUILD_COMPILE_REFS={refs} carries NO {COMPILE_REFS_RX} — core's compile-check.py refuses such a set "
+                f"(exit 4): every MeshWeaver assembly binds Rx, and the portal's /app ships it")
+    return None
 
 # The platform's canonical checkers a repository's stages run (MeshWeaver.Plugins
 # `scripts/canonical-compile-check.py`, `scripts/check-scripts.py`): the image ships core's
@@ -1389,6 +1428,14 @@ def prepared_env(root: str = PREPARED_ROOT, tester: str = TESTER_APP) -> dict:
     return env
 
 
+def sandbox_readonly_roots(env: dict) -> list[str]:
+    """The host-side roots every stage's sandbox binds READ-ONLY: the tester, the portal's /app, the compile
+    reference set (wherever MW_BUILD_COMPILE_REFS points — a path handed to a stage must be visible in it),
+    and the staged image roots."""
+    return [p for p in (env.get("MW_BUILD_GATE_HOST"), env.get("MeshWeaverRefs"), env.get("MW_BUILD_COMPILE_REFS"),
+                        "/portal", "/tester", "/tools", "/core-tests") if p]
+
+
 class Sandbox:
     """`bwrap` per stage: user, PID, mount, IPC and UTS namespaces; `--die-with-parent`; a fresh
     /proc; `--clearenv` + the allow-list; the system and the caches bound READ-ONLY; writable only
@@ -1411,10 +1458,14 @@ class Sandbox:
              "--clearenv"]
         for k in sorted(env):
             a += ["--setenv", k, env[k]]
+        # The tmpfs mounts come FIRST: bwrap applies mounts in order, so a tmpfs laid after a bind hides
+        # whatever was bound beneath it — a read-only root under /tmp or /scratch would pass preflight
+        # and then be invisible to the stage.
+        a += ["--tmpfs", "/tmp", "--tmpfs", SCRATCH,
+              "--dir", f"{SCRATCH}/home", "--dir", f"{SCRATCH}/tmp", "--dir", f"{SCRATCH}/nuget"]
         for p in self.SYSTEM_RO + self.readonly + tuple(readonly):
             a += ["--ro-bind-try", p, p]
-        a += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-              "--tmpfs", SCRATCH, "--dir", f"{SCRATCH}/home", "--dir", f"{SCRATCH}/tmp", "--dir", f"{SCRATCH}/nuget",
+        a += ["--proc", "/proc", "--dev", "/dev",
               "--bind", checkout, checkout, "--bind", outputs, outputs]
         for w in writable:
             a += ["--bind", w, w]
@@ -1913,9 +1964,7 @@ class Host:
         # The staged image roots are bound read-only, `--ro-bind-try` (absent on a set that names no
         # such image): /core-tests is where a set's mw-core-tests image is staged, and core's shard and
         # doc-gate stages run `python3 /core-tests/core-tests.py …` from it.
-        self.sandbox = sandbox or Sandbox(env.get("BWRAP", "bwrap"), [
-            p for p in (env.get("MW_BUILD_GATE_HOST"), env.get("MeshWeaverRefs"),
-                        "/portal", "/tester", "/tools", "/core-tests") if p])
+        self.sandbox = sandbox or Sandbox(env.get("BWRAP", "bwrap"), sandbox_readonly_roots(env))
         self.leftovers = leftovers or pid_namespace_leftovers
         self.reap = reap or reap_children
         self.registry_get = registry_get or _registry_get
@@ -1999,6 +2048,10 @@ class Host:
             missing.append("MW_BUILD_PLATFORM_VERSION (the set this host runs)")
         if not self.identity:
             missing.append("MW_BUILD_FRAMEWORK_IDENTITY or a readable MW_BUILD_IDENTITY_FILE")
+        if self.env.get("MW_BUILD_COMPILE_REFS"):
+            why = compile_refs_refusal(self.env["MW_BUILD_COMPILE_REFS"])
+            if why:
+                missing.append(why)
         if not (MIN_RUN_DEADLINE <= self.run_deadline <= MAX_RUN_DEADLINE):
             missing.append(f"MW_BUILD_RUN_DEADLINE_SECONDS within [{MIN_RUN_DEADLINE}, {MAX_RUN_DEADLINE}] — the RUN budget "
                            f"(the contract's budgetMinutes is 10..720), which must cover the stages a repository declares")
@@ -4634,6 +4687,46 @@ def self_test() -> int:
                 check(f"version/refused: {why}", False, "started")
             except Refusal as e:
                 check(f"version/refused: {why}", why in str(e), e)
+        # THE COMPILE REFERENCE SET: the host does not start on a set core's compile-check.py would refuse.
+        # NEGATIVE CONTROL: the staging the first probe met (the portal's /app alone) is refused by name.
+        cr = tempfile.mkdtemp(prefix="compile-refs-")
+        try:
+            open(os.path.join(cr, "MeshWeaver.Messaging.Hub.dll"), "wb").close()
+            try:
+                host(_FakeApi({}), env=dict(env_v, MW_BUILD_COMPILE_REFS=cr)).preflight()
+                check("compile refs/the portal's /app alone (the old staging) is refused", False, "started")
+            except Refusal as e:
+                check("compile refs/the portal's /app alone (the old staging) is refused",
+                      "NO shared frameworks" in str(e) and "MW_BUILD_COMPILE_REFS" in str(e), e)
+            fx = os.path.join(cr, "shared-frameworks", "Microsoft.NETCore.App", "10.0.0")
+            os.makedirs(fx)
+            open(os.path.join(fx, "System.Private.CoreLib.dll"), "wb").close()
+            check("compile refs/NEGATIVE CONTROL: a set without System.Reactive.dll is refused (core's checker refuses it too)",
+                  "System.Reactive.dll" in (compile_refs_refusal(cr) or ""), compile_refs_refusal(cr))
+            open(os.path.join(cr, "System.Reactive.dll"), "wb").close()
+            host(_FakeApi({}), env=dict(env_v, MW_BUILD_COMPILE_REFS=cr)).preflight()
+            check("compile refs/the configured directory is bound read-only into every stage's sandbox",
+                  cr in sandbox_readonly_roots({"MW_BUILD_COMPILE_REFS": cr})
+                  and f"--ro-bind-try {cr} {cr}" in " ".join(Sandbox("bwrap", sandbox_readonly_roots({"MW_BUILD_COMPILE_REFS": cr})).argv("true", "/w", "/o", {})),
+                  sandbox_readonly_roots({"MW_BUILD_COMPILE_REFS": cr}))
+            check("compile refs/the prepared set (/app + shared-frameworks) starts", compile_refs_refusal(cr) is None)
+            # VISIBILITY, not just the argument: a root under /tmp or /scratch is bound AFTER the tmpfs that would
+            # otherwise cover it (binds first, then a tmpfs, hid the root while the argument check still passed).
+            for root in ("/tmp/refs-x", f"{SCRATCH}/refs-x", cr):
+                av = Sandbox("bwrap", [root]).argv("true", "/w", "/o", {})
+                bind_at = max(i for i in range(len(av) - 2) if av[i:i + 3] == ["--ro-bind-try", root, root])
+                tmpfs_at = [i for i in range(len(av) - 1) if av[i] == "--tmpfs"]
+                check(f"compile refs/a read-only root at {root} is bound AFTER every tmpfs (visible in the sandbox)",
+                      all(t < bind_at for t in tmpfs_at), av)
+            os.remove(os.path.join(cr, "MeshWeaver.Messaging.Hub.dll"))
+            check("compile refs/a set without the portal's MeshWeaver assemblies is refused",
+                  "no MeshWeaver" in (compile_refs_refusal(cr) or ""), compile_refs_refusal(cr))
+            check("compile refs/a missing directory is refused",
+                  "not a directory" in (compile_refs_refusal(os.path.join(cr, "absent")) or ""))
+            check("compile refs/handed to a stage through the allow-list",
+                  sandbox_env({"PATH": "/bin", "MW_BUILD_COMPILE_REFS": cr}, {}, "/cache").get("MW_BUILD_COMPILE_REFS") == cr)
+        finally:
+            shutil.rmtree(cr, ignore_errors=True)
         claims_v: list[dict] = []
         hv_claim = host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})],
                                   ("POST", "/claim"): lambda p_, b: (claims_v.append(b), (204, None))[1]}), env=env_v)
