@@ -6,12 +6,18 @@
     checkout. Default: a SIBLING checkout (../MeshWeaver beside this repository); CI checks the
     platform out at a DECLARED ref and passes -p:MeshWeaverRoot=….
 
+    $(MeshWeaverPluginsRoot) names a Systemorph/MeshWeaver.Plugins checkout: the portal hosts'
+    service defaults (the probe and drain wiring the chart has to agree with) left the platform for
+    MeshWeaver.Plugins (MeshWeaver#7297, MeshWeaver.Plugins#4333). Default: a SIBLING checkout
+    (../MeshWeaver.Plugins); CI checks it out at a DECLARED ref and passes -p:MeshWeaverPluginsRoot=….
+
     The test infrastructure (xunit v3 on Microsoft.Testing.Platform, the shared xunit.runner.json
     with its methodTimeout, the assertion helpers) is the platform's, imported, never copied: a
     second copy here would drift from the one every other suite in the fleet runs under.
   -->
   <PropertyGroup>
     <MeshWeaverRoot Condition="'$(MeshWeaverRoot)' == ''">$(MSBuildThisFileDirectory)../../MeshWeaver</MeshWeaverRoot>
+    <MeshWeaverPluginsRoot Condition="'$(MeshWeaverPluginsRoot)' == ''">$(MSBuildThisFileDirectory)../../MeshWeaver.Plugins</MeshWeaverPluginsRoot>
     <TargetFramework>net10.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>

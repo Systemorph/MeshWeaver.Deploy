@@ -160,7 +160,9 @@ Every job caps at a literal `timeout-minutes` ≤ 45 and carries no input-shaped
 1. `chart-gate.yml` — `Chart invariants`, `Observability values (rendered + binary-validated)`,
    `Bundle registry scripts (executed)`, `Registry retention (this chart against core's record)`.
 2. `chart-guards.yml` — `Chart guards (vs platform)`: the C# guards built and run against the
-   declared platform ref.
+   declared platform ref. It reads the PRIVATE MeshWeaver.Plugins checkout through the
+   `meshweaver-cloud` App, so on a pull request from a FORK — which GitHub never hands secrets — it
+   is RED by design and says so; a maintainer pushes the branch into this repository instead.
 3. `repo-hygiene.yml` — `Workflow hygiene (vs platform)`: the platform's workflow guards
    (timeouts, ignored YAML keys, secret preflight) fetched at `main`, self-tested, run on this tree.
 4. `review-answered.yml` — `review-answered / Automatic review answered`: the automatic review has
