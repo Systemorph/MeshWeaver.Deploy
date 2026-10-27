@@ -497,6 +497,28 @@ def _job_of(lines: list[str], i: int) -> int:
     return j
 
 
+CACHE_REF_CASE = re.compile(r'\bcase\s+"?\$\{?CACHE_REF\}?"?\s+in\b(?P<arms>.*?)\besac\b', re.S)
+
+
+def digest_refusal_problem(body: str) -> str | None:
+    """None when the step refuses a non-digest hand-over: a `case` on $CACHE_REF whose `*@sha256:*)` arm
+    proceeds and whose catch-all `*)` arm EXITS NON-ZERO. Grepping for the pattern alone is not enough —
+    an arm deleted, or `exit 1` turned into `true`, keeps the pattern and refuses nothing."""
+    m = CACHE_REF_CASE.search(body)
+    if not m:
+        return "does not test the hand-over with `case \"$CACHE_REF\" in …` — nothing refuses a non-digest cache"
+    arms = m.group("arms")
+    if not re.search(r"(^|\s)\*@sha256:\*\)", arms):
+        return "tests $CACHE_REF without a `*@sha256:*)` arm — the digest-pinned case is not recognised"
+    catch_all = re.search(r"(^|\s)\*\)(?P<arm>.*?);;", arms, flags=re.S)
+    if not catch_all:
+        return "has no catch-all `*)` arm in its `case \"$CACHE_REF\"` — a non-digest hand-over is not refused"
+    if not re.search(r"\bexit\s+[1-9][0-9]*\b", catch_all.group("arm")):
+        return ("does not exit non-zero in the catch-all `*)` arm of its `case \"$CACHE_REF\"` — a non-digest "
+                "hand-over would be built from anyway")
+    return None
+
+
 def check_cache_handover(text: str) -> list[str]:
     lines = text.splitlines()
     code = [_code(x) for x in lines]
@@ -532,8 +554,9 @@ def check_cache_handover(text: str) -> list[str]:
             problems.append(f"{where} does not take `CACHE_REF` from the cache job's `cache_ref` output")
         if '--cache-from "type=registry,ref=$CACHE_REF"' not in body:
             problems.append(f"{where} does not build `--cache-from` the handed-over `$CACHE_REF`")
-        if "*@sha256:*" not in body:
-            problems.append(f"{where} does not refuse a hand-over that is not digest-pinned (`case … *@sha256:*`)")
+        refusal = digest_refusal_problem(body)
+        if refusal:
+            problems.append(f"{where} {refusal}")
     return problems
 
 
@@ -984,7 +1007,26 @@ jobs:
           lambda p: any("SHARED cache tag" in x for x in p))
     check("cache: a hand-over not refused unless digest-pinned is red",
           lambda: check_cache_handover(handover.replace('case "$CACHE_REF" in *@sha256:*) ;; *) exit 1 ;; esac', "true")),
-          lambda p: len(p) == 1 and "digest-pinned" in p[0])
+          lambda p: len(p) == 1 and "case \"$CACHE_REF\" in" in p[0])
+    check("cache: the refusal arm DELETED (pattern still present) is red (review round 2)",
+          lambda: check_cache_handover(handover.replace('case "$CACHE_REF" in *@sha256:*) ;; *) exit 1 ;; esac',
+                                                        'case "$CACHE_REF" in *@sha256:*) ;; esac')),
+          lambda p: len(p) == 1 and "no catch-all" in p[0])
+    check("cache: the refusal arm's `exit 1` turned into `true` is red (review round 2)",
+          lambda: check_cache_handover(handover.replace('*) exit 1 ;; esac', '*) true ;; esac')),
+          lambda p: len(p) == 1 and "exit non-zero" in p[0])
+    check("cache: `exit 0` in the refusal arm is red",
+          lambda: check_cache_handover(handover.replace('*) exit 1 ;; esac', '*) echo no; exit 0 ;; esac')),
+          lambda p: len(p) == 1 and "exit non-zero" in p[0])
+    check("cache: a case on ANOTHER variable is red",
+          lambda: check_cache_handover(handover.replace('case "$CACHE_REF" in', 'case "$OTHER" in')),
+          lambda p: len(p) == 1 and "case \"$CACHE_REF\" in" in p[0])
+    check("cache: the digest arm missing is red",
+          lambda: check_cache_handover(handover.replace('*@sha256:*) ;; ', '')),
+          lambda p: len(p) == 1 and "*@sha256:*)" in p[0])
+    check("cache: the real refusal arm (echo …; exit 1) passes",
+          lambda: digest_refusal_problem('case "$CACHE_REF" in *@sha256:*) ;; *) echo "::error::x (\'$CACHE_REF\')"; exit 1 ;; esac'),
+          lambda p: p is None)
     check("cache: the cache built BEFORE the existence check is red (review: skip cache construction entirely)",
           lambda: check_cache_handover(handover.replace(
               "      - name: Is this commit already published?\n        id: published\n        run: echo exists=false\n", "")
