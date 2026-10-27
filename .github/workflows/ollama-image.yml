@@ -59,6 +59,9 @@ env:
   ACR: meshweaver.azurecr.io
   REPO: ollama
   LINE: 0.33.2-qwen3.6-bge-m3
+  # The registry build cache (see the `cache` job). Same repository as the image, so every blob the
+  # image names is already in it and a push only HEADs it.
+  BUILD_CACHE: buildcache-0.33.2-qwen3.6-bge-m3
 
 jobs:
   # Pull requests: build and prove — nothing from a PR reaches ACR, and this job holds no secret
@@ -163,9 +166,82 @@ jobs:
           done
           echo "chart: nothing by default; enabled → $kinds; egress denied; no tag or a moving tag → refused"
 
+  # 🧊 THE ~24 GB OF WEIGHTS ARE UPLOADED IN THEIR OWN JOB — AND ONLY WHEN THEY CHANGED.
+  # Deploy#32's first main run (40493629457) was cut at 45 min INSIDE the push: build 4.5 min, layer
+  # compression 3.9 min, unpacking into the local store 3.9 min (a publish never runs the image), then the
+  # ~24 GB model layer was still uploading after 28 min. Core's one green publish (40232022675) pushed the
+  # same layer in 880 s; this one did not finish in 1,686 s — the upload rate varies run to run, and every
+  # publication re-uploaded all of it, because nothing in the build was ever reused: the weights layer is
+  # not reproducible (file times) and no build cache existed (a repository's BuildKit state starts cold).
+  # So this job exports the whole build to a REGISTRY cache (mode=max, zstd, in the image's own repository)
+  # and reads it back first: on a warm cache every step is CACHED and nothing is uploaded; on a cold one the
+  # weights go up once, in a job that does nothing else (no image export, no unpack). The `publish` job then
+  # builds from that cache and pushes the image by reference: its blobs are already in the repository.
+  cache:
+    name: Build ollama into the registry build cache (the weights upload, once)
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write   # OIDC to Azure (the federated credential is scoped to main)
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          docker-images: true
+      # The image is ~25 GB (25,090 MiB measured). /mnt is the runner's temporary disk where it has one
+      # (on the 2026-10-25 runner it was part of the 145 GB root, 118 GB free after the clean-up).
+      - name: Move Docker's data root to /mnt
+        run: |
+          set -euo pipefail
+          df -h / /mnt
+          sudo systemctl stop docker docker.socket
+          sudo mkdir -p /mnt/docker
+          # The containerd image store lets the daemon's OWN BuildKit push zstd layers (next steps) — no
+          # separate builder container, so nothing is pulled from Docker Hub beyond the Dockerfile's FROMs.
+          echo '{"data-root":"/mnt/docker","features":{"containerd-snapshotter":true}}' | sudo tee /etc/docker/daemon.json >/dev/null
+          sudo systemctl start docker
+          [ "$(docker info --format '{{.DockerRootDir}}')" = "/mnt/docker" ] \
+            || { echo "::error::Docker did not move its data root to /mnt/docker"; exit 1; }
+          status=$(docker info --format '{{json .DriverStatus}}')
+          grep -q 'io.containerd.snapshotter' <<<"$status" \
+            || { echo "::error::Docker is not on the containerd image store — the zstd push needs it"; exit 1; }
+      - name: Ensure Azure CLI
+        run: command -v az >/dev/null || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+      - name: Azure login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          # The identity holds AcrPush on the registry RESOURCE and nothing at subscription scope
+          # (least privilege), so it signs in tenant-level; the registry is then reached through its
+          # data plane only (acr-data-plane.py), never through an ARM lookup.
+          allow-no-subscriptions: true
+      - name: ACR login (data plane)
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: python3 .github/scripts/acr-data-plane.py login --registry "$ACR" --tenant "$AZURE_TENANT_ID"
+      - name: Build into the registry cache (cache-from first, cache-to; no image)
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          docker buildx build --builder "$(docker context show)" --progress=plain --provenance=false --sbom=false \
+            --cache-from "type=registry,ref=$ACR/$REPO:$BUILD_CACHE" \
+            --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,compression-level=1,force-compression=true" \
+            --output type=cacheonly \
+            deploy/ollama
+          echo "build cache written in $(( $(date +%s) - start ))s"
+          echo "### ollama build cache: $(( $(date +%s) - start ))s" >> "$GITHUB_STEP_SUMMARY"
+
   # main (push or dispatch): build the same way, push both tags, read them back.
   publish:
     name: Build and push ollama to ACR
+    needs: cache
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -257,8 +333,13 @@ jobs:
         run: |
           set -euo pipefail
           start=$(date +%s)
+          # From the `cache` job's registry cache: every step is CACHED and the layers stay remote (lazy), so
+          # the push HEADs blobs the repository already holds. unpack=false: a publish never runs the image,
+          # and unpacking ~25 GB into the local store cost 3.9 min of the cut run. No force-compression: the
+          # cached layers are zstd already, and forcing would fetch every lazy blob to recompress it.
           docker buildx build --builder "$(docker context show)" --progress=plain --provenance=false --sbom=false \
-            --output "type=image,name=$ACR/$REPO:${LINE}-${GITHUB_SHA::7},push=true,compression=zstd,compression-level=1,force-compression=true,oci-mediatypes=true" \
+            --cache-from "type=registry,ref=$ACR/$REPO:$BUILD_CACHE" \
+            --output "type=image,name=$ACR/$REPO:${LINE}-${GITHUB_SHA::7},push=true,unpack=false,compression=zstd,compression-level=1,oci-mediatypes=true" \
             deploy/ollama
           echo "built and pushed in $(( $(date +%s) - start ))s"
           echo "### ollama build + push: $(( $(date +%s) - start ))s" >> "$GITHUB_STEP_SUMMARY"
