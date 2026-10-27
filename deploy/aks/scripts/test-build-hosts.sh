@@ -53,14 +53,15 @@ if [ -f "$DOCKERFILE" ] \
    && grep -q "grep -Eq '\^\[0-9a-f\]{40}\$'" "$DOCKERFILE" \
    && grep -q 'bubblewrap' "$DOCKERFILE" \
    && grep -q 'sandbox-postgres.sh --self-test' "$DOCKERFILE" \
-   && grep -q 'build-run.py --self-test' "$DOCKERFILE" \
+   && grep -q '^RUN python3 /opt/build-host/build-run.py --self-test$' "$DOCKERFILE" \
+   && [ "$(grep -n '^USER 1654' "$DOCKERFILE" | head -1 | cut -d: -f1)" -lt "$(grep -n 'build-run.py --self-test' "$DOCKERFILE" | head -1 | cut -d: -f1)" ] \
    && grep -q 'module-build-key.py --self-test' "$DOCKERFILE" \
    && grep -q 'module-build-key.py node-repo-scope.py' "$DOCKERFILE" \
    && grep -q 'compile-check.py --help' "$DOCKERFILE" \
    && ! grep -Eq '^FROM [^ ]*:latest' "$DOCKERFILE"; then
-  ok "deploy/build-host/Dockerfile fetches the runner, composer, sandbox-postgres, module-build-key with its sibling node-repo-scope.py, core's compile-check.py (handed to stages as MW_PLATFORM_SCRIPTS) and the plugin-build tool by 40-hex commit (nothing COPYed from the context), installs bubblewrap, runs the self-tests (module-build-key's too, so a missing sibling fails the build), and pins no :latest"
+  ok "deploy/build-host/Dockerfile fetches the runner, composer, sandbox-postgres, module-build-key with its sibling node-repo-scope.py, core's compile-check.py (handed to stages as MW_PLATFORM_SCRIPTS) and the plugin-build tool by 40-hex commit (nothing COPYed from the context), installs bubblewrap, runs the self-tests (module-build-key's too, so a missing sibling fails the build; the runner's as the unprivileged uid 1654, never root), and pins no :latest"
 else
-  report "deploy/build-host/Dockerfile must fetch its sources by 40-hex commit in the 'sources' stage, COPY only --from=sources (build-run.py, compose-gate-host.sh, sandbox-postgres.sh, module-build-key.py, node-repo-scope.py — module-build-key imports it, core #7270 —, ci-artifact-store.py, compile-check.py — a stage's canonical checker, MW_PLATFORM_SCRIPTS —, plugin-build) to /opt/build-host/, install bubblewrap, run the self-tests incl. module-build-key.py's, and name no :latest base"
+  report "deploy/build-host/Dockerfile must fetch its sources by 40-hex commit in the 'sources' stage, COPY only --from=sources (build-run.py, compose-gate-host.sh, sandbox-postgres.sh, module-build-key.py, node-repo-scope.py — module-build-key imports it, core #7270 —, ci-artifact-store.py, compile-check.py — a stage's canonical checker, MW_PLATFORM_SCRIPTS —, plugin-build) to /opt/build-host/, install bubblewrap, run the self-tests incl. module-build-key.py's (build-run.py's AFTER 'USER 1654': root reads past file modes), and name no :latest base"
 fi
 # 1b. the PREPARED host (MeshWeaver.Plugins Hosting/StandingBuildHosts.md, "a prepared server, never a
 #     prepared run"): the image carries core's source at the set's commit and the portal chart (both by

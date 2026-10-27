@@ -3570,8 +3570,11 @@ def self_test() -> int:
             for d_ in ds_:
                 if not os.access(os.path.join(r_, d_), os.R_OK | os.X_OK):
                     os.chmod(os.path.join(r_, d_), 0o700)
+        # Root reads past file modes, so as root the build CANNOT leave its output unreadable and this case has no
+        # subject: it is red there, naming why, never a vacuous pass (the image runs this self-test as uid 1654).
         check("prepared-inputs/a build that leaves its output UNREADABLE is a RED verdict naming it, never a crash",
-              rf5 and rf5[0]["succeeded"] is False and "shelf" in (rf5[0]["error"] or "") and "cannot be" in (rf5[0]["error"] or ""), rf5)
+              os.geteuid() != 0 and rf5 and rf5[0]["succeeded"] is False and "shelf" in (rf5[0]["error"] or "") and "cannot be" in (rf5[0]["error"] or ""),
+              "run this self-test as an unprivileged uid: root reads a chmod-000 directory" if os.geteuid() == 0 else rf5)
         posted.clear()
         host(api_ev(), env=penv, checkout=checkout_with(dict(prep_doc("3" * 64), prepared=[dict(prep_doc("3" * 64)["prepared"][0], build="exit 7")]))).run(dict(claim, isTrunk=True))
         rf4 = last_verdict()

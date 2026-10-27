@@ -90,13 +90,15 @@ COPY --from=sources /out/platform-src/ /opt/build-host/platform-src/
 COPY --from=sources /out/deploy-src/ /opt/build-host/deploy-src/
 RUN chmod 0555 /opt/build-host/*.py /opt/build-host/*.sh \
  && test -f /opt/build-host/plugin-build/MeshWeaver.Plugin.Build.dll \
- && python3 /opt/build-host/build-run.py --self-test \
  && python3 /opt/build-host/module-build-key.py --self-test \
  && python3 /opt/build-host/compile-check.py --help > /dev/null \
  && bash /opt/build-host/sandbox-postgres.sh --self-test
 
 # The SDK image's unprivileged `app` user (uid 1654). bwrap creates its namespaces unprivileged.
 USER 1654
+# The runner's self-test runs as the uid the host RUNS as, never as root: root reads past file modes, so a case
+# whose subject is what an unprivileged host meets (a build that leaves its output unreadable) cannot be built as root.
+RUN python3 /opt/build-host/build-run.py --self-test
 # The PREPARED test cluster (UTF8, a pgvector template) is built HERE, once per image, as the
 # unprivileged user (initdb refuses root); a stage starts a copy of it inside its sandbox. The
 # self-test is a REAL server: two stage servers from copies, the suites' superuser operations,
