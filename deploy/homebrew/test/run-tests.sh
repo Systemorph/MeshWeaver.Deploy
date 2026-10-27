@@ -304,7 +304,23 @@ reports "an install still in progress says so, and is still not green" "still in
   FAKE_HTTP_ROOT=200 FAKE_HTTP_LOGIN=200 \
   FAKE_MODULES='module=MeshWeaver.Blazor.Views missing
 module=MeshWeaver.Blazor.Graph missing'
+# 🚨 …and it is a DISTINCT status from "broken" (first-run walk-through, 2026-10-27): `up` and
+# `update` used to read this 1 and die with "NOT USABLE / err" on a portal that was honestly still
+# installing its packages and finished minutes later by itself. 2 is what lets the two callers
+# print one calm line instead, while a genuine red (1) still dies.
+run_verify FAKE_HTTP_ROOT=200 FAKE_HTTP_LOGIN=200 \
+  FAKE_MODULES='module=MeshWeaver.Blazor.Views missing
+module=MeshWeaver.Blazor.Graph missing'
+if [ "$RC" -eq 2 ]; then ok "'still installing' exits 2 — distinct from a broken portal's 1"
+else bad "'still installing' exits 2 — distinct from a broken portal's 1" "exited $RC: $OUT"; fi
 VERIFY_FLAGS=""
+# The negative control for the status: a portal whose reconcile HAS reported and still lacks a pack
+# is broken, not installing, and must keep exiting 1 — otherwise every red would read as "not yet".
+run_verify FAKE_HTTP_ROOT=200 FAKE_HTTP_LOGIN=200 \
+  FAKE_MODULES='module=MeshWeaver.Blazor.Views missing
+module=MeshWeaver.Blazor.Graph missing'
+if [ "$RC" -eq 1 ]; then ok "a settled missing pack still exits 1, never 2"
+else bad "a settled missing pack still exits 1, never 2" "exited $RC: $OUT"; fi
 
 echo "── …and a green run is reachable (so the above is not vacuous) ───"
 
@@ -400,7 +416,67 @@ for c in cmd_up cmd_update; do
     *"verify_usable --wait"*) ok "${c} runs the usability verification" ;;
     *) bad "${c} runs the usability verification" "no verify_usable call in ${c}()" ;;
   esac
+  # 🚨 …and reads its THREE-WAY answer. Status 2 ("still installing") must reach ONE calm line and
+  # a clean exit, never the `die "… NOT USABLE …"` a genuine red gets — that die on a portal that
+  # finished by itself minutes later is what the first-run walk-through (2026-10-27) met.
+  case "$body" in
+    *"2) still_installing_note; return 0 ;;"*) ok "${c} treats 'still installing' (2) as a calm state, not NOT USABLE" ;;
+    *) bad "${c} treats 'still installing' (2) as a calm state, not NOT USABLE" "no status-2 arm in ${c}()" ;;
+  esac
+  case "$body" in
+    *"NOT USABLE"*) ok "${c} still dies on a genuine red (1)" ;;
+    *) bad "${c} still dies on a genuine red (1)" "no NOT USABLE die left in ${c}()" ;;
+  esac
+  # And both hand the person INTO the wizard — one shared line, then cmd_setup with the token in
+  # the URL — when the portal is waiting to be set up. `update` used to end on "update complete"
+  # and leave the person to find the token themselves.
+  case "$body" in
+    *"awaiting_setup"*"hand_into_setup"*) ok "${c} hands an instance awaiting setup into the wizard" ;;
+    *) bad "${c} hands an instance awaiting setup into the wizard" "no awaiting_setup → hand_into_setup in ${c}()" ;;
+  esac
 done
+body="$(awk -v f='^hand_into_setup\\(\\)' '$0 ~ f { on=1 } on { print } on && /^}$/ { exit }' "$CLI")"
+case "$body" in
+  *cmd_setup*) ok "the hand-off runs cmd_setup (URL with the token, opened)" ;;
+  *) bad "the hand-off runs cmd_setup (URL with the token, opened)" "$body" ;;
+esac
+body="$(awk -v f='^still_installing_note\\(\\)' '$0 ~ f { on=1 } on { print } on && /^}$/ { exit }' "$CLI")"
+case "$body" in
+  *"finishes by itself"*"memex-local verify"*) ok "the still-installing line says it finishes by itself and how to re-check" ;;
+  *) bad "the still-installing line says it finishes by itself and how to re-check" "$body" ;;
+esac
+
+echo "── first-run copy: the key is optional, the token is in the link ──"
+
+# cmd_setup is what `up`/`update` hand into; what it prints is the ONLY guidance a person has
+# before the page. The walk-through stalled twice on exactly these two words: "token" (where is
+# it?) and "key" (do I need one?).
+body="$(awk -v f='^cmd_setup\\(\\)' '$0 ~ f { on=1 } on { print } on && /^}$/ { exit }' "$CLI")"
+case "$body" in
+  *"OPTIONAL"*"free plan"*) ok "cmd_setup says the Registration key is optional and empty means the free plan" ;;
+  *) bad "cmd_setup says the Registration key is optional and empty means the free plan" "not in cmd_setup()" ;;
+esac
+case "$body" in
+  *"already in that URL"*) ok "cmd_setup says the token is already in the link it opens" ;;
+  *) bad "cmd_setup says the token is already in the link it opens" "not in cmd_setup()" ;;
+esac
+case "$body" in
+  *"already runs"*"pre-selected"*) ok "cmd_setup names the deployment's own PostgreSQL as the pre-selected database" ;;
+  *) bad "cmd_setup names the deployment's own PostgreSQL as the pre-selected database" "not in cmd_setup()" ;;
+esac
+
+# The page-side half of the token hint: the portal renders "On this install, run `memex-local
+# setup`" from InstanceSetup:TokenCommand, which the TRACKED defaults layer carries so every install
+# gets it on `brew upgrade` (the generated overlay never reaches existing installs).
+DEFAULTS="$HERE/../share/values.local.defaults.yaml"
+if grep -q '^    InstanceSetup__TokenCommand: "memex-local setup"$' "$DEFAULTS"; then
+  ok "values.local.defaults.yaml names 'memex-local setup' as the token command the setup page shows"
+else bad "values.local.defaults.yaml names 'memex-local setup' as the token command the setup page shows" "$(grep -n TokenCommand "$DEFAULTS")"; fi
+# …and says this install runs on a Mac, which the wizard's package step reads
+# (InstanceSetup:HostPlatform) to pre-check the Mac-only packages (Google, iMessage, WhatsApp).
+if grep -q '^    InstanceSetup__HostPlatform: "mac"$' "$DEFAULTS"; then
+  ok "values.local.defaults.yaml declares InstanceSetup__HostPlatform: mac for the package step"
+else bad "values.local.defaults.yaml declares InstanceSetup__HostPlatform: mac for the package step" "$(grep -n HostPlatform "$DEFAULTS")"; fi
 
 echo "── a gate's own INPUT must be reachable (static — needs a live pod) ──"
 
