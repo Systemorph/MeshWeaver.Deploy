@@ -71,12 +71,12 @@ if [ -f "$DOCKERFILE" ] \
    && grep -q '^COPY --from=sources /out/deploy-src/ /opt/build-host/deploy-src/$' "$DOCKERFILE" \
    && grep -q '^COPY --from=sources /out/scripts/host-postgres.sh /opt/build-host/$' "$DOCKERFILE" \
    && grep -q 'postgresql-${PG_MAJOR}-pgvector' "$DOCKERFILE" \
-   && grep -q '^RUN bash /opt/build-host/host-postgres.sh --self-test$' "$DOCKERFILE" \
-   && grep -q 'bash /opt/build-host/host-postgres.sh start; exec python3 /opt/build-host/build-run.py --host' "$DOCKERFILE" \
+   && grep -q '^RUN bash /opt/build-host/host-postgres.sh --self-test \\$' "$DOCKERFILE" \
+   && grep -q '^ && bash /opt/build-host/host-postgres.sh prepare /opt/build-host/pg-snapshot$' "$DOCKERFILE" \
    && [ "$(grep -n '^USER 1654' "$DOCKERFILE" | head -1 | cut -d: -f1)" -lt "$(grep -n 'host-postgres.sh --self-test' "$DOCKERFILE" | head -1 | cut -d: -f1)" ]; then
-  ok "deploy/build-host/Dockerfile carries core's source and the chart by commit, PostgreSQL with pgvector, runs the prepared server's REAL self-test as the unprivileged user, and starts it before the claim loop"
+  ok "deploy/build-host/Dockerfile carries core's source and the chart by commit, PostgreSQL with pgvector, runs the prepared cluster's REAL self-test and builds the snapshot as the unprivileged user"
 else
-  report "deploy/build-host/Dockerfile must COPY --from=sources platform-src/, deploy-src/ and host-postgres.sh, install postgresql-\${PG_MAJOR}-pgvector, run host-postgres.sh --self-test AFTER 'USER 1654' (initdb refuses root), and start it in the ENTRYPOINT before build-run.py --host"
+  report "deploy/build-host/Dockerfile must COPY --from=sources platform-src/, deploy-src/ and host-postgres.sh, install postgresql-\${PG_MAJOR}-pgvector, run host-postgres.sh --self-test and prepare /opt/build-host/pg-snapshot AFTER 'USER 1654' (initdb refuses root)"
 fi
 if python3 "$REPO/.github/scripts/build-run.py" --self-test; then
   ok "build-run.py passes its self-test"

@@ -54,12 +54,11 @@ THE LOOP, and the order that matters:
      ONLY for a succeeded BUILD stage of a trunk run, and ONLY when it recomputes the key itself
      (module: core's module-build-key.py; NodeType: sources + reference set + compile-check options
      + compiler). Never a test verdict; never a pull request's output. A stage needing PostgreSQL
-     gets the host's PREPARED server (host-postgres.sh, started once per pod: pgvector, one template,
-     Unix socket only) as the RUN's own role — created before the run, every database it owns and the
-     role dropped after it (TestPostgres) — and every database a suite opens is a clone of the
-     template (MW_TEST_PG_CONNECTION, MW_TEST_PG_TEMPLATE). The prepared host's other facts — core's
-     source at the set's commit, the portal chart, the tester /app — are handed when the image carries
-     them (prepared_env: MW_PLATFORM_SOURCE, MW_DEPLOY_SOURCE, MW_BUILD_TESTER_APP).
+     starts a COPY of the image's PREPARED cluster inside its own sandbox (host-postgres.sh: UTF8, a
+     pgvector template every suite database is cloned from; MW_TEST_PG_SNAPSHOT, MW_TEST_PG_SERVER) —
+     never an initdb, never a container. The prepared host's other facts — core's source at the set's
+     commit, the portal chart, the tester /app — are handed when the image carries them (prepared_env:
+     MW_PLATFORM_SOURCE, MW_DEPLOY_SOURCE, MW_BUILD_TESTER_APP).
   5. 409 on an event POST = the run is claimed by another host: the child is killed, nothing more
      is posted for that run.
 
@@ -107,7 +106,6 @@ import json
 import os
 import queue
 import re
-import secrets
 import shutil
 import signal
 import socket
@@ -900,74 +898,15 @@ def prepared_env(root: str = PREPARED_ROOT, tester: str = TESTER_APP) -> dict:
         env["MW_DEPLOY_SOURCE"] = deploy_src
     if os.path.isfile(os.path.join(tester, "mw-plugin-test.dll")):
         env["MW_BUILD_TESTER_APP"] = tester
+    # THE PREPARED TEST CLUSTER (deploy/build-host/host-postgres.sh, built at image build): UTF8 with a
+    # pgvector template. A stage that needs PostgreSQL starts a COPY of it inside its own sandbox —
+    # `eval "$(bash "$MW_TEST_PG_SERVER" start "$MW_TEST_PG_SNAPSHOT" <dir>)"` — never an initdb, never
+    # a container; every suite database is a clone of the template (MW_TEST_PG_TEMPLATE).
+    snapshot, server = os.path.join(root, "pg-snapshot"), os.path.join(root, "host-postgres.sh")
+    if os.path.isfile(os.path.join(snapshot, "ready")) and os.path.isfile(server):
+        env["MW_TEST_PG_SNAPSHOT"] = snapshot
+        env["MW_TEST_PG_SERVER"] = server
     return env
-
-
-# THE PREPARED TEST DATABASE: one pgvector server per pod (deploy/build-host/host-postgres.sh, started by
-# the entrypoint before the loop) with ONE prepared template. Per RUN: a fresh LOGIN CREATEDB role with
-# a random password, handed to every stage of the run as MW_TEST_PG_CONNECTION (+ the template's name),
-# so every database a suite opens is a CLONE of the prepared template — never one built from scratch.
-# After the run every database that role owns is dropped, then the role. The admin password is a file
-# under MW_TEST_PG_ROOT, which no sandbox binds; the socket directory is bound read-only (/opt).
-TEST_PG_ROOT = "/work/.mw-test-pg"
-TEST_PG_SOCKET = "/opt/build-host-pg"
-TEST_PG_ADMIN = "mwadmin"
-ROLE = re.compile(r"^run_[0-9a-f]{12}$")
-
-
-class TestPostgres:
-    def __init__(self, env: dict, psql: Callable[[str], tuple[int, str]] = None, log: Callable[[str], None] = None) -> None:
-        self.root = env.get("MW_TEST_PG_ROOT", TEST_PG_ROOT)
-        self.socket = env.get("MW_TEST_PG_SOCKET", TEST_PG_SOCKET)
-        self.log = log or (lambda s: None)
-        self.psql = psql or self._psql
-
-    def ready(self) -> dict:
-        """The server's ready marker (`template=`, `vector=`, …) — empty when no prepared server runs."""
-        try:
-            with open(os.path.join(self.root, "ready")) as fh:
-                return dict(l.strip().split("=", 1) for l in fh if "=" in l)
-        except OSError:
-            return {}
-
-    def _psql(self, sql: str) -> tuple[int, str]:
-        with open(os.path.join(self.root, "admin.pw")) as fh:
-            pw = fh.read().strip()
-        r = subprocess.run(["psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-h", self.socket, "-U", TEST_PG_ADMIN,
-                            "-d", "postgres", "-At", "-c", sql],
-                           env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PGPASSWORD": pw},
-                           capture_output=True, text=True, timeout=300)
-        return r.returncode, (r.stdout or "") + (r.stderr or "")
-
-    def open_run(self) -> tuple[Optional[str], dict]:
-        """(role, the stage env) for ONE run, or (None, {}) when there is no prepared server — the stage
-        that needs one then refuses, naming MW_TEST_PG_CONNECTION; a run never builds a server."""
-        ready = self.ready()
-        if not ready.get("template"):
-            return None, {}
-        role = "run_" + secrets.token_hex(6)
-        pw = secrets.token_hex(24)
-        rc, out = self.psql(f"CREATE ROLE {role} LOGIN CREATEDB PASSWORD '{pw}'")
-        if rc != 0:
-            self.log(f"the prepared test database refused a run role (exit {rc}): {out.strip()[-200:]} — no database is handed to this run")
-            return None, {}
-        return role, {"MW_TEST_PG_CONNECTION": f"Host={self.socket};Username={role};Password={pw};Database=postgres",
-                      "MW_TEST_PG_TEMPLATE": ready["template"]}
-
-    def close_run(self, role: Optional[str]) -> None:
-        """Every database the run's role owns, then the role. Said when it fails — never silent."""
-        if not role or not ROLE.match(role):
-            return
-        rc, out = self.psql("SELECT d.datname FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba "
-                            f"WHERE r.rolname = '{role}'")
-        dbs = [l for l in out.splitlines() if l.strip()] if rc == 0 else []
-        for db in dbs:
-            drc, dout = self.psql('DROP DATABASE IF EXISTS "' + db.replace('"', '""') + '" WITH (FORCE)')
-            if drc != 0:
-                self.log(f"run role {role}: database {db} could not be dropped: {dout.strip()[-200:]}")
-        rc2, out2 = self.psql(f"DROP ROLE IF EXISTS {role}")
-        if rc != 0 or rc2 != 0:
-            self.log(f"run role {role}: teardown incomplete ({(out + out2).strip()[-200:]}) — the next pod start re-creates the server")
 
 
 class Sandbox:
@@ -1536,7 +1475,6 @@ class Host:
         self.plugins_known = False
         self.held: list[EventSink] = []
         self.artifacts_dir = ""
-        self.test_pg = TestPostgres(env, log=self.log)
         self.run_env: dict = {}
         self.plugins_key: Optional[str] = None
         self.heartbeat: Optional[Heartbeat] = None
@@ -1776,8 +1714,7 @@ class Host:
         self.run_scope = {"channel": claimed.strip()} if isinstance(claimed, str) and claimed.strip() else {"channel": self.channel}
         if claim.get("claimId"):
             self.claim_id = str(claim["claimId"])
-        pg_role, pg_env = self.test_pg.open_run()
-        self.run_env = {**prepared_env(), **pg_env}
+        self.run_env = prepared_env()
         with Heartbeat() as hb:
             self.heartbeat = hb
             outcome = "lost"
@@ -1788,7 +1725,6 @@ class Host:
             finally:
                 self.heartbeat = None
                 self.run_env = {}
-                self.test_pg.close_run(pg_role)
                 # A run refused before any stage never created its artifacts directory: nothing was
                 # handed over, so there is no receipt to keep the workspace for.
                 if (outcome == "undelivered" and os.path.isdir(self.artifacts_dir)
@@ -2477,35 +2413,15 @@ def self_test() -> int:
                                                     "MW_DEPLOY_SOURCE": os.path.join(pr, "deploy-src"),
                                                     "MW_BUILD_TESTER_APP": os.path.join(pr, "tester")}, pe)
         check("prepared/reaches a stage through the allow-list", sandbox_env({"PATH": "/usr/bin"}, pe, "/cache").get("MW_DEPLOY_SOURCE") == pe["MW_DEPLOY_SOURCE"], pe)
-        # THE PREPARED TEST DATABASE: per-run role in, every owned database and the role out.
-        sql: list[str] = []
-        def fake_psql(q, answers={}):
-            sql.append(q)
-            if q.startswith("SELECT d.datname"):
-                return 0, 'suite_a_1234\nweird"db\n'
-            return answers.get(q.split()[0], (0, ""))
-        tp = TestPostgres({"MW_TEST_PG_ROOT": pr, "MW_TEST_PG_SOCKET": "/opt/x"}, psql=fake_psql)
-        check("testpg/no ready marker: no role, nothing handed", tp.open_run() == (None, {}) and sql == [], sql)
-        open(os.path.join(pr, "ready"), "w").write("template=mw_test_template\nvector=0.8.0\n")
-        role, penv = tp.open_run()
-        check("testpg/a fresh role per run", bool(role) and ROLE.match(role) is not None and sql[-1].startswith(f"CREATE ROLE {role} LOGIN CREATEDB PASSWORD"), sql)
-        check("testpg/the stage gets the run's own credential and the template",
-              penv.get("MW_TEST_PG_TEMPLATE") == "mw_test_template" and f"Username={role};" in penv.get("MW_TEST_PG_CONNECTION", "")
-              and penv["MW_TEST_PG_CONNECTION"].startswith("Host=/opt/x;"), penv)
-        check("testpg/the run credential passes the credential filter by NAME (it is the run's, not the host's)",
-              sandbox_env({"PATH": "/usr/bin"}, penv, "/cache").get("MW_TEST_PG_TEMPLATE") == "mw_test_template", penv)
-        role2, _ = tp.open_run()
-        check("testpg/two runs never share a role", role2 != role, (role, role2))
-        sql.clear()
-        tp.close_run(role)
-        check("testpg/teardown drops every owned database (quoted) then the role",
-              sql[1:] == ['DROP DATABASE IF EXISTS "suite_a_1234" WITH (FORCE)', 'DROP DATABASE IF EXISTS "weird""db" WITH (FORCE)',
-                          f"DROP ROLE IF EXISTS {role}"], sql)
-        sql.clear()
-        tp.close_run("postgres; DROP ROLE mwadmin")
-        check("testpg/teardown refuses a name that is not a run role", sql == [], sql)
-        refusing = TestPostgres({"MW_TEST_PG_ROOT": pr}, psql=lambda q: (1, "permission denied"))
-        check("testpg/a refused role is said and hands nothing", refusing.open_run() == (None, {}))
+        # THE PREPARED TEST CLUSTER: handed only with its ready marker AND its starter.
+        os.makedirs(os.path.join(pr, "pg-snapshot"))
+        check("prepared/a snapshot without its ready marker is NOT handed", "MW_TEST_PG_SNAPSHOT" not in prepared_env(pr, pr), pr)
+        open(os.path.join(pr, "pg-snapshot", "ready"), "w").write("template=mw_test_template\n")
+        check("prepared/a snapshot without its starter is NOT handed", "MW_TEST_PG_SNAPSHOT" not in prepared_env(pr, pr), pr)
+        open(os.path.join(pr, "host-postgres.sh"), "w").close()
+        pe = prepared_env(pr, pr)
+        check("prepared/the snapshot and its starter are handed together",
+              pe.get("MW_TEST_PG_SNAPSHOT") == os.path.join(pr, "pg-snapshot") and pe.get("MW_TEST_PG_SERVER") == os.path.join(pr, "host-postgres.sh"), pe)
     with tempfile.TemporaryDirectory() as ps:
         check("platform scripts/absent: no MW_PLATFORM_SCRIPTS at all (never an empty value)", platform_scripts_env(ps) == {}, ps)
         for n in PLATFORM_SCRIPTS:

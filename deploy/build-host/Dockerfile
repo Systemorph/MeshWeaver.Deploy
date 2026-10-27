@@ -2,9 +2,9 @@
 #
 # What a stage needs and nothing it does not: bash, python3, git, bubblewrap (every stage runs in a
 # `bwrap` sandbox — the host refuses to start without it), the .NET 10 SDK (the src/ half still
-# builds with it), the PostgreSQL SERVER BINARIES with pgvector (host-postgres.sh starts ONE prepared
-# server per pod with a pgvector template every test database is cloned from — each run gets its own
-# role; sandbox-postgres.sh still starts a disposable one for a stage that wants its own), core's
+# builds with it), PostgreSQL 17 with pgvector and a PREPARED test cluster built at image build
+# (host-postgres.sh: UTF8, a pgvector template every suite database is cloned from — a stage starts a
+# copy of it inside its own sandbox; sandbox-postgres.sh still initialises a bare one on demand), core's
 # SOURCE at the set's commit and this repository's portal chart (the portal-host lane's test-support
 # projects and chart guards — handed to stages as MW_PLATFORM_SOURCE / MW_DEPLOY_SOURCE), and the runner with its
 # helpers — module-build-key.py (the host recomputes every module cache key before promoting it),
@@ -72,7 +72,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends "postgresql-${PG_MAJOR}" "postgresql-${PG_MAJOR}-pgvector" \
  && rm -rf /var/lib/apt/lists/* \
  && test -f "/usr/share/postgresql/${PG_MAJOR}/extension/vector.control" \
- && install -d -o 1654 -g 1654 -m 0700 /opt/build-host-pg \
+ && install -d -o 1654 -g 1654 -m 0700 /opt/build-host/pg-snapshot \
  && bwrap --version && python3 --version && git --version && dotnet --version \
  && find /usr/lib/postgresql -maxdepth 3 -name initdb | grep -q initdb
 
@@ -92,8 +92,12 @@ RUN chmod 0555 /opt/build-host/*.py /opt/build-host/*.sh \
 
 # The SDK image's unprivileged `app` user (uid 1654). bwrap creates its namespaces unprivileged.
 USER 1654
-# The prepared server's self-test needs a real server, which initdb refuses to create as root.
-RUN bash /opt/build-host/host-postgres.sh --self-test
+# The PREPARED test cluster (UTF8, a pgvector template) is built HERE, once per image, as the
+# unprivileged user (initdb refuses root); a stage starts a copy of it inside its sandbox. The
+# self-test is a REAL server: two stage servers from copies, the suites' superuser operations,
+# isolation, and TCP / a missing / a stale snapshot refused.
+RUN bash /opt/build-host/host-postgres.sh --self-test \
+ && bash /opt/build-host/host-postgres.sh prepare /opt/build-host/pg-snapshot
 WORKDIR /work
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 ARG DEPLOY_COMMIT
@@ -101,4 +105,4 @@ ARG PLATFORM_COMMIT
 LABEL org.opencontainers.image.source="https://github.com/Systemorph/MeshWeaver.Deploy" \
       org.opencontainers.image.revision="${DEPLOY_COMMIT}" \
       io.meshweaver.platform.revision="${PLATFORM_COMMIT}"
-ENTRYPOINT ["/bin/bash", "-c", "set -euo pipefail; bash /opt/build-host/compose-gate-host.sh /portal/app /tester /host/app; bash /opt/build-host/host-postgres.sh start; exec python3 /opt/build-host/build-run.py --host"]
+ENTRYPOINT ["/bin/bash", "-c", "set -euo pipefail; bash /opt/build-host/compose-gate-host.sh /portal/app /tester /host/app; exec python3 /opt/build-host/build-run.py --host"]
