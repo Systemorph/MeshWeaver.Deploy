@@ -354,13 +354,18 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def runner_key(repo: Path) -> dict:
-    """{inputs_commit, runner_rev} of the checkout at `repo`: the newest commit (from HEAD) that touched
-    `RUNNER_INPUTS`, and its ancestor count. 🚨 A SHALLOW checkout is refused: its ancestor count is
-    the clone depth, not the history, and would tag a runner with a revision that means nothing."""
+    """{inputs_commit, runner_rev} of the checkout at `repo`: the newest FIRST-PARENT commit (from HEAD)
+    whose change against its first parent touched `RUNNER_INPUTS`, and its ancestor count. 🚨 First
+    parent only: a plain path-limited `git log` simplifies a merge that is TREESAME to its feature-branch
+    parent onto that parent, and a feature commit's ancestor count can equal (or trail) a revision main
+    already published — different inputs would then reuse an old revision and never be built. Along
+    main's first-parent chain every later commit has strictly more ancestors, so the revision is
+    monotone. 🚨 A SHALLOW checkout is refused: its ancestor count is the clone depth, not the history,
+    and would tag a runner with a revision that means nothing."""
     if _git(repo, "rev-parse", "--is-shallow-repository") != "false":
         raise Refusal(f"{repo} is a shallow clone — the runner revision is an ancestor count and needs the "
                       "full history (actions/checkout fetch-depth: 0)")
-    commit = _git(repo, "log", "-1", "--format=%H", "HEAD", "--", *RUNNER_INPUTS)
+    commit = _git(repo, "log", "-1", "--first-parent", "--format=%H", "HEAD", "--", *RUNNER_INPUTS)
     if not SHA.fullmatch(commit):
         raise Refusal(f"no commit in {repo} touches the runner inputs {list(RUNNER_INPUTS)} — not this repository?")
     return {"inputs_commit": commit, "runner_rev": str(int(_git(repo, "rev-list", "--count", commit)))}
@@ -710,6 +715,23 @@ def _self_test() -> int:
         c5 = commit(repo, "deploy/build-host/Dockerfile", "FROM x")      # 5 — an input
         check("runner-key: a Dockerfile change moves it again — monotone along main", lambda: runner_key(repo),
               lambda o: o["inputs_commit"] == c5 and int(o["runner_rev"]) > 4)
+        # A MERGE whose result equals its feature-branch parent (the feature's change won the conflict):
+        # a plain path-limited log follows that parent and returns the feature commit, whose ancestor
+        # count EQUALS the revision main already published — the merge must get a new revision instead.
+        base = git(repo, "rev-parse", "HEAD")
+        git(repo, "checkout", "-q", "-b", "feature")
+        commit(repo, "deploy/helm/values.yaml", "feature chart")          # the feature's input change
+        git(repo, "checkout", "-q", "main")
+        published = commit(repo, "deploy/helm/values.yaml", "main chart")  # main moves the same input
+        published_rev = runner_key(repo)["runner_rev"]
+        check("runner-key: the main commit and the feature commit share an ancestor count (the trap's premise)",
+              lambda: git(repo, "rev-list", "--count", "feature") == published_rev, lambda o: o is True)
+        git(repo, "merge", "-q", "--no-ff", "--no-commit", "-X", "theirs", "feature")
+        git(repo, "commit", "-q", "-m", "merge feature (its chart wins)")
+        merged = git(repo, "rev-parse", "HEAD")
+        check("runner-key: a merge adopting the feature's inputs gets a NEW, higher revision (first parent)",
+              lambda: runner_key(repo),
+              lambda o: o["inputs_commit"] == merged and int(o["runner_rev"]) > int(published_rev) and base != published)
         shallow = Path(tmp) / "shallow"
         subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{repo}", str(shallow)], check=True, capture_output=True)
         check("runner-key: refuses a shallow clone (its count is the depth, not the history)",

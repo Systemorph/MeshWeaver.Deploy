@@ -50,8 +50,9 @@ delivery waits on it.
 **The runner follows this repository's `main`** (owner: "always latest everything is installed").
 A runner is built from the set's platform commit AND this repository's runner inputs
 (`.github/scripts/build-run.py`, `deploy/build-host/`, `deploy/helm/`), so it is keyed by both:
-`mw-build-host:<version>-r<rev>`, where `rev` is the ancestor count of the newest commit touching
-those inputs (`platform-set-dispatch.py runner-key`; a shallow checkout is refused). When the newest
+`mw-build-host:<version>-r<rev>`, where `rev` is the ancestor count of the newest FIRST-PARENT commit
+touching those inputs (`platform-set-dispatch.py runner-key`; first parent so a merge adopting a feature
+branch's inputs gets a new, higher revision; a shallow checkout is refused). When the newest
 armed set's runners all predate main's `rev`, the tick REFRESHES it (after a set with no runner at
 all, before the backfill), and the hand-over sends the set's highest-revision runner naming every
 older one in `supersedesRunnerDigests` (`runner-choice`). The receiver (MeshWeaver.Plugins

@@ -40,7 +40,7 @@ name: Build host — runner image and the build-latest hand-over
 # hand over.
 #
 # 🔁 THE RUNNER FOLLOWS DEPLOY'S MAIN (owner: "always latest everything is installed"). A runner is
-# keyed by (set, runner revision) — `rev` is the ancestor count of the newest commit touching the
+# keyed by (set, runner revision) — `rev` is the ancestor count of the newest first-parent commit touching the
 # runner inputs (`platform-set-dispatch.py runner-key`). A Deploy change to the runner therefore
 # makes the newest armed set's runner STALE, the next tick REFRESHES it (`discover`), and the
 # hand-over sends the set's highest-revision runner naming every older one as superseded — the
