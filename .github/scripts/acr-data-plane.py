@@ -561,7 +561,10 @@ def run_cache_import_problem(body: str) -> str | None:
     consuming = []
     for m in loops:
         var, feed = m.group(1), m.group(3)
-        appends = re.search(rf'\bfrom\+=\(\s*--cache-from\s+"type=registry,ref=[^"]*\$\{{?{var}\}}?[^"]*"\s*\)',
+        # The read variable EXACTLY: `${V}`, or `$V` not followed by an identifier character (so neither
+        # `$V_other` nor `${V_other}` counts as consuming V).
+        appends = re.search(rf'\bfrom\+=\(\s*--cache-from\s+"type=registry,ref=[^"]*'
+                            rf'(?:\$\{{{var}\}}|\${var}(?![A-Za-z0-9_]))[^"]*"\s*\)',
                             m.group("loop"))
         if appends and feed in sources:
             consuming.append(m)
@@ -1128,6 +1131,15 @@ jobs:
     check("cache: a loop appending a CONSTANT instead of the listed tag is red",
           lambda: check_cache_handover(handover.replace('ref=$ACR/$REPO:$tag")', 'ref=$ACR/$REPO:$BUILD_CACHE")')),
           lambda p: len(p) == 1 and "nothing appends" in p[0])
+    check("cache: a loop appending `$tag_other` (not the read `tag`) is red (review of #54)",
+          lambda: check_cache_handover(handover.replace('ref=$ACR/$REPO:$tag")', 'ref=$ACR/$REPO:$tag_other")')),
+          lambda p: len(p) == 1 and "nothing appends" in p[0])
+    check("cache: a loop appending `${tag_other}` (not the read `tag`) is red (review of #54)",
+          lambda: check_cache_handover(handover.replace('ref=$ACR/$REPO:$tag")', 'ref=$ACR/$REPO:${tag_other}")')),
+          lambda p: len(p) == 1 and "nothing appends" in p[0])
+    check("cache: a loop appending `${tag}` (braced, the read variable) passes",
+          lambda: check_cache_handover(handover.replace('ref=$ACR/$REPO:$tag")', 'ref=$ACR/$REPO:${tag}")')),
+          lambda p: p == [])
     check("cache: a loop over a file NOT derived from the listing is red",
           lambda: check_cache_handover(handover.replace('done < "$RUNNER_TEMP/run-caches"', 'done < "$RUNNER_TEMP/elsewhere"')),
           lambda p: len(p) == 1 and "nothing appends" in p[0])
