@@ -82,6 +82,14 @@ ask for — see
 [`PluginRegistry.md`](../../src/MeshWeaver.Documentation/Data/Architecture/PluginRegistry.md)
 → *Plans*. `memex-local registry off` returns to serving a checkout.
 
+**What installs at first boot in registry mode is the first-run wizard's decision, not the
+chart's.** `helm_deploy` clears the chart's `pluginCatalog.installByDefault` (`["Plugins/*"]`)
+in this mode: the registry source is named by its URL, so that pattern named a source the
+install does not have (`[DefaultInstall] 1 InstallByDefault pattern(s) name a source this
+installation does not have`) while overriding the packages the person ticked in the wizard.
+The instance manifest the wizard writes carries the selection instead. Self-registry mode keeps
+its per-source `<name>/*` entries.
+
 ## Use
 
 ```bash
@@ -117,6 +125,27 @@ Docker store — the *no-cloud-creds* path the doc leads with for un-pushed sour
 which needs the MeshWeaver source: set `MEMEX_REPO` to your checkout, or run from
 a checkout. **Option A** (`--from-acr`) pulls the now-multi-arch image from
 `meshweaver.azurecr.io` (run `az acr login -n meshweaver` first).
+
+### First run — the wizard, the token, the key
+
+A portal with no database serves the **first-run wizard** and nothing else. `memex-local up` (and
+`memex-local update` onto an instance that is not set up yet) ends by handing you straight into it:
+one line saying so, then the wizard's URL **with its one-time setup token already in it**, opened
+in your browser. If you ever reach the page without the token, `memex-local setup` re-prints and
+re-opens that link — the page itself says the same, because the chart's tracked defaults set
+`InstanceSetup__TokenCommand: "memex-local setup"`.
+
+In the wizard the **Registration key is optional**: leave it empty and the instance registers on
+the free plan; a key is a pre-minted coupon a registry administrator hands a customer for a paid
+plan, and the administrator can raise the plan later without one. For the database, "PostgreSQL —
+the database this deployment already runs" is offered pre-selected (the connection string is never
+shown); SQLite stays one click away, and pasting a connection string is only for a server of your
+own.
+
+After the wizard the portal restarts and installs the packages you chose. While it does,
+`memex-local verify` exits **2** and `up`/`update` print one calm line — *"still installing its
+packages — this finishes by itself"*. That is a state, not an error; only exit 1 (a red with a
+remedy) means something is broken.
 
 ### First-run secrets & OAuth
 

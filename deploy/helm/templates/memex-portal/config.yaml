@@ -1399,6 +1399,21 @@ data:
   # One-shot first-admin bootstrap secret. Empty = endpoint disabled. Set it, POST
   # /bootstrap/first-admin?secret=...&email=..., then clear it. (Self-host / local only.)
   Bootstrap__Secret: "{{ .Values.config.memex_portal.Bootstrap__Secret | default "" }}"
+  {{- /* ---- First-run setup hints (Memex.Portal.Shared/Setup/SetupHostHints.cs in MeshWeaver.Plugins).
+         InstanceSetup__TokenCommand (read as InstanceSetup:TokenCommand): the command that re-prints
+         the wizard link on THIS install — the setup page tells a person who reaches it without the
+         one-time ?token= exactly what to run ("On this install, run `memex-local setup`"). Blank reads
+         as unset and the page falls back to "read the pod log". The local defaults set it; a cluster
+         install leaves it empty. */}}
+  {{- if .Values.config.memex_portal.InstanceSetup__TokenCommand }}
+  InstanceSetup__TokenCommand: "{{ .Values.config.memex_portal.InstanceSetup__TokenCommand }}"
+  {{- end }}
+  {{- /* InstanceSetup__HostPlatform (read as InstanceSetup:HostPlatform): the host the portal runs
+         on, e.g. "mac" — the wizard's package step pre-checks the host-only packages (Google,
+         iMessage, WhatsApp on a Mac) from it. Blank reads as unset: no host-specific pre-check. */}}
+  {{- if .Values.config.memex_portal.InstanceSetup__HostPlatform }}
+  InstanceSetup__HostPlatform: "{{ .Values.config.memex_portal.InstanceSetup__HostPlatform }}"
+  {{- end }}
   # ---- Static-repo → DB sync: which partitions are materialized into + served from the DB
   # (instead of the in-memory static provider). Default = Doc, Agent, Provider, Harness, Skill.
   # (The model catalog — providers + models + policy — imports into the top-level "Provider"

@@ -65,6 +65,18 @@ config:
     # the previous behaviour rather than a slower variant of it.
     PreWarm__BatchBake: "true"
     PreWarm__BetweenTypes: "00:00:00"
+    # ---- First-run setup: name the command that re-prints the wizard link -------
+    # The portal's setup page is gated by a one-time token printed to the pod log. A
+    # person who reaches the page WITHOUT it (a stale tab, a typed URL) is told where
+    # the token is, and — when this key is set — exactly what to run on THIS install:
+    # "On this install, run `memex-local setup`". Read by Memex.Portal.Shared/Setup in
+    # MeshWeaver.Plugins as the configuration key InstanceSetup:TokenCommand. Bound by name in
+    # the ConfigMap's literal half (deploy/helm/templates/memex-portal/config.yaml, rendered
+    # only when set) — the binding guard requires every values key to be templated there.
+    InstanceSetup__TokenCommand: "memex-local setup"
+    # This install runs on a Mac: the wizard's package step pre-checks the Mac-only packages
+    # (Google, iMessage, WhatsApp) from InstanceSetup:HostPlatform; bound the same way.
+    InstanceSetup__HostPlatform: "mac"
 
 # ---- Portal Ingress: the TLS Secret is minted by `memex-local up`, not issued -------------------
 # The chart refuses an ingress that names a `tlsSecret` with no issuer reaching it (an ingress
