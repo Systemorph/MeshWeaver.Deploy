@@ -128,6 +128,8 @@ jobs:
         run: python3 deploy/.github/scripts/build-run.py --self-test
       - name: The announcement can say no (self-test)
         run: python3 deploy/.github/scripts/build-host-announcement.py --self-test
+      - name: The runner's platform reading can say no (self-test)
+        run: python3 deploy/.github/scripts/build-host-platforms.py --self-test
       # The publishing identity holds AcrPush on the registry resource ONLY. Hold this lane to it:
       # every azure/login tenant-level, every registry call on the data plane (no ARM lookup).
       - name: The registry is reached as a resource-scoped identity can (self-test + this lane)
@@ -516,12 +518,25 @@ jobs:
           case "$digest" in sha256:*) ;; *) echo "::error::mw-build-host:$VERSION resolves to no digest ('$digest')"; exit 1 ;; esac
           # Kept or joined, the version's tag must carry BOTH platforms: a kept amd64-only runner
           # (written before the arm64 leg existed) is named, never handed on as a multi-arch one.
-          plats=$(docker buildx imagetools inspect "$ref" --raw | jq -r '[.manifests[]?.platform | select(. != null) | "\(.os)/\(.architecture)"] | join(" ")')
-          for p in linux/amd64 linux/arm64; do
-            case " $plats " in *" $p "*) ;; *) echo "::warning title=mw-build-host:$VERSION lacks $p::the tag's platforms are '${plats:-<a single-platform manifest>}' — a host on $p cannot run this version's runner (a version's runner is written once)" ;; esac
+          # An index names its platforms; a single image manifest only in its config — both are read
+          # (build-host-platforms.py), and what cannot be read is said to be unknown, never "missing".
+          docker buildx imagetools inspect "$ref" --raw > "$RUNNER_TEMP/runner-raw.json"
+          docker buildx imagetools inspect "$ref" --format '{{json .Image}}' > "$RUNNER_TEMP/runner-image.json" \
+            || : > "$RUNNER_TEMP/runner-image.json"
+          python3 deploy/.github/scripts/build-host-platforms.py read --raw "$RUNNER_TEMP/runner-raw.json" \
+            --image "$RUNNER_TEMP/runner-image.json" > "$RUNNER_TEMP/runner-platforms"
+          known=$(sed -n 's/^known=//p' "$RUNNER_TEMP/runner-platforms")
+          plats=$(sed -n 's/^platforms=//p' "$RUNNER_TEMP/runner-platforms")
+          missing=$(sed -n 's/^missing=//p' "$RUNNER_TEMP/runner-platforms")
+          if [ "$known" != true ]; then
+            plats="platforms unknown"
+            echo "::warning title=mw-build-host:$VERSION platforms unknown::neither the tag's manifest nor its image config names its platforms — whether a linux/amd64 or linux/arm64 host can run it is not established"
+          fi
+          for p in $missing; do
+            echo "::warning title=mw-build-host:$VERSION lacks $p::the tag's platforms are '$plats' — a host on $p cannot run this version's runner (a version's runner is written once)"
           done
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          echo "- mw-build-host \`$VERSION\` = \`$digest\` (${plats:-single-platform})" >> "$GITHUB_STEP_SUMMARY"
+          echo "- mw-build-host \`$VERSION\` = \`$digest\` ($plats)" >> "$GITHUB_STEP_SUMMARY"
       # The same manifest to the fleet registry, digest verified — the registry contract every image
       # of the set keeps, so a build-host record whose runnerRepository names the fleet registry can
       # pull the digest it is handed.
