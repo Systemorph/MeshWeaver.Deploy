@@ -1,0 +1,48 @@
+# TEMPORARY diagnostic — do not merge. Does the meshweaver-cloud App's installation token read
+# repository CONTENT (git + REST contents) on private repos? Prints only status codes, the App slug
+# and the installation id. Discriminates a systemorph-com-installation limit from an org-wide one.
+name: diag — app token content probe
+on:
+  pull_request:
+    paths: ['.github/workflows/diag-app-token-probe.yml']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - id: narrow
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.MESHWEAVER_APP_ID }}
+          private-key: ${{ secrets.MESHWEAVER_APP_PRIVATE_KEY }}
+          owner: Systemorph
+          repositories: Memex,MeshWeaver.Plugins
+          permission-contents: read
+      - id: wide
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.MESHWEAVER_APP_ID }}
+          private-key: ${{ secrets.MESHWEAVER_APP_PRIVATE_KEY }}
+          owner: Systemorph
+      - name: probe
+        env:
+          T_NARROW: ${{ steps.narrow.outputs.token }}
+          T_WIDE: ${{ steps.wide.outputs.token }}
+          SLUG_N: ${{ steps.narrow.outputs.app-slug }}
+          INST_N: ${{ steps.narrow.outputs.installation-id }}
+          SLUG_W: ${{ steps.wide.outputs.app-slug }}
+          INST_W: ${{ steps.wide.outputs.installation-id }}
+        run: |
+          echo "narrow: app-slug=$SLUG_N installation-id=$INST_N"
+          echo "wide:   app-slug=$SLUG_W installation-id=$INST_W"
+          for kind in narrow wide; do
+            [ "$kind" = narrow ] && T="$T_NARROW" || T="$T_WIDE"
+            for repo in Memex MeshWeaver.Plugins; do
+              meta=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $T" "https://api.github.com/repos/Systemorph/$repo")
+              readme=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $T" "https://api.github.com/repos/Systemorph/$repo/readme")
+              if git ls-remote "https://x-access-token:$T@github.com/Systemorph/$repo.git" HEAD >/dev/null 2>&1; then lr=ok; else lr=FAIL; fi
+              echo "$kind $repo: metadata=$meta readme=$readme ls-remote=$lr"
+            done
+          done
