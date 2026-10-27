@@ -468,6 +468,16 @@ spec:
 {{- end }}
 {{- end }}
 {{- end }}
+{{- /* The standing build hosts' artifact store (buildHosts.artifactStore.claimName), READ-ONLY: the build API serves a
+       receipted object's bytes from it (GET /api/builds/{repo}/{sha}/artifacts/{sha256}, MeshWeaver.Plugins
+       Hosting/StandingBuildHosts.md) to a reader that mounts no store — core's public CI. Derived from the SAME helper the
+       hosts render from, so the claim and the spec the portal reads can never differ from the ones the hosts write. */}}
+{{- $bhStore := (include "memex.buildHosts" . | fromYaml).artifactStore | default dict }}
+{{- if $bhStore.claimName }}
+            - name: "build-artifacts"
+              mountPath: "/build-artifacts"
+              readOnly: true
+{{- end }}
 {{- /* The mount of the DECLARED Key Vault CSI volume (.Values.keyVaultSecrets). The mount is what
        makes the driver fetch the vault objects, create the synced Secret and keep rotating it — a
        SecretProviderClass with no mounting pod syncs nothing, with no error anywhere. */}}
@@ -743,6 +753,14 @@ spec:
             readOnly: true
 {{- end }}
 {{- end }}
+{{- end }}
+{{- /* The build hosts' artifact store, read-only (the mount above says why). */}}
+{{- $bhStoreVol := (include "memex.buildHosts" . | fromYaml).artifactStore | default dict }}
+{{- if $bhStoreVol.claimName }}
+        - name: "build-artifacts"
+          persistentVolumeClaim:
+            claimName: "{{ $bhStoreVol.claimName }}"
+            readOnly: true
 {{- end }}
 {{- /* The DECLARED Key Vault CSI volume (.Values.keyVaultSecrets) — the volume half of the
        SecretProviderClass the chart renders in secretproviderclass.yaml. Same block, so the

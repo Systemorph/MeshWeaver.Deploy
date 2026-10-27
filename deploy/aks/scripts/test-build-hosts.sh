@@ -20,6 +20,8 @@
 #   3d. a build-host-only release (portal.enabled: false) renders the version's host, its cache and
 #      the release-named ServiceAccount + NetworkPolicy and NOTHING of the portal, and two such
 #      releases and the portal's own never name one object twice;
+#   3f. a release whose hosts have an artifact store mounts it READ-ONLY into the portal and names the
+#      hosts' own spec to the build API; without one, neither renders;
 #   4. the refusals hold: a tag instead of a digest, plain http to a public host, and a registry
 #      credential for the host, fail
 #      `helm template` naming why.
@@ -613,6 +615,51 @@ sys.exit(1 if problems else 0)
 PY4
 else
   report "the node-local cache values did not render:"; sed 's/^/    /' "$WORK/nodecache.err"
+fi
+
+# 3f. the PORTAL mounts the hosts' artifact store READ-ONLY and names it to the build API (Hosting__Builds__ArtifactStore =
+#     the hosts' own MW_BUILD_ARTIFACT_STORE, Hosting__Builds__ArtifactStoreRoot = the mount), so the API can serve a receipted
+#     object's bytes to a reader with no store (core's public CI); and a release whose hosts have no store renders neither.
+if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --namespace check > "$WORK/store.yaml" 2> "$WORK/store.err" \
+   && helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.artifactStore.claimName= \
+        --namespace check > "$WORK/nostore.yaml" 2>> "$WORK/store.err"; then
+  python3 - "$WORK/store.yaml" "$WORK/nostore.yaml" <<'PY5' && ok "the portal mounts the hosts' artifact store read-only and names its spec + root; no store, neither renders" || report "the portal's read-only artifact-store mount is wrong (above)"
+import sys, yaml
+def portal(path):
+    docs = [d for d in yaml.safe_load_all(open(path)) if d]
+    dep = next((d for d in docs if d.get("kind") == "Deployment" and d["metadata"]["name"] == "memex-portal-deployment"), None)
+    cms = [d for d in docs if d.get("kind") == "ConfigMap"]
+    hosts = [d for d in docs if d.get("kind") == "Deployment" and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "build-host"]
+    return dep, cms, hosts
+problems = []
+dep, cms, hosts = portal(sys.argv[1])
+if dep is None:
+    problems.append("no portal Deployment rendered")
+else:
+    pod = dep["spec"]["template"]["spec"]
+    c = next(c for c in pod["containers"] if c["name"] == "memex-portal")
+    m = next((m for m in c.get("volumeMounts", []) if m["name"] == "build-artifacts"), None)
+    v = next((v for v in pod.get("volumes", []) if v["name"] == "build-artifacts"), None)
+    if m != {"name": "build-artifacts", "mountPath": "/build-artifacts", "readOnly": True}:
+        problems.append(f"portal mount: {m}")
+    if v != {"name": "build-artifacts", "persistentVolumeClaim": {"claimName": "ci-artifacts", "readOnly": True}}:
+        problems.append(f"portal volume: {v}")
+data = {k: v for cm in cms for k, v in (cm.get("data") or {}).items()}
+host_spec = {e["name"]: e.get("value") for h in hosts for c in h["spec"]["template"]["spec"]["containers"] if c["name"] == "build" for e in c.get("env", [])}.get("MW_BUILD_ARTIFACT_STORE")
+if data.get("Hosting__Builds__ArtifactStore") != host_spec or host_spec != "file:/ci-artifacts":
+    problems.append(f"the portal's store spec {data.get('Hosting__Builds__ArtifactStore')!r} is not the hosts' {host_spec!r}")
+if data.get("Hosting__Builds__ArtifactStoreRoot") != "/build-artifacts":
+    problems.append(f"the portal's store root: {data.get('Hosting__Builds__ArtifactStoreRoot')!r}")
+dep, cms, _ = portal(sys.argv[2])
+if dep is not None and any(v["name"] == "build-artifacts" for v in dep["spec"]["template"]["spec"].get("volumes", [])):
+    problems.append("a release whose hosts have no store still mounts one into the portal")
+if any("Hosting__Builds__ArtifactStore" in (cm.get("data") or {}) for cm in cms):
+    problems.append("a release whose hosts have no store still names one to the portal")
+for p in problems: print("   ", p)
+sys.exit(1 if problems else 0)
+PY5
+else
+  report "the artifact-store mount values did not render:"; sed 's/^/    /' "$WORK/store.err"
 fi
 
 # 4. refusals

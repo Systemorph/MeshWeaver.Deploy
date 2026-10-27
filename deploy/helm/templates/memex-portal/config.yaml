@@ -762,6 +762,14 @@ data:
   {{- if .Values.config.memex_portal.Hosting__Builds__Concurrency }}
   Hosting__Builds__Concurrency: "{{ .Values.config.memex_portal.Hosting__Builds__Concurrency }}"
   {{- end }}
+  # The build hosts' artifact store as the HOSTS name it (their MW_BUILD_ARTIFACT_STORE) and where THIS portal mounts it
+  # read-only (deployment.yaml, `build-artifacts`): the build API serves a receipted object's bytes only from a locator
+  # under that spec (MeshWeaver.Plugins BuildHostEndpoints). Rendered only when the release's build hosts have a store.
+  {{- $bhStoreCfg := (include "memex.buildHosts" . | fromYaml).artifactStore | default dict }}
+  {{- if $bhStoreCfg.claimName }}
+  Hosting__Builds__ArtifactStore: "{{ $bhStoreCfg.spec }}"
+  Hosting__Builds__ArtifactStoreRoot: "/build-artifacts"
+  {{- end }}
   # ---- The triage scope (MeshWeaver.Plugins Hosting/Triage → "The scope") ----------------------
   # Binds Hosting:Triage:Repositories: the ONLY repositories the control instance's periodic issue
   # sweep lists and its org-webhook issue intake triages (one comma-separated value). Absent = the

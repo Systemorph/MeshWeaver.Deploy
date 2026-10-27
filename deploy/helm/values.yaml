@@ -1218,6 +1218,10 @@ buildHosts:
   # H9: the shared CI artifact store the HOST hands every module bundle (and the gate bake) to
   # before posting its receipt — content-addressed, read back. claimName mounts the runners' shared
   # share at /ci-artifacts (spec defaults to file:/ci-artifacts). An existing claim; never created.
+  # The SAME claim is mounted READ-ONLY into this release's portal at /build-artifacts, with
+  # Hosting__Builds__ArtifactStore (= this spec) and Hosting__Builds__ArtifactStoreRoot, so the build API
+  # can serve a receipted object's bytes (GET /api/builds/{repo}/{sha}/artifacts/{sha256}) to a reader
+  # that mounts no store — core's public CI.
   artifactStore:
     spec: ""
     claimName: ""
