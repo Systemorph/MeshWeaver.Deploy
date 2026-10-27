@@ -5,7 +5,9 @@
 # builds with it), the PostgreSQL SERVER BINARIES (no server runs: a stage that needs a database
 # starts a disposable one inside its own sandbox with sandbox-postgres.sh), and the runner with its
 # helpers — module-build-key.py (the host recomputes every module cache key before promoting it),
-# ci-artifact-store.py (H9: the host hands every module bundle to the shared CI artifact store)
+# ci-artifact-store.py (H9: the host hands every module bundle to the shared CI artifact store),
+# compile-check.py (the canonical NodeType checker a repository's stages run, handed to them as
+# MW_PLATFORM_SCRIPTS — a sandbox has no credential to fetch it)
 # and core's `meshweaver-plugin-build` (module-fetch: the plugins layer from the registry's index). The PLATFORM (the compiler and the reference set) is NOT
 # here: it is the set's tester and portal images, copied in by the host's init containers by digest.
 #
@@ -40,7 +42,7 @@ RUN set -eu \
  && fetch /src/platform "$PLATFORM_REPO" "$PLATFORM_COMMIT" \
  && mkdir -p /out/scripts \
  && cp /src/deploy/.github/scripts/build-run.py /out/scripts/ \
- && for f in compose-gate-host.sh sandbox-postgres.sh module-build-key.py node-repo-scope.py ci-artifact-store.py; do \
+ && for f in compose-gate-host.sh sandbox-postgres.sh module-build-key.py node-repo-scope.py ci-artifact-store.py compile-check.py; do \
       [ -s "/src/platform/.github/scripts/$f" ] || { echo "the platform at $PLATFORM_COMMIT has no .github/scripts/$f"; exit 1; }; \
       cp "/src/platform/.github/scripts/$f" /out/scripts/; \
     done \
@@ -58,12 +60,13 @@ RUN apt-get update \
 
 # The runner (this repository) and the platform's composer and helpers (the set's commit) — one
 # implementation each, versioned with the image (the chart ships no copy).
-COPY --from=sources /out/scripts/build-run.py /out/scripts/compose-gate-host.sh /out/scripts/sandbox-postgres.sh /out/scripts/module-build-key.py /out/scripts/node-repo-scope.py /out/scripts/ci-artifact-store.py /opt/build-host/
+COPY --from=sources /out/scripts/build-run.py /out/scripts/compose-gate-host.sh /out/scripts/sandbox-postgres.sh /out/scripts/module-build-key.py /out/scripts/node-repo-scope.py /out/scripts/ci-artifact-store.py /out/scripts/compile-check.py /opt/build-host/
 COPY --from=sources /out/plugin-build/ /opt/build-host/plugin-build/
 RUN chmod 0555 /opt/build-host/*.py /opt/build-host/*.sh \
  && test -f /opt/build-host/plugin-build/MeshWeaver.Plugin.Build.dll \
  && python3 /opt/build-host/build-run.py --self-test \
  && python3 /opt/build-host/module-build-key.py --self-test \
+ && python3 /opt/build-host/compile-check.py --help > /dev/null \
  && bash /opt/build-host/sandbox-postgres.sh --self-test
 
 # The SDK image's unprivileged `app` user (uid 1654). bwrap creates its namespaces unprivileged.
