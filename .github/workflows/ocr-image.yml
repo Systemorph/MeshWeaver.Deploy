@@ -141,6 +141,8 @@ jobs:
       id-token: write   # OIDC to Azure (the federated credential is scoped to main)
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Ensure Azure CLI
         run: command -v az >/dev/null || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
       - name: Azure login (OIDC)
@@ -187,27 +189,47 @@ jobs:
         run: |
           set -euo pipefail
           short="${GITHUB_SHA::7}"
-          docker build -t "$ACR/ocr:${LINE}-${short}" -t "$ACR/ocr:${LINE}" deploy/ocr
-      - name: Push ocr:<line>-<sha> and :<line>
+          docker build -t "$ACR/ocr:${LINE}-${short}" deploy/ocr
+      - name: Push ocr:<line>-<sha>
         if: steps.published.outputs.exists == 'false'
         run: |
           set -euo pipefail
           short="${GITHUB_SHA::7}"
           docker push "$ACR/ocr:${LINE}-${short}"
-          docker push "$ACR/ocr:${LINE}"
+      # The moving line follows the NEWEST publication only, and it is converged on EVERY run — a run
+      # whose image was already published included. It is moved by a registry-side retag of the
+      # already-published manifest (acr-data-plane.py retag: GET by the immutable tag, PUT the same bytes
+      # under the line), so a run whose line move failed completes it on rerun, and a rerun of an OLDER
+      # commit never moves the line back over a newer one (the ollama-image.yml ordering).
+      - name: Move :<line> onto this build (only if this is the newest publication)
+        id: line
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+          # --first-parent: main's own history, so a merged pull request answers with the MERGE commit that
+          # landed (GITHUB_SHA), never the feature-branch commit a path-filtered log would simplify to.
+          newest=$(git log -1 --first-parent --format=%H origin/main -- deploy/ocr .github/workflows/ocr-image.yml)
+          if [ "$newest" != "$GITHUB_SHA" ]; then
+            echo "moved=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$GITHUB_SHA is not the newest publication (main's is $newest) — the line stays where the newer run put it"
+            exit 0
+          fi
+          python3 .github/scripts/acr-data-plane.py retag --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
+            --repository "ocr" --from "${LINE}-${GITHUB_SHA::7}" --to "$LINE"
+          echo "moved=true" >> "$GITHUB_OUTPUT"
       - name: Verify the tags exist in the registry (read back, never the green tick)
         run: |
           set -euo pipefail
           short="${GITHUB_SHA::7}"
           immutable=$(docker buildx imagetools inspect "$ACR/ocr:${LINE}-${short}" --format '{{json .Manifest.Digest}}' | tr -d '"')
-          if [ "${{ steps.published.outputs.exists }}" = "true" ]; then
-            [ -n "$immutable" ] || { echo "::error::ocr:${LINE}-${short} was reported published but does not resolve"; exit 1; }
-            echo "kept $ACR/ocr:${LINE}-${short} = ${immutable} (write-once: not rebuilt, the line not moved)"
-            exit 0
+          [ -n "$immutable" ] || { echo "::error::ocr:${LINE}-${short} is not in the registry"; exit 1; }
+          if [ "${{ steps.line.outputs.moved }}" = "true" ]; then
+            moving=$(docker buildx imagetools inspect "$ACR/ocr:${LINE}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+            [ "$immutable" = "$moving" ] \
+              || { echo "::error::ocr:${LINE}-${short} (${immutable}) and :${LINE} (${moving:-absent}) do not name one manifest"; exit 1; }
           fi
-          moving=$(docker buildx imagetools inspect "$ACR/ocr:${LINE}" --format '{{json .Manifest.Digest}}' | tr -d '"')
-          [ -n "$immutable" ] && [ "$immutable" = "$moving" ] \
-            || { echo "::error::ocr:${LINE}-${short} (${immutable:-absent}) and :${LINE} (${moving:-absent}) do not name one pushed manifest"; exit 1; }
-          echo "published $ACR/ocr:${LINE}-${short} = ${immutable} (+ :${LINE})"
+          echo "ocr:${LINE}-${short} = ${immutable} (built: ${{ steps.published.outputs.exists == 'false' }}, line moved: ${{ steps.line.outputs.moved }})"
           echo "### ocr published" >> "$GITHUB_STEP_SUMMARY"
           echo "\`$ACR/ocr:${LINE}-${short}\` — \`${immutable}\`. An estate overlay names this immutable tag." >> "$GITHUB_STEP_SUMMARY"

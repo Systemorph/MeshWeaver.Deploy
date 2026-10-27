@@ -44,5 +44,9 @@ jobs:
           for lane in "${lanes[@]}"; do
             [ -f ".github/workflows/$lane" ] || { echo "::error::.github/workflows/$lane is missing — the guard's subject moved; repoint it"; exit 1; }
             python3 .github/scripts/acr-data-plane.py check-workflow ".github/workflows/$lane"
+            # The image is write-once, the LINE converges on every run: only by the ordered retag, never
+            # gated on "image not yet published" (a failed line move must complete on rerun), never by a
+            # build or push (an older rerun must not move it back).
+            python3 .github/scripts/acr-data-plane.py check-line-convergence ".github/workflows/$lane"
           done
           echo "checked ${#lanes[@]} lane(s)"

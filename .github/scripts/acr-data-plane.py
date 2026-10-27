@@ -31,6 +31,11 @@ registry with that.
         RED unless every azure/login step signs in with `allow-no-subscriptions: true` and names no
         `subscription-id`, and nothing in the workflow runs an `az acr` command or the platform's
         `acr-login.sh` (both take the ARM lookup above).
+    acr-data-plane.py check-line-convergence <workflow.yml>
+        RED unless the service-image lane moves its moving line tag ONLY by `retag`, in a step that runs
+        on EVERY publish run (no `if:` — a rerun whose image was already published still converges the
+        line), behind the newest-publication ordering check (an older rerun never moves the line back),
+        with main's history checked out for that check.
     acr-data-plane.py --self-test
 
 Nothing here prints a token. The refresh token reaches docker on stdin only.
@@ -298,6 +303,62 @@ def check_workflow(text: str) -> list[str]:
     return problems
 
 
+# ───────────────────────────── the line-convergence invariant ─────────────────────────────
+
+# A WRITE of the line tag: docker push/build/tag, a buildx build or imagetools create, or a BuildKit
+# `name=` output. A READ (`imagetools inspect`, the read-back) is not one.
+LINE_TAG_PUSH = re.compile(
+    r"""(docker\s+(push|build|tag)\b|buildx\s+(build|imagetools\s+create)\b|name=)[^\n]*:\$\{?LINE\}?["'\s,]""")
+
+
+def _step_around(lines: list[str], i: int) -> tuple[int, int]:
+    """(start, end) of the workflow step that holds line i: its `- ` line and everything indented below."""
+    start = i
+    while start >= 0 and not re.match(r"^\s*-\s", lines[start]):
+        start -= 1
+    if start < 0:
+        return -1, -1
+    dash = _indent(lines[start])
+    end = start + 1
+    while end < len(lines) and (not lines[end].strip() or _indent(lines[end]) > dash):
+        end += 1
+    return start, end
+
+
+def check_line_convergence(text: str) -> list[str]:
+    lines = text.splitlines()
+    problems: list[str] = []
+    retags = [i for i, ln in enumerate(lines)
+              if "acr-data-plane.py retag" in _code(ln) and not ln.strip().startswith("#")]
+    to_line = []
+    for i in retags:
+        start, end = _step_around(lines, i)
+        body = "\n".join(_code(x) for x in lines[start:end])
+        if re.search(r'--to\s+"?\$\{?LINE\}?"?', body):
+            to_line.append((start, end, body))
+    if not to_line:
+        problems.append("no step moves the line with `acr-data-plane.py retag … --to \"$LINE\"` — the line tag "
+                        "must be converged by a byte-for-byte retag of the published image")
+    for start, end, body in to_line:
+        where = f"the line-retag step at line {start + 1}"
+        if re.search(r"^\s*(?:-\s+)?if:", body, flags=re.M):
+            problems.append(f"{where} carries an `if:` — the line must converge on EVERY publish run, a rerun whose "
+                            "image was already published included, or a failed line move is never completed")
+        if "git log -1 --first-parent" not in body or '"$newest" != "$GITHUB_SHA"' not in body:
+            problems.append(f"{where} lacks the newest-publication ordering check (`git log -1 --first-parent` "
+                            "compared with $GITHUB_SHA) — an older rerun could move the line backwards")
+    for i, ln in enumerate(lines):
+        c = _code(ln)
+        if c.strip().startswith("#"):
+            continue
+        if LINE_TAG_PUSH.search(c + " "):
+            problems.append(f"line {i + 1}: the moving line tag is written by a build or push — it must only be "
+                            "moved by the ordered retag, or a rebuild of an older commit moves it backwards")
+    if to_line and not re.search(r"^\s*fetch-depth:\s*0\s*$", text, flags=re.M):
+        problems.append("no checkout carries `fetch-depth: 0` — the ordering check reads main's history")
+    return problems
+
+
 # ───────────────────────────── self-test ─────────────────────────────
 
 GOOD = """\
@@ -536,6 +597,60 @@ def self_test() -> int:
     check("offline/(the malformed tag made no call)", lambda: early, lambda c: c == [])
     check("offline/the same tag twice is refused",
           lambda: retag("r.example.io", "tid", "ollama", "a", "a", retag_io([])), REFUSED)
+
+    # ── the line-convergence invariant ──
+    lane = """\
+jobs:
+  publish:
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Build
+        if: steps.published.outputs.exists == 'false'
+        run: docker build -t "$ACR/x:${LINE}-${short}" deploy/x
+      - name: Push
+        if: steps.published.outputs.exists == 'false'
+        run: docker push "$ACR/x:${LINE}-${short}"
+      - name: Move the line
+        id: line
+        run: |
+          newest=$(git log -1 --first-parent --format=%H origin/main -- deploy/x)
+          if [ "$newest" != "$GITHUB_SHA" ]; then exit 0; fi
+          python3 .github/scripts/acr-data-plane.py retag --registry "$ACR" --tenant "$T" \\
+            --repository x --from "${LINE}-${GITHUB_SHA::7}" --to "$LINE"
+"""
+    check("line: the converging lane passes (positive control)", lambda: check_line_convergence(lane), lambda p: p == [])
+    check("line: a retag step gated on `exists == 'false'` is red (the review-found defect)",
+          lambda: check_line_convergence(lane.replace("        id: line\n",
+                                                      "        id: line\n        if: steps.published.outputs.exists == 'false'\n")),
+          lambda p: len(p) == 1 and "`if:`" in p[0])
+    check("line: no ordering check is red",
+          lambda: check_line_convergence(lane.replace('if [ "$newest" != "$GITHUB_SHA" ]; then exit 0; fi', "true")),
+          lambda p: len(p) == 1 and "ordering" in p[0])
+    check("line: pushing :$LINE with docker is red",
+          lambda: check_line_convergence(lane.replace('run: docker push "$ACR/x:${LINE}-${short}"',
+                                                      'run: docker push "$ACR/x:${LINE}"')),
+          lambda p: len(p) == 1 and "build or push" in p[0])
+    check("line: tagging :${LINE} in the build is red",
+          lambda: check_line_convergence(lane.replace('docker build -t "$ACR/x:${LINE}-${short}"',
+                                                      'docker build -t "$ACR/x:${LINE}-${short}" -t "$ACR/x:${LINE}"')),
+          lambda p: len(p) == 1 and "build or push" in p[0])
+    check("line: READING the line back (imagetools inspect) is not a write",
+          lambda: check_line_convergence(lane + '      - run: moving=$(docker buildx imagetools inspect "$ACR/x:${LINE}" --format x)\n'),
+          lambda p: p == [])
+    check("line: imagetools create onto :$LINE is a write and red",
+          lambda: check_line_convergence(lane + '      - run: docker buildx imagetools create --tag "$ACR/x:${LINE}" src\n'),
+          lambda p: len(p) == 1 and "build or push" in p[0])
+    check("line: a lane with no line retag at all is red, never vacuously green",
+          lambda: check_line_convergence("jobs: {}\n"), lambda p: len(p) == 1 and "no step moves the line" in p[0])
+    check("line: a shallow checkout is red",
+          lambda: check_line_convergence(lane.replace("        with:\n          fetch-depth: 0\n", "")),
+          lambda p: len(p) == 1 and "fetch-depth" in p[0])
+    check("line: a commented-out retag does not count",
+          lambda: check_line_convergence(lane.replace("          python3 .github/scripts/acr-data-plane.py retag",
+                                                      "          # python3 .github/scripts/acr-data-plane.py retag")),
+          lambda p: any("no step moves the line" in x for x in p))
     print(f"acr-data-plane self-test: {'PASS' if fails == 0 else f'{fails} FAILED'}")
     return 0 if fails == 0 else 1
 
@@ -558,6 +673,14 @@ def main(argv: list[str]) -> int:
             if not problems:
                 print(f"{argv[1]}: every azure/login is tenant-level (allow-no-subscriptions, no subscription-id) "
                       "and the registry is reached through its data plane only")
+            return 1 if problems else 0
+        if len(argv) == 2 and argv[0] == "check-line-convergence":
+            with open(argv[1], encoding="utf-8") as f:
+                problems = check_line_convergence(f.read())
+            for p in problems:
+                print(f"::error file={argv[1]}::{p}")
+            if not problems:
+                print(f"{argv[1]}: the line tag is moved only by the ordered retag, on every publish run")
             return 1 if problems else 0
         if argv and argv[0] == "login":
             docker_login(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")), Io())
