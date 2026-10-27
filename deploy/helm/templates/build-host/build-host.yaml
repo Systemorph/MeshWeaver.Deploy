@@ -241,8 +241,9 @@ spec:
             - { name: MW_PLUGINS_REGISTRY, value: {{ $b.pluginsRegistry | quote }} }
             - { name: MW_PLUGINS_SOURCE, value: {{ $b.pluginsSource | quote }} }
             {{- if $b.artifactStore.spec }}
-            # H9: every module bundle a stage produces is handed to the shared CI artifact store by the
-            # HOST (content-addressed, read back) before its receipt is posted.
+            # H9: every module bundle a stage produces is handed over by the HOST before its receipt is posted:
+            # `api:` = uploaded through the build API (the instance verifies and stores it, and answers the receipt);
+            # `file:<dir>` = written to a mounted CI artifact store (content-addressed, read back).
             - { name: MW_BUILD_ARTIFACT_STORE, value: {{ $b.artifactStore.spec | quote }} }
             {{- end }}
             {{- if $b.registry.url }}
