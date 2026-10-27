@@ -6,7 +6,8 @@
 # (host-postgres.sh: UTF8, a pgvector template every suite database is cloned from — a stage starts a
 # copy of it inside its own sandbox; sandbox-postgres.sh still initialises a bare one on demand), core's
 # SOURCE at the set's commit and this repository's portal chart (the portal-host lane's test-support
-# projects and chart guards — handed to stages as MW_PLATFORM_SOURCE / MW_DEPLOY_SOURCE), and the runner with its
+# projects and chart guards — handed to stages as MW_PLATFORM_SOURCE / MW_DEPLOY_SOURCE), the portal's headless
+# browser and font set at the platform's own Playwright version (core's browser/PDF tests), and the runner with its
 # helpers — module-build-key.py (the host recomputes every module cache key before promoting it),
 # ci-artifact-store.py (H9: the host hands every module bundle to the shared CI artifact store),
 # compile-check.py (the canonical NodeType checker a repository's stages run, handed to them as
@@ -60,6 +61,19 @@ RUN set -eu \
  && dotnet publish src/MeshWeaver.Plugin.Build/MeshWeaver.Plugin.Build.csproj -c Release -o /out/plugin-build -nologo \
  && test -f /out/plugin-build/MeshWeaver.Plugin.Build.dll
 
+# The headless browser's VERSION and the font defaults come from the PLATFORM at the set's commit —
+# the portal image's own declaration (deploy/base-images/portal-ai/Dockerfile `ARG PLAYWRIGHT_VERSION=`
+# and its fonts-local.conf), never a literal here: the host follows each platform set exactly as the
+# portal image does, so core's browser/PDF tests run on a host against the browser production ships.
+RUN set -eu; \
+    f=/src/platform/deploy/base-images/portal-ai/Dockerfile; \
+    v="$(sed -n 's/^ARG PLAYWRIGHT_VERSION=\([0-9][0-9.]*\)$/\1/p' "$f" 2>/dev/null | head -n 1)"; \
+    if [ -z "$v" ]; then echo "the platform at $PLATFORM_COMMIT declares no 'ARG PLAYWRIGHT_VERSION=<x.y.z>' in deploy/base-images/portal-ai/Dockerfile — the host cannot follow the portal's browser"; exit 1; fi; \
+    if [ ! -s /src/platform/deploy/base-images/portal-ai/fonts-local.conf ]; then echo "the platform at $PLATFORM_COMMIT has no deploy/base-images/portal-ai/fonts-local.conf"; exit 1; fi; \
+    mkdir -p /out/browser; \
+    printf '%s\n' "$v" > /out/browser/playwright-version; \
+    cp /src/platform/deploy/base-images/portal-ai/fonts-local.conf /out/browser/fonts-local.conf
+
 FROM mcr.microsoft.com/dotnet/sdk:10.0
 
 # PostgreSQL 17 with pgvector from the PostgreSQL project's own apt repository — the SAME major and
@@ -75,6 +89,39 @@ RUN apt-get update \
  && install -d -o 1654 -g 1654 -m 0700 /opt/build-host/pg-snapshot \
  && bwrap --version && python3 --version && git --version && dotnet --version \
  && find /usr/lib/postgresql -maxdepth 3 -name initdb | grep -q initdb
+
+# The headless BROWSER and its FONT SET, as the portal image installs them (portal-ai's Dockerfile):
+# Node from NodeSource, Playwright's `--only-shell` Chromium with `--with-deps` (this Ubuntu release's
+# shared libraries AND font packages, per architecture) under /opt/ms-playwright, `/usr/bin/chromium`
+# resolved from whichever binary name this architecture gets (`headless_shell` on arm64,
+# `chrome-headless-shell` on amd64), CHROME_BIN, and the platform's fonts-local.conf. Installed ONCE
+# per image — a stage provisions nothing. The version is the platform's (sources stage), so a new set
+# brings its browser with it. The smoke print runs as the unprivileged uid 1654 the stages run as: an
+# image whose browser cannot print a PDF fails its BUILD, never a test.
+COPY --from=sources /out/browser/ /opt/build-host/browser/
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN set -eu; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl ca-certificates gnupg; \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -; \
+    apt-get install -y --no-install-recommends nodejs; \
+    npx --yes "playwright-core@$(cat /opt/build-host/browser/playwright-version)" install --with-deps --only-shell chromium; \
+    BROWSER="$(find /opt/ms-playwright -type f -executable \( -name headless_shell -o -name chrome-headless-shell \) -print -quit)"; \
+    if [ -z "$BROWSER" ]; then echo "No headless-shell binary under /opt/ms-playwright for $(uname -m):"; find /opt/ms-playwright -maxdepth 3; exit 1; fi; \
+    ln -s "$BROWSER" /usr/bin/chromium; \
+    /usr/bin/chromium --version; \
+    cp /opt/build-host/browser/fonts-local.conf /etc/fonts/local.conf; \
+    fc-cache -f > /dev/null; \
+    chmod -R a+rX /opt/ms-playwright; \
+    smoke="$(mktemp -d)"; chown 1654:1654 "$smoke"; \
+    printf '<html><body><h1>mw-build-host</h1><p><b>bold</b> <i>italic</i> &auml;&ouml;&uuml;</p></body></html>' > "$smoke/p.html"; \
+    setpriv --reuid=1654 --regid=1654 --clear-groups env HOME="$smoke" \
+      /usr/bin/chromium --headless --no-sandbox --disable-gpu --print-to-pdf="$smoke/p.pdf" "file://$smoke/p.html" > /dev/null 2>&1 || true; \
+    if [ ! -s "$smoke/p.pdf" ] || [ "$(head -c 4 "$smoke/p.pdf")" != "%PDF" ]; then echo "the headless shell did not print a PDF as uid 1654 — a host on this image cannot run core's browser tests"; exit 1; fi; \
+    rm -rf "$smoke" /root/.npm /root/.cache; \
+    npm cache clean --force; \
+    apt-get purge -y gnupg; apt-get autoremove -y; apt-get clean; rm -rf /var/lib/apt/lists/*
+ENV CHROME_BIN=/usr/bin/chromium
 
 # The runner (this repository) and the platform's composer and helpers (the set's commit) — one
 # implementation each, versioned with the image (the chart ships no copy).
