@@ -66,8 +66,21 @@ jobs:
         env:
           MESHWEAVER_APP_ID: ${{ secrets.MESHWEAVER_APP_ID }}
           MESHWEAVER_APP_PRIVATE_KEY: ${{ secrets.MESHWEAVER_APP_PRIVATE_KEY }}
+          # Read from the EVENT, never from whether a secret is empty: it only chooses which
+          # remedy the red names, it never turns the red into a skip.
+          FROM_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         run: |
           set -euo pipefail
+          # 🚨 A pull request from a FORK never receives this repository's secrets — not even after a
+          # maintainer approves its run — so the guards cannot read the private MeshWeaver.Plugins
+          # checkout there, and the required check is RED for it by design (fail closed: the chart
+          # is never merged unchecked against the platform). Provisioning cannot fix that, so the
+          # red says what does: a maintainer pushes the contribution's branch into this repository
+          # and the guards run on that pull request.
+          if [ "$FROM_FORK" = "true" ]; then
+            echo "::error title=Chart guards cannot run on a fork pull request::GitHub withholds repository secrets from pull requests opened from a fork, so the private MeshWeaver.Plugins checkout the guards compile against cannot be read. This is not a provisioning gap. A maintainer pushes this branch into Systemorph/MeshWeaver.Deploy and opens the pull request from there; the guards run on it."
+            exit 1
+          fi
           missing=()
           [ -n "${MESHWEAVER_APP_ID:-}" ]          || missing+=("secrets.MESHWEAVER_APP_ID — the meshweaver-cloud App id (reads the private MeshWeaver.Plugins checkout)")
           [ -n "${MESHWEAVER_APP_PRIVATE_KEY:-}" ] || missing+=("secrets.MESHWEAVER_APP_PRIVATE_KEY — the meshweaver-cloud App's private key")
