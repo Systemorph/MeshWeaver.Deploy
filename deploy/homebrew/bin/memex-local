@@ -1162,13 +1162,24 @@ helm_deploy() {
   local plugin_args=() idx=0 repo_path repo_name install_names=()
   # ── …unless this install is a CONSUMER of a remote registry (§17). Then it mounts NO checkout
   #    and serves NO source: the registry file (layered last, below) carries registryUrl +
-  #    instanceId + the bootstrap key, the chart's own installByDefault ["Plugins/*"] applies, and
-  #    the image baseline's Modules__Required stands — the modules LAND from the registry now, so
-  #    the self-registry layer that blanks them is deliberately NOT passed.
+  #    instanceId + the bootstrap key, and the image baseline's Modules__Required stands — the
+  #    modules LAND from the registry now, so the self-registry layer that blanks them is
+  #    deliberately NOT passed.
+  #
+  # 🚨 The chart's own installByDefault ["Plugins/*"] is CLEARED in this mode. Measured on the
+  #    maintainer's laptop (2026-10-27): the registry source is named by its URL (no Name is
+  #    configured), so the chart's pattern reaches the pod as PluginCatalog__InstallByDefault__0
+  #    and names a source this installation does not have —
+  #      [DefaultInstall] 1 InstallByDefault pattern(s) name a source this installation does not
+  #      have: [Plugins/*]. Configured sources: [https://…]
+  #    — while at the same time overriding the person's own wizard selection with a wildcard.
+  #    Cleared, the instance manifest the first-run wizard writes decides what installs (it
+  #    projects the ticked packages as PluginCatalog:InstallByDefault:N and names the registry).
+  #    Self-registry mode keeps today's per-source "<name>/*" entries, assembled below.
   local mode_args=()
   if registry_mode; then
-    mode_args=(-f "$REGISTRY_FILE")
-    info "REGISTRY MODE: consuming $(registry_url) as instance '$(registry_instance_id)' — no checkout is mounted"
+    mode_args=(-f "$REGISTRY_FILE" --set-json 'pluginCatalog.installByDefault=[]')
+    info "REGISTRY MODE: consuming $(registry_url) as instance '$(registry_instance_id)' — no checkout is mounted; the wizard's selection decides what installs"
   else
     mode_args=(-f "$share_dir/values.local.self-registry.yaml")
   fi
