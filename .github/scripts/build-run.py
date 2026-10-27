@@ -697,6 +697,17 @@ def materialize_nuget_package(pkg_dir: str, pid: str, ver: str, dest: str) -> No
         json.dump(out_meta, fh, indent=2)
 
 
+PREPARED_OUTPUT_TAIL = 64 * 1024
+
+
+def file_tail(fh, limit: int) -> str:
+    """The last `limit` bytes of an open binary file, decoded leniently — a bounded read of untrusted output."""
+    fh.flush()
+    size = fh.seek(0, os.SEEK_END)
+    fh.seek(max(0, size - limit))
+    return fh.read().decode("utf-8", errors="replace")
+
+
 def promote_nuget(restored: str, cache: str, log: Callable[[str], None]) -> tuple[int, int, list[str]]:
     """Promote the packages a TRUNK build stage restored into the shared warm NuGet cache
     (`<cache>/nuget/<id>/<version>/`, the stages' read-only fallback folder), so the next run restores
@@ -722,7 +733,9 @@ def promote_nuget(restored: str, cache: str, log: Callable[[str], None]) -> tupl
             materialize_nuget_package(os.path.join(restored, pid, ver), pid, ver, os.path.join(tmp, "p"))
             os.rename(os.path.join(tmp, "p"), final)
             promoted += 1
-        except (OSError, ValueError, zipfile.BadZipFile, KeyError) as e:
+        except (OSError, ValueError, zipfile.BadZipFile, KeyError, RuntimeError) as e:
+            # RuntimeError: an ENCRYPTED entry (zipfile asks for a password) and NotImplementedError (an unsupported
+            # compression method, a RuntimeError subclass) — the package is refused, never an unverdicted host.
             if not os.path.isfile(os.path.join(final, ".nupkg.metadata")):
                 refused.append(f"{entry} (could not be moved into place: {e})")
             else:
@@ -2338,15 +2351,23 @@ class Host:
         def sandboxed(command: str, out: str, extra: dict, readonly: list, writable: list, timeout: float) -> tuple[int, str]:
             argv = self.sandbox.argv(command, checkout, out, sandbox_env(self.env, extra, self.cache),
                                      readonly=readonly, writable=writable)
+            # The command is repository-controlled: its output goes to host-owned FILES (outside the sandbox's
+            # writable binds) and only a bounded tail of each is read back, so a noisy key or build command can
+            # never exhaust the host's memory and end the worker without a verdict.
+            logs = tempfile.mkdtemp(prefix=".prep-log-", dir=workdir)
             try:
-                r = subprocess.run(argv, cwd=checkout, env={"PATH": self.env.get("PATH", "/usr/bin:/bin")},
-                                   capture_output=True, text=True, errors="replace", timeout=max(1.0, timeout),
-                                   stdin=subprocess.DEVNULL)
-            except subprocess.TimeoutExpired:
-                return 124, "timed out"
-            except OSError as e:
-                return 127, str(e)
-            return r.returncode, (r.stderr or "") + (r.stdout or "")      # stdout LAST: the key is its final line
+                with open(os.path.join(logs, "out"), "w+b") as so, open(os.path.join(logs, "err"), "w+b") as se:
+                    try:
+                        r = subprocess.run(argv, cwd=checkout, env={"PATH": self.env.get("PATH", "/usr/bin:/bin")},
+                                           stdout=so, stderr=se, timeout=max(1.0, timeout), stdin=subprocess.DEVNULL)
+                    except subprocess.TimeoutExpired:
+                        return 124, "timed out"
+                    except OSError as e:
+                        return 127, str(e)
+                    # stdout LAST: the key is its final line
+                    return r.returncode, file_tail(se, PREPARED_OUTPUT_TAIL) + file_tail(so, PREPARED_OUTPUT_TAIL)
+            finally:
+                shutil.rmtree(logs, ignore_errors=True)
 
         base_extra = {"MW_BUILD_PLATFORM_VERSION": self.platform_version, "MW_BUILD_REPO": repo}
         for p in inputs:
@@ -3393,7 +3414,7 @@ def self_test() -> int:
         # self-test writes: `good` (unsigned), `signed` (a `.signature.p7s` entry appended — its content hash is the
         # UNSIGNED package's, not the archive's), `forged` (metadata naming another hash) and `tamper` (good hashes,
         # but the extracted DLL altered and an extra file planted after NuGet extracted it).
-        def fixture_zip(signed_: bool) -> bytes:
+        def fixture_zip(signed_: bool, encrypted_: bool = False) -> bytes:
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
                 for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net10.0/Demo.dll", b"the-real-dll"),
@@ -3401,11 +3422,24 @@ def self_test() -> int:
                     z.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_)
                 if signed_:
                     z.writestr(zipfile.ZipInfo(NUGET_SIGNATURE, (2020, 1, 1, 0, 0, 0)), b"pkcs7-signature")
-            return buf.getvalue()
+            if not encrypted_:
+                return buf.getvalue()
+            # zipfile resets flag_bits on write, so set the ENCRYPTED bit (0x1) in the bytes: on the DLL's local header
+            # (flags at +6) and its central-directory record (flags at +8) — zipfile then refuses to read it.
+            raw_ = bytearray(buf.getvalue())
+            for sig_, off_ in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+                at_ = raw_.find(sig_)
+                while at_ >= 0:
+                    nl_ = struct.unpack_from("<H", raw_, at_ + (26 if off_ == 6 else 28))[0]
+                    name_at_ = at_ + (30 if off_ == 6 else 46)
+                    if bytes(raw_[name_at_:name_at_ + nl_]).endswith(b".dll"):
+                        raw_[at_ + off_] |= 0x1
+                    at_ = raw_.find(sig_, at_ + 4)
+            return bytes(raw_)
 
         def b64sha(b_: bytes) -> str:
             return base64.b64encode(hashlib.sha512(b_).digest()).decode()
-        unsigned_, signed_zip = fixture_zip(False), fixture_zip(True)
+        unsigned_, signed_zip, encrypted_zip = fixture_zip(False), fixture_zip(True), fixture_zip(False, True)
         check("nuget/a signed package's content hash is the UNSIGNED package's, not its archive hash",
               nupkg_content_hash(signed_zip) == b64sha(unsigned_) != b64sha(signed_zip), nupkg_content_hash(signed_zip))
         check("nuget/an unsigned package's content hash is its archive hash", nupkg_content_hash(unsigned_) == b64sha(unsigned_))
@@ -3426,7 +3460,7 @@ def self_test() -> int:
             d_ = os.path.join(root_, "demo.pkg", "1.0.0")
             shutil.rmtree(root_, ignore_errors=True)
             os.makedirs(os.path.join(d_, "lib", "net10.0"))
-            b_ = signed_zip if kind_ == "signed" else unsigned_
+            b_ = signed_zip if kind_ == "signed" else encrypted_zip if kind_ == "encrypted" else unsigned_
             open(os.path.join(d_, "demo.pkg.1.0.0.nupkg"), "wb").write(b_)
             open(os.path.join(d_, "demo.pkg.1.0.0.nupkg.sha512"), "w").write(b64sha(b_))
             open(os.path.join(d_, "demo.pkg.nuspec"), "wb").write(b"<package/>")
@@ -3455,6 +3489,14 @@ def self_test() -> int:
         check("prepared/a SIGNED package (content hash != archive hash) is promoted, its signature extracted as NuGet does",
               os.path.isfile(os.path.join(warm, ".nupkg.metadata")) and os.path.isfile(os.path.join(warm, NUGET_SIGNATURE)))
         shutil.rmtree(os.path.join(cache, "nuget"))
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("encrypted")}]})).run(dict(claim, isTrunk=True))
+        check("prepared/negative control: an ENCRYPTED package (valid hashes, unreadable entry) is refused, never a crash",
+              not os.path.exists(warm))
+        big_ = tempfile.TemporaryFile()
+        big_.write(b"x" * (3 * PREPARED_OUTPUT_TAIL) + b"\nKEY")
+        check("prepared/a command's output is read back as a BOUNDED tail, its final line intact",
+              len(file_tail(big_, PREPARED_OUTPUT_TAIL)) == PREPARED_OUTPUT_TAIL and file_tail(big_, PREPARED_OUTPUT_TAIL).endswith("\nKEY"))
+        big_.close()
         htf = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("forged")}]}))
         htf.run(dict(claim, isTrunk=True))
         check("prepared/negative control: a package whose hash is not what NuGet recorded is NOT promoted", not os.path.exists(warm))
