@@ -131,6 +131,7 @@ import shutil
 import signal
 import socket
 import struct
+import zlib
 import subprocess
 import sys
 import tempfile
@@ -739,7 +740,7 @@ def promote_nuget(restored: str, cache: str, log: Callable[[str], None]) -> tupl
             materialize_nuget_package(os.path.join(restored, pid, ver), pid, ver, os.path.join(tmp, "p"))
             os.rename(os.path.join(tmp, "p"), final)
             promoted += 1
-        except (OSError, ValueError, zipfile.BadZipFile, KeyError, RuntimeError) as e:
+        except (OSError, ValueError, zipfile.BadZipFile, KeyError, RuntimeError, zlib.error, EOFError) as e:
             # RuntimeError: an ENCRYPTED entry (zipfile asks for a password) and NotImplementedError (an unsupported
             # compression method, a RuntimeError subclass) — the package is refused, never an unverdicted host.
             if not os.path.isfile(os.path.join(final, ".nupkg.metadata")):
@@ -2308,6 +2309,10 @@ class Host:
             why = ""
             run_end = self.clock() + budget
             prepared_ro: list[str] = []
+            # NUGET_FALLBACK_PACKAGES names <cache>/nuget for EVERY stage that needs `nuget`, prepared inputs or not;
+            # NuGet refuses a fallback folder that does not exist, so a fresh host creates it before any stage runs
+            # (else the first trunk build — the one that warms it — could never restore).
+            os.makedirs(os.path.join(self.cache, "nuget"), exist_ok=True)
             if prepared_inputs:
                 psink = self._sink_for(repo, sha, stages[0]["name"])
                 try:
@@ -3749,6 +3754,18 @@ def self_test() -> int:
         def b64sha(b_: bytes) -> str:
             return base64.b64encode(hashlib.sha512(b_).digest()).decode()
         unsigned_, signed_zip, encrypted_zip = fixture_zip(False), fixture_zip(True), fixture_zip(False, True)
+        # CORRUPT DEFLATE: the DLL entry's compressed bytes are garbage (valid zip structure, so its hashes still
+        # match what the fixture records) — extraction raises zlib.error, which must be a refusal, never a crash.
+        _cz = io.BytesIO()
+        with zipfile.ZipFile(_cz, "w", zipfile.ZIP_DEFLATED) as z:
+            for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net10.0/Demo.dll", b"the-real-dll" * 64),
+                           ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
+                z.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_, compress_type=zipfile.ZIP_DEFLATED)
+        corrupt_zip = bytearray(_cz.getvalue())
+        _at = corrupt_zip.find(b"PK\x03\x04", corrupt_zip.find(b"lib/net10.0/Demo.dll") - 30)
+        _data = _at + 30 + struct.unpack_from("<H", corrupt_zip, _at + 26)[0] + struct.unpack_from("<H", corrupt_zip, _at + 28)[0]
+        corrupt_zip[_data:_data + 4] = b"\xff\xff\xff\xff"
+        corrupt_zip = bytes(corrupt_zip)
         check("nuget/a signed package's content hash is the UNSIGNED package's, not its archive hash",
               nupkg_content_hash(signed_zip) == b64sha(unsigned_) != b64sha(signed_zip), nupkg_content_hash(signed_zip))
         check("nuget/an unsigned package's content hash is its archive hash", nupkg_content_hash(unsigned_) == b64sha(unsigned_))
@@ -3769,7 +3786,8 @@ def self_test() -> int:
             d_ = os.path.join(root_, "demo.pkg", "1.0.0")
             shutil.rmtree(root_, ignore_errors=True)
             os.makedirs(os.path.join(d_, "lib", "net10.0"))
-            b_ = signed_zip if kind_ == "signed" else encrypted_zip if kind_ == "encrypted" else unsigned_
+            b_ = (signed_zip if kind_ == "signed" else encrypted_zip if kind_ == "encrypted"
+                  else corrupt_zip if kind_ == "corrupt" else unsigned_)
             open(os.path.join(d_, "demo.pkg.1.0.0.nupkg"), "wb").write(b_)
             open(os.path.join(d_, "demo.pkg.1.0.0.nupkg.sha512"), "w").write(b64sha(b_))
             open(os.path.join(d_, "demo.pkg.nuspec"), "wb").write(b"<package/>")
@@ -3801,6 +3819,12 @@ def self_test() -> int:
         host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("encrypted")}]})).run(dict(claim, isTrunk=True))
         check("prepared/negative control: an ENCRYPTED package (valid hashes, unreadable entry) is refused, never a crash",
               not os.path.exists(warm))
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("corrupt")}]})).run(dict(claim, isTrunk=True))
+        check("prepared/negative control: a CORRUPT-DEFLATE package (valid hashes) is refused, never a crash", not os.path.exists(warm))
+        shutil.rmtree(os.path.join(cache, "nuget"), ignore_errors=True)
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": "true"}]})).run(dict(claim, isTrunk=True))
+        check("prepared/a fresh cache gets <cache>/nuget before any stage runs, with NO prepared inputs declared",
+              os.path.isdir(os.path.join(cache, "nuget")))
         big_ = tempfile.TemporaryFile()
         big_.write(b"x" * (3 * PREPARED_OUTPUT_TAIL) + b"\nKEY")
         check("prepared/a command's output is read back as a BOUNDED tail, its final line intact",
