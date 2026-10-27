@@ -961,6 +961,20 @@ ENV_ALLOW = ("PATH", "LANG", "LC_ALL", "TZ", "DOTNET_ROOT", "DOTNET_CLI_TELEMETR
              "MW_BUILD_GATE_HOST", "MW_BUILD_PORTAL_DOTNET")
 SCRATCH = "/scratch"
 
+# The platform's canonical checkers a repository's stages run (MeshWeaver.Plugins
+# `scripts/canonical-compile-check.py`, `scripts/check-scripts.py`): the image ships core's
+# `compile-check.py` beside this runner, AT THE SET'S COMMIT (deploy/build-host/Dockerfile), and a
+# stage is told where through `MW_PLATFORM_SCRIPTS`. A sandbox holds no GitHub credential, so
+# without it the launcher's fallback fetch fails and the stage is red. /opt is bound read-only.
+PLATFORM_SCRIPTS = ("compile-check.py",)
+
+
+def platform_scripts_env(scripts_dir: str) -> dict:
+    """`{"MW_PLATFORM_SCRIPTS": scripts_dir}` when every canonical checker is there, `{}` otherwise —
+    never an empty value, which the launcher would read as "fetch it" and fail on, unexplained."""
+    ok = all(os.path.isfile(os.path.join(scripts_dir, n)) for n in PLATFORM_SCRIPTS)
+    return {"MW_PLATFORM_SCRIPTS": scripts_dir} if ok else {}
+
 
 def sandbox_env(host_env: dict, extra: dict, cache: str) -> dict:
     """The explicit allow-list a stage gets. A key that looks like a credential is refused even when
@@ -1877,6 +1891,7 @@ class Host:
                 "MW_BUILD_PLATFORM_REF": self.env.get("MW_BUILD_PLATFORM_REF", ""),
                 "MW_PLUGINS_KEY": self.effective_plugins_key(),
                 "MW_BUILD_REFSET_KEY": self.env.get("MW_BUILD_REFSET_KEY", ""),
+                **platform_scripts_env(os.path.dirname(os.path.abspath(__file__))),
             }
             failed_at = None
             why = ""
@@ -2480,6 +2495,13 @@ def self_test() -> int:
           [av[i + 1] for i, a in enumerate(av) if a == "--bind"] == ["/work/r/src", "/work/r/out"]
           and "--tmpfs /scratch" in joined, joined)
     check("bwrap/env only via --setenv", av.count("--setenv") == 2 and av.index("--clearenv") < av.index("--setenv"), av)
+    with tempfile.TemporaryDirectory() as ps:
+        check("platform scripts/absent: no MW_PLATFORM_SCRIPTS at all (never an empty value)", platform_scripts_env(ps) == {}, ps)
+        for n in PLATFORM_SCRIPTS:
+            open(os.path.join(ps, n), "w").close()
+        check("platform scripts/present: MW_PLATFORM_SCRIPTS names the runner's directory", platform_scripts_env(ps) == {"MW_PLATFORM_SCRIPTS": ps}, ps)
+        pe = sandbox_env({"PATH": "/usr/bin"}, platform_scripts_env(ps), "/cache")
+        check("platform scripts/reach the stage through the allow-list", pe.get("MW_PLATFORM_SCRIPTS") == ps, pe)
     check("bwrap/command last", av[-4:] == ["--", "/bin/bash", "-c", "make test"], av[-4:])
     check("bwrap/no network namespace (builds fetch packages)", "--unshare-net" not in av and "--unshare-all" not in av)
     # The host's OWN sandbox binds every staged image root read-only — /core-tests included: core's
