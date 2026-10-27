@@ -74,6 +74,9 @@ config:
     # the container through the ConfigMap's pass-through half (any config.memex_portal
     # key with a value is rendered — _portal-config-passthrough.tpl).
     InstanceSetup__TokenCommand: "memex-local setup"
+    # This install runs on a Mac: the wizard's package step pre-checks the Mac-only packages
+    # (Google, iMessage, WhatsApp) from InstanceSetup:HostPlatform; same pass-through delivery.
+    InstanceSetup__HostPlatform: "mac"
 
 # ---- Portal Ingress: the TLS Secret is minted by `memex-local up`, not issued -------------------
 # The chart refuses an ingress that names a `tlsSecret` with no issuer reaching it (an ingress

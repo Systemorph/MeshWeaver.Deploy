@@ -472,6 +472,11 @@ DEFAULTS="$HERE/../share/values.local.defaults.yaml"
 if grep -q '^    InstanceSetup__TokenCommand: "memex-local setup"$' "$DEFAULTS"; then
   ok "values.local.defaults.yaml names 'memex-local setup' as the token command the setup page shows"
 else bad "values.local.defaults.yaml names 'memex-local setup' as the token command the setup page shows" "$(grep -n TokenCommand "$DEFAULTS")"; fi
+# …and says this install runs on a Mac, which the wizard's package step reads
+# (InstanceSetup:HostPlatform) to pre-check the Mac-only packages (Google, iMessage, WhatsApp).
+if grep -q '^    InstanceSetup__HostPlatform: "mac"$' "$DEFAULTS"; then
+  ok "values.local.defaults.yaml declares InstanceSetup__HostPlatform: mac for the package step"
+else bad "values.local.defaults.yaml declares InstanceSetup__HostPlatform: mac for the package step" "$(grep -n HostPlatform "$DEFAULTS")"; fi
 
 echo "── a gate's own INPUT must be reachable (static — needs a live pod) ──"
 
