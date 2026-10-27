@@ -51,6 +51,12 @@ a hand-over) goes through the same reader with the same rules.
         need_core7, need_run_id, backlog (retained sets in the window still lacking a runner), why
     platform-set-dispatch.py claim --run-url U --run-core-sha S [--set-version V --set-core-sha S]
         → the same lines `read` prints, for a hand-over this repository discovered itself
+    platform-set-dispatch.py runner-key --repo <this repository's checkout, FULL history>
+        → lines: inputs_commit (the newest commit touching the runner inputs), runner_rev (its
+          ancestor count — the revision every runner built from those inputs is tagged with)
+    platform-set-dispatch.py runner-choice --runner r.json --version V
+        → lines: runner_tag, runner_digest, runner_rev, superseded (space-separated digests of the
+          set's OLDER runners) — what the hand-over sends for set V
     platform-set-dispatch.py --self-test
 
 DISCOVERY (the pull). A set is PROMOTED when `mw-plugin-test` carries its version tag (main-cd
@@ -76,6 +82,21 @@ runner aged out with the registry's retention, and is not rebuilt — and at mos
 newest armed and the newest promoted set get one. A ceiling outside the window still gets its runner
 — `build-host-stable.yml` builds it on demand before it hands the ceiling over.
 
+THE RUNNER FOLLOWS DEPLOY'S MAIN (owner: "always latest everything is installed"). A set's runner is
+built from TWO sources: the platform at the set's commit, and THIS repository's runner inputs
+(`RUNNER_INPUTS`: `build-run.py`, `deploy/build-host/`, `deploy/helm/`). Keyed by the set alone, a
+runner was built once and never again, so a Deploy change to the runner reached the host only when
+the platform moved. A runner is therefore keyed by (set, runner revision):
+`mw-build-host:<version>-r<rev>`, where `rev` is the ancestor count of the newest commit that touched
+the runner inputs (`runner-key`) — monotone along `main`, unchanged by commits that do not touch
+them. The plain `mw-build-host:<version>` tag is still written once (the first runner of the set),
+for the lanes that hand over a version's ONE runner (build-host-stable.yml, the versioned
+deploy-test-switch). `discover` adds a third reason to build, between the first two: the newest armed
+set HAS a runner but none at Deploy main's current `rev` — a REFRESH. The hand-over then sends the
+set's highest-`rev` runner and names every older one as superseded (`runner-choice`), and the
+receiver takes a runner for the SAME set only when it supersedes the runner held — so a re-run of an
+old hand-over can never move the host's runner backwards (MeshWeaver.Plugins `BuildHostUpdates`).
+
 The registry is the record: what a registry listing cannot place (a NEWEST version tag with no
 staging tag, or naming two commits) is a Refusal, never a guess. An OLDER set it cannot place is
 skipped from the backfill and named in `why` — one unreadable old manifest must not stop the newest
@@ -86,7 +107,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 EVENT_TYPE = "platform-set-sealed"
@@ -106,6 +129,14 @@ STAGING_TAG = re.compile(r"^staging-([0-9a-f]{7})-([0-9]+)$")
 # The backfill considers at most this many of the newest retained sets (see THE BOUNDS above). A
 # ceiling older than that is built on demand by build-host-stable.yml.
 BACKFILL_WINDOW = 60
+# What of THIS repository a runner image is built from (deploy/build-host/Dockerfile copies exactly
+# these: the runner, the prepared-cluster script, the Dockerfile itself, and the portal chart handed
+# to stages as MW_DEPLOY_SOURCE). A commit touching none of them builds byte-identical runners.
+RUNNER_INPUTS = (".github/scripts/build-run.py", "deploy/build-host", "deploy/helm")
+# `<set version>-r<rev>`: a runner keyed by its set AND its runner revision. The plain `<version>`
+# tag is revision 0 (the runner written before the key existed, or the set's first one).
+RUNNER_REV_TAG = re.compile(r"^(.+)-r([1-9][0-9]{0,8})$")
+DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class Refusal(Exception):
@@ -258,18 +289,99 @@ def newest_set(manifests: object, what: str) -> dict | None:
     return _place(best[1], best[2], what)
 
 
-def discover(tester: object, portal: object, runner: object) -> dict:
+def runner_tag(version: str, rev: int) -> str:
+    """The tag of `version`'s runner at runner revision `rev`. Pure."""
+    if run_number_of(version) is None:
+        raise Refusal(f"{version!r} is no set version — refusing to name a runner for it")
+    if rev < 1:
+        raise Refusal(f"runner revision must be positive, got {rev}")
+    return f"{version}-r{rev}"
+
+
+def parse_runner_tag(tag: str) -> tuple[str, int] | None:
+    """(set version, runner revision) a `mw-build-host` tag names — the plain `<version>` is revision 0 —
+    or None for a tag that names no set's runner (a commit, `main`, …). Pure."""
+    if run_number_of(tag) is not None:
+        return tag, 0
+    m = RUNNER_REV_TAG.match(tag or "")
+    if m and run_number_of(m.group(1)) is not None:
+        return m.group(1), int(m.group(2))
+    return None
+
+
+def runner_revisions(runner: object) -> dict[str, dict[int, str]]:
+    """{set version: {runner revision: digest}} from the `mw-build-host` manifest metadata. A row with no
+    digest still counts as a runner that EXISTS (its digest reads as ""). Pure."""
+    out: dict[str, dict[int, str]] = {}
+    for row in runner if isinstance(runner, list) else []:
+        if not isinstance(row, dict) or not isinstance(row.get("tags"), list):
+            continue
+        digest = str(row.get("digest") or "")
+        for t in row["tags"]:
+            parsed = parse_runner_tag(str(t))
+            if parsed is not None:
+                out.setdefault(parsed[0], {})[parsed[1]] = digest
+    return out
+
+
+def runner_choice(runner: object, version: str) -> dict:
+    """What the hand-over sends for set `version`: its HIGHEST-revision runner, and every older runner of
+    the set (a different digest) named as superseded — so the receiver can tell a newer runner of the same
+    set from a re-sent older one. An empty `runner_digest` when the set has no runner at all. Pure."""
+    if not isinstance(runner, list):
+        raise Refusal("the mw-build-host manifest metadata is not a JSON list")
+    revs = runner_revisions(runner).get(version, {})
+    if not revs:
+        return {"runner_tag": "", "runner_digest": "", "runner_rev": "", "superseded": ""}
+    top = max(revs)
+    digest = revs[top]
+    if not DIGEST.fullmatch(digest):
+        raise Refusal(f"mw-build-host revision {top} of {version} carries no readable digest ({digest!r})")
+    older = sorted({d for r, d in revs.items() if r < top and d != digest})
+    for d in older:
+        if not DIGEST.fullmatch(d):
+            raise Refusal(f"an older runner of {version} carries no readable digest ({d!r}) — refusing to "
+                          "hand over a runner whose predecessors cannot all be named")
+    return {"runner_tag": version if top == 0 else runner_tag(version, top), "runner_digest": digest,
+            "runner_rev": str(top), "superseded": " ".join(older)}
+
+
+def _git(repo: Path, *args: str) -> str:
+    r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Refusal(f"git {' '.join(args)} failed in {repo}: {r.stderr.strip() or r.stdout.strip()}")
+    return r.stdout.strip()
+
+
+def runner_key(repo: Path) -> dict:
+    """{inputs_commit, runner_rev} of the checkout at `repo`: the newest commit (from HEAD) that touched
+    `RUNNER_INPUTS`, and its ancestor count. 🚨 A SHALLOW checkout is refused: its ancestor count is
+    the clone depth, not the history, and would tag a runner with a revision that means nothing."""
+    if _git(repo, "rev-parse", "--is-shallow-repository") != "false":
+        raise Refusal(f"{repo} is a shallow clone — the runner revision is an ancestor count and needs the "
+                      "full history (actions/checkout fetch-depth: 0)")
+    commit = _git(repo, "log", "-1", "--format=%H", "HEAD", "--", *RUNNER_INPUTS)
+    if not SHA.fullmatch(commit):
+        raise Refusal(f"no commit in {repo} touches the runner inputs {list(RUNNER_INPUTS)} — not this repository?")
+    return {"inputs_commit": commit, "runner_rev": str(int(_git(repo, "rev-list", "--count", commit)))}
+
+
+def discover(tester: object, portal: object, runner: object, runner_rev: int | None = None) -> dict:
     """The newest PROMOTED set (mw-plugin-test's newest version tag) and the ONE set this tick builds a
-    runner for: the newest ARMED set (memex-portal-ai's) when it lacks `mw-build-host:<version>`,
-    else the OLDEST retained set in the backfill window that lacks one (module docstring, DISCOVERY
-    and THE BOUNDS). A tester repository with no version tag at all is a Refusal: a registry that
+    runner for: the newest ARMED set (memex-portal-ai's) when it lacks any runner, else — given Deploy
+    main's `runner_rev` — the newest ARMED set again when all its runners predate that revision (a
+    REFRESH: THE RUNNER FOLLOWS DEPLOY'S MAIN), else the OLDEST retained set in the backfill window
+    that lacks one (module docstring, DISCOVERY and THE BOUNDS). A tester repository with no version tag at all is a Refusal: a registry that
     never promoted anything is not 'nothing to do', it is a reading that went wrong."""
     promoted = newest_set(tester, "mw-plugin-test")
     if promoted is None:
         raise Refusal("mw-plugin-test carries no set version tag at all — refusing to read that as "
                       "'nothing was promoted'")
     armed = newest_set(portal, "memex-portal-ai")
-    runners = {t for tags in _rows(runner, "mw-build-host") for t in tags}
+    _rows(runner, "mw-build-host")  # a listing that is not a list is refused, as before
+    revisions = runner_revisions(runner)
+    # A set HAS a runner when any revision of it exists — the plain tag or a keyed one.
+    runners = set(revisions)
 
     # Every retained PROMOTED set, placed by its own mw-plugin-test manifest: the image job builds a
     # runner only for a set whose `mw-plugin-test:<version>` exists, so a version only the portal
@@ -312,9 +424,14 @@ def discover(tester: object, portal: object, runner: object) -> dict:
         window.sort(key=lambda c: run_number_of(c["version"]) or 0)
     missing = [c for c in window if c["version"] not in runners]
 
-    need, why = None, ""
+    need, why, refresh = None, "", False
     if armed is not None and armed["version"] not in runners:
         need, why = armed, f"the newest armed set {armed['version']} has no mw-build-host image yet"
+    elif armed is not None and runner_rev is not None and max(revisions[armed["version"]]) < runner_rev:
+        need, refresh = armed, True
+        why = (f"runner refresh: the newest armed set {armed['version']} has runners up to revision "
+               f"{max(revisions[armed['version']])}, Deploy main's runner inputs are revision {runner_rev} — "
+               f"build mw-build-host:{runner_tag(armed['version'], runner_rev)}")
     elif missing:
         need = missing[0]
         label = "newest promoted" if need is promoted else "retained"
@@ -330,6 +447,7 @@ def discover(tester: object, portal: object, runner: object) -> dict:
     out = {f"promoted_{k}": v for k, v in promoted.items()}
     out.update({f"need_{k}": (need or {}).get(k, "") for k in ("version", "core7", "run_id")})
     out["backlog"] = str(len(missing))
+    out["refresh"] = "true" if refresh else "false"
     out["why"] = why
     return out
 
@@ -509,12 +627,106 @@ def _self_test() -> int:
           lambda o: o["set_version"] == "")
     check("a discovered claim with an abbreviated commit is refused",
           lambda: claim("https://github.com/o/r/actions/runs/901", a, "3.1.10412", "aaaaaaa"), REFUSED)
+
+    # ── the runner follows Deploy's main: keyed by (set, runner revision) ──
+    # THE DEFECT: once a set had `mw-build-host:<version>`, a Deploy change to the runner never reached
+    # the host until the platform moved. Each case below that says "refresh" was "nothing to build" before.
+    da, db, dc = ("sha256:" + ch * 64 for ch in "abc")
+    armed_b = [{"tags": ["staging-bbbbbbb-902", b_]}]
+    check("tags: the plain version is revision 0, a keyed one its revision, anything else none",
+          lambda: [parse_runner_tag(t) for t in (b_, f"{b_}-r57", "main", "aaaaaaa", f"{b_}-r0", "x-r5", f"{b_}-rx")],
+          lambda o: o == [(b_, 0), (b_, 57), None, None, None, None, None])
+    check("refresh: the armed set's only runner is the plain (pre-key) tag → build it at Deploy main's revision",
+          lambda: discover(two_tester, armed_b, [{"tags": [b_], "digest": da}], runner_rev=57),
+          lambda o: o["need_version"] == b_ and o["refresh"] == "true" and f"{b_}-r57" in o["why"])
+    check("refresh: an older keyed runner → build the current revision",
+          lambda: discover(two_tester, armed_b, [{"tags": [b_, f"{b_}-r40"], "digest": da}], runner_rev=57),
+          lambda o: o["need_version"] == b_ and o["refresh"] == "true")
+    check("NEGATIVE CONTROL: the current revision is there → nothing to refresh",
+          lambda: discover(two_tester, armed_b, [{"tags": [b_, f"{b_}-r40"], "digest": da}, {"tags": [f"{b_}-r57"], "digest": db},
+                                                 {"tags": [a_]}, {"tags": [z]}], runner_rev=57),
+          lambda o: o["need_version"] == "" and o["refresh"] == "false")
+    check("NEGATIVE CONTROL: a NEWER revision is there (an old commit's tick) → never rebuilt backwards",
+          lambda: discover(two_tester, armed_b, [{"tags": [f"{b_}-r60"], "digest": da}, {"tags": [a_]}, {"tags": [z]}], runner_rev=57),
+          lambda o: o["need_version"] == "" and o["refresh"] == "false")
+    check("NEGATIVE CONTROL: no revision given (a person's dispatch path) → the old rule, nothing to refresh",
+          lambda: discover(two_tester, armed_b, [{"tags": [b_]}, {"tags": [a_]}, {"tags": [z]}]),
+          lambda o: o["need_version"] == "" and o["refresh"] == "false")
+    check("an armed set with NO runner still comes first (and is no refresh)",
+          lambda: discover(two_tester, armed_b, [{"tags": [z]}], runner_rev=57),
+          lambda o: o["need_version"] == b_ and o["refresh"] == "false")
+    check("a refresh comes before a backfill, a backfill after it",
+          lambda: [discover(two_tester, two_portal, [{"tags": [z]}, {"tags": [b_]}], runner_rev=57)["need_version"],
+                   discover(two_tester, two_portal, [{"tags": [z]}, {"tags": [b_, f"{b_}-r57"]}], runner_rev=57)["need_version"]],
+          lambda o: o == [b_, a_])
+    check("a keyed runner counts as the set HAVING a runner for the backfill",
+          lambda: discover(two_tester, two_portal, [{"tags": [f"{z}-r3"]}, {"tags": [f"{b_}-r57"]}, {"tags": [f"{a_}-r9"]}], runner_rev=57),
+          lambda o: o["need_version"] == "" and o["backlog"] == "0")
+    rows = [{"tags": [b_, f"{b_}-r40"], "digest": da}, {"tags": [f"{b_}-r57"], "digest": db}, {"tags": [f"{a_}-r70"], "digest": dc}]
+    check("choice: the highest revision, every older one named as superseded",
+          lambda: runner_choice(rows, b_),
+          lambda o: o == {"runner_tag": f"{b_}-r57", "runner_digest": db, "runner_rev": "57", "superseded": da})
+    check("choice: a plain-only set hands over the plain runner, superseding nothing",
+          lambda: runner_choice([{"tags": [b_], "digest": da}], b_),
+          lambda o: o["runner_tag"] == b_ and o["runner_digest"] == da and o["superseded"] == "")
+    check("choice: another set's revisions are never this set's",
+          lambda: runner_choice(rows, a_), lambda o: o["runner_digest"] == dc and o["superseded"] == "")
+    check("choice: the same digest under two revisions is never 'superseded' by itself",
+          lambda: runner_choice([{"tags": [b_, f"{b_}-r57"], "digest": db}], b_),
+          lambda o: o["runner_digest"] == db and o["superseded"] == "")
+    check("choice: no runner → empty, never a guess", lambda: runner_choice(rows, z), lambda o: o["runner_digest"] == "")
+    check("choice: refuses a newest runner with no readable digest",
+          lambda: runner_choice([{"tags": [f"{b_}-r57"], "digest": ""}], b_), REFUSED)
+    check("choice: refuses an older runner with no readable digest (it could not be named as superseded)",
+          lambda: runner_choice([{"tags": [b_], "digest": "nope"}, {"tags": [f"{b_}-r57"], "digest": db}], b_), REFUSED)
+    check("refuses naming a keyed runner for a non-set", lambda: runner_tag("main", 3), REFUSED)
+
+    # runner-key over REAL git history: commits touching the inputs move the revision, others do not,
+    # and a shallow clone (whose ancestor count is its depth) is refused.
+    def git(repo: Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com",
+                               "-c", "commit.gpgsign=false", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(repo: Path, path: str, text: str) -> str:
+        f = repo / path
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", path)
+        return git(repo, "rev-parse", "HEAD")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp) / "deploy"
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        commit(repo, "README.md", "1")                                   # 1
+        c2 = commit(repo, ".github/scripts/build-run.py", "runner v1")  # 2 — an input
+        commit(repo, "deploy/ocr/x", "unrelated")                        # 3
+        check("runner-key: an unrelated commit keeps the inputs' commit and revision",
+              lambda: runner_key(repo), lambda o: o == {"inputs_commit": c2, "runner_rev": "2"})
+        c4 = commit(repo, "deploy/helm/values.yaml", "chart")             # 4 — an input (the chart is copied in)
+        check("runner-key: a chart change moves the revision", lambda: runner_key(repo),
+              lambda o: o == {"inputs_commit": c4, "runner_rev": "4"})
+        c5 = commit(repo, "deploy/build-host/Dockerfile", "FROM x")      # 5 — an input
+        check("runner-key: a Dockerfile change moves it again — monotone along main", lambda: runner_key(repo),
+              lambda o: o["inputs_commit"] == c5 and int(o["runner_rev"]) > 4)
+        shallow = Path(tmp) / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{repo}", str(shallow)], check=True, capture_output=True)
+        check("runner-key: refuses a shallow clone (its count is the depth, not the history)",
+              lambda: runner_key(shallow), REFUSED)
+        empty = Path(tmp) / "empty"
+        empty.mkdir()
+        git(empty, "init", "-q", "-b", "main")
+        commit(empty, "README.md", "x")
+        check("runner-key: refuses a repository no commit of which touches the inputs", lambda: runner_key(empty), REFUSED)
+
     if fails:
         print("platform-set-dispatch self-test FAILED:")
         for f in fails:
             print("  - " + f)
         return 1
-    print("platform-set-dispatch self-test: all cases passed (the contract, every refusal, both events, the backfill)")
+    print("platform-set-dispatch self-test: all cases passed (the contract, every refusal, both events, the backfill, "
+          "the runner refresh and its choice, runner-key over real history)")
     return 0
 
 
@@ -529,6 +741,13 @@ def main(argv: list[str]) -> int:
     d.add_argument("--tester", type=Path, required=True)
     d.add_argument("--portal", type=Path, required=True)
     d.add_argument("--runner", type=Path, required=True)
+    d.add_argument("--runner-rev", type=int, default=None,
+                   help="Deploy main's runner revision (runner-key) — a newest armed set whose runners all predate it is REFRESHED")
+    k = sub.add_parser("runner-key")
+    k.add_argument("--repo", type=Path, required=True)
+    rc = sub.add_parser("runner-choice")
+    rc.add_argument("--runner", type=Path, required=True)
+    rc.add_argument("--version", required=True)
     c = sub.add_parser("claim")
     c.add_argument("--run-url", required=True)
     c.add_argument("--run-core-sha", required=True)
@@ -541,11 +760,15 @@ def main(argv: list[str]) -> int:
         if a.cmd == "read":
             out = read_event(json.loads(a.event.read_text()), a.event_name)
         elif a.cmd == "discover":
-            out = discover(*(json.loads(p.read_text()) for p in (a.tester, a.portal, a.runner)))
+            out = discover(*(json.loads(p.read_text()) for p in (a.tester, a.portal, a.runner)), runner_rev=a.runner_rev)
+        elif a.cmd == "runner-key":
+            out = runner_key(a.repo)
+        elif a.cmd == "runner-choice":
+            out = runner_choice(json.loads(a.runner.read_text()), _version(a.version, "--version"))
         elif a.cmd == "claim":
             out = claim(a.run_url, a.run_core_sha, a.set_version, a.set_core_sha)
         else:
-            ap.error("read, discover, claim or --self-test")
+            ap.error("read, discover, claim, runner-key, runner-choice or --self-test")
     except (OSError, ValueError) as e:
         print(f"::error::the platform's sets cannot be read: {e}")
         return 1

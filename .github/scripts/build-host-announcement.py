@@ -18,7 +18,8 @@ Deployment: the record is the only source of truth for what the host runs.
         --tester-image cr.example.com/mw-plugin-test --tester-digest sha256:… \
         --portal-image cr.example.com/memex-portal-ai --portal-digest sha256:… \
         --runner-image cr.example.com/mw-build-host --runner-digest sha256:… \
-        --core-sha <40 hex> [--plugins-sha <40 hex>] --instance <run url>
+        --core-sha <40 hex> [--plugins-sha <40 hex>] --instance <run url> \
+        [--supersedes "sha256:… sha256:…"]
         → the event JSON, one line (the bytes that are signed are the bytes that are sent)
     build-host-announcement.py --self-test
 
@@ -31,6 +32,12 @@ an event cannot switch the hosts on by itself. Both halves default to off.
 🚨 NEVER BACKWARDS. The job sends only for the newest ARMED set (the same reading
 `notify-platform-update` makes), and the receiver refuses a `platformVersion` older than the one
 the record names.
+
+🚨 …AND THE RUNNER NEVER BACKWARDS EITHER. A set's runner follows this repository's main
+(platform-set-dispatch.py, THE RUNNER FOLLOWS DEPLOY'S MAIN), so one set can be handed over again
+with a NEWER runner. `supersedesRunnerDigests` names every older runner of the same set; the
+receiver takes a runner for the SAME set only when the runner it holds is among them, so a re-run
+of an old hand-over (whose runner is older than the one held) can never move the host back.
 """
 from __future__ import annotations
 
@@ -54,6 +61,8 @@ CHANNELS = ("latest", "stable")
 CD_CHANNELS = {"latest": None, "stable": "schedule"}
 SET_NAME = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9./_-]*$")
+# MeshWeaver.Plugins BuildHostUpdates.MaxSupersededRunners — a longer list is refused there.
+MAX_SUPERSEDED = 64
 
 
 def load_declaration(path: Path) -> dict:
@@ -87,7 +96,7 @@ def decide(declaration: dict, control: dict, channel: str, trigger: str = "") ->
 
 def body(*, deployment: str, channel: str, version: str, tester_image: str, tester_digest: str,
          portal_image: str, portal_digest: str, runner_image: str, runner_digest: str, core_sha: str,
-         plugins_sha: str, instance: str, detected_at: str) -> dict:
+         plugins_sha: str, instance: str, detected_at: str, supersedes: list[str] | None = None) -> dict:
     """The signed event. Pure; every field validated — a fact naming something malformed is worse
     than no fact."""
     if channel not in CHANNELS:
@@ -104,6 +113,14 @@ def body(*, deployment: str, channel: str, version: str, tester_image: str, test
         raise ValueError(f"core sha {core_sha!r} is not a full commit")
     if plugins_sha and not SHA.match(plugins_sha):
         raise ValueError(f"plugins sha {plugins_sha!r} is not a full commit")
+    superseded = list(dict.fromkeys(supersedes or []))
+    for d in superseded:
+        if not DIGEST.match(d or ""):
+            raise ValueError(f"superseded runner digest {d!r} is not sha256:<64 hex>")
+    if runner_digest in superseded:
+        raise ValueError("the runner handed over is named as superseded by itself — refusing a contradictory event")
+    if len(superseded) > MAX_SUPERSEDED:
+        raise ValueError(f"{len(superseded)} superseded runners — at most {MAX_SUPERSEDED} (the receiver's bound)")
     prefix = f"buildHosts.{channel}"
     # Key order is the wire order: `event` first.
     return {
@@ -117,6 +134,8 @@ def body(*, deployment: str, channel: str, version: str, tester_image: str, test
         "portalDigest": portal_digest,
         "runnerImage": runner_image,
         "runnerDigest": runner_digest,
+        # The set's OLDER runners: the receiver replaces a runner of the SAME set only when it holds one of these.
+        "supersedesRunnerDigests": superseded,
         "coreSha": core_sha or None,     # empty when CD re-sends a set another run armed
         "pluginsSha": plugins_sha or None,
         # What the receiver writes on the record, spelled as the chart reads it.
@@ -150,6 +169,7 @@ def main(argv: list[str]) -> int:
         b.add_argument(f"--{k}", required=True)
     b.add_argument("--core-sha", default="")
     b.add_argument("--plugins-sha", default="")
+    b.add_argument("--supersedes", default="", help="space-separated digests of the set's OLDER runners")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "decide":
@@ -164,6 +184,7 @@ def main(argv: list[str]) -> int:
                   portal_image=a.portal_image, portal_digest=a.portal_digest,
                   runner_image=a.runner_image, runner_digest=a.runner_digest,
                   core_sha=a.core_sha, plugins_sha=a.plugins_sha, instance=a.instance,
+                  supersedes=a.supersedes.split(),
                   detected_at=_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
         print(json.dumps(ev, separators=(",", ":")))
         return 0
@@ -222,6 +243,15 @@ def self_test() -> int:
         "buildHosts.latest.portalDigest": "sha256:" + "2" * 64,
         "buildHosts.latest.runnerDigest": "sha256:" + "3" * 64}, ev["recordFields"])
     check("body/a re-sent set without its core sha says null", body(**dict(ok, core_sha=""))["coreSha"] is None)
+    check("body/names no superseded runner by default (an empty list, never absent)", ev["supersedesRunnerDigests"] == [], ev)
+    older = ["sha256:" + "4" * 64, "sha256:" + "5" * 64]
+    check("body/names the set's older runners", body(**dict(ok, supersedes=older + older[:1]))["supersedesRunnerDigests"] == older)
+    for bad in (["sha256:abc"], ["sha256:" + "3" * 64], ["sha256:%064x" % i for i in range(MAX_SUPERSEDED + 1)]):
+        try:
+            body(**dict(ok, supersedes=bad))
+            check(f"body/refuses supersedes={bad[:1]}…", False, "accepted")
+        except ValueError:
+            pass
     check("body/ci set name accepted", body(**dict(ok, version="3.0.0-ci.10052"))["platformVersion"] == "3.0.0-ci.10052")
     for k, v in (("tester_digest", "3.1.10412"), ("portal_digest", "sha256:abc"), ("runner_digest", ""),
                  ("runner_image", "cr.example.com/mw-build-host:latest"),
@@ -243,8 +273,8 @@ def self_test() -> int:
             print(f"SELF-TEST FAILED: {f}")
         return 1
     print("build-host-announcement self-test: all cases passed (no-op while off, channel declaration, "
-          "stable only on the daily schedule, record fields incl. the runner, digest/repository/sha/version "
-          "refusals, the shipped declaration)")
+          "stable only on the daily schedule, record fields incl. the runner, the superseded runners, "
+          "digest/repository/sha/version refusals, the shipped declaration)")
     return 0
 
 

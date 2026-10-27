@@ -19,9 +19,11 @@ name: Build host — runner image and the build-latest hand-over
 # order the platform's former jobs `build-host-image` → `build-host-latest` → `build-host-report`
 # ran it:
 #
-#   1. `image`    — the build host's RUNNER image `mw-build-host:<version>` for the hand-over's set:
-#                   this repository's Dockerfile and runner (`build-run.py`), plus the
-#                   platform's helpers and `meshweaver-plugin-build` from the SET'S OWN commit.
+#   1. `image`    — the build host's RUNNER image `mw-build-host:<version>-r<rev>` for the hand-over's
+#                   set: this repository's Dockerfile and runner (`build-run.py`) at the newest
+#                   commit that touched the runner inputs, plus the platform's helpers and
+#                   `meshweaver-plugin-build` from the SET'S OWN commit. The plain
+#                   `mw-build-host:<version>` is written once too (the set's first runner).
 #                   ONE index of linux/amd64 and linux/arm64: `image-arch` builds each platform
 #                   natively, `image` joins them under the version's tag.
 #   2. `handover` — the newest ARMED set handed to `build-latest`: a SIGNED
@@ -36,6 +38,15 @@ name: Build host — runner image and the build-latest hand-over
 # (the record declares it, and `enabled` is `true`, as in the platform since core #7235), so every
 # hand-over sends. The runner IMAGE is built regardless, so a set is never armed with no runner to
 # hand over.
+#
+# 🔁 THE RUNNER FOLLOWS DEPLOY'S MAIN (owner: "always latest everything is installed"). A runner is
+# keyed by (set, runner revision) — `rev` is the ancestor count of the newest commit touching the
+# runner inputs (`platform-set-dispatch.py runner-key`). A Deploy change to the runner therefore
+# makes the newest armed set's runner STALE, the next tick REFRESHES it (`discover`), and the
+# hand-over sends the set's highest-revision runner naming every older one as superseded — the
+# receiver takes a newer runner for the SAME set, which rolls the host without draining it (the
+# claim barrier is the platform version, and that did not move). Before this, a set's runner was
+# built once and a Deploy change reached the host only when the platform next moved.
 #
 # NEVER BACKWARDS: only the newest armed set is sent, re-sent on every tick, so a missed hand-over
 # self-heals on the next one; the receiver changes nothing for a set it already holds and never
@@ -119,11 +130,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # FULL history: the runner revision below is an ancestor count.
       - uses: actions/checkout@v7
         with:
           path: deploy
+          fetch-depth: 0
       - name: The hand-over reader can say no (self-test)
         run: python3 deploy/.github/scripts/platform-set-dispatch.py --self-test
+      # The key every published runner is tagged with, read from THIS history the way preflight reads
+      # it on main — a shallow or unrelated checkout is red here, not on the first publishing tick.
+      - name: The runner inputs' revision reads from this history (runner-key)
+        run: python3 deploy/.github/scripts/platform-set-dispatch.py runner-key --repo deploy
       - name: The runner can say no (self-test)
         run: python3 deploy/.github/scripts/build-run.py --self-test
       - name: The announcement can say no (self-test)
@@ -196,9 +213,13 @@ jobs:
       armed_version: ${{ steps.claim.outputs.armed_version }}
       armed_core_sha: ${{ steps.claim.outputs.armed_core_sha }}
       armed_plugins_sha: ${{ steps.claim.outputs.armed_plugins_sha }}
+      inputs_commit: ${{ steps.runner.outputs.inputs_commit }}
+      runner_rev: ${{ steps.runner.outputs.runner_rev }}
     steps:
+      # FULL history: the runner revision is an ancestor count (a shallow clone is refused by name).
       - uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: false
       - name: Every credential the publishing lane uses, or a red run naming what to provision
@@ -218,6 +239,15 @@ jobs:
             exit 1
           fi
           echo "All publishing inputs are present."
+      # 🚨 A runner is tagged with the revision of the commit it was built from, and the hand-over
+      # sends the set's HIGHEST revision — so a run from another branch (a person's dispatch on a
+      # feature branch) could hand the host a runner main never had. Only main publishes.
+      - name: "The runner inputs: this run is on main, and their revision"
+        id: runner
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::the publishing lane runs from main only (this run is on $GITHUB_REF) — a runner's revision is main's"; exit 1; }
+          python3 .github/scripts/platform-set-dispatch.py runner-key --repo . | tee -a "$GITHUB_OUTPUT"
       # THE PULL: a schedule tick reads the platform's sealed sets from the registry itself. The
       # platform's CD dispatches to no repository, so this is how a set it sealed reaches us.
       - name: "Schedule: ensure Azure CLI"
@@ -239,6 +269,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          RUNNER_REV: ${{ steps.runner.outputs.runner_rev }}
         run: |
           set -euo pipefail
           for repo in mw-plugin-test memex-portal-ai mw-build-host; do
@@ -246,7 +277,8 @@ jobs:
               --repository "$repo" --top 300 > "$RUNNER_TEMP/$repo.json"
           done
           python3 .github/scripts/platform-set-dispatch.py discover --tester "$RUNNER_TEMP/mw-plugin-test.json" \
-            --portal "$RUNNER_TEMP/memex-portal-ai.json" --runner "$RUNNER_TEMP/mw-build-host.json" > "$RUNNER_TEMP/found"
+            --portal "$RUNNER_TEMP/memex-portal-ai.json" --runner "$RUNNER_TEMP/mw-build-host.json" \
+            --runner-rev "$RUNNER_REV" > "$RUNNER_TEMP/found"
           cat "$RUNNER_TEMP/found"
           get() { sed -n "s/^$1=//p" "$RUNNER_TEMP/found"; }
           # The registry names a commit by its seven characters; the platform's PUBLIC history names
@@ -361,15 +393,21 @@ jobs:
         if: steps.set.outputs.build == 'true'
         env:
           ARCH: ${{ matrix.arch }}
+          # The runner is built from the newest commit that touched its inputs (the Dockerfile fetches
+          # that commit), so every runner of one revision is the same bytes whatever later commit ran.
+          INPUTS_COMMIT: ${{ needs.preflight.outputs.inputs_commit }}
+          RUNNER_REV: ${{ needs.preflight.outputs.runner_rev }}
         run: |
           set -euo pipefail
+          [ -n "$INPUTS_COMMIT" ] && [ -n "$RUNNER_REV" ] || { echo "::error::preflight named no runner inputs commit / revision"; exit 1; }
           out="$RUNNER_TEMP/build-host-layout"
           mkdir -p "$out"
           docker buildx build --platform "linux/$ARCH" -f deploy/deploy/build-host/Dockerfile \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --label "io.meshweaver.platform.revision=$(git -C platform rev-parse HEAD)" \
-            --build-arg DEPLOY_COMMIT="$(git -C deploy rev-parse HEAD)" --build-arg PLATFORM_COMMIT="$(git -C platform rev-parse HEAD)" \
+            --label "io.meshweaver.runner.revision=$RUNNER_REV" \
+            --build-arg DEPLOY_COMMIT="$INPUTS_COMMIT" --build-arg PLATFORM_COMMIT="$(git -C platform rev-parse HEAD)" \
             --provenance=false --sbom=false \
             --output "type=oci,dest=$out/$ARCH.tar" deploy/deploy/build-host
           [ -s "$out/$ARCH.tar" ] || { echo "::error::mw-build-host linux/$ARCH built but wrote no OCI layout"; exit 1; }
@@ -474,26 +512,30 @@ jobs:
           pattern: build-host-layout-*
           merge-multiple: true
           path: ${{ runner.temp }}/build-host-layout
-      # 🚨 ONE DIGEST PER VERSION. The hosts are handed the runner BY DIGEST, so a version's tag is
-      # written once: a second hand-over of the same set (a re-sent dispatch, a re-run) reads the
-      # digest that is there instead of pushing different bytes under the same name.
-      - name: "Join + push mw-build-host:<version> (linux/amd64 + linux/arm64), and read its digest"
+      # 🚨 ONE DIGEST PER (VERSION, RUNNER REVISION). The hosts are handed the runner BY DIGEST, so a
+      # keyed tag is written once: a second hand-over of the same set at the same revision (a re-sent
+      # dispatch, a re-run) reads the digest that is there instead of pushing different bytes under
+      # the same name. A NEW revision is a new tag — that is how the runner follows Deploy's main.
+      - name: "Join + push mw-build-host:<version>-r<rev> (linux/amd64 + linux/arm64), and read its digest"
         if: steps.set.outputs.build == 'true'
         id: push
         env:
           VERSION: ${{ needs.preflight.outputs.set_version }}
+          RUNNER_REV: ${{ needs.preflight.outputs.runner_rev }}
         run: |
           set -euo pipefail
-          ref="$ACR/mw-build-host:$VERSION"
+          [ -n "$RUNNER_REV" ] || { echo "::error::preflight named no runner revision"; exit 1; }
+          tag="$VERSION-r$RUNNER_REV"
+          ref="$ACR/mw-build-host:$tag"
           # Only a registry that ANSWERED "not found" means absent. A timeout, a throttle or an auth
           # failure is not an answer, and building on it could put new bytes under a digest a host
           # was already handed — so it is RED.
           if d=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' 2>"$RUNNER_TEMP/inspect.err"); then
             digest=$(printf '%s' "$d" | tr -d '"')
-            echo "::notice title=mw-build-host:$VERSION exists::kept $digest — a version's runner is written once"
+            echo "::notice title=mw-build-host:$tag exists::kept $digest — a revision's runner is written once"
           elif ! grep -qiE 'not found|manifest unknown|MANIFEST_UNKNOWN' "$RUNNER_TEMP/inspect.err"; then
             cat "$RUNNER_TEMP/inspect.err"
-            echo "::error::could not establish whether mw-build-host:$VERSION exists (the registry did not answer 'not found') — refusing to build over a tag that may be there"
+            echo "::error::could not establish whether mw-build-host:$tag exists (the registry did not answer 'not found') — refusing to build over a tag that may be there"
             exit 1
           else
             # Each leg's layout must hold exactly ONE image manifest, for exactly its platform: an
@@ -515,7 +557,7 @@ jobs:
             docker buildx imagetools create --tag "$ref" "${sources[@]}"
             digest=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' | tr -d '"')
           fi
-          case "$digest" in sha256:*) ;; *) echo "::error::mw-build-host:$VERSION resolves to no digest ('$digest')"; exit 1 ;; esac
+          case "$digest" in sha256:*) ;; *) echo "::error::mw-build-host:$tag resolves to no digest ('$digest')"; exit 1 ;; esac
           # Kept or joined, the version's tag must carry BOTH platforms: a kept amd64-only runner
           # (written before the arm64 leg existed) is named, never handed on as a multi-arch one.
           # An index names its platforms; a single image manifest only in its config — both are read
@@ -530,13 +572,35 @@ jobs:
           missing=$(sed -n 's/^missing=//p' "$RUNNER_TEMP/runner-platforms")
           if [ "$known" != true ]; then
             plats="platforms unknown"
-            echo "::warning title=mw-build-host:$VERSION platforms unknown::neither the tag's manifest nor its image config names its platforms — whether a linux/amd64 or linux/arm64 host can run it is not established"
+            echo "::warning title=mw-build-host:$tag platforms unknown::neither the tag's manifest nor its image config names its platforms — whether a linux/amd64 or linux/arm64 host can run it is not established"
           fi
           for p in $missing; do
-            echo "::warning title=mw-build-host:$VERSION lacks $p::the tag's platforms are '$plats' — a host on $p cannot run this version's runner (a version's runner is written once)"
+            echo "::warning title=mw-build-host:$tag lacks $p::the tag's platforms are '$plats' — a host on $p cannot run this version's runner (a version's runner is written once)"
           done
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          echo "- mw-build-host \`$VERSION\` = \`$digest\` ($plats)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- mw-build-host \`$tag\` = \`$digest\` ($plats)" >> "$GITHUB_STEP_SUMMARY"
+      # The plain `<version>` tag stays the set's FIRST runner, written once: build-host-stable.yml and
+      # the versioned deploy-test-switch hand over a version's ONE runner by that name. Written by a
+      # byte-for-byte retag of the keyed tag (same digest), only when the registry ANSWERED "not found".
+      - name: "Name the set's first runner mw-build-host:<version> too (only when absent)"
+        if: steps.set.outputs.build == 'true'
+        env:
+          VERSION: ${{ needs.preflight.outputs.set_version }}
+          RUNNER_REV: ${{ needs.preflight.outputs.runner_rev }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          set -euo pipefail
+          if d=$(docker buildx imagetools inspect "$ACR/mw-build-host:$VERSION" --format '{{json .Manifest.Digest}}' 2>"$RUNNER_TEMP/plain.err"); then
+            echo "- mw-build-host \`$VERSION\` already names \`$(printf '%s' "$d" | tr -d '"')\` — kept (a version's first runner is written once)" >> "$GITHUB_STEP_SUMMARY"
+          elif grep -qiE 'not found|manifest unknown|MANIFEST_UNKNOWN' "$RUNNER_TEMP/plain.err"; then
+            python3 deploy/.github/scripts/acr-data-plane.py retag --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
+              --repository mw-build-host --from "$VERSION-r$RUNNER_REV" --to "$VERSION"
+            echo "- mw-build-host \`$VERSION\` = \`$VERSION-r$RUNNER_REV\` (the set's first runner)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat "$RUNNER_TEMP/plain.err"
+            echo "::error::could not establish whether mw-build-host:$VERSION exists (the registry did not answer 'not found') — refusing to write over a tag that may be there"
+            exit 1
+          fi
       # The same manifest to the fleet registry, digest verified — the registry contract every image
       # of the set keeps, so a build-host record whose runnerRepository names the fleet registry can
       # pull the digest it is handed.
@@ -545,11 +609,16 @@ jobs:
         env:
           REGISTRY_PASSWORD: ${{ secrets.MW_REGISTRY_PUBLISHER_PASSWORD }}
         run: bash platform/.github/scripts/registry-login.sh "$REGISTRY" "$REGISTRY_PUBLISHER"
-      - name: Mirror mw-build-host:<version> to the fleet registry — same manifest, digest verified
+      - name: Mirror mw-build-host:<version>-r<rev> and :<version> to the fleet registry — same manifests, digests verified
         if: steps.set.outputs.build == 'true'
         env:
           VERSION: ${{ needs.preflight.outputs.set_version }}
-        run: bash platform/.github/scripts/mirror-image-to-registry.sh "$ACR/mw-build-host:$VERSION" "$REGISTRY/mw-build-host:$VERSION"
+          RUNNER_REV: ${{ needs.preflight.outputs.runner_rev }}
+        run: |
+          set -euo pipefail
+          for tag in "$VERSION-r$RUNNER_REV" "$VERSION"; do
+            bash platform/.github/scripts/mirror-image-to-registry.sh "$ACR/mw-build-host:$tag" "$REGISTRY/mw-build-host:$tag"
+          done
 
   handover:
     name: "Build host: hand the armed set to build-latest (record path)"
@@ -654,11 +723,16 @@ jobs:
             || { echo "::error::the newest armed set '$newest' carries no run ordinal — the armed-state reading is not trustworthy"; exit 1; }
           core=""; plugins=""
           if [ "$ARMED_HERE" = true ] && [ "$V_ARMED_HERE" = "$newest" ]; then core="$CORE_HERE"; plugins="$PLUGINS_HERE"; fi
-          python3 deploy/.github/scripts/acr-data-plane.py login --registry "$ACR" --tenant "$AZURE_TENANT_ID"
-          runner=""
-          if d=$(docker buildx imagetools inspect "$ACR/mw-build-host:$newest" --format '{{json .Manifest.Digest}}'); then
-            runner=$(printf '%s' "$d" | tr -d '"')
-          fi
+          # The set's HIGHEST-revision runner, and every older one named as superseded (the receiver
+          # takes a runner for the SAME set only when it supersedes the one held — never backwards).
+          python3 deploy/.github/scripts/acr-data-plane.py manifests --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
+            --repository mw-build-host --top 300 > "$RUNNER_TEMP/runner-manifests.json"
+          python3 deploy/.github/scripts/platform-set-dispatch.py runner-choice --runner "$RUNNER_TEMP/runner-manifests.json" \
+            --version "$newest" > "$RUNNER_TEMP/runner-choice"
+          cat "$RUNNER_TEMP/runner-choice"
+          runner=$(sed -n 's/^runner_digest=//p' "$RUNNER_TEMP/runner-choice")
+          runner_tag=$(sed -n 's/^runner_tag=//p' "$RUNNER_TEMP/runner-choice")
+          superseded=$(sed -n 's/^superseded=//p' "$RUNNER_TEMP/runner-choice")
           case "$runner" in
             sha256:*) echo "send=true" >> "$GITHUB_OUTPUT" ;;
             *)
@@ -671,7 +745,8 @@ jobs:
               echo "- build-latest: $newest has no runner image — not handed over" >> "$GITHUB_STEP_SUMMARY"
               ;;
           esac
-          { echo "version=$newest"; echo "core=$core"; echo "plugins=$plugins"; echo "runner=$runner"; } >> "$GITHUB_OUTPUT"
+          { echo "version=$newest"; echo "core=$core"; echo "plugins=$plugins"; echo "runner=$runner"
+            echo "runner_tag=$runner_tag"; echo "superseded=$superseded"; } >> "$GITHUB_OUTPUT"
       - name: "Sign and POST build-host-update-available for build-latest"
         id: build_host_send
         if: steps.build_host.outputs.enabled == 'true' && steps.build_host_current.outputs.send == 'true'
@@ -683,6 +758,8 @@ jobs:
           CORE_SHA: ${{ steps.build_host_current.outputs.core }}
           PLUGINS_SHA: ${{ steps.build_host_current.outputs.plugins }}
           RUNNER_DIGEST: ${{ steps.build_host_current.outputs.runner }}
+          RUNNER_TAG: ${{ steps.build_host_current.outputs.runner_tag }}
+          SUPERSEDED: ${{ steps.build_host_current.outputs.superseded }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         run: |
@@ -708,7 +785,7 @@ jobs:
             --version "$V_SET" --tester-image "$ACR/mw-plugin-test" --tester-digest "$TESTER_DIGEST" \
             --portal-image "$ACR/memex-portal-ai" --portal-digest "$PORTAL_DIGEST" \
             --runner-image "$ACR/mw-build-host" --runner-digest "$RUNNER_DIGEST" \
-            --core-sha "$CORE_SHA" --plugins-sha "$PLUGINS_SHA" --instance "$RUN_URL")
+            --core-sha "$CORE_SHA" --plugins-sha "$PLUGINS_SHA" --instance "$RUN_URL" --supersedes "$SUPERSEDED")
           SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^.*= /sha256=/')
           code=$(curl -sS -o "$RUNNER_TEMP/build-host-resp" -w '%{http_code}' --connect-timeout 10 --max-time 60 \
             -X POST "$URL" -H 'Content-Type: application/json' \
@@ -722,7 +799,7 @@ jobs:
               # record declares buildHosts.enabled. Whether build-latest RUNS the set is read on the
               # run nodes it claims (`PlatformVersion`), never inferred from this 200.
               echo "handed=true" >> "$GITHUB_OUTPUT"
-              echo "- build-latest handed \`$V_SET\` (tester \`${TESTER_DIGEST:7:12}\`, portal \`${PORTAL_DIGEST:7:12}\`, runner \`${RUNNER_DIGEST:7:12}\`) for record \`$DEPLOYMENT\`: STORED and signature-verified (HTTP $code). Not yet a roll — the record's Reconcile is" >> "$GITHUB_STEP_SUMMARY"
+              echo "- build-latest handed \`$V_SET\` (tester \`${TESTER_DIGEST:7:12}\`, portal \`${PORTAL_DIGEST:7:12}\`, runner \`$RUNNER_TAG\` = \`${RUNNER_DIGEST:7:12}\`, superseding $(printf '%s' "$SUPERSEDED" | wc -w | tr -d ' ') older runner(s)) for record \`$DEPLOYMENT\`: STORED and signature-verified (HTTP $code). Not yet a roll — the record's Reconcile is" >> "$GITHUB_STEP_SUMMARY"
               ;;
             000) echo "::error::could not reach the control plane's inbox — build-latest was NOT handed $V_SET"; exit 1 ;;
             401) echo "::error::the inbox REFUSED the signature (HTTP 401): secrets.CONTROL_WEBHOOK_SECRET and the instance's Hosting:PlatformWebhookSecret differ — build-latest was NOT handed $V_SET"; exit 1 ;;
