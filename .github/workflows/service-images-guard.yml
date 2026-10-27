@@ -49,5 +49,9 @@ jobs:
             # it on an older image), never gated on "image not yet published" (a failed line move must
             # complete on rerun), never by a raw retag, a build or a push.
             python3 .github/scripts/acr-data-plane.py check-line-convergence ".github/workflows/$lane"
+            # A lane built through a registry build cache (ollama): the cache is built only for an
+            # unpublished commit, and the publish imports THIS run's cache by digest, never the shared
+            # tag an overlapping run may re-point. A lane with no registry cache passes.
+            python3 .github/scripts/acr-data-plane.py check-cache-handover ".github/workflows/$lane"
           done
           echo "checked ${#lanes[@]} lane(s)"

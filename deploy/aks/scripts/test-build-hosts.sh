@@ -47,7 +47,7 @@ if [ -f "$CHART/files/build-run.py" ]; then
   report "deploy/helm/files/build-run.py exists — the chart must not carry a second copy of the runner; it ships in the mw-build-host image"
 fi
 if [ -f "$DOCKERFILE" ] \
-   && grep -q '^COPY --from=sources /out/scripts/build-run.py /out/scripts/compose-gate-host.sh /out/scripts/sandbox-postgres.sh /out/scripts/module-build-key.py /out/scripts/node-repo-scope.py /out/scripts/ci-artifact-store.py /opt/build-host/$' "$DOCKERFILE" \
+   && grep -q '^COPY --from=sources /out/scripts/build-run.py /out/scripts/compose-gate-host.sh /out/scripts/sandbox-postgres.sh /out/scripts/module-build-key.py /out/scripts/node-repo-scope.py /out/scripts/ci-artifact-store.py /out/scripts/compile-check.py /opt/build-host/$' "$DOCKERFILE" \
    && grep -q '^COPY --from=sources /out/plugin-build/ /opt/build-host/plugin-build/$' "$DOCKERFILE" \
    && ! grep -Eq '^COPY [^-]' "$DOCKERFILE" \
    && grep -q "grep -Eq '\^\[0-9a-f\]{40}\$'" "$DOCKERFILE" \
@@ -56,10 +56,27 @@ if [ -f "$DOCKERFILE" ] \
    && grep -q 'build-run.py --self-test' "$DOCKERFILE" \
    && grep -q 'module-build-key.py --self-test' "$DOCKERFILE" \
    && grep -q 'module-build-key.py node-repo-scope.py' "$DOCKERFILE" \
+   && grep -q 'compile-check.py --help' "$DOCKERFILE" \
    && ! grep -Eq '^FROM [^ ]*:latest' "$DOCKERFILE"; then
-  ok "deploy/build-host/Dockerfile fetches the runner, composer, sandbox-postgres, module-build-key with its sibling node-repo-scope.py and the plugin-build tool by 40-hex commit (nothing COPYed from the context), installs bubblewrap, runs the self-tests (module-build-key's too, so a missing sibling fails the build), and pins no :latest"
+  ok "deploy/build-host/Dockerfile fetches the runner, composer, sandbox-postgres, module-build-key with its sibling node-repo-scope.py, core's compile-check.py (handed to stages as MW_PLATFORM_SCRIPTS) and the plugin-build tool by 40-hex commit (nothing COPYed from the context), installs bubblewrap, runs the self-tests (module-build-key's too, so a missing sibling fails the build), and pins no :latest"
 else
-  report "deploy/build-host/Dockerfile must fetch its sources by 40-hex commit in the 'sources' stage, COPY only --from=sources (build-run.py, compose-gate-host.sh, sandbox-postgres.sh, module-build-key.py, node-repo-scope.py — module-build-key imports it, core #7270 —, ci-artifact-store.py, plugin-build) to /opt/build-host/, install bubblewrap, run the self-tests incl. module-build-key.py's, and name no :latest base"
+  report "deploy/build-host/Dockerfile must fetch its sources by 40-hex commit in the 'sources' stage, COPY only --from=sources (build-run.py, compose-gate-host.sh, sandbox-postgres.sh, module-build-key.py, node-repo-scope.py — module-build-key imports it, core #7270 —, ci-artifact-store.py, compile-check.py — a stage's canonical checker, MW_PLATFORM_SCRIPTS —, plugin-build) to /opt/build-host/, install bubblewrap, run the self-tests incl. module-build-key.py's, and name no :latest base"
+fi
+# 1b. the PREPARED host (MeshWeaver.Plugins Hosting/StandingBuildHosts.md, "a prepared server, never a
+#     prepared run"): the image carries core's source at the set's commit and the portal chart (both by
+#     commit, from the sources stage), PostgreSQL with pgvector, and the prepared test-database server,
+#     whose REAL self-test runs as the unprivileged user and which the entrypoint starts before the loop.
+if [ -f "$DOCKERFILE" ] \
+   && grep -q '^COPY --from=sources /out/platform-src/ /opt/build-host/platform-src/$' "$DOCKERFILE" \
+   && grep -q '^COPY --from=sources /out/deploy-src/ /opt/build-host/deploy-src/$' "$DOCKERFILE" \
+   && grep -q '^COPY --from=sources /out/scripts/host-postgres.sh /opt/build-host/$' "$DOCKERFILE" \
+   && grep -q 'postgresql-${PG_MAJOR}-pgvector' "$DOCKERFILE" \
+   && grep -q '^RUN bash /opt/build-host/host-postgres.sh --self-test \\$' "$DOCKERFILE" \
+   && grep -q '^ && bash /opt/build-host/host-postgres.sh prepare /opt/build-host/pg-snapshot$' "$DOCKERFILE" \
+   && [ "$(grep -n '^USER 1654' "$DOCKERFILE" | head -1 | cut -d: -f1)" -lt "$(grep -n 'host-postgres.sh --self-test' "$DOCKERFILE" | head -1 | cut -d: -f1)" ]; then
+  ok "deploy/build-host/Dockerfile carries core's source and the chart by commit, PostgreSQL with pgvector, runs the prepared cluster's REAL self-test and builds the snapshot as the unprivileged user"
+else
+  report "deploy/build-host/Dockerfile must COPY --from=sources platform-src/, deploy-src/ and host-postgres.sh, install postgresql-\${PG_MAJOR}-pgvector, run host-postgres.sh --self-test and prepare /opt/build-host/pg-snapshot AFTER 'USER 1654' (initdb refuses root)"
 fi
 if python3 "$REPO/.github/scripts/build-run.py" --self-test; then
   ok "build-run.py passes its self-test"
