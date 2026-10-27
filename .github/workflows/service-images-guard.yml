@@ -1,0 +1,48 @@
+# `Service images reach the registry as the publishing identity can` — the guard over the four
+# service-image lanes (ocr-image.yml, ollama-image.yml, whisper-image.yml, s1-extract-image.yml).
+#
+# Those lanes moved here from the platform repository (core slimming). There they signed in with a
+# subscription and reached the registry through `az acr` (an ARM lookup) and the platform's
+# acr-login.sh. This repository's ONE cloud credential holds AcrPush on the registry resource and
+# nothing at subscription scope, so each lane signs in tenant-level and talks to the registry through
+# its data plane (.github/scripts/acr-data-plane.py). A lane that drifted back would be refused at
+# login on its next `main` run — after the merge, where nobody is looking. This job says so on the
+# pull request instead.
+#
+# Every line is load-bearing: no path filter (the image lanes are path-filtered, and a change to
+# acr-data-plane.py alone must still be held), no job-level `if:`, no `continue-on-error:`, and the
+# script's own self-test runs immediately before the check, because against a clean tree a guard
+# prints the same green whether it measured or not.
+name: Service images guard
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: service-images-guard-${{ github.ref }}
+  cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+
+jobs:
+  guard:
+    name: Service image lanes reach the registry through its data plane
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: acr-data-plane.py can fail (self-test, incl. the byte-for-byte retag)
+        run: python3 .github/scripts/acr-data-plane.py --self-test
+      - name: Every service-image lane signs in tenant-level and never asks ARM
+        run: |
+          set -euo pipefail
+          lanes=(ocr-image.yml ollama-image.yml whisper-image.yml s1-extract-image.yml)
+          for lane in "${lanes[@]}"; do
+            [ -f ".github/workflows/$lane" ] || { echo "::error::.github/workflows/$lane is missing — the guard's subject moved; repoint it"; exit 1; }
+            python3 .github/scripts/acr-data-plane.py check-workflow ".github/workflows/$lane"
+          done
+          echo "checked ${#lanes[@]} lane(s)"

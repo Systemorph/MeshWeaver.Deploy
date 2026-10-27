@@ -21,6 +21,12 @@ registry with that.
     acr-data-plane.py manifests --registry <login server> --tenant <tenant id> --repository <name> --top N
         the newest N manifests of <name>, newest first, as a JSON array on stdout — the rows
         `az acr manifest list-metadata --orderby time_desc -o json` prints (each carries `tags`).
+    acr-data-plane.py retag     --registry <login server> --tenant <tenant id> --repository <name> --from <tag> --to <tag>
+        put the manifest <name>:<from> names under <to> as well, BYTE FOR BYTE (GET by the source tag,
+        PUT the same body under the target with the same media type), so both tags name ONE digest;
+        prints that digest. `docker buildx imagetools create` is no substitute: it wraps a
+        single-platform manifest in a new index, which is a different digest (the service-image lanes,
+        e.g. ollama-image.yml, move their line tag this way without re-uploading ~25 GB).
     acr-data-plane.py check-workflow <workflow.yml>
         RED unless every azure/login step signs in with `allow-no-subscriptions: true` and names no
         `subscription-id`, and nothing in the workflow runs an `az acr` command or the platform's
@@ -31,6 +37,7 @@ Nothing here prints a token. The refresh token reaches docker on stdin only.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -80,12 +87,25 @@ def _get_json(url: str, token: str) -> tuple[object, str | None]:
         return json.loads(r.read().decode()), r.headers.get("Link")
 
 
-class Io:
-    """The four edges this script touches — HTTP POST, HTTP GET, a process, a sleep — so the
-    self-test drives every path OFFLINE with fakes (the same seam build-run.py uses)."""
+def _fetch(method: str, url: str, token: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
+    """One raw registry request: (status, lower-cased headers, body). An HTTP error status is
+    RETURNED, never raised, so the caller decides what an answer means. A transport failure (no
+    answer at all) still raises."""
+    req = urllib.request.Request(url, data=body, method=method,
+                                 headers={"Authorization": f"Bearer {token}", **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return r.status, {k.lower(): v for k, v in r.headers.items()}, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, {k.lower(): v for k, v in (e.headers or {}).items()}, e.read() or b""
 
-    def __init__(self, post=_post_form, get=_get_json, run=subprocess.run, sleep=time.sleep):
-        self.post, self.get, self.run, self.sleep = post, get, run, sleep
+
+class Io:
+    """The edges this script touches — HTTP POST, HTTP GET, a raw registry request, a process, a
+    sleep — so the self-test drives every path OFFLINE with fakes (the same seam build-run.py uses)."""
+
+    def __init__(self, post=_post_form, get=_get_json, run=subprocess.run, sleep=time.sleep, fetch=_fetch):
+        self.post, self.get, self.run, self.sleep, self.fetch = post, get, run, sleep, fetch
 
 
 def entra_token(tenant: str, io: Io) -> str:
@@ -141,6 +161,51 @@ def list_manifests(server: str, tenant: str, repository: str, top: int, io: Io) 
         rows.extend(batch)
         url = next_link(link)
     return rows[:top]
+
+
+# Every manifest shape the registry may hold under a tag: a single image (OCI or Docker v2) or an
+# index / manifest list. The registry answers with the stored media type, which the PUT repeats.
+MANIFEST_ACCEPT = ",".join((
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+))
+TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
+REPOSITORY_RE = re.compile(r"[a-z0-9]+(?:[._/-][a-z0-9]+)*")
+
+
+def retag(server: str, tenant: str, repository: str, source: str, target: str, io: Io) -> str:
+    """Name the manifest `<repository>:<source>` names under `<target>` as well, byte for byte, and
+    return its digest. Refused — never a partial success — when the source is absent or unreadable,
+    when the registry's digest does not match the bytes it served, or when the PUT is not stored
+    under that same digest."""
+    if not REPOSITORY_RE.fullmatch(repository or ""):
+        raise Refusal(f"--repository is not a repository name: {repository!r}")
+    for flag, tag in (("--from", source), ("--to", target)):
+        if not TAG_RE.fullmatch(tag or ""):
+            raise Refusal(f"{flag} is not a tag: {tag!r}")
+    if source == target:
+        raise Refusal(f"--from and --to are the same tag ({source!r}) — nothing to move")
+    token = access_token(server, refresh_token(server, tenant, io), f"repository:{repository}:pull,push", io)
+    base = f"https://{server}/v2/{repository}/manifests"
+    status, headers, body = io.fetch("GET", f"{base}/{source}", token, {"Accept": MANIFEST_ACCEPT}, None)
+    if status != 200:
+        raise Refusal(f"GET {repository}:{source} answered HTTP {status} — the source manifest was not read")
+    media = (headers.get("content-type") or "").split(";")[0].strip()
+    if not media:
+        raise Refusal(f"{repository}:{source} was served with no Content-Type — its media type is unknown")
+    digest = "sha256:" + hashlib.sha256(body).hexdigest()
+    served = headers.get("docker-content-digest")
+    if served and served != digest:
+        raise Refusal(f"{repository}:{source}: the registry names {served}, but the bytes it served hash to {digest}")
+    status, headers, _ = io.fetch("PUT", f"{base}/{target}", token, {"Content-Type": media}, body)
+    if status not in (200, 201):
+        raise Refusal(f"PUT {repository}:{target} answered HTTP {status} — the tag was not moved")
+    stored = headers.get("docker-content-digest")
+    if stored and stored != digest:
+        raise Refusal(f"{repository}:{target} was stored as {stored}, not {digest} — the tags name two manifests")
+    return digest
 
 
 def docker_login(server: str, tenant: str, io: Io) -> None:
@@ -408,6 +473,69 @@ def self_test() -> int:
           lambda: docker_login("r.example.io", "tid", fake([], runs=runs, run_fail=99)), REFUSED)
     check("offline/exhaustion = 5 attempts, 4 back-offs 5→40 s",
           lambda: (len([r for r in runs if r[0][0] == "docker"]), sleeps), lambda g: g == (5, [5, 10, 20, 40]))
+
+    # ── OFFLINE: the byte-for-byte retag ──
+    manifest = b'{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}'
+    mdigest = "sha256:" + hashlib.sha256(manifest).hexdigest()
+    oci = "application/vnd.oci.image.manifest.v1+json"
+
+    def retag_io(calls, get=None, put=None):
+        def post(url, form):
+            calls.append(("POST", url, dict(form)))
+            return {"refresh_token": "acr-refresh"} if url.endswith("/oauth2/exchange") else {"access_token": "acr-access"}
+
+        def fetch(method, url, token, headers, body):
+            calls.append((method, url, token, dict(headers), body))
+            if method == "GET":
+                return get if get is not None else (200, {"content-type": oci, "docker-content-digest": mdigest}, manifest)
+            return put if put is not None else (201, {"docker-content-digest": mdigest}, b"")
+
+        def run(cmd, **kw):
+            calls.append(("RUN", cmd))
+            return Done("entra-token\n")
+        return Io(post=post, run=run, fetch=fetch, sleep=lambda s: None)
+
+    def calls_of(kind, calls):
+        return [c for c in calls if c[0] == kind]
+
+    calls: list = []
+    got = retag("r.example.io", "tid", "ollama", "0.1-abc1234", "0.1", retag_io(calls))
+    check("offline/retag returns the ONE digest both tags name", lambda: got, lambda d: d == mdigest)
+    check("offline/retag asks for pull,push on the ONE repository",
+          lambda: calls_of("POST", calls)[1], lambda c: c[2]["scope"] == "repository:ollama:pull,push")
+    check("offline/retag GETs the source tag, accepting every manifest shape",
+          lambda: calls_of("GET", calls)[0],
+          lambda c: c[1] == "https://r.example.io/v2/ollama/manifests/0.1-abc1234"
+          and c[2] == "acr-access" and "application/vnd.oci.image.index.v1+json" in c[3]["Accept"])
+    check("offline/retag PUTs the SAME bytes under the target with the served media type",
+          lambda: calls_of("PUT", calls)[0],
+          lambda c: c[1] == "https://r.example.io/v2/ollama/manifests/0.1"
+          and c[3] == {"Content-Type": oci} and c[4] == manifest)
+    params: list = []
+    retag("r.example.io", "tid", "ollama", "a", "b",
+          retag_io(params, get=(200, {"content-type": oci + "; charset=utf-8"}, manifest)))
+    check("offline/a media type with parameters is PUT without them",
+          lambda: calls_of("PUT", params)[0][3]["Content-Type"], lambda t: t == oci)
+    absent: list = []
+    check("offline/an absent source (404) is refused",
+          lambda: retag("r.example.io", "tid", "ollama", "a", "b", retag_io(absent, get=(404, {}, b""))), REFUSED)
+    check("offline/(the 404 case issued no PUT)", lambda: calls_of("PUT", absent), lambda p: p == [])
+    check("offline/a source served with no Content-Type is refused",
+          lambda: retag("r.example.io", "tid", "ollama", "a", "b", retag_io([], get=(200, {}, manifest))), REFUSED)
+    check("offline/bytes that do not hash to the served digest are refused",
+          lambda: retag("r.example.io", "tid", "ollama", "a", "b", retag_io([], get=(
+              200, {"content-type": oci, "docker-content-digest": "sha256:" + "0" * 64}, manifest))), REFUSED)
+    check("offline/a refused PUT (403) is refused",
+          lambda: retag("r.example.io", "tid", "ollama", "a", "b", retag_io([], put=(403, {}, b"denied"))), REFUSED)
+    check("offline/a PUT stored under ANOTHER digest is refused",
+          lambda: retag("r.example.io", "tid", "ollama", "a", "b",
+                        retag_io([], put=(201, {"docker-content-digest": "sha256:" + "1" * 64}, b""))), REFUSED)
+    early: list = []
+    check("offline/a malformed tag is refused before any network call",
+          lambda: retag("r.example.io", "tid", "ollama", "a/../b", "b", retag_io(early)), REFUSED)
+    check("offline/(the malformed tag made no call)", lambda: early, lambda c: c == [])
+    check("offline/the same tag twice is refused",
+          lambda: retag("r.example.io", "tid", "ollama", "a", "a", retag_io([])), REFUSED)
     print(f"acr-data-plane self-test: {'PASS' if fails == 0 else f'{fails} FAILED'}")
     return 0 if fails == 0 else 1
 
@@ -439,6 +567,11 @@ def main(argv: list[str]) -> int:
                                   _arg(argv, "--repository"), int(_arg(argv, "--top")), Io())
             json.dump(rows, sys.stdout)
             sys.stdout.write("\n")
+            return 0
+        if argv and argv[0] == "retag":
+            digest = retag(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")),
+                           _arg(argv, "--repository"), _arg(argv, "--from"), _arg(argv, "--to"), Io())
+            print(digest)
             return 0
         print(__doc__, file=sys.stderr)
         return 2

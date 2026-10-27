@@ -17,3 +17,17 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# A real `.env` is deployment configuration — hosts, database names, keys. `deploy/.env.example`
+# is the documented surface and is tracked; the filled-in copy beside a compose file never is
+# (moved here with deploy/compose and deploy/compose-ha from the platform repository).
+.env
+!deploy/.env.example
+# The compose topology's bind-mounted runtime data.
+deploy/compose/data/
+deploy/compose-ha/data/
+
+# The Whisper voice model is a DOWNLOAD, never a tracked file — GitHub rejects any blob over 100 MB.
+# The context build (MODEL_SOURCE=context, deploy/whisper/Dockerfile) reads it from this untracked
+# directory; deploy/whisper/README.md says how to fetch it.
+deploy/whisper/models/
