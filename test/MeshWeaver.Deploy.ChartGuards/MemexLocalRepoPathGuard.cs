@@ -13,7 +13,7 @@ namespace MeshWeaver.Deploy.ChartGuards;
 /// 🚨 <b>Every path <c>memex-local</c> builds under the platform checkout must still be there.</b>
 ///
 /// <para>The script composes absolute paths from <c>resolve_repo()</c> — <c>"$repo/clients/…"</c>,
-/// <c>"$repo/memex/aspire/…"</c> — and hands them to <c>npm</c> and <c>docker build</c>. Nothing
+/// <c>"$repo/deploy/base-images/…"</c> — and hands them to <c>npm</c> and <c>docker build</c>. Nothing
 /// links those strings to the tree, so when a directory MOVES the script keeps pointing at where it
 /// used to be and fails at the developer's machine rather than in CI.</para>
 ///

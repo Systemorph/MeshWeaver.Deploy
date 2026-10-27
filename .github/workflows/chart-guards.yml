@@ -8,11 +8,16 @@ name: Chart guards
 # migration Job model, the Modules__Required__N ceiling with the record contract. They lived in the
 # platform's test projects until the chart left it (core slimming); they moved WITH the chart, and
 # they build against a platform checkout as PROJECT references — the platform is read, never copied.
+# The portal hosts' service defaults (ServiceDefaults, ProbeEndpoints) left the platform for
+# MeshWeaver.Plugins (MeshWeaver#7297, MeshWeaver.Plugins#4333), so a Plugins checkout is read too.
 #
-# 🛡️ NO SKIP-TRAPDOOR: every input is a checkout (this repository, and the PUBLIC platform repository
-# — no token). No secret, no cluster, no `continue-on-error:`, no input-shaped `if:`, no path filter.
-# The run must PRINT its verdict line with a non-zero total and zero failures; an exit code alone is
-# not a verdict.
+# 🛡️ NO SKIP-TRAPDOOR: every input is a checkout — this repository, the PUBLIC platform repository
+# (no token), and the PRIVATE MeshWeaver.Plugins repository, read with a contents:read token minted
+# from the meshweaver-cloud App (MESHWEAVER_APP_ID / MESHWEAVER_APP_PRIVATE_KEY). The `preflight` job
+# asserts that App's secrets and fails RED naming them; nothing skips on their absence — the guards
+# job runs after a failed preflight and fails RED itself, since it is the required context. No cluster,
+# no `continue-on-error:`, no input-shaped `if:`, no path filter. The run must PRINT its verdict line
+# with a non-zero total and zero failures; an exit code alone is not a verdict.
 #
 # 🔭 WHAT THIS CANNOT SEE. A platform change that breaks this agreement reaches here on the next PR
 # or on the daily schedule below — no platform pull request runs this. That is the cost of the chart
@@ -38,6 +43,9 @@ env:
   # (MeshWeaver#3259). The chart is deployed against the platform's tip, so the guards track it.
   # The repo VARIABLE MW_PLATFORM_REF wins over it.
   MW_CHART_GUARDS_PLATFORM_REF: main
+  # Which MeshWeaver.Plugins the guards read the portal hosts' service defaults from — declared the
+  # same way; the repo VARIABLE MW_PLUGINS_REF wins over it.
+  MW_CHART_GUARDS_PLUGINS_REF: main
   # 21 guard classes are deterministic (70 tests); 3 more render the chart with `helm template`
   # (17). The floor is the REAL count (87): 88 at the move, less SetupProbeEndpointsTest's one,
   # which left with its subject (Memex.Portal.Shared moved to MeshWeaver.Plugins, MeshWeaver#7125).
@@ -45,23 +53,82 @@ env:
   MIN_TESTS: "87"
 
 jobs:
+  # Asserts every external input the guards need, and fails RED naming what to provision. The
+  # guards job needs it and runs after it whatever it concluded — an absent secret is never a skip.
+  # 🚨 A Dependabot run resolves `secrets.` against the DEPENDABOT store, so these two must be
+  # provisioned there as well as under Actions.
+  preflight:
+    name: Preflight (inputs present)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Assert the MeshWeaver.Plugins read credential exists
+        env:
+          MESHWEAVER_APP_ID: ${{ secrets.MESHWEAVER_APP_ID }}
+          MESHWEAVER_APP_PRIVATE_KEY: ${{ secrets.MESHWEAVER_APP_PRIVATE_KEY }}
+          # Read from the EVENT, never from whether a secret is empty: it only chooses which
+          # remedy the red names, it never turns the red into a skip.
+          FROM_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          set -euo pipefail
+          # 🚨 A pull request from a FORK never receives this repository's secrets — not even after a
+          # maintainer approves its run — so the guards cannot read the private MeshWeaver.Plugins
+          # checkout there, and the required check is RED for it by design (fail closed: the chart
+          # is never merged unchecked against the platform). Provisioning cannot fix that, so the
+          # red says what does: a maintainer pushes the contribution's branch into this repository
+          # and the guards run on that pull request.
+          if [ "$FROM_FORK" = "true" ]; then
+            echo "::error title=Chart guards cannot run on a fork pull request::GitHub withholds repository secrets from pull requests opened from a fork, so the private MeshWeaver.Plugins checkout the guards compile against cannot be read. This is not a provisioning gap. A maintainer pushes this branch into Systemorph/MeshWeaver.Deploy and opens the pull request from there; the guards run on it."
+            exit 1
+          fi
+          missing=()
+          [ -n "${MESHWEAVER_APP_ID:-}" ]          || missing+=("secrets.MESHWEAVER_APP_ID — the meshweaver-cloud App id (reads the private MeshWeaver.Plugins checkout)")
+          [ -n "${MESHWEAVER_APP_PRIVATE_KEY:-}" ] || missing+=("secrets.MESHWEAVER_APP_PRIVATE_KEY — the meshweaver-cloud App's private key")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error title=Chart guards inputs missing::provision under Settings → Secrets → Actions (and → Dependabot for Dependabot pull requests):"
+            printf '  • %s\n' "${missing[@]}"
+            exit 1
+          fi
+          echo "MeshWeaver.Plugins read credential present"
+
+  # 🚨 This job, not `preflight`, is the REQUIRED context — and GitHub accepts a SKIPPED required
+  # check as satisfied. So it must never be skipped because its dependency failed: it runs after
+  # any preflight outcome (`!cancelled()`) and asserts that outcome INSIDE the job, going RED
+  # before checkout when the inputs were not present.
   guards:
     name: Chart guards (vs platform)
+    needs: [preflight]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Assert the preflight passed
+        env:
+          PREFLIGHT: ${{ needs.preflight.result }}
+        run: |
+          set -euo pipefail
+          if [ "$PREFLIGHT" != "success" ]; then
+            echo "::error title=Chart guards did not run::preflight concluded '$PREFLIGHT' — its log names the input to provision. This required check is red, never skipped."
+            exit 1
+          fi
       - uses: actions/checkout@v7
-      - name: Resolve the platform ref the guards compile against
+      - name: Resolve the platform and Plugins refs the guards compile against
         id: platform-ref
         env:
           REF: ${{ vars.MW_PLATFORM_REF || env.MW_CHART_GUARDS_PLATFORM_REF }}
+          PLUGINS_REF: ${{ vars.MW_PLUGINS_REF || env.MW_CHART_GUARDS_PLUGINS_REF }}
         run: |
           set -euo pipefail
           if [ -z "${REF:-}" ]; then
             echo "::error title=No platform ref declared::Neither the repo VARIABLE MW_PLATFORM_REF nor this workflow's MW_CHART_GUARDS_PLATFORM_REF names a platform ref."
             exit 1
           fi
+          if [ -z "${PLUGINS_REF:-}" ]; then
+            echo "::error title=No Plugins ref declared::Neither the repo VARIABLE MW_PLUGINS_REF nor this workflow's MW_CHART_GUARDS_PLUGINS_REF names a MeshWeaver.Plugins ref."
+            exit 1
+          fi
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "plugins_ref=$PLUGINS_REF" >> "$GITHUB_OUTPUT"
       # PUBLIC: no token.
       - name: Check out the platform
         uses: actions/checkout@v7
@@ -69,6 +136,25 @@ jobs:
           repository: Systemorph/MeshWeaver
           ref: ${{ steps.platform-ref.outputs.ref }}
           path: meshweaver
+      # PRIVATE: a contents:read token for MeshWeaver.Plugins alone, minted from the App the
+      # preflight asserted. A token the App cannot issue fails HERE, naming the permission.
+      - name: A read token for MeshWeaver.Plugins (meshweaver-cloud App)
+        id: plugins-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.MESHWEAVER_APP_ID }}
+          private-key: ${{ secrets.MESHWEAVER_APP_PRIVATE_KEY }}
+          owner: Systemorph
+          repositories: MeshWeaver.Plugins
+          permission-contents: read
+      - name: Check out MeshWeaver.Plugins
+        uses: actions/checkout@v7
+        with:
+          repository: Systemorph/MeshWeaver.Plugins
+          ref: ${{ steps.platform-ref.outputs.plugins_ref }}
+          path: meshweaver-plugins
+          token: ${{ steps.plugins-token.outputs.token }}
+          persist-credentials: false
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.x
@@ -81,8 +167,10 @@ jobs:
         run: |
           set -euo pipefail
           echo "platform $(git -C meshweaver rev-parse HEAD)"
+          echo "plugins  $(git -C meshweaver-plugins rev-parse HEAD)"
           dotnet build test/MeshWeaver.Deploy.ChartGuards/MeshWeaver.Deploy.ChartGuards.csproj \
-            -c Release -warnaserror -p:MeshWeaverRoot="$GITHUB_WORKSPACE/meshweaver"
+            -c Release -warnaserror -p:MeshWeaverRoot="$GITHUB_WORKSPACE/meshweaver" \
+            -p:MeshWeaverPluginsRoot="$GITHUB_WORKSPACE/meshweaver-plugins"
       - name: Run the guards
         run: |
           set -euo pipefail

@@ -43,8 +43,8 @@ namespace MeshWeaver.Deploy.ChartGuards;
 public class ProbeSemanticsGuard
 {
     private const string Deployment = "deploy/helm/templates/memex-portal/deployment.yaml";
-    private const string ServiceDefaults = "memex/aspire/Memex.Portal.ServiceDefaults/ServiceDefaults.cs";
-    private const string ProbeEndpoints = "memex/aspire/Memex.Portal.ServiceDefaults/ProbeEndpoints.cs";
+    private const string ServiceDefaults = "src/Memex.Portal.ServiceDefaults/ServiceDefaults.cs";
+    private const string ProbeEndpoints = "src/Memex.Portal.ServiceDefaults/ProbeEndpoints.cs";
     private const string Values = "deploy/helm/values.yaml";
 
     /// <summary>
@@ -139,7 +139,7 @@ public class ProbeSemanticsGuard
         var constants = DeclaredConstants();
         var tag = EndpointTagWiring(constants)[probes["readinessProbe"]];
 
-        var source = File.ReadAllText(ChartRoots.PlatformFile(ServiceDefaults));
+        var source = File.ReadAllText(ChartRoots.PluginsFile(ServiceDefaults));
         var registrations = Regex.Matches(source, @"AddCheck[^;]*?;", RegexOptions.Singleline)
             .Select(m => m.Value)
             .Where(r => constants.Any(c => c.Value == tag
@@ -219,7 +219,7 @@ public class ProbeSemanticsGuard
     /// <summary>The <c>ProbeEndpoints</c> string constants, by name — the one place they are declared.</summary>
     private static IReadOnlyDictionary<string, string> DeclaredConstants()
     {
-        var source = File.ReadAllText(ChartRoots.PlatformFile(ProbeEndpoints));
+        var source = File.ReadAllText(ChartRoots.PluginsFile(ProbeEndpoints));
         var constants = Regex.Matches(source, @"public const string (?<name>\w+)\s*=\s*""(?<value>[^""]+)"";")
             .ToDictionary(m => m.Groups["name"].Value, m => m.Groups["value"].Value, StringComparer.Ordinal);
 
@@ -237,7 +237,7 @@ public class ProbeSemanticsGuard
     private static IReadOnlyDictionary<string, string> EndpointTagWiring(
         IReadOnlyDictionary<string, string> constants)
     {
-        var source = File.ReadAllText(ChartRoots.PlatformFile(ServiceDefaults));
+        var source = File.ReadAllText(ChartRoots.PluginsFile(ServiceDefaults));
         var wiring = new Dictionary<string, string>(StringComparer.Ordinal);
 
         foreach (Match m in Regex.Matches(
