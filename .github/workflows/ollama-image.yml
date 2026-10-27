@@ -256,19 +256,42 @@ jobs:
           status=$(docker info --format '{{json .DriverStatus}}')
           grep -q 'io.containerd.snapshotter' <<<"$status" \
             || { echo "::error::Docker is not on the containerd image store — the zstd push needs it"; exit 1; }
-      # Reads the SHARED tag only as a warm start, and exports this run's cache ONCE, to a RUN-SPECIFIC tag.
+      # Exports this run's cache ONCE, to a RUN-SPECIFIC tag.
       # 🚨 ONE `--cache-to`. Two (shared + run tag) made BuildKit run two concurrent exports that each
       # uploaded the ~24 GB weights layer, neither seeing the other's blob: run 40559129837 finished one in
       # 1560.7 s and was cut at 45 min still uploading the other. The shared tag is moved afterwards by a
       # manifest PUT (next step), which uploads no blob.
-      - name: Build into the registry cache (cache-from first, cache-to once; no image)
+      # 🚨 AND IMPORTS EVERY COMPLETED EXPORT, not only the shared tag. A run-specific cache tag exists only
+      # once its export finished (BuildKit writes the cache manifest last), so it is durable progress — but
+      # the shared tag is moved only AFTER the export, and a job cut in between leaves it unmoved. That is
+      # what happened: run 40559129837's export completed (`…-run-eb56da1-40559129837-1`, manifest
+      # f399b351…, weights blob 52896636… = 23.59 GB, all in the registry), the shared tag was never written,
+      # and run 40571543897 — the same Dockerfile and context, so the same cache keys — imported nothing and
+      # started a second 24 GB upload that the cut ended. Importing the newest completed run caches makes any
+      # export that ever finished count, whatever happened to its job afterwards.
+      - name: Build into the registry cache (cache-from every completed export, cache-to once; no image)
         if: steps.published.outputs.exists == 'false'
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         run: |
           set -euo pipefail
           start=$(date +%s)
+          # The completed run caches of this line, newest run first (the tag ends <run id>-<attempt>). The
+          # listing is RED if it cannot be read; an empty match is a genuinely cold cache.
+          python3 .github/scripts/acr-data-plane.py tags --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
+            --repository "$REPO" > "$RUNNER_TEMP/tags"
+          { grep -E "^${BUILD_CACHE//./\\.}-run-[0-9a-f]{7}-[0-9]+-[0-9]+$" "$RUNNER_TEMP/tags" || true; } \
+            | awk -F- '{ print $(NF-1), $NF, $0 }' | sort -k1,1nr -k2,2nr | awk 'NR <= 3 { print $3 }' \
+            > "$RUNNER_TEMP/run-caches"
+          from=(--cache-from "type=registry,ref=$ACR/$REPO:$BUILD_CACHE")
+          while read -r tag; do
+            from+=(--cache-from "type=registry,ref=$ACR/$REPO:$tag")
+            echo "importing completed cache $tag"
+          done < "$RUNNER_TEMP/run-caches"
+          [ -s "$RUNNER_TEMP/run-caches" ] || echo "::notice::no completed run cache of $BUILD_CACHE — a cold build"
           opts="mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,compression-level=1,force-compression=true"
           docker buildx build --builder "$(docker context show)" --progress=plain --provenance=false --sbom=false \
-            --cache-from "type=registry,ref=$ACR/$REPO:$BUILD_CACHE" \
+            "${from[@]}" \
             --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE-run-${GITHUB_SHA::7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT},$opts" \
             --output type=cacheonly \
             deploy/ollama
