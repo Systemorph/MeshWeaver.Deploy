@@ -19,7 +19,13 @@ THE LOOP, and the order that matters:
      host's `pluginsDigest` on the run, and a run must record exactly what compiled it.
      With MW_REGISTRY_URL set (H8) the layer is the registry's BUNDLE INDEX instead (read with the
      host's mwi_ instance key, a host-only file), keyed by the digest of its sorted
-     `package@version[@hash]` list, changed bundles fetched with core's `module-fetch`.
+     `package@version[@hash]` list, changed bundles fetched with core's `module-fetch`. The index is
+     read when the module HAND-OVER signal moved (`inputs` → `modules.key`: the registry's
+     module-published broadcast as the operations instance reconciled it), so an IDLE host installs a
+     handed-over module on its next loop turn, ahead of the next build; it is read on every turn while
+     there is no signal, and whenever the staged layer is no longer intact on the cache
+     (install-on-miss). The installed layer is recorded on the shared cache
+     (`<cache>/plugin-sets/current-<identity digest>.json`), so the next host starts with it installed.
   2. `POST {api}/claim` with the host's channel, platform set, framework identity, plugins digest
      or key, and a fresh `claimId` (the SAME one on a network-error retry). 204 = nothing
      claimable → sleep. 200 = a run: `{path, repo, sha, refs, isTrunk, publish, stages}` — `path`
@@ -803,6 +809,56 @@ def stage_bundle_set(lines: list[str], cache: str, fetch: Callable[[str, str, st
     return set_dir
 
 
+def layer_intact(set_dir: Optional[str]) -> bool:
+    """A staged plugins layer is still INSTALLED: its set is complete and every package link resolves
+    into a complete bundle on the cache. A layer evicted from the cache, or a volume that was
+    replaced, is not — and is installed again from the index whatever the hand-over key says."""
+    if not set_dir or not os.path.isfile(os.path.join(set_dir, ".complete")):
+        return False
+    try:
+        for name in os.listdir(set_dir):
+            if name.startswith("."):
+                continue
+            target = os.path.realpath(os.path.join(set_dir, name))
+            if not os.path.isfile(os.path.join(os.path.dirname(target), ".complete")):
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def layer_record_path(cache: str, identity: str) -> str:
+    """Where the INSTALLED plugins layer for one framework identity is recorded on the shared cache, so
+    the next host (a new replica, a restart, a scale-up from zero) starts with it installed."""
+    return os.path.join(cache, "plugin-sets", "current-" + hashlib.sha256(identity.encode()).hexdigest()[:16] + ".json")
+
+
+def read_layer_record(cache: str, identity: str) -> Optional[dict]:
+    """The recorded layer for `identity`, or None when there is none, it is unreadable, it names
+    another identity, or the layer it names is no longer intact on the cache."""
+    try:
+        with open(layer_record_path(cache, identity)) as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or rec.get("identity") != identity or not isinstance(rec.get("key"), str):
+        return None
+    d = rec.get("dir")
+    if not isinstance(d, str) or os.path.realpath(d) != os.path.realpath(os.path.join(cache, "plugin-sets", rec["key"].split(":", 1)[-1])):
+        return None
+    return rec if layer_intact(d) else None
+
+
+def write_layer_record(cache: str, identity: str, key: str, set_dir: str, modules_key: Optional[str]) -> None:
+    """Record the installed layer atomically (write + rename): a reader sees the old record or the new."""
+    path = layer_record_path(cache, identity)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".current-", dir=os.path.dirname(path))
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"identity": identity, "key": key, "dir": set_dir, "modulesKey": modules_key}, fh)
+    os.replace(tmp, path)
+
+
 # ───────────────────────────────── the host ───────────────────────────────────────────────
 
 class Fatal(Exception):
@@ -1428,6 +1484,11 @@ class Host:
         self.held: list[EventSink] = []
         self.artifacts_dir = ""
         self.plugins_key: Optional[str] = None
+        # The module hand-over signal the layer was staged at (`/hosts/inputs` → `modules.key`), and whether
+        # the persistent layer record was consulted yet (once per process).
+        self.modules_seen: Optional[str] = None
+        self.layer_record_read = False
+        self.modules_signal_said: Optional[str] = None
         self.heartbeat: Optional[Heartbeat] = None
         self.run_sinks: dict[str, EventSink] = {}
         self.claim_id = ""
@@ -1492,10 +1553,40 @@ class Host:
             return self.refresh_bundles()
         return self.refresh_seal()
 
+    def modules_signal(self) -> Optional[str]:
+        """The module hand-over signal: `/hosts/inputs` → `modules.key` (MeshWeaver.Plugins
+        Hosting/StandingBuildHosts §2). It MOVES when a module is handed over to the registry (the
+        registry's module-published broadcast, reconciled on the operations instance), so the index is
+        read when something was handed over — not on every loop turn. None = no signal (unreadable inputs,
+        a null `modules`): the caller then reads the index every turn, as before the signal existed."""
+        status, body = self.api.call("GET", "/hosts/inputs", query=self.scope)
+        modules = body.get("modules") if status == 200 and isinstance(body, dict) else None
+        key = modules.get("key") if isinstance(modules, dict) else None
+        key = key if isinstance(key, str) and key.strip() else None
+        said = key and "signal" or f"none (HTTP {status})"
+        if said != self.modules_signal_said:
+            self.modules_signal_said = said
+            self.log("the operations instance reports the module hand-over signal — the bundle index is read when it moves"
+                     if key else f"no module hand-over signal ({said}) — reading the bundle index every turn")
+        return key
+
     def refresh_bundles(self) -> bool:
         """H8: the plugins layer from the REGISTRY's bundle index — what an instance on this framework
-        identity would install — read before every claim with the host's read-only `mwi_` instance
-        key (a file in the host container, never bound into a sandbox)."""
+        identity would install — read with the host's read-only `mwi_` instance key (a file in the host
+        container, never bound into a sandbox). The index is read when the module HAND-OVER signal moved
+        (`modules_signal`), when the staged layer is not intact on the cache (install-on-miss), or on every
+        turn while there is no signal. The installed layer is recorded on the shared cache, so the next
+        host starts with it installed."""
+        if not self.layer_record_read:
+            self.layer_record_read = True
+            rec = read_layer_record(self.cache, self.identity) if self.identity else None
+            if rec:
+                self.plugins_dir, self.plugins_key, self.plugins_digest, self.plugins_known = rec["dir"], rec["key"], None, True
+                self.modules_seen = rec.get("modulesKey") if isinstance(rec.get("modulesKey"), str) else None
+                self.log(f"plugins layer already installed on the cache: {rec['key'][:19]}…")
+        signal = self.modules_signal()
+        if signal is not None and signal == self.modules_seen and self.plugins_key and layer_intact(self.plugins_dir):
+            return True                     # nothing handed over since the layer was staged
         url = self.env["MW_REGISTRY_URL"].rstrip("/")
         key_file = self.env.get("MW_REGISTRY_KEY_FILE", "/run/registry-key/key")
         try:
@@ -1521,7 +1612,7 @@ class Host:
         try:
             lines = bundle_lines(index)
             key = plugins_key_of(lines)
-            if key != self.plugins_key or not self.plugins_dir:
+            if key != self.plugins_key or not layer_intact(self.plugins_dir):
                 d = stage_bundle_set(lines, self.cache, lambda pkg, ver, out: self.module_fetch(url, instance_key, pkg, ver, out))
                 self.log(f"plugins layer staged from the registry index: {key[:19]}… ({len(lines)} bundle(s))")
                 self.plugins_dir = d
@@ -1529,6 +1620,11 @@ class Host:
             self.log(f"{r} — NOT claiming this cycle")
             return False
         self.plugins_key, self.plugins_digest, self.plugins_known = key, None, True
+        self.modules_seen = signal
+        try:
+            write_layer_record(self.cache, self.identity, key, self.plugins_dir, signal)
+        except OSError as e:
+            self.log(f"could not record the installed plugins layer on the cache ({e}) — the next host reads the index")
         return True
 
     def module_fetch(self, registry: str, instance_key: str, package: str, version: str, out: str) -> int:
@@ -2735,6 +2831,64 @@ def self_test() -> int:
                 pass
         check("h8/the instance key never reaches a sandbox",
               not any("REGISTRY" in k for k in sandbox_env(dict(h8env, MW_REGISTRY_INSTANCE_KEY="x"), {}, "/cache")))
+
+        # ── 6c. the plugins layer follows the module HAND-OVER signal, and stays installed ─────
+        sig = {"key": "sha256:" + "1" * 64}
+        index_reads: list[str] = []
+        idx2 = {"frameworkMvid": "c3e1", "bundles": [{"plugin": "AI", "version": "1.40.1"}, {"plugin": "Store", "version": "1.36.20"}]}
+
+        def reg_get(u, k):
+            index_reads.append(u)
+            return (200, json.loads(json.dumps(idx2)))
+        fetched.clear()
+        hoenv = dict(h8env, MW_BUILD_CACHE=os.path.join(tmp, "hocache"))
+        claims2: list[dict] = []
+        ho_api = _FakeApi({("GET", "/hosts/inputs"): lambda p_, b: (200, {"plugins": None, "platformVersion": "3.1.10412", "modules": dict(sig)}),
+                           ("POST", "/claim"): lambda p_, b: (claims2.append(b), (204, None))[1]})
+        ho = host(ho_api, env=hoenv, registry_get=reg_get, fetch_runner=fetch_runner)
+        check("handover/first turn installs the layer", ho.cycle() == "idle" and len(index_reads) == 1
+              and sorted(a[a.index("module-fetch") + 1] for a in fetched) == ["AI", "Store"], (index_reads, fetched))
+        for _ in range(3):
+            ho.cycle()
+        check("handover/IDLE turns with an unchanged signal read NO index and fetch nothing", len(index_reads) == 1 and len(fetched) == 2, index_reads)
+        check("handover/idle turns still claim on the installed layer", claims2[-1]["pluginsKey"] == plugins_key_of(["AI@1.40.1", "Store@1.36.20"]), claims2[-1:])
+        # A module is handed over: the registry now serves AI 1.40.2 and the signal moved — the IDLE host installs it on
+        # its next turn, before any run is claimed on it.
+        idx2["bundles"][0] = {"plugin": "AI", "version": "1.40.2"}
+        sig["key"] = "sha256:" + "2" * 64
+        fetched.clear()
+        ho.cycle()
+        check("handover/a moved signal reads the index once and fetches ONLY the handed-over module",
+              len(index_reads) == 2 and [a[a.index("module-fetch") + 1] for a in fetched] == ["AI"], (index_reads, fetched))
+        check("handover/the next claim presents the new layer", claims2[-1]["pluginsKey"] == plugins_key_of(["AI@1.40.2", "Store@1.36.20"]))
+        # Negative control: the registry moved but the signal did NOT — the host must not have read it (proves the
+        # skip is the signal's doing, not an accident of the fake).
+        idx2["bundles"][1] = {"plugin": "Store", "version": "1.36.21"}
+        ho.cycle()
+        check("handover/negative control: no signal move, no index read", len(index_reads) == 2, index_reads)
+        # Persistent install: a NEW host on the same cache (a restart, a new replica) starts installed — no fetch, no
+        # index read while the signal is the one the layer was staged at.
+        fetched.clear()
+        ho2 = host(_FakeApi({("GET", "/hosts/inputs"): lambda p_, b: (200, {"modules": dict(sig)}),
+                             ("POST", "/claim"): lambda p_, b: (claims2.append(b), (204, None))[1]}),
+                   env=hoenv, registry_get=reg_get, fetch_runner=fetch_runner)
+        check("handover/the next host finds the layer installed (no index read, no fetch)",
+              ho2.cycle() == "idle" and len(index_reads) == 2 and fetched == []
+              and claims2[-1]["pluginsKey"] == plugins_key_of(["AI@1.40.2", "Store@1.36.20"]), (index_reads, fetched))
+        # Install-on-miss: the layer was evicted from the cache — reinstalled whatever the signal says.
+        evicted = os.path.join(hoenv["MW_BUILD_CACHE"], "bundles", hashlib.sha256(b"AI@1.40.2").hexdigest()[:32])
+        check("handover/the fixture names the installed AI bundle", os.path.isfile(os.path.join(evicted, ".complete")), evicted)
+        shutil.rmtree(evicted)
+        ho2.cycle()
+        check("handover/install-on-miss: a layer no longer intact is installed again from the index", len(index_reads) == 3, index_reads)
+        # No signal (an older operations instance, an unreadable ledger): the index is read every turn, as before.
+        nosig = host(_FakeApi({("GET", "/hosts/inputs"): lambda p_, b: (200, {"modules": None}),
+                               ("POST", "/claim"): lambda p_, b: (204, None)}), env=hoenv, registry_get=reg_get, fetch_runner=fetch_runner)
+        before = len(index_reads)
+        nosig.cycle()
+        nosig.cycle()
+        check("handover/no signal: the index is read on EVERY turn (never 'nothing handed over')", len(index_reads) == before + 2, index_reads)
+        check("handover/a record for another identity is never adopted", read_layer_record(hoenv["MW_BUILD_CACHE"], "other-identity") is None)
 
         # ── 7. whole runs ─────────────────────────────────────────────────────────────────
         posted: list[tuple] = []
