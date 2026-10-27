@@ -66,6 +66,13 @@ THE LOOP, and the order that matters:
     on latest and `build-<channel>/<name>` otherwise; the run's AGGREGATE check is `build` /
     `build-<channel>` (no slash), so no stage — not even one named `verdict` — can publish under it.
   * `kind` is `build` or `test`; `timeoutMinutes` defaults to 45.
+  * a PREPARED server, never a prepared run: a command that stages, resolves, pulls or restores per
+    run (resolve-platform.py, fetch-refs.py, platform-mount, module-fetch, an image pull, dotnet
+    restore, a NuGet/pip/npm/system install) is REFUSED, naming where the step belongs. A NuGet
+    package a build still had to restore (the warm cache lacked it) is SAID as a warning
+    (MWPREP001); on a trunk build it is verified (the .nupkg's SHA-512 against what NuGet recorded)
+    and promoted into `<cache>/nuget`, the stages' read-only fallback folder, so the next run
+    restores nothing.
   * stages run in declaration order, fail-fast: after a failed stage the rest are finished
     `failed` with "not run" — never left open, never silently skipped. When the claim names
     `stages`, only those run, and a claimed stage the repository does not declare is RED.
@@ -425,6 +432,111 @@ def load_stages(path: str) -> list[dict]:
 STAGE_NEEDS = {"plugins", "outputs", "nuget"}
 
 
+# 🚨 A PREPARED SERVER, NEVER A PREPARED RUN (MeshWeaver.Plugins Hosting/StandingBuildHosts §H7 → "A prepared
+# server"; owner: "nothing should ever run this prepare step"). A run arrives on a host that already holds the
+# platform it was rolled to, the reference set, the installed plugins layer and the warm NuGet cache. A declared stage
+# that stages, resolves, pulls or restores per run is REFUSED — the step belongs in the host image, its init
+# containers or its persistent caches, and the refusal names which. Matched as whole words on the command text; a
+# stage that legitimately needs one of these is a server that is not prepared yet, never an exception to grant here.
+PREPARE_STEPS = (
+    (re.compile(r"\bresolve-platform\.py\b"), "resolve-platform.py — the host's set IS the platform (the claim stamps it); nothing resolves one per run"),
+    (re.compile(r"\bfetch-refs\.py\b"), "fetch-refs.py — the reference set is staged by the host's init containers, $MeshWeaverRefs"),
+    (re.compile(r"\bplatform-mount(?:\.py|-reference-set)?\b"), "platform-mount — the platform is mounted once per roll, by digest"),
+    (re.compile(r"\bmodule-fetch\b"), "module-fetch — the plugins layer is installed by the host on the module hand-over"),
+    (re.compile(r"\b(?:docker|podman|crane|skopeo|oras)\s+(?:image\s+)?(?:pull|copy|cp)\b"), "an image pull — images are pre-pulled into the host image or its node-local cache"),
+    (re.compile(r"\bprepull\b"), "an image pre-pull — done by the host image, not per run"),
+    (re.compile(r"\bdotnet\s+restore\b"), "dotnet restore — packages come from the host's warm NuGet cache (stage `needs: [\"nuget\"]`)"),
+    (re.compile(r"\b(?:nuget|dotnet\s+nuget)\s+(?:install|restore)\b"), "a NuGet install — packages come from the host's warm NuGet cache"),
+    (re.compile(r"\b(?:apt-get|apt|apk|dnf|yum)\s+(?:-\S+\s+)*install\b"), "a system package install — the host image carries its tools"),
+    (re.compile(r"\bpip3?\s+install\b|\bpython3?\s+-m\s+pip\s+install\b"), "a pip install — the host image carries its tools"),
+    (re.compile(r"\bnpm\s+(?:ci|install|i)\b"), "an npm install — the host image carries its tools"),
+    (re.compile(r"\bactions/(?:setup-|cache)"), "a GitHub Actions setup/cache step — the host is already set up"),
+)
+
+
+def per_run_prepare_steps(command: str) -> list[str]:
+    """Why `command` would prepare per run — one entry per prepare step it contains; empty = prepared."""
+    return [why for rx, why in PREPARE_STEPS if rx.search(command)]
+
+
+def nuget_packages(folder: str) -> set[str]:
+    """`id/version` of every COMPLETE package in a NuGet global-packages folder (one with its
+    `.nupkg.metadata`, which NuGet writes last)."""
+    found: set[str] = set()
+    try:
+        for pid in os.listdir(folder):
+            pdir = os.path.join(folder, pid)
+            if pid.startswith(".") or not os.path.isdir(pdir) or os.path.islink(pdir):
+                continue
+            for ver in os.listdir(pdir):
+                if os.path.isfile(os.path.join(pdir, ver, ".nupkg.metadata")):
+                    found.add(f"{pid}/{ver}")
+    except OSError:
+        pass
+    return found
+
+
+def nuget_package_problem(pkg_dir: str, pid: str, ver: str) -> Optional[str]:
+    """Why a restored package folder may NOT enter the shared warm cache, or None. The `.nupkg` must
+    hash (SHA-512, base64) to the `.nupkg.sha512` NuGet wrote beside it AND to the metadata's
+    `contentHash`, and the folder must hold no symlink — a package is promoted only when it is the
+    package NuGet verified, never whatever a stage left in the folder."""
+    nupkg = next((f for f in os.listdir(pkg_dir) if f.lower() == f"{pid}.{ver}.nupkg".lower()), None)
+    if not nupkg:
+        return "no .nupkg"
+    try:
+        with open(os.path.join(pkg_dir, nupkg), "rb") as fh:
+            digest = base64.b64encode(hashlib.sha512(fh.read()).digest()).decode()
+        with open(os.path.join(pkg_dir, nupkg + ".sha512")) as fh:
+            stated = fh.read().strip()
+        with open(os.path.join(pkg_dir, ".nupkg.metadata")) as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError) as e:
+        return f"unreadable ({e})"
+    if digest != stated or not isinstance(meta, dict) or meta.get("contentHash") != digest:
+        return "its hash does not match what NuGet recorded"
+    for root, dirs, files in os.walk(pkg_dir):
+        if any(os.path.islink(os.path.join(root, n)) for n in dirs + files):
+            return "it contains a symlink"
+    return None
+
+
+def promote_nuget(restored: str, cache: str, log: Callable[[str], None]) -> tuple[int, int, list[str]]:
+    """Promote the packages a TRUNK build stage restored into the shared warm NuGet cache
+    (`<cache>/nuget/<id>/<version>/`, the stages' read-only fallback folder), so the next run restores
+    nothing. Each verified (`nuget_package_problem`), copied to a temp dir and renamed into place; a
+    package already present is kept (a NuGet id/version is immutable). Returns (promoted, kept, refused)."""
+    root = os.path.join(cache, "nuget")
+    os.makedirs(root, exist_ok=True)
+    promoted, kept, refused = 0, 0, []
+    for entry in sorted(nuget_packages(restored)):
+        pid, ver = entry.split("/", 1)
+        final = os.path.join(root, pid, ver)
+        if os.path.isfile(os.path.join(final, ".nupkg.metadata")):
+            kept += 1
+            continue
+        why = nuget_package_problem(os.path.join(restored, pid, ver), pid, ver)
+        if why:
+            refused.append(f"{entry} ({why})")
+            continue
+        os.makedirs(os.path.join(root, pid), exist_ok=True)
+        tmp = tempfile.mkdtemp(prefix=f".{ver}-", dir=os.path.join(root, pid))
+        try:
+            shutil.copytree(os.path.join(restored, pid, ver), os.path.join(tmp, "p"), symlinks=True)
+            os.rename(os.path.join(tmp, "p"), final)
+            promoted += 1
+        except OSError as e:
+            if not os.path.isfile(os.path.join(final, ".nupkg.metadata")):
+                refused.append(f"{entry} (could not be moved into place: {e})")
+            else:
+                kept += 1
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if refused:
+        log(f"NuGet packages NOT promoted into the warm cache: {refused[:5]}")
+    return promoted, kept, refused
+
+
 def validate_stages(doc: object) -> list[dict]:
     stages = doc.get("stages") if isinstance(doc, dict) else None
     if not isinstance(stages, list) or not stages:
@@ -447,6 +559,10 @@ def validate_stages(doc: object) -> list[dict]:
         cmd = s.get("command")
         if not isinstance(cmd, str) or not cmd.strip():
             raise Refusal(f"stage {name!r} has no command")
+        prepares = per_run_prepare_steps(cmd)
+        if prepares:
+            raise Refusal(f"stage {name!r} prepares per run — a host stage runs on a PREPARED server, so it may not "
+                          f"stage, resolve, pull or restore: " + "; ".join(prepares))
         tmo = s.get("timeoutMinutes", DEFAULT_STAGE_TIMEOUT_MINUTES)
         if not isinstance(tmo, (int, float)) or not (0 < tmo <= DEFAULT_STAGE_TIMEOUT_MINUTES):
             raise Refusal(f"stage {name!r} timeoutMinutes {tmo!r} must be in (0, {DEFAULT_STAGE_TIMEOUT_MINUTES}]")
@@ -1777,12 +1893,32 @@ class Host:
                     self.deliver(sink)
                     continue
                 self.drain_held(attempts=2)
+                # The stage's OWN package folder lives in the run's workspace (not the sandbox's tmpfs), so the
+                # host can SEE what a run restored: a package missing from the warm cache is a server that was
+                # not prepared for it — said, and on a trunk build promoted, so the next run restores nothing.
+                nuget_dir = os.path.join(workdir, "nuget")
+                os.makedirs(nuget_dir, exist_ok=True)
+                nuget_before = nuget_packages(nuget_dir)
                 ok = self.run_stage(dict(st, timeoutMinutes=min(st["timeoutMinutes"], remaining / 60)),
-                                    checkout_dir, outputs_dir, sink, {**extra, "MW_BUILD_STAGE": st["name"]},
-                                    readonly=self.stage_readonly(repo, st), writable=[artifacts_dir],
+                                    checkout_dir, outputs_dir, sink,
+                                    {**extra, "MW_BUILD_STAGE": st["name"], "NUGET_PACKAGES": nuget_dir},
+                                    readonly=self.stage_readonly(repo, st), writable=[artifacts_dir, nuget_dir],
                                     hand_over=lambda: self.hand_over_artifacts(repo, sha, st["name"], artifacts_dir,
                                                                                deadline=run_end))
                 self.assert_clean()
+                restored = sorted(nuget_packages(nuget_dir) - nuget_before)
+                if restored:
+                    sink.add([{"kind": "diagnostic", "severity": "warning", "code": "MWPREP001",
+                               "message": f"{len(restored)} NuGet package(s) restored PER RUN — the server's warm cache "
+                                          f"did not hold them: {', '.join(restored[:10])}"
+                                          + ("" if trunk else " (a trunk build promotes them)")},
+                              {"kind": "line", "text": f"prepared server: {len(restored)} package(s) restored per run"}])
+                    self.deliver(sink)
+                if ok and trunk and st["kind"] == "build" and restored:
+                    np_, nk, nr = promote_nuget(nuget_dir, self.cache, self.log)
+                    sink.add([{"kind": "line", "text": f"warm NuGet cache: {np_} package(s) promoted, {nk} already present"
+                                                       + (f", {len(nr)} NOT promoted (unverified)" if nr else "")}])
+                    self.deliver(sink)
                 if not ok:
                     failed_at = st["name"]
                 elif trunk and st["kind"] == "build":
@@ -2821,6 +2957,52 @@ def self_test() -> int:
              f"mkdir -p $MW_BUILD_OUTPUTS/{lie} && cp s.json $MW_BUILD_OUTPUTS/{lie}/.cache-key.json"}]}))
         h6l.run(dict(claim, isTrunk=True))
         check("run/an output whose name is not its recomputed key is refused", not os.path.exists(os.path.join(cache, "outputs", "MeshWeaver.Plugins", lie)))
+
+        # ── 7b. a PREPARED server: no stage prepares per run; what a run had to restore warms the server ──
+        for cmd_, why_ in (("python3 .github/scripts/resolve-platform.py --passed-on-main", "resolve-platform"),
+                           ("python3 scripts/fetch-refs.py --digest x", "fetch-refs"),
+                           ("python3 scripts/platform-mount.py", "platform-mount"),
+                           ("dotnet /opt/x.dll module-fetch AI --registry r", "module-fetch"),
+                           ("docker pull postgres:17", "image pull"), ("oras pull cr/x@sha256:1", "image pull"),
+                           ("docker image pull x", "image pull"), ("bash scripts/prepull-testcontainers-images.sh", "pre-pull"),
+                           ("set -e; dotnet restore src/X.csproj", "dotnet restore"), ("nuget install X", "NuGet install"),
+                           ("apt-get -y install jq", "system package"), ("python3 -m pip install pyyaml", "pip"),
+                           ("npm ci", "npm")):
+            try:
+                validate_stages({"stages": [{"name": "x", "kind": "build", "command": cmd_}]})
+                check(f"prepared/refuses a stage that prepares per run: {cmd_}", False, "accepted")
+            except Refusal as r:
+                check(f"prepared/the refusal names what to move into the server ({why_})", why_ in str(r) and "PREPARED" in str(r), str(r))
+        # negative controls: what the fleet's stages run today is NOT a prepare step
+        for cmd_ in ("python3 scripts/canonical-compile-check.py --refs \"$refs\"; python3 scripts/check-scripts.py --refs \"$refs\"",
+                     "\"$dn\" \"$tester\" compile . --app \"$app\" --allow plugin-gate.allow",
+                     "python3 /core-tests/core-tests.py shard 3", "dotnet build -c Release --no-restore src/X.csproj",
+                     "echo restored-by-the-server; grep -c pull log.txt"):
+            check(f"prepared/accepts a prepared stage: {cmd_[:40]}", per_run_prepare_steps(cmd_) == [], per_run_prepare_steps(cmd_))
+        mk_pkg = ("python3 -c \"import os,hashlib,base64,json,sys;d=os.path.join(os.environ['NUGET_PACKAGES'],'demo.pkg','1.0.0');"
+                  "os.makedirs(d,exist_ok=True);b=b'nupkg-bytes';open(os.path.join(d,'demo.pkg.1.0.0.nupkg'),'wb').write(b);"
+                  "h=base64.b64encode(hashlib.sha512(b).digest()).decode();open(os.path.join(d,'demo.pkg.1.0.0.nupkg.sha512'),'w').write(h);"
+                  "json.dump({'version':2,'contentHash':h if sys.argv[1]=='good' else 'forged'},open(os.path.join(d,'.nupkg.metadata'),'w'))\" ")
+        warm = os.path.join(cache, "nuget", "demo.pkg", "1.0.0")
+        posted.clear()
+        hpr = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": mk_pkg + "good"}]}))
+        hpr.run(claim)
+        warns = [e for _, evs in posted for e in evs if e["kind"] == "diagnostic" and e.get("code") == "MWPREP001"]
+        check("prepared/a package restored per run is SAID (a warning naming it)", len(warns) == 1 and "demo.pkg/1.0.0" in warns[0]["message"], warns)
+        check("prepared/a PR run's restore never enters the warm cache", not os.path.exists(warm))
+        posted.clear()
+        htr = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": mk_pkg + "good"}]}))
+        htr.run(dict(claim, isTrunk=True))
+        check("prepared/a trunk build's verified restore is promoted into the warm cache",
+              os.path.isfile(os.path.join(warm, ".nupkg.metadata")) and nuget_packages(os.path.join(cache, "nuget")) == {"demo.pkg/1.0.0"})
+        shutil.rmtree(os.path.join(cache, "nuget"))
+        htf = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": mk_pkg + "forged"}]}))
+        htf.run(dict(claim, isTrunk=True))
+        check("prepared/negative control: a package whose hash is not what NuGet recorded is NOT promoted", not os.path.exists(warm))
+        posted.clear()
+        hnone = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": "true"}]}))
+        hnone.run(dict(claim, isTrunk=True))
+        check("prepared/a run that restored nothing says nothing", not [e for _, evs in posted for e in evs if e.get("code") == "MWPREP001"])
         # the key covers sources, reference set, options and compiler
         kd = os.path.join(tmp, "keydir")
         os.makedirs(kd)
