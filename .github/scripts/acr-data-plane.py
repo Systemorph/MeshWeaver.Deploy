@@ -201,7 +201,9 @@ def check_workflow(text: str) -> list[str]:
     problems: list[str] = []
     logins = 0
     for i, line in enumerate(lines):
-        if not re.match(r"^\s*(?:-\s+)?uses:\s*azure/login@", _code(line)):
+        # A quoted ref (`uses: "azure/login@v3"`, `'azure/login@v3'`) is the same action. Plain text,
+        # not a YAML parser: the test job runs on the runner's bare python3, which has no PyYAML.
+        if not re.match(r"""^\s*(?:-\s+)?["']?uses["']?:\s*["']?azure/login@""", _code(line)):
             continue
         logins += 1
         start = i
@@ -302,10 +304,20 @@ def self_test() -> int:
     check("no Link header means the last page", lambda: next_link(None), lambda u: u is None)
     check("a Link without rel=next is not followed", lambda: next_link('</x>; rel="prev"'), lambda u: u is None)
     check("a login server is accepted", lambda: _login_server("MyReg.azurecr.io"), lambda s: s == "myreg.azurecr.io")
-    check("a bare registry NAME is refused (it would send the CLI to ARM)", lambda: _login_server("meshweaver"), REFUSED)
+    check("a bare registry NAME is refused (it would send the CLI to ARM)", lambda: _login_server("acme"), REFUSED)
     check("an empty tenant is refused", lambda: _tenant(" "), REFUSED)
     check("a non-repository name is refused before any network call",
           lambda: list_manifests("r.azurecr.io", "t", "../etc", 3, Io()), REFUSED)
+    check("a QUOTED login with the flag false, beside a correct unquoted one, is red",
+          lambda: check_workflow(GOOD + '      - name: quoted\n        uses: "azure/login@v3"\n        with:\n'
+                                 '          client-id: x\n          allow-no-subscriptions: false\n'),
+          lambda p: len(p) == 1 and "allow-no-subscriptions" in p[0])
+    check("a single-quoted login ref is checked too",
+          lambda: check_workflow(GOOD + "      - uses: 'azure/login@v3'\n        with:\n          client-id: x\n"),
+          lambda p: len(p) == 1 and "allow-no-subscriptions" in p[0])
+    check("a correctly flagged quoted login passes",
+          lambda: check_workflow(GOOD + '      - uses: "azure/login@v3"\n        with:\n          allow-no-subscriptions: true\n'),
+          lambda p: p == [])
     check("the flag under `env:` with no `with:` is red (inputs only)",
           lambda: check_workflow("jobs:\n  a:\n    steps:\n      - uses: azure/login@v3\n        env:\n"
                                  "          allow-no-subscriptions: true\n"),
