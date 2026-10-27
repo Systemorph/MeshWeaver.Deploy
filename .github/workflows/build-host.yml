@@ -124,6 +124,13 @@ jobs:
         run: python3 deploy/.github/scripts/build-run.py --self-test
       - name: The announcement can say no (self-test)
         run: python3 deploy/.github/scripts/build-host-announcement.py --self-test
+      # The publishing identity holds AcrPush on the registry resource ONLY. Hold this lane to it:
+      # every azure/login tenant-level, every registry call on the data plane (no ARM lookup).
+      - name: The registry is reached as a resource-scoped identity can (self-test + this lane)
+        run: |
+          set -euo pipefail
+          python3 deploy/.github/scripts/acr-data-plane.py --self-test
+          python3 deploy/.github/scripts/acr-data-plane.py check-workflow deploy/.github/workflows/build-host.yml
       # The platform commit the image is composed against: the set's own commit when a hand-over
       # names one, the platform's main otherwise (a change here is tested against the platform it
       # will next be built with).
@@ -192,14 +199,12 @@ jobs:
         env:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           MW_REGISTRY_PUBLISHER_PASSWORD: ${{ secrets.MW_REGISTRY_PUBLISHER_PASSWORD }}
         run: |
           set -euo pipefail
           missing=()
-          [ -n "$AZURE_CLIENT_ID" ]       || missing+=("secrets.AZURE_CLIENT_ID — the OIDC app registration that pushes to and reads the platform registry (its federated credential must trust this repository)")
+          [ -n "$AZURE_CLIENT_ID" ]       || missing+=("secrets.AZURE_CLIENT_ID — the OIDC app registration that pushes to and reads the platform registry (its federated credential must trust this repository; it needs AcrPush on the registry resource and nothing at subscription scope)")
           [ -n "$AZURE_TENANT_ID" ]       || missing+=("secrets.AZURE_TENANT_ID — that app registration's tenant")
-          [ -n "$AZURE_SUBSCRIPTION_ID" ] || missing+=("secrets.AZURE_SUBSCRIPTION_ID — the subscription that holds the platform registry")
           [ -n "$MW_REGISTRY_PUBLISHER_PASSWORD" ] || missing+=("secrets.MW_REGISTRY_PUBLISHER_PASSWORD — the fleet registry's publisher password (the same value the platform repository holds)")
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::the build-host lane cannot publish — provision the following on this repository, then re-run:"
@@ -218,17 +223,21 @@ jobs:
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          # The identity holds AcrPush on the registry RESOURCE and nothing at subscription scope
+          # (least privilege), so it signs in tenant-level; the registry is then reached through its
+          # data plane only (acr-data-plane.py), never through an ARM lookup.
+          allow-no-subscriptions: true
       - name: "Schedule: discover the sealed set that still lacks a runner (newest armed, else the oldest retained)"
         id: discover
         if: github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         run: |
           set -euo pipefail
           for repo in mw-plugin-test memex-portal-ai mw-build-host; do
-            az acr manifest list-metadata --registry meshweaver --name "$repo" --top 300 --orderby time_desc \
-              -o json --only-show-errors > "$RUNNER_TEMP/$repo.json"
+            python3 .github/scripts/acr-data-plane.py manifests --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
+              --repository "$repo" --top 300 > "$RUNNER_TEMP/$repo.json"
           done
           python3 .github/scripts/platform-set-dispatch.py discover --tester "$RUNNER_TEMP/mw-plugin-test.json" \
             --portal "$RUNNER_TEMP/memex-portal-ai.json" --runner "$RUNNER_TEMP/mw-build-host.json" > "$RUNNER_TEMP/found"
@@ -344,10 +353,15 @@ jobs:
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      - name: ACR login
+          # The identity holds AcrPush on the registry RESOURCE and nothing at subscription scope
+          # (least privilege), so it signs in tenant-level; the registry is then reached through its
+          # data plane only (acr-data-plane.py), never through an ARM lookup.
+          allow-no-subscriptions: true
+      - name: ACR login (data plane)
         if: steps.set.outputs.build == 'true'
-        run: bash platform/.github/scripts/acr-login.sh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: python3 deploy/.github/scripts/acr-data-plane.py login --registry "$ACR" --tenant "$AZURE_TENANT_ID"
       - name: The set exists in the platform registry
         if: steps.set.outputs.build == 'true'
         env:
@@ -487,7 +501,10 @@ jobs:
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          # The identity holds AcrPush on the registry RESOURCE and nothing at subscription scope
+          # (least privilege), so it signs in tenant-level; the registry is then reached through its
+          # data plane only (acr-data-plane.py), never through an ARM lookup.
+          allow-no-subscriptions: true
       - name: "The newest armed set, and its runner"
         id: build_host_current
         if: steps.build_host.outputs.enabled == 'true'
@@ -497,10 +514,11 @@ jobs:
           CORE_HERE: ${{ needs.preflight.outputs.armed_core_sha }}
           PLUGINS_HERE: ${{ needs.preflight.outputs.armed_plugins_sha }}
           IMAGE_LEG: ${{ needs.image.result }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         run: |
           set -euo pipefail
-          az acr manifest list-metadata --registry meshweaver --name memex-portal-ai --top 300 --orderby time_desc \
-            -o json --only-show-errors > "$RUNNER_TEMP/portal-manifests.json"
+          python3 deploy/.github/scripts/acr-data-plane.py manifests --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
+            --repository memex-portal-ai --top 300 > "$RUNNER_TEMP/portal-manifests.json"
           st=$(python3 platform/.github/scripts/arm-promoted-set.py armed-state --manifests "$RUNNER_TEMP/portal-manifests.json")
           newest=$(printf '%s' "$st" | jq -r '.version // empty')
           [ -n "$newest" ] || { echo "::error::no armed set could be read from memex-portal-ai — nothing to hand build-latest, and nothing to say it is current"; exit 1; }
@@ -508,7 +526,7 @@ jobs:
             || { echo "::error::the newest armed set '$newest' carries no run ordinal — the armed-state reading is not trustworthy"; exit 1; }
           core=""; plugins=""
           if [ "$ARMED_HERE" = true ] && [ "$V_ARMED_HERE" = "$newest" ]; then core="$CORE_HERE"; plugins="$PLUGINS_HERE"; fi
-          bash platform/.github/scripts/acr-login.sh
+          python3 deploy/.github/scripts/acr-data-plane.py login --registry "$ACR" --tenant "$AZURE_TENANT_ID"
           runner=""
           if d=$(docker buildx imagetools inspect "$ACR/mw-build-host:$newest" --format '{{json .Manifest.Digest}}'); then
             runner=$(printf '%s' "$d" | tr -d '"')
@@ -538,13 +556,14 @@ jobs:
           PLUGINS_SHA: ${{ steps.build_host_current.outputs.plugins }}
           RUNNER_DIGEST: ${{ steps.build_host_current.outputs.runner }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         run: |
           set -euo pipefail
           case "$URL" in
             https://*/api/hooks/Hosting/PlatformBuilds) ;;
             *) echo "::error::vars.CONTROL_WEBHOOK_URL is not an https URL of a Hosting/PlatformBuilds inbox — refusing to sign anything to it"; exit 1 ;;
           esac
-          bash platform/.github/scripts/acr-login.sh
+          python3 deploy/.github/scripts/acr-data-plane.py login --registry "$ACR" --tenant "$AZURE_TENANT_ID"
           # Resolved from the ARMED set's version tag, never a moving name — the same rule the
           # platform's notify-platform-update follows, so the host runs exactly the set the fleet
           # is offered.
