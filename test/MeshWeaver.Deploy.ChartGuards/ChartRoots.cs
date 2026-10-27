@@ -7,7 +7,7 @@ using Xunit;
 namespace MeshWeaver.Deploy.ChartGuards;
 
 /// <summary>
-/// The two roots every chart guard in this project reads from.
+/// The three roots every chart guard in this project reads from.
 ///
 /// <para><b>The chart is THIS repository's.</b> <c>deploy/helm</c>, <c>deploy/helm-db</c>,
 /// <c>deploy/aks/scripts</c>, <c>deploy/aks/manifests</c> and <c>deploy/aks/values.aks.yaml</c>
@@ -16,11 +16,15 @@ namespace MeshWeaver.Deploy.ChartGuards;
 /// chart file is resolved against this repository's root and its absence FAILS — it never skips: a
 /// guard whose subject moved and whose roots did not passes having checked nothing.</para>
 ///
-/// <para><b>The code the chart has to agree with is the PLATFORM's</b> — the probe wiring in
-/// <c>memex/aspire/Memex.Portal.ServiceDefaults</c>, the portal base image's Dockerfile, the record
-/// contract. Those resolve against the platform checkout this assembly was BUILT against
-/// (<c>MeshWeaverRoot</c>, baked in as AssemblyMetadata by the project file), so the chart is always
-/// compared with the platform it was compiled against.</para>
+/// <para><b>The code the chart has to agree with is the PLATFORM's</b> — the portal base image's
+/// Dockerfile, the record contract. Those resolve against the platform checkout this assembly was
+/// BUILT against (<c>MeshWeaverRoot</c>, baked in as AssemblyMetadata by the project file), so the
+/// chart is always compared with the platform it was compiled against.</para>
+///
+/// <para><b>...and the portal HOSTS'</b> — the probe and drain wiring in
+/// <c>src/Memex.Portal.ServiceDefaults</c>, which left the platform for MeshWeaver.Plugins
+/// (MeshWeaver#7297, MeshWeaver.Plugins#4333). Those resolve against the MeshWeaver.Plugins checkout
+/// this assembly was built against (<c>MeshWeaverPluginsRoot</c>, baked in the same way).</para>
 /// </summary>
 internal static class ChartRoots
 {
@@ -45,6 +49,18 @@ internal static class ChartRoots
         Assert.False(string.IsNullOrWhiteSpace(value),
             "MeshWeaverRoot was not baked into the test assembly (AssemblyMetadata in the csproj).");
         Assert.True(Directory.Exists(value), $"MeshWeaverRoot '{value}' is not a directory.");
+        return value!;
+    }
+
+    /// <summary>The MeshWeaver.Plugins checkout this test assembly was built against.</summary>
+    public static string PluginsRoot()
+    {
+        var value = typeof(ChartRoots).Assembly
+            .GetCustomAttributes<AssemblyMetadataAttribute>()
+            .FirstOrDefault(a => a.Key == "MeshWeaverPluginsRoot")?.Value;
+        Assert.False(string.IsNullOrWhiteSpace(value),
+            "MeshWeaverPluginsRoot was not baked into the test assembly (AssemblyMetadata in the csproj).");
+        Assert.True(Directory.Exists(value), $"MeshWeaverPluginsRoot '{value}' is not a directory.");
         return value!;
     }
 
@@ -75,4 +91,17 @@ internal static class ChartRoots
     /// <summary>A platform file (repo-relative, forward-slashed) under <see cref="PlatformRoot"/>.</summary>
     public static string PlatformFile(string relative) =>
         Path.Combine(PlatformRoot(), relative.Replace('/', Path.DirectorySeparatorChar));
+
+    /// <summary>
+    /// A MeshWeaver.Plugins file (repo-relative, forward-slashed) under <see cref="PluginsRoot"/>,
+    /// asserted present: a subject that moved again must fail here, never be read as empty.
+    /// </summary>
+    public static string PluginsFile(string relative)
+    {
+        var path = Path.Combine(PluginsRoot(), relative.Replace('/', Path.DirectorySeparatorChar));
+        Assert.True(File.Exists(path),
+            $"{relative} is not in the MeshWeaver.Plugins checkout ({path}). If it moved again, "
+            + "point these guards at where it lives now rather than letting them check nothing.");
+        return path;
+    }
 }

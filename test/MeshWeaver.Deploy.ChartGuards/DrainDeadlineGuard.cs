@@ -37,7 +37,7 @@ public class DrainDeadlineGuard
     private const string Values = "deploy/helm/values.yaml";
 
     /// <summary>Where the drain endpoint the preStop loop probes is actually mapped.</summary>
-    private const string ServiceDefaults = "memex/aspire/Memex.Portal.ServiceDefaults/ServiceDefaults.cs";
+    private const string ServiceDefaults = "src/Memex.Portal.ServiceDefaults/ServiceDefaults.cs";
 
     /// <summary>The base image the chart's default portal image is built on — where the probe tool
     /// preStop shells out to has to actually exist.</summary>
@@ -153,7 +153,7 @@ public class DrainDeadlineGuard
         var path = probe.Groups["path"].Value.TrimEnd(';');
         var port = probe.Groups["port"].Value;
 
-        var serviceDefaults = File.ReadAllText(ChartRoots.PlatformFile(ServiceDefaults));
+        var serviceDefaults = File.ReadAllText(ChartRoots.PluginsFile(ServiceDefaults));
         Assert.True(
             serviceDefaults.Contains($"MapGet(\"{path}\"", StringComparison.Ordinal),
             $"{Deployment}'s preStop probes '{path}', but {ServiceDefaults} does not map that "

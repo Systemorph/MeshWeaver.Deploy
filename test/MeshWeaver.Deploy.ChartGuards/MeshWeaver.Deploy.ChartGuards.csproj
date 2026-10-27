@@ -4,7 +4,8 @@
     drain deadline against ServiceDefaults, ConfigMap keys against their readers, the migration Job
     model, the Modules__Required__N ceiling against the record contract, and the rest. They moved
     out of the platform's test projects (and briefly through MeshWeaver.Plugins) with the chart.
-    Chart files resolve against THIS repository; platform files against $(MeshWeaverRoot).
+    Chart files resolve against THIS repository; platform files against $(MeshWeaverRoot); the portal
+    hosts' service defaults (which left the platform, MeshWeaver#7297) against $(MeshWeaverPluginsRoot).
   -->
   <PropertyGroup>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
@@ -13,8 +14,9 @@
     <!-- ProbeSeparationTest, RollGateReadinessOnlyTest, RollMidSessionDrainTest drive the platform's
          REAL probe and drain composition on the paths the chart ships. The setup-only host's probe
          guard (SetupProbeEndpointsTest) is NOT here: Memex.Portal.Shared left the public platform
-         for MeshWeaver.Plugins (MeshWeaver#7125), so its guard lives beside it there. -->
-    <ProjectReference Include="$(MeshWeaverRoot)/memex/aspire/Memex.Portal.ServiceDefaults/Memex.Portal.ServiceDefaults.csproj" />
+         for MeshWeaver.Plugins (MeshWeaver#7125), so its guard lives beside it there.
+         Memex.Portal.ServiceDefaults followed it (MeshWeaver#7297, MeshWeaver.Plugins#4333). -->
+    <ProjectReference Include="$(MeshWeaverPluginsRoot)/src/Memex.Portal.ServiceDefaults/Memex.Portal.ServiceDefaults.csproj" />
     <ProjectReference Include="$(MeshWeaverRoot)/src/MeshWeaver.Hosting/MeshWeaver.Hosting.csproj" />
     <ProjectReference Include="$(MeshWeaverRoot)/src/MeshWeaver.Mesh.Contract/MeshWeaver.Mesh.Contract.csproj" />
     <ProjectReference Include="$(MeshWeaverRoot)/src/MeshWeaver.Deployment.Contract/MeshWeaver.Deployment.Contract.csproj" />
@@ -27,5 +29,7 @@
   <ItemGroup>
     <!-- ChartRoots.PlatformRoot resolves the platform checkout at RUN time through this. -->
     <AssemblyMetadata Include="MeshWeaverRoot" Value="$([System.IO.Path]::GetFullPath('$(MeshWeaverRoot)'))" />
+    <!-- ChartRoots.PluginsRoot resolves the MeshWeaver.Plugins checkout the same way. -->
+    <AssemblyMetadata Include="MeshWeaverPluginsRoot" Value="$([System.IO.Path]::GetFullPath('$(MeshWeaverPluginsRoot)'))" />
   </ItemGroup>
 </Project>
