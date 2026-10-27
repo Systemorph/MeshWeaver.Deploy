@@ -47,6 +47,13 @@ registry with that.
         RED unless the service-image lane moves its line tag ONLY through `converge-line` (never a raw
         `retag … --to "$LINE"`, which has no post-write re-check, and never a build or push), in a step
         that runs on EVERY publish run (no `if:`), with main's history checked out.
+    acr-data-plane.py check-cache-handover <workflow.yml>
+        For a lane that builds through a REGISTRY build cache (`--cache-to`): RED unless the cache is
+        built only after the job confirmed this commit's image is NOT published (an `id: published`
+        step earlier in the job, and the cache build gated on it — a rerun of a published commit skips
+        straight to converging the line), and the image is published from an IMMUTABLE hand-over
+        (`--cache-from` the cache job's digest-pinned `cache_ref`, refused unless it is `@sha256:`), never
+        from the shared cache tag an overlapping run may re-point. A lane with no `--cache-to` passes.
     acr-data-plane.py --self-test
 
 Nothing here prints a token. The refresh token reaches docker on stdin only.
@@ -480,6 +487,56 @@ def check_line_convergence(text: str) -> list[str]:
     return problems
 
 
+# ───────────────────────────── the cache hand-over invariant ─────────────────────────────
+
+def _job_of(lines: list[str], i: int) -> int:
+    """Index of the `  <job>:` line that owns line i (two-space indent under `jobs:`)."""
+    j = i
+    while j >= 0 and not re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[j]):
+        j -= 1
+    return j
+
+
+def check_cache_handover(text: str) -> list[str]:
+    lines = text.splitlines()
+    code = [_code(x) for x in lines]
+    problems: list[str] = []
+    exporters = [i for i, c in enumerate(code) if "--cache-to" in c and not c.strip().startswith("#")]
+    if not exporters:
+        return []
+    for i in exporters:
+        start, end = _step_around(lines, i)
+        body = "\n".join(code[start:end])
+        job = _job_of(lines, i)
+        published = [k for k in range(job, start) if re.search(r"^\s*id:\s*published\s*$", code[k])]
+        if not published:
+            problems.append(f"the cache build at line {start + 1} is not preceded, in its job, by the `id: published` "
+                            "existence check — a rerun of a published commit would rebuild the cache (and fail if "
+                            "it was pruned) before it ever reaches the converge step")
+        if not re.search(r"^\s*if:\s*steps\.published\.outputs\.exists\s*==\s*'false'\s*$", body, flags=re.M):
+            problems.append(f"the cache build at line {start + 1} is not gated on `steps.published.outputs.exists == "
+                            "'false'` — an already-published commit must skip cache construction entirely")
+    publishers = [i for i, c in enumerate(code) if re.search(r'--output\s+"type=image,[^"]*push=true', c)]
+    if not publishers:
+        problems.append("a lane with a registry build cache publishes no image (`--output \"type=image,…push=true\"`) "
+                        "— the hand-over has nothing to check (wrong file?)")
+    for i in publishers:
+        start, end = _step_around(lines, i)
+        body = "\n".join(code[start:end])
+        where = f"the image publish at line {start + 1}"
+        if re.search(r'--cache-from\s+"type=registry,ref=[^"]*\$\{?BUILD_CACHE\b', body):
+            problems.append(f"{where} imports the SHARED cache tag — an overlapping run may re-point it between the "
+                            "cache export and this import, and a miss re-uploads everything. Import the cache job's "
+                            "digest-pinned `cache_ref`")
+        if not re.search(r"CACHE_REF:\s*\$\{\{\s*needs\.[A-Za-z0-9_-]+\.outputs\.cache_ref\s*\}\}", body):
+            problems.append(f"{where} does not take `CACHE_REF` from the cache job's `cache_ref` output")
+        if '--cache-from "type=registry,ref=$CACHE_REF"' not in body:
+            problems.append(f"{where} does not build `--cache-from` the handed-over `$CACHE_REF`")
+        if "*@sha256:*" not in body:
+            problems.append(f"{where} does not refuse a hand-over that is not digest-pinned (`case … *@sha256:*`)")
+    return problems
+
+
 # ───────────────────────────── self-test ─────────────────────────────
 
 GOOD = """\
@@ -891,6 +948,56 @@ jobs:
           lambda: tag_digest("r.io", "t", "x", "0.1", Io(post=lambda u, f: {"refresh_token": "r", "access_token": "t"},
                                                        run=lambda c, **k: Done("e\n"), fetch=lambda *a: (500, {}, b""))),
           REFUSED)
+
+    # ── the cache hand-over invariant ──
+    handover = """\
+jobs:
+  cache:
+    outputs:
+      cache_ref: ${{ steps.handover.outputs.cache_ref }}
+    steps:
+      - name: Is this commit already published?
+        id: published
+        run: echo exists=false
+      - name: Build into the registry cache
+        if: steps.published.outputs.exists == 'false'
+        run: |
+          docker buildx build --cache-from "type=registry,ref=$ACR/$REPO:$BUILD_CACHE" \\
+            --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE-run-1,mode=max" --output type=cacheonly x
+  publish:
+    needs: cache
+    steps:
+      - name: Build and push
+        if: steps.published.outputs.exists == 'false'
+        env:
+          CACHE_REF: ${{ needs.cache.outputs.cache_ref }}
+        run: |
+          case "$CACHE_REF" in *@sha256:*) ;; *) exit 1 ;; esac
+          docker buildx build --cache-from "type=registry,ref=$CACHE_REF" \\
+            --output "type=image,name=$ACR/$REPO:t,push=true,unpack=false" x
+"""
+    check("cache: the immutable hand-over + early existence check passes (positive control)",
+          lambda: check_cache_handover(handover), lambda p: p == [])
+    check("cache: publish importing the SHARED cache tag is red (review: overlapping runs re-point it)",
+          lambda: check_cache_handover(handover.replace('--cache-from "type=registry,ref=$CACHE_REF"',
+                                                        '--cache-from "type=registry,ref=$ACR/$REPO:$BUILD_CACHE"')),
+          lambda p: any("SHARED cache tag" in x for x in p))
+    check("cache: a hand-over not refused unless digest-pinned is red",
+          lambda: check_cache_handover(handover.replace('case "$CACHE_REF" in *@sha256:*) ;; *) exit 1 ;; esac', "true")),
+          lambda p: len(p) == 1 and "digest-pinned" in p[0])
+    check("cache: the cache built BEFORE the existence check is red (review: skip cache construction entirely)",
+          lambda: check_cache_handover(handover.replace(
+              "      - name: Is this commit already published?\n        id: published\n        run: echo exists=false\n", "")
+              .replace("    needs: cache\n    steps:\n",
+                       "    needs: cache\n    steps:\n      - name: Is this commit already published?\n        id: published\n        run: echo x\n")),
+          lambda p: any("not preceded" in x for x in p))
+    check("cache: an ungated cache build is red",
+          lambda: check_cache_handover(handover.replace(
+              "      - name: Build into the registry cache\n        if: steps.published.outputs.exists == 'false'\n",
+              "      - name: Build into the registry cache\n")),
+          lambda p: len(p) == 1 and "not gated" in p[0])
+    check("cache: a lane with no registry cache passes (nothing to hand over)",
+          lambda: check_cache_handover("jobs:\n  publish:\n    steps:\n      - run: docker push x\n"), lambda p: p == [])
     print(f"acr-data-plane self-test: {'PASS' if fails == 0 else f'{fails} FAILED'}")
     return 0 if fails == 0 else 1
 
@@ -920,6 +1027,15 @@ def main(argv: list[str]) -> int:
             print(f"newest={newest}")
             print(f"digest={digest}")
             return 0
+        if len(argv) == 2 and argv[0] == "check-cache-handover":
+            with open(argv[1], encoding="utf-8") as f:
+                problems = check_cache_handover(f.read())
+            for p in problems:
+                print(f"::error file={argv[1]}::{p}")
+            if not problems:
+                print(f"{argv[1]}: a registry build cache, if any, is built only for an unpublished commit and handed to "
+                      "the publish by digest")
+            return 1 if problems else 0
         if len(argv) == 2 and argv[0] == "check-line-convergence":
             with open(argv[1], encoding="utf-8") as f:
                 problems = check_line_convergence(f.read())

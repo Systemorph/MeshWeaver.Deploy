@@ -185,32 +185,15 @@ jobs:
     permissions:
       contents: read
       id-token: write   # OIDC to Azure (the federated credential is scoped to main)
+    # What `publish` builds from: THIS run's cache, by DIGEST — never the shared tag, which an overlapping
+    # main run may re-point between this export and that import (a miss there re-uploads ~24 GB).
+    outputs:
+      exists: ${{ steps.published.outputs.exists }}
+      cache_ref: ${{ steps.handover.outputs.cache_ref }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          docker-images: true
-      # The image is ~25 GB (25,090 MiB measured). /mnt is the runner's temporary disk where it has one
-      # (on the 2026-10-25 runner it was part of the 145 GB root, 118 GB free after the clean-up).
-      - name: Move Docker's data root to /mnt
-        run: |
-          set -euo pipefail
-          df -h / /mnt
-          sudo systemctl stop docker docker.socket
-          sudo mkdir -p /mnt/docker
-          # The containerd image store lets the daemon's OWN BuildKit push zstd layers (next steps) — no
-          # separate builder container, so nothing is pulled from Docker Hub beyond the Dockerfile's FROMs.
-          echo '{"data-root":"/mnt/docker","features":{"containerd-snapshotter":true}}' | sudo tee /etc/docker/daemon.json >/dev/null
-          sudo systemctl start docker
-          [ "$(docker info --format '{{.DockerRootDir}}')" = "/mnt/docker" ] \
-            || { echo "::error::Docker did not move its data root to /mnt/docker"; exit 1; }
-          status=$(docker info --format '{{json .DriverStatus}}')
-          grep -q 'io.containerd.snapshotter' <<<"$status" \
-            || { echo "::error::Docker is not on the containerd image store — the zstd push needs it"; exit 1; }
       - name: Ensure Azure CLI
         run: command -v az >/dev/null || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
       - name: Azure login (OIDC)
@@ -226,17 +209,81 @@ jobs:
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         run: python3 .github/scripts/acr-data-plane.py login --registry "$ACR" --tenant "$AZURE_TENANT_ID"
+      # 🚨 FIRST: is this commit's image already published? Then there is nothing to build — not even the
+      # cache — and a rerun goes straight on to `publish`'s converge step, even when the cache was pruned.
+      # Only a registry that ANSWERED "not found" means absent; any other lookup failure is RED.
+      - name: Is this commit already published?
+        id: published
+        run: |
+          set -euo pipefail
+          tag="${LINE}-${GITHUB_SHA::7}"
+          exists=false
+          if docker buildx imagetools inspect "$ACR/$REPO:$tag" --format '{{json .Manifest.Digest}}' \
+               >/dev/null 2>"$RUNNER_TEMP/inspect.err"; then
+            exists=true
+          elif ! grep -qiE 'not found|manifest unknown|MANIFEST_UNKNOWN|NAME_UNKNOWN' "$RUNNER_TEMP/inspect.err"; then
+            cat "$RUNNER_TEMP/inspect.err"
+            echo "::error::could not establish whether $REPO:$tag exists (the registry did not answer 'not found') — refusing to build over a tag that may be there"
+            exit 1
+          fi
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+          if [ "$exists" = true ]; then
+            echo "$REPO:$tag is already published — no cache is built; publish goes straight to converging the line"
+          else
+            echo "$REPO:$tag is confirmed absent (the registry answered not found) — building the cache"
+          fi
+      - name: Free disk space
+        if: steps.published.outputs.exists == 'false'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          docker-images: true
+      # The image is ~25 GB (25,090 MiB measured). /mnt is the runner's temporary disk where it has one
+      # (on the 2026-10-25 runner it was part of the 145 GB root, 118 GB free after the clean-up).
+      - name: Move Docker's data root to /mnt
+        if: steps.published.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          df -h / /mnt
+          sudo systemctl stop docker docker.socket
+          sudo mkdir -p /mnt/docker
+          # The containerd image store lets the daemon's OWN BuildKit push zstd layers (next steps) — no
+          # separate builder container, so nothing is pulled from Docker Hub beyond the Dockerfile's FROMs.
+          echo '{"data-root":"/mnt/docker","features":{"containerd-snapshotter":true}}' | sudo tee /etc/docker/daemon.json >/dev/null
+          sudo systemctl start docker
+          [ "$(docker info --format '{{.DockerRootDir}}')" = "/mnt/docker" ] \
+            || { echo "::error::Docker did not move its data root to /mnt/docker"; exit 1; }
+          status=$(docker info --format '{{json .DriverStatus}}')
+          grep -q 'io.containerd.snapshotter' <<<"$status" \
+            || { echo "::error::Docker is not on the containerd image store — the zstd push needs it"; exit 1; }
+      # Reads the SHARED tag only as a warm start, and writes this run's cache twice: to the shared tag (the
+      # next run's warm start) and to a RUN-SPECIFIC tag, whose digest is what `publish` imports.
       - name: Build into the registry cache (cache-from first, cache-to; no image)
+        if: steps.published.outputs.exists == 'false'
         run: |
           set -euo pipefail
           start=$(date +%s)
+          opts="mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,compression-level=1,force-compression=true"
           docker buildx build --builder "$(docker context show)" --progress=plain --provenance=false --sbom=false \
             --cache-from "type=registry,ref=$ACR/$REPO:$BUILD_CACHE" \
-            --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,compression-level=1,force-compression=true" \
+            --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE,$opts" \
+            --cache-to "type=registry,ref=$ACR/$REPO:$BUILD_CACHE-run-${GITHUB_SHA::7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT},$opts" \
             --output type=cacheonly \
             deploy/ollama
           echo "build cache written in $(( $(date +%s) - start ))s"
           echo "### ollama build cache: $(( $(date +%s) - start ))s" >> "$GITHUB_STEP_SUMMARY"
+      # The hand-over is the run-specific cache manifest's DIGEST, hashed from the bytes the registry serves.
+      - name: Hand the cache to publish by digest (immutable)
+        id: handover
+        if: steps.published.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          run_tag="$BUILD_CACHE-run-${GITHUB_SHA::7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker buildx imagetools inspect --raw "$ACR/$REPO:$run_tag" > "$RUNNER_TEMP/cache-manifest.json"
+          digest="sha256:$(sha256sum "$RUNNER_TEMP/cache-manifest.json" | cut -d' ' -f1)"
+          [ -s "$RUNNER_TEMP/cache-manifest.json" ] || { echo "::error::$REPO:$run_tag read back empty"; exit 1; }
+          echo "cache_ref=$ACR/$REPO@$digest" >> "$GITHUB_OUTPUT"
+          echo "publish imports $ACR/$REPO@$digest ($run_tag)"
 
   # main (push or dispatch): build the same way, push both tags, read them back.
   publish:
@@ -330,15 +377,18 @@ jobs:
       # `docker-container` builder would pull moby/buildkit from Docker Hub anonymously (DockerHubInCi).
       - name: Build and push ollama:<line>-<sha> (BuildKit, zstd)
         if: steps.published.outputs.exists == 'false'
+        env:
+          CACHE_REF: ${{ needs.cache.outputs.cache_ref }}
         run: |
           set -euo pipefail
+          case "$CACHE_REF" in *@sha256:*) ;; *) echo "::error::the cache job handed over no digest-pinned cache ('$CACHE_REF') — refusing to rebuild ~24 GB without it"; exit 1 ;; esac
           start=$(date +%s)
           # From the `cache` job's registry cache: every step is CACHED and the layers stay remote (lazy), so
           # the push HEADs blobs the repository already holds. unpack=false: a publish never runs the image,
           # and unpacking ~25 GB into the local store cost 3.9 min of the cut run. No force-compression: the
           # cached layers are zstd already, and forcing would fetch every lazy blob to recompress it.
           docker buildx build --builder "$(docker context show)" --progress=plain --provenance=false --sbom=false \
-            --cache-from "type=registry,ref=$ACR/$REPO:$BUILD_CACHE" \
+            --cache-from "type=registry,ref=$CACHE_REF" \
             --output "type=image,name=$ACR/$REPO:${LINE}-${GITHUB_SHA::7},push=true,unpack=false,compression=zstd,compression-level=1,oci-mediatypes=true" \
             deploy/ollama
           echo "built and pushed in $(( $(date +%s) - start ))s"
