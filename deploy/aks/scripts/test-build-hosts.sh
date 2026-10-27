@@ -53,14 +53,15 @@ if [ -f "$DOCKERFILE" ] \
    && grep -q "grep -Eq '\^\[0-9a-f\]{40}\$'" "$DOCKERFILE" \
    && grep -q 'bubblewrap' "$DOCKERFILE" \
    && grep -q 'sandbox-postgres.sh --self-test' "$DOCKERFILE" \
-   && grep -q 'build-run.py --self-test' "$DOCKERFILE" \
+   && grep -q '^RUN python3 /opt/build-host/build-run.py --self-test$' "$DOCKERFILE" \
+   && [ "$(grep -n '^USER 1654' "$DOCKERFILE" | head -1 | cut -d: -f1)" -lt "$(grep -n 'build-run.py --self-test' "$DOCKERFILE" | head -1 | cut -d: -f1)" ] \
    && grep -q 'module-build-key.py --self-test' "$DOCKERFILE" \
    && grep -q 'module-build-key.py node-repo-scope.py' "$DOCKERFILE" \
    && grep -q 'compile-check.py --help' "$DOCKERFILE" \
    && ! grep -Eq '^FROM [^ ]*:latest' "$DOCKERFILE"; then
-  ok "deploy/build-host/Dockerfile fetches the runner, composer, sandbox-postgres, module-build-key with its sibling node-repo-scope.py, core's compile-check.py (handed to stages as MW_PLATFORM_SCRIPTS) and the plugin-build tool by 40-hex commit (nothing COPYed from the context), installs bubblewrap, runs the self-tests (module-build-key's too, so a missing sibling fails the build), and pins no :latest"
+  ok "deploy/build-host/Dockerfile fetches the runner, composer, sandbox-postgres, module-build-key with its sibling node-repo-scope.py, core's compile-check.py (handed to stages as MW_PLATFORM_SCRIPTS) and the plugin-build tool by 40-hex commit (nothing COPYed from the context), installs bubblewrap, runs the self-tests (module-build-key's too, so a missing sibling fails the build; the runner's as the unprivileged uid 1654, never root), and pins no :latest"
 else
-  report "deploy/build-host/Dockerfile must fetch its sources by 40-hex commit in the 'sources' stage, COPY only --from=sources (build-run.py, compose-gate-host.sh, sandbox-postgres.sh, module-build-key.py, node-repo-scope.py — module-build-key imports it, core #7270 —, ci-artifact-store.py, compile-check.py — a stage's canonical checker, MW_PLATFORM_SCRIPTS —, plugin-build) to /opt/build-host/, install bubblewrap, run the self-tests incl. module-build-key.py's, and name no :latest base"
+  report "deploy/build-host/Dockerfile must fetch its sources by 40-hex commit in the 'sources' stage, COPY only --from=sources (build-run.py, compose-gate-host.sh, sandbox-postgres.sh, module-build-key.py, node-repo-scope.py — module-build-key imports it, core #7270 —, ci-artifact-store.py, compile-check.py — a stage's canonical checker, MW_PLATFORM_SCRIPTS —, plugin-build) to /opt/build-host/, install bubblewrap, run the self-tests incl. module-build-key.py's (build-run.py's AFTER 'USER 1654': root reads past file modes), and name no :latest base"
 fi
 # 1b. the PREPARED host (MeshWeaver.Plugins Hosting/StandingBuildHosts.md, "a prepared server, never a
 #     prepared run"): the image carries core's source at the set's commit and the portal chart (both by
@@ -78,6 +79,51 @@ if [ -f "$DOCKERFILE" ] \
 else
   report "deploy/build-host/Dockerfile must COPY --from=sources platform-src/, deploy-src/ and host-postgres.sh, install postgresql-\${PG_MAJOR}-pgvector, run host-postgres.sh --self-test and prepare /opt/build-host/pg-snapshot AFTER 'USER 1654' (initdb refuses root)"
 fi
+# 1c. the BROWSER and FONT SET core's browser/PDF tests need, installed ONCE in the image (never per
+#     stage): Playwright's --only-shell Chromium WITH its deps (the font packages) at the version the
+#     PLATFORM's portal image declares — read from the platform source at the set's commit, never a
+#     literal here — the platform's fonts-local.conf, the both-architecture binary lookup, and a smoke
+#     print as uid 1654. Installed as root, BEFORE 'USER 1654'. Negative controls: each mutant is RED.
+browser_problems() {
+  local f="$1" p=()
+  grep -qF 'PLAYWRIGHT_VERSION=\([0-9][0-9.]*\)' "$f" && grep -q 'deploy/base-images/portal-ai/Dockerfile' "$f" \
+    || p+=("the Playwright version is not read from the platform's portal-ai Dockerfile")
+  grep -Eq 'playwright-core@[0-9]' "$f" && p+=("a literal Playwright version is pinned here")
+  grep -Eq '^ARG PLAYWRIGHT_VERSION' "$f" && p+=("a PLAYWRIGHT_VERSION build argument would let the version drift from the platform's")
+  grep -q 'npx --yes "playwright-core@$(cat /opt/build-host/browser/playwright-version)" install --with-deps --only-shell chromium' "$f" \
+    || p+=("no --with-deps --only-shell Chromium install at the platform's version")
+  grep -q 'portal-ai/fonts-local.conf' "$f" && grep -q 'cp /opt/build-host/browser/fonts-local.conf /etc/fonts/local.conf' "$f" \
+    || p+=("the platform's fonts-local.conf is not installed")
+  grep -q -- '-name headless_shell -o -name chrome-headless-shell' "$f" || p+=("the binary lookup does not cover both architectures")
+  grep -q '^ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright$' "$f" && grep -q '^ENV CHROME_BIN=/usr/bin/chromium$' "$f" \
+    || p+=("PLAYWRIGHT_BROWSERS_PATH / CHROME_BIN are not set")
+  grep -q 'setpriv --reuid=1654' "$f" && grep -q -- '--print-to-pdf=' "$f" && grep -q '"%PDF"' "$f" \
+    || p+=("no smoke print as uid 1654")
+  local inst user
+  inst="$(grep -n 'install --with-deps --only-shell chromium' "$f" | head -1 | cut -d: -f1)"
+  user="$(grep -n '^USER 1654' "$f" | head -1 | cut -d: -f1)"
+  [ -n "$inst" ] && [ -n "$user" ] && [ "$inst" -lt "$user" ] || p+=("the browser is not installed as root before 'USER 1654'")
+  printf '%s\n' "${p[@]+"${p[@]}"}"
+}
+bp="$(browser_problems "$DOCKERFILE")"
+if [ -f "$DOCKERFILE" ] && [ -z "$bp" ]; then
+  ok "deploy/build-host/Dockerfile installs the portal's headless browser and font set once, at the platform's own Playwright version, and smoke-prints a PDF as uid 1654"
+else
+  report "deploy/build-host/Dockerfile browser/font set: $bp"
+fi
+BMUT="$(mktemp -d)"
+bmutant() { # <name> <sed expression>
+  sed -e "$2" "$DOCKERFILE" > "$BMUT/$1"
+  if [ -n "$(browser_problems "$BMUT/$1")" ]; then ok "negative control RED: $1"; else report "negative control stayed GREEN: $1"; fi
+}
+bmutant "literal version" 's#playwright-core@$(cat /opt/build-host/browser/playwright-version)#playwright-core@1.62.1#'
+bmutant "no smoke print" 's#--print-to-pdf=#--dump-dom #'
+bmutant "no deps (no font packages)" 's# install --with-deps --only-shell# install --only-shell#'
+bmutant "fonts-local.conf not installed" 's#cp /opt/build-host/browser/fonts-local.conf /etc/fonts/local.conf#true#'
+bmutant "amd64-only lookup" 's# -o -name chrome-headless-shell##'
+bmutant "installed after USER 1654" '/^ENV PLAYWRIGHT_BROWSERS_PATH/i\
+USER 1654'
+rm -rf "$BMUT"
 if python3 "$REPO/.github/scripts/build-run.py" --self-test; then
   ok "build-run.py passes its self-test"
 else
