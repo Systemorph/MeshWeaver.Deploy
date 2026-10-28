@@ -140,6 +140,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import struct
 import zlib
 import subprocess
@@ -724,6 +725,44 @@ def file_tail(fh, limit: int) -> str:
     size = fh.seek(0, os.SEEK_END)
     fh.seek(max(0, size - limit))
     return fh.read().decode("utf-8", errors="replace")
+
+
+def _artifact_identity(st: os.stat_result):
+    return "dir" if stat.S_ISDIR(st.st_mode) else (stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns, st.st_ino)
+
+
+def artifact_snapshot(root: str) -> dict:
+    """Every entry under the shared artifacts directory, by relative path: a real directory as "dir" (what changes
+    inside it is found by descending), anything else — file, symlink, fifo — by its lstat identity (type, size,
+    mtime, inode), so a stage that ADDS or REWRITES an entry is visible against the snapshot taken before it ran."""
+    snap: dict = {}
+    for base, dirs, names in os.walk(root):
+        for n in dirs + names:
+            full = os.path.join(base, n)
+            snap[os.path.relpath(full, root)] = _artifact_identity(os.lstat(full))
+    return snap
+
+
+def quarantine_artifacts(root: str, before: dict, dest: str) -> list[str]:
+    """Move out of the shared artifacts directory every entry a FAILED stage added or rewrote (anything not in, or
+    different from, `before`), into `dest`. The artifacts directory is shared by the run's stages and each successful
+    stage hands over everything under it, so a failed stage's unfinished files would otherwise be uploaded — and
+    receipted — under a later independent sibling's name, and an invalid leftover (a dangling symlink) would turn that
+    sibling red. Returns the moved relative paths."""
+    moved: list[str] = []
+    for base, dirs, names in os.walk(root):
+        for n in list(dirs) + names:
+            full = os.path.join(base, n)
+            rel = os.path.relpath(full, root)
+            if before.get(rel) == _artifact_identity(os.lstat(full)):
+                continue
+            target = os.path.join(dest, rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            os.rename(full, target)
+            moved.append(rel)
+            if n in dirs:
+                dirs.remove(n)
+    return sorted(moved)
 
 
 def promote_nuget(restored: str, cache: str, log: Callable[[str], None]) -> tuple[int, int, list[str]]:
@@ -2466,6 +2505,7 @@ class Host:
                 nuget_dir = os.path.join(workdir, "nuget")
                 os.makedirs(nuget_dir, exist_ok=True)
                 nuget_before = nuget_packages(nuget_dir)
+                art_before = artifact_snapshot(artifacts_dir)
                 ok = self.run_stage(dict(st, timeoutMinutes=min(st["timeoutMinutes"], remaining / 60)),
                                     checkout_dir, outputs_dir, sink,
                                     {**extra, "MW_BUILD_STAGE": st["name"], "NUGET_PACKAGES": nuget_dir},
@@ -2492,6 +2532,15 @@ class Host:
                 if not ok:
                     failed.add(st["name"])
                     ran_red.append(st["name"])
+                    # A red stage's artifacts never reach a later sibling's hand-over (which uploads everything under the
+                    # shared directory): what it added or rewrote is quarantined beside the run, out of the hand-over's walk.
+                    quarantined = quarantine_artifacts(artifacts_dir, art_before,
+                                                       os.path.join(workdir, "failed-artifacts", st["name"]))
+                    if quarantined:
+                        sink.add([{"kind": "line", "text": (f"artifacts: {len(quarantined)} entry(ies) left by the red stage "
+                                                            f"quarantined, never handed over: "
+                                                            f"{', '.join(quarantined[:5])}")[:MAX_LINE]}])
+                        self.deliver(sink)
                     failed_at = failed_at or st["name"]
                 elif trunk and st["kind"] == "build" and ran_red:
                     # The outputs folder is shared by every stage of the run, and a stage that ran red may have
@@ -4445,6 +4494,45 @@ def self_test() -> int:
              checkout=checkout_with({"stages": [{"name": "modules", "kind": "build", "command": art_cmd}]})).run(claim)
         fin = [e for _, es in posted for e in es if e["kind"] == "stage-finished"]
         check("h9/artifacts with no store fail the stage", fin and fin[-1]["state"] == "failed" and "no artifact store" in fin[-1]["summary"], fin)
+        # A RED stage's artifacts never reach a later independent sibling's hand-over: the shared directory is walked
+        # whole by every green stage, so without the quarantine `bad`'s unfinished bundle would be receipted as `good`'s,
+        # and its dangling symlink would turn `good` red.
+        for leftover, label in (("echo half > $MW_BUILD_ARTIFACTS/Bad/Bad-1.0.0.zip", "an unfinished file"),
+                                ("ln -s /nonexistent $MW_BUILD_ARTIFACTS/Bad/dangling", "a dangling symlink")):
+            sib = [{"name": "good0", "kind": "build", "command": art_cmd},
+                   {"name": "bad", "kind": "build", "command": f"mkdir -p $MW_BUILD_ARTIFACTS/Bad && {leftover}; exit 1",
+                    "after": []},
+                   {"name": "good", "kind": "build", "command": "mkdir -p $MW_BUILD_ARTIFACTS/Good && echo ok > "
+                                                                "$MW_BUILD_ARTIFACTS/Good/Good.json", "after": []}]
+            for quarantine in (True, False):
+                posted.clear()
+                hq = host(api_ev(), env=dict(env_s, MW_BUILD_ARTIFACT_STORE="file:" + store_dir), store_runner=fake_store,
+                          checkout=checkout_with({"stages": sib}))
+                real_q = quarantine_artifacts
+                if not quarantine:   # NEGATIVE CONTROL: the same run with the quarantine disabled
+                    globals()["quarantine_artifacts"] = lambda root, before, dest: []
+                try:
+                    hq.run(claim)
+                finally:
+                    globals()["quarantine_artifacts"] = real_q
+                by = {}
+                for pth, es in posted:
+                    for e in es:
+                        by.setdefault(pth.split("/")[-2], []).append(e)
+                good_units = sorted(e["unit"] for e in by.get("good", []) if e["kind"] == "artifact")
+                good_fin = [e for e in by.get("good", []) if e["kind"] == "stage-finished"]
+                clean = (good_fin and good_fin[-1]["state"] == "succeeded"
+                         and not [u for u in good_units if u.startswith("Bad/")] and "Good/Good.json" in good_units
+                         and "Store/Store-1.4.2.zip" in good_units)
+                if quarantine:
+                    check(f"h9/{label} left by a red stage is not handed over by a later independent sibling, which stays green",
+                          clean, (good_fin, good_units))
+                    check(f"h9/{label}: the red stage says what it quarantined",
+                          any(e["kind"] == "line" and "quarantined" in e["text"] and e["text"].endswith(": Bad")
+                              for e in by.get("bad", [])), by.get("bad"))
+                else:
+                    check(f"h9/negative control: without the quarantine {label} reaches the sibling's hand-over",
+                          not clean, (good_fin, good_units))
         # H9, the API store (`MW_BUILD_ARTIFACT_STORE=api:`): each artifact is PUT to the build API as the run's holder and
         # its receipt is the SERVER's answer; nothing touches ci-artifact-store.py.
         api_env = dict(env_s, MW_BUILD_ARTIFACT_STORE="api:")
