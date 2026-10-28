@@ -728,13 +728,16 @@ def file_tail(fh, limit: int) -> str:
 
 
 def _artifact_identity(st: os.stat_result):
-    return "dir" if stat.S_ISDIR(st.st_mode) else (stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns, st.st_ino)
+    # st_ctime_ns too: no process can set it, so a same-size rewrite that restores the old mtime (`cp -p`, `touch -d`,
+    # a reproducible-build timestamp normalisation) onto the same inode still reads as rewritten.
+    return "dir" if stat.S_ISDIR(st.st_mode) else (stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns, st.st_ino,
+                                                   st.st_ctime_ns)
 
 
 def artifact_snapshot(root: str) -> dict:
     """Every entry under the shared artifacts directory, by relative path: a real directory as "dir" (what changes
     inside it is found by descending), anything else — file, symlink, fifo — by its lstat identity (type, size,
-    mtime, inode), so a stage that ADDS or REWRITES an entry is visible against the snapshot taken before it ran."""
+    mtime, inode, ctime), so a stage that ADDS or REWRITES an entry is visible against the snapshot taken before it ran."""
     snap: dict = {}
     for base, dirs, names in os.walk(root):
         for n in dirs + names:
@@ -4494,6 +4497,31 @@ def self_test() -> int:
              checkout=checkout_with({"stages": [{"name": "modules", "kind": "build", "command": art_cmd}]})).run(claim)
         fin = [e for _, es in posted for e in es if e["kind"] == "stage-finished"]
         check("h9/artifacts with no store fail the stage", fin and fin[-1]["state"] == "failed" and "no artifact store" in fin[-1]["summary"], fin)
+        # A red stage that rewrites an EXISTING artifact in place, same size, and restores its mtime (cp -p, touch -d,
+        # timestamp normalisation) is still seen as a rewrite: ctime is part of the identity and no process can set it.
+        qroot = tempfile.mkdtemp(prefix="h9q-")
+        try:
+            art = os.path.join(qroot, "a", "Keep.zip")
+            os.makedirs(os.path.dirname(art))
+            for n_, body in (("Keep.zip", b"good"), ("Same.zip", b"same")):
+                with open(os.path.join(qroot, "a", n_), "wb") as fh:
+                    fh.write(body)
+            before_q = artifact_snapshot(qroot)
+            st0 = os.stat(art)
+            time.sleep(0.05)   # past the kernel's coarse timestamp tick, so the rewrite's ctime is a later one
+            with open(art, "r+b") as fh:
+                fh.write(b"evil")
+            os.utime(art, ns=(st0.st_atime_ns, st0.st_mtime_ns))
+            st1 = os.stat(art)
+            check("h9/negative control: size, mtime and inode alone cannot see the restored-mtime rewrite",
+                  (st1.st_size, st1.st_mtime_ns, st1.st_ino) == (st0.st_size, st0.st_mtime_ns, st0.st_ino), (st0, st1))
+            moved_q = quarantine_artifacts(qroot, before_q, os.path.join(qroot, "..", os.path.basename(qroot) + "-q"))
+            check("h9/a same-size rewrite with its mtime restored is quarantined; the untouched sibling stays",
+                  moved_q == [os.path.join("a", "Keep.zip")] and os.path.exists(os.path.join(qroot, "a", "Same.zip")),
+                  moved_q)
+        finally:
+            shutil.rmtree(qroot, ignore_errors=True)
+            shutil.rmtree(qroot + "-q", ignore_errors=True)
         # A RED stage's artifacts never reach a later independent sibling's hand-over: the shared directory is walked
         # whole by every green stage, so without the quarantine `bad`'s unfinished bundle would be receipted as `good`'s,
         # and its dangling symlink would turn `good` red.
