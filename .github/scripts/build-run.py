@@ -86,10 +86,14 @@ THE LOOP, and the order that matters:
     not the run's subject (MeshWeaver.Plugins' module-libraries shelf and Razor build extension,
     `MW_BUILD_MODULE_LIBS` / `MW_BUILD_EXTENSIONS`). The host keys each with the repository's own
     `key` command and installs it once per (repository, input, platform, key) under
-    `<cache>/prepared/`, stamped `.source-key`; a run whose key is installed prepares nothing. A
-    trunk run whose key is not installed builds it (`build`, against the image's platform source
-    `MW_PLATFORM_SOURCE`) and installs it — every push to main queues one, so the server follows
-    main. A pull request with other sources builds it for that run only (MWPREP002), never installs.
+    `<cache>/prepared/`, stamped `.source-key`; a run whose key is installed prepares nothing. What
+    is installed is only ever built from DEFAULT-BRANCH content (`build`, against the image's
+    platform source `MW_PLATFORM_SOURCE`): a trunk run's own tree, or — for ANY run whose key is not
+    installed, trunk runs never reaching the host included — the default branch's tip, which the
+    host checks out from its mirror and keys and builds with the TIP's own commands. A pull request
+    whose key equals the tip's installs that build and reads it, so the server is prepared for a new
+    platform or a new main key by the first run that needs it. A pull request with other sources
+    builds it for that run only (MWPREP002) and never installs.
   * stages run in declaration order, and a stage is skipped ONLY when a stage it runs AFTER failed:
     its `after` (names of stages declared earlier), or — when it declares none — every earlier
     stage of kind `build` (what produces the outputs later stages read). A skipped stage is finished
@@ -457,10 +461,12 @@ class Refusal(Exception):
 #                 "timeoutMinutes": 20}]
 # The host computes each input's source key from the run's tree (the repository's OWN `key` command, so the stage's own
 # check agrees by construction), and installs it PERSISTENTLY per (repository, input, platform, key) under
-# `<cache>/prepared/`. A run whose key is installed reads it, read-only, and prepares nothing. A TRUNK run whose key is not
-# installed builds it once and installs it — every push to main queues a trunk run, so the server follows main. A pull
-# request whose sources differ from every installed copy builds it for that run only (said, MWPREP002), and never writes
-# the shared copy. Only the names below may carry a prepared input: a stage's environment is an allow-list.
+# `<cache>/prepared/`. A run whose key is installed reads it, read-only, and prepares nothing. A miss is installed ONCE,
+# built only from DEFAULT-BRANCH content: a trunk run builds its own tree; any other run (trunk runs need not reach the
+# host at all) has the host check out the default branch's tip from the mirror and key and build THAT with the tip's own
+# commands — installed when its key equals the run's. A pull request whose sources differ from the tip's builds it for
+# that run only (said, MWPREP002), and never writes the shared copy: no PR-controlled command ever builds installed bytes.
+# Only the names below may carry a prepared input: a stage's environment is an allow-list.
 PREPARED_ENV = ("MW_BUILD_MODULE_LIBS", "MW_BUILD_EXTENSIONS")
 PREPARED_NAME = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
 SOURCE_KEY = re.compile(r"^[0-9a-f]{64}$")
@@ -984,11 +990,15 @@ RUN_MARGIN_SECONDS = 600
 PREPARED_KEY_SECONDS = 300
 
 
-def run_budget_seconds(stages: list[dict], deadline: float, prepared: Sequence[dict] = ()) -> int:
+def run_budget_seconds(stages: list[dict], deadline: float, prepared: Sequence[dict] = (), trunk: bool = True) -> int:
     """The run's effective budget: the selected stages' summed caps + each declared prepared input's build cap
-    and key-command allowance (a cache miss builds it inside the run) + a margin, never past the deadline."""
+    and TWO key-command allowances (a miss keys the run's tree and the default branch's tip, then builds ONE of
+    them inside the run) + a margin, never past the deadline. On a NON-trunk run the build a miss runs may be the
+    DEFAULT BRANCH's declaration, whose cap this run cannot know before it keys the tip — so it reserves the largest
+    cap any declaration may carry, never this run's own (a 1-minute PR cap must not cut a valid 45-minute tip build)."""
     total = sum(float(st.get("timeoutMinutes", DEFAULT_STAGE_TIMEOUT_MINUTES)) * 60 for st in stages) + RUN_MARGIN_SECONDS
-    total += sum(float(p.get("timeoutMinutes", 20)) * 60 + PREPARED_KEY_SECONDS for p in prepared)
+    total += sum((float(p.get("timeoutMinutes", 20)) if trunk else float(DEFAULT_STAGE_TIMEOUT_MINUTES)) * 60
+                 + 2 * PREPARED_KEY_SECONDS for p in prepared)
     return int(min(deadline, total))
 
 
@@ -2435,7 +2445,7 @@ class Host:
             plan = self._sink_for(repo, sha, stages[0]["name"])
             # The run's declared execution budget: the instance sets the attempt's deadline to claim
             # time + budget + 15 min. The host enforces the same number (`budget`, below).
-            budget = run_budget_seconds(stages, self.run_deadline - (self.clock() - started), prepared_inputs)
+            budget = run_budget_seconds(stages, self.run_deadline - (self.clock() - started), prepared_inputs, trunk)
             plan_event = {"kind": "plan", "stages": [st["name"] for st in stages], "budgetMinutes": budget_minutes(budget)}
             if merge_base:
                 plan_event["mergeBase"] = merge_base
@@ -2689,11 +2699,40 @@ class Host:
                 continue
         return gone
 
+    def default_branch_tree(self, repo: str, workdir: str) -> tuple[str, str]:
+        """The repository's DEFAULT BRANCH tip as a host-made tree: the mirror's HEAD (the default branch, fetched just
+        before this run's checkout) cloned `--shared` from the LOCAL mirror and checked out detached — no network, no
+        credential, and none of the run's own content. Returns (tip sha, tree). Raises Refusal, naming why."""
+        mirror = os.path.join(self.cache, "git", f"{repo}.git")
+        tree = os.path.join(workdir, "default-branch")
+        genv = {**{k: self.env[k] for k in ("PATH", "LANG") if self.env.get(k)}, "HOME": workdir, "GIT_TERMINAL_PROMPT": "0"}
+        rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", "HEAD^{commit}"], genv)
+        tip = out.strip().splitlines()[-1].strip().lower() if rc == 0 and out.strip() else ""
+        if not SHA.match(tip):
+            raise Refusal(f"the default branch's tip could not be resolved from the mirror (exit {rc}): {out.strip()[-160:]}")
+        shutil.rmtree(tree, ignore_errors=True)
+        for args in (["clone", "--quiet", "--shared", "--no-checkout", mirror, tree],
+                     ["-C", tree, "checkout", "--quiet", "--detach", tip]):
+            rc, out = self.git_runner(args, genv)
+            if rc != 0:
+                raise Refusal(f"the default branch's tip {tip[:12]} could not be checked out (exit {rc}): {out.strip()[-160:]}")
+        return tip, tree
+
     def prepare_inputs(self, repo: str, checkout: str, workdir: str, trunk: bool, inputs: list[dict],
                        sink: "EventSink", run_end: float) -> tuple[dict, list[str]]:
         """Provide every PREPARED input the repository declares (see PREPARED_ENV): the installed copy for this
-        run's source key, or — once — a build of it, installed for every later run when this is a trunk run.
-        Returns (the stage environment additions, the read-only binds). Raises Refusal, naming the input."""
+        run's source key, or — once per (platform, key) — a build of it, installed for every later run. "Once" is
+        the INSTALL: two runs that miss the same key concurrently may each build it; the first rename wins and the
+        other's copy is dropped (`install`), so the cost of a race is a duplicate build, never a mixed copy.
+        Returns (the stage environment additions, the read-only binds). Raises Refusal, naming the input.
+
+        What is INSTALLED is only ever built from DEFAULT-BRANCH content, with the default branch's own key and build
+        commands: a trunk run's tree, or — for any other run whose key is not installed — the default branch's tip,
+        checked out by the host from the mirror. A pull request whose sources key the same as that tip (it did not
+        change them: its tree is merged onto the tip) therefore installs the tip's build and reads it, so the server is
+        prepared for a new platform (or a new main key) by the FIRST run that needs it, trunk run or not. A pull request
+        that changed the sources builds them for that run only (MWPREP002): its bytes never reach the shared copy,
+        because its own commands never build what is installed — a PR that LIES about its key fools only itself."""
         env_add: dict = {}
         ro: list[str] = []
         mirror = os.path.join(self.cache, "git", f"{repo}.git")
@@ -2702,8 +2741,8 @@ class Host:
         # --ro-bind-try would silently skip it — so a fresh host creates it before the first preparation.
         os.makedirs(os.path.join(self.cache, "nuget"), exist_ok=True)
 
-        def sandboxed(command: str, out: str, extra: dict, readonly: list, writable: list, timeout: float) -> tuple[int, str]:
-            argv = self.sandbox.argv(command, checkout, out, sandbox_env(self.env, extra, self.cache),
+        def sandboxed(command: str, tree: str, out: str, extra: dict, readonly: list, writable: list, timeout: float) -> tuple[int, str]:
+            argv = self.sandbox.argv(command, tree, out, sandbox_env(self.env, extra, self.cache),
                                      readonly=readonly, writable=writable)
             # The command is repository-controlled: its output goes to host-owned FILES (outside the sandbox's
             # writable binds) and only a bounded tail of each is read back, so a noisy key or build command can
@@ -2712,7 +2751,7 @@ class Host:
             try:
                 with open(os.path.join(logs, "out"), "w+b") as so, open(os.path.join(logs, "err"), "w+b") as se:
                     try:
-                        r = subprocess.run(argv, cwd=checkout, env={"PATH": self.env.get("PATH", "/usr/bin:/bin")},
+                        r = subprocess.run(argv, cwd=tree, env={"PATH": self.env.get("PATH", "/usr/bin:/bin")},
                                            stdout=so, stderr=se, timeout=max(1.0, timeout), stdin=subprocess.DEVNULL)
                     except subprocess.TimeoutExpired:
                         return 124, "timed out"
@@ -2724,43 +2763,45 @@ class Host:
                 shutil.rmtree(logs, ignore_errors=True)
 
         base_extra = {"MW_BUILD_PLATFORM_VERSION": self.platform_version, "MW_BUILD_REPO": repo}
-        for p in inputs:
-            name = p["name"]
+
+        def source_key(p: dict, tree: str, label: str) -> str:
             left = run_end - self.clock()
             if left <= 0:
-                raise Refusal(f"{name}: the run deadline passed before it was prepared")
-            keydir = os.path.join(workdir, "prepared-key", name)
+                raise Refusal(f"{p['name']}: the run deadline passed before it was prepared")
+            keydir = os.path.join(workdir, "prepared-key", label, p["name"])
             os.makedirs(keydir, exist_ok=True)
-            rc, text = sandboxed(p["key"], keydir, base_extra, [mirror], [], min(left, float(PREPARED_KEY_SECONDS)))
+            rc, text = sandboxed(p["key"], tree, keydir, base_extra, [mirror], [], min(left, float(PREPARED_KEY_SECONDS)))
             key = (text.strip().splitlines() or [""])[-1].strip() if rc == 0 else ""
             if rc != 0 or not SOURCE_KEY.match(key):
-                raise Refusal(f"{name}: its key command did not answer a source key (exit {rc}): {text.strip()[-300:]}")
-            store = prepared_store(self.cache, repo, name, self.platform_version, key)
-            if os.path.isfile(os.path.join(store, ".complete")):
-                env_add[p["env"]] = store
-                ro.append(store)
-                sink.add([{"kind": "line", "text": f"prepared {name}: installed on this server (key {key[:12]}) — nothing prepared for this run"}])
-                continue
+                whose = "the default branch's" if label == "default" else "its"
+                raise Refusal(f"{p['name']}: {whose} key command did not answer a source key (exit {rc}): {text.strip()[-300:]}")
+            return key
+
+        def build(p: dict, tree: str, label: str, key: str) -> tuple[str, int]:
+            name = p["name"]
             if not platform_src or not os.path.isdir(platform_src):
                 raise Refusal(f"{name} (key {key[:12]}) is not installed and this host has no platform source to build it "
                               f"with (MW_PLATFORM_SOURCE is {'unset' if not platform_src else 'not a directory: ' + platform_src})")
-            out = os.path.join(workdir, "prepared", name)
+            out = os.path.join(workdir, "prepared", label, name)
             shutil.rmtree(out, ignore_errors=True)
             os.makedirs(out)
-            nuget = os.path.join(workdir, "nuget")
+            # Everything a build may WRITE is per LABEL: a run-content ("run") build of one input must never leave
+            # bytes a later default-branch ("default") build of another input reads — a shared package folder would
+            # let a pull request's command plant packages into what the default branch's build installs for every run.
+            nuget = os.path.join(workdir, "prepared-nuget", label)
             os.makedirs(nuget, exist_ok=True)
             # The build gets its OWN writable copy of the platform source: a `dotnet publish` that references
             # platform projects writes their obj/ and bin/ into that tree, and the image's copy is read-only.
-            # A miss is rare (once per key on main), so the copy is paid once per prepared build.
-            psrc = os.path.join(workdir, "prepared-platform", name)
+            # A miss is rare (once per platform and key), so the copy is paid once per prepared build.
+            psrc = os.path.join(workdir, "prepared-platform", label, name)
             shutil.rmtree(psrc, ignore_errors=True)
             shutil.copytree(platform_src, psrc, symlinks=True)
             left = run_end - self.clock()
             if left <= 0:
                 raise Refusal(f"{name}: the run deadline passed before it was built")
             started = self.clock()
-            rc, text = sandboxed(p["build"], out, {**base_extra, "MW_PREPARE_OUT": out, "MW_PLATFORM_SOURCE": psrc,
-                                                   "NUGET_PACKAGES": nuget},
+            rc, text = sandboxed(p["build"], tree, out, {**base_extra, "MW_PREPARE_OUT": out, "MW_PLATFORM_SOURCE": psrc,
+                                                         "NUGET_PACKAGES": nuget},
                                  [mirror, os.path.join(self.cache, "nuget")], [nuget, psrc],
                                  min(left, p["timeoutMinutes"] * 60))
             shutil.rmtree(psrc, ignore_errors=True)
@@ -2771,36 +2812,78 @@ class Host:
             except OSError as e:
                 raise Refusal(f"{name}: its output cannot be read ({e})")
             if rc != 0 or not wrote:
-                raise Refusal(f"{name}: building it failed (exit {rc}{', it wrote nothing' if rc == 0 else ''}): {text.strip()[-600:]}")
+                where = "from the default branch " if label == "default" else ""
+                raise Refusal(f"{name}: building it {where}failed (exit {rc}{', it wrote nothing' if rc == 0 else ''}): {text.strip()[-600:]}")
             # Host-side marker writes never follow what the build left: the build controls `out`, so a
             # `.source-key` (or, in the copy, a `.complete`) it planted as a symlink would redirect the write.
             try:
                 write_marker(out, ".source-key", key)
             except OSError as e:
                 raise Refusal(f"{name}: its output cannot be marked ({e})")
-            secs = int(self.clock() - started)
+            return out, int(self.clock() - started)
+
+        def install(name: str, out: str, store: str, key: str) -> None:
+            """Atomic and keyed: the copy is completed beside the store and renamed into place; when a concurrent
+            installer of the same (platform, key) won the rename, this copy is dropped and theirs is read."""
+            os.makedirs(os.path.dirname(store), exist_ok=True)
+            tmp = tempfile.mkdtemp(prefix=".prep-", dir=os.path.dirname(store))
+            try:
+                shutil.copytree(out, os.path.join(tmp, "p"), symlinks=True)
+                write_marker(os.path.join(tmp, "p"), ".complete", key)
+                os.rename(os.path.join(tmp, "p"), store)
+            except (OSError, shutil.Error):
+                if not os.path.isfile(os.path.join(store, ".complete")):
+                    raise Refusal(f"{name}: built, but could not be installed at {store}")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        base: Optional[tuple[str, str, dict]] = None       # (tip, tree, the tip's declared inputs by name), made once
+        for p in inputs:
+            name = p["name"]
+            key = source_key(p, checkout, "run")
+            store = prepared_store(self.cache, repo, name, self.platform_version, key)
+            if os.path.isfile(os.path.join(store, ".complete")):
+                env_add[p["env"]] = store
+                ro.append(store)
+                sink.add([{"kind": "line", "text": f"prepared {name}: installed on this server (key {key[:12]}) — nothing prepared for this run"}])
+                continue
             if trunk:
-                os.makedirs(os.path.dirname(store), exist_ok=True)
-                tmp = tempfile.mkdtemp(prefix=".prep-", dir=os.path.dirname(store))
-                try:
-                    shutil.copytree(out, os.path.join(tmp, "p"), symlinks=True)
-                    write_marker(os.path.join(tmp, "p"), ".complete", key)
-                    os.rename(os.path.join(tmp, "p"), store)
-                except (OSError, shutil.Error):
-                    if not os.path.isfile(os.path.join(store, ".complete")):
-                        raise Refusal(f"{name}: built, but could not be installed at {store}")
-                finally:
-                    shutil.rmtree(tmp, ignore_errors=True)
+                out, secs = build(p, checkout, "run", key)
+                install(name, out, store, key)
                 env_add[p["env"]] = store
                 ro.append(store)
                 sink.add([{"kind": "line", "text": f"prepared {name}: main moved its sources — built once ({secs} s) and "
                                                    f"installed on this server (key {key[:12]}); later runs prepare nothing"}])
-            else:
-                env_add[p["env"]] = out
-                ro.append(out)
-                sink.add([{"kind": "diagnostic", "severity": "warning", "code": "MWPREP002",
-                           "message": f"prepared input {name} built PER RUN ({secs} s): this change's sources (key {key[:12]}) "
-                                      "differ from every copy installed on the server; a trunk run installs it"}])
+                continue
+            # Not a trunk run and not installed: the server is prepared from the DEFAULT BRANCH's tip — its tree, its
+            # key command, its build command — never from this run's content.
+            if base is None:
+                tip, tree = self.default_branch_tree(repo, workdir)
+                try:
+                    declared_there = {q["name"]: q for q in load_prepared(os.path.join(tree, ".github", "build-stages.json"))}
+                except Refusal as r:
+                    sink.add([{"kind": "line", "text": f"prepared inputs: the default branch's tip {tip[:12]} declares none usable ({r})"[:MAX_LINE]}])
+                    declared_there = {}
+                base = (tip, tree, declared_there)
+            tip, tree, declared_there = base
+            bp = declared_there.get(name)
+            bkey = source_key(bp, tree, "default") if bp else None
+            if bkey == key:
+                out, secs = build(bp, tree, "default", bkey)
+                install(name, out, store, bkey)
+                env_add[p["env"]] = store
+                ro.append(store)
+                sink.add([{"kind": "line", "text": f"prepared {name}: not installed for platform {self.platform_version} — built once "
+                                                   f"({secs} s) from the default branch's tip {tip[:12]} (key {key[:12]}) and installed "
+                                                   "on this server; later runs prepare nothing"}])
+                continue
+            out, secs = build(p, checkout, "run", key)
+            env_add[p["env"]] = out
+            ro.append(out)
+            theirs = f"key {bkey[:12]}" if bkey else "which does not declare it"
+            sink.add([{"kind": "diagnostic", "severity": "warning", "code": "MWPREP002",
+                       "message": f"prepared input {name} built PER RUN ({secs} s): this change's sources (key {key[:12]}) "
+                                  f"differ from the default branch's tip {tip[:12]} ({theirs}); never installed"}])
         self.deliver(sink)
         return env_add, ro
 
@@ -4306,6 +4389,105 @@ def self_test() -> int:
         rf4 = last_verdict()
         check("prepared-inputs/a failed build is RED and installs nothing", rf4 and rf4[0]["succeeded"] is False
               and not os.path.exists(prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], "3" * 64)), rf4)
+        # ── the server is prepared WITHOUT a trunk run: the default branch's tip is built by the host, once ──
+        # Trunk runs need not reach the host at all, so a missing (platform, key) is installed by the FIRST run that needs
+        # it — from the default branch's tip (its tree, its key and build commands), never from the run's own content.
+        def default_doc(key_, declare=True):
+            d_ = prep_doc(key_)
+            if not declare:
+                return {"stages": d_["stages"]}
+            # the default branch's build writes the TREE it ran in, so what was installed names where it was built
+            return dict(d_, prepared=[dict(d_["prepared"][0], build=f"echo built >> {builds}; cp tree \"$MW_PREPARE_OUT/Shelf.dll\"")])
+
+        def git_with_default(doc_, tip_="d" * 40, resolves=True):
+            def g(args, env_):
+                if "rev-parse" in args:
+                    return (0, tip_ + "\n") if resolves else (128, "fatal: no HEAD")
+                if args[0] == "clone" and "--shared" in args:
+                    dest_ = args[-1]
+                    os.makedirs(os.path.join(dest_, ".github"))
+                    with open(os.path.join(dest_, ".github", "build-stages.json"), "w") as fh:
+                        json.dump(doc_, fh)
+                    with open(os.path.join(dest_, "tree"), "w") as fh:
+                        fh.write("default-branch")
+                return 0, ""
+            return g
+
+        def shelf_of(store_):
+            return open(os.path.join(store_, "Shelf.dll")).read().strip() if os.path.isfile(os.path.join(store_, "Shelf.dll")) else None
+        k5, k6, k7 = "5" * 64, "6" * 64, "7" * 64
+        store5 = prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], k5)
+        before_ = n_builds()
+        posted.clear()
+        host(api_ev(), env=penv, git_runner=git_with_default(default_doc(k5)), checkout=checkout_with(prep_doc(k5))).run(claim)
+        lines_ = [e.get("text", "") for _, evs in posted for e in evs if e["kind"] == "line"]
+        check("prepared-inputs/missing for this platform, NO trunk run: the first PR run prepares it ONCE and installs it",
+              n_builds() == before_ + 1 and os.path.isfile(os.path.join(store5, ".complete"))
+              and open(seen_in).read().split() == [k5, store5]
+              and any("default branch's tip dddddddddddd" in t_ for t_ in lines_), (n_builds() - before_, lines_))
+        check("prepared-inputs/what is installed was built from the DEFAULT BRANCH's tree with ITS command, never the PR's",
+              shelf_of(store5) == "default-branch", shelf_of(store5))
+        check("prepared-inputs/the run is green on the copy it installed", last_verdict() == [{"kind": "run-finished", "succeeded": True, "error": None}], last_verdict())
+        check("prepared-inputs/a PR run that installs from the default branch says no MWPREP002",
+              not [e for _, evs in posted for e in evs if e.get("code") == "MWPREP002"])
+        posted.clear()
+        host(api_ev(), env=penv, git_runner=git_with_default(default_doc(k5)), checkout=checkout_with(prep_doc(k5))).run(claim)
+        check("prepared-inputs/the second run reads it — no rebuild", n_builds() == before_ + 1
+              and open(seen_in).read().split() == [k5, store5], n_builds() - before_)
+        # negative control: a PR that CHANGED the sources (its key differs from the tip's) builds per run, said, and
+        # writes NEITHER key's shared copy — at most one build per run, and never one of the PR's bytes installed
+        posted.clear()
+        host(api_ev(), env=penv, git_runner=git_with_default(default_doc(k7)), checkout=checkout_with(prep_doc(k6))).run(claim)
+        warn6 = [e for _, evs in posted for e in evs if e.get("code") == "MWPREP002"]
+        check("prepared-inputs/negative control: a PR changing the sources builds PER RUN, said, naming the tip's key",
+              n_builds() == before_ + 2 and len(warn6) == 1 and k7[:12] in warn6[0]["message"]
+              and open(seen_in).read().split()[0] == k6, (n_builds() - before_, warn6))
+        check("prepared-inputs/negative control: ... and writes NO shared copy, neither its own key nor the tip's",
+              not os.path.exists(prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], k6))
+              and not os.path.exists(prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], k7)))
+        # negative control: a PR whose key command LIES (answers the tip's key over changed sources) never installs
+        # its own bytes — what it reads is the default branch's build
+        k8 = "8" * 64
+        store8 = prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], k8)
+        lying_ = dict(prep_doc(k8), prepared=[dict(prep_doc(k8)["prepared"][0], build=f"echo built >> {builds}; echo forged > \"$MW_PREPARE_OUT/Shelf.dll\"")])
+        posted.clear()
+        host(api_ev(), env=penv, git_runner=git_with_default(default_doc(k8)), checkout=checkout_with(lying_)).run(claim)
+        check("prepared-inputs/negative control: a PR that lies about its key never installs its own bytes",
+              shelf_of(store8) == "default-branch", shelf_of(store8))
+        # a tip that does not declare the input: per run, said — nothing installed
+        k9 = "9" * 64
+        posted.clear()
+        host(api_ev(), env=penv, git_runner=git_with_default(default_doc(k9, declare=False)), checkout=checkout_with(prep_doc(k9))).run(claim)
+        check("prepared-inputs/a tip that does not declare the input: the PR builds per run, nothing installed",
+              [e for _, evs in posted for e in evs if e.get("code") == "MWPREP002"]
+              and not os.path.exists(prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], k9)))
+        # TWO inputs, the PR's FIRST built per run: its command writes a package into the folder it is handed. The
+        # default branch's build of the SECOND input must not see it — what it installs serves every later run.
+        kp, kq = "b" * 64, "c" * 64
+        storeq = prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], kq)
+        planted_, read_ = os.path.join(tmp, "prep-planted"), os.path.join(tmp, "prep-default-nuget")
+        evil_ = {"name": "evil", "env": "MW_BUILD_EXTENSIONS", "key": f"echo {kp}",
+                 "build": f"mkdir -p \"$NUGET_PACKAGES/poison\"; echo \"$NUGET_PACKAGES\" > {planted_}; "
+                          "echo x > \"$MW_PREPARE_OUT/E.dll\""}
+        two_pr_ = dict(prep_doc(kq), prepared=[evil_, prep_doc(kq)["prepared"][0]])
+        tip_doc_ = dict(default_doc(kq), prepared=[dict(default_doc(kq)["prepared"][0],
+                        build=f"echo \"$NUGET_PACKAGES\" > {read_}; cp tree \"$MW_PREPARE_OUT/Shelf.dll\"; "
+                              "if [ -e \"$NUGET_PACKAGES/poison\" ]; then echo poisoned >> \"$MW_PREPARE_OUT/Shelf.dll\"; fi")])
+        posted.clear()
+        host(api_ev(), env=penv, git_runner=git_with_default(tip_doc_), checkout=checkout_with(two_pr_)).run(claim)
+        planted_at = open(planted_).read().strip() if os.path.exists(planted_) else None
+        read_at = open(read_).read().strip() if os.path.exists(read_) else None
+        check("prepared-inputs/negative control: the PR's per-run build DID plant a package (the case has a subject)",
+              planted_at is not None and read_at is not None, (planted_at, read_at, last_verdict()))
+        check("prepared-inputs/a default-branch build never reads a package folder a PR command wrote, and installs clean",
+              planted_at != read_at and shelf_of(storeq) == "default-branch", (planted_at, read_at, shelf_of(storeq)))
+        # the default branch cannot be resolved: RED, naming it — never a silent per-run build that installs nothing
+        posted.clear()
+        host(api_ev(), env=penv, git_runner=git_with_default(default_doc(k9), resolves=False),
+             checkout=checkout_with(dict(prep_doc("a" * 64)))).run(dict(claim, mergeBaseSha="e" * 40))
+        rfd = last_verdict()
+        check("prepared-inputs/an unresolvable default branch is RED, naming it",
+              rfd and rfd[0]["succeeded"] is False and "default branch" in (rfd[0]["error"] or ""), rfd)
         # the key covers sources, reference set, options and compiler
         kd = os.path.join(tmp, "keydir")
         os.makedirs(kd)
@@ -4753,8 +4935,14 @@ def self_test() -> int:
               run_budget_seconds([{"timeoutMinutes": 40}, {"timeoutMinutes": 45}], DEFAULT_RUN_DEADLINE) == 85 * 60 + RUN_MARGIN_SECONDS)
         check("budget/a declared prepared input's build cap and key allowance are inside the budget",
               run_budget_seconds([{"timeoutMinutes": 1}], DEFAULT_RUN_DEADLINE, [{"timeoutMinutes": 20}])
-              == 60 + RUN_MARGIN_SECONDS + 20 * 60 + PREPARED_KEY_SECONDS)
+              == 60 + RUN_MARGIN_SECONDS + 20 * 60 + 2 * PREPARED_KEY_SECONDS)
         check("budget/capped by the deadline", run_budget_seconds([{"timeoutMinutes": 45}] * 4, 2100) == 2100)
+        check("budget/a NON-trunk run reserves the largest prepared cap: the default branch's declaration may be the one built",
+              run_budget_seconds([{"timeoutMinutes": 1}], DEFAULT_RUN_DEADLINE, [{"timeoutMinutes": 1}], trunk=False)
+              == 60 + RUN_MARGIN_SECONDS + DEFAULT_STAGE_TIMEOUT_MINUTES * 60 + 2 * PREPARED_KEY_SECONDS)
+        check("budget/negative control: a trunk run builds its OWN declaration and reserves its own cap",
+              run_budget_seconds([{"timeoutMinutes": 1}], DEFAULT_RUN_DEADLINE, [{"timeoutMinutes": 1}], trunk=True)
+              == 60 + RUN_MARGIN_SECONDS + 60 + 2 * PREPARED_KEY_SECONDS)
         check("budget/2100 s declares 35 minutes", budget_minutes(2100) == 35)
         check("budget/minutes round up and stay in 10..720",
               budget_minutes(61) == 10 and budget_minutes(661) == 12 and budget_minutes(10 ** 6) == 720)
