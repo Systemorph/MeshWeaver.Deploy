@@ -926,12 +926,15 @@ RUN_MARGIN_SECONDS = 600
 PREPARED_KEY_SECONDS = 300
 
 
-def run_budget_seconds(stages: list[dict], deadline: float, prepared: Sequence[dict] = ()) -> int:
+def run_budget_seconds(stages: list[dict], deadline: float, prepared: Sequence[dict] = (), trunk: bool = True) -> int:
     """The run's effective budget: the selected stages' summed caps + each declared prepared input's build cap
     and TWO key-command allowances (a miss keys the run's tree and the default branch's tip, then builds ONE of
-    them inside the run) + a margin, never past the deadline."""
+    them inside the run) + a margin, never past the deadline. On a NON-trunk run the build a miss runs may be the
+    DEFAULT BRANCH's declaration, whose cap this run cannot know before it keys the tip — so it reserves the largest
+    cap any declaration may carry, never this run's own (a 1-minute PR cap must not cut a valid 45-minute tip build)."""
     total = sum(float(st.get("timeoutMinutes", DEFAULT_STAGE_TIMEOUT_MINUTES)) * 60 for st in stages) + RUN_MARGIN_SECONDS
-    total += sum(float(p.get("timeoutMinutes", 20)) * 60 + 2 * PREPARED_KEY_SECONDS for p in prepared)
+    total += sum((float(p.get("timeoutMinutes", 20)) if trunk else float(DEFAULT_STAGE_TIMEOUT_MINUTES)) * 60
+                 + 2 * PREPARED_KEY_SECONDS for p in prepared)
     return int(min(deadline, total))
 
 
@@ -2378,7 +2381,7 @@ class Host:
             plan = self._sink_for(repo, sha, stages[0]["name"])
             # The run's declared execution budget: the instance sets the attempt's deadline to claim
             # time + budget + 15 min. The host enforces the same number (`budget`, below).
-            budget = run_budget_seconds(stages, self.run_deadline - (self.clock() - started), prepared_inputs)
+            budget = run_budget_seconds(stages, self.run_deadline - (self.clock() - started), prepared_inputs, trunk)
             plan_event = {"kind": "plan", "stages": [st["name"] for st in stages], "budgetMinutes": budget_minutes(budget)}
             if merge_base:
                 plan_event["mergeBase"] = merge_base
@@ -2623,7 +2626,9 @@ class Host:
     def prepare_inputs(self, repo: str, checkout: str, workdir: str, trunk: bool, inputs: list[dict],
                        sink: "EventSink", run_end: float) -> tuple[dict, list[str]]:
         """Provide every PREPARED input the repository declares (see PREPARED_ENV): the installed copy for this
-        run's source key, or — once per (platform, key) — a build of it, installed for every later run.
+        run's source key, or — once per (platform, key) — a build of it, installed for every later run. "Once" is
+        the INSTALL: two runs that miss the same key concurrently may each build it; the first rename wins and the
+        other's copy is dropped (`install`), so the cost of a race is a duplicate build, never a mixed copy.
         Returns (the stage environment additions, the read-only binds). Raises Refusal, naming the input.
 
         What is INSTALLED is only ever built from DEFAULT-BRANCH content, with the default branch's own key and build
@@ -2685,12 +2690,15 @@ class Host:
             out = os.path.join(workdir, "prepared", label, name)
             shutil.rmtree(out, ignore_errors=True)
             os.makedirs(out)
-            nuget = os.path.join(workdir, "nuget")
+            # Everything a build may WRITE is per LABEL: a run-content ("run") build of one input must never leave
+            # bytes a later default-branch ("default") build of another input reads — a shared package folder would
+            # let a pull request's command plant packages into what the default branch's build installs for every run.
+            nuget = os.path.join(workdir, "prepared-nuget", label)
             os.makedirs(nuget, exist_ok=True)
             # The build gets its OWN writable copy of the platform source: a `dotnet publish` that references
             # platform projects writes their obj/ and bin/ into that tree, and the image's copy is read-only.
             # A miss is rare (once per platform and key), so the copy is paid once per prepared build.
-            psrc = os.path.join(workdir, "prepared-platform", name)
+            psrc = os.path.join(workdir, "prepared-platform", label, name)
             shutil.rmtree(psrc, ignore_errors=True)
             shutil.copytree(platform_src, psrc, symlinks=True)
             left = run_end - self.clock()
@@ -4276,6 +4284,26 @@ def self_test() -> int:
         check("prepared-inputs/a tip that does not declare the input: the PR builds per run, nothing installed",
               [e for _, evs in posted for e in evs if e.get("code") == "MWPREP002"]
               and not os.path.exists(prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], k9)))
+        # TWO inputs, the PR's FIRST built per run: its command writes a package into the folder it is handed. The
+        # default branch's build of the SECOND input must not see it — what it installs serves every later run.
+        kp, kq = "b" * 64, "c" * 64
+        storeq = prepared_store(cache, "MeshWeaver.Plugins", "shelf", keyed_env["MW_BUILD_PLATFORM_VERSION"], kq)
+        planted_, read_ = os.path.join(tmp, "prep-planted"), os.path.join(tmp, "prep-default-nuget")
+        evil_ = {"name": "evil", "env": "MW_BUILD_EXTENSIONS", "key": f"echo {kp}",
+                 "build": f"mkdir -p \"$NUGET_PACKAGES/poison\"; echo \"$NUGET_PACKAGES\" > {planted_}; "
+                          "echo x > \"$MW_PREPARE_OUT/E.dll\""}
+        two_pr_ = dict(prep_doc(kq), prepared=[evil_, prep_doc(kq)["prepared"][0]])
+        tip_doc_ = dict(default_doc(kq), prepared=[dict(default_doc(kq)["prepared"][0],
+                        build=f"echo \"$NUGET_PACKAGES\" > {read_}; cp tree \"$MW_PREPARE_OUT/Shelf.dll\"; "
+                              "if [ -e \"$NUGET_PACKAGES/poison\" ]; then echo poisoned >> \"$MW_PREPARE_OUT/Shelf.dll\"; fi")])
+        posted.clear()
+        host(api_ev(), env=penv, git_runner=git_with_default(tip_doc_), checkout=checkout_with(two_pr_)).run(claim)
+        planted_at = open(planted_).read().strip() if os.path.exists(planted_) else None
+        read_at = open(read_).read().strip() if os.path.exists(read_) else None
+        check("prepared-inputs/negative control: the PR's per-run build DID plant a package (the case has a subject)",
+              planted_at is not None and read_at is not None, (planted_at, read_at, last_verdict()))
+        check("prepared-inputs/a default-branch build never reads a package folder a PR command wrote, and installs clean",
+              planted_at != read_at and shelf_of(storeq) == "default-branch", (planted_at, read_at, shelf_of(storeq)))
         # the default branch cannot be resolved: RED, naming it — never a silent per-run build that installs nothing
         posted.clear()
         host(api_ev(), env=penv, git_runner=git_with_default(default_doc(k9), resolves=False),
@@ -4668,6 +4696,12 @@ def self_test() -> int:
               run_budget_seconds([{"timeoutMinutes": 1}], DEFAULT_RUN_DEADLINE, [{"timeoutMinutes": 20}])
               == 60 + RUN_MARGIN_SECONDS + 20 * 60 + 2 * PREPARED_KEY_SECONDS)
         check("budget/capped by the deadline", run_budget_seconds([{"timeoutMinutes": 45}] * 4, 2100) == 2100)
+        check("budget/a NON-trunk run reserves the largest prepared cap: the default branch's declaration may be the one built",
+              run_budget_seconds([{"timeoutMinutes": 1}], DEFAULT_RUN_DEADLINE, [{"timeoutMinutes": 1}], trunk=False)
+              == 60 + RUN_MARGIN_SECONDS + DEFAULT_STAGE_TIMEOUT_MINUTES * 60 + 2 * PREPARED_KEY_SECONDS)
+        check("budget/negative control: a trunk run builds its OWN declaration and reserves its own cap",
+              run_budget_seconds([{"timeoutMinutes": 1}], DEFAULT_RUN_DEADLINE, [{"timeoutMinutes": 1}], trunk=True)
+              == 60 + RUN_MARGIN_SECONDS + 60 + 2 * PREPARED_KEY_SECONDS)
         check("budget/2100 s declares 35 minutes", budget_minutes(2100) == 35)
         check("budget/minutes round up and stay in 10..720",
               budget_minutes(61) == 10 and budget_minutes(661) == 12 and budget_minutes(10 ** 6) == 720)
