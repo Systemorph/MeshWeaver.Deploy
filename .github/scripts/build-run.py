@@ -2761,7 +2761,15 @@ class Host:
         """What the warm NuGet cache needs for this repository's DEFAULT BRANCH tip, read from the host's mirror only (the
         run's own tree is never consulted): `state` is `warm` (the tip declares a restore whose key the cache does not
         hold yet — `tip`, `key`, `command`, `timeoutMinutes`, `marker`), `held` (it does) or `none` (nothing to do), with
-        `text` saying which. Never raises: a mirror that cannot answer is said and the run proceeds unwarmed."""
+        `text` saying which. Never raises: a mirror that cannot answer — a nonzero exit, a git that times out, an I/O error —
+        is said and the run proceeds unwarmed (the cache is optional; a run's verdict never hangs on it)."""
+        try:
+            return self._nuget_warm_plan(repo, workdir)
+        except (subprocess.SubprocessError, OSError, ValueError) as e:
+            return {"state": "none", "text": f"warm NuGet cache: the mirror could not be read ({type(e).__name__}: {str(e)[:160]}) "
+                                             "— not warmed this run"}
+
+    def _nuget_warm_plan(self, repo: str, workdir: str) -> dict:
         mirror = os.path.join(self.cache, "git", f"{repo}.git")
         genv = {**{k: self.env[k] for k in ("PATH", "LANG") if self.env.get(k)}, "HOME": workdir, "GIT_TERMINAL_PROMPT": "0"}
         rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", "HEAD^{commit}"], genv)
@@ -2800,9 +2808,11 @@ class Host:
         def warn(msg: str) -> None:
             sink.add([{"kind": "diagnostic", "severity": "warning", "code": "MWPREP003", "message": msg[:MAX_LINE]}])
             self.deliver(sink)
+        # Every host-side failure at this boundary (a git that times out, an I/O error) is SAID and the run goes on:
+        # warming is optional, so it must never end the worker without a run verdict.
         try:
             tip, tree = self.default_branch_tree(repo, workdir)
-        except Refusal as r:
+        except (Refusal, subprocess.SubprocessError, OSError, ValueError) as r:
             warn(f"the warm NuGet cache was not filled: {r}")
             return
         if tip != plan["tip"]:
@@ -2814,20 +2824,25 @@ class Host:
             return
         # A FRESH folder, written only by this restore: nothing a stage or a per-run prepared build restored can reach it.
         fetched = os.path.join(workdir, "warm-nuget")
-        shutil.rmtree(fetched, ignore_errors=True)
-        os.makedirs(fetched)
-        out = os.path.join(workdir, "warm-out")
-        os.makedirs(out, exist_ok=True)
-        started = self.clock()
-        rc, text = self._sandboxed_capture(plan["command"], tree, out, workdir,
-                                           {"MW_BUILD_PLATFORM_VERSION": self.platform_version, "MW_BUILD_REPO": repo,
-                                            "NUGET_PACKAGES": fetched},
-                                           [os.path.join(self.cache, "git", f"{repo}.git"), os.path.join(self.cache, "nuget")],
-                                           [fetched], min(left, plan["timeoutMinutes"] * 60))
-        # Every package fetched came from the TIP's own sources by the TIP's own command, so even a failed restore's
-        # complete packages may be promoted; each is verified against what NuGet recorded and rebuilt from its archive.
-        np_, nk, nr = promote_nuget(fetched, self.cache, self.log)
-        shutil.rmtree(fetched, ignore_errors=True)
+        try:
+            shutil.rmtree(fetched, ignore_errors=True)
+            os.makedirs(fetched)
+            out = os.path.join(workdir, "warm-out")
+            os.makedirs(out, exist_ok=True)
+            started = self.clock()
+            rc, text = self._sandboxed_capture(plan["command"], tree, out, workdir,
+                                               {"MW_BUILD_PLATFORM_VERSION": self.platform_version, "MW_BUILD_REPO": repo,
+                                                "NUGET_PACKAGES": fetched},
+                                               [os.path.join(self.cache, "git", f"{repo}.git"), os.path.join(self.cache, "nuget")],
+                                               [fetched], min(left, plan["timeoutMinutes"] * 60))
+            # Every package fetched came from the TIP's own sources by the TIP's own command, so even a failed restore's
+            # complete packages may be promoted; each is verified against what NuGet recorded and rebuilt from its archive.
+            np_, nk, nr = promote_nuget(fetched, self.cache, self.log)
+        except (subprocess.SubprocessError, OSError) as e:
+            warn(f"the warm NuGet cache was not filled: a host-side failure while warming ({type(e).__name__}: {str(e)[:200]})")
+            return
+        finally:
+            shutil.rmtree(fetched, ignore_errors=True)
         secs = int(self.clock() - started)
         if rc != 0 or nr:
             warn(f"the warm NuGet cache was not filled from the default branch's tip {tip[:12]} (restore exit {rc}"
@@ -4587,6 +4602,28 @@ def self_test() -> int:
         check("warm/negative control: with the tip declaring a restore, what is installed is the TIP's closure, never the PR's",
               nuget_packages(os.path.join(neg_cache, "nuget")) == {"demo.pkg/1.0.0"} and not os.path.exists(pr_ran),
               nuget_packages(os.path.join(neg_cache, "nuget")))
+        # A host-side failure while warming (a git that times out, an I/O error) is SAID and the run still gets its verdict.
+        def raising_git(stage_, exc_):
+            inner_ = tip_git(tip_restore)
+
+            def g(args, env_):
+                if stage_ in args:
+                    raise exc_
+                return inner_(args, env_)
+            return g
+        for name_, git_ in (("planning", raising_git("show", subprocess.TimeoutExpired(["git", "show"], 900))),
+                            ("checkout", raising_git("--shared", subprocess.TimeoutExpired(["git", "clone"], 900))),
+                            ("checkout-io", raising_git("--detach", OSError(5, "Input/output error")))):
+            posted.clear()
+            raise_cache_ = os.path.join(tmp, f"warm-raise-{name_}")
+            outcome_ = host(api_ev(), env=dict(wenv, MW_BUILD_CACHE=raise_cache_), git_runner=git_,
+                            checkout=checkout_with(pr_doc)).run(claim)
+            said_ = codes("MWPREP003") if name_ != "planning" else \
+                [e for _, evs in posted for e in evs if "could not be read" in e.get("text", "")]
+            check(f"warm/a host-side failure in warm {name_} never ends the worker without a verdict: said, and the run is green",
+                  outcome_ == "ran" and run_verdict() == [{"kind": "run-finished", "succeeded": True, "error": None}]
+                  and len(said_) == 1 and not os.path.exists(os.path.join(raise_cache_, "nuget-warm")),
+                  (outcome_, run_verdict(), said_))
         wlog: list = []
         posted.clear()
         host(api_ev(), env=dict(wenv, MW_BUILD_CACHE=os.path.join(tmp, "warm-src")), git_runner=tip_git(tip_restore, log_=wlog),
