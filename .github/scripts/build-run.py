@@ -145,7 +145,8 @@ Environment (rendered by the chart from `buildHosts.*`):
   MW_BUILD_IDLE_SECONDS        sleep after a 204                           default 15
   MW_BUILD_RUN_DEADLINE_SECONDS  the whole run's deadline (= the pod's grace) default 3600
   MW_BUILD_STAGE_SLOTS         how many of a `parallel` run's stages run at once  default 1 (serial); the host
-                               refuses to START when its cgroup cannot give each slot 1 CPU and 2 GiB
+                               refuses to START when its cgroup cannot give each slot 1 CPU and 2 GiB, or
+                               when neither the cgroup v2 nor the v1 limits can be read (more than 1 slot)
   BWRAP                        the bubblewrap binary                       default bwrap
   MW_PLUGINS_REGISTRY          registry host the plugins publication is pulled from
   MW_PLUGINS_SOURCE            the publication's source name               default plugins
@@ -1071,35 +1072,61 @@ def planned_seconds(stages: Sequence[dict], slots: int) -> float:
     return cap_schedule(stages, slots)[0]
 
 
-def cgroup_capacity(root: str = "/sys/fs/cgroup") -> tuple[float, Optional[int]]:
-    """(CPUs, memory bytes or None) this process may use: the cgroup v2 `cpu.max` quota and `memory.max`, else the
-    machine's CPU count and no memory bound."""
-    cpus = float(os.cpu_count() or 1)
-    mem: Optional[int] = None
-    try:
-        with open(os.path.join(root, "cpu.max")) as fh:
-            quota, period = (fh.read().split() + ["100000"])[:2]
-        if quota != "max" and float(period) > 0:
-            cpus = min(cpus, float(quota) / float(period))
-    except (OSError, ValueError):
-        pass
-    try:
-        with open(os.path.join(root, "memory.max")) as fh:
-            raw = fh.read().strip()
-        mem = None if raw == "max" else int(raw)
-    except (OSError, ValueError):
-        mem = None
-    return cpus, mem
+# A cgroup v1 limit at or past this is the kernel's "no limit" (page-rounded LONG_MAX), never a real bound.
+CGROUP_V1_UNLIMITED = 1 << 60
 
 
-def stage_slots_refusal(slots_text: str, capacity: tuple[float, Optional[int]]) -> Optional[str]:
-    """Why MW_BUILD_STAGE_SLOTS cannot be run on this host's cgroup, or None."""
+def _read_cgroup_file(path: str) -> Optional[str]:
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def cgroup_capacity(root: str = "/sys/fs/cgroup") -> "tuple[float, Optional[int]] | str":
+    """(CPUs, memory bytes or None = no limit) this process may use, read from the cgroup v2 `cpu.max`/`memory.max` or
+    the cgroup v1 `cpu.cfs_quota_us`/`cpu.cfs_period_us`/`memory.limit_in_bytes` — or, when neither layout yields both
+    limits, a string naming what could not be read. An unmeasured cgroup is never taken for an unrestricted one."""
+    machine = float(os.cpu_count() or 1)
+    try:
+        if os.path.exists(os.path.join(root, "cgroup.controllers")):
+            cpu_raw = _read_cgroup_file(os.path.join(root, "cpu.max"))
+            mem_raw = _read_cgroup_file(os.path.join(root, "memory.max"))
+            if cpu_raw is None or mem_raw is None:
+                return (f"the cgroup v2 limits under {root} (cpu.max {'unreadable' if cpu_raw is None else 'read'}, "
+                        f"memory.max {'unreadable' if mem_raw is None else 'read'})")
+            quota, period = (cpu_raw.split() + ["100000"])[:2]
+            cpus = machine if quota == "max" else min(machine, float(quota) / float(period))
+            return cpus, (None if mem_raw == "max" else int(mem_raw))
+        quota_raw = _read_cgroup_file(os.path.join(root, "cpu", "cpu.cfs_quota_us"))
+        period_raw = _read_cgroup_file(os.path.join(root, "cpu", "cpu.cfs_period_us"))
+        mem_raw = _read_cgroup_file(os.path.join(root, "memory", "memory.limit_in_bytes"))
+        if quota_raw is None or period_raw is None or mem_raw is None:
+            return (f"the cgroup limits under {root} (neither cgroup v2 cpu.max/memory.max nor cgroup v1 "
+                    f"cpu/cpu.cfs_quota_us, cpu/cpu.cfs_period_us and memory/memory.limit_in_bytes are readable)")
+        quota_us = int(quota_raw)
+        cpus = machine if quota_us < 0 else min(machine, quota_us / float(period_raw))
+        mem = int(mem_raw)
+        return cpus, (None if mem >= CGROUP_V1_UNLIMITED else mem)
+    except (ValueError, ZeroDivisionError) as e:
+        return f"the cgroup limits under {root} (unparseable: {e})"
+
+
+def stage_slots_refusal(slots_text: str, capacity: "tuple[float, Optional[int]] | str") -> Optional[str]:
+    """Why MW_BUILD_STAGE_SLOTS cannot be run on this host's cgroup, or None. `capacity` as a string = the cgroup's
+    limits could not be established, which refuses more than one slot rather than assuming none apply."""
     try:
         slots = int(slots_text)
     except ValueError:
         return f"MW_BUILD_STAGE_SLOTS as a whole number in [1, {MAX_STAGE_SLOTS}] (got {slots_text!r})"
     if not (1 <= slots <= MAX_STAGE_SLOTS):
         return f"MW_BUILD_STAGE_SLOTS within [1, {MAX_STAGE_SLOTS}] (got {slots})"
+    if isinstance(capacity, str):
+        if slots > 1:
+            return (f"MW_BUILD_STAGE_SLOTS {slots} on a host whose capacity cannot be measured — could not read "
+                    f"{capacity}; run one slot (buildHosts.stageSlots: 1) or run on a supported cgroup layout")
+        return None
     cpus, mem = capacity
     if slots > 1 and cpus / slots < MIN_CPU_PER_SLOT:
         return (f"MW_BUILD_STAGE_SLOTS {slots} on {cpus:g} CPU(s) — each concurrent stage needs at least "
@@ -2290,7 +2317,7 @@ class Host:
                  git_runner: Callable[[list[str], dict], tuple[int, str]] = None,
                  sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic,
-                 capacity: Callable[[], tuple[float, Optional[int]]] = None) -> None:
+                 capacity: Callable[[], "tuple[float, Optional[int]] | str"] = None) -> None:
         self.env = env
         self.api = api
         self.log = log or (lambda s: print(f"build-run: {s}", flush=True))
@@ -5526,6 +5553,8 @@ def self_test() -> int:
             check("fanout/the start refusal names the slots", "MW_BUILD_STAGE_SLOTS" in str(e), e)
         cg = os.path.join(tmp, "cgroup")
         os.makedirs(cg)
+        with open(os.path.join(cg, "cgroup.controllers"), "w") as fh:
+            fh.write("cpu memory pids\n")
         with open(os.path.join(cg, "cpu.max"), "w") as fh:
             fh.write("1500000 100000\n")
         with open(os.path.join(cg, "memory.max"), "w") as fh:
@@ -5535,6 +5564,38 @@ def self_test() -> int:
         with open(os.path.join(cg, "memory.max"), "w") as fh:
             fh.write("max\n")
         check("fanout/an unbounded memory.max is no bound", cgroup_capacity(cg)[1] is None, cgroup_capacity(cg))
+        os.remove(os.path.join(cg, "memory.max"))
+        why = stage_slots_refusal("8", cgroup_capacity(cg))
+        check("fanout/a cgroup v2 host without a readable memory.max refuses 8 slots", bool(why) and "memory.max unreadable" in why, why)
+        # cgroup v1: the limits are READ, never taken for the machine's (a 2-CPU, 4 GiB container on any node refuses 8 slots).
+        v1 = os.path.join(tmp, "cgroup-v1")
+        os.makedirs(os.path.join(v1, "cpu"))
+        os.makedirs(os.path.join(v1, "memory"))
+        for rel, val in (("cpu/cpu.cfs_quota_us", "200000"), ("cpu/cpu.cfs_period_us", "100000"),
+                         ("memory/memory.limit_in_bytes", str(4 * gib))):
+            with open(os.path.join(v1, rel), "w") as fh:
+                fh.write(val + "\n")
+        check("fanout/the cgroup v1 quota and memory limit are read", cgroup_capacity(v1) == (min(2.0, float(os.cpu_count() or 1)), 4 * gib),
+              cgroup_capacity(v1))
+        why = stage_slots_refusal("8", cgroup_capacity(v1))
+        check("fanout/a 2-CPU, 4 GiB cgroup v1 host refuses 8 slots", bool(why) and "MW_BUILD_STAGE_SLOTS 8" in why, why)
+        for rel, val in (("cpu/cpu.cfs_quota_us", "-1"), ("memory/memory.limit_in_bytes", "9223372036854771712")):
+            with open(os.path.join(v1, rel), "w") as fh:
+                fh.write(val + "\n")
+        check("fanout/an unlimited cgroup v1 is the machine's CPUs and no memory bound",
+              cgroup_capacity(v1) == (float(os.cpu_count() or 1), None), cgroup_capacity(v1))
+        # Neither layout readable: unmeasured, never unrestricted — more than one slot is refused, one slot still runs.
+        empty = os.path.join(tmp, "cgroup-none")
+        os.makedirs(empty)
+        why = stage_slots_refusal("8", cgroup_capacity(empty))
+        check("fanout/a host whose cgroup limits cannot be read refuses 8 slots", bool(why) and "cannot be measured" in why, why)
+        check("fanout/a host whose cgroup limits cannot be read still runs one slot", stage_slots_refusal("1", cgroup_capacity(empty)) is None)
+        hs = host(_FakeApi({}), env=dict(env_s, MW_BUILD_STAGE_SLOTS="8"), capacity=lambda: cgroup_capacity(empty))
+        try:
+            hs.preflight()
+            check("fanout/a host with an unmeasurable cgroup and 8 slots refuses to start", False, "started")
+        except Refusal as ex:
+            check("fanout/the unmeasured start refusal names the slots", "cannot be measured" in str(ex), ex)
         for bad in ({"parallel": "yes", "stages": []}, {"parallel": 1, "stages": []}):
             pf = os.path.join(tmp, "parallel.json")
             with open(pf, "w") as fh:
