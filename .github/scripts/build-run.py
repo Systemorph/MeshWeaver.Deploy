@@ -77,11 +77,18 @@ THE LOOP, and the order that matters:
   * `kind` is `build` or `test`; `timeoutMinutes` defaults to 45.
   * a PREPARED server, never a prepared run: a command that stages, resolves, pulls or restores per
     run (resolve-platform.py, fetch-refs.py, platform-mount, module-fetch, an image pull, dotnet
-    restore, a NuGet/pip/npm/system install) is REFUSED, naming where the step belongs. A NuGet
-    package a build still had to restore (the warm cache lacked it) is SAID as a warning
-    (MWPREP001); on a trunk build it is verified (the .nupkg's SHA-512 against what NuGet recorded)
-    and promoted into `<cache>/nuget`, the stages' read-only fallback folder, so the next run
-    restores nothing.
+    restore, a NuGet/pip/npm/system install) is REFUSED, naming where the step belongs. Every stage
+    is bound `<cache>/nuget` read-only and handed it as its NuGet FALLBACK folder (declared
+    `needs: ["nuget"]` or not — a build's project.assets.json names it, so a test stage that could
+    not see it failed ResolvePackageAssets). The cache is WARMED from the DEFAULT BRANCH, never from
+    a run's content: before a run's stages, the host reads the tip's declared
+    `"restore": {"command": …, "timeoutMinutes": N}` from its mirror (`git show <tip>:…`), keys it
+    (the tip's NuGet-relevant files by blob id + the command + the platform) and, once per key, runs
+    the TIP's command on a host-made checkout of the tip into a fresh folder, verifies every package
+    and promotes it (a failure is said, MWPREP003, and never reds the run). A NuGet package a stage
+    still had to restore (the warm cache lacked it) is SAID as a warning (MWPREP001); on a trunk
+    build it is verified (the .nupkg's SHA-512 against what NuGet recorded) and promoted too. A pull
+    request's own restore — and any package source its tree adds — never writes the shared cache.
   * `prepared` (optional, beside `stages`): inputs built from the repository's OWN sources that are
     not the run's subject (MeshWeaver.Plugins' module-libraries shelf and Razor build extension,
     `MW_BUILD_MODULE_LIBS` / `MW_BUILD_EXTENSIONS`). The host keys each with the repository's own
@@ -529,6 +536,47 @@ def load_prepared(path: str) -> list[dict]:
         raise Refusal(f".github/build-stages.json is unreadable: {e}")
 
 
+# THE WARM NUGET CACHE, prepared from the DEFAULT BRANCH (the same trust boundary as the prepared inputs above). Every
+# stage reads `<cache>/nuget` read-only as its NuGet FALLBACK folder; what it lacks a stage restores per run (MWPREP001)
+# into a folder of its own that is never shared unless the run is a trunk build. Trunk runs need not reach the host at
+# all, so the host fills the cache ITSELF, once per (repository, platform, restore key), from the default branch's tip:
+#   "restore": {"command": "dotnet restore MeshWeaver.slnx -p:CIRun=true", "timeoutMinutes": 20}
+# declared beside the stages and read ONLY from the tip (`git show <tip>:.github/build-stages.json` on the host's
+# mirror) — a run's own declaration is never executed, so neither its command nor a package source its tree adds ever
+# writes the shared cache. The restore runs in the sandbox on a host-made checkout of the tip, writes into a fresh
+# host-owned folder, and every package it fetched is verified and rebuilt into the cache by `promote_nuget`. The key is
+# the host's own: every NuGet-relevant file of the tip (`NUGET_KEY_FILE`, by blob id) + the command + the platform, so
+# a second run on the same tip finds the marker and restores nothing.
+NUGET_KEY_FILE = re.compile(r"(?:^|/)(?:[^/]+\.(?:csproj|fsproj|vbproj|props|targets|sln|slnx)|nuget\.config|global\.json"
+                            r"|packages\.lock\.json)$", re.I)
+
+
+def validate_restore(doc: object) -> Optional[dict]:
+    """The declared default-branch restore, or None when the repository declares none. Raises Refusal on a malformed one."""
+    r = doc.get("restore") if isinstance(doc, dict) else None
+    if r is None:
+        return None
+    if not isinstance(r, dict) or not isinstance(r.get("command"), str) or not r["command"].strip():
+        raise Refusal("`restore` in .github/build-stages.json must be {\"command\": \"…\", \"timeoutMinutes\": N}")
+    tmo = r.get("timeoutMinutes", 20)
+    if not isinstance(tmo, (int, float)) or isinstance(tmo, bool) or not (0 < tmo <= DEFAULT_STAGE_TIMEOUT_MINUTES):
+        raise Refusal(f"`restore` timeoutMinutes {tmo!r} must be in (0, {DEFAULT_STAGE_TIMEOUT_MINUTES}]")
+    return {"command": r["command"], "timeoutMinutes": float(tmo)}
+
+
+def nuget_warm_key(ls_tree: str, command: str, platform: str) -> str:
+    """The restore key of a tree from its `git ls-tree -r` listing: the blob ids of every NuGet-relevant file, the
+    restore command and the platform. A change to none of them restores nothing new."""
+    rows = sorted(line.strip() for line in ls_tree.splitlines()
+                  if "\t" in line and NUGET_KEY_FILE.search(line.split("\t", 1)[1].strip()))
+    return hashlib.sha256("\n".join([platform, command, *rows]).encode()).hexdigest()
+
+
+def nuget_warm_marker(cache: str, repo: str, key: str) -> str:
+    """Where the host records that the default branch's restore closure for `key` is in `<cache>/nuget`."""
+    return os.path.join(cache, "nuget-warm", repo, key[:32])
+
+
 def load_stages(path: str) -> list[dict]:
     try:
         with open(path) as fh:
@@ -542,7 +590,11 @@ def load_stages(path: str) -> list[dict]:
 
 
 # The shared-cache entries a stage may DECLARE it reads (`needs`), each bound read-only into its
-# sandbox: the plugins layer, its repository's own compile outputs, the NuGet package cache.
+# sandbox: the plugins layer, its repository's own compile outputs, the NuGet package cache. `nuget` is
+# bound for EVERY stage whether declared or not (`Host.stage_readonly`): every stage is handed
+# NUGET_FALLBACK_PACKAGES, and a build stage's project.assets.json NAMES that folder, so a later stage
+# that cannot see it fails ResolvePackageAssets ("Unable to find fallback package folder"). `nuget` stays
+# accepted so existing declarations remain valid.
 STAGE_NEEDS = {"plugins", "outputs", "nuget"}
 
 
@@ -990,7 +1042,8 @@ RUN_MARGIN_SECONDS = 600
 PREPARED_KEY_SECONDS = 300
 
 
-def run_budget_seconds(stages: list[dict], deadline: float, prepared: Sequence[dict] = (), trunk: bool = True) -> int:
+def run_budget_seconds(stages: list[dict], deadline: float, prepared: Sequence[dict] = (), trunk: bool = True,
+                       warm_minutes: float = 0.0) -> int:
     """The run's effective budget: the selected stages' summed caps + each declared prepared input's build cap
     and TWO key-command allowances (a miss keys the run's tree and the default branch's tip, then builds ONE of
     them inside the run) + a margin, never past the deadline. On a NON-trunk run the build a miss runs may be the
@@ -999,6 +1052,8 @@ def run_budget_seconds(stages: list[dict], deadline: float, prepared: Sequence[d
     total = sum(float(st.get("timeoutMinutes", DEFAULT_STAGE_TIMEOUT_MINUTES)) * 60 for st in stages) + RUN_MARGIN_SECONDS
     total += sum((float(p.get("timeoutMinutes", 20)) if trunk else float(DEFAULT_STAGE_TIMEOUT_MINUTES)) * 60
                  + 2 * PREPARED_KEY_SECONDS for p in prepared)
+    # the default branch's restore, when the warm NuGet cache does not hold its key yet (`Host.nuget_warm_plan`)
+    total += float(warm_minutes) * 60
     return int(min(deadline, total))
 
 
@@ -2445,7 +2500,9 @@ class Host:
             plan = self._sink_for(repo, sha, stages[0]["name"])
             # The run's declared execution budget: the instance sets the attempt's deadline to claim
             # time + budget + 15 min. The host enforces the same number (`budget`, below).
-            budget = run_budget_seconds(stages, self.run_deadline - (self.clock() - started), prepared_inputs, trunk)
+            warm = self.nuget_warm_plan(repo, workdir)
+            budget = run_budget_seconds(stages, self.run_deadline - (self.clock() - started), prepared_inputs, trunk,
+                                        warm["timeoutMinutes"] if warm["state"] == "warm" else 0.0)
             plan_event = {"kind": "plan", "stages": [st["name"] for st in stages], "budgetMinutes": budget_minutes(budget)}
             if merge_base:
                 plan_event["mergeBase"] = merge_base
@@ -2487,6 +2544,7 @@ class Host:
             # NuGet refuses a fallback folder that does not exist, so a fresh host creates it before any stage runs
             # (else the first trunk build — the one that warms it — could never restore).
             os.makedirs(os.path.join(self.cache, "nuget"), exist_ok=True)
+            self.warm_nuget(repo, workdir, warm, self._sink_for(repo, sha, stages[0]["name"]), run_end)
             if prepared_inputs:
                 psink = self._sink_for(repo, sha, stages[0]["name"])
                 try:
@@ -2699,6 +2757,114 @@ class Host:
                 continue
         return gone
 
+    def nuget_warm_plan(self, repo: str, workdir: str) -> dict:
+        """What the warm NuGet cache needs for this repository's DEFAULT BRANCH tip, read from the host's mirror only (the
+        run's own tree is never consulted): `state` is `warm` (the tip declares a restore whose key the cache does not
+        hold yet — `tip`, `key`, `command`, `timeoutMinutes`, `marker`), `held` (it does) or `none` (nothing to do), with
+        `text` saying which. Never raises: a mirror that cannot answer is said and the run proceeds unwarmed."""
+        mirror = os.path.join(self.cache, "git", f"{repo}.git")
+        genv = {**{k: self.env[k] for k in ("PATH", "LANG") if self.env.get(k)}, "HOME": workdir, "GIT_TERMINAL_PROMPT": "0"}
+        rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", "HEAD^{commit}"], genv)
+        tip = out.strip().splitlines()[-1].strip().lower() if rc == 0 and out.strip() else ""
+        if not SHA.match(tip):
+            return {"state": "none", "text": f"warm NuGet cache: the default branch's tip could not be resolved from the mirror "
+                                             f"(exit {rc}) — not warmed this run"}
+        rc, doc = self.git_runner(["--git-dir", mirror, "show", f"{tip}:.github/build-stages.json"], genv)
+        try:
+            decl = validate_restore(json.loads(doc)) if rc == 0 else None
+        except (ValueError, Refusal) as e:
+            return {"state": "none", "text": f"warm NuGet cache: the default branch's tip {tip[:12]} declares no usable `restore` ({e})"}
+        if decl is None:
+            return {"state": "none", "text": f"warm NuGet cache: the default branch's tip {tip[:12]} declares no `restore` — "
+                                             "the cache is filled only by trunk builds"}
+        rc, listing = self.git_runner(["--git-dir", mirror, "ls-tree", "-r", "--full-tree", tip], genv)
+        if rc != 0:
+            return {"state": "none", "text": f"warm NuGet cache: the default branch's tip {tip[:12]} could not be listed (exit {rc})"}
+        key = nuget_warm_key(listing, decl["command"], self.platform_version)
+        marker = nuget_warm_marker(self.cache, repo, key)
+        if os.path.isfile(marker):
+            return {"state": "held", "text": f"warm NuGet cache: holds the default branch's restore (tip {tip[:12]}, key {key[:12]}) "
+                                             "— nothing restored for the server"}
+        return {"state": "warm", "tip": tip, "key": key, "marker": marker, **decl}
+
+    def warm_nuget(self, repo: str, workdir: str, plan: dict, sink: "EventSink", run_end: float) -> None:
+        """Fill `<cache>/nuget` from the DEFAULT BRANCH's tip per `plan` (`nuget_warm_plan`): the tip's OWN restore
+        command, on a host-made checkout of the tip, writing into a fresh host-owned folder; every package it fetched is
+        verified and rebuilt into the cache (`promote_nuget`), and the key is marked once it restored cleanly. A failure
+        is SAID (MWPREP003) and never reds the run — its stages still restore what they lack, per run."""
+        if plan.get("state") != "warm":
+            sink.add([{"kind": "line", "text": plan.get("text", "")[:MAX_LINE]}])
+            self.deliver(sink)
+            return
+
+        def warn(msg: str) -> None:
+            sink.add([{"kind": "diagnostic", "severity": "warning", "code": "MWPREP003", "message": msg[:MAX_LINE]}])
+            self.deliver(sink)
+        try:
+            tip, tree = self.default_branch_tree(repo, workdir)
+        except Refusal as r:
+            warn(f"the warm NuGet cache was not filled: {r}")
+            return
+        if tip != plan["tip"]:
+            warn(f"the warm NuGet cache was not filled: the default branch moved ({plan['tip'][:12]} → {tip[:12]}) while it was planned")
+            return
+        left = run_end - self.clock()
+        if left <= 0:
+            warn("the warm NuGet cache was not filled: the run deadline passed first")
+            return
+        # A FRESH folder, written only by this restore: nothing a stage or a per-run prepared build restored can reach it.
+        fetched = os.path.join(workdir, "warm-nuget")
+        shutil.rmtree(fetched, ignore_errors=True)
+        os.makedirs(fetched)
+        out = os.path.join(workdir, "warm-out")
+        os.makedirs(out, exist_ok=True)
+        started = self.clock()
+        rc, text = self._sandboxed_capture(plan["command"], tree, out, workdir,
+                                           {"MW_BUILD_PLATFORM_VERSION": self.platform_version, "MW_BUILD_REPO": repo,
+                                            "NUGET_PACKAGES": fetched},
+                                           [os.path.join(self.cache, "git", f"{repo}.git"), os.path.join(self.cache, "nuget")],
+                                           [fetched], min(left, plan["timeoutMinutes"] * 60))
+        # Every package fetched came from the TIP's own sources by the TIP's own command, so even a failed restore's
+        # complete packages may be promoted; each is verified against what NuGet recorded and rebuilt from its archive.
+        np_, nk, nr = promote_nuget(fetched, self.cache, self.log)
+        shutil.rmtree(fetched, ignore_errors=True)
+        secs = int(self.clock() - started)
+        if rc != 0 or nr:
+            warn(f"the warm NuGet cache was not filled from the default branch's tip {tip[:12]} (restore exit {rc}"
+                 + (f", {len(nr)} package(s) failed verification: {nr[:5]}" if nr else "") + f"): {text.strip()[-400:]}")
+            return
+        try:
+            os.makedirs(os.path.dirname(plan["marker"]), exist_ok=True)
+            write_marker(os.path.dirname(plan["marker"]), os.path.basename(plan["marker"]), f"{tip} {plan['key']}")
+        except OSError as e:
+            warn(f"the warm NuGet cache was filled but its key could not be marked ({e})")
+            return
+        sink.add([{"kind": "line", "text": f"warm NuGet cache: filled from the default branch's tip {tip[:12]} (key {plan['key'][:12]}, "
+                                           f"{secs} s): {np_} package(s) promoted, {nk} already present — later runs restore nothing"}])
+        self.deliver(sink)
+
+    def _sandboxed_capture(self, command: str, tree: str, out: str, workdir: str, extra: dict, readonly: list,
+                           writable: list, timeout: float) -> tuple[int, str]:
+        """Run a host-chosen, repository-declared command in the sandbox on `tree`. Its output goes to host-owned FILES
+        (outside the sandbox's writable binds) and only a bounded tail of each is read back, so a noisy command can never
+        exhaust the host's memory and end the worker without a verdict. Returns (exit code, stderr tail + stdout tail)."""
+        argv = self.sandbox.argv(command, tree, out, sandbox_env(self.env, extra, self.cache),
+                                 readonly=readonly, writable=writable)
+        logs = tempfile.mkdtemp(prefix=".prep-log-", dir=workdir)
+        try:
+            with open(os.path.join(logs, "out"), "w+b") as so, open(os.path.join(logs, "err"), "w+b") as se:
+                try:
+                    r = subprocess.run(argv, cwd=tree, env={"PATH": self.env.get("PATH", "/usr/bin:/bin")},
+                                       stdout=so, stderr=se, timeout=max(1.0, timeout), stdin=subprocess.DEVNULL)
+                except subprocess.TimeoutExpired:
+                    return 124, "timed out"
+                except OSError as e:
+                    return 127, str(e)
+                # stdout LAST: a key command's key is its final line
+                return r.returncode, file_tail(se, PREPARED_OUTPUT_TAIL) + file_tail(so, PREPARED_OUTPUT_TAIL)
+        finally:
+            shutil.rmtree(logs, ignore_errors=True)
+
     def default_branch_tree(self, repo: str, workdir: str) -> tuple[str, str]:
         """The repository's DEFAULT BRANCH tip as a host-made tree: the mirror's HEAD (the default branch, fetched just
         before this run's checkout) cloned `--shared` from the LOCAL mirror and checked out detached — no network, no
@@ -2742,25 +2908,7 @@ class Host:
         os.makedirs(os.path.join(self.cache, "nuget"), exist_ok=True)
 
         def sandboxed(command: str, tree: str, out: str, extra: dict, readonly: list, writable: list, timeout: float) -> tuple[int, str]:
-            argv = self.sandbox.argv(command, tree, out, sandbox_env(self.env, extra, self.cache),
-                                     readonly=readonly, writable=writable)
-            # The command is repository-controlled: its output goes to host-owned FILES (outside the sandbox's
-            # writable binds) and only a bounded tail of each is read back, so a noisy key or build command can
-            # never exhaust the host's memory and end the worker without a verdict.
-            logs = tempfile.mkdtemp(prefix=".prep-log-", dir=workdir)
-            try:
-                with open(os.path.join(logs, "out"), "w+b") as so, open(os.path.join(logs, "err"), "w+b") as se:
-                    try:
-                        r = subprocess.run(argv, cwd=tree, env={"PATH": self.env.get("PATH", "/usr/bin:/bin")},
-                                           stdout=so, stderr=se, timeout=max(1.0, timeout), stdin=subprocess.DEVNULL)
-                    except subprocess.TimeoutExpired:
-                        return 124, "timed out"
-                    except OSError as e:
-                        return 127, str(e)
-                    # stdout LAST: the key is its final line
-                    return r.returncode, file_tail(se, PREPARED_OUTPUT_TAIL) + file_tail(so, PREPARED_OUTPUT_TAIL)
-            finally:
-                shutil.rmtree(logs, ignore_errors=True)
+            return self._sandboxed_capture(command, tree, out, workdir, extra, readonly, writable, timeout)
 
         base_extra = {"MW_BUILD_PLATFORM_VERSION": self.platform_version, "MW_BUILD_REPO": repo}
 
@@ -2901,8 +3049,11 @@ class Host:
                     ro.append(os.path.realpath(link))     # a plugin set's links point into /cache/bundles
         if "outputs" in needs:
             ro.append(outputs_root(self.cache, repo))
-        if "nuget" in needs:
-            ro.append(os.path.join(self.cache, "nuget"))
+        # The warm NuGet cache, for EVERY stage: sandbox_env hands each one NUGET_FALLBACK_PACKAGES=<cache>/nuget, and
+        # the build stage's project.assets.json records it as a package folder, so a test stage that restores nothing
+        # still resolves its assets through it. Binding it only for `needs: ["nuget"]` left the folder named but
+        # absent in every other stage — MSB4018 ResolvePackageAssets "Unable to find fallback package folder".
+        ro.append(os.path.join(self.cache, "nuget"))
         return ro
 
     def run_stage(self, st: dict, checkout: str, outputs: str, sink: EventSink, extra: dict,
@@ -3673,7 +3824,11 @@ def self_test() -> int:
                    leftovers=lambda: [], sleep=lambda x: None)
         hs_.plugins_dir = os.path.join(tmp, "sc-cache", "plugin-sets", "k")
         ro = hs_.stage_readonly("MeshWeaver.Plugins", {"needs": []})
-        check("scope/no needs: only the repository's own mirror", ro == [os.path.join(tmp, "sc-cache", "git", "MeshWeaver.Plugins.git")], ro)
+        check("scope/no needs: the repository's own mirror and the warm NuGet cache (every stage is handed it as its "
+              "fallback folder, and a build's project.assets.json names it)",
+              ro == [os.path.join(tmp, "sc-cache", "git", "MeshWeaver.Plugins.git"), os.path.join(tmp, "sc-cache", "nuget")], ro)
+        check("scope/the fallback folder every stage is handed is one it is bound",
+              sandbox_env({}, {}, os.path.join(tmp, "sc-cache"))["NUGET_FALLBACK_PACKAGES"] in ro)
         ro = hs_.stage_readonly("MeshWeaver.Plugins", {"needs": ["plugins", "outputs", "nuget"]})
         check("scope/declared needs are bound, repository-scoped",
               os.path.join(tmp, "sc-cache", "outputs", "MeshWeaver.Plugins") in ro and hs_.plugins_dir in ro
@@ -4292,6 +4447,153 @@ def self_test() -> int:
         hnone = host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": "true"}]}))
         hnone.run(dict(claim, isTrunk=True))
         check("prepared/a run that restored nothing says nothing", not [e for _, evs in posted for e in evs if e.get("code") == "MWPREP001"])
+
+        # ── 7b'. the fallback folder every stage is handed EXISTS in every stage, and the build and test stages agree ──
+        # The defect: a build stage restored with NUGET_FALLBACK_PACKAGES=<cache>/nuget, its project.assets.json named the
+        # folder, and a test stage that did not declare `needs: ["nuget"]` was not bound it → MSB4018 ResolvePackageAssets
+        # "Unable to find fallback package folder". The build writes what NuGet would record; the test stage resolves it.
+        fresh_nuget = os.path.join(tmp, "fresh-nuget-cache")
+
+        def run_verdict():
+            return [e for _, evs in posted for e in evs if e["kind"] == "run-finished"][-1:]
+        assets_ = os.path.join(tmp, "assets-fallback")
+        seen_ro: list = []
+
+        class _RecordingSandbox(_EnvSandbox):
+            def argv(self, command, checkout, outputs, env, readonly=(), writable=()):
+                seen_ro.append((env.get("MW_BUILD_STAGE"), list(readonly), env.get("NUGET_FALLBACK_PACKAGES")))
+                return super().argv(command, checkout, outputs, env, readonly, writable)
+        posted.clear()
+        h_fb = Host(dict(keyed_env, MW_BUILD_CACHE=fresh_nuget), api_ev(), log=lambda s: None, sandbox=_RecordingSandbox(),
+                    leftovers=lambda: [], sleep=lambda s: None, pull=pull,
+                    git_runner=lambda args, env_: (0, "e" * 40 + "\n" if "rev-parse" in args else ""),
+                    checkout=checkout_with({"stages": [
+                        {"name": "build", "kind": "build", "needs": ["nuget"],
+                         "command": f"echo \"$NUGET_FALLBACK_PACKAGES\" > {assets_}"},
+                        {"name": "test-shard-0", "kind": "test", "command": f"test -d \"$(cat {assets_})\""}]}))
+        h_fb.run(claim)
+        fb_dir = os.path.join(fresh_nuget, "nuget")
+        check("fallback/an ABSENT warm cache: the folder every stage names exists before the first stage, and the test "
+              "stage resolves what the build recorded", run_verdict() == [{"kind": "run-finished", "succeeded": True, "error": None}]
+              and os.path.isdir(fb_dir), run_verdict())
+        check("fallback/the build and EVERY test stage are bound the folder they are handed — `needs` declared or not",
+              len(seen_ro) == 2 and all(fb_ == fb_dir and fb_dir in ro_ for _, ro_, fb_ in seen_ro), seen_ro)
+        av_fb = Sandbox("bwrap", []).argv("x", "/w/s", "/w/o", sandbox_env({}, {}, fresh_nuget),
+                                          readonly=h_fb.stage_readonly("MeshWeaver.Plugins", {"needs": []}))
+        check("fallback/the bwrap argv of a stage that declares no needs binds the fallback folder read-only",
+              f"--ro-bind-try {fb_dir} {fb_dir}" in " ".join(av_fb) and f"--bind {fb_dir} " not in " ".join(av_fb), av_fb)
+
+        # ── 7b''. the warm NuGet cache is filled from the DEFAULT BRANCH's tip, without a trunk run, once per key ──
+        warm_cache = os.path.join(tmp, "warm-cache")
+        warm_runs = os.path.join(tmp, "warm-restores")
+        pkg_good = pkg_fixture("good")
+        # the run's stage behaves as NuGet does: it restores a package into its own folder only when the fallback lacks it
+        nuget_like = ("if [ ! -f \"$NUGET_FALLBACK_PACKAGES/demo.pkg/1.0.0/.nupkg.metadata\" ]; then " + pkg_good + "; fi")
+        pr_doc = {"stages": [{"name": "build", "kind": "build", "command": nuget_like},
+                             {"name": "test-shard-0", "kind": "test", "command": "true"}]}
+
+        def tip_git(tip_doc, listing="100644 blob " + "a" * 40 + "\tsrc/A/A.csproj\n", tip_="d" * 40, log_=None):
+            def g(args, env_):
+                if log_ is not None:
+                    log_.append(args)
+                if "rev-parse" in args:
+                    return 0, tip_ + "\n"
+                if "show" in args:
+                    return (0, json.dumps(tip_doc)) if tip_doc is not None else (128, "fatal: path does not exist")
+                if "ls-tree" in args:
+                    return 0, listing
+                if args[0] == "clone" and "--shared" in args:
+                    os.makedirs(os.path.join(args[-1], ".github"))
+                return 0, ""
+            return g
+        tip_restore = {"stages": pr_doc["stages"],
+                       "restore": {"command": f"echo restored >> {warm_runs}; " + pkg_good, "timeoutMinutes": 10}}
+        wenv = dict(keyed_env, MW_BUILD_CACHE=warm_cache)
+
+        def n_warm():
+            return len(open(warm_runs).read().splitlines()) if os.path.exists(warm_runs) else 0
+
+        def codes(c_):
+            return [e for _, evs in posted for e in evs if e.get("code") == c_]
+        posted.clear()
+        host(api_ev(), env=wenv, git_runner=tip_git(tip_restore), checkout=checkout_with(pr_doc)).run(claim)
+        warm_pkg = os.path.join(warm_cache, "nuget", "demo.pkg", "1.0.0")
+        check("warm/an EMPTY cache, NO trunk run: the first PR run fills it from the default branch's tip, once",
+              n_warm() == 1 and os.path.isfile(os.path.join(warm_pkg, ".nupkg.metadata"))
+              and nuget_packages(os.path.join(warm_cache, "nuget")) == {"demo.pkg/1.0.0"}, (n_warm(), run_verdict()))
+        check("warm/... before its stages ran, so even that run restores nothing per run", not codes("MWPREP001"), codes("MWPREP001"))
+        def marks(c_):
+            d_ = os.path.join(c_, "nuget-warm", "MeshWeaver.Plugins")
+            return len(os.listdir(d_)) if os.path.isdir(d_) else 0
+        check("warm/... and the key is marked", marks(warm_cache) == 1, marks(warm_cache))
+        check("warm/the run is green", run_verdict() == [{"kind": "run-finished", "succeeded": True, "error": None}], run_verdict())
+        posted.clear()
+        host(api_ev(), env=wenv, git_runner=tip_git(tip_restore), checkout=checkout_with(pr_doc)).run(claim)
+        lines_w = [e.get("text", "") for _, evs in posted for e in evs if e["kind"] == "line"]
+        check("warm/the SECOND run restores nothing — neither the server nor the run",
+              n_warm() == 1 and not codes("MWPREP001") and any("holds the default branch's restore" in t_ for t_ in lines_w),
+              (n_warm(), codes("MWPREP001"), lines_w))
+        posted.clear()
+        host(api_ev(), env=wenv, git_runner=tip_git(tip_restore, listing="100644 blob " + "b" * 40 + "\tsrc/A/A.csproj\n"),
+             checkout=checkout_with(pr_doc)).run(claim)
+        check("warm/main changed a project file: a new key, restored once more (what the cache holds is kept)",
+              n_warm() == 2 and marks(warm_cache) == 2, (n_warm(), marks(warm_cache)))
+        check("warm/the key: a project file's blob, the command and the platform change it; a source file does not",
+              nuget_warm_key("100644 blob " + "a" * 40 + "\tsrc/A/A.cs\n", "c", "p") == nuget_warm_key("", "c", "p")
+              and nuget_warm_key("100644 blob " + "a" * 40 + "\tDirectory.Packages.props\n", "c", "p") != nuget_warm_key("", "c", "p")
+              and nuget_warm_key("100644 blob " + "a" * 40 + "\tNuGet.Config\n", "c", "p") != nuget_warm_key("", "c", "p")
+              and nuget_warm_key("", "c", "p") != nuget_warm_key("", "c2", "p") != nuget_warm_key("", "c", "p2"))
+        # a failed tip restore is SAID and never reds the run; nothing is marked, so the next run tries again
+        posted.clear()
+        failing_tip = dict(tip_restore, restore={"command": f"echo restored >> {warm_runs}; exit 3"})
+        host(api_ev(), env=dict(wenv, MW_BUILD_CACHE=os.path.join(tmp, "warm-fail")), git_runner=tip_git(failing_tip),
+             checkout=checkout_with(pr_doc)).run(claim)
+        check("warm/a failed tip restore is SAID (MWPREP003), marks nothing, and the run still restores per run, green",
+              len(codes("MWPREP003")) == 1 and "exit 3" in codes("MWPREP003")[0]["message"]
+              and not os.path.exists(os.path.join(tmp, "warm-fail", "nuget-warm")) and codes("MWPREP001")
+              and run_verdict() == [{"kind": "run-finished", "succeeded": True, "error": None}], (codes("MWPREP003"), run_verdict()))
+        posted.clear()
+        host(api_ev(), env=dict(wenv, MW_BUILD_CACHE=os.path.join(tmp, "warm-none")), git_runner=tip_git(None),
+             checkout=checkout_with(pr_doc)).run(claim)
+        check("warm/a tip that declares no `restore`: said, nothing restored for the server",
+              n_warm() == 3 and any("declares no `restore`" in e.get("text", "") for _, evs in posted for e in evs), n_warm())
+        check("warm/the budget reserves the tip's restore only when it will run",
+              run_budget_seconds([{"timeoutMinutes": 10}], 10 ** 6, warm_minutes=5) == 15 * 60 + RUN_MARGIN_SECONDS
+              and run_budget_seconds([{"timeoutMinutes": 10}], 10 ** 6) == 10 * 60 + RUN_MARGIN_SECONDS)
+        # NEGATIVE CONTROLS (the trust boundary): a PR's own `restore` declaration is never executed, and neither its
+        # per-run restore nor a package source its tree adds ever writes the shared cache.
+        # The PR's package is VALID (it would pass verification), so only the trust boundary keeps it out of the cache.
+        poison_ = os.path.join(tmp, "poison-pkg")
+        shutil.rmtree(poison_, ignore_errors=True)
+        shutil.copytree(os.path.join(tmp, "pkg-good", "demo.pkg", "1.0.0"), os.path.join(poison_, "evil.pkg", "6.6.6"))
+        for ext_ in ("nupkg", "nupkg.sha512"):
+            os.rename(os.path.join(poison_, "evil.pkg", "6.6.6", f"demo.pkg.1.0.0.{ext_}"),
+                      os.path.join(poison_, "evil.pkg", "6.6.6", f"evil.pkg.6.6.6.{ext_}"))
+        check("warm/negative control: the PR's package would pass verification (the case has a subject)",
+              nuget_package_problem(os.path.join(poison_, "evil.pkg", "6.6.6"), "evil.pkg", "6.6.6") is None)
+        pr_ran = os.path.join(tmp, "pr-restore-ran")
+        evil_pr = {"stages": [{"name": "build", "kind": "build", "command": f"cp -R {poison_}/. \"$NUGET_PACKAGES\"/"}],
+                   "restore": {"command": f"echo ran > {pr_ran}; cp -R {poison_}/. \"$NUGET_PACKAGES\"/"}}
+        neg_cache = os.path.join(tmp, "warm-neg")
+        posted.clear()
+        host(api_ev(), env=dict(wenv, MW_BUILD_CACHE=neg_cache), git_runner=tip_git(None), checkout=checkout_with(evil_pr)).run(claim)
+        check("warm/negative control: the PR's per-run restore DID fetch its package (the case has a subject)",
+              any("evil.pkg/6.6.6" in w_["message"] for w_ in codes("MWPREP001")), codes("MWPREP001"))
+        check("warm/negative control: a PR's own `restore` declaration is never executed", not os.path.exists(pr_ran))
+        check("warm/negative control: ... and a PR's restore never writes the shared cache",
+              nuget_packages(os.path.join(neg_cache, "nuget")) == set() and not os.path.exists(os.path.join(neg_cache, "nuget-warm")))
+        posted.clear()
+        host(api_ev(), env=dict(wenv, MW_BUILD_CACHE=neg_cache), git_runner=tip_git(tip_restore), checkout=checkout_with(evil_pr)).run(claim)
+        check("warm/negative control: with the tip declaring a restore, what is installed is the TIP's closure, never the PR's",
+              nuget_packages(os.path.join(neg_cache, "nuget")) == {"demo.pkg/1.0.0"} and not os.path.exists(pr_ran),
+              nuget_packages(os.path.join(neg_cache, "nuget")))
+        wlog: list = []
+        posted.clear()
+        host(api_ev(), env=dict(wenv, MW_BUILD_CACHE=os.path.join(tmp, "warm-src")), git_runner=tip_git(tip_restore, log_=wlog),
+             checkout=checkout_with(evil_pr)).run(claim)
+        check("warm/the declaration and the key are read from the MIRROR at the tip, never from the run's tree",
+              any("show" in a_ and a_[-1] == "d" * 40 + ":.github/build-stages.json" for a_ in wlog)
+              and any("ls-tree" in a_ and a_[-1] == "d" * 40 for a_ in wlog), wlog)
 
         # ── 7c. PREPARED INPUTS: built from the repository's own sources ONCE per (platform, key), installed persistently ──
         for bad_ in ({"prepared": {}}, {"prepared": [{"name": "shelf", "env": "MW_SECRET", "key": "k", "build": "b"}]},
@@ -5007,6 +5309,12 @@ def self_test() -> int:
         # trunk → no merge
         def merge_host(gitlog, tip="e" * 40, merge_rc=0):
             def git(args, env_):
+                # The warm NuGet cache's plan reads the mirror too (rev-parse → show → ls-tree); those reads are not the
+                # merge's, so they are left out of the log these cases assert on — the rev-parse it opened with included.
+                if "show" in args or "ls-tree" in args:
+                    if "show" in args and gitlog and "rev-parse" in gitlog[-1]:
+                        gitlog.pop()
+                    return 0, ""
                 gitlog.append(args)
                 if "rev-parse" in args:
                     return 0, tip + "\n"
@@ -5260,7 +5568,7 @@ def self_test() -> int:
         return 1
     print("build-run self-test: all cases passed (diagnostics, dedup, vstest + xunit results, structured events, "
           "stage declaration, the bwrap argv, the env allow-list, the token file, the startup sandbox probe, "
-          "pid-namespace leftovers, one merged tree per PR attempt, the network-boundary self-check, trunk-only BUILD-stage cache promotion under recomputed keys, the plan, batch seq, the lease heartbeat, the claimId, the git mirror, cache scoping per stage, the refset key, the H9 artifact hand-over (a file: store and the build API), the workload-identity pull, the registry bundle index (H8), plugins refresh BEFORE claim, fresh process per "
+          "pid-namespace leftovers, one merged tree per PR attempt, the network-boundary self-check, trunk-only BUILD-stage cache promotion under recomputed keys, the plan, batch seq, the lease heartbeat, the claimId, the git mirror, cache scoping per stage, the NuGet fallback folder bound for every stage, the warm NuGet cache filled from the default branch's tip once per key (and never from a PR), the refset key, the H9 artifact hand-over (a file: store and the build API), the workload-identity pull, the registry bundle index (H8), plugins refresh BEFORE claim, fresh process per "
           "stage, fail-fast, channel + publish, 409, undeclared stages, stage timeout, run deadline)")
     return 0
 
