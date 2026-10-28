@@ -142,6 +142,7 @@ import threading
 import time
 import uuid
 import hashlib
+import http.client
 import io
 import urllib.error
 import urllib.parse
@@ -848,10 +849,50 @@ class Api:
             try:
                 raw = e.read().decode()
                 return e.code, (json.loads(raw) if raw.strip() else None)
-            except (OSError, ValueError):
+            except (OSError, ValueError, http.client.HTTPException):
+                # A refusal whose body was cut short is still that refusal: keep its status.
                 return e.code, None
-        except (urllib.error.URLError, OSError, ValueError) as e:
+        # http.client.HTTPException covers IncompleteRead: a response closed before its Content-Length
+        # arrived is a transport failure (status 0, retried inside the budget), never an escaping traceback.
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
             return 0, str(e)
+
+
+    def upload(self, path: str, query: dict, file_path: str, size: int, timeout: float) -> tuple[int, object]:
+        """PUT one file's bytes to `path` (`Content-Length` = `size`, streamed from disk, never read whole into memory) with
+        the worker token; the answer's status and JSON body, as `call` returns them (0 = transport failure)."""
+        url = self.base + path + (("?" + urllib.parse.urlencode(query)) if query else "")
+        try:
+            with open(file_path, "rb") as fh:
+                req = urllib.request.Request(url, data=fh, method="PUT", headers={
+                    "Authorization": f"Bearer {self.token}", "Accept": "application/json",
+                    "Content-Type": "application/octet-stream", "Content-Length": str(size)})
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    raw = r.read().decode()
+                    return r.status, (json.loads(raw) if raw.strip() else None)
+        except urllib.error.HTTPError as e:
+            try:
+                raw = e.read().decode()
+                return e.code, (json.loads(raw) if raw.strip() else None)
+            except (OSError, ValueError, http.client.HTTPException):
+                # A refusal whose body was cut short is still that refusal: keep its status.
+                return e.code, None
+        # http.client.HTTPException covers IncompleteRead: a response closed before its Content-Length
+        # arrived is a transport failure (status 0, retried inside the budget), never an escaping traceback.
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+            return 0, str(e)
+
+
+def artifact_path(repo: str, sha: str, digest: str) -> str:
+    return f"/{urllib.parse.quote(repo, safe='')}/{sha}/artifacts/{digest}"
+
+
+# The API artifact store (`MW_BUILD_ARTIFACT_STORE=api:`): every artifact is PUT to the build API, which verifies its
+# length and sha256 while it stores it under the instance's own root and records the receipt. A transport failure or a
+# 5xx is retried at most API_UPLOAD_ATTEMPTS times in all, with a doubling pause, inside the run budget; anything else —
+# and the last failed attempt — fails the stage, naming the answer. Never a silent pass.
+API_STORE_SPEC = "api:"
+API_UPLOAD_ATTEMPTS = 4
 
 
 def events_path(repo: str, sha: str, stage: str) -> str:
@@ -2815,11 +2856,16 @@ class Host:
         store_url = self.env.get("MW_BUILD_ARTIFACT_STORE", "").strip()
         if not store_url:
             return [], "the stage produced artifacts but no artifact store is configured (MW_BUILD_ARTIFACT_STORE)"
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci-artifact-store.py")
-        receipts = []
 
         def left() -> float:
             return float("inf") if deadline is None else deadline - self.clock()
+
+        if store_url == API_STORE_SPEC:
+            return self.hand_over_through_api(repo, sha, stage, artifacts_dir, files, left)
+        if store_url.startswith(API_STORE_SPEC):
+            return [], f"MW_BUILD_ARTIFACT_STORE {store_url!r} is not a store: the API store is exactly {API_STORE_SPEC!r}"
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci-artifact-store.py")
+        receipts = []
 
         def store(argv: list[str]) -> tuple[int, str]:
             budget = left()
@@ -2859,6 +2905,46 @@ class Host:
             receipts.append({"kind": "artifact", "unit": unit, "key": locator, "sha256": digest, "bytes": size})
         return receipts, None
 
+    def hand_over_through_api(self, repo: str, sha: str, stage: str, artifacts_dir: str, files: list[str],
+                              left: Callable[[], float]) -> tuple[list[dict], Optional[str]]:
+        """The API store: PUT each artifact to `{api}/{repo}/{sha}/artifacts/{sha256}` as the run's holder (host + claim id),
+        and take the receipt FROM THE SERVER'S ANSWER — the instance hashed what it stored, so a receipt is a byte it holds.
+        The answer must name this unit, this sha256, this size and a locator attesting the digest, or the stage fails. A
+        409 means the run is no longer this host's (Lost). Retries only a transport failure or a 5xx, bounded by
+        API_UPLOAD_ATTEMPTS and the run budget; every other answer fails the stage at once, naming it."""
+        receipts = []
+        for full in sorted(files):
+            unit = os.path.relpath(full, artifacts_dir).replace(os.sep, "/")
+            if "/" not in unit:
+                return receipts, f"{unit} is not under a unit directory ($MW_BUILD_ARTIFACTS/<unit>/<file>)"
+            digest, size = _sha256_file(full), os.path.getsize(full)
+            query = {**self.run_scope, "stage": stage, "unit": unit, "host": self.host, "claimId": self.claim_id,
+                     **({"probe": self.probe} if self.probe else {})}
+            path = artifact_path(repo, sha, digest)
+            status, answer, pause = 0, None, 2.0
+            for attempt in range(1, API_UPLOAD_ATTEMPTS + 1):
+                budget = left()
+                if budget <= 0:
+                    return receipts, f"the run deadline passed during the hand-over of {unit} (upload)"
+                status, answer = self.api.upload(path, query, full, size, timeout=min(1800.0, budget))
+                if 200 <= status < 300 or status == 409 or not (status == 0 or status >= 500):
+                    break
+                if attempt < API_UPLOAD_ATTEMPTS:
+                    self.log(f"upload of {unit} → {status or 'no answer'} ({_answer_text(answer)}); "
+                             f"retrying ({attempt}/{API_UPLOAD_ATTEMPTS})")
+                    self.sleep(max(0.0, min(pause, left())))
+                    pause = min(pause * 2, 60.0)
+            if status == 409:
+                raise Lost(f"{path}: the run is not this host's claim any more (409 on the artifact upload: {_answer_text(answer)})")
+            if not (200 <= status < 300):
+                tries = f" after {API_UPLOAD_ATTEMPTS} attempts" if status == 0 or status >= 500 else ""
+                return receipts, f"the build API did not store {unit} ({status or 'no answer'}{tries}): {_answer_text(answer)}"
+            problem = api_receipt_problem(answer, unit, digest, size)
+            if problem:
+                return receipts, f"the build API's answer for {unit} {problem}"
+            receipts.append({"kind": "artifact", "unit": unit, "key": answer["key"], "sha256": digest, "bytes": size})
+        return receipts, None
+
     # -- terminal events are never lost -----------------------------------------------------
     def deliver(self, sink: EventSink) -> bool:
         """Flush a sink; one that could not be emptied (the API is down) is HELD, with its
@@ -2884,6 +2970,30 @@ class Host:
                 self.sleep(idle if what == "idle" else max(idle, 30))
         self.log("stopping: no further claims (the run in hand, if any, has finished)")
         return 0
+
+
+def _answer_text(answer: object) -> str:
+    """A refusal's reason as the build API states it (`{"error": …}`), else the raw answer — bounded."""
+    if isinstance(answer, dict) and isinstance(answer.get("error"), str):
+        return answer["error"][:200]
+    return str(answer)[:200]
+
+
+def api_receipt_problem(answer: object, unit: str, digest: str, size: int) -> Optional[str]:
+    """None when the build API's answer is the receipt of exactly this artifact — this unit, this sha256, this size, and a
+    locator under the API store attesting the digest; otherwise what is wrong with it."""
+    if not isinstance(answer, dict):
+        return "is not a receipt"
+    if answer.get("unit") != unit:
+        return f"names another unit ({str(answer.get('unit'))[:80]})"
+    if answer.get("sha256") != digest:
+        return f"names another hash ({str(answer.get('sha256'))[:80]})"
+    if answer.get("bytes") != size:
+        return f"names another size ({answer.get('bytes')} bytes, not {size})"
+    key = answer.get("key")
+    if not (isinstance(key, str) and key.startswith(API_STORE_SPEC + "/") and key.endswith(f"#sha256={digest}") and len(key) <= 512):
+        return f"carries no locator attesting sha256 {digest[:12]}… ({str(key)[:80]})"
+    return None
 
 
 def _kill(proc: subprocess.Popen) -> None:
@@ -2965,6 +3075,17 @@ class _FakeApi(Api):
             if m == method and path.startswith(p):
                 if callable(answers):
                     return answers(path, body)
+                return answers.pop(0) if len(answers) > 1 else answers[0]
+        return 404, None
+
+    def upload(self, path, query, file_path, size, timeout):
+        with open(file_path, "rb") as fh:
+            data = fh.read()
+        self.calls.append(("PUT", path, None, dict(query or {})))
+        for (m, p), answers in self.script.items():
+            if m == "PUT" and path.startswith(p):
+                if callable(answers):
+                    return answers(path, dict(query or {}), data, size, timeout)
                 return answers.pop(0) if len(answers) > 1 else answers[0]
         return 404, None
 
@@ -4199,6 +4320,164 @@ def self_test() -> int:
              checkout=checkout_with({"stages": [{"name": "modules", "kind": "build", "command": art_cmd}]})).run(claim)
         fin = [e for _, es in posted for e in es if e["kind"] == "stage-finished"]
         check("h9/artifacts with no store fail the stage", fin and fin[-1]["state"] == "failed" and "no artifact store" in fin[-1]["summary"], fin)
+        # H9, the API store (`MW_BUILD_ARTIFACT_STORE=api:`): each artifact is PUT to the build API as the run's holder and
+        # its receipt is the SERVER's answer; nothing touches ci-artifact-store.py.
+        api_env = dict(env_s, MW_BUILD_ARTIFACT_STORE="api:")
+        api_store: dict[str, bytes] = {}
+        api_puts: list[tuple] = []
+
+        def api_put(answers=None, lie=None):
+            """A fake build API upload route: verifies the body against the digest in the path, stores it, answers like
+            the instance (201 new / 200 existed). `answers` scripts statuses first; `lie` rewrites a field of the answer."""
+            scripted = list(answers or [])
+
+            def on_put(path, query, data, size, timeout):
+                api_puts.append((path, query, len(data), size, timeout))
+                if scripted:
+                    return scripted.pop(0)
+                digest = path.rsplit("/", 1)[1]
+                if hashlib.sha256(data).hexdigest() != digest or len(data) != size:
+                    return 422, {"error": "the body does not hash to its name"}
+                existed = digest in api_store
+                api_store[digest] = data
+                answer = {"stage": query["stage"], "unit": query["unit"], "sha256": digest, "bytes": size, "existed": existed,
+                          "key": f"api:/build-hosts/R/{'c' * 40}/stable/{query['stage']}/{digest}/{query['unit']}#sha256={digest}"}
+                if lie:
+                    answer.update(lie)
+                return (200 if existed else 201), answer
+            return on_put
+
+        def api_run(on_put, **kw):
+            posted.clear()
+            api_puts.clear()
+            store_calls.clear()
+            api = api_ev(((("PUT", "/MeshWeaver.Plugins/"), on_put)))
+            hx = host(api, env=api_env, store_runner=fake_store,
+                      checkout=checkout_with({"stages": [{"name": "modules", "kind": "build", "command": art_cmd}]}), **kw)
+            outcome = hx.run(dict(claim, claimId="claim-api"))
+            evs_ = [e for _, es in posted for e in es]
+            return outcome, evs_, [e for e in evs_ if e["kind"] == "stage-finished"]
+
+        outcome, evs, fin = api_run(api_put())
+        arts = [e for e in evs if e["kind"] == "artifact"]
+        check("h9-api/a run with artifacts succeeds", outcome == "ran" and fin and fin[-1]["state"] == "succeeded", (outcome, fin))
+        check("h9-api/one PUT per artifact, nothing through ci-artifact-store.py", len(api_puts) == 2 and not store_calls, (api_puts, store_calls))
+        check("h9-api/each PUT names the run's holder, stage, unit and channel",
+              all(q.get("host") and q.get("claimId") == "claim-api" and q.get("stage") == "modules" and q.get("channel") == "stable"
+                  and q.get("unit") in ("Store/Store-1.4.2.zip", "Store/Store.publication.json") for _p, q, *_ in api_puts), api_puts)
+        check("h9-api/each PUT carries the whole file and declares its size", all(n == sz and n > 0 for _p, _q, n, sz, _t in api_puts), api_puts)
+        check("h9-api/the receipts are the server's answers (api:/ locators attesting the digest)",
+              sorted(a["unit"] for a in arts) == ["Store/Store-1.4.2.zip", "Store/Store.publication.json"]
+              and all(a["key"].startswith("api:/build-hosts/") and a["key"].endswith("#sha256=" + a["sha256"]) for a in arts), arts)
+        check("h9-api/every upload is bounded by the run budget left", all(t is not None and 0 < t <= min(1800, ha.run_deadline) for *_x, t in api_puts), api_puts)
+        # a duplicate upload is idempotent at the server: the receipt is the same
+        outcome, evs, fin = api_run(api_put())
+        check("h9-api/a re-run of the same bytes is answered 'existed' and still receipted", outcome == "ran" and fin[-1]["state"] == "succeeded"
+              and len([e for e in evs if e["kind"] == "artifact"]) == 2, fin)
+        # bounded retries on a transport failure or a 5xx, then the stage passes
+        outcome, evs, fin = api_run(api_put(answers=[(503, {"error": "busy"}), (0, "connection reset")]))
+        check("h9-api/a 503 and a transport failure are retried, then stored", outcome == "ran" and fin[-1]["state"] == "succeeded"
+              and len(api_puts) == 4, (len(api_puts), fin))
+        # ... and a 5xx that never ends fails the stage after exactly API_UPLOAD_ATTEMPTS — red, named, never a pass
+        outcome, evs, fin = api_run(api_put(answers=[(503, {"error": "the run is being written concurrently"})] * 50))
+        check("h9-api/a persistent 5xx fails the stage after the bounded attempts, naming it",
+              fin and fin[-1]["state"] == "failed" and f"after {API_UPLOAD_ATTEMPTS} attempts" in fin[-1]["summary"]
+              and len(api_puts) == API_UPLOAD_ATTEMPTS and not [e for e in evs if e["kind"] == "artifact"], (len(api_puts), fin))
+        # a refusal is NOT retried: 422 (hash), 401 (token), 413 (size) fail the stage at once, naming the server's reason
+        for code, why in ((422, "the body hashes to sha256 x, not y"), (401, "the build-host worker token is required"), (413, "an artifact is at most 1 bytes")):
+            outcome, evs, fin = api_run(api_put(answers=[(code, {"error": why})] * 5))
+            check(f"h9-api/a {code} fails the stage at once, naming the reason", fin and fin[-1]["state"] == "failed"
+                  and f"({code})" in fin[-1]["summary"] and why[:20] in fin[-1]["summary"] and len(api_puts) == 1, (len(api_puts), fin))
+        # NEGATIVE CONTROLS: a server answer that is not the receipt of THIS artifact fails the stage
+        for field, lie in (("hash", {"sha256": "0" * 64}), ("size", {"bytes": 1}), ("unit", {"unit": "Other/x.zip"}),
+                           ("locator", {"key": "file:/ci-artifacts/x#sha256=" + "0" * 64})):
+            outcome, evs, fin = api_run(api_put(lie=lie))
+            check(f"h9-api/an answer naming another {field} fails the stage", fin and fin[-1]["state"] == "failed"
+                  and "build API's answer" in fin[-1]["summary"] and not [e for e in evs if e["kind"] == "artifact"], fin)
+        # a 409 means the run is not this host's any more: the run is lost, nothing more is posted for it
+        outcome, evs, fin = api_run(api_put(answers=[(409, {"error": "not-yours: the run is not held by this host"})]))
+        check("h9-api/a 409 on the upload abandons the run", outcome == "lost" and len(api_puts) == 1, (outcome, api_puts))
+        # a spent budget makes no upload and is a problem
+        api_puts.clear()
+        hs = host(_FakeApi({("PUT", "/R/"): api_put()}), env=api_env)
+        _r, problem = hs.hand_over_artifacts("R", "f" * 40, "modules", os.path.dirname(spent_dir), deadline=hs.clock() - 1)
+        check("h9-api/a spent budget makes no upload and is a problem", not api_puts and problem and "run deadline" in problem, (api_puts, problem))
+        _r, problem = host(_FakeApi({}), env=dict(env_s, MW_BUILD_ARTIFACT_STORE="api:/elsewhere")).hand_over_artifacts(
+            "R", "f" * 40, "modules", os.path.dirname(spent_dir))
+        check("h9-api/an api: spec that is not exactly 'api:' is refused, never guessed", problem and "not a store" in problem, problem)
+        # the TRANSPORT: Api.upload over real HTTP to a local server — the bytes, the length and the bearer arrive intact
+        import http.server
+        got: dict = {}
+
+        class _Upload(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                n = int(self.headers.get("Content-Length", "-1"))
+                got.update(path=self.path, auth=self.headers.get("Authorization"), length=n,
+                           type=self.headers.get("Content-Type"), body=self.rfile.read(n) if n >= 0 else b"")
+                payload = json.dumps({"ok": True}).encode()
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Upload)
+        serving = threading.Thread(target=server.serve_forever, daemon=True)
+        serving.start()
+        try:
+            blob = os.path.join(tmp, "transport.bin")
+            data = os.urandom(300_000)
+            with open(blob, "wb") as fh:
+                fh.write(data)
+            real = Api(f"http://127.0.0.1:{server.server_address[1]}/api/builds", "the-worker-token")
+            status, answer = real.upload("/R/" + "f" * 40 + "/artifacts/" + hashlib.sha256(data).hexdigest(),
+                                         {"channel": "latest", "unit": "u/f"}, blob, len(data), timeout=30)
+            check("h9-api/transport: the PUT is answered and its JSON read", status == 201 and answer == {"ok": True}, (status, answer))
+            check("h9-api/transport: the bytes arrive byte-identical with their length and the bearer",
+                  got.get("body") == data and got.get("length") == len(data) and got.get("auth") == "Bearer the-worker-token"
+                  and got.get("type") == "application/octet-stream" and "unit=u%2Ff" in got.get("path", ""), {k: v for k, v in got.items() if k != "body"})
+        finally:
+            server.shutdown()
+            server.server_close()
+        status, answer = Api("http://127.0.0.1:9/api/builds", "t").upload("/x", {}, blob, 1, timeout=5)
+        check("h9-api/transport: an unreachable API is status 0, never a pass", status == 0, (status, answer))
+
+        # a response closed before its Content-Length arrived (IncompleteRead) is status 0 on BOTH paths — a
+        # transport failure the bounded retry handles — never an exception escaping before the verdict is posted
+        class _Truncated(http.server.BaseHTTPRequestHandler):
+            def _cut(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                if n:
+                    self.rfile.read(n)
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b'{"ok":')
+                self.wfile.flush()
+                self.close_connection = True
+
+            do_PUT = _cut
+            do_POST = _cut
+
+            def log_message(self, *a):
+                pass
+
+        cut = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Truncated)
+        threading.Thread(target=cut.serve_forever, daemon=True).start()
+        try:
+            api = Api(f"http://127.0.0.1:{cut.server_address[1]}/api/builds", "t")
+            status, answer = api.upload("/x", {}, blob, 1, timeout=10)
+            check("h9-api/transport: a truncated upload answer is status 0, never an escaping IncompleteRead", status == 0, (status, answer))
+            status, answer = api.call("POST", "/y", {"a": 1})
+            check("h9-api/transport: a truncated call answer is status 0, never an escaping IncompleteRead", status == 0, (status, answer))
+        finally:
+            cut.shutdown()
+            cut.server_close()
+
         # the workspace stays until every receipt was acknowledged
         hk = host(_FakeApi({("POST", "/token"): [(404, None)], ("POST", "/MeshWeaver.Plugins/"): [(503, None)]}),
                   env=dict(env_s, MW_BUILD_ARTIFACT_STORE="file:" + store_dir), store_runner=fake_store,
@@ -4552,7 +4831,7 @@ def self_test() -> int:
         return 1
     print("build-run self-test: all cases passed (diagnostics, dedup, vstest + xunit results, structured events, "
           "stage declaration, the bwrap argv, the env allow-list, the token file, the startup sandbox probe, "
-          "pid-namespace leftovers, one merged tree per PR attempt, the network-boundary self-check, trunk-only BUILD-stage cache promotion under recomputed keys, the plan, batch seq, the lease heartbeat, the claimId, the git mirror, cache scoping per stage, the refset key, the H9 artifact hand-over, the workload-identity pull, the registry bundle index (H8), plugins refresh BEFORE claim, fresh process per "
+          "pid-namespace leftovers, one merged tree per PR attempt, the network-boundary self-check, trunk-only BUILD-stage cache promotion under recomputed keys, the plan, batch seq, the lease heartbeat, the claimId, the git mirror, cache scoping per stage, the refset key, the H9 artifact hand-over (a file: store and the build API), the workload-identity pull, the registry bundle index (H8), plugins refresh BEFORE claim, fresh process per "
           "stage, fail-fast, channel + publish, 409, undeclared stages, stage timeout, run deadline)")
     return 0
 

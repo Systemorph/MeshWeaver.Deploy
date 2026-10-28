@@ -20,6 +20,7 @@
 #   3d. a build-host-only release (portal.enabled: false) renders the version's host, its cache and
 #      the release-named ServiceAccount + NetworkPolicy and NOTHING of the portal, and two such
 #      releases and the portal's own never name one object twice;
+#   3f. artifactStore.upload renders MW_BUILD_ARTIFACT_STORE=api: and mounts no store; beside a claim it is refused;
 #   4. the refusals hold: a tag instead of a digest, plain http to a public host, and a registry
 #      credential for the host, fail
 #      `helm template` naming why.
@@ -643,6 +644,61 @@ sys.exit(1 if problems else 0)
 PY4
 else
   report "the node-local cache values did not render:"; sed 's/^/    /' "$WORK/nodecache.err"
+fi
+
+# 3f. artifactStore.upload: the hosts hand their artifacts to the BUILD API (MW_BUILD_ARTIFACT_STORE=api:) — no store claim, no
+#     /ci-artifacts mount (a host in its own user namespace cannot mount the share) — and upload beside a claim is refused.
+if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.artifactStore.claimName= \
+     --set buildHosts.artifactStore.upload=true --namespace check > "$WORK/upload.yaml" 2> "$WORK/upload.err"; then
+  python3 - "$WORK/upload.yaml" <<'PY5' && ok "artifactStore.upload renders MW_BUILD_ARTIFACT_STORE=api: on every host, and mounts no store" || report "the artifactStore.upload render is wrong (above)"
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+problems = []
+hosts = [d for d in docs if d.get("kind") == "Deployment" and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "build-host"]
+if not hosts: problems.append("no build-host Deployment rendered")
+for d in hosts:
+    pod = d["spec"]["template"]["spec"]
+    build = next(c for c in pod["containers"] if c["name"] == "build")
+    env = {e["name"]: e for e in build.get("env", [])}
+    if env.get("MW_BUILD_ARTIFACT_STORE", {}).get("value") != "api:":
+        problems.append(f"{d['metadata']['name']}: MW_BUILD_ARTIFACT_STORE is {env.get('MW_BUILD_ARTIFACT_STORE')}, not api:")
+    if any(v["name"] == "ci-artifacts" for v in pod.get("volumes", [])) or any(m["mountPath"] == "/ci-artifacts" for m in build.get("volumeMounts", [])):
+        problems.append(f"{d['metadata']['name']}: a CI artifact store is mounted although the hosts upload through the API")
+for p in problems: print("   ", p)
+sys.exit(1 if problems else 0)
+PY5
+else
+  report "the artifactStore.upload values did not render:"; sed 's/^/    /' "$WORK/upload.err"
+fi
+if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.artifactStore.upload=true \
+     --namespace check > "$WORK/upload-claim.yaml" 2> "$WORK/upload-claim.err"; then
+  report "artifactStore.upload beside a claimName RENDERED — the chart must refuse it (one store per host)"
+elif grep -qF -- "takes neither a claimName nor a spec" "$WORK/upload-claim.err"; then
+  ok "refusal artifactStore.upload + claimName holds (one store per host)"
+else
+  report "artifactStore.upload + claimName failed, but not for the stated reason:"; sed 's/^/    /' "$WORK/upload-claim.err"
+fi
+if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set-string 'buildHosts.artifactStore.spec=api:' \
+     --namespace check > "$WORK/api-spec-claim.yaml" 2> "$WORK/api-spec-claim.err"; then
+  report "artifactStore.spec 'api:' beside a claimName RENDERED — it would mount /ci-artifacts on a host that uploads (and a user-namespaced host cannot start)"
+elif grep -qF -- "it takes no claimName" "$WORK/api-spec-claim.err"; then
+  ok "refusal artifactStore.spec 'api:' + claimName holds (both spellings of the API store mount nothing)"
+else
+  report "artifactStore.spec 'api:' + claimName failed, but not for the stated reason:"; sed 's/^/    /' "$WORK/api-spec-claim.err"
+fi
+if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.artifactStore.claimName= \
+     --set buildHosts.artifactStore.spec=api: --namespace check > "$WORK/upload-spec.yaml" 2> "$WORK/upload-spec.err"; then
+  python3 - "$WORK/upload-spec.yaml" <<'PY6' && ok "spec api: renders like upload (the runner's own spelling of the mode)" || report "spec api: rendered wrong (above)"
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+hosts = [d for d in docs if d.get("kind") == "Deployment" and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "build-host"]
+vals = [e.get("value") for d in hosts for c in d["spec"]["template"]["spec"]["containers"] if c["name"] == "build" for e in c.get("env", []) if e["name"] == "MW_BUILD_ARTIFACT_STORE"]
+ok = hosts and vals == ["api:"] * len(hosts)
+if not ok: print("   ", vals)
+sys.exit(0 if ok else 1)
+PY6
+else
+  report "spec api: did not render:"; sed 's/^/    /' "$WORK/upload-spec.err"
 fi
 
 # 4. refusals

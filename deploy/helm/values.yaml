@@ -1215,10 +1215,15 @@ buildHosts:
     # and Azure's platform endpoint 168.63.129.16 (WireServer). Stages share the pod's network
     # namespace, so this is the boundary, not the sandbox.
     privateCidrs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "168.63.129.16/32"]
-  # H9: the shared CI artifact store the HOST hands every module bundle (and the gate bake) to
-  # before posting its receipt — content-addressed, read back. claimName mounts the runners' shared
-  # share at /ci-artifacts (spec defaults to file:/ci-artifacts). An existing claim; never created.
+  # H9: where the HOST hands every module bundle (and the gate bake) before posting its receipt.
+  #   upload: true  — through the BUILD API (MW_BUILD_ARTIFACT_STORE=api:): each artifact is PUT to
+  #                   apiUrl with the worker token, the instance verifies its sha256 and length while it
+  #                   stores it under its own artifact root, and answers the receipt. Nothing is mounted
+  #                   (a host in its own user namespace cannot mount an SMB/NFS share). Excludes the two below.
+  #   claimName     — mounts the runners' shared share at /ci-artifacts (spec defaults to file:/ci-artifacts),
+  #                   content-addressed, read back. An existing claim; never created.
   artifactStore:
+    upload: false
     spec: ""
     claimName: ""
   # H8: the plugins layer from the REGISTRY's bundle index (what an instance on this framework identity

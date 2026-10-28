@@ -16,7 +16,8 @@ The refusals, and why each one exists:
   * the API URL must be https, or http to a cluster-local host (no dot, or *.svc / *.cluster.local)
     — the worker token rides on it;
   * at least one channel must be enabled — an enabled block that renders no host is a typo;
-  * `cache.create` needs its storageClass and size — the chart never guesses a volume's tier or size.
+  * `cache.create` needs its storageClass and size — the chart never guesses a volume's tier or size;
+  * the artifact store is `upload: true` (through the build API) OR a `file:` store — never both, never anything else.
 */ -}}
 {{- define "memex.buildHosts" -}}
 {{- $b := (.Values.buildHosts | default dict) -}}
@@ -105,9 +106,21 @@ The refusals, and why each one exists:
 {{- end -}}
 {{- $as := ($b.artifactStore | default dict) -}}
 {{- $asClaim := ($as.claimName | default "") -}}
-{{- $asSpec := ($as.spec | default (ternary "file:/ci-artifacts" "" (ne $asClaim ""))) -}}
-{{- if and $asSpec (not (hasPrefix "file:" $asSpec)) -}}
-{{- fail (printf "buildHosts.artifactStore.spec %q must be a file: store — the runner image carries no az CLI, and the host holds no cloud credential to write a blob container" $asSpec) -}}
+{{- /* artifactStore.upload: the hosts UPLOAD every artifact through the build API (`api:` — `PUT <apiUrl>/<repo>/<sha>/artifacts/<sha256>`
+       with the worker token); the instance stores it under its own artifact root and records the receipt. Nothing is mounted:
+       a host in its own user namespace cannot mount an SMB/NFS share (the same reason its cache is node-local). It excludes a
+       claim and a spec — one store per host. */ -}}
+{{- if and $as.upload (or $asClaim $as.spec) -}}
+{{- fail "buildHosts.artifactStore.upload uploads through the build API — it takes neither a claimName nor a spec (one store per host)" -}}
+{{- end -}}
+{{- $asSpec := ternary "api:" ($as.spec | default (ternary "file:/ci-artifacts" "" (ne $asClaim ""))) (eq ($as.upload | default false) true) -}}
+{{- /* `spec: api:` spelled out is the same no-mount store as `upload: true`: a claim beside it would still be mounted
+       at /ci-artifacts, and a user-namespaced host cannot start on that mount. */ -}}
+{{- if and $asClaim (eq $asSpec "api:") -}}
+{{- fail "buildHosts.artifactStore.spec 'api:' uploads through the build API — it takes no claimName (nothing is mounted; one store per host)" -}}
+{{- end -}}
+{{- if and $asSpec (not (hasPrefix "file:" $asSpec)) (ne $asSpec "api:") -}}
+{{- fail (printf "buildHosts.artifactStore.spec %q must be a file: store, or set artifactStore.upload — the runner image carries no az CLI, and the host holds no cloud credential to write a blob container" $asSpec) -}}
 {{- end -}}
 {{- $reg := ($b.registry | default dict) -}}
 {{- $regUrl := trimSuffix "/" ($reg.url | default "") -}}
