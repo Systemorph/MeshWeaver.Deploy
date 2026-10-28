@@ -83,6 +83,12 @@ The refusals, and why each one exists:
 {{- if or (lt $runDeadline 600) (gt $runDeadline 43200) -}}
 {{- fail (printf "buildHosts.runDeadlineSeconds %d must be within [600, 43200] — the RUN budget (the contract's budgetMinutes is 10..720), which must cover the stages a repository declares (they run sequentially)" $runDeadline) -}}
 {{- end -}}
+{{- /* hasKey, not `default`: an explicit 0 must be refused, never turned into the default */ -}}
+{{- $stageSlots := 8 -}}
+{{- if hasKey $b "stageSlots" -}}{{- $stageSlots = int $b.stageSlots -}}{{- end -}}
+{{- if or (lt $stageSlots 1) (gt $stageSlots 32) -}}
+{{- fail (printf "buildHosts.stageSlots %d must be within [1, 32] — how many of one run's stages a host runs at once (1 = serial)" $stageSlots) -}}
+{{- end -}}
 {{- $sb := ($b.sandbox | default dict) -}}
 {{- $sandbox := dict "seccompProfile" ($sb.seccompProfile | default "") "seccompLocalhostProfile" ($sb.seccompLocalhostProfile | default "")
       "appArmorProfile" ($sb.appArmorProfile | default "") "appArmorLocalhostProfile" ($sb.appArmorLocalhostProfile | default "")
@@ -263,7 +269,7 @@ The refusals, and why each one exists:
       "orasImage" (required "buildHosts.orasImage is required" $b.orasImage)
       "nodeSelector" $nodeSelector "tolerations" $tolerations
       "resources" ($b.resources | default dict) "workSizeLimit" ($b.workSizeLimit | default "60Gi")
-      "runDeadline" $runDeadline
+      "runDeadline" $runDeadline "stageSlots" $stageSlots
       "scaleDownStabilizationSeconds" (int ($b.scaleDownStabilizationSeconds | default 300))
       "sandbox" $sandbox
       "pollingInterval" (int ($b.pollingInterval | default 15)) "cooldownPeriod" (int ($b.cooldownPeriod | default 600))
