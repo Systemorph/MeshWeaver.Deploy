@@ -94,9 +94,16 @@ THE LOOP, and the order that matters:
     whose key equals the tip's installs that build and reads it, so the server is prepared for a new
     platform or a new main key by the first run that needs it. A pull request with other sources
     builds it for that run only (MWPREP002) and never installs.
-  * stages run in declaration order, fail-fast: after a failed stage the rest are finished
-    `failed` with "not run" — never left open, never silently skipped. When the claim names
-    `stages`, only those run, and a claimed stage the repository does not declare is RED.
+  * stages run in declaration order, and a stage is skipped ONLY when a stage it runs AFTER failed:
+    its `after` (names of stages declared earlier), or — when it declares none — every earlier
+    stage of kind `build` (what produces the outputs later stages read). A skipped stage is finished
+    `failed` with "not run — stage <x>, which it runs after, failed first" — never left open, never
+    silently skipped — and it counts as failed for ITS dependants. An independent sibling of a red
+    stage still runs, so one red test shard never hides the others. A prepared input that cannot be
+    provided, or the run deadline passing, ends every remaining stage "not run". The run is red if
+    ANY stage is. When the claim names `stages`, only those run (a dependency the claim did not
+    select is not run here and blocks nothing), and a claimed stage the repository does not declare
+    is RED.
 
 Environment (rendered by the chart from `buildHosts.*`):
   BUILD_API                    https://<operations instance>/api/builds              required
@@ -137,6 +144,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import struct
 import zlib
 import subprocess
@@ -725,6 +733,47 @@ def file_tail(fh, limit: int) -> str:
     return fh.read().decode("utf-8", errors="replace")
 
 
+def _artifact_identity(st: os.stat_result):
+    # st_ctime_ns too: no process can set it, so a same-size rewrite that restores the old mtime (`cp -p`, `touch -d`,
+    # a reproducible-build timestamp normalisation) onto the same inode still reads as rewritten.
+    return "dir" if stat.S_ISDIR(st.st_mode) else (stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns, st.st_ino,
+                                                   st.st_ctime_ns)
+
+
+def artifact_snapshot(root: str) -> dict:
+    """Every entry under the shared artifacts directory, by relative path: a real directory as "dir" (what changes
+    inside it is found by descending), anything else — file, symlink, fifo — by its lstat identity (type, size,
+    mtime, inode, ctime), so a stage that ADDS or REWRITES an entry is visible against the snapshot taken before it ran."""
+    snap: dict = {}
+    for base, dirs, names in os.walk(root):
+        for n in dirs + names:
+            full = os.path.join(base, n)
+            snap[os.path.relpath(full, root)] = _artifact_identity(os.lstat(full))
+    return snap
+
+
+def quarantine_artifacts(root: str, before: dict, dest: str) -> list[str]:
+    """Move out of the shared artifacts directory every entry a FAILED stage added or rewrote (anything not in, or
+    different from, `before`), into `dest`. The artifacts directory is shared by the run's stages and each successful
+    stage hands over everything under it, so a failed stage's unfinished files would otherwise be uploaded — and
+    receipted — under a later independent sibling's name, and an invalid leftover (a dangling symlink) would turn that
+    sibling red. Returns the moved relative paths."""
+    moved: list[str] = []
+    for base, dirs, names in os.walk(root):
+        for n in list(dirs) + names:
+            full = os.path.join(base, n)
+            rel = os.path.relpath(full, root)
+            if before.get(rel) == _artifact_identity(os.lstat(full)):
+                continue
+            target = os.path.join(dest, rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            os.rename(full, target)
+            moved.append(rel)
+            if n in dirs:
+                dirs.remove(n)
+    return sorted(moved)
+
+
 def promote_nuget(restored: str, cache: str, log: Callable[[str], None]) -> tuple[int, int, list[str]]:
     """Promote the packages a TRUNK build stage restored into the shared warm NuGet cache
     (`<cache>/nuget/<id>/<version>/`, the stages' read-only fallback folder), so the next run restores
@@ -797,7 +846,22 @@ def validate_stages(doc: object) -> list[dict]:
         if not isinstance(needs, list) or not all(isinstance(n, str) and n in STAGE_NEEDS for n in needs):
             raise Refusal(f"stage {name!r} needs {needs!r} must be a list drawn from {sorted(STAGE_NEEDS)} — "
                           f"the shared-cache entries the stage may read (its own repository's mirror always)")
-        out.append({"name": name, "kind": kind, "command": cmd, "timeoutMinutes": float(tmo), "needs": list(needs)})
+        # `after`: the stages this one DEPENDS ON — it is skipped when any of them failed. Only names declared EARLIER
+        # (declaration order is execution order, so a dependency always runs first and no cycle can be written).
+        # Absent: every earlier `build` stage — the build that produces the outputs later stages read. `[]` declares
+        # a stage independent of every other.
+        if "after" in s:
+            after = s["after"]
+            if not isinstance(after, list) or not all(isinstance(a, str) for a in after) or len(set(after)) != len(after):
+                raise Refusal(f"stage {name!r} after {after!r} must be a list of distinct stage names")
+            unknown = [a for a in after if a not in seen or a == name]
+            if unknown:
+                raise Refusal(f"stage {name!r} runs after {unknown}, which no stage declared BEFORE it names — "
+                              f"a stage may run only after stages declared earlier in .github/build-stages.json")
+        else:
+            after = [o["name"] for o in out if o["kind"] == "build"]
+        out.append({"name": name, "kind": kind, "command": cmd, "timeoutMinutes": float(tmo), "needs": list(needs),
+                    "after": list(after)})
     return out
 
 
@@ -2409,7 +2473,13 @@ class Host:
                 **platform_scripts_env(os.path.dirname(os.path.abspath(__file__))),
                 **self.run_env,
             }
+            # A stage is skipped only when a stage it runs AFTER failed (`after`); its independent siblings still
+            # run. `failed` holds every red stage — ran red or was skipped — so a skip propagates to the skipped
+            # stage's own dependants. `why` is a RUN-WIDE stop (a prepared input, the run deadline) that ends every
+            # remaining stage. `failed_at` is the first red stage (the run's log line); any red stage reds the run.
             failed_at = None
+            failed: set = set()
+            ran_red: list = []
             why = ""
             run_end = self.clock() + budget
             prepared_ro: list[str] = []
@@ -2424,17 +2494,21 @@ class Host:
                     extra.update(penv)
                 except Refusal as r:
                     failed_at, why = stages[0]["name"], f"a prepared input could not be provided: {r}"
+                    failed.add(failed_at)
                     psink.add([{"kind": "line", "text": why[:MAX_LINE]}])
                     self.deliver(psink)
             for st in stages:
                 last_stage = st["name"]
                 sink = self._sink_for(repo, sha, st["name"])
                 remaining = run_end - self.clock()
-                if failed_at is None and remaining <= 0:
-                    failed_at, why = st["name"], f"the run deadline ({budget} s) passed"
-                if failed_at is not None:
+                if not why and remaining <= 0:
+                    why = f"the run deadline ({budget} s) passed"
+                blocked = [a for a in st.get("after", []) if a in failed]
+                if why or blocked:
+                    failed.add(st["name"])
+                    failed_at = failed_at or st["name"]
                     sink.add([{"kind": "stage-finished", "state": "failed",
-                               "summary": f"not run — {why or 'stage ' + failed_at + ' failed first'}"}])
+                               "summary": f"not run — {why or 'stage ' + blocked[0] + ', which it runs after, failed first'}"}])
                     self.deliver(sink)
                     continue
                 self.drain_held(attempts=2)
@@ -2444,6 +2518,7 @@ class Host:
                 nuget_dir = os.path.join(workdir, "nuget")
                 os.makedirs(nuget_dir, exist_ok=True)
                 nuget_before = nuget_packages(nuget_dir)
+                art_before = artifact_snapshot(artifacts_dir)
                 ok = self.run_stage(dict(st, timeoutMinutes=min(st["timeoutMinutes"], remaining / 60)),
                                     checkout_dir, outputs_dir, sink,
                                     {**extra, "MW_BUILD_STAGE": st["name"], "NUGET_PACKAGES": nuget_dir},
@@ -2468,7 +2543,25 @@ class Host:
                                                        + (f", {len(nr)} NOT promoted (unverified)" if nr else "")}])
                     self.deliver(sink)
                 if not ok:
-                    failed_at = st["name"]
+                    failed.add(st["name"])
+                    ran_red.append(st["name"])
+                    # A red stage's artifacts never reach a later sibling's hand-over (which uploads everything under the
+                    # shared directory): what it added or rewrote is quarantined beside the run, out of the hand-over's walk.
+                    quarantined = quarantine_artifacts(artifacts_dir, art_before,
+                                                       os.path.join(workdir, "failed-artifacts", st["name"]))
+                    if quarantined:
+                        sink.add([{"kind": "line", "text": (f"artifacts: {len(quarantined)} entry(ies) left by the red stage "
+                                                            f"quarantined, never handed over: "
+                                                            f"{', '.join(quarantined[:5])}")[:MAX_LINE]}])
+                        self.deliver(sink)
+                    failed_at = failed_at or st["name"]
+                elif trunk and st["kind"] == "build" and ran_red:
+                    # The outputs folder is shared by every stage of the run, and a stage that ran red may have
+                    # left a PARTIAL output under a valid key (cache_key_problem verifies the key, never that the
+                    # output is complete). Once any stage ran red, nothing more from this run enters the cache.
+                    sink.add([{"kind": "line", "text": f"cache: outputs NOT promoted — stage {ran_red[0]} ran red "
+                                                       f"earlier in this run and may have left partial outputs"}])
+                    self.deliver(sink)
                 elif trunk and st["kind"] == "build":
                     # Only COMPILATION is reused across runs — never a test verdict — and only a key
                     # the host can RECOMPUTE from the inputs the output names (cache_key_problem).
@@ -2492,8 +2585,10 @@ class Host:
                 self.held = []
                 return "undelivered"
             sink = self._sink_for(repo, sha, last_stage)
+            error = "; ".join(([f"stage {ran_red[0]} failed" if len(ran_red) == 1
+                                else f"stages {', '.join(ran_red)} failed"] if ran_red else []) + ([why] if why else []))
             sink.add([{"kind": "run-finished", "succeeded": failed_at is None,
-                       "error": None if failed_at is None else (why or f"stage {failed_at} failed")}])
+                       "error": None if failed_at is None else (error or f"stage {failed_at} failed")}])
             if not sink.flush(attempts=12):
                 self.log(f"{path}: run-finished could not be delivered — the instance's adoption re-queues the run")
                 return "undelivered"
@@ -3275,6 +3370,29 @@ def self_test() -> int:
         except Refusal:
             pass
     d = validate_stages(good)
+    check("stages/no `after`: a stage runs after every earlier BUILD stage",
+          [x["after"] for x in d] == [[], ["compile-check"]], [x["after"] for x in d])
+    deps = validate_stages({"stages": [{"name": "build", "kind": "build", "command": "t"},
+                                       {"name": "s0", "kind": "test", "command": "t"},
+                                       {"name": "s1", "kind": "test", "command": "t"},
+                                       {"name": "doc", "kind": "test", "command": "t", "after": ["build", "s0"]},
+                                       {"name": "lone", "kind": "test", "command": "t", "after": []}]})
+    check("stages/sibling test stages do NOT run after each other (only after the build)",
+          [x["after"] for x in deps] == [[], ["build"], ["build"], ["build", "s0"], []], [x["after"] for x in deps])
+    for bad in ({"stages": [{"name": "a", "kind": "build", "command": "t", "after": ["b"]},
+                            {"name": "b", "kind": "test", "command": "t"}]},
+                {"stages": [{"name": "a", "kind": "build", "command": "t", "after": ["a"]}]},
+                {"stages": [{"name": "a", "kind": "build", "command": "t"},
+                            {"name": "b", "kind": "test", "command": "t", "after": "a"}]},
+                {"stages": [{"name": "a", "kind": "build", "command": "t"},
+                            {"name": "b", "kind": "test", "command": "t", "after": ["a", "a"]}]},
+                {"stages": [{"name": "a", "kind": "build", "command": "t"},
+                            {"name": "b", "kind": "test", "command": "t", "after": ["nope"]}]}):
+        try:
+            validate_stages(bad)
+            check(f"stages/refuses `after` {bad}", False, "accepted")
+        except Refusal:
+            pass
     check("stages/claim selects", [x["name"] for x in select_stages(d, ["build/gate"])] == ["gate"])
     check("stages/a stable stage check selects its stage", [x["name"] for x in select_stages(d, ["build-stable/gate"])] == ["gate"])
     try:
@@ -3914,6 +4032,49 @@ def self_test() -> int:
         rf_ = [e for _, e in allev if e["kind"] == "run-finished"]
         check("run/run-finished false, once", len(rf_) == 1 and rf_[0]["succeeded"] is False, rf_)
 
+        # A red SIBLING hides nothing: build green, s0 red → s1 (after the build only) still RUNS, doc (after s0)
+        # is not run and says which stage it waited on, tail (after doc) is not run either (a skip propagates),
+        # lone (`after: []`) runs. The run stays red, naming the stage that ran red.
+        posted.clear()
+        marks = os.path.join(tmp, "sib")
+        os.makedirs(marks)
+        h5s = host(api_ev(), env=env_s, checkout=checkout_with({"stages": [
+            {"name": "build", "kind": "build", "command": f"touch {marks}/build"},
+            {"name": "s0", "kind": "test", "command": f"touch {marks}/s0; exit 1"},
+            {"name": "s1", "kind": "test", "command": f"touch {marks}/s1"},
+            {"name": "doc", "kind": "test", "command": f"touch {marks}/doc", "after": ["s0"]},
+            {"name": "tail", "kind": "test", "command": f"touch {marks}/tail", "after": ["doc"]},
+            {"name": "lone", "kind": "test", "command": f"touch {marks}/lone", "after": []}]}))
+        check("run/siblings ran", h5s.run(claim) == "ran")
+        check("run/an independent stage after a red sibling RUNS (one red shard never hides the others)",
+              sorted(os.listdir(marks)) == ["build", "lone", "s0", "s1"], sorted(os.listdir(marks)))
+        allev = [(pth, e) for pth, evs in posted for e in evs]
+        fin = {pth.split("/")[-2]: e for pth, e in allev if e["kind"] == "stage-finished"}
+        check("run/the independent sibling is GREEN", fin.get("s1", {}).get("state") == "succeeded", fin)
+        check("run/a dependant of the red stage is not run and names it",
+              fin.get("doc", {}).get("state") == "failed" and "not run" in fin["doc"]["summary"]
+              and "s0" in fin["doc"]["summary"], fin)
+        check("run/a skip propagates to the skipped stage's own dependants",
+              fin.get("tail", {}).get("state") == "failed" and "doc" in fin["tail"]["summary"], fin)
+        rf_ = [e for _, e in allev if e["kind"] == "run-finished"]
+        check("run/a red sibling keeps the RUN red, naming the stage that ran red",
+              len(rf_) == 1 and rf_[0]["succeeded"] is False and rf_[0]["error"] == "stage s0 failed", rf_)
+        # Negative control: the same declaration with the BUILD red runs nothing that runs after it — only `lone`.
+        posted.clear()
+        shutil.rmtree(marks)
+        os.makedirs(marks)
+        h5n = host(api_ev(), env=env_s, checkout=checkout_with({"stages": [
+            {"name": "build", "kind": "build", "command": f"touch {marks}/build; exit 1"},
+            {"name": "s0", "kind": "test", "command": f"touch {marks}/s0"},
+            {"name": "s1", "kind": "test", "command": f"touch {marks}/s1"},
+            {"name": "lone", "kind": "test", "command": f"touch {marks}/lone", "after": []}]}))
+        h5n.run(claim)
+        check("run/negative control: a red BUILD skips every stage that runs after it",
+              sorted(os.listdir(marks)) == ["build", "lone"], sorted(os.listdir(marks)))
+        fin = {pth.split("/")[-2]: e for pth, evs in posted for e in evs if e["kind"] == "stage-finished"}
+        check("run/negative control: the shards are not run, naming the build",
+              all(fin.get(n, {}).get("state") == "failed" and "build" in fin[n]["summary"] for n in ("s0", "s1")), fin)
+
         # what a stage SEES: fresh process per stage, publish from the claim, nothing credential-shaped
         seen = os.path.join(tmp, "seen")
         dump = f"echo $$ ${{MW_BUILD_PUBLISH}} ${{AZURE_CLIENT_SECRET:-none}} ${{BUILD_TOKEN_FILE:-none}} ${{GITHUB_TOKEN:-none}} >> {seen}"
@@ -3954,6 +4115,22 @@ def self_test() -> int:
              f"mkdir -p $MW_BUILD_OUTPUTS/{lie} && cp s.json $MW_BUILD_OUTPUTS/{lie}/.cache-key.json"}]}))
         h6l.run(dict(claim, isTrunk=True))
         check("run/an output whose name is not its recomputed key is refused", not os.path.exists(os.path.join(cache, "outputs", "MeshWeaver.Plugins", lie)))
+        # a red BUILD stage's partial output is never promoted by an independent build that runs after it
+        keyed_b = keyed.replace("public class A {}", "public class B {}").replace("> ../KEY", "> ../KEYB")
+        partial = [{"name": "bad", "kind": "build", "command": keyed_b + f" && cp ../KEYB {tmp}/KEYB; exit 1"},
+                   {"name": "good", "kind": "build", "command": "true", "after": []}]
+        posted.clear()
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": partial})).run(dict(claim, isTrunk=True))
+        kb = open(os.path.join(tmp, "KEYB")).read().strip() if os.path.exists(os.path.join(tmp, "KEYB")) else ""
+        fin = {pth.split("/")[-2]: e for pth, evs in posted for e in evs if e["kind"] == "stage-finished"}
+        check("run/the independent build after a red build RUNS", fin.get("good", {}).get("state") == "succeeded", fin)
+        check("run/a red build's (partial) output is NOT promoted by a later independent build",
+              kb and not os.path.exists(os.path.join(cache, "outputs", "MeshWeaver.Plugins", kb)), kb)
+        # Negative control: the same declaration with `bad` GREEN promotes that very output.
+        partial[0] = dict(partial[0], command=keyed_b + f" && cp ../KEYB {tmp}/KEYB")
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": partial})).run(dict(claim, isTrunk=True))
+        check("run/negative control: the same output from a GREEN build is promoted",
+              kb and os.path.isfile(os.path.join(cache, "outputs", "MeshWeaver.Plugins", kb, "A.dll")), kb)
 
         # ── 7b. a PREPARED server: no stage prepares per run; what a run had to restore warms the server ──
         for cmd_, why_ in (("python3 .github/scripts/resolve-platform.py --passed-on-main", "resolve-platform"),
@@ -4502,6 +4679,70 @@ def self_test() -> int:
              checkout=checkout_with({"stages": [{"name": "modules", "kind": "build", "command": art_cmd}]})).run(claim)
         fin = [e for _, es in posted for e in es if e["kind"] == "stage-finished"]
         check("h9/artifacts with no store fail the stage", fin and fin[-1]["state"] == "failed" and "no artifact store" in fin[-1]["summary"], fin)
+        # A red stage that rewrites an EXISTING artifact in place, same size, and restores its mtime (cp -p, touch -d,
+        # timestamp normalisation) is still seen as a rewrite: ctime is part of the identity and no process can set it.
+        qroot = tempfile.mkdtemp(prefix="h9q-")
+        try:
+            art = os.path.join(qroot, "a", "Keep.zip")
+            os.makedirs(os.path.dirname(art))
+            for n_, body in (("Keep.zip", b"good"), ("Same.zip", b"same")):
+                with open(os.path.join(qroot, "a", n_), "wb") as fh:
+                    fh.write(body)
+            before_q = artifact_snapshot(qroot)
+            st0 = os.stat(art)
+            time.sleep(0.05)   # past the kernel's coarse timestamp tick, so the rewrite's ctime is a later one
+            with open(art, "r+b") as fh:
+                fh.write(b"evil")
+            os.utime(art, ns=(st0.st_atime_ns, st0.st_mtime_ns))
+            st1 = os.stat(art)
+            check("h9/negative control: size, mtime and inode alone cannot see the restored-mtime rewrite",
+                  (st1.st_size, st1.st_mtime_ns, st1.st_ino) == (st0.st_size, st0.st_mtime_ns, st0.st_ino), (st0, st1))
+            moved_q = quarantine_artifacts(qroot, before_q, os.path.join(qroot, "..", os.path.basename(qroot) + "-q"))
+            check("h9/a same-size rewrite with its mtime restored is quarantined; the untouched sibling stays",
+                  moved_q == [os.path.join("a", "Keep.zip")] and os.path.exists(os.path.join(qroot, "a", "Same.zip")),
+                  moved_q)
+        finally:
+            shutil.rmtree(qroot, ignore_errors=True)
+            shutil.rmtree(qroot + "-q", ignore_errors=True)
+        # A RED stage's artifacts never reach a later independent sibling's hand-over: the shared directory is walked
+        # whole by every green stage, so without the quarantine `bad`'s unfinished bundle would be receipted as `good`'s,
+        # and its dangling symlink would turn `good` red.
+        for leftover, label in (("echo half > $MW_BUILD_ARTIFACTS/Bad/Bad-1.0.0.zip", "an unfinished file"),
+                                ("ln -s /nonexistent $MW_BUILD_ARTIFACTS/Bad/dangling", "a dangling symlink")):
+            sib = [{"name": "good0", "kind": "build", "command": art_cmd},
+                   {"name": "bad", "kind": "build", "command": f"mkdir -p $MW_BUILD_ARTIFACTS/Bad && {leftover}; exit 1",
+                    "after": []},
+                   {"name": "good", "kind": "build", "command": "mkdir -p $MW_BUILD_ARTIFACTS/Good && echo ok > "
+                                                                "$MW_BUILD_ARTIFACTS/Good/Good.json", "after": []}]
+            for quarantine in (True, False):
+                posted.clear()
+                hq = host(api_ev(), env=dict(env_s, MW_BUILD_ARTIFACT_STORE="file:" + store_dir), store_runner=fake_store,
+                          checkout=checkout_with({"stages": sib}))
+                real_q = quarantine_artifacts
+                if not quarantine:   # NEGATIVE CONTROL: the same run with the quarantine disabled
+                    globals()["quarantine_artifacts"] = lambda root, before, dest: []
+                try:
+                    hq.run(claim)
+                finally:
+                    globals()["quarantine_artifacts"] = real_q
+                by = {}
+                for pth, es in posted:
+                    for e in es:
+                        by.setdefault(pth.split("/")[-2], []).append(e)
+                good_units = sorted(e["unit"] for e in by.get("good", []) if e["kind"] == "artifact")
+                good_fin = [e for e in by.get("good", []) if e["kind"] == "stage-finished"]
+                clean = (good_fin and good_fin[-1]["state"] == "succeeded"
+                         and not [u for u in good_units if u.startswith("Bad/")] and "Good/Good.json" in good_units
+                         and "Store/Store-1.4.2.zip" in good_units)
+                if quarantine:
+                    check(f"h9/{label} left by a red stage is not handed over by a later independent sibling, which stays green",
+                          clean, (good_fin, good_units))
+                    check(f"h9/{label}: the red stage says what it quarantined",
+                          any(e["kind"] == "line" and "quarantined" in e["text"] and e["text"].endswith(": Bad")
+                              for e in by.get("bad", [])), by.get("bad"))
+                else:
+                    check(f"h9/negative control: without the quarantine {label} reaches the sibling's hand-over",
+                          not clean, (good_fin, good_units))
         # H9, the API store (`MW_BUILD_ARTIFACT_STORE=api:`): each artifact is PUT to the build API as the run's holder and
         # its receipt is the SERVER's answer; nothing touches ci-artifact-store.py.
         api_env = dict(env_s, MW_BUILD_ARTIFACT_STORE="api:")
