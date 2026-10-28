@@ -24,6 +24,9 @@ buildHosts:
     requests: { cpu: "4", memory: 8Gi }
     limits: { cpu: "6", memory: 12Gi }
   workSizeLimit: 12Gi
+  # Fan-out within the VM: 2 stages of a `parallel` run at once (3 CPU / 6 GiB each of the 6 CPU / 12 GiB limit); the
+  # chart default (8) would exceed the Mac's cgroup, and the runner refuses to start on that.
+  stageSlots: 2
   cacheClaimName: "build-cache-mac"
   # The Mac's only class is node-local; one replica owns the cache.
   cache: {create: true, storageClass: "local-path", size: "20Gi", accessMode: "ReadWriteOnce"}

@@ -222,6 +222,8 @@ spec:
             # a process could inherit; no stage's sandbox binds /run/build-worker.
             - { name: BUILD_TOKEN_FILE, value: "/run/build-worker/token" }
             - { name: MW_BUILD_RUN_DEADLINE_SECONDS, value: {{ $b.runDeadline | quote }} }
+            # Fan-out: how many of a `parallel` run's stages run at once; the runner checks it against its cgroup.
+            - { name: MW_BUILD_STAGE_SLOTS, value: {{ $b.stageSlots | quote }} }
             {{- if eq $c.kind "channel" }}
             - { name: MW_BUILD_CHANNEL, value: {{ $c.name | quote }} }
             {{- else }}

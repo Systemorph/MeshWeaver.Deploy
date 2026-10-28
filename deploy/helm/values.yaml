@@ -1180,6 +1180,12 @@ buildHosts:
   # declares — they run sequentially (MeshWeaver.Plugins: compile-check 40 + gate 45 = 85 min); a
   # stage's timeoutMinutes is a per-stage cap inside it. Within [600, 43200] (budgetMinutes 10..720).
   runDeadlineSeconds: 7200
+  # FAN-OUT: how many of ONE run's stages a replica runs at once, when the repository declares its stages
+  # `"parallel": true` (core: build, then its 8 test shards and doc-gate concurrently — the Actions matrix on one
+  # host). A build stage always runs alone. Each concurrent stage needs at least 1 CPU and 2 GiB of the container's
+  # cgroup, and the runner REFUSES TO START when the declared slots exceed that (MW_BUILD_STAGE_SLOTS, build-run.py
+  # `stage_slots_refusal`) — so lowering `resources` means lowering this too. 1 = every run serial.
+  stageSlots: 8
   # KEDA: polling, the scale-to-zero calm window, and the scale-down stabilization window (longer
   # than a claim's round trip, so a replica is not removed between two runs).
   pollingInterval: 15
