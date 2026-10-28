@@ -90,9 +90,16 @@ THE LOOP, and the order that matters:
     trunk run whose key is not installed builds it (`build`, against the image's platform source
     `MW_PLATFORM_SOURCE`) and installs it — every push to main queues one, so the server follows
     main. A pull request with other sources builds it for that run only (MWPREP002), never installs.
-  * stages run in declaration order, fail-fast: after a failed stage the rest are finished
-    `failed` with "not run" — never left open, never silently skipped. When the claim names
-    `stages`, only those run, and a claimed stage the repository does not declare is RED.
+  * stages run in declaration order, and a stage is skipped ONLY when a stage it runs AFTER failed:
+    its `after` (names of stages declared earlier), or — when it declares none — every earlier
+    stage of kind `build` (what produces the outputs later stages read). A skipped stage is finished
+    `failed` with "not run — stage <x>, which it runs after, failed first" — never left open, never
+    silently skipped — and it counts as failed for ITS dependants. An independent sibling of a red
+    stage still runs, so one red test shard never hides the others. A prepared input that cannot be
+    provided, or the run deadline passing, ends every remaining stage "not run". The run is red if
+    ANY stage is. When the claim names `stages`, only those run (a dependency the claim did not
+    select is not run here and blocks nothing), and a claimed stage the repository does not declare
+    is RED.
 
 Environment (rendered by the chart from `buildHosts.*`):
   BUILD_API                    https://<operations instance>/api/builds              required
@@ -791,7 +798,22 @@ def validate_stages(doc: object) -> list[dict]:
         if not isinstance(needs, list) or not all(isinstance(n, str) and n in STAGE_NEEDS for n in needs):
             raise Refusal(f"stage {name!r} needs {needs!r} must be a list drawn from {sorted(STAGE_NEEDS)} — "
                           f"the shared-cache entries the stage may read (its own repository's mirror always)")
-        out.append({"name": name, "kind": kind, "command": cmd, "timeoutMinutes": float(tmo), "needs": list(needs)})
+        # `after`: the stages this one DEPENDS ON — it is skipped when any of them failed. Only names declared EARLIER
+        # (declaration order is execution order, so a dependency always runs first and no cycle can be written).
+        # Absent: every earlier `build` stage — the build that produces the outputs later stages read. `[]` declares
+        # a stage independent of every other.
+        if "after" in s:
+            after = s["after"]
+            if not isinstance(after, list) or not all(isinstance(a, str) for a in after) or len(set(after)) != len(after):
+                raise Refusal(f"stage {name!r} after {after!r} must be a list of distinct stage names")
+            unknown = [a for a in after if a not in seen or a == name]
+            if unknown:
+                raise Refusal(f"stage {name!r} runs after {unknown}, which no stage declared BEFORE it names — "
+                              f"a stage may run only after stages declared earlier in .github/build-stages.json")
+        else:
+            after = [o["name"] for o in out if o["kind"] == "build"]
+        out.append({"name": name, "kind": kind, "command": cmd, "timeoutMinutes": float(tmo), "needs": list(needs),
+                    "after": list(after)})
     return out
 
 
@@ -2399,7 +2421,13 @@ class Host:
                 **platform_scripts_env(os.path.dirname(os.path.abspath(__file__))),
                 **self.run_env,
             }
+            # A stage is skipped only when a stage it runs AFTER failed (`after`); its independent siblings still
+            # run. `failed` holds every red stage — ran red or was skipped — so a skip propagates to the skipped
+            # stage's own dependants. `why` is a RUN-WIDE stop (a prepared input, the run deadline) that ends every
+            # remaining stage. `failed_at` is the first red stage (the run's log line); any red stage reds the run.
             failed_at = None
+            failed: set = set()
+            ran_red: list = []
             why = ""
             run_end = self.clock() + budget
             prepared_ro: list[str] = []
@@ -2414,17 +2442,21 @@ class Host:
                     extra.update(penv)
                 except Refusal as r:
                     failed_at, why = stages[0]["name"], f"a prepared input could not be provided: {r}"
+                    failed.add(failed_at)
                     psink.add([{"kind": "line", "text": why[:MAX_LINE]}])
                     self.deliver(psink)
             for st in stages:
                 last_stage = st["name"]
                 sink = self._sink_for(repo, sha, st["name"])
                 remaining = run_end - self.clock()
-                if failed_at is None and remaining <= 0:
-                    failed_at, why = st["name"], f"the run deadline ({budget} s) passed"
-                if failed_at is not None:
+                if not why and remaining <= 0:
+                    why = f"the run deadline ({budget} s) passed"
+                blocked = [a for a in st.get("after", []) if a in failed]
+                if why or blocked:
+                    failed.add(st["name"])
+                    failed_at = failed_at or st["name"]
                     sink.add([{"kind": "stage-finished", "state": "failed",
-                               "summary": f"not run — {why or 'stage ' + failed_at + ' failed first'}"}])
+                               "summary": f"not run — {why or 'stage ' + blocked[0] + ', which it runs after, failed first'}"}])
                     self.deliver(sink)
                     continue
                 self.drain_held(attempts=2)
@@ -2458,7 +2490,9 @@ class Host:
                                                        + (f", {len(nr)} NOT promoted (unverified)" if nr else "")}])
                     self.deliver(sink)
                 if not ok:
-                    failed_at = st["name"]
+                    failed.add(st["name"])
+                    ran_red.append(st["name"])
+                    failed_at = failed_at or st["name"]
                 elif trunk and st["kind"] == "build":
                     # Only COMPILATION is reused across runs — never a test verdict — and only a key
                     # the host can RECOMPUTE from the inputs the output names (cache_key_problem).
@@ -2482,8 +2516,10 @@ class Host:
                 self.held = []
                 return "undelivered"
             sink = self._sink_for(repo, sha, last_stage)
+            error = "; ".join(([f"stage {ran_red[0]} failed" if len(ran_red) == 1
+                                else f"stages {', '.join(ran_red)} failed"] if ran_red else []) + ([why] if why else []))
             sink.add([{"kind": "run-finished", "succeeded": failed_at is None,
-                       "error": None if failed_at is None else (why or f"stage {failed_at} failed")}])
+                       "error": None if failed_at is None else (error or f"stage {failed_at} failed")}])
             if not sink.flush(attempts=12):
                 self.log(f"{path}: run-finished could not be delivered — the instance's adoption re-queues the run")
                 return "undelivered"
@@ -3192,6 +3228,29 @@ def self_test() -> int:
         except Refusal:
             pass
     d = validate_stages(good)
+    check("stages/no `after`: a stage runs after every earlier BUILD stage",
+          [x["after"] for x in d] == [[], ["compile-check"]], [x["after"] for x in d])
+    deps = validate_stages({"stages": [{"name": "build", "kind": "build", "command": "t"},
+                                       {"name": "s0", "kind": "test", "command": "t"},
+                                       {"name": "s1", "kind": "test", "command": "t"},
+                                       {"name": "doc", "kind": "test", "command": "t", "after": ["build", "s0"]},
+                                       {"name": "lone", "kind": "test", "command": "t", "after": []}]})
+    check("stages/sibling test stages do NOT run after each other (only after the build)",
+          [x["after"] for x in deps] == [[], ["build"], ["build"], ["build", "s0"], []], [x["after"] for x in deps])
+    for bad in ({"stages": [{"name": "a", "kind": "build", "command": "t", "after": ["b"]},
+                            {"name": "b", "kind": "test", "command": "t"}]},
+                {"stages": [{"name": "a", "kind": "build", "command": "t", "after": ["a"]}]},
+                {"stages": [{"name": "a", "kind": "build", "command": "t"},
+                            {"name": "b", "kind": "test", "command": "t", "after": "a"}]},
+                {"stages": [{"name": "a", "kind": "build", "command": "t"},
+                            {"name": "b", "kind": "test", "command": "t", "after": ["a", "a"]}]},
+                {"stages": [{"name": "a", "kind": "build", "command": "t"},
+                            {"name": "b", "kind": "test", "command": "t", "after": ["nope"]}]}):
+        try:
+            validate_stages(bad)
+            check(f"stages/refuses `after` {bad}", False, "accepted")
+        except Refusal:
+            pass
     check("stages/claim selects", [x["name"] for x in select_stages(d, ["build/gate"])] == ["gate"])
     check("stages/a stable stage check selects its stage", [x["name"] for x in select_stages(d, ["build-stable/gate"])] == ["gate"])
     try:
@@ -3830,6 +3889,49 @@ def self_test() -> int:
         check("run/fail-fast: the second stage never started", not os.path.exists(os.path.join(tmp, "ran2")))
         rf_ = [e for _, e in allev if e["kind"] == "run-finished"]
         check("run/run-finished false, once", len(rf_) == 1 and rf_[0]["succeeded"] is False, rf_)
+
+        # A red SIBLING hides nothing: build green, s0 red → s1 (after the build only) still RUNS, doc (after s0)
+        # is not run and says which stage it waited on, tail (after doc) is not run either (a skip propagates),
+        # lone (`after: []`) runs. The run stays red, naming the stage that ran red.
+        posted.clear()
+        marks = os.path.join(tmp, "sib")
+        os.makedirs(marks)
+        h5s = host(api_ev(), env=env_s, checkout=checkout_with({"stages": [
+            {"name": "build", "kind": "build", "command": f"touch {marks}/build"},
+            {"name": "s0", "kind": "test", "command": f"touch {marks}/s0; exit 1"},
+            {"name": "s1", "kind": "test", "command": f"touch {marks}/s1"},
+            {"name": "doc", "kind": "test", "command": f"touch {marks}/doc", "after": ["s0"]},
+            {"name": "tail", "kind": "test", "command": f"touch {marks}/tail", "after": ["doc"]},
+            {"name": "lone", "kind": "test", "command": f"touch {marks}/lone", "after": []}]}))
+        check("run/siblings ran", h5s.run(claim) == "ran")
+        check("run/an independent stage after a red sibling RUNS (one red shard never hides the others)",
+              sorted(os.listdir(marks)) == ["build", "lone", "s0", "s1"], sorted(os.listdir(marks)))
+        allev = [(pth, e) for pth, evs in posted for e in evs]
+        fin = {pth.split("/")[-2]: e for pth, e in allev if e["kind"] == "stage-finished"}
+        check("run/the independent sibling is GREEN", fin.get("s1", {}).get("state") == "succeeded", fin)
+        check("run/a dependant of the red stage is not run and names it",
+              fin.get("doc", {}).get("state") == "failed" and "not run" in fin["doc"]["summary"]
+              and "s0" in fin["doc"]["summary"], fin)
+        check("run/a skip propagates to the skipped stage's own dependants",
+              fin.get("tail", {}).get("state") == "failed" and "doc" in fin["tail"]["summary"], fin)
+        rf_ = [e for _, e in allev if e["kind"] == "run-finished"]
+        check("run/a red sibling keeps the RUN red, naming the stage that ran red",
+              len(rf_) == 1 and rf_[0]["succeeded"] is False and rf_[0]["error"] == "stage s0 failed", rf_)
+        # Negative control: the same declaration with the BUILD red runs nothing that runs after it — only `lone`.
+        posted.clear()
+        shutil.rmtree(marks)
+        os.makedirs(marks)
+        h5n = host(api_ev(), env=env_s, checkout=checkout_with({"stages": [
+            {"name": "build", "kind": "build", "command": f"touch {marks}/build; exit 1"},
+            {"name": "s0", "kind": "test", "command": f"touch {marks}/s0"},
+            {"name": "s1", "kind": "test", "command": f"touch {marks}/s1"},
+            {"name": "lone", "kind": "test", "command": f"touch {marks}/lone", "after": []}]}))
+        h5n.run(claim)
+        check("run/negative control: a red BUILD skips every stage that runs after it",
+              sorted(os.listdir(marks)) == ["build", "lone"], sorted(os.listdir(marks)))
+        fin = {pth.split("/")[-2]: e for pth, evs in posted for e in evs if e["kind"] == "stage-finished"}
+        check("run/negative control: the shards are not run, naming the build",
+              all(fin.get(n, {}).get("state") == "failed" and "build" in fin[n]["summary"] for n in ("s0", "s1")), fin)
 
         # what a stage SEES: fresh process per stage, publish from the claim, nothing credential-shaped
         seen = os.path.join(tmp, "seen")
