@@ -2493,6 +2493,13 @@ class Host:
                     failed.add(st["name"])
                     ran_red.append(st["name"])
                     failed_at = failed_at or st["name"]
+                elif trunk and st["kind"] == "build" and ran_red:
+                    # The outputs folder is shared by every stage of the run, and a stage that ran red may have
+                    # left a PARTIAL output under a valid key (cache_key_problem verifies the key, never that the
+                    # output is complete). Once any stage ran red, nothing more from this run enters the cache.
+                    sink.add([{"kind": "line", "text": f"cache: outputs NOT promoted — stage {ran_red[0]} ran red "
+                                                       f"earlier in this run and may have left partial outputs"}])
+                    self.deliver(sink)
                 elif trunk and st["kind"] == "build":
                     # Only COMPILATION is reused across runs — never a test verdict — and only a key
                     # the host can RECOMPUTE from the inputs the output names (cache_key_problem).
@@ -3973,6 +3980,22 @@ def self_test() -> int:
              f"mkdir -p $MW_BUILD_OUTPUTS/{lie} && cp s.json $MW_BUILD_OUTPUTS/{lie}/.cache-key.json"}]}))
         h6l.run(dict(claim, isTrunk=True))
         check("run/an output whose name is not its recomputed key is refused", not os.path.exists(os.path.join(cache, "outputs", "MeshWeaver.Plugins", lie)))
+        # a red BUILD stage's partial output is never promoted by an independent build that runs after it
+        keyed_b = keyed.replace("public class A {}", "public class B {}").replace("> ../KEY", "> ../KEYB")
+        partial = [{"name": "bad", "kind": "build", "command": keyed_b + f" && cp ../KEYB {tmp}/KEYB; exit 1"},
+                   {"name": "good", "kind": "build", "command": "true", "after": []}]
+        posted.clear()
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": partial})).run(dict(claim, isTrunk=True))
+        kb = open(os.path.join(tmp, "KEYB")).read().strip() if os.path.exists(os.path.join(tmp, "KEYB")) else ""
+        fin = {pth.split("/")[-2]: e for pth, evs in posted for e in evs if e["kind"] == "stage-finished"}
+        check("run/the independent build after a red build RUNS", fin.get("good", {}).get("state") == "succeeded", fin)
+        check("run/a red build's (partial) output is NOT promoted by a later independent build",
+              kb and not os.path.exists(os.path.join(cache, "outputs", "MeshWeaver.Plugins", kb)), kb)
+        # Negative control: the same declaration with `bad` GREEN promotes that very output.
+        partial[0] = dict(partial[0], command=keyed_b + f" && cp ../KEYB {tmp}/KEYB")
+        host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": partial})).run(dict(claim, isTrunk=True))
+        check("run/negative control: the same output from a GREEN build is promoted",
+              kb and os.path.isfile(os.path.join(cache, "outputs", "MeshWeaver.Plugins", kb, "A.dll")), kb)
 
         # ── 7b. a PREPARED server: no stage prepares per run; what a run had to restore warms the server ──
         for cmd_, why_ in (("python3 .github/scripts/resolve-platform.py --passed-on-main", "resolve-platform"),
