@@ -713,6 +713,7 @@ for entry in \
   "values.build-hosts-run-deadline-too-long.yaml|RUN budget" \
   "values.build-hosts-run-deadline-zero.yaml|RUN budget" \
   "values.build-hosts-stage-slots-zero.yaml|buildHosts.stageSlots 0 must be within" \
+  "values.build-hosts-stage-slots-fraction.yaml|buildHosts.stageSlots 2.9 must be a whole number" \
   "values.build-hosts-alias-twice.yaml|an alias is ONE version" \
   "values.build-hosts-version-twice.yaml|one deployment per version" \
   "values.build-hosts-bad-version.yaml|must be MAJOR.MINOR.PATCH" \

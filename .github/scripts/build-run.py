@@ -109,7 +109,8 @@ THE LOOP, and the order that matters:
     Each concurrent stage keeps its own sandbox, /tmp, scratch, PostgreSQL socket and event route, and hands over
     its OWN `$MW_BUILD_ARTIFACTS` (`<run>/artifacts/<stage>/`), so a sibling can neither see nor contribute to
     another's receipts; a red stage's directory is quarantined whole. The declared budget is the schedule
-    (`planned_seconds`: the critical path through the slots), the run deadline still ends every stage not started,
+    (`planned_seconds`: the critical path through the slots — and the scheduler is PINNED to that all-caps schedule,
+    `cap_schedule`, so a stage finishing early can never push a later one past it), the run deadline still ends every stage not started,
     a 409 on any stage's route kills every sibling in flight and abandons the run, and the pid-namespace leftover
     check runs whenever no stage is in flight. Without both declarations the run is serial, exactly as below.
   * stages run in declaration order, and a stage is skipped ONLY when a stage it runs AFTER failed:
@@ -160,6 +161,7 @@ import base64
 import json
 import os
 import queue
+import random
 import re
 import shutil
 import signal
@@ -994,10 +996,12 @@ def load_parallel(path: str) -> bool:
 
 
 def next_stages(pending: Sequence[dict], selected: set, finished: set, failed: set, running: dict,
-                slots: int) -> tuple[list[tuple[dict, str]], list[dict]]:
+                slots: int, prereqs: Optional[dict] = None) -> tuple[list[tuple[dict, str]], list[dict]]:
     """One scheduling decision. `pending` in declaration order; `running` maps each in-flight stage to its kind.
     Returns (blocked, start): the pending stages a FAILED dependency blocks — each with the first such dependency — and
-    the stages to start now. A dependency the claim did not select is not run here and blocks nothing."""
+    the stages to start now. A dependency the claim did not select is not run here and blocks nothing. `prereqs` (fan-out,
+    `cap_schedule`) PINS the schedule: a stage also waits until every stage its all-caps schedule finished before it
+    started has finished here — so no stage ever starts later than the declared budget planned it."""
     blocked: list[tuple[dict, str]] = []
     start: list[dict] = []
     running = dict(running)
@@ -1009,6 +1013,8 @@ def next_stages(pending: Sequence[dict], selected: set, finished: set, failed: s
             continue
         if any(a not in finished for a in deps):
             continue
+        if prereqs is not None and any(p not in finished for p in prereqs.get(st["name"], ())):
+            continue
         if "build" in running.values() or (st["kind"] == "build" and running) or len(running) >= slots:
             break
         start.append(st)
@@ -1016,29 +1022,53 @@ def next_stages(pending: Sequence[dict], selected: set, finished: set, failed: s
     return blocked, start
 
 
-def planned_seconds(stages: Sequence[dict], slots: int) -> float:
-    """The schedule's length when every stage takes its full cap: `next_stages` simulated over the caps. With one slot it
-    is the caps' sum — the serial run; with fan-out, the critical path through the slots."""
-    if slots <= 1:
-        return sum(float(st.get("timeoutMinutes", DEFAULT_STAGE_TIMEOUT_MINUTES)) * 60 for st in stages)
+def simulate_schedule(stages: Sequence[dict], slots: int, duration: Callable[[dict], float],
+                      prereqs: Optional[dict] = None) -> tuple[float, dict]:
+    """Run `next_stages` over `stages` (none failing) with each stage taking `duration(stage)` seconds. Returns the
+    makespan and, per stage, the stages that had FINISHED before it started — the pin `cap_schedule` hands the scheduler."""
     stages = [dict(st, name=st.get("name", f"#{i}"), kind=st.get("kind", "test")) for i, st in enumerate(stages)]
     selected = {s["name"] for s in stages}
     pending = list(stages)
     finished: set = set()
     inflight: dict = {}
+    before: dict = {}
     now = 0.0
     while pending or inflight:
-        _, start = next_stages(pending, selected, finished, set(), {n: k for n, (_, k) in inflight.items()}, slots)
+        _, start = next_stages(pending, selected, finished, set(), {n: k for n, (_, k) in inflight.items()}, slots, prereqs)
         for st in start:
             pending.remove(st)
-            inflight[st["name"]] = (now + float(st.get("timeoutMinutes", DEFAULT_STAGE_TIMEOUT_MINUTES)) * 60, st["kind"])
+            before[st["name"]] = frozenset(finished)
+            inflight[st["name"]] = (now + float(duration(st)), st["kind"])
         if not inflight:
             break
         now = min(end for end, _ in inflight.values())
         for n in [n for n, (end, _) in inflight.items() if end <= now]:
             finished.add(n)
             del inflight[n]
-    return now
+    return now, before
+
+
+def _cap_seconds(st: dict) -> float:
+    return float(st.get("timeoutMinutes", DEFAULT_STAGE_TIMEOUT_MINUTES)) * 60
+
+
+def cap_schedule(stages: Sequence[dict], slots: int) -> tuple[float, Optional[dict]]:
+    """The schedule when every stage takes its full cap, and the PIN that makes it a bound: per stage, the stages that
+    finished before it started there. A greedy schedule is NOT monotone in its durations (Graham's anomaly — a stage
+    finishing early hands its slot to a stage that then delays a longer one), so the all-caps length alone bounds
+    nothing; with every stage also waiting for its pinned predecessors (`next_stages(prereqs=…)`), each start is the
+    latest finish of a fixed set of stages, so no stage starts later than it does here and the run ends within it.
+    One slot: the caps' sum, no pin (one stage at a time is monotone by itself)."""
+    if slots <= 1:
+        return sum(_cap_seconds(st) for st in stages), None
+    return simulate_schedule(stages, slots, _cap_seconds)
+
+
+def planned_seconds(stages: Sequence[dict], slots: int) -> float:
+    """The schedule's length when every stage takes its full cap (`cap_schedule`). With one slot it is the caps' sum — the
+    serial run; with fan-out, the critical path through the slots — a BOUND on the run, because the scheduler is pinned
+    to that schedule."""
+    return cap_schedule(stages, slots)[0]
 
 
 def cgroup_capacity(root: str = "/sys/fs/cgroup") -> tuple[float, Optional[int]]:
@@ -1086,6 +1116,19 @@ class Lost(Exception):
     """409: the run is claimed by another host. Stop everything for it."""
 
 
+class CancellableReader:
+    """A request body read block by block that raises Lost once `cancel` is set — http.client streams a file-like body
+    by calling `read`, so an upload of an abandoned run stops at its next block instead of running to its timeout."""
+
+    def __init__(self, fh, cancel: threading.Event) -> None:
+        self.fh, self.cancel = fh, cancel
+
+    def read(self, n: int = -1) -> bytes:
+        if self.cancel.is_set():
+            raise Lost("the run was abandoned while an artifact upload was streaming")
+        return self.fh.read(n)
+
+
 class Api:
     def __init__(self, base: str, token: str) -> None:
         self.base = base.rstrip("/")
@@ -1117,12 +1160,15 @@ class Api:
             return 0, str(e)
 
 
-    def upload(self, path: str, query: dict, file_path: str, size: int, timeout: float) -> tuple[int, object]:
+    def upload(self, path: str, query: dict, file_path: str, size: int, timeout: float,
+               cancel: Optional[threading.Event] = None) -> tuple[int, object]:
         """PUT one file's bytes to `path` (`Content-Length` = `size`, streamed from disk, never read whole into memory) with
-        the worker token; the answer's status and JSON body, as `call` returns them (0 = transport failure)."""
+        the worker token; the answer's status and JSON body, as `call` returns them (0 = transport failure). `cancel` set
+        while the body streams raises Lost at the next block — an abandoned run stops sending at once."""
         url = self.base + path + (("?" + urllib.parse.urlencode(query)) if query else "")
         try:
-            with open(file_path, "rb") as fh:
+            with open(file_path, "rb") as raw_fh:
+                fh = CancellableReader(raw_fh, cancel) if cancel is not None else raw_fh
                 req = urllib.request.Request(url, data=fh, method="PUT", headers={
                     "Authorization": f"Bearer {self.token}", "Accept": "application/json",
                     "Content-Type": "application/octet-stream", "Content-Length": str(size)})
@@ -2205,12 +2251,27 @@ def _git_run(args: list[str], env: dict) -> tuple[int, str]:
     return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 
-def _run_capture_stdout(argv: list[str], timeout: float = 1800) -> tuple[int, str]:
+def _run_capture_stdout(argv: list[str], timeout: float = 1800,
+                        cancel: Optional[threading.Event] = None) -> tuple[int, str]:
     """A HOST helper (ci-artifact-store.py): no credential but the Azure workload identity's.
-    `timeout` is the caller's remaining RUN budget; past it the helper is killed (TimeoutExpired)."""
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=max(1.0, timeout),
-                       env={k: v for k, v in os.environ.items() if not SECRET_ENV.search(k) or k.startswith("AZURE_")})
-    return r.returncode, (r.stdout or "") + ("\n" + r.stderr if r.returncode else "")
+    `timeout` is the caller's remaining RUN budget; past it the helper is killed (TimeoutExpired). `cancel` set (the run
+    was abandoned — a sibling stage met the 409) kills it at once and raises Lost: never a store call waited out."""
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
+                            start_new_session=True,
+                            env={k: v for k, v in os.environ.items() if not SECRET_ENV.search(k) or k.startswith("AZURE_")})
+    end = time.monotonic() + max(1.0, timeout)
+    while True:
+        try:
+            out, err = proc.communicate(timeout=max(0.01, min(1.0, end - time.monotonic())))
+            break
+        except subprocess.TimeoutExpired:
+            if cancel is not None and cancel.is_set():
+                _kill(proc)
+                raise Lost(f"{os.path.basename(argv[1]) if len(argv) > 1 else argv[0]}: killed — the run was abandoned")
+            if time.monotonic() >= end:
+                _kill(proc)
+                raise subprocess.TimeoutExpired(argv, timeout)
+    return proc.returncode, (out or "") + ("\n" + err if proc.returncode else "")
 
 
 def _run_capture(argv: list[str]) -> tuple[int, str]:
@@ -2725,6 +2786,9 @@ class Host:
             # artifacts directory); everything AFTER a stage (the restored-package report, the promotions, the
             # quarantine, the leftover check) runs here, on the scheduler's thread, one stage at a time.
             selected = {s["name"] for s in stages}
+            # The PIN: with fan-out a stage also waits for every stage the budget's all-caps schedule finished before it
+            # started, so the declared budget bounds the run whatever the stages' real durations (`cap_schedule`).
+            pin = cap_schedule(stages, slots)[1] if fanout else None
             finished: set = set()
             pending = list(stages)
             inflight: dict = {}            # name → (thread, stage, nuget_before, art_before, artifacts dir)
@@ -2768,10 +2832,14 @@ class Host:
                     try:
                         ok = self.run_stage(spec, checkout_dir, outputs_dir, sink, stage_env,
                                             readonly=readonly, writable=[art, nuget_dir],
-                                            hand_over=lambda: self.hand_over_artifacts(repo, sha, name, art, deadline=run_end),
+                                            hand_over=lambda: self.hand_over_artifacts(repo, sha, name, art, deadline=run_end,
+                                                                                       cancel=cancel),
                                             cancel=cancel)
                         done.put((name, ok, None))
                     except BaseException as e:     # Lost, or a host defect: the scheduler decides, never a dead thread
+                        # The run is abandoned the moment a worker KNOWS it — not when the scheduler reads this from the
+                        # queue: a sibling's success queued ahead of it must not get its freed slot refilled first.
+                        cancel.set()
                         done.put((name, False, e))
 
                 t = threading.Thread(target=work, name=f"stage-{st['name']}", daemon=True)
@@ -2837,24 +2905,27 @@ class Host:
                         self.deliver(sink)
 
             try:
-                # Once the run is lost nothing more starts: the loop drains only what is in flight.
-                while (pending and lost is None) or inflight:
-                    if lost is None:
+                # Once the run is lost nothing more starts: the loop drains only what is in flight. `cancel` is the
+                # signal — a worker sets it the moment it meets the 409, before its exception reaches this queue.
+                while (pending and lost is None and not cancel.is_set()) or inflight:
+                    if lost is None and not cancel.is_set():
                         if not why and run_end - self.clock() <= 0:
                             why = f"the run deadline ({budget} s) passed"
                         if why:
                             for st in list(pending):
                                 not_run(st, why)
-                        while pending:
+                        while pending and not cancel.is_set():
                             blocked, ready = next_stages(pending, selected, finished, failed,
-                                                         {n: v[1]["kind"] for n, v in inflight.items()}, slots)
+                                                         {n: v[1]["kind"] for n, v in inflight.items()}, slots, pin)
                             for st, dep in blocked:
                                 not_run(st, f"stage {dep}, which it runs after, failed first")
                             for st in ready:
+                                if cancel.is_set():
+                                    break
                                 start(st)
                             if not blocked and not ready:
                                 break
-                        if pending and not inflight:
+                        if pending and not inflight and not cancel.is_set():
                             # Unreachable: every dependency is declared earlier, so with nothing in flight the first
                             # pending stage is ready or blocked. A scheduler that stalls is a host defect — said, red.
                             raise Fatal(f"the stage scheduler made no progress with {[s['name'] for s in pending]} pending")
@@ -3328,6 +3399,13 @@ class Host:
         """Run ONE stage in a fresh sandboxed process tree; post its events; return success. `cancel` (fan-out): set
         when a sibling stage found the run is no longer this host's — the stage is killed and Lost raised."""
         name, started = st["name"], self.clock()
+
+        def abandoned() -> None:
+            if cancel is not None and cancel.is_set():
+                raise Lost(f"stage {name}: abandoned — a sibling stage found the run is not this host's claim any more")
+
+        # Never START a sandbox for a run already abandoned (a sibling may have met the 409 since this stage was picked).
+        abandoned()
         parser = OutputParser(checkout, name)
         sink.add([{"kind": "line", "text": f"[00:00:00] {st['kind']}/{name} on build-{self.lane} "
                                            f"({self.platform_version}, plugins {(self.plugins_digest or '-')[:19]})"}])
@@ -3352,10 +3430,6 @@ class Host:
         threading.Thread(target=reader, daemon=True).start()
         deadline = started + st["timeoutMinutes"] * 60
         timed_out = False
-
-        def abandoned() -> None:
-            if cancel is not None and cancel.is_set():
-                raise Lost(f"stage {name}: abandoned — a sibling stage found the run is not this host's claim any more")
 
         try:
             while True:
@@ -3402,6 +3476,8 @@ class Host:
             # nothing structured explains the failure — the tail is the evidence
             events += [{"kind": "line", "text": "│ " + t} for t in parser.tail if t.strip()]
         note = f"timed out after {st['timeoutMinutes']:g} min" if timed_out else ""
+        # An abandoned run hands nothing over and posts no verdict: the hand-over itself stops at its next step too.
+        abandoned()
         if ok and hand_over is not None:
             # H9: every artifact the stage produced is in the shared CI store, its stored hash re-read,
             # BEFORE the stage can succeed — a receipt the instance holds is a byte the store holds.
@@ -3410,6 +3486,7 @@ class Host:
             if problem:
                 ok = False
                 note = (note + "; " if note else "") + f"artifact hand-over failed: {problem}"
+        abandoned()
         events.append({"kind": "stage-finished", "state": "succeeded" if ok else "failed",
                        "summary": parser.summary(rc, self.clock() - started, note)})
         sink.add(events)
@@ -3437,7 +3514,8 @@ class Host:
         return None if key == os.path.basename(output_dir.rstrip("/")) else f"the recomputed key is {key[:16]}…, not the directory's name"
 
     def hand_over_artifacts(self, repo: str, sha: str, stage: str, artifacts_dir: str,
-                            deadline: Optional[float] = None) -> tuple[list[dict], Optional[str]]:
+                            deadline: Optional[float] = None,
+                            cancel: Optional[threading.Event] = None) -> tuple[list[dict], Optional[str]]:
         """H9: upload every file a stage left under `$MW_BUILD_ARTIFACTS/<unit>/` (a module bundle,
         its publication record, the gate bake) to the shared CI artifact store with core's
         `ci-artifact-store.py` (content-addressed, SHA-256), READ IT BACK and re-hash it, and only
@@ -3446,7 +3524,8 @@ class Host:
         The hand-over is INSIDE the run budget: every store call gets the time left until `deadline`
         (the run's absolute end, on self.clock) and no more, so a stage finishing near the limit
         cannot hold its claim past the follower's window or the pod's grace; when the budget runs
-        out the hand-over is a problem and the stage fails."""
+        out the hand-over is a problem and the stage fails. `cancel` (fan-out) set — a sibling met the 409 — raises Lost
+        before the next store call and kills the one in flight: an abandoned run uploads and receipts nothing more."""
         files = []
         for root, _dirs, names in os.walk(artifacts_dir):
             for n in sorted(names):
@@ -3464,17 +3543,18 @@ class Host:
             return float("inf") if deadline is None else deadline - self.clock()
 
         if store_url == API_STORE_SPEC:
-            return self.hand_over_through_api(repo, sha, stage, artifacts_dir, files, left)
+            return self.hand_over_through_api(repo, sha, stage, artifacts_dir, files, left, cancel)
         if store_url.startswith(API_STORE_SPEC):
             return [], f"MW_BUILD_ARTIFACT_STORE {store_url!r} is not a store: the API store is exactly {API_STORE_SPEC!r}"
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci-artifact-store.py")
         receipts = []
 
         def store(argv: list[str]) -> tuple[int, str]:
+            abandoned(cancel, stage)
             budget = left()
             if budget <= 0:
                 raise subprocess.TimeoutExpired(argv, 0)
-            return self.store_runner(argv, timeout=min(1800.0, budget))
+            return self.store_runner(argv, timeout=min(1800.0, budget), cancel=cancel)
 
         for full in sorted(files):
             unit = os.path.relpath(full, artifacts_dir).replace(os.sep, "/")
@@ -3509,7 +3589,8 @@ class Host:
         return receipts, None
 
     def hand_over_through_api(self, repo: str, sha: str, stage: str, artifacts_dir: str, files: list[str],
-                              left: Callable[[], float]) -> tuple[list[dict], Optional[str]]:
+                              left: Callable[[], float],
+                              cancel: Optional[threading.Event] = None) -> tuple[list[dict], Optional[str]]:
         """The API store: PUT each artifact to `{api}/{repo}/{sha}/artifacts/{sha256}` as the run's holder (host + claim id),
         and take the receipt FROM THE SERVER'S ANSWER — the instance hashed what it stored, so a receipt is a byte it holds.
         The answer must name this unit, this sha256, this size and a locator attesting the digest, or the stage fails. A
@@ -3526,10 +3607,11 @@ class Host:
             path = artifact_path(repo, sha, digest)
             status, answer, pause = 0, None, 2.0
             for attempt in range(1, API_UPLOAD_ATTEMPTS + 1):
+                abandoned(cancel, stage)
                 budget = left()
                 if budget <= 0:
                     return receipts, f"the run deadline passed during the hand-over of {unit} (upload)"
-                status, answer = self.api.upload(path, query, full, size, timeout=min(1800.0, budget))
+                status, answer = self.api.upload(path, query, full, size, timeout=min(1800.0, budget), cancel=cancel)
                 if 200 <= status < 300 or status == 409 or not (status == 0 or status >= 500):
                     break
                 if attempt < API_UPLOAD_ATTEMPTS:
@@ -3576,6 +3658,12 @@ class Host:
                 self.sleep(idle if what == "idle" else max(idle, 30))
         self.log("stopping: no further claims (the run in hand, if any, has finished)")
         return 0
+
+
+def abandoned(cancel: Optional[threading.Event], stage: str) -> None:
+    """Raise Lost when the run was abandoned (`cancel` set: a sibling stage met the 409)."""
+    if cancel is not None and cancel.is_set():
+        raise Lost(f"stage {stage}: abandoned during the artifact hand-over — the run is not this host's claim any more")
 
 
 def _answer_text(answer: object) -> str:
@@ -3684,7 +3772,8 @@ class _FakeApi(Api):
                 return answers.pop(0) if len(answers) > 1 else answers[0]
         return 404, None
 
-    def upload(self, path, query, file_path, size, timeout):
+    def upload(self, path, query, file_path, size, timeout, cancel=None):
+        abandoned(cancel, "fake-upload")
         with open(file_path, "rb") as fh:
             data = fh.read()
         self.calls.append(("PUT", path, None, dict(query or {})))
@@ -5216,7 +5305,7 @@ def self_test() -> int:
         store_calls: list[list[str]] = []
         store_timeouts: list = []
 
-        def fake_store(argv, timeout=None):
+        def fake_store(argv, timeout=None, cancel=None):
             store_calls.append(argv)
             store_timeouts.append(timeout)
             verb = argv[2]
@@ -5248,7 +5337,7 @@ def self_test() -> int:
         check("h9/every store call is bounded by the run budget left",
               store_timeouts and all(t is not None and 0 < t <= min(1800, ha.run_deadline) for t in store_timeouts), store_timeouts)
         # the hand-over is INSIDE the run budget: a store that outlasts it, or a budget already spent, fails the stage
-        def slow_store(argv, timeout=None):
+        def slow_store(argv, timeout=None, cancel=None):
             raise subprocess.TimeoutExpired(argv, timeout)
         posted.clear()
         host(api_ev(), env=dict(env_s, MW_BUILD_ARTIFACT_STORE="file:" + store_dir), store_runner=slow_store,
@@ -5264,7 +5353,7 @@ def self_test() -> int:
         _r, problem = hd.hand_over_artifacts("R", "f" * 40, "modules", os.path.dirname(spent_dir), deadline=hd.clock() - 1)
         check("h9/a spent budget makes no store call and is a problem", not store_calls and problem and "run deadline" in problem, (store_calls, problem))
         # a store that reads back other bytes, and a missing store, fail the stage
-        def lying_store(argv, timeout=None):
+        def lying_store(argv, timeout=None, cancel=None):
             if argv[2] == "get":
                 open(argv[argv.index("--out") + 1], "w").write("other")
                 return 0, ""
@@ -5382,6 +5471,45 @@ def self_test() -> int:
         check("fanout/the declared budget follows the schedule",
               run_budget_seconds(core, 10 ** 6, slots=8) == 70 * 60 + RUN_MARGIN_SECONDS
               and run_budget_seconds(core, 10 ** 6) == 210 * 60 + RUN_MARGIN_SECONDS)
+        # The budget BOUNDS the run: a greedy schedule is not monotone in its durations (Graham's anomaly). Two slots,
+        # a/b/c/d/e capped 20/20/15/45/30 min, c and d after b: all caps take 65 min; but if only `a` finishes at 5 min,
+        # unpinned, `e` takes the freed slot, `d` waits for `c`, and the run takes 80 min — cut by its own deadline with
+        # every stage inside its cap. Pinned to the all-caps schedule it can never exceed it.
+        anomaly = [{"name": "a", "kind": "test", "timeoutMinutes": 20, "after": []},
+                   {"name": "b", "kind": "test", "timeoutMinutes": 20, "after": []},
+                   {"name": "c", "kind": "test", "timeoutMinutes": 15, "after": ["b"]},
+                   {"name": "d", "kind": "test", "timeoutMinutes": 45, "after": ["b"]},
+                   {"name": "e", "kind": "test", "timeoutMinutes": 30, "after": []}]
+        early_a = lambda st: 5 * 60 if st["name"] == "a" else _cap_seconds(st)
+        planned_a, pin_a = cap_schedule(anomaly, 2)
+        check("fanout/budget: the anomaly's all-caps schedule is 65 min", planned_a == 65 * 60, planned_a)
+        check("fanout/budget: negative control — UNPINNED, `a` finishing early takes the run to 80 min, past the budget",
+              simulate_schedule(anomaly, 2, early_a)[0] == 80 * 60, simulate_schedule(anomaly, 2, early_a)[0])
+        check("fanout/budget: PINNED, `a` finishing early cannot push the run past the budget",
+              simulate_schedule(anomaly, 2, early_a, pin_a)[0] <= planned_a, simulate_schedule(anomaly, 2, early_a, pin_a)[0])
+        # …and for ANY declaration and ANY durations within the caps (a seeded sweep, so the case is reproducible): builds
+        # anywhere, explicit and default `after`, 2-4 slots. The unpinned sweep must find an overrun (or it proves nothing).
+        rnd = random.Random(69)
+        worst_pinned, unpinned_over = 0.0, 0
+        for _ in range(4000):
+            decl: list = []
+            for i in range(rnd.randint(2, 8)):
+                kind = "build" if rnd.random() < 0.2 else "test"
+                st = {"name": f"x{i}", "kind": kind, "timeoutMinutes": rnd.randint(1, 45)}
+                earlier = [d["name"] for d in decl]
+                st["after"] = (rnd.sample(earlier, rnd.randint(0, min(2, len(earlier)))) if rnd.random() < 0.7
+                               else [d["name"] for d in decl if d["kind"] == "build"])
+                decl.append(st)
+            sl = rnd.randint(2, 4)
+            planned_r, pin_r = cap_schedule(decl, sl)
+            # half the stages take their full cap, the rest finish early — the shape an anomaly needs
+            real = {d["name"]: (1.0 if rnd.random() < 0.5 else rnd.uniform(0.01, 1.0)) * _cap_seconds(d) for d in decl}
+            pinned_r = simulate_schedule(decl, sl, lambda st: real[st["name"]], pin_r)[0]
+            worst_pinned = max(worst_pinned, pinned_r - planned_r)
+            unpinned_over += simulate_schedule(decl, sl, lambda st: real[st["name"]])[0] > planned_r + 1e-6
+        check("fanout/budget: pinned, no declaration and no durations within the caps outlast the budget",
+              worst_pinned <= 1e-6, worst_pinned)
+        check("fanout/budget: negative control — the unpinned sweep does find runs past the budget", unpinned_over > 0, unpinned_over)
         # The host's slots are DECLARED and checked against the cgroup it runs in — refused at start, never clamped.
         gib = 1024 ** 3
         check("fanout/8 slots fit the chart's default host (15 CPU, 52 GiB)", stage_slots_refusal("8", (15.0, 52 * gib)) is None)
@@ -5541,6 +5669,98 @@ def self_test() -> int:
         tl.join(60)
         check("fanout/a 409 on a serial run with stages pending ends the run lost", done_l == ["lost"], done_l)
         check("fanout/…and starts no further stage", os.listdir(marks) == [], os.listdir(marks))
+
+        # The 409 ends the run the moment a WORKER meets it, not when the scheduler dequeues it: completions queued as
+        # [s0 succeeded, s1 Lost] must not see s0's freed slot refilled. Forced with no clock: the scheduler's own clock
+        # read, once s0's worker has ENDED (its success queued), releases s1 through a FIFO and joins s1's worker — so the
+        # 409 is met and queued behind s0's success before the scheduler looks at its queue again.
+        fifo = tempfile.mkdtemp(prefix="fifo-", dir=tmp)
+        os.mkfifo(os.path.join(fifo, "go"))
+        sched_thread = threading.current_thread()
+        started_stages: list = []
+        fired: list = []
+
+        class _RecordingSandbox(_EnvSandbox):
+            def argv(self, command, checkout, outputs, env, readonly=(), writable=()):
+                started_stages.append(env.get("MW_BUILD_STAGE"))
+                return super().argv(command, checkout, outputs, env, readonly, writable)
+
+        def staged_clock() -> float:
+            if (threading.current_thread() is sched_thread and not fired and "s0" in started_stages
+                    and not any(t.name == "stage-s0" for t in threading.enumerate())):
+                fired.append(True)
+                with open(os.path.join(fifo, "go"), "w") as fh:
+                    fh.write("go\n")
+                s1t = next((t for t in threading.enumerate() if t.name == "stage-s1"), None)
+                if s1t is not None:
+                    s1t.join(60)
+            return time.monotonic()
+
+        def on_events_409_s1(path, body):
+            if "/stages/s1/" in path:
+                return 409, None
+            posted.append((path, body["events"]))
+            return 202, None
+        posted.clear()
+        hr = host(_FakeApi({("POST", "/token"): [(404, None)], ("POST", "/MeshWeaver.Plugins/"): on_events_409_s1}),
+                  env=dict(env_s, MW_BUILD_STAGE_SLOTS="2"), clock=staged_clock, checkout=checkout_with({"parallel": True, "stages": [
+                      {"name": "s0", "kind": "test", "after": [], "timeoutMinutes": 1, "command": "true"},
+                      {"name": "s1", "kind": "test", "after": [], "timeoutMinutes": 5, "command": f"read x < {fifo}/go && echo hi"},
+                      {"name": "s2", "kind": "test", "after": [], "timeoutMinutes": 1, "command": "true"}]}))
+        hr.sandbox = _RecordingSandbox()
+        check("fanout/a 409 met behind a queued success ends the run lost", hr.run(claim) == "lost")
+        check("fanout/the race was forced (s1 released only after s0's worker ended)", fired == [True], fired)
+        check("fanout/…and no stage starts once a worker has met the 409, even into a freed slot",
+              sorted(started_stages) == ["s0", "s1"], started_stages)
+
+        # A sibling BLOCKED in the artifact store when the 409 arrives is cut loose, not waited out: the store call is
+        # killed (cancel reaches it), and the abandoned stage hands over and receipts nothing, posting no verdict.
+        fifo = tempfile.mkdtemp(prefix="fifo-", dir=tmp)
+        os.mkfifo(os.path.join(fifo, "go"))
+        store_cancels: list = []
+
+        def blocking_store(argv, timeout=None, cancel=None):
+            store_cancels.append(cancel is not None)
+            if len(store_cancels) == 1:
+                with open(os.path.join(fifo, "go"), "w") as fh:     # releases s1, whose verdict meets the 409
+                    fh.write("go\n")
+            # the real runner (`_run_capture_stdout`) kills its helper when `cancel` is set; without it, a slow store
+            if (cancel or threading.Event()).wait(30):
+                raise Lost("store helper killed — the run was abandoned")
+            return fake_store(argv, timeout)
+        posted.clear()
+        t0 = time.monotonic()
+        hb_ = host(_FakeApi({("POST", "/token"): [(404, None)], ("POST", "/MeshWeaver.Plugins/"): on_events_409_s1}),
+                   env=dict(env_s, MW_BUILD_STAGE_SLOTS="2", MW_BUILD_ARTIFACT_STORE="file:" + store_dir),
+                   store_runner=blocking_store, checkout=checkout_with({"parallel": True, "stages": [
+                       {"name": "s0", "kind": "test", "after": [],
+                        "command": "mkdir -p $MW_BUILD_ARTIFACTS/U && echo 0 > $MW_BUILD_ARTIFACTS/U/u.txt"},
+                       {"name": "s1", "kind": "test", "after": [], "command": f"read x < {fifo}/go && echo hi"}]}))
+        check("fanout/a 409 while a sibling is in the store ends the run lost", hb_.run(claim) == "lost")
+        check("fanout/the store call is told the run was abandoned", store_cancels[:1] == [True], store_cancels)
+        check("fanout/…and no further store call follows it", len(store_cancels) == 1, store_cancels)
+        check("fanout/…and is cut loose at once, not waited out", time.monotonic() - t0 < 20, time.monotonic() - t0)
+        s0_posted = [e for pth, es in posted if "/stages/s0/" in pth for e in es]
+        check("fanout/the abandoned sibling posts no receipt and no verdict",
+              not [e for e in s0_posted if e["kind"] in ("artifact", "stage-finished")], s0_posted)
+        # The real store runner kills its helper on `cancel` (a helper that would run 30 s), and an upload's body stops
+        # streaming at its next block.
+        gone = threading.Event()
+        gone.set()
+        t0 = time.monotonic()
+        try:
+            _run_capture_stdout(["/bin/sleep", "30"], 60, gone)
+            check("fanout/the store helper of an abandoned run is killed", False, "it ran to the end")
+        except Lost:
+            check("fanout/the store helper of an abandoned run is killed at once", time.monotonic() - t0 < 15, time.monotonic() - t0)
+        check("fanout/the store helper still answers when not cancelled",
+              _run_capture_stdout(["/bin/echo", "locator=x"], 60, threading.Event()) == (0, "locator=x\n"))
+        try:
+            CancellableReader(io.BytesIO(b"bytes"), gone).read(4)
+            check("fanout/an abandoned upload stops streaming", False, "read on")
+        except Lost:
+            pass
+        check("fanout/an upload streams while not cancelled", CancellableReader(io.BytesIO(b"bytes"), threading.Event()).read(4) == b"byte")
 
         # H9, the API store (`MW_BUILD_ARTIFACT_STORE=api:`): each artifact is PUT to the build API as the run's holder and
         # its receipt is the SERVER's answer; nothing touches ci-artifact-store.py.

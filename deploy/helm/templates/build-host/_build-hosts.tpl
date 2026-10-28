@@ -85,7 +85,13 @@ The refusals, and why each one exists:
 {{- end -}}
 {{- /* hasKey, not `default`: an explicit 0 must be refused, never turned into the default */ -}}
 {{- $stageSlots := 8 -}}
-{{- if hasKey $b "stageSlots" -}}{{- $stageSlots = int $b.stageSlots -}}{{- end -}}
+{{- if hasKey $b "stageSlots" -}}
+{{- /* the WHOLE-NUMBER form is checked before `int`, which truncates: 32.5 would otherwise render as 32, unseen */ -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $b.stageSlots)) -}}
+{{- fail (printf "buildHosts.stageSlots %v must be a whole number within [1, 32] — how many of one run's stages a host runs at once (1 = serial)" $b.stageSlots) -}}
+{{- end -}}
+{{- $stageSlots = int $b.stageSlots -}}
+{{- end -}}
 {{- if or (lt $stageSlots 1) (gt $stageSlots 32) -}}
 {{- fail (printf "buildHosts.stageSlots %d must be within [1, 32] — how many of one run's stages a host runs at once (1 = serial)" $stageSlots) -}}
 {{- end -}}
