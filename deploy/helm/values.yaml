@@ -579,7 +579,7 @@ keda:
   # (waiting jobs per pod), a scaling target, not an admission bound — nothing waits on it.
   queueDepth:
     enabled: false
-    url: ""                  # default http://memex-portal-service:8080/api/queues/depth
+    url: ""                  # default http://memex-portal-service.<release namespace>.svc.cluster.local:8080/api/queues/depth (KEDA polls from its own namespace)
     waitingPerReplica: 4
 # ---- External Ollama (local self-host) ------------------------------------
 # Front a host-native Ollama with an in-cluster Service so the portal addresses

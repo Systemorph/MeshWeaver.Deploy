@@ -31,6 +31,15 @@ The refusals, and why each one exists:
 {{- if not (or (hasPrefix "https://" $api) (and (hasPrefix "http://" $api) $local)) -}}
 {{- fail (printf "buildHosts.apiUrl %q must be https, or http to a cluster-local host — the worker token rides on it" $api) -}}
 {{- end -}}
+{{- /* The URL the KEDA trigger polls. KEDA sends that request from ITS OWN namespace (the AKS add-on runs keda-operator
+       in kube-system), where a bare Service name such as `memex-portal-service` resolves to nothing: every poll then
+       errors, the HPA never moves, and the Deployment stays at the one replica it was created with, whatever the
+       demand and maxReplicas say. So a bare name is qualified with the release's namespace here. The hosts run in
+       that namespace and keep the URL as given; `localhost` and dotted hosts are left alone. */ -}}
+{{- $scalerApi := $api -}}
+{{- if and (not (contains "." $host)) (ne $host "localhost") -}}
+{{- $scalerApi = regexReplaceAll "^([a-z]+://)([^/:]+)" $api (printf "${1}${2}.%s.svc.cluster.local" .Release.Namespace) -}}
+{{- end -}}
 {{- $runnerRepo := required "buildHosts.runnerRepository is required when buildHosts.enabled — the mw-build-host image (bash, python3, git, bubblewrap, the .NET SDK, build-run.py); each channel names its digest" $b.runnerRepository -}}
 {{- $testerRepo := required "buildHosts.testerRepository is required when buildHosts.enabled (e.g. cr.example.com/mw-plugin-test)" $b.testerRepository -}}
 {{- $portalRepo := required "buildHosts.portalRepository is required when buildHosts.enabled (e.g. cr.example.com/memex-portal-ai)" $b.portalRepository -}}
@@ -268,7 +277,7 @@ The refusals, and why each one exists:
 {{- end -}}
 {{- $np := ($b.networkPolicy | default dict) -}}
 {{- $wi := ($b.workloadIdentity | default dict) -}}
-{{- toYaml (dict "enabled" true "sharedName" $shared "apiUrl" $api "tokenSecret" $tokName "tokenKey" $tokKey
+{{- toYaml (dict "enabled" true "sharedName" $shared "apiUrl" $api "scalerApiUrl" $scalerApi "tokenSecret" $tokName "tokenKey" $tokKey
       "workloadIdentityClientId" (trim ($wi.clientId | default ""))
       "cacheClaim" $cache "cache" $cacheCreate "imagePullSecret" ($b.imagePullSecret | default "")
       "pluginsRegistry" ($b.pluginsRegistry | default "") "pluginsSource" ($b.pluginsSource | default "plugins")

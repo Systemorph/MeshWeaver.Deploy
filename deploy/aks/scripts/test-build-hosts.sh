@@ -284,9 +284,12 @@ for ch, (tester, portal, runner, mx, pv) in want.items():
     if s.get("scaleTargetRef", {}).get("name") != f"build-host-{ch}":
         problems.append(f"{ch}: ScaledObject targets {s.get('scaleTargetRef')}")
     trig = [t for t in s.get("triggers", []) if t.get("type") == "metrics-api"]
-    url = f"http://memex-portal-service:8080/api/builds/queue?channel={ch}"
+    url = f"http://memex-portal-service.check.svc.cluster.local:8080/api/builds/queue?channel={ch}"  # KEDA polls from its own namespace
     if len(trig) != 1 or trig[0]["metadata"].get("url") != url or trig[0]["metadata"].get("valueLocation") != "demand":
         problems.append(f"{ch}: not ONE metrics-api trigger on {url} valueLocation demand: {trig}")
+    # The HOST keeps the URL as given — it runs in this namespace; only KEDA (another namespace) needs it qualified.
+    if env.get("BUILD_API", {}).get("value") != "http://memex-portal-service:8080/api/builds":
+        problems.append(f"{ch}: the host's BUILD_API must stay the apiUrl as given: {env.get('BUILD_API')}")
     win = s.get("advanced", {}).get("horizontalPodAutoscalerConfig", {}).get("behavior", {}).get("scaleDown", {}).get("stabilizationWindowSeconds")
     if win != 300:
         problems.append(f"{ch}: scale-down stabilization window {win} != 300")
@@ -378,7 +381,7 @@ for v, alias, mx in want:
     if sel.get("meshweaver.io/build-version") != v:
         problems.append(f"{v}: the selector does not pin the version (two versions' pods would mix): {sel}")
     s = so["spec"]
-    url = f"http://memex-portal-service:8080/api/builds/queue?version={v}"
+    url = f"http://memex-portal-service.check.svc.cluster.local:8080/api/builds/queue?version={v}"
     trig = s.get("triggers", [{}])[0].get("metadata", {}).get("url")
     if trig != url or s.get("maxReplicaCount") != int(mx) or s.get("scaleTargetRef", {}).get("name") != n:
         problems.append(f"{v}: ScaledObject not demand-by-version {url} / max {mx} / target {n}: {trig} {s.get('maxReplicaCount')}")
