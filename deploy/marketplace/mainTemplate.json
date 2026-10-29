@@ -4,8 +4,8 @@
   "metadata": {
     "_generator": {
       "name": "bicep",
-      "version": "0.41.2.15936",
-      "templateHash": "8255626853934111120"
+      "version": "0.44.1.10279",
+      "templateHash": "534124826596101484"
     }
   },
   "parameters": {
@@ -17,6 +17,12 @@
     },
     "principalId": {
       "type": "string"
+    },
+    "memex_postgres_password_value": {
+      "type": "securestring"
+    },
+    "key_protection_master_key_value": {
+      "type": "securestring"
     }
   },
   "resources": [
@@ -47,8 +53,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.41.2.15936",
-              "templateHash": "17549538876489140601"
+              "version": "0.44.1.10279",
+              "templateHash": "5429357904626882386"
             }
           },
           "parameters": {
@@ -121,8 +127,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.41.2.15936",
-              "templateHash": "13259423154412693621"
+              "version": "0.44.1.10279",
+              "templateHash": "4931519855758851228"
             }
           },
           "parameters": {
@@ -144,6 +150,9 @@
             "memex_aca_acr_outputs_name": {
               "type": "string"
             }
+          },
+          "variables": {
+            "resourceToken": "[uniqueString(resourceGroup().id)]"
           },
           "resources": [
             {
@@ -218,7 +227,7 @@
             {
               "type": "Microsoft.Storage/storageAccounts",
               "apiVersion": "2024-01-01",
-              "name": "[take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24)]",
+              "name": "[take(format('memexacasv{0}', variables('resourceToken')), 24)]",
               "kind": "StorageV2",
               "location": "[parameters('location')]",
               "sku": {
@@ -233,114 +242,148 @@
             {
               "type": "Microsoft.Storage/storageAccounts/fileServices",
               "apiVersion": "2024-01-01",
-              "name": "[format('{0}/{1}', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24), 'default')]",
+              "name": "[format('{0}/{1}', take(format('memexacasv{0}', variables('resourceToken')), 24), 'default')]",
               "dependsOn": [
-                "[resourceId('Microsoft.Storage/storageAccounts', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24))]"
+                "[resourceId('Microsoft.Storage/storageAccounts', take(format('memexacasv{0}', variables('resourceToken')), 24))]"
               ]
             },
             {
               "type": "Microsoft.Storage/storageAccounts/fileServices/shares",
               "apiVersion": "2024-01-01",
-              "name": "[format('{0}/{1}/{2}', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24), 'default', take(format('sharesvolumesmemexpostgres0-{0}', uniqueString(resourceGroup().id)), 63))]",
+              "name": "[format('{0}/{1}/{2}', take(format('memexacasv{0}', variables('resourceToken')), 24), 'default', take(format('{0}-{1}', toLower('memex-postgres'), toLower('memexpgdata')), 60))]",
               "properties": {
                 "enabledProtocols": "SMB",
                 "shareQuota": 1024
               },
               "dependsOn": [
-                "[resourceId('Microsoft.Storage/storageAccounts/fileServices', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24), 'default')]"
+                "[resourceId('Microsoft.Storage/storageAccounts/fileServices', take(format('memexacasv{0}', variables('resourceToken')), 24), 'default')]"
               ]
             },
             {
               "type": "Microsoft.App/managedEnvironments/storages",
               "apiVersion": "2025-07-01",
-              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), take(format('managedstoragevolumesmemexpostgres{0}', uniqueString(resourceGroup().id)), 24))]",
+              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), take(format('{0}-{1}-{2}', toLower('memex-postgres'), toLower('memexpgdata'), variables('resourceToken')), 32))]",
               "properties": {
                 "azureFile": {
-                  "accountName": "[take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24)]",
-                  "accountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24)), '2024-01-01').keys[0].value]",
+                  "accountName": "[take(format('memexacasv{0}', variables('resourceToken')), 24)]",
+                  "accountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', take(format('memexacasv{0}', variables('resourceToken')), 24)), '2024-01-01').keys[0].value]",
                   "accessMode": "ReadWrite",
-                  "shareName": "[take(format('sharesvolumesmemexpostgres0-{0}', uniqueString(resourceGroup().id)), 63)]"
+                  "shareName": "[take(format('{0}-{1}', toLower('memex-postgres'), toLower('memexpgdata')), 60)]"
                 }
               },
               "dependsOn": [
                 "[resourceId('Microsoft.App/managedEnvironments', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24))]",
-                "[resourceId('Microsoft.Storage/storageAccounts', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24))]",
-                "[resourceId('Microsoft.Storage/storageAccounts/fileServices/shares', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24), 'default', take(format('sharesvolumesmemexpostgres0-{0}', uniqueString(resourceGroup().id)), 63))]"
+                "[resourceId('Microsoft.Storage/storageAccounts', take(format('memexacasv{0}', variables('resourceToken')), 24))]",
+                "[resourceId('Microsoft.Storage/storageAccounts/fileServices/shares', take(format('memexacasv{0}', variables('resourceToken')), 24), 'default', take(format('{0}-{1}', toLower('memex-postgres'), toLower('memexpgdata')), 60))]"
               ]
             },
             {
               "type": "Microsoft.Storage/storageAccounts/fileServices/shares",
               "apiVersion": "2024-01-01",
-              "name": "[format('{0}/{1}/{2}', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24), 'default', take(format('sharesvolumesmemexportal0-{0}', uniqueString(resourceGroup().id)), 63))]",
+              "name": "[format('{0}/{1}/{2}', take(format('memexacasv{0}', variables('resourceToken')), 24), 'default', take(format('{0}-{1}', toLower('memex-portal'), toLower('memexportaldata')), 60))]",
               "properties": {
                 "enabledProtocols": "SMB",
                 "shareQuota": 1024
               },
               "dependsOn": [
-                "[resourceId('Microsoft.Storage/storageAccounts/fileServices', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24), 'default')]"
+                "[resourceId('Microsoft.Storage/storageAccounts/fileServices', take(format('memexacasv{0}', variables('resourceToken')), 24), 'default')]"
               ]
             },
             {
               "type": "Microsoft.App/managedEnvironments/storages",
               "apiVersion": "2025-07-01",
-              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), take(format('managedstoragevolumesmemexportal{0}', uniqueString(resourceGroup().id)), 24))]",
+              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), take(format('{0}-{1}-{2}', toLower('memex-portal'), toLower('memexportaldata'), variables('resourceToken')), 32))]",
               "properties": {
                 "azureFile": {
-                  "accountName": "[take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24)]",
-                  "accountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24)), '2024-01-01').keys[0].value]",
+                  "accountName": "[take(format('memexacasv{0}', variables('resourceToken')), 24)]",
+                  "accountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', take(format('memexacasv{0}', variables('resourceToken')), 24)), '2024-01-01').keys[0].value]",
                   "accessMode": "ReadWrite",
-                  "shareName": "[take(format('sharesvolumesmemexportal0-{0}', uniqueString(resourceGroup().id)), 63)]"
+                  "shareName": "[take(format('{0}-{1}', toLower('memex-portal'), toLower('memexportaldata')), 60)]"
                 }
               },
               "dependsOn": [
                 "[resourceId('Microsoft.App/managedEnvironments', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24))]",
-                "[resourceId('Microsoft.Storage/storageAccounts', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24))]",
-                "[resourceId('Microsoft.Storage/storageAccounts/fileServices/shares', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24), 'default', take(format('sharesvolumesmemexportal0-{0}', uniqueString(resourceGroup().id)), 63))]"
+                "[resourceId('Microsoft.Storage/storageAccounts', take(format('memexacasv{0}', variables('resourceToken')), 24))]",
+                "[resourceId('Microsoft.Storage/storageAccounts/fileServices/shares', take(format('memexacasv{0}', variables('resourceToken')), 24), 'default', take(format('{0}-{1}', toLower('memex-portal'), toLower('memexportaldata')), 60))]"
               ]
             },
             {
               "type": "Microsoft.Storage/storageAccounts/fileServices/shares",
               "apiVersion": "2024-01-01",
-              "name": "[format('{0}/{1}/{2}', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24), 'default', take(format('sharesvolumesmemexportal1-{0}', uniqueString(resourceGroup().id)), 63))]",
+              "name": "[format('{0}/{1}/{2}', take(format('memexacasv{0}', variables('resourceToken')), 24), 'default', take(format('{0}-{1}', toLower('memex-portal'), toLower('memexportalcontent')), 60))]",
               "properties": {
                 "enabledProtocols": "SMB",
                 "shareQuota": 1024
               },
               "dependsOn": [
-                "[resourceId('Microsoft.Storage/storageAccounts/fileServices', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24), 'default')]"
+                "[resourceId('Microsoft.Storage/storageAccounts/fileServices', take(format('memexacasv{0}', variables('resourceToken')), 24), 'default')]"
               ]
             },
             {
               "type": "Microsoft.App/managedEnvironments/storages",
               "apiVersion": "2025-07-01",
-              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), take(format('managedstoragevolumesmemexportal{0}', uniqueString(resourceGroup().id)), 24))]",
+              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), take(format('{0}-{1}-{2}', toLower('memex-portal'), toLower('memexportalcontent'), variables('resourceToken')), 32))]",
               "properties": {
                 "azureFile": {
-                  "accountName": "[take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24)]",
-                  "accountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24)), '2024-01-01').keys[0].value]",
+                  "accountName": "[take(format('memexacasv{0}', variables('resourceToken')), 24)]",
+                  "accountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', take(format('memexacasv{0}', variables('resourceToken')), 24)), '2024-01-01').keys[0].value]",
                   "accessMode": "ReadWrite",
-                  "shareName": "[take(format('sharesvolumesmemexportal1-{0}', uniqueString(resourceGroup().id)), 63)]"
+                  "shareName": "[take(format('{0}-{1}', toLower('memex-portal'), toLower('memexportalcontent')), 60)]"
                 }
               },
               "dependsOn": [
                 "[resourceId('Microsoft.App/managedEnvironments', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24))]",
-                "[resourceId('Microsoft.Storage/storageAccounts', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24))]",
-                "[resourceId('Microsoft.Storage/storageAccounts/fileServices/shares', take(format('memexacastoragevolume{0}', uniqueString(resourceGroup().id)), 24), 'default', take(format('sharesvolumesmemexportal1-{0}', uniqueString(resourceGroup().id)), 63))]"
+                "[resourceId('Microsoft.Storage/storageAccounts', take(format('memexacasv{0}', variables('resourceToken')), 24))]",
+                "[resourceId('Microsoft.Storage/storageAccounts/fileServices/shares', take(format('memexacasv{0}', variables('resourceToken')), 24), 'default', take(format('{0}-{1}', toLower('memex-portal'), toLower('memexportalcontent')), 60))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/fileServices/shares",
+              "apiVersion": "2024-01-01",
+              "name": "[format('{0}/{1}/{2}', take(format('memexacasv{0}', variables('resourceToken')), 24), 'default', take(format('{0}-{1}', toLower('memex-portal'), toLower('memexportalusers')), 60))]",
+              "properties": {
+                "enabledProtocols": "SMB",
+                "shareQuota": 1024
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/fileServices', take(format('memexacasv{0}', variables('resourceToken')), 24), 'default')]"
+              ]
+            },
+            {
+              "type": "Microsoft.App/managedEnvironments/storages",
+              "apiVersion": "2025-07-01",
+              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), take(format('{0}-{1}-{2}', toLower('memex-portal'), toLower('memexportalusers'), variables('resourceToken')), 32))]",
+              "properties": {
+                "azureFile": {
+                  "accountName": "[take(format('memexacasv{0}', variables('resourceToken')), 24)]",
+                  "accountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', take(format('memexacasv{0}', variables('resourceToken')), 24)), '2024-01-01').keys[0].value]",
+                  "accessMode": "ReadWrite",
+                  "shareName": "[take(format('{0}-{1}', toLower('memex-portal'), toLower('memexportalusers')), 60)]"
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.App/managedEnvironments', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', take(format('memexacasv{0}', variables('resourceToken')), 24))]",
+                "[resourceId('Microsoft.Storage/storageAccounts/fileServices/shares', take(format('memexacasv{0}', variables('resourceToken')), 24), 'default', take(format('{0}-{1}', toLower('memex-portal'), toLower('memexportalusers')), 60))]"
               ]
             }
           ],
           "outputs": {
             "volumes_memex_postgres_0": {
               "type": "string",
-              "value": "[take(format('managedstoragevolumesmemexpostgres{0}', uniqueString(resourceGroup().id)), 24)]"
+              "value": "[take(format('{0}-{1}-{2}', toLower('memex-postgres'), toLower('memexpgdata'), variables('resourceToken')), 32)]"
             },
             "volumes_memex_portal_0": {
               "type": "string",
-              "value": "[take(format('managedstoragevolumesmemexportal{0}', uniqueString(resourceGroup().id)), 24)]"
+              "value": "[take(format('{0}-{1}-{2}', toLower('memex-portal'), toLower('memexportaldata'), variables('resourceToken')), 32)]"
             },
             "volumes_memex_portal_1": {
               "type": "string",
-              "value": "[take(format('managedstoragevolumesmemexportal{0}', uniqueString(resourceGroup().id)), 24)]"
+              "value": "[take(format('{0}-{1}-{2}', toLower('memex-portal'), toLower('memexportalcontent'), variables('resourceToken')), 32)]"
+            },
+            "volumes_memex_portal_2": {
+              "type": "string",
+              "value": "[take(format('{0}-{1}-{2}', toLower('memex-portal'), toLower('memexportalusers'), variables('resourceToken')), 32)]"
             },
             "AZURE_LOG_ANALYTICS_WORKSPACE_NAME": {
               "type": "string",
@@ -381,6 +424,626 @@
         "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca-acr')]",
         "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('resourceGroupName'))]"
       ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "memex-migration",
+      "resourceGroup": "[parameters('resourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "memex_aca_outputs_azure_container_apps_environment_default_domain": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca'), '2025-04-01').outputs.AZURE_CONTAINER_APPS_ENVIRONMENT_DEFAULT_DOMAIN.value]"
+          },
+          "memex_aca_outputs_azure_container_apps_environment_id": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca'), '2025-04-01').outputs.AZURE_CONTAINER_APPS_ENVIRONMENT_ID.value]"
+          },
+          "memex_postgres_password_value": {
+            "value": "[parameters('memex_postgres_password_value')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "17013572737887653022"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "defaultValue": "[resourceGroup().location]",
+              "metadata": {
+                "description": "The location for the resource(s) to be deployed."
+              }
+            },
+            "memex_aca_outputs_azure_container_apps_environment_default_domain": {
+              "type": "string"
+            },
+            "memex_aca_outputs_azure_container_apps_environment_id": {
+              "type": "string"
+            },
+            "memex_postgres_password_value": {
+              "type": "securestring"
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.App/containerApps",
+              "apiVersion": "2025-07-01",
+              "name": "memex-migration",
+              "location": "[parameters('location')]",
+              "properties": {
+                "configuration": {
+                  "secrets": [
+                    {
+                      "name": "connectionstrings--memex",
+                      "value": "[format('Host=memex-postgres;Port=5432;Username=postgres;Password={0};Database=memex', parameters('memex_postgres_password_value'))]"
+                    },
+                    {
+                      "name": "memex-password",
+                      "value": "[parameters('memex_postgres_password_value')]"
+                    },
+                    {
+                      "name": "memex-uri",
+                      "value": "[format('postgresql://postgres:{0}@memex-postgres:5432/memex', uriComponent(parameters('memex_postgres_password_value')))]"
+                    },
+                    {
+                      "name": "connectionstrings--orleans",
+                      "value": "[format('Host=memex-postgres;Port=5432;Username=postgres;Password={0};Database=orleans', parameters('memex_postgres_password_value'))]"
+                    },
+                    {
+                      "name": "orleans-password",
+                      "value": "[parameters('memex_postgres_password_value')]"
+                    },
+                    {
+                      "name": "orleans-uri",
+                      "value": "[format('postgresql://postgres:{0}@memex-postgres:5432/orleans', uriComponent(parameters('memex_postgres_password_value')))]"
+                    }
+                  ],
+                  "activeRevisionsMode": "Single"
+                },
+                "environmentId": "[parameters('memex_aca_outputs_azure_container_apps_environment_id')]",
+                "template": {
+                  "containers": [
+                    {
+                      "image": "cr.meshweaver.cloud/memex-migration:latest",
+                      "name": "memex-migration",
+                      "env": [
+                        {
+                          "name": "ConnectionStrings__memex",
+                          "secretRef": "connectionstrings--memex"
+                        },
+                        {
+                          "name": "MEMEX_HOST",
+                          "value": "memex-postgres"
+                        },
+                        {
+                          "name": "MEMEX_PORT",
+                          "value": "5432"
+                        },
+                        {
+                          "name": "MEMEX_USERNAME",
+                          "value": "postgres"
+                        },
+                        {
+                          "name": "MEMEX_PASSWORD",
+                          "secretRef": "memex-password"
+                        },
+                        {
+                          "name": "MEMEX_URI",
+                          "secretRef": "memex-uri"
+                        },
+                        {
+                          "name": "MEMEX_JDBCCONNECTIONSTRING",
+                          "value": "jdbc:postgresql://memex-postgres:5432/memex"
+                        },
+                        {
+                          "name": "MEMEX_DATABASENAME",
+                          "value": "memex"
+                        },
+                        {
+                          "name": "ConnectionStrings__orleans",
+                          "secretRef": "connectionstrings--orleans"
+                        },
+                        {
+                          "name": "ORLEANS_HOST",
+                          "value": "memex-postgres"
+                        },
+                        {
+                          "name": "ORLEANS_PORT",
+                          "value": "5432"
+                        },
+                        {
+                          "name": "ORLEANS_USERNAME",
+                          "value": "postgres"
+                        },
+                        {
+                          "name": "ORLEANS_PASSWORD",
+                          "secretRef": "orleans-password"
+                        },
+                        {
+                          "name": "ORLEANS_URI",
+                          "secretRef": "orleans-uri"
+                        },
+                        {
+                          "name": "ORLEANS_JDBCCONNECTIONSTRING",
+                          "value": "jdbc:postgresql://memex-postgres:5432/orleans"
+                        },
+                        {
+                          "name": "ORLEANS_DATABASENAME",
+                          "value": "orleans"
+                        }
+                      ]
+                    }
+                  ],
+                  "scale": {
+                    "minReplicas": 1
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca')]",
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('resourceGroupName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "memex-portal",
+      "resourceGroup": "[parameters('resourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "memex_aca_outputs_azure_container_apps_environment_default_domain": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca'), '2025-04-01').outputs.AZURE_CONTAINER_APPS_ENVIRONMENT_DEFAULT_DOMAIN.value]"
+          },
+          "memex_aca_outputs_azure_container_apps_environment_id": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca'), '2025-04-01').outputs.AZURE_CONTAINER_APPS_ENVIRONMENT_ID.value]"
+          },
+          "memex_postgres_password_value": {
+            "value": "[parameters('memex_postgres_password_value')]"
+          },
+          "key_protection_master_key_value": {
+            "value": "[parameters('key_protection_master_key_value')]"
+          },
+          "memex_aca_outputs_volumes_memex_portal_0": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca'), '2025-04-01').outputs.volumes_memex_portal_0.value]"
+          },
+          "memex_aca_outputs_volumes_memex_portal_1": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca'), '2025-04-01').outputs.volumes_memex_portal_1.value]"
+          },
+          "memex_aca_outputs_volumes_memex_portal_2": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca'), '2025-04-01').outputs.volumes_memex_portal_2.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "13526069901591114211"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "defaultValue": "[resourceGroup().location]",
+              "metadata": {
+                "description": "The location for the resource(s) to be deployed."
+              }
+            },
+            "memex_aca_outputs_azure_container_apps_environment_default_domain": {
+              "type": "string"
+            },
+            "memex_aca_outputs_azure_container_apps_environment_id": {
+              "type": "string"
+            },
+            "memex_postgres_password_value": {
+              "type": "securestring"
+            },
+            "key_protection_master_key_value": {
+              "type": "securestring"
+            },
+            "memex_aca_outputs_volumes_memex_portal_0": {
+              "type": "string"
+            },
+            "memex_aca_outputs_volumes_memex_portal_1": {
+              "type": "string"
+            },
+            "memex_aca_outputs_volumes_memex_portal_2": {
+              "type": "string"
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.App/containerApps",
+              "apiVersion": "2025-07-01",
+              "name": "memex-portal",
+              "location": "[parameters('location')]",
+              "properties": {
+                "configuration": {
+                  "secrets": [
+                    {
+                      "name": "connectionstrings--memex",
+                      "value": "[format('Host=memex-postgres;Port=5432;Username=postgres;Password={0};Database=memex', parameters('memex_postgres_password_value'))]"
+                    },
+                    {
+                      "name": "memex-password",
+                      "value": "[parameters('memex_postgres_password_value')]"
+                    },
+                    {
+                      "name": "memex-uri",
+                      "value": "[format('postgresql://postgres:{0}@memex-postgres:5432/memex', uriComponent(parameters('memex_postgres_password_value')))]"
+                    },
+                    {
+                      "name": "connectionstrings--orleans",
+                      "value": "[format('Host=memex-postgres;Port=5432;Username=postgres;Password={0};Database=orleans', parameters('memex_postgres_password_value'))]"
+                    },
+                    {
+                      "name": "orleans-password",
+                      "value": "[parameters('memex_postgres_password_value')]"
+                    },
+                    {
+                      "name": "orleans-uri",
+                      "value": "[format('postgresql://postgres:{0}@memex-postgres:5432/orleans', uriComponent(parameters('memex_postgres_password_value')))]"
+                    },
+                    {
+                      "name": "ai--keyprotection--masterkey",
+                      "value": "[parameters('key_protection_master_key_value')]"
+                    }
+                  ],
+                  "activeRevisionsMode": "Single",
+                  "ingress": {
+                    "external": true,
+                    "targetPort": 8080,
+                    "transport": "http"
+                  }
+                },
+                "environmentId": "[parameters('memex_aca_outputs_azure_container_apps_environment_id')]",
+                "template": {
+                  "containers": [
+                    {
+                      "image": "cr.meshweaver.cloud/memex-portal-ai:latest",
+                      "name": "memex-portal",
+                      "env": [
+                        {
+                          "name": "ConnectionStrings__memex",
+                          "secretRef": "connectionstrings--memex"
+                        },
+                        {
+                          "name": "MEMEX_HOST",
+                          "value": "memex-postgres"
+                        },
+                        {
+                          "name": "MEMEX_PORT",
+                          "value": "5432"
+                        },
+                        {
+                          "name": "MEMEX_USERNAME",
+                          "value": "postgres"
+                        },
+                        {
+                          "name": "MEMEX_PASSWORD",
+                          "secretRef": "memex-password"
+                        },
+                        {
+                          "name": "MEMEX_URI",
+                          "secretRef": "memex-uri"
+                        },
+                        {
+                          "name": "MEMEX_JDBCCONNECTIONSTRING",
+                          "value": "jdbc:postgresql://memex-postgres:5432/memex"
+                        },
+                        {
+                          "name": "MEMEX_DATABASENAME",
+                          "value": "memex"
+                        },
+                        {
+                          "name": "ConnectionStrings__orleans",
+                          "secretRef": "connectionstrings--orleans"
+                        },
+                        {
+                          "name": "ORLEANS_HOST",
+                          "value": "memex-postgres"
+                        },
+                        {
+                          "name": "ORLEANS_PORT",
+                          "value": "5432"
+                        },
+                        {
+                          "name": "ORLEANS_USERNAME",
+                          "value": "postgres"
+                        },
+                        {
+                          "name": "ORLEANS_PASSWORD",
+                          "secretRef": "orleans-password"
+                        },
+                        {
+                          "name": "ORLEANS_URI",
+                          "secretRef": "orleans-uri"
+                        },
+                        {
+                          "name": "ORLEANS_JDBCCONNECTIONSTRING",
+                          "value": "jdbc:postgresql://memex-postgres:5432/orleans"
+                        },
+                        {
+                          "name": "ORLEANS_DATABASENAME",
+                          "value": "orleans"
+                        },
+                        {
+                          "name": "Deployment__Record",
+                          "value": "{\"namespace\":\"memex\",\"imageRepository\":\"cr.meshweaver.cloud/memex-portal-ai\",\"isPluginRegistry\":false,\"pluginRepos\":[],\"preInstall\":[],\"defaultGrants\":[],\"requiredModules\":[],\"requiredModulesAuthoritative\":false,\"helmRelease\":\"memex\",\"replicas\":1,\"gracePeriodDays\":0,\"inClusterPostgres\":false,\"volumes\":[{\"name\":\"data\",\"claimName\":\"memex-data\",\"mountPath\":\"/data\",\"create\":false,\"readOnly\":false},{\"name\":\"content\",\"claimName\":\"memex-content\",\"mountPath\":\"/mnt/content\",\"create\":false,\"readOnly\":false},{\"name\":\"users\",\"claimName\":\"memex-users\",\"mountPath\":\"/mnt/users\",\"create\":false,\"readOnly\":false}],\"keyVaultSecretClasses\":[],\"vaultValuesKeys\":[],\"inlineEnv\":[],\"gates\":[],\"secretMounts\":[],\"signIn\":{\"enableDevLogin\":false},\"orleansClustering\":\"AdoNet\",\"requiredModuleSlots\":{},\"webhookInboxTargets\":[],\"webhookInbox\":[],\"extraPortalConfig\":{},\"features\":{}}"
+                        },
+                        {
+                          "name": "ASPNETCORE_HTTP_PORTS",
+                          "value": "8080"
+                        },
+                        {
+                          "name": "Authentication__EnableDevLogin",
+                          "value": "false"
+                        },
+                        {
+                          "name": "Authentication__Provider",
+                          "value": "Custom"
+                        },
+                        {
+                          "name": "Deployment__Backend",
+                          "value": "Filesystem"
+                        },
+                        {
+                          "name": "Deployment__DataRoot",
+                          "value": "/data"
+                        },
+                        {
+                          "name": "Deployment__Orleans__Clustering",
+                          "value": "AdoNet"
+                        },
+                        {
+                          "name": "Graph__Storage__BasePath",
+                          "value": "/data/graph"
+                        },
+                        {
+                          "name": "Graph__Storage__Type",
+                          "value": "PostgreSql"
+                        },
+                        {
+                          "name": "Modules__Root",
+                          "value": "/data"
+                        },
+                        {
+                          "name": "SelfUpdate__MinRollInterval",
+                          "value": "01:00:00"
+                        },
+                        {
+                          "name": "SelfUpdate__Registry",
+                          "value": "cr.meshweaver.cloud"
+                        },
+                        {
+                          "name": "Storage__BasePath",
+                          "value": "/mnt/content"
+                        },
+                        {
+                          "name": "Storage__Name",
+                          "value": "content"
+                        },
+                        {
+                          "name": "Storage__SourceType",
+                          "value": "FileSystem"
+                        },
+                        {
+                          "name": "Mcp__BaseUrl",
+                          "value": "[format('https://memex-portal.{0}', parameters('memex_aca_outputs_azure_container_apps_environment_default_domain'))]"
+                        },
+                        {
+                          "name": "Features__Orleans__Clustering",
+                          "value": "AdoNet"
+                        },
+                        {
+                          "name": "Ai__KeyProtection__MasterKey",
+                          "secretRef": "ai--keyprotection--masterkey"
+                        }
+                      ],
+                      "volumeMounts": [
+                        {
+                          "volumeName": "v0",
+                          "mountPath": "/data"
+                        },
+                        {
+                          "volumeName": "v1",
+                          "mountPath": "/mnt/content"
+                        },
+                        {
+                          "volumeName": "v2",
+                          "mountPath": "/mnt/users"
+                        }
+                      ]
+                    }
+                  ],
+                  "scale": {
+                    "minReplicas": 1
+                  },
+                  "volumes": [
+                    {
+                      "name": "v0",
+                      "storageType": "AzureFile",
+                      "storageName": "[parameters('memex_aca_outputs_volumes_memex_portal_0')]"
+                    },
+                    {
+                      "name": "v1",
+                      "storageType": "AzureFile",
+                      "storageName": "[parameters('memex_aca_outputs_volumes_memex_portal_1')]"
+                    },
+                    {
+                      "name": "v2",
+                      "storageType": "AzureFile",
+                      "storageName": "[parameters('memex_aca_outputs_volumes_memex_portal_2')]"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca')]",
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('resourceGroupName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "memex-postgres",
+      "resourceGroup": "[parameters('resourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "memex_aca_outputs_azure_container_apps_environment_default_domain": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca'), '2025-04-01').outputs.AZURE_CONTAINER_APPS_ENVIRONMENT_DEFAULT_DOMAIN.value]"
+          },
+          "memex_aca_outputs_azure_container_apps_environment_id": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca'), '2025-04-01').outputs.AZURE_CONTAINER_APPS_ENVIRONMENT_ID.value]"
+          },
+          "memex_postgres_password_value": {
+            "value": "[parameters('memex_postgres_password_value')]"
+          },
+          "memex_aca_outputs_volumes_memex_postgres_0": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca'), '2025-04-01').outputs.volumes_memex_postgres_0.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "2302901301452870319"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "defaultValue": "[resourceGroup().location]",
+              "metadata": {
+                "description": "The location for the resource(s) to be deployed."
+              }
+            },
+            "memex_aca_outputs_azure_container_apps_environment_default_domain": {
+              "type": "string"
+            },
+            "memex_aca_outputs_azure_container_apps_environment_id": {
+              "type": "string"
+            },
+            "memex_postgres_password_value": {
+              "type": "securestring"
+            },
+            "memex_aca_outputs_volumes_memex_postgres_0": {
+              "type": "string"
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.App/containerApps",
+              "apiVersion": "2025-07-01",
+              "name": "memex-postgres",
+              "location": "[parameters('location')]",
+              "properties": {
+                "configuration": {
+                  "secrets": [
+                    {
+                      "name": "postgres-password",
+                      "value": "[parameters('memex_postgres_password_value')]"
+                    }
+                  ],
+                  "activeRevisionsMode": "Single",
+                  "ingress": {
+                    "external": false,
+                    "targetPort": 5432,
+                    "transport": "tcp"
+                  }
+                },
+                "environmentId": "[parameters('memex_aca_outputs_azure_container_apps_environment_id')]",
+                "template": {
+                  "containers": [
+                    {
+                      "image": "docker.io/pgvector/pgvector:pg17",
+                      "name": "memex-postgres",
+                      "env": [
+                        {
+                          "name": "POSTGRES_HOST_AUTH_METHOD",
+                          "value": "scram-sha-256"
+                        },
+                        {
+                          "name": "POSTGRES_INITDB_ARGS",
+                          "value": "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+                        },
+                        {
+                          "name": "POSTGRES_USER",
+                          "value": "postgres"
+                        },
+                        {
+                          "name": "POSTGRES_PASSWORD",
+                          "secretRef": "postgres-password"
+                        }
+                      ],
+                      "volumeMounts": [
+                        {
+                          "volumeName": "v0",
+                          "mountPath": "/var/lib/postgresql/data"
+                        }
+                      ]
+                    }
+                  ],
+                  "scale": {
+                    "minReplicas": 1
+                  },
+                  "volumes": [
+                    {
+                      "name": "v0",
+                      "storageType": "AzureFile",
+                      "storageName": "[parameters('memex_aca_outputs_volumes_memex_postgres_0')]"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca')]",
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('resourceGroupName'))]"
+      ]
     }
   ],
   "outputs": {
@@ -403,6 +1066,10 @@
     "memex_aca_volumes_memex_portal_1": {
       "type": "string",
       "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca'), '2025-04-01').outputs.volumes_memex_portal_1.value]"
+    },
+    "memex_aca_volumes_memex_portal_2": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'memex-aca'), '2025-04-01').outputs.volumes_memex_portal_2.value]"
     }
   }
 }
