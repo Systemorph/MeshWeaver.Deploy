@@ -52,7 +52,18 @@ az bicep build --file deploy/aca/main.bicep --stdout > /dev/null
      credential, minting a plugin-registry sync-token signing key and rotating the Entra
      credential each refuse, naming the setting. Reading stays tolerant, so an install that
      already holds legacy plaintext keys keeps working. Never commit it.
-3. `docker compose up -d`.
+3. Sign Docker in to the image registry. The portal and migration images come from
+   `cr.meshweaver.cloud`, which refuses anonymous pulls (`deploy/helm/templates/registry/configmap.yaml`,
+   the ACL: an anonymous account matches no rule). The password is this install's MeshWeaver
+   **instance key** (`mwi_…`); the account name is free text and names the install in the
+   registry's log:
+
+   ```bash
+   docker login cr.meshweaver.cloud -u <install-name> --password-stdin   # paste the mwi_ key
+   ```
+
+   Without it `up` fails on the first pull (`unauthorized`).
+4. `docker compose up -d`.
 
 The same `.env` is the portal's `env_file`, so any portal configuration key you add there in the
 ASP.NET double-underscore form (`Section__Key`) reaches the container. The service's own
