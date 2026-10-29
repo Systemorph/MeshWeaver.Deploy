@@ -114,7 +114,7 @@ Deployment, and the conditional workload-identity annotation/label/env. The gaps
    ```bash
    PORTAL_MI=$(az identity show -g <aks-resource-group> -n <portal-identity> --query principalId -o tsv)
    az role assignment create --assignee-object-id "$PORTAL_MI" --assignee-principal-type ServicePrincipal \
-     --role AcrPull --scope "$(az acr show -n meshweaver --query id -o tsv)"
+     --role AcrPull --scope "$(az acr show -n <acrName> -g <acr-resource-group> --query id -o tsv)"   # YOUR registry, never a sample name
    ```
 2. **Set `selfUpdate.azureClientId`** to the UAMI client id in each env's (git-ignored) values overlay,
    then **`helm upgrade`** the env. This both wires workload identity AND (for envs whose live
