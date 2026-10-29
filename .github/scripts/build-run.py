@@ -1635,8 +1635,11 @@ def _swap_into_place(tmp: str, final: str, intact: Callable[[str], bool], lock_f
         stale = tempfile.mkdtemp(prefix=".stale-", dir=os.path.dirname(final))
         os.rmdir(stale)
         try:
+            # The displacement time, which the sweep's grace counts from, is stamped BEFORE the rename: a sweep run
+            # under ANOTHER entry's lock may scan the parent the instant the `.stale-*` name exists, and must never
+            # see it carrying the entry's old mtime (a rename does not change it) — it would delete it at once.
+            os.utime(final)
             os.rename(final, stale)
-            os.utime(stale)        # the displacement time, which the sweep's grace counts from
         except OSError:
             pass
         try:
@@ -4763,6 +4766,30 @@ def self_test() -> int:
               len(displaced) == 1
               and sweep_displaced(os.path.dirname(race_set), now=time.time() + STALE_RECLAIM_SECONDS + 1) == displaced
               and not os.path.exists(displaced[0]) and layer_intact(race_set, rc_), displaced)
+        # A sweep under ANOTHER entry's lock may scan the parent between the rename and anything after it: an old
+        # entry displaced at that instant must already carry its displacement time, never its old mtime.
+        os.unlink(os.path.join(race_set, ".complete"))
+        old_t = time.time() - STALE_RECLAIM_SECONDS - 3600
+        os.utime(race_set, (old_t, old_t))
+        dup = tempfile.mkdtemp(prefix=".set-", dir=os.path.dirname(race_set))
+        os.symlink(os.path.join(race_final, "Race"), os.path.join(dup, "Race"))
+        with open(os.path.join(dup, ".complete"), "w") as fh_:
+            fh_.write(race_line + "\n")
+        swept_mid: list = []
+        real_rename = os.rename
+
+        def rename_then_sweep(src, dst):
+            real_rename(src, dst)
+            if src == race_set and os.path.basename(dst).startswith(".stale-"):
+                swept_mid.extend(sweep_displaced(os.path.dirname(race_set)))
+        os.rename = rename_then_sweep
+        try:
+            _swap_into_place(dup, race_set, lambda d: layer_intact(d, rc_))
+        finally:
+            os.rename = real_rename
+        check("handover/a sweep that runs the instant an OLD entry is displaced does not delete it",
+              swept_mid == [] and len([n for n in os.listdir(os.path.dirname(race_set)) if n.startswith(".stale-")]) == 1,
+              (swept_mid, os.listdir(os.path.dirname(race_set))))
         check("handover/the reclaim grace outlives every run a host may be configured for",
               STALE_RECLAIM_SECONDS > MAX_RUN_DEADLINE)
         # Without exclusion (the lock cannot be taken) a damaged entry is NEVER moved aside: Refusal, tmp discarded,
