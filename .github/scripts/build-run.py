@@ -6772,7 +6772,24 @@ def self_test() -> int:
                     self.end_headers()
                     self.wfile.write(payload)
                     self.wfile.flush()
-                    self.close_connection = True      # the body is never read
+                    self.close_connection = True      # the body is never USED — only discarded, below
+                    # A LINGERING close, as a real server makes one (Kestrel, nginx): the answer is sent BEFORE the
+                    # body is read, then the body is read and thrown away until the client hangs up. An ABORTIVE close
+                    # here — close() with the body still unread — makes the kernel answer with a RST that DISCARDS this
+                    # server's own still-unsent answer (Linux tcp_close, data_was_unread), so the client met an EOF
+                    # with no 413 at all: no client can read an answer that was never transmitted, and the check went
+                    # red on runners whenever the answer was still queued (Deploy main, 2026-10-29: `(0, 'EOF occurred
+                    # in violation of protocol')`). Bounded by the declared length and by the upload's own budget.
+                    self.connection.settimeout(30)
+                    left_ = int(self.headers.get("Content-Length", "0"))
+                    try:
+                        while left_ > 0:
+                            chunk = self.rfile.read1(min(left_, 1 << 16))
+                            if not chunk:
+                                break
+                            left_ -= len(chunk)
+                    except OSError:
+                        pass                          # the client read the answer and hung up: the drain is over
                     return
                 n = int(self.headers.get("Content-Length", "0"))
                 tls_got["body"] = self.rfile.read(n)
