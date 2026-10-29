@@ -169,6 +169,10 @@ for ch, (tester, portal, runner, mx, pv) in want.items():
     spec = dep["spec"]
     if "replicas" in spec:
         problems.append(f"{ch}: Deployment renders spec.replicas beside a ScaledObject")
+    # DRAIN, THEN REPLACE (Memex#863/#885): a surge pod needs capacity beyond a full ci-build pool and stays
+    # Pending, so a surge-first roll never removes the old replica and the set change never lands.
+    if spec.get("strategy") != {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}}:
+        problems.append(f"{ch}: the roll is not drain-then-replace (maxSurge 0 / maxUnavailable 1): {spec.get('strategy')}")
     pod = spec["template"]["spec"]
     inits = {c["name"]: c for c in pod.get("initContainers", [])}
     if not inits.get("tester", {}).get("image", "").endswith("@sha256:" + tester * 16):
