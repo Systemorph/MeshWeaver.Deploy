@@ -857,6 +857,22 @@ def _self_test() -> int:
           lambda: seal_gate("3.1.11970", 0, sealed_out), REFUSED)
     check("seal-gate: negative control — exit 0 with no answer is RED", lambda: seal_gate("3.1.11970", 0, ""), REFUSED)
 
+    # The CLI's refusal must reach the LOG: every caller redirects stdout into a file it parses, so a
+    # refusal on stdout made the step red with no reason shown. It goes to stderr; stdout stays empty.
+    def cli_refusal() -> dict:
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "seal.log"
+            empty.write_text("")
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = main(["seal-gate", "--version", "3.1.11970", "--exit", "0", "--output", str(empty)])
+            return {"rc": rc, "out": out.getvalue(), "err": err.getvalue()}
+    check("seal-gate CLI: a refusal is printed to STDERR (the log), never into the redirected answer file",
+          cli_refusal, lambda o: o["rc"] == 1 and o["out"] == ""
+          and "::error::the platform's hand-over is refused" in o["err"])
+
     if fails:
         print("platform-set-dispatch self-test FAILED:")
         for f in fails:
@@ -912,11 +928,14 @@ def main(argv: list[str]) -> int:
             out = seal_gate(a.version, a.exit, a.output.read_text(encoding="utf-8", errors="replace"))
         else:
             ap.error("read, discover, claim, runner-key, runner-choice, seal-gate or --self-test")
+    # 🚨 A refusal goes to STDERR. Every caller redirects stdout into a file it parses (`> seal-gate`,
+    # `> claim`, `> found`, `> runner-choice`), so an `::error::` printed there never reached the log:
+    # the step went RED naming nothing (Copilot on Deploy#82). GitHub reads workflow commands on both.
     except (OSError, ValueError) as e:
-        print(f"::error::the platform's sets cannot be read: {e}")
+        print(f"::error::the platform's sets cannot be read: {e}", file=sys.stderr)
         return 1
     except Refusal as e:
-        print(f"::error::the platform's hand-over is refused: {e}")
+        print(f"::error::the platform's hand-over is refused: {e}", file=sys.stderr)
         return 1
     for k, v in out.items():
         print(f"{k}={v}")
