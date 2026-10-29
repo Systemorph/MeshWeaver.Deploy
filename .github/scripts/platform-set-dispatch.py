@@ -496,6 +496,42 @@ def claim(run_url: str, run_core_sha: str, set_version: str, set_core_sha: str) 
                          "armed": {"armed": False}})
 
 
+# The platform resolver's refusal for a freeze on a run that exists but is not sealed (core
+# `resolve-platform.py`, `choose`: "the freeze names main-cd #N (core …), which is not a sealed set").
+NOT_SEALED = "which is not a sealed set"
+
+
+def seal_gate(version: str, exit_code: int, output: str) -> dict:
+    """Whether the newest ARMED set may be handed to `build-latest`: only once the platform's own
+    resolver calls it SEALED, read by `resolve-platform.py --no-registry --freeze <version>` — the
+    exact reading every MeshWeaver.Plugins run makes of the `latest` channel's set (its freeze path:
+    that set, sealed, or RED). Pure.
+
+    WHY. Arming does not wait for the platform bake or `verify-images` (core `main-cd.yml`: `arm`
+    needs `promote` and the ladder), so the newest armed set can be one the resolver does not call
+    sealed — still sealing, or a bake that failed. Handed over, the channel would name a set every
+    Plugins run then refuses. So the hand-over HOLDS: the receiver never moves a channel backwards,
+    and build-latest keeps its previous sealed set until this one seals (a later tick re-reads).
+
+      * exit 0 and `set=<version>` printed       → send
+      * exit ≠ 0 and the resolver's NOT-SEALED refusal → hold, said (a later tick re-reads it)
+      * anything else (no answer, another set, another refusal) → Refusal: "could not read" is
+        never "sealed", and never a silent hold either."""
+    version = _version(version, "--version")
+    lines = output.splitlines()
+    if exit_code == 0:
+        if f"set={version}" in lines:
+            return {"send": "true", "why": f"{version} is sealed (core's resolver, --freeze) — handed to build-latest"}
+        named = next((ln[4:] for ln in lines if ln.startswith("set=")), "")
+        raise Refusal(f"the resolver answered for {version} but named set {named or 'none'} — not this set's seal")
+    if any(NOT_SEALED in ln for ln in lines):
+        return {"send": "false",
+                "why": f"{version} is armed but not sealed yet (core's resolver: not a sealed set) — build-latest "
+                       "keeps its previous sealed set; a later tick hands this one over once it seals"}
+    tail = " | ".join(ln.strip() for ln in lines[-3:] if ln.strip())[:400]
+    raise Refusal(f"the resolver could not say whether {version} is sealed (exit {exit_code}): {tail or 'no output'}")
+
+
 def _self_test() -> int:
     a, b, c = "a" * 40, "b" * 40, "c" * 40
     good = {"schema": 1, "run": {"url": "https://github.com/o/r/actions/runs/1", "coreSha": a},
@@ -797,6 +833,46 @@ def _self_test() -> int:
         commit(empty, "README.md", "x")
         check("runner-key: refuses a repository no commit of which touches the inputs", lambda: runner_key(empty), REFUSED)
 
+    # ── the seal gate: build-latest is handed only a set the resolver calls SEALED ──
+    sealed_out = "freeze requested: set 3.1.11961\nsha=" + a + "\nset=3.1.11961\nrun-number=11961\n"
+    check("seal-gate: a sealed armed set is handed over",
+          lambda: seal_gate("3.1.11961", 0, sealed_out), lambda o: o["send"] == "true")
+    # PROMOTED AND ARMED, BUT THE CD RUN WAS CANCELLED BEFORE IT SEALED: the resolver's own refusal text.
+    cancelled = ("freeze requested: set 3.1.11970 (repo VARIABLE MW_PLATFORM_REF)\n"
+                 "  skip main-cd #11970 (core e6c6d76c3): NOT sealed — the run itself was cancelled before any seal job ran\n"
+                 "::error title=The released platform did not resolve::the freeze names main-cd #11970 (core e6c6d76c3), "
+                 "which is not a sealed set (the run itself was cancelled before any seal job ran). A freeze is an "
+                 "instruction, not a preference: refusing to substitute another set.\n")
+    check("seal-gate: promoted+armed but the CD run was cancelled before the seal → HOLD (build-latest keeps its sealed set)",
+          lambda: seal_gate("3.1.11970", 1, cancelled), lambda o: o["send"] == "false" and "keeps its previous sealed set" in o["why"])
+    still_sealing = cancelled.replace("the run itself was cancelled before any seal job ran",
+                                      "platform bake (`Bake platform content`) in progress — still sealing")
+    check("seal-gate: armed while the platform bake still runs → HOLD",
+          lambda: seal_gate("3.1.11970", 1, still_sealing), lambda o: o["send"] == "false")
+    check("seal-gate: negative control — an unreachable resolver is RED, never a hold or a send",
+          lambda: seal_gate("3.1.11970", 1, "::error::HTTP 502 from api.github.com\n"), REFUSED)
+    check("seal-gate: negative control — a freeze that matched no run is RED",
+          lambda: seal_gate("3.1.11970", 1, "::error::the freeze `3.1.11970` matched no main-cd.yml run\n"), REFUSED)
+    check("seal-gate: negative control — exit 0 naming ANOTHER set is RED, never a send",
+          lambda: seal_gate("3.1.11970", 0, sealed_out), REFUSED)
+    check("seal-gate: negative control — exit 0 with no answer is RED", lambda: seal_gate("3.1.11970", 0, ""), REFUSED)
+
+    # The CLI's refusal must reach the LOG: every caller redirects stdout into a file it parses, so a
+    # refusal on stdout made the step red with no reason shown. It goes to stderr; stdout stays empty.
+    def cli_refusal() -> dict:
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "seal.log"
+            empty.write_text("")
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = main(["seal-gate", "--version", "3.1.11970", "--exit", "0", "--output", str(empty)])
+            return {"rc": rc, "out": out.getvalue(), "err": err.getvalue()}
+    check("seal-gate CLI: a refusal is printed to STDERR (the log), never into the redirected answer file",
+          cli_refusal, lambda o: o["rc"] == 1 and o["out"] == ""
+          and "::error::the platform's hand-over is refused" in o["err"])
+
     if fails:
         print("platform-set-dispatch self-test FAILED:")
         for f in fails:
@@ -830,6 +906,10 @@ def main(argv: list[str]) -> int:
     c.add_argument("--run-core-sha", required=True)
     c.add_argument("--set-version", default="")
     c.add_argument("--set-core-sha", default="")
+    sg = sub.add_parser("seal-gate", help="whether the newest armed set may be handed to build-latest (sealed?)")
+    sg.add_argument("--version", required=True)
+    sg.add_argument("--exit", type=int, required=True, help="the resolver's exit code")
+    sg.add_argument("--output", type=Path, required=True, help="the resolver's combined output")
     a = ap.parse_args(argv)
     if a.self_test:
         return _self_test()
@@ -844,13 +924,18 @@ def main(argv: list[str]) -> int:
             out = runner_choice(json.loads(a.runner.read_text()), _version(a.version, "--version"))
         elif a.cmd == "claim":
             out = claim(a.run_url, a.run_core_sha, a.set_version, a.set_core_sha)
+        elif a.cmd == "seal-gate":
+            out = seal_gate(a.version, a.exit, a.output.read_text(encoding="utf-8", errors="replace"))
         else:
-            ap.error("read, discover, claim, runner-key, runner-choice or --self-test")
+            ap.error("read, discover, claim, runner-key, runner-choice, seal-gate or --self-test")
+    # 🚨 A refusal goes to STDERR. Every caller redirects stdout into a file it parses (`> seal-gate`,
+    # `> claim`, `> found`, `> runner-choice`), so an `::error::` printed there never reached the log:
+    # the step went RED naming nothing (Copilot on Deploy#82). GitHub reads workflow commands on both.
     except (OSError, ValueError) as e:
-        print(f"::error::the platform's sets cannot be read: {e}")
+        print(f"::error::the platform's sets cannot be read: {e}", file=sys.stderr)
         return 1
     except Refusal as e:
-        print(f"::error::the platform's hand-over is refused: {e}")
+        print(f"::error::the platform's hand-over is refused: {e}", file=sys.stderr)
         return 1
     for k, v in out.items():
         print(f"{k}={v}")
