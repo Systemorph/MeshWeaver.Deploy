@@ -275,10 +275,15 @@ jobs:
           RUNNER_REV: ${{ steps.runner.outputs.runner_rev }}
         run: |
           set -euo pipefail
-          for repo in mw-plugin-test memex-portal-ai mw-build-host; do
+          for repo in mw-plugin-test memex-portal-ai; do
             python3 .github/scripts/acr-data-plane.py manifests --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
               --repository "$repo" --top 300 > "$RUNNER_TEMP/$repo.json"
           done
+          # The runners from the COMPLETE tag listing, never the newest 300 manifests: whether a set has its
+          # plain `<version>` tag and which runner is its FIRST must not depend on how many runners were
+          # published since (Deploy#62 — a window that lost the first runner queued a "repair" every tick).
+          python3 .github/scripts/acr-data-plane.py tag-rows --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
+            --repository mw-build-host > "$RUNNER_TEMP/mw-build-host.json"
           python3 .github/scripts/platform-set-dispatch.py discover --tester "$RUNNER_TEMP/mw-plugin-test.json" \
             --portal "$RUNNER_TEMP/memex-portal-ai.json" --runner "$RUNNER_TEMP/mw-build-host.json" \
             --runner-rev "$RUNNER_REV" > "$RUNNER_TEMP/found"

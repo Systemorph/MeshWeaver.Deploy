@@ -27,6 +27,12 @@ registry with that.
         COMPLETE, Link-paged tag listing, never a newest-N window: a hand-over that read `--top 300`
         manifests lost an older runner of the set once 300 newer ones were published, and the receiver then
         refused the refresh (MeshWeaver.Deploy#60).
+    acr-data-plane.py tag-rows  --registry <login server> --tenant <tenant id> --repository <name>
+        EVERY tag of <name>, one manifest-shaped row per tag (`[{"tags": [tag]}]`), from the COMPLETE,
+        Link-paged tag listing — what discovery reads the runners from (`platform-set-dispatch.py discover
+        --runner`). It needs only which runner revisions EXIST; a newest-N manifest window made a set whose
+        first runner had aged out of it read as lacking its plain tag, and discovery then queued the same
+        compatibility-tag "repair" on every tick (Deploy#62).
     acr-data-plane.py retag     --registry <login server> --tenant <tenant id> --repository <name> --from <tag> --to <tag>
         put the manifest <name>:<from> names under <to> as well, BYTE FOR BYTE (GET by the source tag,
         PUT the same body under the target with the same media type), so both tags name ONE digest;
@@ -291,6 +297,11 @@ def set_runners(server: str, tenant: str, repository: str, version: str, io: Io)
             raise Refusal(f"{repository}:{tag} is in the tag list but the registry says it is absent")
         rows.append({"digest": digest, "tags": [tag]})
     return rows
+
+
+def tag_rows(server: str, tenant: str, repository: str, io: Io) -> list[dict]:
+    """Every tag of <repository> as a manifest-shaped row `{"tags": [tag]}` (no digest), from the COMPLETE listing."""
+    return [{"tags": [t]} for t in sorted(list_tags(server, tenant, repository, io))]
 
 
 def main_first_parent(io: Io) -> list[str]:
@@ -1007,6 +1018,12 @@ jobs:
           lambda: set_runners("r.io", "t", "x", "3.1.100", converge_io([[A]], runners_reg, [], page=50)),
           lambda rows: [r["tags"] for r in rows] == [["3.1.100"], ["3.1.100-r5"], ["3.1.100-r7"]]
           and rows[0]["digest"] == rows[1]["digest"] == "sha256:" + hashlib.sha256(b'{"r":0}').hexdigest())
+    check("tag-rows: EVERY tag across many pages, one row each — no newest-N window",
+          lambda: tag_rows("r.io", "t", "x", converge_io([[A]], runners_reg, [], page=50)),
+          lambda rows: len(rows) == len(runners_reg) and {"tags": ["3.1.100"]} in rows
+          and all(set(r) == {"tags"} and len(r["tags"]) == 1 for r in rows))
+    check("tag-rows: an unreadable listing is refused, never an empty repository",
+          lambda: tag_rows("r.io", "t", "x", converge_io([[A]], runners_reg, [], list_status=503)), REFUSED)
     check("set-runners: an unreadable listing is refused, never an empty set",
           lambda: set_runners("r.io", "t", "x", "3.1.100", converge_io([[A]], runners_reg, [], list_status=503)), REFUSED)
 
@@ -1241,6 +1258,11 @@ def main(argv: list[str]) -> int:
             rows = set_runners(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")),
                                _arg(argv, "--repository"), _arg(argv, "--version"), Io())
             json.dump(rows, sys.stdout)
+            sys.stdout.write("\n")
+            return 0
+        if argv and argv[0] == "tag-rows":
+            json.dump(tag_rows(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")),
+                               _arg(argv, "--repository"), Io()), sys.stdout)
             sys.stdout.write("\n")
             return 0
         if argv and argv[0] == "manifests":
