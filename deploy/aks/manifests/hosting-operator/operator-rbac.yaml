@@ -167,6 +167,16 @@ rules:
   - apiGroups: ["cert-manager.io"]
     resources: ["certificates"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # READ on the ARC runners' EphemeralRunners — get + list, no watch, no write. hosting-runner-reap
+  # (MeshWeaver.Plugins, InstanceAction kind RunnerReap, Systemorph/Memex#879) joins each runner to its
+  # pod to find the runners ARC still reports Running although their pods have exited. On 2026-10-26 that
+  # state held a runner scale set at its maximum with zero live runners. Its remedy restarts the ARC
+  # controller (`rollout restart`, a patch on apps/deployments, already granted above) and never writes
+  # an EphemeralRunner. What a compromised Job learns from this grant: runner names, the repository each
+  # one is running a job for, and their phases.
+  - apiGroups: ["actions.github.com"]
+    resources: ["ephemeralrunners"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
