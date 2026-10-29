@@ -35,9 +35,10 @@ The refusals, and why each one exists:
        in kube-system), where a bare Service name such as `memex-portal-service` resolves to nothing: every poll then
        errors, the HPA never moves, and the Deployment stays at the one replica it was created with, whatever the
        demand and maxReplicas say. So a bare name is qualified with the release's namespace here. The hosts run in
-       that namespace and keep the URL as given; `localhost` and dotted hosts are left alone. */ -}}
+       that namespace and keep the URL as given. Only a host that IS a Service name (one DNS label) is qualified:
+       `localhost`, dotted hosts and IP literals (an IPv6 `[…]` included) are left alone. */ -}}
 {{- $scalerApi := $api -}}
-{{- if and (not (contains "." $host)) (ne $host "localhost") -}}
+{{- if and (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $host) (ne $host "localhost") -}}
 {{- $scalerApi = regexReplaceAll "^([a-z]+://)([^/:]+)" $api (printf "${1}${2}.%s.svc.cluster.local" .Release.Namespace) -}}
 {{- end -}}
 {{- $runnerRepo := required "buildHosts.runnerRepository is required when buildHosts.enabled — the mw-build-host image (bash, python3, git, bubblewrap, the .NET SDK, build-run.py); each channel names its digest" $b.runnerRepository -}}
