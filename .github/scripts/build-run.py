@@ -192,6 +192,7 @@ import select
 import shutil
 import signal
 import socket
+import unicodedata
 import ssl
 import stat
 import struct
@@ -1701,11 +1702,14 @@ def claim_labels(claim: dict) -> Optional[str]:
     carries none or a malformed list — the variable is then left UNSET, so the stage says it was not told rather than
     classifying an unknown set as known-none. An empty list is "" (known to be none)."""
     raw = claim.get("labels")
-    if not isinstance(raw, list) or len(raw) > 100:
+    # NO count cap: the claim's set is the UNION of every request naming the commit (one build per commit, however many
+    # pull requests name it), so it may hold more than one pull request's 100 — dropping it would drop a `full-run`.
+    # Each name is still a valid label name (validated per request by the instance as well).
+    if not isinstance(raw, list):
         return None
     names = []
     for n in raw:
-        if not isinstance(n, str) or not n.strip() or len(n) > 50 or "," in n or any(ord(c) < 32 for c in n):
+        if not isinstance(n, str) or not n.strip() or len(n) > 50 or "," in n or any(unicodedata.category(c) == "Cc" for c in n):
             return None
         names.append(n.strip())
     return ",".join(sorted(set(names)))
@@ -4496,8 +4500,12 @@ def self_test() -> int:
     # ── 0. the claim's labels → MW_BUILD_LABELS (None = unset: the stage says it was not told) ─────────
     check("labels/sorted, de-duplicated, trimmed", claim_labels({"labels": ["tests-before-review", " full-run", "full-run"]}) == "full-run,tests-before-review")
     check("labels/an empty list is known-none ('')", claim_labels({"labels": []}) == "")
+    union = [f"l{i}" for i in range(160)] + ["full-run"]
+    check("labels/an accumulated union beyond one PR's 100 is handed whole, full-run included",
+          (claim_labels({"labels": union}) or "").split(",").count("full-run") == 1 and len(claim_labels({"labels": union}).split(",")) == 161)
+    check("labels/counted in code points, as GitHub and the instance count them", claim_labels({"labels": ["\U0001F680" * 26]}) == "\U0001F680" * 26)
     for bad in ({}, {"labels": None}, {"labels": "full-run"}, {"labels": [1]}, {"labels": ["a,b"]}, {"labels": [""]},
-                {"labels": ["x" * 51]}, {"labels": ["a\nb"]}, {"labels": [f"l{i}" for i in range(101)]}):
+                {"labels": ["x" * 51]}, {"labels": ["a\nb"]}, {"labels": ["full-\x7frun"]}, {"labels": ["full-run\x85"]}):
         check(f"labels/{str(bad)[:30]} is unknown (None), never a partial set", claim_labels(bad) is None, claim_labels(bad))
 
     # ── 1. compiler diagnostics ─────────────────────────────────────────────────────────────
