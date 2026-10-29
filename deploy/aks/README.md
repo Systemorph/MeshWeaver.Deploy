@@ -1223,10 +1223,12 @@ Postgres endpoint.
 az acr manifest show -r <acrName> -n memex-portal-ai:<tag> \
   | jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"'   # expect linux/amd64 AND linux/arm64
 
-# b) Roll.
-az aks command invoke -g <rg> -n <cluster> --command \
-  "kubectl set image deploy/memex-portal-deployment memex-portal=<acrName>.azurecr.io/memex-portal-ai:<tag> -n <env> \
-   && kubectl rollout status deploy/memex-portal-deployment -n <env> --timeout=600s"
+# b) Roll — through the GOVERNED route, never by hand. A roll is a `Hosting/InstanceAction` with
+#    `"requestedAction": "Roll"` on the CONTROL instance, against the instance's `Deployments/<name>`
+#    record; the in-cluster operator executes it and reports on the action node. A direct
+#    `kubectl set image` bypasses the deployment record and the approval, and the next reconcile
+#    (or `helm upgrade`, which re-renders from `portal.image`) silently reverts it — see the ⚠️
+#    under "The keys that actually set the image" above. `az aks command invoke` / `kubectl` are break-glass only.
 
 # c) Verify with REAL signals, looped. HTTP 200 is the Blazor shell and proves nothing.
 for i in $(seq 1 10); do curl -s -o /dev/null -w "%{http_code} " https://<host>/api/content/<space>/content/<file>; done
