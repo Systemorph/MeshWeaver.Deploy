@@ -869,19 +869,75 @@ NUGET_FEED_TIMEOUT_SECONDS = 20
 NUGET_FEED_MAX_BYTES = 16 << 20
 NUGET_FEED_WORKERS = 8
 NUGET_FEED_BUDGET_SECONDS = 600
+# WHICH feeds may vouch for a package: `.nupkg.metadata` → `source` is written by the restore inside the stage, so a
+# stage could name a feed it controls that publishes its forged archive's hash. The source must therefore be one the
+# HOST trusts, configured independently of anything a stage writes: MW_NUGET_TRUSTED_SOURCES (service-index URLs,
+# separated by whitespace or commas), nuget.org's when unset. A package from any other source is refused, by name.
+NUGET_TRUSTED_SOURCES_ENV = "MW_NUGET_TRUSTED_SOURCES"
+NUGET_DEFAULT_TRUSTED_SOURCES = ("https://api.nuget.org/v3/index.json",)
 NUGET_REGISTRATION_TYPES = ("RegistrationsBaseUrl/3.6.0", "RegistrationsBaseUrl/3.4.0", "RegistrationsBaseUrl/3.0.0-rc",
                             "RegistrationsBaseUrl/3.0.0-beta", "RegistrationsBaseUrl")
 
 
+def nuget_trusted_sources(env: dict) -> tuple:
+    """The service-index URLs this host lets vouch for a package (NUGET_TRUSTED_SOURCES_ENV, else nuget.org's)."""
+    raw = env.get(NUGET_TRUSTED_SOURCES_ENV, "")
+    found = tuple(x for x in re.split(r"[\s,]+", raw) if x)
+    return found or NUGET_DEFAULT_TRUSTED_SOURCES
+
+
+def _source_key(url: str) -> str:
+    """A feed URL compared case-insensitively in scheme and host, without a trailing slash."""
+    u = urllib.parse.urlsplit(url.strip())
+    return urllib.parse.urlunsplit((u.scheme.lower(), u.netloc.lower(), u.path.rstrip("/"), u.query, ""))
+
+
+class HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows a feed's redirect only to another https URL: urllib would follow https → http, and an answer read over
+    plain http could vouch for a package with nobody authenticated."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme != "https":
+            raise ValueError(f"refused a redirect to a non-https URL: {newurl[:200]}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def feed_opener() -> urllib.request.OpenerDirector:
+    """The opener every feed request goes through: redirects only to https (HttpsOnlyRedirect)."""
+    return urllib.request.build_opener(HttpsOnlyRedirect)
+
+
+def read_bounded(r, deadline: float, limit: int, clock: Callable[[], float] = time.monotonic) -> bytes:
+    """Read `r` to its end, refusing past `limit` bytes and past the ABSOLUTE `deadline`: the socket timeout bounds
+    each read, not a response that keeps trickling bytes, so without this a worker could outlive any budget."""
+    chunks: list = []
+    size = 0
+    while True:
+        if clock() >= deadline:
+            raise TimeoutError("the answer did not complete within its deadline")
+        chunk = r.read(64 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > limit:
+            return b"".join(chunks)
+
+
 def feed_get(url: str, timeout: float) -> bytes:
-    """GET one NuGet v3 document over HTTPS, bounded in time (`timeout` per request) and size (NUGET_FEED_MAX_BYTES,
-    after gzip too: nuget.org serves its semver2 registration hive gzip-encoded). Raises on any failure."""
+    """GET one NuGet v3 document over HTTPS — redirects only to https (`feed_opener`) — bounded in time (`timeout`
+    per socket operation AND as an absolute deadline over the whole body, `read_bounded`) and size
+    (NUGET_FEED_MAX_BYTES, after gzip too: nuget.org serves its semver2 registration hive gzip-encoded). Raises on any
+    failure."""
     if urllib.parse.urlsplit(url).scheme != "https":
         raise ValueError(f"not an https URL: {url[:200]}")
+    deadline = time.monotonic() + timeout
     req = urllib.request.Request(url, headers={"Accept": "application/json", "Accept-Encoding": "gzip",
                                                "User-Agent": "meshweaver-build-host"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = r.read(NUGET_FEED_MAX_BYTES + 1)
+    with feed_opener().open(req, timeout=timeout) as r:
+        if urllib.parse.urlsplit(r.geturl()).scheme != "https":
+            raise ValueError(f"the answer came from a non-https URL: {r.geturl()[:200]}")
+        data = read_bounded(r, deadline, NUGET_FEED_MAX_BYTES)
         gz = (r.headers.get("Content-Encoding") or "").lower() == "gzip"
     if len(data) > NUGET_FEED_MAX_BYTES:
         raise ValueError(f"the answer exceeds {NUGET_FEED_MAX_BYTES} bytes: {url[:200]}")
@@ -895,10 +951,13 @@ def feed_get(url: str, timeout: float) -> bytes:
 
 class NugetFeeds:
     """The hash each package's SOURCE FEED publishes, read through `get(url, timeout) -> bytes` (`feed_get`; the
-    self-test injects a stand-in, never the network). One service index read per source; every answer must be https."""
+    self-test injects a stand-in, never the network). One service index read per source; every answer must be https,
+    and the source must be one of `trusted` (nuget_trusted_sources — the host's configuration, never the package's)."""
 
-    def __init__(self, get: Callable[[str, float], bytes] = feed_get) -> None:
+    def __init__(self, get: Callable[[str, float], bytes] = feed_get,
+                 trusted: Sequence[str] = NUGET_DEFAULT_TRUSTED_SOURCES) -> None:
         self.get = get
+        self.trusted = frozenset(_source_key(t) for t in trusted)
         self.bases: dict = {}
         self.lock = threading.Lock()
 
@@ -930,6 +989,8 @@ class NugetFeeds:
         if not isinstance(source, str) or urllib.parse.urlsplit(source).scheme != "https" \
                 or not source.rstrip("/").lower().endswith("index.json"):
             raise ValueError(f"its source {str(source)[:120]!r} is not a NuGet v3 feed this host can verify")
+        if _source_key(source) not in self.trusted:
+            raise ValueError(f"its source {source[:120]!r} is not a feed this host trusts ({NUGET_TRUSTED_SOURCES_ENV})")
         try:
             base = self._registrations(source)
             leaf = self._json(f"{base.rstrip('/')}/{urllib.parse.quote(pid.lower())}/{urllib.parse.quote(ver.lower())}.json")
@@ -1074,13 +1135,16 @@ def quarantine_artifacts(root: str, before: dict, dest: str) -> list[str]:
 
 
 def promote_nuget(restored: str, cache: str, log: Callable[[str], None],
-                  feeds: Optional[NugetFeeds] = None) -> tuple[int, int, list[str]]:
+                  feeds: Optional[NugetFeeds] = None,
+                  budget: float = NUGET_FEED_BUDGET_SECONDS) -> tuple[int, int, list[str]]:
     """Promote the packages a TRUNK build stage restored into the shared warm NuGet cache
     (`<cache>/nuget/<id>/<version>/`, the stages' read-only fallback folder), so the next run restores
     nothing. Each verified (`nuget_package_problem`), compared with the hash its SOURCE FEED publishes
     (`NugetFeeds.published_hash` — a mismatch, or no answer, refuses it), REBUILT from its verified archive in a temp
     dir (`materialize_nuget_package`) and renamed into place; a
-    package already present is kept (a NuGet id/version is immutable). Returns (promoted, kept, refused)."""
+    package already present is kept (a NuGet id/version is immutable). The feed is asked within `budget` seconds —
+    the caller passes what its RUN has left, so verification never overruns the run; with none left nothing is asked
+    and every candidate is refused (retried by a later run). Returns (promoted, kept, refused)."""
     feeds = feeds or NugetFeeds()
     root = os.path.join(cache, "nuget")
     os.makedirs(root, exist_ok=True)
@@ -1103,7 +1167,9 @@ def promote_nuget(restored: str, cache: str, log: Callable[[str], None],
             refused.append(f"{entry} (its source cannot be read: {e})")
             continue
         candidates.append((entry, source, pid, ver))
-    published = feeds.published_hashes(candidates)
+    budget = min(budget, NUGET_FEED_BUDGET_SECONDS)
+    published = feeds.published_hashes(candidates, budget) if budget > 0 else \
+        {entry: ValueError("the run had no time left to ask its source feed") for entry, _s, _p, _v in candidates}
     for entry, _source, pid, ver in candidates:
         final = os.path.join(root, pid, ver)
         answer = published.get(entry, ValueError("its source feed was not asked"))
@@ -2776,7 +2842,7 @@ class Host:
                  nuget_feeds: Optional[NugetFeeds] = None) -> None:
         self.env = env
         # Where a package promoted into the warm NuGet cache is checked against its source feed (promote_nuget).
-        self.nuget_feeds = nuget_feeds or NugetFeeds()
+        self.nuget_feeds = nuget_feeds or NugetFeeds(trusted=nuget_trusted_sources(env))
         self.api = api
         self.log = log or (lambda s: print(f"build-run: {s}", flush=True))
         self.pull = pull or (lambda cmd: subprocess.run(cmd).returncode)
@@ -3357,7 +3423,8 @@ class Host:
                 # promote_nuget keeps a package the warm cache already holds. A build stage runs ALONE, so nothing
                 # writes the folder while it is promoted.
                 if ok and trunk and st["kind"] == "build" and nuget_packages(nuget_dir):
-                    np_, nk, nr = promote_nuget(nuget_dir, self.cache, self.log, self.nuget_feeds)
+                    np_, nk, nr = promote_nuget(nuget_dir, self.cache, self.log, self.nuget_feeds,
+                                                budget=run_end - self.clock())
                     sink.add([{"kind": "line", "text": f"warm NuGet cache: {np_} package(s) promoted, {nk} already present"
                                                        + (f", {len(nr)} NOT promoted (unverified)" if nr else "")}])
                     self.deliver(sink)
@@ -3680,7 +3747,7 @@ class Host:
             # Every package fetched came from the TIP's own sources by the TIP's own command, so even a failed restore's
             # complete packages may be promoted; each is verified against what NuGet recorded AND against the hash its
             # source feed publishes, and rebuilt from its archive.
-            np_, nk, nr = promote_nuget(fetched, self.cache, self.log, self.nuget_feeds)
+            np_, nk, nr = promote_nuget(fetched, self.cache, self.log, self.nuget_feeds, budget=run_end - self.clock())
         except (subprocess.SubprocessError, OSError) as e:
             warn(f"the warm NuGet cache was not filled: a host-side failure while warming ({type(e).__name__}: {str(e)[:200]})")
             return
@@ -5544,6 +5611,63 @@ def self_test() -> int:
             check("provenance/the real fetch refuses a non-https URL before any request", False, "fetched")
         except ValueError:
             pass
+        # A REDIRECT to plain http is refused before it is followed; one to https is followed.
+        rd_ = HttpsOnlyRedirect()
+        rq_ = urllib.request.Request("https://api.nuget.org/v3/index.json")
+        try:
+            rd_.redirect_request(rq_, None, 302, "Found", {}, "http://api.nuget.org/v3/index.json")
+            check("provenance/a redirect from https to http is refused", False, "followed")
+        except ValueError:
+            pass
+        check("provenance/a redirect to another https URL is followed",
+              rd_.redirect_request(rq_, None, 302, "Found", {}, "https://api.nuget.org/v3-flat/index.json") is not None)
+        check("provenance/the real fetch's opener refuses http redirects (HttpsOnlyRedirect is installed)",
+              any(isinstance(h_, HttpsOnlyRedirect) for h_ in feed_opener().handlers))
+        # A body that keeps TRICKLING is cut at the absolute deadline (the socket timeout bounds each read only).
+        clock_ = [0.0]
+
+        class Trickle:
+            def read(self, n_):
+                clock_[0] += 1.0
+                return b"x"
+        try:
+            read_bounded(Trickle(), 5.0, NUGET_FEED_MAX_BYTES, clock=lambda: clock_[0])
+            check("provenance/a trickling answer is cut at its absolute deadline", False, "read to the end")
+        except TimeoutError:
+            check("provenance/a trickling answer is cut at its absolute deadline", clock_[0] <= 6.0, clock_[0])
+        # TRUST is the host's, never the package's: a stage that rewrites BOTH the archive and `source` to a feed it
+        # controls (an https v3 feed that publishes the forged archive's hash) is refused.
+        def rogue_feed(url, timeout):
+            if url == "https://rogue.test/v3/index.json":
+                return json.dumps({"resources": [{"@id": "https://feed.test/reg/", "@type": "RegistrationsBaseUrl/3.6.0"}]}).encode()
+            return stand_in_feed(url, timeout)
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(forged_zip)
+        rogue_dir = restored_pkg(os.path.join(tmp, "prov-rogue"), forged_zip, "https://rogue.test/v3/index.json")
+        (pr_, _, rr_), inr_, _ = promote_into("rogue", rogue_dir, NugetFeeds(rogue_feed))
+        check("provenance/a forged archive whose `source` names a feed the STAGE controls is REFUSED (untrusted source)",
+              pr_ == 0 and inr_ == set() and len(rr_) == 1 and "not a feed this host trusts" in rr_[0], (pr_, inr_, rr_))
+        (pt_, _, _), int_, _ = promote_into("rogue-trusted", rogue_dir,
+                                            NugetFeeds(rogue_feed, trusted=("https://rogue.test/v3/index.json",)))
+        check("provenance/negative control: the same feed, trusted by the HOST's configuration, vouches",
+              pt_ == 1 and int_ == {"demo.pkg/1.0.0"}, (pt_, int_))
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(unsigned_)
+        check("provenance/the trusted sources come from the host's env, nuget.org's when unset",
+              nuget_trusted_sources({}) == NUGET_DEFAULT_TRUSTED_SOURCES
+              and nuget_trusted_sources({NUGET_TRUSTED_SOURCES_ENV: "https://a.test/v3/index.json, https://b.test/index.json"})
+              == ("https://a.test/v3/index.json", "https://b.test/index.json"))
+        check("provenance/a trusted source matches case-insensitively in host, with or without a trailing slash",
+              _source_key("https://API.nuget.org/v3/index.json/") == _source_key("https://api.nuget.org/v3/index.json"))
+        # The RUN's remaining time bounds the verification: with none left the feed is never asked and nothing promoted.
+        asked_: list = []
+
+        def counting_get(url, timeout):
+            asked_.append(url)
+            return stand_in_feed(url, timeout)
+        (pb_, _, rb_), inb_, _ = (promote_nuget(good_dir, os.path.join(tmp, "prov-cache-nobudget"), lambda m: None,
+                                                NugetFeeds(counting_get), budget=0),
+                                  nuget_packages(os.path.join(tmp, "prov-cache-nobudget", "nuget")), None)
+        check("provenance/no run time left: the feed is not asked, the package is refused (retried by a later run)",
+              pb_ == 0 and inb_ == set() and asked_ == [] and len(rb_) == 1 and "no time left" in rb_[0], (pb_, inb_, asked_, rb_))
 
         def pkg_fixture(kind_: str) -> str:
             root_ = os.path.join(tmp, f"pkg-{kind_}")
@@ -5583,11 +5707,21 @@ def self_test() -> int:
         check("prepared/a SIGNED package (content hash != archive hash) is promoted, its signature extracted as NuGet does",
               os.path.isfile(os.path.join(warm, ".nupkg.metadata")) and os.path.isfile(os.path.join(warm, NUGET_SIGNATURE)))
         shutil.rmtree(os.path.join(cache, "nuget"))
+        # The feed publishes EACH fixture's own archive hash, so provenance PASSES and the refusal under test is the
+        # materialisation's (RuntimeError / zlib.error) — never a provenance mismatch standing in for it.
+        for kind_, zip_ in (("encrypted", encrypted_zip), ("corrupt", corrupt_zip)):
+            feed_hashes["demo.pkg/1.0.0"] = b64sha(zip_)
+            (pm_, _, rm_), inm_, _ = promote_into(f"mat-{kind_}", restored_pkg(os.path.join(tmp, f"prov-mat-{kind_}"), zip_))
+            check(f"provenance/the {kind_} fixture passes provenance and is refused by MATERIALISATION",
+                  pm_ == 0 and inm_ == set() and len(rm_) == 1 and "could not be moved into place" in rm_[0], rm_)
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(encrypted_zip)
         host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("encrypted")}]})).run(dict(claim, isTrunk=True))
         check("prepared/negative control: an ENCRYPTED package (valid hashes, unreadable entry) is refused, never a crash",
               not os.path.exists(warm))
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(corrupt_zip)
         host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("corrupt")}]})).run(dict(claim, isTrunk=True))
         check("prepared/negative control: a CORRUPT-DEFLATE package (valid hashes) is refused, never a crash", not os.path.exists(warm))
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(unsigned_)
         shutil.rmtree(os.path.join(cache, "nuget"), ignore_errors=True)
         host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": "true"}]})).run(dict(claim, isTrunk=True))
         check("prepared/a fresh cache gets <cache>/nuget before any stage runs, with NO prepared inputs declared",
