@@ -5817,9 +5817,30 @@ def self_test() -> int:
             check("h9/diagnostics: an expired run copies nothing and names the deadline",
                   r_ == [] and bool(prob_) and "deadline" in prob_
                   and not [d for d in os.listdir(sroot) if d.startswith(".diagnostics-")], (r_, prob_))
+            # A dump larger than two chunks, stopped by the check after the first chunk: only that chunk is written.
+            # An unbounded read followed by one check would write the whole file before it could stop.
+            big_root = os.path.join(sroot, "big")
+            os.makedirs(os.path.join(big_root, "diagnostics", "x"))
+            with open(os.path.join(big_root, "diagnostics", "x", "core.dump"), "wb") as fh:
+                fh.truncate(2 * DIAGNOSTICS_COPY_CHUNK + 1)
             calls = []
-            red_stage_diagnostics(os.path.join(sroot, "art"), {}, os.path.join(sroot, "copy"), lambda: calls.append(1))
-            check("h9/diagnostics: the copy re-checks before each file and between its chunks", len(calls) >= 2, calls)
+
+            class _Stop(Exception):
+                pass
+
+            def stop_after_first_chunk():
+                calls.append(1)
+                if len(calls) == 2:     # call 1 precedes the file, call 2 follows its first chunk
+                    raise _Stop()
+            stopped = False
+            try:
+                red_stage_diagnostics(big_root, {}, os.path.join(sroot, "copy"), stop_after_first_chunk)
+            except _Stop:
+                stopped = True
+            copied_target = os.path.join(sroot, "copy", "diagnostics", "x", "core.dump")
+            written = os.path.getsize(copied_target) if os.path.isfile(copied_target) else -1
+            check("h9/diagnostics: the copy re-checks before each file and between its chunks, and stops mid-file",
+                  stopped and calls == [1, 1] and written == DIAGNOSTICS_COPY_CHUNK, (stopped, calls, written))
         finally:
             shutil.rmtree(sroot, ignore_errors=True)
         # ── 7d. FAN-OUT: a `parallel` run's independent stages run CONCURRENTLY, within the host's declared slots ──
