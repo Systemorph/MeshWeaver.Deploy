@@ -53,7 +53,10 @@ THE LOOP, and the order that matters:
      `{api}/{repo}/{sha}/stages/{stage}/events?channel=<c>`: compiler `file(line,col): error CODE:
      message` → `diagnostic`; test results (vstest `Passed/Failed/Skipped` and xunit `[FAIL]`) →
      `test-finished`; a structured `::mw-event::{json}` line → that event; plus the host's own
-     `line`, `stage-finished` and `run-finished`. Everything else the child prints stays in a local
+     `line`, `stage-finished` and `run-finished`. A stage that runs CONCURRENT LANES tags each lane's
+     line `::mw-lane::<lane>::<line>`: every lane keeps its own current suite and pending failure, so
+     interleaved lanes are never attributed to one another (Deploy#47); an untagged line is the
+     stage's own. Everything else the child prints stays in a local
      tail and is forwarded ONLY when the stage failed with nothing else to explain it ("CI logs
      warn/error + verdicts only"). A stage writes outputs to `$MW_BUILD_OUTPUTS/<content key>/`
      with a `.cache-key.json`; the HOST promotes them into the shared cache (`<cache>/outputs/<key>/`)
@@ -221,6 +224,12 @@ SUMMARY = re.compile(r"^\s*((Passed|Failed|Skipped)!\s+-|Total tests:|=== TEST E
 TEST_RUN_FOR = re.compile(r"Test run for (?P<dll>\S+?\.dll)")
 STACK_FILE = re.compile(r"\bin (?P<file>\S+\.(?:cs|fs|vb|razor)):line (?P<line>\d+)")
 MW_EVENT = re.compile(r"^::mw-event::(?P<json>.*)$")
+# A PARALLEL LANE's line: `::mw-lane::<lane>::<the lane's own line>`. A stage that runs suites in
+# concurrent lanes (MeshWeaver.Plugins scripts/host-portal-hosts.sh) writes whole lines, but the lanes
+# INTERLEAVE: one lane's failed test is followed by another lane's `Test run for`, and its error
+# message arrives after that. Each lane is therefore parsed with its OWN suite and pending failure
+# (OutputParser.LANE_STATE); a line without the tag is the stage's own, parsed as before.
+MW_LANE = re.compile(r"^::mw-lane::(?P<lane>[A-Za-z0-9._-]{1,40})::(?P<rest>.*)$")
 OUTCOME = {"Passed": "passed", "Failed": "failed", "Skipped": "skipped",
            "PASS": "passed", "FAIL": "failed", "SKIP": "skipped"}
 
@@ -242,7 +251,13 @@ def parse_duration_ms(text: Optional[str]) -> int:
 
 class OutputParser:
     """Translates one stage's child output into §7a progress events. Stateful (a failed test's
-    message and file follow it on later lines); feed every line, then call finish()."""
+    message and file follow it on later lines); feed every line, then call finish().
+
+    The per-LANE state (`LANE_STATE`: the current suite and the pending failure) is kept per lane
+    (`MW_LANE`), so interleaved lines of concurrent lanes are never attributed across lanes; the
+    counters, the diagnostic de-duplication and the tail are the stage's, shared by every lane."""
+
+    LANE_STATE = ("suite", "pending", "pending_state", "pending_lines")
 
     def __init__(self, workdir: str, stage: str) -> None:
         self.workdir = os.path.realpath(workdir).rstrip("/") + "/" if workdir else ""
@@ -251,6 +266,8 @@ class OutputParser:
         self.pending: Optional[dict] = None
         self.pending_state = ""        # "", "message", "stack"
         self.pending_lines = 0
+        self.lane: Optional[str] = None            # the lane whose state is loaded (None: the stage's own)
+        self.parked: dict = {}                     # lane → its saved LANE_STATE while another lane's is loaded
         self.seen_diag: set[tuple] = set()
         self.diag_count = 0
         self.diag_dropped = 0
@@ -380,11 +397,27 @@ class OutputParser:
         except Exception as e:      # the parser is total by contract; this is its seatbelt
             return [{"kind": "line", "text": f"output line not parsed ({type(e).__name__})"}]
 
+    def _switch_lane(self, lane: Optional[str]) -> None:
+        """Load `lane`'s state, parking the current one — WITHOUT flushing its pending failure, whose
+        message lines may still arrive after another lane's lines."""
+        if lane == self.lane:
+            return
+        self.parked[self.lane] = {k: getattr(self, k) for k in self.LANE_STATE}
+        state = self.parked.pop(lane, None) or {"suite": self.stage, "pending": None, "pending_state": "", "pending_lines": 0}
+        for k, v in state.items():
+            setattr(self, k, v)
+        self.lane = lane
+
     def _feed(self, raw: str) -> list[dict]:
         line = raw.rstrip("\r\n")
         self.tail.append(line[:MAX_LINE])
         if len(self.tail) > TAIL_LINES:
             del self.tail[0]
+
+        m = MW_LANE.match(line)
+        self._switch_lane(m.group("lane") if m else None)
+        if m:
+            line = m.group("rest")
 
         m = MW_EVENT.match(line)
         if m:
@@ -447,6 +480,9 @@ class OutputParser:
 
     def finish(self) -> list[dict]:
         out = self._flush_pending()
+        for lane in list(self.parked):             # every lane's last failure, not only the loaded one's
+            self._switch_lane(lane)
+            out += self._flush_pending()
         if self.diag_dropped:
             out.append({"kind": "line", "text": f"{self.diag_dropped} further diagnostic(s) not forwarded "
                                                 f"(cap {MAX_DIAGNOSTICS_PER_STAGE} per stage)"})
@@ -1385,6 +1421,9 @@ class Heartbeat:
         self.target: Optional[EventSink] = None
         self.period = period
         self.stop = threading.Event()
+        # SET when a beat met the 409: the claim is gone. Work that posts nothing for minutes (a prepared
+        # input's build, Deploy#49) polls it and ends at once, instead of finding out on its next post.
+        self.lost = threading.Event()
         self.thread = threading.Thread(target=self._loop, daemon=True)
 
     def _loop(self) -> None:
@@ -1394,7 +1433,10 @@ class Heartbeat:
                 continue
             try:
                 t.beat()
-            except Exception:       # Lost is seen by the run's own next post; a beat never kills the run
+            except Lost:
+                self.lost.set()     # the run's own next post raises Lost too; nothing more is beaten for it
+                return
+            except Exception:       # a transient fault never kills the run; the next beat retries
                 pass
 
     def __enter__(self) -> "Heartbeat":
@@ -1485,9 +1527,40 @@ def plugins_key_of(lines: list[str]) -> str:
     return "sha256:" + hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
 
+# A DISPLACED cache entry (`.stale-*`, renamed aside by `_swap_into_place`) may still be bind-mounted by a running
+# sandbox on another replica (`stage_readonly`): the rename keeps that mount on the moved inode, but deleting the files
+# would pull them out from under the build (Deploy#46). It is therefore kept until no run that could have mounted it
+# can still be alive — the longest run a host may be configured for, plus the run margin — and swept after.
+STALE_RECLAIM_SECONDS = MAX_RUN_DEADLINE + RUN_MARGIN_SECONDS
+
+
+def sweep_displaced(parent: str, now: Optional[float] = None, grace: float = STALE_RECLAIM_SECONDS) -> list[str]:
+    """Remove the `.stale-*` entries under `parent` displaced longer than `grace` seconds ago (their mtime is stamped
+    when they are displaced). Returns what was removed. Never raises: a sweep is housekeeping, not a verdict."""
+    now = time.time() if now is None else now
+    removed = []
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return removed
+    for n in names:
+        p = os.path.join(parent, n)
+        if not n.startswith(".stale-") or os.path.islink(p) or not os.path.isdir(p):
+            continue
+        try:
+            if now - os.stat(p).st_mtime < grace:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(p, ignore_errors=True)
+        removed.append(p)
+    return removed
+
+
 def _swap_into_place(tmp: str, final: str, intact: Callable[[str], bool], lock_fn: Optional[Callable] = None) -> None:
     """Move a freshly built `tmp` to `final`, REPLACING a damaged `final` (a populated directory a plain rename
-    cannot overwrite): the damaged one is renamed aside first and removed after. Validation and publication are
+    cannot overwrite): the damaged one is renamed aside first and RECLAIMED LATER (`sweep_displaced`), never deleted
+    while a running sandbox on another replica may still read it. Validation and publication are
     SERIALISED per cache entry (an exclusive lock on `.<name>.lock` beside it), and `final` is re-validated under
     that lock: when another replica installed an intact entry while this one fetched, `tmp` is discarded and the
     installed entry is never moved aside — a running sandbox may bind-mount it. When the lock CANNOT be taken
@@ -1509,17 +1582,19 @@ def _swap_into_place(tmp: str, final: str, intact: Callable[[str], bool], lock_f
             shutil.rmtree(tmp, ignore_errors=True)
             raise Refusal(f"{final} is damaged, and its lock could not be taken on this cache: not replacing it "
                           "without exclusion (another replica may be installing it)")
+        # Under the lock: reclaim what was displaced long enough ago that no run can still read it.
+        sweep_displaced(os.path.dirname(final))
         stale = tempfile.mkdtemp(prefix=".stale-", dir=os.path.dirname(final))
         os.rmdir(stale)
         try:
             os.rename(final, stale)
+            os.utime(stale)        # the displacement time, which the sweep's grace counts from
         except OSError:
             pass
         try:
             os.rename(tmp, final)
         except OSError:
             shutil.rmtree(tmp, ignore_errors=True)
-        shutil.rmtree(stale, ignore_errors=True)
 
 
 def bundle_intact(final: str, line: str) -> bool:
@@ -3207,24 +3282,36 @@ class Host:
         self.deliver(sink)
 
     def _sandboxed_capture(self, command: str, tree: str, out: str, workdir: str, extra: dict, readonly: list,
-                           writable: list, timeout: float) -> tuple[int, str]:
+                           writable: list, timeout: float, cancel: Optional[threading.Event] = None) -> tuple[int, str]:
         """Run a host-chosen, repository-declared command in the sandbox on `tree`. Its output goes to host-owned FILES
         (outside the sandbox's writable binds) and only a bounded tail of each is read back, so a noisy command can never
-        exhaust the host's memory and end the worker without a verdict. Returns (exit code, stderr tail + stdout tail)."""
+        exhaust the host's memory and end the worker without a verdict. Returns (exit code, stderr tail + stdout tail).
+        `cancel` set (the heartbeat met the 409 — the run is not this host's claim any more) kills the sandbox's whole
+        tree at once and raises Lost: a build for a run another host now owns is never waited out (Deploy#49)."""
         argv = self.sandbox.argv(command, tree, out, sandbox_env(self.env, extra, self.cache),
                                  readonly=readonly, writable=writable)
         logs = tempfile.mkdtemp(prefix=".prep-log-", dir=workdir)
         try:
             with open(os.path.join(logs, "out"), "w+b") as so, open(os.path.join(logs, "err"), "w+b") as se:
                 try:
-                    r = subprocess.run(argv, cwd=tree, env={"PATH": self.env.get("PATH", "/usr/bin:/bin")},
-                                       stdout=so, stderr=se, timeout=max(1.0, timeout), stdin=subprocess.DEVNULL)
-                except subprocess.TimeoutExpired:
-                    return 124, "timed out"
+                    proc = subprocess.Popen(argv, cwd=tree, env={"PATH": self.env.get("PATH", "/usr/bin:/bin")},
+                                            stdout=so, stderr=se, stdin=subprocess.DEVNULL, start_new_session=True)
                 except OSError as e:
                     return 127, str(e)
+                end = time.monotonic() + max(1.0, timeout)
+                while True:
+                    try:
+                        proc.wait(timeout=max(0.01, min(1.0, end - time.monotonic())))
+                        break
+                    except subprocess.TimeoutExpired:
+                        if cancel is not None and cancel.is_set():
+                            _kill(proc)
+                            raise Lost("a prepared input's command was killed — the run is not this host's claim any more")
+                        if time.monotonic() >= end:
+                            _kill(proc)
+                            return 124, "timed out"
                 # stdout LAST: a key command's key is its final line
-                return r.returncode, file_tail(se, PREPARED_OUTPUT_TAIL) + file_tail(so, PREPARED_OUTPUT_TAIL)
+                return proc.returncode, file_tail(se, PREPARED_OUTPUT_TAIL) + file_tail(so, PREPARED_OUTPUT_TAIL)
         finally:
             shutil.rmtree(logs, ignore_errors=True)
 
@@ -3270,8 +3357,13 @@ class Host:
         # --ro-bind-try would silently skip it — so a fresh host creates it before the first preparation.
         os.makedirs(os.path.join(self.cache, "nuget"), exist_ok=True)
 
+        # The claim's loss, as the heartbeat sees it: a key or build command polls it and is killed on it (Deploy#49).
+        lost = self.heartbeat.lost if self.heartbeat is not None else None
+
         def sandboxed(command: str, tree: str, out: str, extra: dict, readonly: list, writable: list, timeout: float) -> tuple[int, str]:
-            return self._sandboxed_capture(command, tree, out, workdir, extra, readonly, writable, timeout)
+            if lost is not None and lost.is_set():
+                raise Lost("the run is not this host's claim any more — preparing nothing more for it")
+            return self._sandboxed_capture(command, tree, out, workdir, extra, readonly, writable, timeout, cancel=lost)
 
         base_extra = {"MW_BUILD_PLATFORM_VERSION": self.platform_version, "MW_BUILD_REPO": repo}
 
@@ -3877,6 +3969,61 @@ def self_test() -> int:
           f.get("file") == "test/QueueTest.cs" and f.get("line") == 42, f)
     check("vstest/duration", tests[0]["durationMs"] == 12 and f.get("durationMs") == 1000, tests)
     check("vstest/summary not a result", t.tests == {"passed": 1, "failed": 1, "skipped": 1}, t.tests)
+    # Two LANES interleaved (Deploy#47): lane 1's failure message arrives AFTER lane 2 started its own suite,
+    # and lane 2's results arrive while lane 1's failure is still pending. Each result keeps its own lane's
+    # suite and its own failure detail.
+    il = OutputParser("/work/run2/src", "portal-hosts")
+    io_: list[dict] = []
+    for ln in [
+        "::mw-lane::1::Test run for /work/run2/src/bin/Alpha.Test.dll (.NETCoreApp,Version=v10.0)",
+        "::mw-lane::1::  Failed Alpha.Test.Suite.Breaks [1 s]",
+        "::mw-lane::2::Test run for /work/run2/src/bin/Beta.Test.dll (.NETCoreApp,Version=v10.0)",
+        "::mw-lane::1::  Error Message:",
+        "::mw-lane::2::  Passed Beta.Test.Suite.Holds [3 ms]",
+        "::mw-lane::1::   alpha went wrong",
+        "::mw-lane::2::  Failed Beta.Test.Suite.Falls [2 s]",
+        "::mw-lane::2::  Error Message:",
+        "::mw-lane::1::  Stack Trace:",
+        "::mw-lane::2::   beta went wrong",
+        "::mw-lane::1::     at Alpha.Test.Suite.Breaks() in /work/run2/src/test/Alpha.cs:line 7",
+        "::mw-lane::2::  Stack Trace:",
+        "::mw-lane::2::     at Beta.Test.Suite.Falls() in /work/run2/src/test/Beta.cs:line 9",
+        "::mw-lane::1::  Passed Alpha.Test.Suite.Holds [1 ms]",
+    ]:
+        io_ += il.feed(ln)
+    io_ += il.finish()
+    it = {e["test"]: e for e in io_ if e["kind"] == "test-finished"}
+    check("lanes/every interleaved result is reported once", sorted(it) == sorted(
+        ["Alpha.Test.Suite.Breaks", "Alpha.Test.Suite.Holds", "Beta.Test.Suite.Holds", "Beta.Test.Suite.Falls"])
+        and len([e for e in io_ if e["kind"] == "test-finished"]) == 4, io_)
+    check("lanes/each result keeps its OWN lane's suite",
+          [it.get(k, {}).get("suite") for k in ("Alpha.Test.Suite.Breaks", "Alpha.Test.Suite.Holds")] == ["Alpha.Test", "Alpha.Test"]
+          and [it.get(k, {}).get("suite") for k in ("Beta.Test.Suite.Holds", "Beta.Test.Suite.Falls")] == ["Beta.Test", "Beta.Test"], it)
+    check("lanes/each failure keeps its OWN message and source line",
+          it.get("Alpha.Test.Suite.Breaks", {}).get("message") == "alpha went wrong"
+          and it["Alpha.Test.Suite.Breaks"].get("file") == "test/Alpha.cs" and it["Alpha.Test.Suite.Breaks"].get("line") == 7
+          and it.get("Beta.Test.Suite.Falls", {}).get("message") == "beta went wrong"
+          and it["Beta.Test.Suite.Falls"].get("file") == "test/Beta.cs" and it["Beta.Test.Suite.Falls"].get("line") == 9, it)
+    check("lanes/the stage's counters span every lane", il.tests == {"passed": 2, "failed": 2, "skipped": 0}, il.tests)
+    # Negative control: the SAME interleaving without lane tags is what misattributed — lane 2's `Test run for`
+    # moves lane 1's suite, so lane 1's later result lands in lane 2's suite.
+    un = OutputParser("/work/run2/src", "portal-hosts")
+    uo: list[dict] = []
+    for ln in ["Test run for /work/run2/src/bin/Alpha.Test.dll", "  Failed Alpha.Test.Suite.Breaks [1 s]",
+               "Test run for /work/run2/src/bin/Beta.Test.dll", "  Error Message:", "   alpha went wrong",
+               "  Passed Alpha.Test.Suite.Holds [1 ms]"]:
+        uo += un.feed(ln)
+    uo += un.finish()
+    ut = {e["test"]: e for e in uo if e["kind"] == "test-finished"}
+    check("lanes/negative control: untagged interleaving loses lane 1's failure message and suite",
+          ut.get("Alpha.Test.Suite.Breaks", {}).get("message") != "alpha went wrong"
+          and ut.get("Alpha.Test.Suite.Holds", {}).get("suite") == "Beta.Test", ut)
+    # A stage's own untagged lines between lane lines keep the stage's own state.
+    mx = OutputParser("/w", "portal-hosts")
+    mo = mx.feed("::mw-lane::a::Test run for /w/bin/A.Test.dll") + mx.feed("  Passed Own.Thing [1 ms]") \
+        + mx.feed("::mw-lane::a::  Passed A.Test.X [1 ms]") + mx.finish()
+    check("lanes/an untagged line is the stage's own, never a lane's",
+          [(e["test"], e["suite"]) for e in mo if e["kind"] == "test-finished"] == [("Own.Thing", "Own"), ("A.Test.X", "A.Test")], mo)
     x = OutputParser("/w", "tests")
     xo = x.feed("    MeshWeaver.Store.Test.GateTest.Refuses [FAIL]") + x.feed("      Expected refusal, got grant") + x.finish()
     check("xunit/fail with message", xo and xo[0]["outcome"] == "failed"
@@ -4507,8 +4654,24 @@ def self_test() -> int:
         os.symlink(os.path.join(race_final, "Race"), os.path.join(dup, "Race"))
         with open(os.path.join(dup, ".complete"), "w") as fh_:
             fh_.write(race_line + "\n")
+        displaced_before = {n for n in os.listdir(os.path.dirname(race_set)) if n.startswith(".stale-")}
         _swap_into_place(dup, race_set, lambda d: layer_intact(d, rc_))
         check("handover/negative control: a DAMAGED set is still replaced", layer_intact(race_set, rc_) and os.stat(race_set).st_ino != set_ino)
+        # Deploy#46: the displaced entry is KEPT — a sandbox on another replica may still bind-mount it — and its
+        # files are intact; it is reclaimed only once older than the longest run.
+        displaced = [os.path.join(os.path.dirname(race_set), n) for n in os.listdir(os.path.dirname(race_set))
+                     if n.startswith(".stale-") and n not in displaced_before]
+        check("handover/a displaced entry is kept, its files intact, for a reader that may still mount it",
+              len(displaced) == 1 and os.path.islink(os.path.join(displaced[0], "Race"))
+              and os.stat(displaced[0]).st_ino == set_ino, displaced)
+        check("handover/a freshly displaced entry is not swept", len(displaced) == 1
+              and sweep_displaced(os.path.dirname(race_set)) == [] and os.path.isdir(displaced[0]), displaced)
+        check("handover/a displaced entry older than the longest run IS swept",
+              len(displaced) == 1
+              and sweep_displaced(os.path.dirname(race_set), now=time.time() + STALE_RECLAIM_SECONDS + 1) == displaced
+              and not os.path.exists(displaced[0]) and layer_intact(race_set, rc_), displaced)
+        check("handover/the reclaim grace outlives every run a host may be configured for",
+              STALE_RECLAIM_SECONDS > MAX_RUN_DEADLINE)
         # Without exclusion (the lock cannot be taken) a damaged entry is NEVER moved aside: Refusal, tmp discarded,
         # the damaged entry's files left as they are. An absent entry is still installed (a rename is not destructive).
         os.unlink(os.path.join(race_set, ".complete"))
@@ -6070,6 +6233,48 @@ def self_test() -> int:
         with hbt:
             time.sleep(0.3)
         check("lease/the run's heartbeat thread beats the current sink", len(hbp) >= 2, hbp)
+        check("lease/a healthy heartbeat names no loss", not hbt.lost.is_set())
+
+        # Deploy#49: a beat that meets the 409 SETS the heartbeat's loss — a transient fault does not.
+        class _Beats:
+            def __init__(self, fault):
+                self.fault, self.n = fault, 0
+
+            def beat(self):
+                self.n += 1
+                raise self.fault
+        gone_beat = _Beats(Lost("409"))
+        hbl = Heartbeat(period=0.02)
+        hbl.target = gone_beat
+        with hbl:
+            hbl.lost.wait(2)
+        check("lease/a 409 on a beat sets the heartbeat's loss", hbl.lost.is_set() and gone_beat.n == 1, gone_beat.n)
+        flaky = _Beats(OSError("reset"))
+        hbf = Heartbeat(period=0.02)
+        hbf.target = flaky
+        with hbf:
+            time.sleep(0.2)
+        check("lease/negative control: a transient fault on a beat is NOT a loss (it is retried)",
+              not hbf.lost.is_set() and flaky.n >= 3, flaky.n)
+        # …and a sandboxed preparation command is KILLED on the loss, never waited out.
+        with tempfile.TemporaryDirectory() as ptmp:
+            hp = Host({"MW_BUILD_CHANNEL": "latest", "PATH": os.environ.get("PATH", "/usr/bin:/bin")}, _FakeApi({}),
+                      log=lambda s: None, sandbox=_EnvSandbox(), leftovers=lambda: [], sleep=lambda s: None)
+            gone = threading.Event()
+            threading.Timer(0.3, gone.set).start()
+            t0 = time.monotonic()
+            try:
+                hp._sandboxed_capture("exec sleep 30", ptmp, ptmp, ptmp, {}, [], [], 60, cancel=gone)
+                killed = False
+            except Lost:
+                killed = True
+            check("prepare/a key or build command is killed when the claim is lost (Lost, in seconds, not its timeout)",
+                  killed and time.monotonic() - t0 < 10, (killed, time.monotonic() - t0))
+            check("prepare/negative control: a command with no loss runs to its own exit",
+                  hp._sandboxed_capture("echo prepared", ptmp, ptmp, ptmp, {}, [], [], 60, cancel=threading.Event())
+                  == (0, "prepared\n"))
+            check("prepare/a command past its timeout is still ended as before (124)",
+                  hp._sandboxed_capture("exec sleep 30", ptmp, ptmp, ptmp, {}, [], [], 1)[0] == 124)
         # claimId: fresh per claim attempt, the SAME one on a network-error retry
         ids: list[str] = []
         ans = [(0, "reset"), (503, None), (204, None), (204, None)]
