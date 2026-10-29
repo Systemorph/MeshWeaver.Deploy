@@ -1,5 +1,9 @@
 # Values for s1-extract (deploy/s1-extract/Dockerfile). ClusterIP only, never an Ingress.
 
+# The name the chart's resources are called by (templates/_helpers.tpl). Empty keeps the chart's own
+# name; set it only to run a second copy of the chart beside the first.
+nameOverride: ""
+
 replicaCount: 1
 
 image:
