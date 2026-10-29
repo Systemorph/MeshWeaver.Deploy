@@ -5,6 +5,10 @@
 # (Doc/Architecture/LocalModelService → "Enabling it on an instance"), never a default.
 enabled: false
 
+# The name the chart's resources are called by (templates/_helpers.tpl). Empty keeps the chart's own
+# name; set it only to run a second copy of the chart beside the first.
+nameOverride: ""
+
 replicaCount: 1
 
 image:
