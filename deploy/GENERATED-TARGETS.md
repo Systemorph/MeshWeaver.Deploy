@@ -44,8 +44,10 @@ az bicep build --file deploy/aca/main.bicep --stdout > /dev/null
 
 1. Copy `.env.example` to `.env` beside the compose file.
 2. Fill the two secrets it declares:
-   - `MEMEX_POSTGRES_PASSWORD`: the Postgres password. Left blank, a fresh volume gets an empty
-     password.
+   - `MEMEX_POSTGRES_PASSWORD`: the Postgres password. It is required and must not be empty.
+     Both compose targets set `POSTGRES_HOST_AUTH_METHOD` to `scram-sha-256`, so on a fresh data
+     volume the Postgres entrypoint refuses an empty `POSTGRES_PASSWORD` and exits without
+     initializing the database; `memex-postgres` never starts and nothing that depends on it does.
    - `KEY_PROTECTION_MASTER_KEY`: a base64 32-byte key; the portal receives it as
      `Ai__KeyProtection__MasterKey`. It is required, not only in production: left blank, the
      deployment cannot store a credential at all. Entering a provider key, saving a GitHub
