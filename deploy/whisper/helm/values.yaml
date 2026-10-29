@@ -4,6 +4,10 @@
 #   Speech__Endpoint = http://<release>-whisper-swiss-german:8080
 #   Speech__Enabled  = true
 
+# The name the chart's resources are called by (templates/_helpers.tpl). Empty keeps the chart's own
+# name; set it only to run a second copy of the chart beside the first.
+nameOverride: ""
+
 replicaCount: 1
 
 image:
