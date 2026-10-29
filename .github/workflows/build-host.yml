@@ -30,6 +30,12 @@ name: Build host — runner image and the build-latest hand-over
 #                   `build-host-update-available` into the control plane's inbox, which the
 #                   operations instance turns into a change of its OWN record and that record's
 #                   Reconcile. Never `kubectl set image`, never a hand-edited Deployment.
+#                   ONLY ONCE IT IS SEALED: arming does not wait for the platform bake, and every
+#                   MeshWeaver.Plugins run takes the channel's set through core's resolver freeze
+#                   path (that set, sealed, or RED). So the hand-over asks that same resolver, at
+#                   core `main`, first (`platform-set-dispatch.py seal-gate`); not sealed yet → it
+#                   HOLDS, and build-latest keeps its previous sealed set (the receiver never moves
+#                   backwards) until a later tick finds this one sealed.
 #   3. `report`   — the lane's own alert issue (label `build-host-latest`) in THIS repository.
 #
 # 🚨 DECLARED, TWICE: `.github/build-hosts.json` `enabled` gates the hand-over. While it is `false`
@@ -727,6 +733,8 @@ jobs:
           PLUGINS_HERE: ${{ needs.preflight.outputs.armed_plugins_sha }}
           IMAGE_LEG: ${{ needs.image.result }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          # The platform repository is PUBLIC: this run's own token reads its resolver and its CD runs.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           python3 deploy/.github/scripts/acr-data-plane.py manifests --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
@@ -736,6 +744,28 @@ jobs:
           [ -n "$newest" ] || { echo "::error::no armed set could be read from memex-portal-ai — nothing to hand build-latest, and nothing to say it is current"; exit 1; }
           python3 platform/.github/scripts/platform-version.py ordinal "$newest" >/dev/null \
             || { echo "::error::the newest armed set '$newest' carries no run ordinal — the armed-state reading is not trustworthy"; exit 1; }
+          # 🚨 THE CHANNEL NAMES ONLY A SEALED SET. Arming does not wait for the platform bake or
+          # verify-images, and every MeshWeaver.Plugins run takes the channel's set through core's
+          # resolver FREEZE path (that set, sealed, or RED) — so the set is handed over only once that
+          # SAME resolver, at core `main` (the copy Plugins fetches), calls it sealed. Not sealed yet →
+          # hold: the receiver never moves backwards, so build-latest keeps its previous sealed set and a
+          # later tick hands this one over. A resolver that cannot answer is RED (platform-set-dispatch.py
+          # seal-gate). GITHUB_OUTPUT/GITHUB_STEP_SUMMARY are withheld: the resolver writes its own outputs.
+          gh api "repos/$PLATFORM_REPO/contents/.github/scripts/resolve-platform.py?ref=main" \
+            -H "Accept: application/vnd.github.raw" > "$RUNNER_TEMP/resolve-platform.py"
+          rc=0
+          env -u GITHUB_OUTPUT -u GITHUB_STEP_SUMMARY python3 "$RUNNER_TEMP/resolve-platform.py" --no-registry \
+            --freeze "$newest" > "$RUNNER_TEMP/seal.log" 2>&1 || rc=$?
+          python3 deploy/.github/scripts/platform-set-dispatch.py seal-gate --version "$newest" --exit "$rc" \
+            --output "$RUNNER_TEMP/seal.log" > "$RUNNER_TEMP/seal-gate" || { cat "$RUNNER_TEMP/seal.log"; exit 1; }
+          cat "$RUNNER_TEMP/seal-gate"
+          if [ "$(sed -n 's/^send=//p' "$RUNNER_TEMP/seal-gate")" != true ]; then
+            why=$(sed -n 's/^why=//p' "$RUNNER_TEMP/seal-gate")
+            echo "send=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=build-latest holds its sealed set::$why"
+            echo "- build-latest: $why" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           core=""; plugins=""
           if [ "$ARMED_HERE" = true ] && [ "$V_ARMED_HERE" = "$newest" ]; then core="$CORE_HERE"; plugins="$PLUGINS_HERE"; fi
           # The set's HIGHEST-revision runner, and its newest older ones named as superseded (the receiver
