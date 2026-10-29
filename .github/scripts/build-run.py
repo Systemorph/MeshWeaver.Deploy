@@ -175,6 +175,7 @@ import select
 import shutil
 import signal
 import socket
+import ssl
 import stat
 import struct
 import zlib
@@ -1202,6 +1203,46 @@ class Lost(Exception):
 UPLOAD_BLOCK = 256 * 1024
 
 
+class _AnswerReader(io.RawIOBase):
+    """The answer's first bytes — taken off the socket while the body was still streaming — then the socket itself."""
+
+    def __init__(self, raw, head: bytes) -> None:
+        super().__init__()
+        self._raw, self._head = raw, head
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b) -> int:
+        if self._head:
+            n = min(len(b), len(self._head))
+            b[:n] = self._head[:n]
+            self._head = self._head[n:]
+            return n
+        return self._raw.readinto(b)
+
+    def close(self) -> None:
+        try:
+            self._raw.close()
+        finally:
+            super().close()
+
+
+class _AnsweredSocket:
+    """The upload's socket with the answer's already-read first bytes put back in front, for http.client to parse."""
+
+    def __init__(self, sock, head: bytes) -> None:
+        self._sock, self._head = sock, head
+
+    def makefile(self, mode: str = "rb", *args, **kwargs):
+        # the socket's OWN unbuffered reader underneath: it holds the descriptor open after the connection closes
+        # (http.client closes it once a `Connection: close` answer's head is read), exactly as a plain makefile does
+        return io.BufferedReader(_AnswerReader(self._sock.makefile("rb", buffering=0), self._head))
+
+    def __getattr__(self, name: str):
+        return getattr(self._sock, name)
+
+
 class Api:
     def __init__(self, base: str, token: str) -> None:
         self.base = base.rstrip("/")
@@ -1275,7 +1316,21 @@ class Api:
                     if cancel is not None and cancel.is_set():
                         raise Lost("the run was abandoned while an artifact upload was streaming")
                     if select.select([sock], [], [], 0)[0]:
-                        break          # the server answered (or closed) before the body ended: read what it said
+                        # A readable socket is NOT yet an answer on HTTPS: a TLS 1.3 session ticket (or any other TLS
+                        # control record) makes it readable too, and stopping the body for one leaves both sides
+                        # waiting for the other. Read what is there without blocking: the TLS layer consumes control
+                        # records itself and hands back only HTTP bytes; none means keep sending.
+                        sock.setblocking(False)
+                        try:
+                            head = sock.recv(65536)
+                        except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                            head = None
+                        sock.settimeout(left())
+                        if head is not None:
+                            # the server answered (or closed: b"") before the body ended — the answer is read below,
+                            # starting with the bytes already taken off the socket
+                            conn.sock = _AnsweredSocket(sock, head)
+                            break
                     block = fh.read(UPLOAD_BLOCK)
                     if not block:
                         break
@@ -1287,16 +1342,23 @@ class Api:
             sock.settimeout(left())
             r = conn.getresponse()
             chunks = []
-            while not r.isclosed():     # the response closes itself once its Content-Length has arrived
-                # read1: ONE socket read per call, so each gets only the time left — `read(n)` loops over many reads
-                # under a single timeout and a trickle would outlive the budget inside it.
-                sock.settimeout(left())
-                chunk = r.read1(65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            if r.length:                # closed before its Content-Length arrived
-                raise http.client.IncompleteRead(b"".join(chunks), r.length)
+            try:
+                while not r.isclosed():     # the response closes itself once its Content-Length has arrived
+                    # read1: ONE socket read per call, so each gets only the time left — `read(n)` loops over many
+                    # reads under a single timeout and a trickle would outlive the budget inside it.
+                    sock.settimeout(left())
+                    chunk = r.read1(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                if r.length:                # closed before its Content-Length arrived
+                    raise http.client.IncompleteRead(b"".join(chunks), r.length)
+            except (OSError, http.client.HTTPException):
+                if not (200 <= r.status < 300):
+                    # A refusal whose body was cut short (or reset) is still that refusal: keep its status, as `call`
+                    # does, so a 413/401 fails at once and is never retried as a transport failure.
+                    return r.status, None
+                raise
             left()                      # an answer that arrived after the budget is not accepted
             raw = b"".join(chunks).decode()
             try:
@@ -3876,6 +3938,27 @@ def abandoned(cancel: Optional[threading.Event], stage: str) -> None:
         raise Lost(f"stage {stage}: abandoned during the artifact hand-over — the run is not this host's claim any more")
 
 
+# A throwaway self-signed key and certificate (CN=localhost) for the self-test's local HTTPS server ONLY — it protects
+# nothing and is trusted by nothing; the test's client skips verification.
+_SELFTEST_TLS_PEM = """-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7OlL4C3Ub9FiEweL
+ynk1oc5efgNlmyblhh+7MjIoTTmhRANCAASHr3IYuC94xquFX+ix2VsuPH+rfhVU
+Aehp5XrBb4TXo2FBAumRcQ6ui5yR2qGJ29i9KA3Z88eS1MRShDYujZIM
+-----END PRIVATE KEY-----
+-----BEGIN CERTIFICATE-----
+MIIBfzCCASWgAwIBAgIUK0qzuB9UXvL4tWBQVet/dLTB/rkwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTAyOTA3MDI0N1oYDzIxMjYxMDA1
+MDcwMjQ3WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAASHr3IYuC94xquFX+ix2VsuPH+rfhVUAehp5XrBb4TXo2FBAumRcQ6u
+i5yR2qGJ29i9KA3Z88eS1MRShDYujZIMo1MwUTAdBgNVHQ4EFgQUCbhWWbd/1DPK
+s6XJ6XeB2DYiPAQwHwYDVR0jBBgwFoAUCbhWWbd/1DPKs6XJ6XeB2DYiPAQwDwYD
+VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiABRYhUwwZ3OfgdgUStxR1C
+KnKFMEemuUbbTwqk4CAxdQIhAOxOF6W3fGwFURNaCzgZxdXvmt3WwFb5EEhTLvT5
+QZUn
+-----END CERTIFICATE-----
+"""
+
+
 def _answer_text(answer: object) -> str:
     """A refusal's reason as the build API states it (`{"error": …}`), else the raw answer — bounded."""
     if isinstance(answer, dict) and isinstance(answer.get("error"), str):
@@ -6310,6 +6393,97 @@ def self_test() -> int:
         finally:
             cut.shutdown()
             cut.server_close()
+
+        # a REFUSAL closed before its Content-Length arrived keeps its status: a 413/401 fails at once and is never
+        # retried as a transport failure (the same rule `call` keeps on its HTTPError path)
+        class _TruncatedRefusal(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(413)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b'{"error":"artifact-too')
+                self.wfile.flush()
+                self.close_connection = True
+
+            def log_message(self, *a):
+                pass
+
+        cutr = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _TruncatedRefusal)
+        threading.Thread(target=cutr.serve_forever, daemon=True).start()
+        try:
+            status, answer = Api(f"http://127.0.0.1:{cutr.server_address[1]}/api/builds", "t").upload(
+                "/x", {}, blob, 1, timeout=10)
+            check("h9-api/transport: a truncated REFUSAL keeps its status (413), never status 0 retried as transport",
+                  status == 413, (status, answer))
+        finally:
+            cutr.shutdown()
+            cutr.server_close()
+
+        # HTTPS: a TLS 1.3 server sends its session tickets right after the handshake, which makes the socket READABLE
+        # before any HTTP answer exists. The upload must keep sending through that, not stop the body and wait for an
+        # answer the server will only send once the body arrived — and an early refusal over TLS is still read.
+        tls_dir = tempfile.mkdtemp(prefix="build-run-tls-", dir=tmp)
+        with open(os.path.join(tls_dir, "test.pem"), "w") as fh:
+            fh.write(_SELFTEST_TLS_PEM)
+        srv_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        srv_ctx.load_cert_chain(os.path.join(tls_dir, "test.pem"))
+
+        class _TlsServer(http.server.ThreadingHTTPServer):
+            def get_request(self):
+                c, a = super().get_request()
+                return srv_ctx.wrap_socket(c, server_side=True), a
+
+        tls_got: dict = {}
+
+        class _TlsUpload(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                if self.path.startswith("/api/builds/refuse"):
+                    payload = json.dumps({"error": "artifact-too-large: over TLS"}).encode()
+                    self.send_response(413)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+                    self.close_connection = True      # the body is never read
+                    return
+                n = int(self.headers.get("Content-Length", "0"))
+                tls_got["body"] = self.rfile.read(n)
+                payload = json.dumps({"ok": True}).encode()
+                self.send_response(201)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        def _trusting(*a, **k):
+            c = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            c.check_hostname = False
+            c.verify_mode = ssl.CERT_NONE
+            return c
+
+        tls = _TlsServer(("127.0.0.1", 0), _TlsUpload)
+        threading.Thread(target=tls.serve_forever, daemon=True).start()
+        default_https = ssl._create_default_https_context
+        ssl._create_default_https_context = _trusting
+        try:
+            tls_api = Api(f"https://127.0.0.1:{tls.server_address[1]}/api/builds", "t")
+            t0 = time.monotonic()
+            status, answer = tls_api.upload("/ok", {}, blob, len(data), timeout=10)
+            check("h9-api/transport: an HTTPS upload sends its whole body through the TLS session tickets and reads the answer",
+                  status == 201 and answer == {"ok": True} and tls_got.get("body") == data and time.monotonic() - t0 < 5,
+                  (status, answer, len(tls_got.get("body") or b""), round(time.monotonic() - t0, 2)))
+            status, answer = tls_api.upload("/refuse", {}, big, os.path.getsize(big), timeout=30)
+            check("h9-api/transport: an HTTPS answer sent BEFORE the body was read (413) is reported",
+                  status == 413 and _answer_text(answer).startswith("artifact-too-large"), (status, answer))
+        finally:
+            ssl._create_default_https_context = default_https
+            tls.shutdown()
+            tls.server_close()
 
         # the workspace stays until every receipt was acknowledged
         hk = host(_FakeApi({("POST", "/token"): [(404, None)], ("POST", "/MeshWeaver.Plugins/"): [(503, None)]}),
