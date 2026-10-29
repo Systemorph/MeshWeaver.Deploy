@@ -284,9 +284,12 @@ for ch, (tester, portal, runner, mx, pv) in want.items():
     if s.get("scaleTargetRef", {}).get("name") != f"build-host-{ch}":
         problems.append(f"{ch}: ScaledObject targets {s.get('scaleTargetRef')}")
     trig = [t for t in s.get("triggers", []) if t.get("type") == "metrics-api"]
-    url = f"http://memex-portal-service:8080/api/builds/queue?channel={ch}"
+    url = f"http://memex-portal-service.check.svc.cluster.local:8080/api/builds/queue?channel={ch}"  # KEDA polls from its own namespace
     if len(trig) != 1 or trig[0]["metadata"].get("url") != url or trig[0]["metadata"].get("valueLocation") != "demand":
         problems.append(f"{ch}: not ONE metrics-api trigger on {url} valueLocation demand: {trig}")
+    # The HOST keeps the URL as given — it runs in this namespace; only KEDA (another namespace) needs it qualified.
+    if env.get("BUILD_API", {}).get("value") != "http://memex-portal-service:8080/api/builds":
+        problems.append(f"{ch}: the host's BUILD_API must stay the apiUrl as given: {env.get('BUILD_API')}")
     win = s.get("advanced", {}).get("horizontalPodAutoscalerConfig", {}).get("behavior", {}).get("scaleDown", {}).get("stabilizationWindowSeconds")
     if win != 300:
         problems.append(f"{ch}: scale-down stabilization window {win} != 300")
@@ -378,7 +381,7 @@ for v, alias, mx in want:
     if sel.get("meshweaver.io/build-version") != v:
         problems.append(f"{v}: the selector does not pin the version (two versions' pods would mix): {sel}")
     s = so["spec"]
-    url = f"http://memex-portal-service:8080/api/builds/queue?version={v}"
+    url = f"http://memex-portal-service.check.svc.cluster.local:8080/api/builds/queue?version={v}"
     trig = s.get("triggers", [{}])[0].get("metadata", {}).get("url")
     if trig != url or s.get("maxReplicaCount") != int(mx) or s.get("scaleTargetRef", {}).get("name") != n:
         problems.append(f"{v}: ScaledObject not demand-by-version {url} / max {mx} / target {n}: {trig} {s.get('maxReplicaCount')}")
@@ -702,6 +705,31 @@ PY6
 else
   report "spec api: did not render:"; sed 's/^/    /' "$WORK/upload-spec.err"
 fi
+
+# 3g. the KEDA trigger URL: KEDA polls from its OWN namespace, so a bare Service name is qualified with the release's
+#     namespace (the fixture above pins that case); every other host — a dotted name, an IPv6 literal, localhost — is
+#     polled exactly as given. NEGATIVE CONTROL: the fixture's bare name IS rewritten, so the check can see a rewrite.
+scaler_url() {  # $1 = apiUrl → prints the latest channel's trigger URL, or nothing
+  helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --namespace check \
+    --set-string "buildHosts.apiUrl=$1" 2> "$WORK/scaler.err" \
+  | python3 -c '
+import sys, yaml
+for d in yaml.safe_load_all(sys.stdin):
+    if d and d.get("kind") == "ScaledObject" and d["metadata"]["name"] == "build-host-latest-scaler":
+        print(d["spec"]["triggers"][0]["metadata"]["url"])'
+}
+scaler_bad=0
+for case in \
+  "http://memex-portal-service:8080/api/builds|http://memex-portal-service.check.svc.cluster.local:8080/api/builds/queue?channel=latest" \
+  "http://memex-portal-service.other.svc.cluster.local:8080/api/builds|http://memex-portal-service.other.svc.cluster.local:8080/api/builds/queue?channel=latest" \
+  "https://[2001:db8::1]:8080/api/builds|https://[2001:db8::1]:8080/api/builds/queue?channel=latest" \
+  "http://localhost:8080/api/builds|http://localhost:8080/api/builds/queue?channel=latest"; do
+  got="$(scaler_url "${case%%|*}")"
+  if [ "$got" != "${case#*|}" ]; then
+    report "apiUrl ${case%%|*}: KEDA trigger URL is '${got}', want '${case#*|}'"; sed 's/^/    /' "$WORK/scaler.err"; scaler_bad=1
+  fi
+done
+[ "$scaler_bad" = 0 ] && ok "the KEDA trigger qualifies a bare Service name with the release namespace, and leaves dotted, IPv6 and localhost hosts as given"
 
 # 4. refusals
 for entry in \

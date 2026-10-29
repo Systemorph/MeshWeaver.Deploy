@@ -338,7 +338,8 @@ spec:
             items: [{ key: {{ $b.registry.keySecretKey | quote }}, path: "key" }]
         {{- end }}
 ---
-# Queue depth → replicas: ONE metrics-api trigger on the build API's anonymous per-channel count,
+# Queue depth → replicas: ONE metrics-api trigger on the build API's anonymous per-channel count, at the
+# namespace-qualified URL (`scalerApiUrl` — KEDA resolves it from its own namespace, never this one),
 # `valueLocation: demand` (= claimable + running), so the metric never drops to zero while a host
 # still holds a run. The scale-down stabilization window is longer than a claim's round trip, so a
 # replica is not removed between two runs it was about to take. A 503 (queue unreadable) leaves the
@@ -377,7 +378,7 @@ spec:
     - type: metrics-api
       metricType: AverageValue
       metadata:
-        url: "{{ $b.apiUrl }}/queue?{{ $c.queueQuery }}"
+        url: "{{ $b.scalerApiUrl }}/queue?{{ $c.queueQuery }}"
         valueLocation: "demand"
         targetValue: "1"
 {{- end }}

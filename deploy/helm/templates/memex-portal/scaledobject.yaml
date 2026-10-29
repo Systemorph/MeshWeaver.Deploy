@@ -57,7 +57,8 @@ spec:
     - type: metrics-api
       metricType: AverageValue
       metadata:
-        url: "{{ .Values.keda.queueDepth.url | default "http://memex-portal-service:8080/api/queues/depth" }}"
+        {{- /* Namespace-qualified: KEDA polls from its own namespace, where the bare Service name resolves to nothing. */}}
+        url: "{{ .Values.keda.queueDepth.url | default (printf "http://memex-portal-service.%s.svc.cluster.local:8080/api/queues/depth" .Release.Namespace) }}"
         valueLocation: "waiting"
         targetValue: "{{ .Values.keda.queueDepth.waitingPerReplica | default 4 }}"
     {{- end }}
