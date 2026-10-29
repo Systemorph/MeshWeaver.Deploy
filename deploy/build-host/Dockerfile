@@ -1,6 +1,7 @@
 # The standing build host's RUNNER image — `mw-build-host` (Doc/Architecture/BuildHosts).
 #
-# What a stage needs and nothing it does not: bash, python3, git, bubblewrap (every stage runs in a
+# What a stage needs and nothing it does not: bash, python3, git, jq (the workflow steps core's tests
+# execute call it, as the GitHub-hosted runner they were written for ships it), bubblewrap (every stage runs in a
 # `bwrap` sandbox — the host refuses to start without it), the .NET 10 SDK (the src/ half still
 # builds with it), PostgreSQL 17 with pgvector and a PREPARED test cluster built at image build
 # (host-postgres.sh: UTF8, a pgvector template every suite database is cloned from — a stage starts a
@@ -81,14 +82,19 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0
 # extension line the CI runners' shared server and the developer container run (pgvector/pgvector:pg17);
 # the base image's distribution ships an older major and pgvector 0.6.
 ARG PG_MAJOR=17
+# jq: core's MeshWeaver.Documentation.Test runs the publication workflow's own `run:` steps
+# (PluginPublicationProvenanceTest), and those steps call jq exactly as they do on Actions' ubuntu
+# runner, which ships it. Without it a host's shard 7 was RED on 11 tests (`step.sh: jq: command not
+# found`) that pass on Actions — on every run, serial or fanned out. The version print below makes an
+# image without it fail its BUILD rather than a test.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends bash python3 git bubblewrap ca-certificates postgresql-common \
+ && apt-get install -y --no-install-recommends bash python3 git jq bubblewrap ca-certificates postgresql-common \
  && /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y \
  && apt-get install -y --no-install-recommends "postgresql-${PG_MAJOR}" "postgresql-${PG_MAJOR}-pgvector" \
  && rm -rf /var/lib/apt/lists/* \
  && test -f "/usr/share/postgresql/${PG_MAJOR}/extension/vector.control" \
  && install -d -o 1654 -g 1654 -m 0700 /opt/build-host/pg-snapshot \
- && bwrap --version && python3 --version && git --version && dotnet --version \
+ && bwrap --version && python3 --version && git --version && jq --version && dotnet --version \
  && find /usr/lib/postgresql -maxdepth 3 -name initdb | grep -q initdb
 
 # The headless BROWSER and its FONT SET, as the portal image installs them (portal-ai's Dockerfile):
