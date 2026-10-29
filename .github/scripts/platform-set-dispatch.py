@@ -91,9 +91,13 @@ the platform moved. A runner is therefore keyed by (set, runner revision):
 the runner inputs (`runner-key`) — monotone along `main`, unchanged by commits that do not touch
 them. The plain `mw-build-host:<version>` tag is still written once (the first runner of the set),
 for the lanes that hand over a version's ONE runner (build-host-stable.yml, the versioned
-deploy-test-switch). `discover` adds a third reason to build, between the first two: the newest armed
+deploy-test-switch). A set that has keyed runners but NO plain tag (its retag failed after the keyed
+push) still LACKS its runner for discovery, which names it again with its first runner
+(`need_first_runner`), so the plain tag is repaired from the set's first runner (Deploy#62). `discover` adds a third reason to build, between the first two: the newest armed
 set HAS a runner but none at Deploy main's current `rev` — a REFRESH. The hand-over then sends the
-set's highest-`rev` runner and names every older one as superseded (`runner-choice`), and the
+set's highest-`rev` runner and names its older ones as superseded (`runner-choice`; the newest
+MAX_SUPERSEDED of them, the receiver's bound — Deploy#60), read from the set's COMPLETE tag listing
+(`acr-data-plane.py set-runners`), and the
 receiver takes a runner for the SAME set only when it supersedes the runner held — so a re-run of an
 old hand-over can never move the host's runner backwards (MeshWeaver.Plugins `BuildHostUpdates`).
 
@@ -137,6 +141,10 @@ RUNNER_INPUTS = (".github/scripts/build-run.py", "deploy/build-host", "deploy/he
 # tag is revision 0 (the runner written before the key existed, or the set's first one).
 RUNNER_REV_TAG = re.compile(r"^(.+)-r([1-9][0-9]{0,8})$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+# The receiver's bound on a hand-over's superseded list (MeshWeaver.Plugins BuildHostUpdates.MaxSupersededRunners,
+# build-host-announcement.py MAX_SUPERSEDED). `runner_choice` names at most this many — the NEWEST older runners,
+# by revision — so a set armed across more runner revisions still hands over (MeshWeaver.Deploy#60).
+MAX_SUPERSEDED = 64
 
 
 class Refusal(Exception):
@@ -337,13 +345,22 @@ def runner_choice(runner: object, version: str) -> dict:
     digest = revs[top]
     if not DIGEST.fullmatch(digest):
         raise Refusal(f"mw-build-host revision {top} of {version} carries no readable digest ({digest!r})")
-    older = sorted({d for r, d in revs.items() if r < top and d != digest})
-    for d in older:
+    # The NEWEST older runners, by revision, at most MAX_SUPERSEDED of them (Deploy#60): a list the receiver
+    # refuses made EVERY hand-over tick red until a newer set was armed. A host still holding a runner older
+    # than the newest MAX_SUPERSEDED is refused the refresh by the receiver, and takes the next set's runner.
+    older: list[str] = []
+    for r in sorted(revs, reverse=True):
+        d = revs[r]
+        if r >= top or d == digest or d in older:
+            continue
+        if len(older) == MAX_SUPERSEDED:
+            break
         if not DIGEST.fullmatch(d):
             raise Refusal(f"an older runner of {version} carries no readable digest ({d!r}) — refusing to "
                           "hand over a runner whose predecessors cannot all be named")
+        older.append(d)
     return {"runner_tag": version if top == 0 else runner_tag(version, top), "runner_digest": digest,
-            "runner_rev": str(top), "superseded": " ".join(older)}
+            "runner_rev": str(top), "superseded": " ".join(sorted(older))}
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -427,7 +444,11 @@ def discover(tester: object, portal: object, runner: object, runner_rev: int | N
             if c is not None and c not in window:
                 window.append(c)
         window.sort(key=lambda c: run_number_of(c["version"]) or 0)
-    missing = [c for c in window if c["version"] not in runners]
+    # A set LACKS its runner when it has none at all — or when it has keyed runners but no plain
+    # `<version>` tag (revision 0): the compatibility retag after the keyed push failed (Deploy#62), and
+    # version-only consumers (build-host-stable.yml, the versioned deploy-test-switch) can never resolve it.
+    # Without this the keyed runner made the set look complete and no tick ever retried the retag.
+    missing = [c for c in window if c["version"] not in runners or 0 not in revisions[c["version"]]]
 
     need, why, refresh = None, "", False
     if armed is not None and armed["version"] not in runners:
@@ -440,8 +461,13 @@ def discover(tester: object, portal: object, runner: object, runner_rev: int | N
     elif missing:
         need = missing[0]
         label = "newest promoted" if need is promoted else "retained"
-        why = (f"the oldest {label} set without a runner is {need['version']} — "
-               f"backfill, {len(missing)} set(s) in the window still lack one")
+        if need["version"] in runners:
+            why = (f"compatibility-tag repair: the oldest {label} set {need['version']} has keyed runners but no "
+                   f"mw-build-host:{need['version']} — retag it from its FIRST runner "
+                   f"{runner_tag(need['version'], min(revisions[need['version']]))}; {len(missing)} set(s) in the window still lack one")
+        else:
+            why = (f"the oldest {label} set without a runner is {need['version']} — "
+                   f"backfill, {len(missing)} set(s) in the window still lack one")
     else:
         why = (f"every runner is there: newest promoted {promoted['version']}, newest armed "
                f"{armed['version'] if armed else '(none)'}, {len(window)} retained set(s) in the "
@@ -453,6 +479,10 @@ def discover(tester: object, portal: object, runner: object, runner_rev: int | N
     out.update({f"need_{k}": (need or {}).get(k, "") for k in ("version", "core7", "run_id")})
     out["backlog"] = str(len(missing))
     out["refresh"] = "true" if refresh else "false"
+    # The set's FIRST runner (lowest revision), which the plain `<version>` tag names when it is (re)written —
+    # empty when the set has no runner yet (then the run's own keyed tag is the first).
+    nrevs = revisions.get((need or {}).get("version", ""), {})
+    out["need_first_runner"] = (runner_tag(need["version"], min(nrevs)) if nrevs and min(nrevs) > 0 else "")
     out["why"] = why
     return out
 
@@ -652,7 +682,7 @@ def _self_test() -> int:
                                                  {"tags": [a_]}, {"tags": [z]}], runner_rev=57),
           lambda o: o["need_version"] == "" and o["refresh"] == "false")
     check("NEGATIVE CONTROL: a NEWER revision is there (an old commit's tick) → never rebuilt backwards",
-          lambda: discover(two_tester, armed_b, [{"tags": [f"{b_}-r60"], "digest": da}, {"tags": [a_]}, {"tags": [z]}], runner_rev=57),
+          lambda: discover(two_tester, armed_b, [{"tags": [b_, f"{b_}-r60"], "digest": da}, {"tags": [a_]}, {"tags": [z]}], runner_rev=57),
           lambda o: o["need_version"] == "" and o["refresh"] == "false")
     check("NEGATIVE CONTROL: no revision given (a person's dispatch path) → the old rule, nothing to refresh",
           lambda: discover(two_tester, armed_b, [{"tags": [b_]}, {"tags": [a_]}, {"tags": [z]}]),
@@ -664,8 +694,8 @@ def _self_test() -> int:
           lambda: [discover(two_tester, two_portal, [{"tags": [z]}, {"tags": [b_]}], runner_rev=57)["need_version"],
                    discover(two_tester, two_portal, [{"tags": [z]}, {"tags": [b_, f"{b_}-r57"]}], runner_rev=57)["need_version"]],
           lambda o: o == [b_, a_])
-    check("a keyed runner counts as the set HAVING a runner for the backfill",
-          lambda: discover(two_tester, two_portal, [{"tags": [f"{z}-r3"]}, {"tags": [f"{b_}-r57"]}, {"tags": [f"{a_}-r9"]}], runner_rev=57),
+    check("a keyed runner with its plain first-runner tag counts as the set HAVING a runner for the backfill",
+          lambda: discover(two_tester, two_portal, [{"tags": [z, f"{z}-r3"]}, {"tags": [b_, f"{b_}-r57"]}, {"tags": [a_, f"{a_}-r9"]}], runner_rev=57),
           lambda o: o["need_version"] == "" and o["backlog"] == "0")
     rows = [{"tags": [b_, f"{b_}-r40"], "digest": da}, {"tags": [f"{b_}-r57"], "digest": db}, {"tags": [f"{a_}-r70"], "digest": dc}]
     check("choice: the highest revision, every older one named as superseded",
@@ -685,6 +715,31 @@ def _self_test() -> int:
     check("choice: refuses an older runner with no readable digest (it could not be named as superseded)",
           lambda: runner_choice([{"tags": [b_], "digest": "nope"}, {"tags": [f"{b_}-r57"], "digest": db}], b_), REFUSED)
     check("refuses naming a keyed runner for a non-set", lambda: runner_tag("main", 3), REFUSED)
+    # Deploy#60: a set armed across MORE than the receiver's bound of runner revisions still hands over —
+    # naming the NEWEST older runners — instead of a list the receiver refuses on every tick.
+    many = [{"tags": [f"{b_}-r{r}"], "digest": "sha256:%064x" % r} for r in range(1, MAX_SUPERSEDED + 11)]
+    check(f"choice: {MAX_SUPERSEDED + 9} older runners → the newest {MAX_SUPERSEDED} are named, the oldest dropped",
+          lambda: runner_choice(many, b_),
+          lambda o: (o["runner_rev"] == str(MAX_SUPERSEDED + 10) and len(o["superseded"].split()) == MAX_SUPERSEDED
+                     and ("sha256:%064x" % (MAX_SUPERSEDED + 9)) in o["superseded"].split()
+                     and ("sha256:%064x" % 1) not in o["superseded"].split()))
+    check(f"choice: exactly {MAX_SUPERSEDED} older runners are all named (the bound is not off by one)",
+          lambda: runner_choice(many[:MAX_SUPERSEDED + 1], b_),
+          lambda o: len(o["superseded"].split()) == MAX_SUPERSEDED)
+    # Deploy#62: the keyed tag was pushed and the plain `<version>` retag failed — the set looked complete, no
+    # tick retried, and version-only consumers could never resolve it. It is a repair now, naming the FIRST runner.
+    check("repair: keyed runners but no plain tag → the set is built again, retagged from its FIRST runner",
+          lambda: discover(two_tester, two_portal, [{"tags": [z]}, {"tags": [f"{b_}-r57"], "digest": db},
+                                                    {"tags": [f"{a_}-r40"], "digest": da}, {"tags": [f"{a_}-r57"], "digest": dc}],
+                           runner_rev=57),
+          lambda o: (o["need_version"] == a_ and o["need_first_runner"] == f"{a_}-r40" and "repair" in o["why"]))
+    check("NEGATIVE CONTROL: the plain tag is there → no repair, nothing to build",
+          lambda: discover(two_tester, two_portal, [{"tags": [z]}, {"tags": [b_, f"{b_}-r57"], "digest": db},
+                                                    {"tags": [a_, f"{a_}-r40"], "digest": da}], runner_rev=57),
+          lambda o: o["need_version"] == "" and o["need_first_runner"] == "" and o["backlog"] == "0")
+    check("a set with no runner at all names no first runner (the run's own keyed tag becomes it)",
+          lambda: discover(two_tester, armed_b, [{"tags": [z]}], runner_rev=57),
+          lambda o: o["need_version"] == b_ and o["need_first_runner"] == "")
 
     # runner-key over REAL git history: commits touching the inputs move the revision, others do not,
     # and a shallow clone (whose ancestor count is its depth) is refused.

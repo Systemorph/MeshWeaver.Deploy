@@ -215,6 +215,9 @@ jobs:
       armed_plugins_sha: ${{ steps.claim.outputs.armed_plugins_sha }}
       inputs_commit: ${{ steps.runner.outputs.inputs_commit }}
       runner_rev: ${{ steps.runner.outputs.runner_rev }}
+      # The set's FIRST runner, when discovery found it has keyed runners but no plain `<version>` tag
+      # (a compatibility-tag repair, Deploy#62); empty otherwise.
+      first_runner: ${{ steps.discover.outputs.first_runner }}
     steps:
       # FULL history: the runner revision is an ancestor count (a shallow clone is refused by name).
       - uses: actions/checkout@v7
@@ -299,6 +302,7 @@ jobs:
             echo "run_core_sha=$core"
             echo "set_version=$version"
             echo "set_core_sha=${version:+$core}"
+            echo "first_runner=$(get need_first_runner)"
           } >> "$GITHUB_OUTPUT"
           echo "- discovered: $(get why) — $(get backlog) retained set(s) in the backfill window lack a runner, this tick's included" >> "$GITHUB_STEP_SUMMARY"
       - name: Read the hand-over (validated field by field)
@@ -582,20 +586,26 @@ jobs:
       # The plain `<version>` tag stays the set's FIRST runner, written once: build-host-stable.yml and
       # the versioned deploy-test-switch hand over a version's ONE runner by that name. Written by a
       # byte-for-byte retag of the keyed tag (same digest), only when the registry ANSWERED "not found".
+      # 🚨 A REPAIR (Deploy#62): when an earlier run pushed the keyed tag and its retag failed, discovery names
+      # the set again with its FIRST runner (`first_runner`, the lowest revision) — the plain tag is written
+      # from THAT, never from this run's revision, so the set's first runner stays its first.
       - name: "Name the set's first runner mw-build-host:<version> too (only when absent)"
         if: steps.set.outputs.build == 'true'
         env:
           VERSION: ${{ needs.preflight.outputs.set_version }}
           RUNNER_REV: ${{ needs.preflight.outputs.runner_rev }}
+          FIRST_RUNNER: ${{ needs.preflight.outputs.first_runner }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         run: |
           set -euo pipefail
+          from="${FIRST_RUNNER:-$VERSION-r$RUNNER_REV}"
+          case "$from" in "$VERSION"-r[1-9]*) ;; *) echo "::error::the first runner '$from' is not a keyed runner of $VERSION"; exit 1 ;; esac
           if d=$(docker buildx imagetools inspect "$ACR/mw-build-host:$VERSION" --format '{{json .Manifest.Digest}}' 2>"$RUNNER_TEMP/plain.err"); then
             echo "- mw-build-host \`$VERSION\` already names \`$(printf '%s' "$d" | tr -d '"')\` — kept (a version's first runner is written once)" >> "$GITHUB_STEP_SUMMARY"
           elif grep -qiE 'not found|manifest unknown|MANIFEST_UNKNOWN' "$RUNNER_TEMP/plain.err"; then
             python3 deploy/.github/scripts/acr-data-plane.py retag --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
-              --repository mw-build-host --from "$VERSION-r$RUNNER_REV" --to "$VERSION"
-            echo "- mw-build-host \`$VERSION\` = \`$VERSION-r$RUNNER_REV\` (the set's first runner)" >> "$GITHUB_STEP_SUMMARY"
+              --repository mw-build-host --from "$from" --to "$VERSION"
+            echo "- mw-build-host \`$VERSION\` = \`$from\` (the set's first runner${FIRST_RUNNER:+ — a compatibility-tag repair})" >> "$GITHUB_STEP_SUMMARY"
           else
             cat "$RUNNER_TEMP/plain.err"
             echo "::error::could not establish whether mw-build-host:$VERSION exists (the registry did not answer 'not found') — refusing to write over a tag that may be there"
@@ -723,10 +733,11 @@ jobs:
             || { echo "::error::the newest armed set '$newest' carries no run ordinal — the armed-state reading is not trustworthy"; exit 1; }
           core=""; plugins=""
           if [ "$ARMED_HERE" = true ] && [ "$V_ARMED_HERE" = "$newest" ]; then core="$CORE_HERE"; plugins="$PLUGINS_HERE"; fi
-          # The set's HIGHEST-revision runner, and every older one named as superseded (the receiver
-          # takes a runner for the SAME set only when it supersedes the one held — never backwards).
-          python3 deploy/.github/scripts/acr-data-plane.py manifests --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
-            --repository mw-build-host --top 300 > "$RUNNER_TEMP/runner-manifests.json"
+          # The set's HIGHEST-revision runner, and its newest older ones named as superseded (the receiver
+          # takes a runner for the SAME set only when it supersedes the one held — never backwards). Read
+          # from the set's COMPLETE tag listing, never the newest 300 manifests (Deploy#60).
+          python3 deploy/.github/scripts/acr-data-plane.py set-runners --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
+            --repository mw-build-host --version "$newest" > "$RUNNER_TEMP/runner-manifests.json"
           python3 deploy/.github/scripts/platform-set-dispatch.py runner-choice --runner "$RUNNER_TEMP/runner-manifests.json" \
             --version "$newest" > "$RUNNER_TEMP/runner-choice"
           cat "$RUNNER_TEMP/runner-choice"

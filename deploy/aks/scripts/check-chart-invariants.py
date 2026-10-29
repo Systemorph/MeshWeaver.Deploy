@@ -300,6 +300,41 @@ for key, why in NEVER_BLANK_CONFIG.items():
         )
 
 # ---------------------------------------------------------------------------
+# 9b. The self-updater lists the repository of the image this release RUNS.
+#
+# 🚨 MeshWeaver.Deploy#53. With SelfUpdate__Registry set and the portal image ON that registry, the
+# self-updater lists SelfUpdate__PortalRepository there — the default `memex-portal-ai` when the key is
+# absent. A release running another repository (a control instance's memex-control) whose overlay named
+# no repository polled one it never deployed: a 404 today, and a roll onto the working instances' image
+# the day that repository is mirrored into the same registry. Same for the migration image.
+def _repository_on(image, registry):
+    ref = (image or "").split("@", 1)[0]
+    parts = ref.split("/")
+    if not registry or len(parts) < 2 or parts[0] != registry:
+        return None
+    return "/".join(parts[1:-1] + [parts[-1].split(":", 1)[0]])
+
+
+_su_registry = str(cfg_data.get("SelfUpdate__Registry") or "").strip()
+_migration_job = next(iter(by_kind("Job")), None)
+_migration_image = next((c.get("image") for c in ((((_migration_job or {}).get("spec") or {}).get("template") or {})
+                                                  .get("spec") or {}).get("containers") or []), None)
+for key, default, image in (("SelfUpdate__PortalRepository", "memex-portal-ai", portal.get("image")),
+                            ("SelfUpdate__MigrationRepository", "memex-migration", _migration_image)):
+    runs = _repository_on(image, _su_registry)
+    if runs is None:
+        continue
+    checks += 1
+    lists = str(cfg_data.get(key) or default).strip()
+    if lists != runs:
+        finding(
+            f"the self-updater lists '{_su_registry}/{lists}' but this release runs '{image}'",
+            f"{key} renders {('as ' + repr(cfg_data[key])) if key in cfg_data else 'nothing (the default ' + repr(default) + ')'} "
+            f"while the image is repository '{runs}' on the self-update registry. The self-updater would poll a "
+            f"repository this instance never deployed — and roll onto it once it exists there.",
+        )
+
+# ---------------------------------------------------------------------------
 # 10. Readiness and liveness must not probe the SAME path.
 #
 # 🚨 MeshWeaver#3330. Both post-startup probes were `/alive`, which was harmless only while

@@ -695,11 +695,29 @@ data:
   # memex-control, and a self-updater listing memex-portal-ai there would roll it onto the working
   # instances' image. Same rule as the line above: both are strings WITH a real default, so an
   # empty value must render NOTHING (an empty repository rolls to "<registry>/:<tag>").
-  {{- if (.Values.config.memex_portal.SelfUpdate__PortalRepository | default "" | trim) }}
-  SelfUpdate__PortalRepository: "{{ .Values.config.memex_portal.SelfUpdate__PortalRepository | trim }}"
+  # 🚨 DERIVED when no value is given (MeshWeaver.Deploy#53): an overlay that no control instance renders
+  # never receives the key, and its self-updater then lists the DEFAULT repository — which on a registry
+  # that also holds the working instances' image would roll this instance onto it. So when
+  # selfUpdate.registry is set and the image this release runs is ON that registry, the repository is the
+  # image's own path (portal.image / migration.image). It renders only where that differs from the image
+  # default, the same rule the record applies, so every instance already on the default renders unchanged.
+  # An explicit value always wins.
+  {{- $suRegistry := (.Values.selfUpdate).registry | default "" | trim }}
+  {{- $portalRepo := .Values.config.memex_portal.SelfUpdate__PortalRepository | default "" | trim }}
+  {{- if not $portalRepo }}
+  {{- $derived := include "memex.imageRepositoryOn" (list (.Values.portal).image $suRegistry) }}
+  {{- if and $derived (ne $derived "memex-portal-ai") }}{{ $portalRepo = $derived }}{{ end }}
   {{- end }}
-  {{- if (.Values.config.memex_portal.SelfUpdate__MigrationRepository | default "" | trim) }}
-  SelfUpdate__MigrationRepository: "{{ .Values.config.memex_portal.SelfUpdate__MigrationRepository | trim }}"
+  {{- if $portalRepo }}
+  SelfUpdate__PortalRepository: "{{ $portalRepo }}"
+  {{- end }}
+  {{- $migrationRepo := .Values.config.memex_portal.SelfUpdate__MigrationRepository | default "" | trim }}
+  {{- if not $migrationRepo }}
+  {{- $derived := include "memex.imageRepositoryOn" (list (.Values.migration).image $suRegistry) }}
+  {{- if and $derived (ne $derived "memex-migration") }}{{ $migrationRepo = $derived }}{{ end }}
+  {{- end }}
+  {{- if $migrationRepo }}
+  SelfUpdate__MigrationRepository: "{{ $migrationRepo }}"
   {{- end }}
   # 🚨 The portal that VALIDATES this installation's instance key at that registry — the registry
   # record's own `validationUrl` (MeshWeaver#4093). The fleet registry cr.meshweaver.cloud decides a

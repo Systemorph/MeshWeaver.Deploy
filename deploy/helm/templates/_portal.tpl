@@ -15,6 +15,24 @@ registry, the dashboard, the required-secrets refusal) renders in such a release
   * `ingress.enabled` true — a build host serves nothing.
 `buildHosts` keeps every refusal of its own (templates/build-host/_build-hosts.tpl).
 */ -}}
+{{- /*
+`memex.imageRepositoryOn` — the REPOSITORY an image reference names on `registry`: the path after the
+host, without its tag or digest — or "" when the image is not on that registry (or names no host).
+`(list .Values.portal.image $registry)`. Used to derive the self-updater's repositories from the images
+this release actually runs (MeshWeaver.Deploy#53), so a hand-maintained overlay that names no repository
+cannot leave the self-updater listing a repository its instance never deployed.
+*/ -}}
+{{- define "memex.imageRepositoryOn" -}}
+{{- $image := (index . 0) | default "" | trim -}}
+{{- $registry := (index . 1) | default "" | trim -}}
+{{- $parts := splitList "/" (first (splitList "@" $image)) -}}
+{{- if and $registry (gt (len $parts) 1) (eq (first $parts) $registry) -}}
+{{- $path := rest $parts -}}
+{{- $name := first (splitList ":" (last $path)) -}}
+{{- join "/" (append (initial $path) $name) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "memex.portal.enabled" -}}
 {{- $p := (.Values.portal | default dict) -}}
 {{- if not (hasKey $p "enabled") -}}

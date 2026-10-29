@@ -121,6 +121,10 @@ COMBOS=(
   # an environment — without it those template branches render on nothing in this repo and a
   # regression in any of them is invisible until a real Provision fails.
   "mirror consumer (record-driven provision fixture)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.mirror-consumer.yaml"
+  # A hand-maintained overlay whose portal runs a NON-default repository on its self-update registry and
+  # names no SelfUpdate__PortalRepository (MeshWeaver.Deploy#53): the repository must be derived from the
+  # image, never left at the default the instance never deployed (invariant 9b).
+  "a control-shaped image on its self-update registry, no repository named (fixture)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.self-update-own-repository.yaml"
   # The fleet registry (templates/registry/) renders NOTHING under the three shapes above — it is
   # off by default — so without this combination a broken registry template is invisible to every
   # pull request and surfaces as a failed `helm upgrade` in the deployment repo. The example
@@ -278,6 +282,20 @@ for combo in "a whitespace-only operator maintainer (fixture)" "self-host (neutr
 done
 if [ "$executor_evidence" -eq 3 ]; then
   ok "the executor reaches the ConfigMap with the operator Job off; the maintainer renders trimmed, and only when set; MaintainerSignsAlone renders only when true"
+fi
+
+# The self-update repository evidence (MeshWeaver.Deploy#53). Read by NAME: the fixture's control-shaped
+# images on their own self-update registry render BOTH repositories derived from the images, and the
+# chart defaults (no registry) render neither — so invariant 9b had a subject, and a default install is
+# unchanged.
+own_repo_render="$(render_of "a control-shaped image on its self-update registry, no repository named (fixture)")"
+if [ -f "$own_repo_render" ] && [ -f "$(render_of "self-host (neutral chart defaults)")" ] \
+   && grep -q '^  SelfUpdate__PortalRepository: "memex-control"$' "$own_repo_render" \
+   && grep -q '^  SelfUpdate__MigrationRepository: "memex-control-migration"$' "$own_repo_render" \
+   && ! grep -q '^  SelfUpdate__\(Portal\|Migration\)Repository:' "$(render_of "self-host (neutral chart defaults)")"; then
+  ok "the self-updater's repositories are derived from the images a release runs on its own registry, and only there"
+else
+  report "self-update repositories: the fixture must render SelfUpdate__PortalRepository=\"memex-control\" and SelfUpdate__MigrationRepository=\"memex-control-migration\" (derived from its images), and the chart defaults neither — an overlay naming no repository would otherwise poll one its instance never deployed"
 fi
 
 # The Auth:GlobalAdmins evidence (MeshWeaver#5217). Read by NAME: the fixture renders exactly the

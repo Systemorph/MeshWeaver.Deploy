@@ -1,0 +1,11 @@
+# A FIXTURE (MeshWeaver.Deploy#53), layered on deploy/helm/values.yaml by check-chart-invariants.sh.
+# An installation whose overlay is maintained by hand (no control instance renders a record for it):
+# its portal runs a NON-default repository on the registry its self-updater lists, and the overlay names
+# no SelfUpdate__PortalRepository / SelfUpdate__MigrationRepository. The chart must derive both from the
+# images (invariant 9b), or the self-updater polls the default repositories this instance never deployed.
+selfUpdate:
+  registry: "registry.example.test"
+portal:
+  image: "registry.example.test/memex-control:3.1.1"
+migration:
+  image: "registry.example.test/memex-control-migration:3.1.1"
