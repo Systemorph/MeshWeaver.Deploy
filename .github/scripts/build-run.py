@@ -111,7 +111,9 @@ THE LOOP, and the order that matters:
     because it writes the shared $MW_BUILD_OUTPUTS and the host promotes outputs and NuGet packages after it.
     Each concurrent stage keeps its own sandbox, /tmp, scratch, PostgreSQL socket and event route, and hands over
     its OWN `$MW_BUILD_ARTIFACTS` (`<run>/artifacts/<stage>/`), so a sibling can neither see nor contribute to
-    another's receipts; a red stage's directory is quarantined whole. The declared budget is the schedule
+    another's receipts; a red stage's directory is quarantined whole — except its `diagnostics/` unit, which a RED
+    stage hands over too, before its failed verdict (red_stage_diagnostics: the logs, .trx files and dumps that say
+    WHY it is red; MeshWeaver.Plugins#4499), serial or fanned out alike. The declared budget is the schedule
     (`planned_seconds`: the critical path through the slots — and the scheduler is PINNED to that all-caps schedule,
     `cap_schedule`, so a stage finishing early can never push a later one past it), the run deadline still ends every stage not started,
     a 409 on any stage's route kills every sibling in flight and abandons the run, and the pid-namespace leftover
@@ -854,6 +856,52 @@ def artifact_snapshot(root: str) -> dict:
             full = os.path.join(base, n)
             snap[os.path.relpath(full, root)] = _artifact_identity(os.lstat(full))
     return snap
+
+
+# The one unit a RED stage still hands over (MeshWeaver.Plugins#4499): its diagnostics. A stage writes what explains a
+# failure — per-suite logs, crash .trx files, teardown captures, JIT listings, dumps — under
+# `$MW_BUILD_ARTIFACTS/diagnostics/<anything>`; a green stage hands it over with everything else, and a red one hands over
+# THIS unit alone, before the rest is quarantined. Nothing outside it ever leaves a red stage (a module bundle or a bake
+# a red stage left may be unfinished), and nothing reads a diagnostics receipt as a build output.
+DIAGNOSTICS_UNIT = "diagnostics"
+
+
+DIAGNOSTICS_COPY_CHUNK = 8 << 20
+
+
+def red_stage_diagnostics(root: str, before: dict, dest: str,
+                          proceed: Callable[[], None] = lambda: None) -> list[str]:
+    """COPY into `dest` every REGULAR file under `<root>/diagnostics/` that a failed stage added or rewrote (anything not
+    in, or different from, `before`), at the same relative path. A symlink, fifo or device is skipped, never followed:
+    a red stage's leftovers are untrusted, and diagnostics are evidence, not a reason to fail the hand-over. The source
+    is left in place for the quarantine. Returns the copied relative paths. `proceed` is called before each file and
+    between bounded chunks of it, and raises to stop: dumps can be large, and an expired or abandoned run must not keep
+    copying them."""
+    copied: list[str] = []
+    base_dir = os.path.join(root, DIAGNOSTICS_UNIT)
+    if not os.path.isdir(base_dir) or os.path.islink(base_dir):
+        return copied
+    for base, dirs, names in os.walk(base_dir):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(base, d))]
+        for n in sorted(names):
+            full = os.path.join(base, n)
+            st_ = os.lstat(full)
+            rel = os.path.relpath(full, root)
+            if not stat.S_ISREG(st_.st_mode) or before.get(rel) == _artifact_identity(st_):
+                continue
+            proceed()
+            target = os.path.join(dest, rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            src_fd = os.open(full, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(src_fd, "rb") as src, open(target, "wb") as out:
+                while True:
+                    chunk = src.read(DIAGNOSTICS_COPY_CHUNK)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    proceed()
+            copied.append(rel.replace(os.sep, "/"))
+    return sorted(copied)
 
 
 def quarantine_artifacts(root: str, before: dict, dest: str) -> list[str]:
@@ -2930,13 +2978,16 @@ class Host:
                 stage_env = {**extra, "MW_BUILD_STAGE": st["name"], "NUGET_PACKAGES": nuget_dir, "MW_BUILD_ARTIFACTS": art}
                 readonly = self.stage_readonly(repo, st) + prepared_ro
 
-                def work(spec=spec, sink=sink, art=art, stage_env=stage_env, readonly=readonly, name=st["name"]) -> None:
+                def work(spec=spec, sink=sink, art=art, stage_env=stage_env, readonly=readonly, name=st["name"],
+                         art_before=art_before) -> None:
                     try:
                         ok = self.run_stage(spec, checkout_dir, outputs_dir, sink, stage_env,
                                             readonly=readonly, writable=[art, nuget_dir],
                                             hand_over=lambda: self.hand_over_artifacts(repo, sha, name, art, deadline=run_end,
                                                                                        cancel=cancel),
-                                            cancel=cancel)
+                                            cancel=cancel,
+                                            hand_over_failed=lambda: self.hand_over_diagnostics(
+                                                repo, sha, name, art, art_before, deadline=run_end, cancel=cancel))
                         done.put((name, ok, None))
                     except BaseException as e:     # Lost, or a host defect: the scheduler decides, never a dead thread
                         # The run is abandoned the moment a worker KNOWS it — not when the scheduler reads this from the
@@ -3514,9 +3565,12 @@ class Host:
     def run_stage(self, st: dict, checkout: str, outputs: str, sink: EventSink, extra: dict,
                   readonly: Iterable[str] = (), writable: Iterable[str] = (),
                   hand_over: Callable[[], tuple[list[dict], Optional[str]]] = None,
-                  cancel: Optional[threading.Event] = None) -> bool:
+                  cancel: Optional[threading.Event] = None,
+                  hand_over_failed: Callable[[], tuple[list[dict], Optional[str]]] = None) -> bool:
         """Run ONE stage in a fresh sandboxed process tree; post its events; return success. `cancel` (fan-out): set
-        when a sibling stage found the run is no longer this host's — the stage is killed and Lost raised."""
+        when a sibling stage found the run is no longer this host's — the stage is killed and Lost raised.
+        `hand_over_failed`: what a RED stage still hands over — its diagnostics unit only (red_stage_diagnostics); its
+        receipts are posted before the failed verdict, and a problem with them is named but never turns red green."""
         name, started = st["name"], self.clock()
 
         def abandoned() -> None:
@@ -3605,6 +3659,14 @@ class Host:
             if problem:
                 ok = False
                 note = (note + "; " if note else "") + f"artifact hand-over failed: {problem}"
+        elif not ok and hand_over_failed is not None:
+            # The evidence of WHY it is red outlives the sandbox (MeshWeaver.Plugins#4499) — diagnostics only.
+            receipts, problem = hand_over_failed()
+            events += receipts
+            if receipts:
+                events.append({"kind": "line", "text": f"diagnostics: {len(receipts)} file(s) of the red stage handed over"})
+            if problem:
+                note = (note + "; " if note else "") + f"diagnostics hand-over failed: {problem}"
         abandoned()
         events.append({"kind": "stage-finished", "state": "succeeded" if ok else "failed",
                        "summary": parser.summary(rc, self.clock() - started, note)})
@@ -3707,6 +3769,33 @@ class Host:
             receipts.append({"kind": "artifact", "unit": unit, "key": locator, "sha256": digest, "bytes": size})
         return receipts, None
 
+    def hand_over_diagnostics(self, repo: str, sha: str, stage: str, artifacts_dir: str, before: dict,
+                              deadline: Optional[float] = None,
+                              cancel: Optional[threading.Event] = None) -> tuple[list[dict], Optional[str]]:
+        """A RED stage's diagnostics unit — and nothing else of what it left — through the SAME hand-over a green stage
+        uses (store, read-back, receipt), from a private copy so the quarantine still moves the originals."""
+        def proceed() -> None:
+            abandoned(cancel, stage)    # Lost: an abandoned run stages, uploads and receipts nothing more
+            if deadline is not None and deadline - self.clock() <= 0:
+                raise _DeadlinePassed()
+
+        staged = None
+        try:
+            proceed()
+            # Inside the try: on a full work volume this very mkdtemp raises ENOSPC, and that must become this note,
+            # never an exception out of run_stage that leaves the stage without a verdict.
+            staged = tempfile.mkdtemp(prefix=".diagnostics-", dir=self.work)
+            if not red_stage_diagnostics(artifacts_dir, before, staged, proceed):
+                return [], None
+            return self.hand_over_artifacts(repo, sha, stage, staged, deadline=deadline, cancel=cancel)
+        except _DeadlinePassed:
+            return [], "the run deadline passed while the red stage's diagnostics were staged"
+        except OSError as e:
+            return [], f"the red stage's diagnostics could not be staged ({type(e).__name__}: {str(e)[:160]})"
+        finally:
+            if staged is not None:
+                shutil.rmtree(staged, ignore_errors=True)
+
     def hand_over_through_api(self, repo: str, sha: str, stage: str, artifacts_dir: str, files: list[str],
                               left: Callable[[], float],
                               cancel: Optional[threading.Event] = None) -> tuple[list[dict], Optional[str]]:
@@ -3777,6 +3866,10 @@ class Host:
                 self.sleep(idle if what == "idle" else max(idle, 30))
         self.log("stopping: no further claims (the run in hand, if any, has finished)")
         return 0
+
+
+class _DeadlinePassed(Exception):
+    """The run's deadline passed while a red stage's diagnostics were being staged."""
 
 
 def abandoned(cancel: Optional[threading.Event], stage: str) -> None:
@@ -5623,6 +5716,85 @@ def self_test() -> int:
                 else:
                     check(f"h9/negative control: without the quarantine {label} reaches the sibling's hand-over",
                           not clean, (good_fin, good_units))
+        # A RED stage's DIAGNOSTICS outlive its sandbox (MeshWeaver.Plugins#4499): the `diagnostics` unit it wrote is
+        # handed over and receipted before its failed verdict, while everything else it left (an unfinished bundle) is
+        # still quarantined, and a dangling symlink among the diagnostics is skipped rather than failing the hand-over.
+        red_cmd = ("mkdir -p $MW_BUILD_ARTIFACTS/diagnostics/bad $MW_BUILD_ARTIFACTS/Bad && echo crash > "
+                   "$MW_BUILD_ARTIFACTS/diagnostics/bad/suite.log && echo half > $MW_BUILD_ARTIFACTS/Bad/Bad-1.0.0.zip && "
+                   "ln -s /nonexistent $MW_BUILD_ARTIFACTS/diagnostics/bad/dangling; exit 1")
+        for wired in (True, False):
+            posted.clear()
+            hd = host(api_ev(), env=dict(env_s, MW_BUILD_ARTIFACT_STORE="file:" + store_dir), store_runner=fake_store,
+                      checkout=checkout_with({"stages": [{"name": "bad", "kind": "test", "command": red_cmd}]}))
+            if not wired:   # NEGATIVE CONTROL: the runner as it was — a red stage hands over nothing
+                hd.hand_over_diagnostics = lambda *a, **k: ([], None)
+            hd.run(claim)
+            evs = [e for pth, es in posted if pth.split("/")[-2] == "bad" for e in es]
+            units = sorted(e["unit"] for e in evs if e["kind"] == "artifact")
+            fin = [e for e in evs if e["kind"] == "stage-finished"]
+            if wired:
+                check("h9/a red stage hands over its diagnostics (and only them), and stays red",
+                      units == ["diagnostics/bad/suite.log"] and fin and fin[-1]["state"] == "failed", (units, fin))
+                check("h9/the red stage's receipts precede its failed verdict",
+                      [e["kind"] for e in evs if e["kind"] in ("artifact", "stage-finished")][-1] == "stage-finished", evs)
+            else:
+                check("h9/negative control: without the diagnostics hand-over a red stage receipts nothing", units == [], units)
+        droot = tempfile.mkdtemp(prefix="h9d-")
+        try:
+            os.makedirs(os.path.join(droot, "diagnostics", "x"))
+            os.makedirs(os.path.join(droot, "Mod"))
+            for rel_, body in (("diagnostics/x/old.log", b"old"), ("Mod/Mod.zip", b"zip")):
+                with open(os.path.join(droot, rel_), "wb") as fh:
+                    fh.write(body)
+            before_d = artifact_snapshot(droot)
+            with open(os.path.join(droot, "diagnostics", "x", "new.trx"), "wb") as fh:
+                fh.write(b"trx")
+            with open(os.path.join(droot, "Mod", "Mod.zip"), "wb") as fh:
+                fh.write(b"rewritten")
+            got_d = red_stage_diagnostics(droot, before_d, droot + "-d")
+            check("h9/diagnostics: only what the red stage ADDED under diagnostics/ is staged — not an older file, not a bundle",
+                  got_d == ["diagnostics/x/new.trx"] and os.path.isfile(os.path.join(droot, "diagnostics", "x", "new.trx")),
+                  got_d)
+        finally:
+            shutil.rmtree(droot, ignore_errors=True)
+            shutil.rmtree(droot + "-d", ignore_errors=True)
+        # The staging itself can fail or must stop, and neither may escape run_stage without a verdict: a work volume
+        # that refuses the staging directory (ENOSPC there, a missing directory here) is the diagnostics note; an
+        # abandoned run raises Lost before anything is copied; an expired run copies nothing and says so.
+        sroot = tempfile.mkdtemp(prefix="h9s-")
+        try:
+            os.makedirs(os.path.join(sroot, "art", "diagnostics", "x"))
+            with open(os.path.join(sroot, "art", "diagnostics", "x", "dump.bin"), "wb") as fh:
+                fh.write(b"dump")
+            hs = host(api_ev(), env=dict(env_s, MW_BUILD_ARTIFACT_STORE="file:" + store_dir), store_runner=fake_store)
+            hs.work = os.path.join(sroot, "no-such-work-volume")
+            try:
+                r_, prob_ = hs.hand_over_diagnostics("r", "s", "bad", os.path.join(sroot, "art"), {})
+                staged_ok = r_ == [] and bool(prob_) and "could not be staged" in prob_
+            except Exception as e:      # the defect: the staging error escaped
+                staged_ok, prob_ = False, repr(e)
+            check("h9/diagnostics: a staging directory the work volume refuses is the note, never an escaped exception",
+                  staged_ok, prob_)
+            hs.work = sroot
+            gone = threading.Event()
+            gone.set()
+            try:
+                hs.hand_over_diagnostics("r", "s", "bad", os.path.join(sroot, "art"), {}, cancel=gone)
+                lost_ok = False
+            except Lost:
+                lost_ok = True
+            check("h9/diagnostics: an abandoned run stages nothing (Lost before the first copy)",
+                  lost_ok and not [d for d in os.listdir(sroot) if d.startswith(".diagnostics-")], os.listdir(sroot))
+            r_, prob_ = hs.hand_over_diagnostics("r", "s", "bad", os.path.join(sroot, "art"), {},
+                                                 deadline=hs.clock() - 1)
+            check("h9/diagnostics: an expired run copies nothing and names the deadline",
+                  r_ == [] and bool(prob_) and "deadline" in prob_
+                  and not [d for d in os.listdir(sroot) if d.startswith(".diagnostics-")], (r_, prob_))
+            calls = []
+            red_stage_diagnostics(os.path.join(sroot, "art"), {}, os.path.join(sroot, "copy"), lambda: calls.append(1))
+            check("h9/diagnostics: the copy re-checks before each file and between its chunks", len(calls) >= 2, calls)
+        finally:
+            shutil.rmtree(sroot, ignore_errors=True)
         # ── 7d. FAN-OUT: a `parallel` run's independent stages run CONCURRENTLY, within the host's declared slots ──
         # The scheduling decision itself, pure: a dependant waits for its dependency, a build runs ALONE, slots bound it.
         fs = [{"name": "build", "kind": "build", "after": []}, {"name": "s0", "kind": "test", "after": ["build"]},
