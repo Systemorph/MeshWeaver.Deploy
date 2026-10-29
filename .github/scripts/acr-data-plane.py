@@ -21,6 +21,18 @@ registry with that.
     acr-data-plane.py manifests --registry <login server> --tenant <tenant id> --repository <name> --top N
         the newest N manifests of <name>, newest first, as a JSON array on stdout — the rows
         `az acr manifest list-metadata --orderby time_desc -o json` prints (each carries `tags`).
+    acr-data-plane.py set-runners --registry <login server> --tenant <tenant id> --repository <name> --version V
+        EVERY runner of ONE set — the tags `V` and `V-r<N>` — with the digest each names, as manifest rows
+        (`[{"digest", "tags": [tag]}]`, the shape `platform-set-dispatch.py runner-choice` reads). From the
+        COMPLETE, Link-paged tag listing, never a newest-N window: a hand-over that read `--top 300`
+        manifests lost an older runner of the set once 300 newer ones were published, and the receiver then
+        refused the refresh (MeshWeaver.Deploy#60).
+    acr-data-plane.py tag-rows  --registry <login server> --tenant <tenant id> --repository <name>
+        EVERY tag of <name>, one manifest-shaped row per tag (`[{"tags": [tag]}]`), from the COMPLETE,
+        Link-paged tag listing — what discovery reads the runners from (`platform-set-dispatch.py discover
+        --runner`). It needs only which runner revisions EXIST; a newest-N manifest window made a set whose
+        first runner had aged out of it read as lacking its plain tag, and discovery then queued the same
+        compatibility-tag "repair" on every tick (Deploy#62).
     acr-data-plane.py retag     --registry <login server> --tenant <tenant id> --repository <name> --from <tag> --to <tag>
         put the manifest <name>:<from> names under <to> as well, BYTE FOR BYTE (GET by the source tag,
         PUT the same body under the target with the same media type), so both tags name ONE digest;
@@ -270,6 +282,26 @@ def list_tags(server: str, tenant: str, repository: str, io: Io) -> list[str]:
         tags += [t for t in batch if isinstance(t, str)]
         url = next_link(headers.get("link"))
     return tags
+
+
+def set_runners(server: str, tenant: str, repository: str, version: str, io: Io) -> list[dict]:
+    """Every runner tag of set `version` (`version` itself and `version-r<N>`) with its digest, as manifest rows.
+    A tag in the listing that the registry then answers absent is a Refusal, never a dropped runner."""
+    if not TAG_RE.fullmatch(version or ""):
+        raise Refusal(f"--version is not a tag: {version!r}")
+    mine = re.compile(rf"^{re.escape(version)}(?:-r[1-9][0-9]{{0,8}})?$")
+    rows = []
+    for tag in sorted(t for t in list_tags(server, tenant, repository, io) if mine.match(t)):
+        digest = tag_digest(server, tenant, repository, tag, io)
+        if digest is None:
+            raise Refusal(f"{repository}:{tag} is in the tag list but the registry says it is absent")
+        rows.append({"digest": digest, "tags": [tag]})
+    return rows
+
+
+def tag_rows(server: str, tenant: str, repository: str, io: Io) -> list[dict]:
+    """Every tag of <repository> as a manifest-shaped row `{"tags": [tag]}` (no digest), from the COMPLETE listing."""
+    return [{"tags": [t]} for t in sorted(list_tags(server, tenant, repository, io))]
 
 
 def main_first_parent(io: Io) -> list[str]:
@@ -978,6 +1010,23 @@ jobs:
     def published(*cs):
         return {f"0.1-{c[:7]}": img(c) for c in cs}
 
+    # ── set-runners: the COMPLETE listing of one set's runners (Deploy#60) ──
+    runners_reg = {"3.1.100": b'{"r":0}', "3.1.100-r5": b'{"r":0}', "3.1.100-r7": b'{"r":7}',
+                   "3.1.1000": b'{"o":1}', "3.1.100-r7x": b'{"x":1}', "3.1.1001-r7": b'{"o":2}'}
+    runners_reg.update({f"3.1.{n}-r1": b'{"n":%d}' % n for n in range(2000, 2400)})   # 400 newer tags first
+    check("set-runners: every runner of the set across many pages, nothing of another set",
+          lambda: set_runners("r.io", "t", "x", "3.1.100", converge_io([[A]], runners_reg, [], page=50)),
+          lambda rows: [r["tags"] for r in rows] == [["3.1.100"], ["3.1.100-r5"], ["3.1.100-r7"]]
+          and rows[0]["digest"] == rows[1]["digest"] == "sha256:" + hashlib.sha256(b'{"r":0}').hexdigest())
+    check("tag-rows: EVERY tag across many pages, one row each — no newest-N window",
+          lambda: tag_rows("r.io", "t", "x", converge_io([[A]], runners_reg, [], page=50)),
+          lambda rows: len(rows) == len(runners_reg) and {"tags": ["3.1.100"]} in rows
+          and all(set(r) == {"tags"} and len(r["tags"]) == 1 for r in rows))
+    check("tag-rows: an unreadable listing is refused, never an empty repository",
+          lambda: tag_rows("r.io", "t", "x", converge_io([[A]], runners_reg, [], list_status=503)), REFUSED)
+    check("set-runners: an unreadable listing is refused, never an empty set",
+          lambda: set_runners("r.io", "t", "x", "3.1.100", converge_io([[A]], runners_reg, [], list_status=503)), REFUSED)
+
     def run_converge(self_sha, mains, reg, **kw):
         puts: list = []
         got = converge_line("r.io", "t", "x", "0.1", self_sha, converge_io(mains, reg, puts, **kw))
@@ -1204,6 +1253,17 @@ def main(argv: list[str]) -> int:
             return 1 if problems else 0
         if argv and argv[0] == "login":
             docker_login(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")), Io())
+            return 0
+        if argv and argv[0] == "set-runners":
+            rows = set_runners(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")),
+                               _arg(argv, "--repository"), _arg(argv, "--version"), Io())
+            json.dump(rows, sys.stdout)
+            sys.stdout.write("\n")
+            return 0
+        if argv and argv[0] == "tag-rows":
+            json.dump(tag_rows(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")),
+                               _arg(argv, "--repository"), Io()), sys.stdout)
+            sys.stdout.write("\n")
             return 0
         if argv and argv[0] == "manifests":
             rows = list_manifests(_login_server(_arg(argv, "--registry")), _tenant(_arg(argv, "--tenant")),

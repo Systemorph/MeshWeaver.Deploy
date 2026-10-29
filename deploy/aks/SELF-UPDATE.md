@@ -93,6 +93,20 @@ self-update stops advancing until someone looks.
 | **Update strategy** | `Continuous` (newest build incl. `-ci.N`, default) · `Stable` (clean releases only) · `None` (manual) |
 | **Only update to CI-verified (green) builds** | default **on**. The `images` job publishes ONLY when "Build and Test" is green, so every published tag is green by construction; this flag stays correct if an unverified **edge** channel is added (it excludes `-edge.N` tags). Off = also accept edge builds. |
 
+### Which repositories the self-updater lists
+
+`SelfUpdate__Registry` (from `selfUpdate.registry`) names the host; `SelfUpdate__PortalRepository` and
+`SelfUpdate__MigrationRepository` name the repositories on it, defaulting to `memex-portal-ai` and
+`memex-migration`. A control instance's record renders them from its own image repository. An overlay
+that no control instance renders gets them **derived from the images it runs**: when `selfUpdate.registry`
+is set, the chart writes each repository from `portal.image` / `migration.image` if that image is on that
+registry and its repository is not the default (MeshWeaver.Deploy#53). Before that change, such an overlay
+kept the defaults. Its self-updater then polled a repository the instance never deployed: a 404 at first,
+and a roll onto the working instances' image once that repository was mirrored into the same registry.
+An explicit `config.memex_portal.SelfUpdate__PortalRepository` / `…MigrationRepository` always wins.
+`check-chart-invariants.sh` invariant 9b refuses a render whose self-updater lists a repository other than
+the one its image names on the same registry.
+
 ## Enabling self-update on an AKS environment
 
 🚨 **On the fleet (MeshWeaver#4098) an instance does NOT patch itself**: the chart's default
