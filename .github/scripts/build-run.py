@@ -1243,6 +1243,12 @@ class _AnsweredSocket:
         return getattr(self._sock, name)
 
 
+def upload_endpoint(url: urllib.parse.SplitResult) -> tuple[str, int]:
+    """(host, port) for http.client from a split URL, the port ALWAYS explicit: `urlsplit` strips an IPv6
+    literal's brackets, and http.client re-parses a bare `::1` with no port as host `:` port `1`."""
+    return url.hostname or "", url.port or (443 if url.scheme == "https" else 80)
+
+
 class Api:
     def __init__(self, base: str, token: str) -> None:
         self.base = base.rstrip("/")
@@ -1304,7 +1310,7 @@ class Api:
         if cancel is not None and cancel.is_set():
             raise Lost("the run was abandoned before an artifact upload started")
         try:
-            conn = factory(url.hostname, url.port, timeout=left())
+            conn = factory(*upload_endpoint(url), timeout=left())
             with open(file_path, "rb") as fh:
                 conn.putrequest("PUT", target, skip_accept_encoding=True)
                 for k, v in (("Authorization", f"Bearer {self.token}"), ("Accept", "application/json"),
@@ -1360,8 +1366,9 @@ class Api:
                     return r.status, None
                 raise
             left()                      # an answer that arrived after the budget is not accepted
-            raw = b"".join(chunks).decode()
             try:
+                # decoded INSIDE the guard: a refusal whose body is not UTF-8 is still that refusal
+                raw = b"".join(chunks).decode()
                 return r.status, (json.loads(raw) if raw.strip() else None)
             except ValueError:
                 # A refusal whose body is not JSON is still that refusal: keep its status.
@@ -6420,6 +6427,35 @@ def self_test() -> int:
         finally:
             cutr.shutdown()
             cutr.server_close()
+
+        # an IPv6 literal with no explicit port keeps its address (http.client would read `::1` as host `:` port 1)
+        check("h9-api/transport: an IPv6 API with no port connects to that address on the scheme's port",
+              upload_endpoint(urllib.parse.urlsplit("https://[::1]/api/builds")) == ("::1", 443)
+              and upload_endpoint(urllib.parse.urlsplit("http://[fd00::5]/api/builds")) == ("fd00::5", 80)
+              and upload_endpoint(urllib.parse.urlsplit("http://api:8080/x")) == ("api", 8080))
+
+        # a complete REFUSAL whose body is not UTF-8 keeps its status, never status 0 retried as transport
+        class _BinaryRefusal(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                payload = b"\xff\xfe\x00refused"
+                self.send_response(413)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        binr = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _BinaryRefusal)
+        threading.Thread(target=binr.serve_forever, daemon=True).start()
+        try:
+            status, answer = Api(f"http://127.0.0.1:{binr.server_address[1]}/api/builds", "t").upload(
+                "/x", {}, blob, 1, timeout=10)
+            check("h9-api/transport: a refusal with a non-UTF-8 body keeps its status (413)", status == 413, (status, answer))
+        finally:
+            binr.shutdown()
+            binr.server_close()
 
         # HTTPS: a TLS 1.3 server sends its session tickets right after the handshake, which makes the socket READABLE
         # before any HTTP answer exists. The upload must keep sending through that, not stop the body and wait for an
