@@ -28,7 +28,10 @@ THE LOOP, and the order that matters:
      (`<cache>/plugin-sets/current-<identity digest>.json`), so the next host starts with it installed.
   2. `POST {api}/claim` with the host's channel, platform set, framework identity, plugins digest
      or key, and a fresh `claimId` (the SAME one on a network-error retry). 204 = nothing
-     claimable → sleep. 200 = a run: `{path, repo, sha, refs, isTrunk, publish, stages}` — `path`
+     claimable → sleep. 409 `stale-set` = this host's set is no longer its lane's → DRAINED: it
+     claims nothing and idles, asking again each minute, until SIGTERM (a replica of the new set
+     replaces it) or the instance answers its set current again; it never exits on its own, so a
+     record change that is not applied yet cannot crash-loop the host (Memex#885). 200 = a run: `{path, repo, sha, refs, isTrunk, publish, stages}` — `path`
      is authoritative (a non-latest run's node id is `<sha>-<channel>`). The host then posts the
      PLAN (`{"kind":"plan","stages":[…]}`, host-emitted only) and keeps the claim's lease with a
      batch at least every 45 s (an empty batch is the heartbeat); every stage route's batches are
@@ -145,7 +148,9 @@ Environment (rendered by the chart from `buildHosts.*`):
   MW_BUILD_READY_FILE          written once the host is staged (readiness) default /tmp/build-host-ready
   MW_BUILD_COMPILE_REFS        the compile-check's reference set, prepared once per roll: the portal's
                                /app + shared-frameworks/ (CI's refs/ shape); handed to stages; the host
-                               refuses to START when it carries no System.Private.CoreLib.dll
+                               refuses to START when it carries no System.Private.CoreLib.dll or Rx
+                               OUTSIDE sdk-generators/ and analyzers/ (core's compile-check excludes those),
+                               or when it overlaps the stages' writable /scratch/{home,tmp,nuget}
   MW_BUILD_GIT_BASE            clone base                                  default https://github.com/Systemorph
   MW_BUILD_IDLE_SECONDS        sleep after a 204                           default 15
   MW_BUILD_RUN_DEADLINE_SECONDS  the whole run's deadline (= the pod's grace) default 3600
@@ -169,9 +174,11 @@ import os
 import queue
 import random
 import re
+import select
 import shutil
 import signal
 import socket
+import ssl
 import stat
 import struct
 import zlib
@@ -1227,17 +1234,55 @@ class Lost(Exception):
     """409: the run is claimed by another host. Stop everything for it."""
 
 
-class CancellableReader:
-    """A request body read block by block that raises Lost once `cancel` is set — http.client streams a file-like body
-    by calling `read`, so an upload of an abandoned run stops at its next block instead of running to its timeout."""
+# One block of an artifact upload: between two blocks the upload checks `cancel`, polls for an early answer and gives
+# the next send only the time left of its absolute budget (Api.upload).
+UPLOAD_BLOCK = 256 * 1024
 
-    def __init__(self, fh, cancel: threading.Event) -> None:
-        self.fh, self.cancel = fh, cancel
 
-    def read(self, n: int = -1) -> bytes:
-        if self.cancel.is_set():
-            raise Lost("the run was abandoned while an artifact upload was streaming")
-        return self.fh.read(n)
+class _AnswerReader(io.RawIOBase):
+    """The answer's first bytes — taken off the socket while the body was still streaming — then the socket itself."""
+
+    def __init__(self, raw, head: bytes) -> None:
+        super().__init__()
+        self._raw, self._head = raw, head
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b) -> int:
+        if self._head:
+            n = min(len(b), len(self._head))
+            b[:n] = self._head[:n]
+            self._head = self._head[n:]
+            return n
+        return self._raw.readinto(b)
+
+    def close(self) -> None:
+        try:
+            self._raw.close()
+        finally:
+            super().close()
+
+
+class _AnsweredSocket:
+    """The upload's socket with the answer's already-read first bytes put back in front, for http.client to parse."""
+
+    def __init__(self, sock, head: bytes) -> None:
+        self._sock, self._head = sock, head
+
+    def makefile(self, mode: str = "rb", *args, **kwargs):
+        # the socket's OWN unbuffered reader underneath: it holds the descriptor open after the connection closes
+        # (http.client closes it once a `Connection: close` answer's head is read), exactly as a plain makefile does
+        return io.BufferedReader(_AnswerReader(self._sock.makefile("rb", buffering=0), self._head))
+
+    def __getattr__(self, name: str):
+        return getattr(self._sock, name)
+
+
+def upload_endpoint(url: urllib.parse.SplitResult) -> tuple[str, int]:
+    """(host, port) for http.client from a split URL, the port ALWAYS explicit: `urlsplit` strips an IPv6
+    literal's brackets, and http.client re-parses a bare `::1` with no port as host `:` port `1`."""
+    return url.hostname or "", url.port or (443 if url.scheme == "https" else 80)
 
 
 class Api:
@@ -1273,30 +1318,106 @@ class Api:
 
     def upload(self, path: str, query: dict, file_path: str, size: int, timeout: float,
                cancel: Optional[threading.Event] = None) -> tuple[int, object]:
-        """PUT one file's bytes to `path` (`Content-Length` = `size`, streamed from disk, never read whole into memory) with
-        the worker token; the answer's status and JSON body, as `call` returns them (0 = transport failure). `cancel` set
-        while the body streams raises Lost at the next block — an abandoned run stops sending at once."""
-        url = self.base + path + (("?" + urllib.parse.urlencode(query)) if query else "")
+        """PUT one file's bytes to `path` (`Content-Length` = `size`, streamed from disk in blocks, never read whole into
+        memory) with the worker token; the answer's status and JSON body, as `call` returns them (0 = transport failure).
+        `cancel` set while the body streams raises Lost at the next block — an abandoned run stops sending at once.
+
+        `timeout` is an ABSOLUTE budget for the whole exchange — connect, every block sent, the answer read — never a
+        per-socket-operation bound (MeshWeaver.Deploy#63): an upload that keeps making slow progress used to run past the
+        run's budget, and a success read after it was accepted. Every socket operation gets only the time left, and an
+        exchange that runs out is status 0 naming the budget, the same transport failure the hand-over bounds.
+
+        The server may answer BEFORE it reads the body: the build API refuses an oversize artifact (413) on the declared
+        Content-Length (MeshWeaver.Deploy#64). Between blocks the socket is polled for an answer, and a send that fails
+        (broken pipe, reset) still reads the answer the server sent — so the host reports the server's reason and does
+        not retry a refusal as if the transport had failed."""
+        url = urllib.parse.urlsplit(self.base + path + (("?" + urllib.parse.urlencode(query)) if query else ""))
+        target = (url.path or "/") + (("?" + url.query) if url.query else "")
+        deadline = time.monotonic() + timeout
+
+        def left() -> float:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"the upload ran past its {timeout:g} s budget")
+            return remaining
+
+        factory = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+        conn = None
+        if cancel is not None and cancel.is_set():
+            raise Lost("the run was abandoned before an artifact upload started")
         try:
-            with open(file_path, "rb") as raw_fh:
-                fh = CancellableReader(raw_fh, cancel) if cancel is not None else raw_fh
-                req = urllib.request.Request(url, data=fh, method="PUT", headers={
-                    "Authorization": f"Bearer {self.token}", "Accept": "application/json",
-                    "Content-Type": "application/octet-stream", "Content-Length": str(size)})
-                with urllib.request.urlopen(req, timeout=timeout) as r:
-                    raw = r.read().decode()
-                    return r.status, (json.loads(raw) if raw.strip() else None)
-        except urllib.error.HTTPError as e:
+            conn = factory(*upload_endpoint(url), timeout=left())
+            with open(file_path, "rb") as fh:
+                conn.putrequest("PUT", target, skip_accept_encoding=True)
+                for k, v in (("Authorization", f"Bearer {self.token}"), ("Accept", "application/json"),
+                             ("Content-Type", "application/octet-stream"), ("Content-Length", str(size))):
+                    conn.putheader(k, v)
+                conn.endheaders()
+                sock = conn.sock
+                while True:
+                    if cancel is not None and cancel.is_set():
+                        raise Lost("the run was abandoned while an artifact upload was streaming")
+                    if select.select([sock], [], [], 0)[0]:
+                        # A readable socket is NOT yet an answer on HTTPS: a TLS 1.3 session ticket (or any other TLS
+                        # control record) makes it readable too, and stopping the body for one leaves both sides
+                        # waiting for the other. Read what is there without blocking: the TLS layer consumes control
+                        # records itself and hands back only HTTP bytes; none means keep sending.
+                        sock.setblocking(False)
+                        try:
+                            head = sock.recv(65536)
+                        except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                            head = None
+                        sock.settimeout(left())
+                        if head is not None:
+                            # the server answered (or closed: b"") before the body ended — the answer is read below,
+                            # starting with the bytes already taken off the socket
+                            conn.sock = _AnsweredSocket(sock, head)
+                            break
+                    block = fh.read(UPLOAD_BLOCK)
+                    if not block:
+                        break
+                    sock.settimeout(left())
+                    try:
+                        sock.sendall(block)
+                    except (BrokenPipeError, ConnectionResetError):
+                        break          # the server stopped reading — its answer, if it sent one, is read below
+            sock.settimeout(left())
+            r = conn.getresponse()
+            chunks = []
             try:
-                raw = e.read().decode()
-                return e.code, (json.loads(raw) if raw.strip() else None)
-            except (OSError, ValueError, http.client.HTTPException):
-                # A refusal whose body was cut short is still that refusal: keep its status.
-                return e.code, None
+                while not r.isclosed():     # the response closes itself once its Content-Length has arrived
+                    # read1: ONE socket read per call, so each gets only the time left — `read(n)` loops over many
+                    # reads under a single timeout and a trickle would outlive the budget inside it.
+                    sock.settimeout(left())
+                    chunk = r.read1(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                if r.length:                # closed before its Content-Length arrived
+                    raise http.client.IncompleteRead(b"".join(chunks), r.length)
+            except (OSError, http.client.HTTPException):
+                if not (200 <= r.status < 300):
+                    # A refusal whose body was cut short (or reset) is still that refusal: keep its status, as `call`
+                    # does, so a 413/401 fails at once and is never retried as a transport failure.
+                    return r.status, None
+                raise
+            left()                      # an answer that arrived after the budget is not accepted
+            try:
+                # decoded INSIDE the guard: a refusal whose body is not UTF-8 is still that refusal
+                raw = b"".join(chunks).decode()
+                return r.status, (json.loads(raw) if raw.strip() else None)
+            except ValueError:
+                # A refusal whose body is not JSON is still that refusal: keep its status.
+                return (r.status, None) if not (200 <= r.status < 300) else (0, f"unreadable answer to HTTP {r.status}")
         # http.client.HTTPException covers IncompleteRead: a response closed before its Content-Length
         # arrived is a transport failure (status 0, retried inside the budget), never an escaping traceback.
-        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            if time.monotonic() >= deadline and "budget" not in str(e):
+                return 0, f"the upload ran past its {timeout:g} s budget ({e})"
             return 0, str(e)
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def artifact_path(repo: str, sha: str, digest: str) -> str:
@@ -1824,21 +1945,50 @@ COMPILE_REFS_SHARED = "shared-frameworks"
 COMPILE_REFS_RX = "System.Reactive.dll"
 
 
+# Compiler TOOLING, never a reference: core's compile-check.py (`is_reference_assembly`) drops every
+# assembly under one of these directories before it looks for Rx or CoreLib, so a set whose only
+# System.Reactive.dll sits there is refused by compile-check (exit 4). The preflight applies the SAME
+# exclusion, or it accepts a set that is red later, never green (MeshWeaver.Deploy#58).
+COMPILE_REFS_TOOLING_DIRS = frozenset({"sdk-generators", "analyzers"})
+
+
+def _reference_dll_present(root: str, name: str) -> bool:
+    """True iff `name` exists under `root` outside every compiler-tooling directory."""
+    for _here, subdirs, files in os.walk(root):
+        subdirs[:] = [d for d in subdirs if d not in COMPILE_REFS_TOOLING_DIRS]
+        if name in files:
+            return True
+    return False
+
+
+def _paths_overlap(a: str, b: str) -> bool:
+    a, b = os.path.normpath(a), os.path.normpath(b)
+    return a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/")
+
+
 def compile_refs_refusal(refs: str) -> Optional[str]:
     """Why `refs` is not a complete compile reference set, or None. The same test core's
     compile-check.py applies (`short_reference_set_refusal`): the image's MeshWeaver assemblies AND
-    System.Private.CoreLib.dll under `shared-frameworks/`. Pure apart from reading the tree."""
+    System.Private.CoreLib.dll under `shared-frameworks/`, each counted only OUTSIDE compiler-tooling
+    directories. Also refused: a set that overlaps a stage's WRITABLE scratch ($SCRATCH/home, tmp,
+    nuget) — it is bound read-only into every sandbox AFTER those are created, so every stage that
+    writes a temp file or HOME fails after the host started (MeshWeaver.Deploy#58). Pure apart from
+    reading the tree."""
+    for writable in (f"{SCRATCH}/home", f"{SCRATCH}/tmp", f"{SCRATCH}/nuget"):
+        if _paths_overlap(refs, writable):
+            return (f"MW_BUILD_COMPILE_REFS={refs} overlaps the stages' writable {writable} — it is bound READ-ONLY "
+                    f"into every sandbox over that directory; stage the set elsewhere")
     if not os.path.isdir(refs):
         return f"MW_BUILD_COMPILE_REFS={refs} is not a directory"
     if not any(n.startswith("MeshWeaver.") and n.endswith(".dll") for n in os.listdir(refs)):
         return f"MW_BUILD_COMPILE_REFS={refs} carries no MeshWeaver.*.dll — it is not the portal's /app"
     shared = os.path.join(refs, COMPILE_REFS_SHARED)
-    if not any(COMPILE_REFS_MARKER in files for _dir, _subdirs, files in os.walk(shared)):
+    if not _reference_dll_present(shared, COMPILE_REFS_MARKER):
         return (f"MW_BUILD_COMPILE_REFS={refs} carries NO shared frameworks ({COMPILE_REFS_SHARED}/**/{COMPILE_REFS_MARKER} "
                 f"is missing) — core's compile-check.py refuses such a set (exit 4); the portal init container must "
                 f"stage /usr/share/dotnet/shared beside /app")
     # core's short_reference_set_refusal ALSO refuses a set without Rx (every MeshWeaver assembly binds it).
-    if not any(COMPILE_REFS_RX in files for _dir, _subdirs, files in os.walk(refs)):
+    if not _reference_dll_present(refs, COMPILE_REFS_RX):
         return (f"MW_BUILD_COMPILE_REFS={refs} carries NO {COMPILE_REFS_RX} — core's compile-check.py refuses such a set "
                 f"(exit 4): every MeshWeaver assembly binds Rx, and the portal's /app ships it")
     return None
@@ -2466,6 +2616,8 @@ class Host:
         self.sleep = sleep
         self.clock = clock
         self.stopping = False
+        # stale-set: claiming no work, but RUNNING (Memex#885) — only SIGTERM ends the host.
+        self.drained = False
         self.host = env.get("MW_BUILD_HOST") or socket.gethostname()
         self.channel = env.get("MW_BUILD_CHANNEL", "").strip()
         self.version = env.get("MW_BUILD_VERSION", "").strip()
@@ -2716,8 +2868,12 @@ class Host:
           * `stale-claim-id` — that id is SPENT (its reservation names a run no longer held under this
             host and id) and nothing was handed out: mint a FRESH id and claim again, ONCE — never a
             retry of the spent id, never a loop on it;
-          * `stale-set` — this host's platform set is no longer its channel's: DRAIN (stop claiming;
-            the run in hand, if any, finishes; the replacement replica runs the new set)."""
+          * `stale-set` — this host's platform set is no longer its channel's: DRAIN — claim no work, and
+            IDLE; never exit (Memex#885). The answer reads the LIVE record, and a record change can sit
+            unapplied (an approval lane) with NO replacement replica: a host that exited then was restarted
+            by its Deployment, drained again and exited again — CrashLoopBackOff and no build host at all.
+            The replacement replica, when there is one, ends this host with SIGTERM; until then it asks
+            again each idle period and resumes if the instance answers its set current."""
         for fresh in range(2):
             body = {"host": self.host, **self.scope, **self.set_identity, "platformVersion": self.platform_version,
                     "frameworkIdentity": self.identity, "pluginsDigest": self.plugins_digest,
@@ -2727,10 +2883,11 @@ class Host:
             status, answer = 0, None
             for attempt in range(4):
                 status, answer = self.api.call("POST", "/claim", body)
-                if status == 204:
-                    return None
-                if status == 200 and isinstance(answer, dict):
-                    return answer
+                if status == 204 or (status == 200 and isinstance(answer, dict)):
+                    if self.drained:
+                        self.log(f"the instance answers this host's set {self.platform_version} current again — claiming")
+                        self.drained = False
+                    return answer if status == 200 else None
                 if status != 0 and status < 500:
                     break
                 self.log(f"claim {body['claimId']} answered HTTP {status} — retrying with the SAME claimId")
@@ -2744,16 +2901,18 @@ class Host:
                 self.log("a fresh claim id was answered stale-claim-id too — not claiming again this cycle")
                 return None
             if error.startswith("stale-set"):
-                self.log(f"the instance answers stale-set: this host's set {self.platform_version} is no longer "
-                         f"{'version' if self.version else 'channel'} {self.lane}'s — DRAINING (no further claims)")
-                self.stopping = True
+                if not self.drained:
+                    self.log(f"the instance answers stale-set: this host's set {self.platform_version} is no longer "
+                             f"{'version' if self.version else 'channel'} {self.lane}'s — DRAINED: claiming no work and "
+                             f"idling until a replica of the new set replaces this one (SIGTERM); never exiting")
+                self.drained = True
                 return None
             self.log(f"claim answered HTTP {status} — retrying after a pause")
             return None
         return None
 
     def cycle(self) -> str:
-        """One loop turn: 'stopping', 'no-inputs', 'idle', 'ran' or 'lost'. Raises Fatal."""
+        """One loop turn: 'stopping', 'no-inputs', 'idle', 'drained', 'ran' or 'lost'. Raises Fatal."""
         if self.stopping:
             return "stopping"
         self.assert_clean()
@@ -2764,7 +2923,7 @@ class Host:
             return "stopping"
         claim = self.claim()
         if claim is None:
-            return "idle"
+            return "drained" if self.drained else "idle"
         return self.run(claim)
 
     # -- step 3/4: run ----------------------------------------------------------------------
@@ -3865,8 +4024,8 @@ class Host:
         idle = float(self.env.get("MW_BUILD_IDLE_SECONDS", "15") or 15)
         while not self.stopping:
             what = self.cycle()
-            if what in ("idle", "no-inputs"):
-                self.sleep(idle if what == "idle" else max(idle, 30))
+            if what in ("idle", "no-inputs", "drained"):
+                self.sleep(idle if what == "idle" else max(idle, 60 if what == "drained" else 30))
         self.log("stopping: no further claims (the run in hand, if any, has finished)")
         return 0
 
@@ -3879,6 +4038,27 @@ def abandoned(cancel: Optional[threading.Event], stage: str) -> None:
     """Raise Lost when the run was abandoned (`cancel` set: a sibling stage met the 409)."""
     if cancel is not None and cancel.is_set():
         raise Lost(f"stage {stage}: abandoned during the artifact hand-over — the run is not this host's claim any more")
+
+
+# A throwaway self-signed key and certificate (CN=localhost) for the self-test's local HTTPS server ONLY — it protects
+# nothing and is trusted by nothing; the test's client skips verification.
+_SELFTEST_TLS_PEM = """-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7OlL4C3Ub9FiEweL
+ynk1oc5efgNlmyblhh+7MjIoTTmhRANCAASHr3IYuC94xquFX+ix2VsuPH+rfhVU
+Aehp5XrBb4TXo2FBAumRcQ6ui5yR2qGJ29i9KA3Z88eS1MRShDYujZIM
+-----END PRIVATE KEY-----
+-----BEGIN CERTIFICATE-----
+MIIBfzCCASWgAwIBAgIUK0qzuB9UXvL4tWBQVet/dLTB/rkwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTAyOTA3MDI0N1oYDzIxMjYxMDA1
+MDcwMjQ3WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAASHr3IYuC94xquFX+ix2VsuPH+rfhVUAehp5XrBb4TXo2FBAumRcQ6u
+i5yR2qGJ29i9KA3Z88eS1MRShDYujZIMo1MwUTAdBgNVHQ4EFgQUCbhWWbd/1DPK
+s6XJ6XeB2DYiPAQwHwYDVR0jBBgwFoAUCbhWWbd/1DPKs6XJ6XeB2DYiPAQwDwYD
+VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiABRYhUwwZ3OfgdgUStxR1C
+KnKFMEemuUbbTwqk4CAxdQIhAOxOF6W3fGwFURNaCzgZxdXvmt3WwFb5EEhTLvT5
+QZUn
+-----END CERTIFICATE-----
+"""
 
 
 def _answer_text(answer: object) -> str:
@@ -6199,12 +6379,14 @@ def self_test() -> int:
             check("fanout/the store helper of an abandoned run is killed at once", time.monotonic() - t0 < 15, time.monotonic() - t0)
         check("fanout/the store helper still answers when not cancelled",
               _run_capture_stdout(["/bin/echo", "locator=x"], 60, threading.Event()) == (0, "locator=x\n"))
+        small = os.path.join(tmp, "abandoned-upload.bin")
+        with open(small, "wb") as fh:
+            fh.write(b"bytes")
         try:
-            CancellableReader(io.BytesIO(b"bytes"), gone).read(4)
-            check("fanout/an abandoned upload stops streaming", False, "read on")
+            Api("http://127.0.0.1:9/api/builds", "t").upload("/x", {}, small, 5, timeout=5, cancel=gone)
+            check("fanout/an abandoned upload stops streaming", False, "sent on")
         except Lost:
             pass
-        check("fanout/an upload streams while not cancelled", CancellableReader(io.BytesIO(b"bytes"), threading.Event()).read(4) == b"byte")
 
         # H9, the API store (`MW_BUILD_ARTIFACT_STORE=api:`): each artifact is PUT to the build API as the run's holder and
         # its receipt is the SERVER's answer; nothing touches ci-artifact-store.py.
@@ -6331,6 +6513,72 @@ def self_test() -> int:
         status, answer = Api("http://127.0.0.1:9/api/builds", "t").upload("/x", {}, blob, 1, timeout=5)
         check("h9-api/transport: an unreachable API is status 0, never a pass", status == 0, (status, answer))
 
+        # Deploy#64: the build API refuses an oversize artifact on its DECLARED length, BEFORE it reads the body, and
+        # closes. The host must report THAT answer (413 + reason), never a broken pipe it then retries as transport.
+        class _EarlyRefusal(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                payload = json.dumps({"error": "artifact-too-large: 41943040 bytes, the limit is 1024"}).encode()
+                self.send_response(413)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(payload)
+                self.wfile.flush()
+                self.close_connection = True          # the body is never read
+
+            def log_message(self, *a):
+                pass
+
+        big = os.path.join(tmp, "oversize.bin")
+        with open(big, "wb") as fh:
+            fh.write(b"\0" * (40 * 1024 * 1024))     # far past every socket buffer: the send MUST meet the close
+        early = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _EarlyRefusal)
+        threading.Thread(target=early.serve_forever, daemon=True).start()
+        try:
+            status, answer = Api(f"http://127.0.0.1:{early.server_address[1]}/api/builds", "t").upload(
+                "/x", {}, big, os.path.getsize(big), timeout=30)
+            check("h9-api/transport: an answer sent BEFORE the body was read (413) is reported, never a broken pipe",
+                  status == 413 and _answer_text(answer).startswith("artifact-too-large"), (status, answer))
+        finally:
+            early.shutdown()
+            early.server_close()
+
+        # Deploy#63: `timeout` bounds the WHOLE exchange. A server that answers a trickle — every byte well inside any
+        # per-operation timeout — must not keep the upload past its budget, and a late success is not accepted.
+        class _Trickle(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(n)
+                payload = json.dumps({"ok": True, "pad": "x" * 40}).encode()
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                try:
+                    for b_ in payload:
+                        self.wfile.write(bytes([b_]))
+                        self.wfile.flush()
+                        time.sleep(0.1)               # ~6 s in all, 0.1 s between bytes
+                except OSError:
+                    pass                              # the client gave up — what the budget is for
+
+            def log_message(self, *a):
+                pass
+
+        slow = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Trickle)
+        threading.Thread(target=slow.serve_forever, daemon=True).start()
+        try:
+            t0 = time.monotonic()
+            status, answer = Api(f"http://127.0.0.1:{slow.server_address[1]}/api/builds", "t").upload(
+                "/x", {}, blob, len(data), timeout=1.5)
+            spent = time.monotonic() - t0
+            check("h9-api/transport: a trickling answer ends at the ABSOLUTE budget as a transport failure, never a late success",
+                  status == 0 and "budget" in str(answer) and spent < 3.0, (status, answer, round(spent, 2)))
+        finally:
+            slow.shutdown()
+            slow.server_close()
+
         # a response closed before its Content-Length arrived (IncompleteRead) is status 0 on BOTH paths — a
         # transport failure the bounded retry handles — never an exception escaping before the verdict is posted
         class _Truncated(http.server.BaseHTTPRequestHandler):
@@ -6363,6 +6611,126 @@ def self_test() -> int:
         finally:
             cut.shutdown()
             cut.server_close()
+
+        # a REFUSAL closed before its Content-Length arrived keeps its status: a 413/401 fails at once and is never
+        # retried as a transport failure (the same rule `call` keeps on its HTTPError path)
+        class _TruncatedRefusal(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(413)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b'{"error":"artifact-too')
+                self.wfile.flush()
+                self.close_connection = True
+
+            def log_message(self, *a):
+                pass
+
+        cutr = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _TruncatedRefusal)
+        threading.Thread(target=cutr.serve_forever, daemon=True).start()
+        try:
+            status, answer = Api(f"http://127.0.0.1:{cutr.server_address[1]}/api/builds", "t").upload(
+                "/x", {}, blob, 1, timeout=10)
+            check("h9-api/transport: a truncated REFUSAL keeps its status (413), never status 0 retried as transport",
+                  status == 413, (status, answer))
+        finally:
+            cutr.shutdown()
+            cutr.server_close()
+
+        # an IPv6 literal with no explicit port keeps its address (http.client would read `::1` as host `:` port 1)
+        check("h9-api/transport: an IPv6 API with no port connects to that address on the scheme's port",
+              upload_endpoint(urllib.parse.urlsplit("https://[::1]/api/builds")) == ("::1", 443)
+              and upload_endpoint(urllib.parse.urlsplit("http://[fd00::5]/api/builds")) == ("fd00::5", 80)
+              and upload_endpoint(urllib.parse.urlsplit("http://api:8080/x")) == ("api", 8080))
+
+        # a complete REFUSAL whose body is not UTF-8 keeps its status, never status 0 retried as transport
+        class _BinaryRefusal(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                payload = b"\xff\xfe\x00refused"
+                self.send_response(413)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        binr = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _BinaryRefusal)
+        threading.Thread(target=binr.serve_forever, daemon=True).start()
+        try:
+            status, answer = Api(f"http://127.0.0.1:{binr.server_address[1]}/api/builds", "t").upload(
+                "/x", {}, blob, 1, timeout=10)
+            check("h9-api/transport: a refusal with a non-UTF-8 body keeps its status (413)", status == 413, (status, answer))
+        finally:
+            binr.shutdown()
+            binr.server_close()
+
+        # HTTPS: a TLS 1.3 server sends its session tickets right after the handshake, which makes the socket READABLE
+        # before any HTTP answer exists. The upload must keep sending through that, not stop the body and wait for an
+        # answer the server will only send once the body arrived — and an early refusal over TLS is still read.
+        tls_dir = tempfile.mkdtemp(prefix="build-run-tls-", dir=tmp)
+        with open(os.path.join(tls_dir, "test.pem"), "w") as fh:
+            fh.write(_SELFTEST_TLS_PEM)
+        srv_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        srv_ctx.load_cert_chain(os.path.join(tls_dir, "test.pem"))
+
+        class _TlsServer(http.server.ThreadingHTTPServer):
+            def get_request(self):
+                c, a = super().get_request()
+                return srv_ctx.wrap_socket(c, server_side=True), a
+
+        tls_got: dict = {}
+
+        class _TlsUpload(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                if self.path.startswith("/api/builds/refuse"):
+                    payload = json.dumps({"error": "artifact-too-large: over TLS"}).encode()
+                    self.send_response(413)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+                    self.close_connection = True      # the body is never read
+                    return
+                n = int(self.headers.get("Content-Length", "0"))
+                tls_got["body"] = self.rfile.read(n)
+                payload = json.dumps({"ok": True}).encode()
+                self.send_response(201)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        def _trusting(*a, **k):
+            c = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            c.check_hostname = False
+            c.verify_mode = ssl.CERT_NONE
+            return c
+
+        tls = _TlsServer(("127.0.0.1", 0), _TlsUpload)
+        threading.Thread(target=tls.serve_forever, daemon=True).start()
+        default_https = ssl._create_default_https_context
+        ssl._create_default_https_context = _trusting
+        try:
+            tls_api = Api(f"https://127.0.0.1:{tls.server_address[1]}/api/builds", "t")
+            t0 = time.monotonic()
+            status, answer = tls_api.upload("/ok", {}, blob, len(data), timeout=10)
+            check("h9-api/transport: an HTTPS upload sends its whole body through the TLS session tickets and reads the answer",
+                  status == 201 and answer == {"ok": True} and tls_got.get("body") == data and time.monotonic() - t0 < 5,
+                  (status, answer, len(tls_got.get("body") or b""), round(time.monotonic() - t0, 2)))
+            status, answer = tls_api.upload("/refuse", {}, big, os.path.getsize(big), timeout=30)
+            check("h9-api/transport: an HTTPS answer sent BEFORE the body was read (413) is reported",
+                  status == 413 and _answer_text(answer).startswith("artifact-too-large"), (status, answer))
+        finally:
+            ssl._create_default_https_context = default_https
+            tls.shutdown()
+            tls.server_close()
 
         # the workspace stays until every receipt was acknowledged
         hk = host(_FakeApi({("POST", "/token"): [(404, None)], ("POST", "/MeshWeaver.Plugins/"): [(503, None)]}),
@@ -6605,8 +6973,30 @@ def self_test() -> int:
         check("claim/stale-claim-id twice → once more only, never a loop", hsc2.claim() is None and len(sid) == 2 and not hsc2.stopping, sid)
         sid.clear()
         hss = host(_FakeApi({("POST", "/claim"): lambda p_, b: (sid.append(b["claimId"]), (409, {"error": "stale-set"}))[1]}))
-        check("claim/stale-set → drain, no new claim", hss.claim() is None and len(sid) == 1 and hss.stopping, sid)
-        check("claim/a draining host claims nothing more", hss.cycle() == "stopping" and len(sid) == 1, sid)
+        check("claim/stale-set → drained, no work claimed", hss.claim() is None and len(sid) == 1 and hss.drained, sid)
+        # Memex#885: the answer reads the LIVE record, which can change long before a replacement replica exists.
+        # A drained host that EXITS is restarted by its Deployment and drains again — CrashLoopBackOff, no host.
+        check("claim/stale-set NEVER stops the host (no exit, no CrashLoopBackOff on an unapplied record)",
+              not hss.stopping, hss.stopping)
+        sid.clear()
+        back = [(409, {"error": "stale-set"}), (204, None)]
+        hsb = host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})] * 3,
+                             ("POST", "/claim"): lambda p_, b: (sid.append(b["claimId"]), back.pop(0))[1]}))
+        first, second = hsb.cycle(), hsb.cycle()
+        check("claim/a drained host keeps running and asks again; its set current again → it claims again",
+              first == "drained" and second == "idle" and not hsb.drained and not hsb.stopping and len(sid) == 2,
+              (first, second, sid))
+        slept: list[float] = []
+        hsl = host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})] * 3,
+                             ("POST", "/claim"): [(409, {"error": "stale-set"})] * 3}))
+
+        def stop_after_two(_s):
+            slept.append(_s)
+            if len(slept) >= 2:
+                hsl.stopping = True        # what the SIGTERM handler does
+        hsl.sleep = stop_after_two
+        check("claim/a drained host's loop idles until SIGTERM, then exits 0",
+              hsl.loop() == 0 and len(slept) == 2 and all(x >= 60 for x in slept), slept)
         # the plugins layer is in the cache key in EITHER mode
         hk1 = host(_FakeApi({}))
         hk1.plugins_digest, hk1.plugins_key = "sha256:" + "a" * 64, None
@@ -6683,6 +7073,28 @@ def self_test() -> int:
             open(os.path.join(fx, "System.Private.CoreLib.dll"), "wb").close()
             check("compile refs/NEGATIVE CONTROL: a set without System.Reactive.dll is refused (core's checker refuses it too)",
                   "System.Reactive.dll" in (compile_refs_refusal(cr) or ""), compile_refs_refusal(cr))
+            # Deploy#58: core's compile-check excludes sdk-generators/ and analyzers/ BEFORE it looks for Rx, so an Rx
+            # that lives only there is refused there (exit 4) — the preflight must refuse it too, never pass it on.
+            for tooling in sorted(COMPILE_REFS_TOOLING_DIRS):
+                os.makedirs(os.path.join(cr, tooling, "dotnet", "cs"), exist_ok=True)
+                open(os.path.join(cr, tooling, "dotnet", "cs", "System.Reactive.dll"), "wb").close()
+                check(f"compile refs/an Rx only under {tooling}/ is refused, as core's compile-check refuses it",
+                      "System.Reactive.dll" in (compile_refs_refusal(cr) or ""), compile_refs_refusal(cr))
+                shutil.rmtree(os.path.join(cr, tooling))
+            os.makedirs(os.path.join(fx, "analyzers"))
+            os.rename(os.path.join(fx, "System.Private.CoreLib.dll"), os.path.join(fx, "analyzers", "System.Private.CoreLib.dll"))
+            open(os.path.join(cr, "System.Reactive.dll"), "wb").close()
+            check("compile refs/a CoreLib only under analyzers/ is refused",
+                  "NO shared frameworks" in (compile_refs_refusal(cr) or ""), compile_refs_refusal(cr))
+            os.rename(os.path.join(fx, "analyzers", "System.Private.CoreLib.dll"), os.path.join(fx, "System.Private.CoreLib.dll"))
+            os.rmdir(os.path.join(fx, "analyzers"))
+            os.remove(os.path.join(cr, "System.Reactive.dll"))
+            # Deploy#58: a set bound read-only over the stages' writable scratch would hide it after the host started.
+            for over in (f"{SCRATCH}/tmp", f"{SCRATCH}/home/refs", f"{SCRATCH}/nuget", SCRATCH):
+                check(f"compile refs/a set at {over} (over the writable scratch) is refused before the host starts",
+                      "writable" in (compile_refs_refusal(over) or ""), compile_refs_refusal(over))
+            check("compile refs/a set beside the scratch dirs is not an overlap",
+                  "writable" not in (compile_refs_refusal(f"{SCRATCH}/refs-x") or ""), compile_refs_refusal(f"{SCRATCH}/refs-x"))
             open(os.path.join(cr, "System.Reactive.dll"), "wb").close()
             host(_FakeApi({}), env=dict(env_v, MW_BUILD_COMPILE_REFS=cr)).preflight()
             check("compile refs/the configured directory is bound read-only into every stage's sandbox",
