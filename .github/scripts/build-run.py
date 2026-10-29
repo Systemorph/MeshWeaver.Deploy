@@ -31,8 +31,9 @@ THE LOOP, and the order that matters:
      claimable → sleep. 409 `stale-set` = this host's set is no longer its lane's → DRAINED: it
      claims nothing and idles, asking again each minute, until SIGTERM (a replica of the new set
      replaces it) or the instance answers its set current again; it never exits on its own, so a
-     record change that is not applied yet cannot crash-loop the host (Memex#885). 200 = a run: `{path, repo, sha, refs, isTrunk, publish, stages}` — `path`
-     is authoritative (a non-latest run's node id is `<sha>-<channel>`). The host then posts the
+     record change that is not applied yet cannot crash-loop the host (Memex#885). 200 = a run: `{path, repo, sha, refs, isTrunk, publish, stages, labels}` — `path`
+     is authoritative; `labels` (the pull request's live labels, which a host has no credential to read) reach every stage
+     as `MW_BUILD_LABELS` (comma-separated; left UNSET when the claim carries none, so the stage says it was not told) (a non-latest run's node id is `<sha>-<channel>`). The host then posts the
      PLAN (`{"kind":"plan","stages":[…]}`, host-emitted only) and keeps the claim's lease with a
      batch at least every 45 s (an empty batch is the heartbeat); every stage route's batches are
      numbered (`seq`) and a retried batch keeps its number. No claim survives a host restart.
@@ -1694,6 +1695,22 @@ RUN_MARGIN_SECONDS = 600
 PREPARED_KEY_SECONDS = 300
 
 
+def claim_labels(claim: dict) -> Optional[str]:
+    """The claim's `labels` (the pull request's live labels, carried from the admission by the operations instance) as
+    the comma-separated `MW_BUILD_LABELS` a stage's selectors pass to `ci-change-set.py --labels`; None when the claim
+    carries none or a malformed list — the variable is then left UNSET, so the stage says it was not told rather than
+    classifying an unknown set as known-none. An empty list is "" (known to be none)."""
+    raw = claim.get("labels")
+    if not isinstance(raw, list) or len(raw) > 100:
+        return None
+    names = []
+    for n in raw:
+        if not isinstance(n, str) or not n.strip() or len(n) > 50 or "," in n or any(ord(c) < 32 for c in n):
+            return None
+        names.append(n.strip())
+    return ",".join(sorted(set(names)))
+
+
 def run_budget_seconds(stages: list[dict], deadline: float, prepared: Sequence[dict] = (), trunk: bool = True,
                        warm_minutes: float = 0.0, slots: int = 1) -> int:
     """The run's effective budget: the selected stages' summed caps + each declared prepared input's build cap
@@ -3308,6 +3325,11 @@ class Host:
                 "MW_PLUGINS_KEY": self.effective_plugins_key(),
                 **self.platform_env(),
             }
+            # The pull request's LIVE labels, as the admission's change set read them and the claim carries them: a
+            # host holds no credential to read them, so a stage classifies with these or with none (said by the stage).
+            labels = claim_labels(claim)
+            if labels is not None:
+                extra["MW_BUILD_LABELS"] = labels
             # A stage is skipped only when a stage it runs AFTER failed (`after`); its independent siblings still
             # run. `failed` holds every red stage — ran red or was skipped — so a skip propagates to the skipped
             # stage's own dependants. `why` is a RUN-WIDE stop (a prepared input, the run deadline) that ends every
@@ -4471,6 +4493,13 @@ def self_test() -> int:
         if not cond:
             failures.append(f"{name}: {detail}")
 
+    # ── 0. the claim's labels → MW_BUILD_LABELS (None = unset: the stage says it was not told) ─────────
+    check("labels/sorted, de-duplicated, trimmed", claim_labels({"labels": ["tests-before-review", " full-run", "full-run"]}) == "full-run,tests-before-review")
+    check("labels/an empty list is known-none ('')", claim_labels({"labels": []}) == "")
+    for bad in ({}, {"labels": None}, {"labels": "full-run"}, {"labels": [1]}, {"labels": ["a,b"]}, {"labels": [""]},
+                {"labels": ["x" * 51]}, {"labels": ["a\nb"]}, {"labels": [f"l{i}" for i in range(101)]}):
+        check(f"labels/{str(bad)[:30]} is unknown (None), never a partial set", claim_labels(bad) is None, claim_labels(bad))
+
     # ── 1. compiler diagnostics ─────────────────────────────────────────────────────────────
     p = OutputParser("/work/run1/src", "compile-check")
     ev = p.feed("/work/run1/src/Hosting/Build/Source/BuildApi.cs(41,13): error CS0246: The type or "
@@ -5395,6 +5424,18 @@ def self_test() -> int:
         check("run/a fresh process per stage", len(rows) == 2 and rows[0][0] != rows[1][0], rows)
         check("run/publish from the claim", all(r[1] == "true" for r in rows), rows)
         check("run/no credential reaches a stage", all(r[2:] == ["none", "none", "none"] for r in rows), rows)
+        # the claim's labels reach every stage as MW_BUILD_LABELS; a claim without them leaves it UNSET (not told)
+        posted_h6 = list(posted)
+        for lbl, want in ((["full-run", "tests-before-review"], "full-run,tests-before-review"), ([], ""), (None, "unset")):
+            seen_l = os.path.join(tmp, "seen-labels")
+            if os.path.exists(seen_l):
+                os.remove(seen_l)
+            hl = host(api_ev(), env=env_s, checkout=checkout_with({"stages": [
+                {"name": "a", "kind": "test", "command": f"echo \"[${{MW_BUILD_LABELS-unset}}]\" >> {seen_l}"}]}))
+            hl.run(dict(claim) if lbl is None else dict(claim, labels=lbl))
+            got = open(seen_l).read().strip() if os.path.exists(seen_l) else "<stage did not run>"
+            check(f"run/claim labels {lbl!r} reach the stage as MW_BUILD_LABELS={want!r}", got == f"[{want}]", got)
+        posted[:] = posted_h6   # the checks below read h6's own events
         rf_ = [e for _, evs in posted for e in evs if e["kind"] == "run-finished"]
         check("run/green run-finished", rf_ == [{"kind": "run-finished", "succeeded": True, "error": None}], rf_)
         check("run/a PR run's outputs never enter the shared cache",
