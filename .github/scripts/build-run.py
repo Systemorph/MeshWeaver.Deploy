@@ -90,7 +90,10 @@ THE LOOP, and the order that matters:
     a run's content: before a run's stages, the host reads the tip's declared
     `"restore": {"command": …, "timeoutMinutes": N}` from its mirror (`git show <tip>:…`), keys it
     (the tip's NuGet-relevant files by blob id + the command + the platform) and, once per key, runs
-    the TIP's command on a host-made checkout of the tip into a fresh folder, verifies every package
+    the TIP's command on a host-made checkout of the tip into a fresh folder — handed the installed
+    platform as a stage is (the reference set, the set's identity) and its OWN writable copy of the
+    platform source as MW_PLATFORM_SOURCE, as a prepared input's build is, because a repository whose
+    projects reference the platform cannot restore them from a bare checkout — verifies every package
     and promotes it (a failure is said, MWPREP003, and never reds the run). A NuGet package a stage
     still had to restore (the warm cache lacked it) is SAID as a warning (MWPREP001); on a trunk
     build it is verified (the .nupkg's SHA-512 against what NuGet recorded) and promoted too. A pull
@@ -604,7 +607,9 @@ def load_prepared(path: str) -> list[dict]:
 #   "restore": {"command": "dotnet restore MeshWeaver.slnx -p:CIRun=true", "timeoutMinutes": 20}
 # declared beside the stages and read ONLY from the tip (`git show <tip>:.github/build-stages.json` on the host's
 # mirror) — a run's own declaration is never executed, so neither its command nor a package source its tree adds ever
-# writes the shared cache. The restore runs in the sandbox on a host-made checkout of the tip, writes into a fresh
+# writes the shared cache. The restore runs in the sandbox on a host-made checkout of the tip — handed what a stage is
+# handed of the installed platform (the reference set, the set's identity) and its own WRITABLE copy of the platform
+# source as MW_PLATFORM_SOURCE, exactly as a prepared input's build is — writes into a fresh
 # host-owned folder, and every package it fetched is verified and rebuilt into the cache by `promote_nuget`. The key is
 # the host's own: every NuGet-relevant file of the tip (`NUGET_KEY_FILE`, by blob id) + the command + the platform, so
 # a second run on the same tip finds the marker and restores nothing.
@@ -2054,6 +2059,16 @@ def prepared_env(root: str = PREPARED_ROOT, tester: str = TESTER_APP) -> dict:
     return env
 
 
+def writable_platform_source(platform_src: str, dest: str) -> str:
+    """A WRITABLE copy of the host's platform source (MW_PLATFORM_SOURCE, read-only in the image) at `dest`, for a
+    repository-declared command that builds or restores projects referencing the platform: MSBuild writes their obj/
+    (project.assets.json, the restore graph) and bin/ into that tree, and the image's copy is read-only. Replaces
+    whatever `dest` held; the caller binds it writable and removes it afterwards. Raises OSError (shutil.Error is one)."""
+    shutil.rmtree(dest, ignore_errors=True)
+    shutil.copytree(platform_src, dest, symlinks=True)
+    return dest
+
+
 def sandbox_readonly_roots(env: dict) -> list[str]:
     """The host-side roots every stage's sandbox binds READ-ONLY: the tester, the portal's /app, the compile
     reference set (wherever MW_BUILD_COMPILE_REFS points — a path handed to a stage must be visible in it),
@@ -3054,19 +3069,11 @@ class Host:
                 "MW_BUILD_PUBLISH": "true" if publish else "false",
                 "MW_BUILD_CHANNEL": self.channel, "MW_BUILD_VERSION": self.version, "MW_BUILD_REPO": repo, "MW_BUILD_SHA": sha,
                 "MW_BUILD_RUN_PATH": path, "MW_BUILD_IS_TRUNK": "true" if trunk else "false",
-                "MW_BUILD_PLATFORM_VERSION": self.platform_version,
-                "MW_BUILD_FRAMEWORK_IDENTITY": self.identity,
                 "MW_PLUGINS_DIR": self.plugins_dir or "", "MW_PLUGINS_DIGEST": self.plugins_digest or "",
                 "MW_BUILD_CACHE_OUTPUTS": outputs_root(self.cache, repo), "MW_BUILD_ARTIFACTS": artifacts_dir,
                 "MW_BUILD_OUTPUTS": outputs_dir,
-                # What a stage needs to compute the cross-run cache keys the host will recompute.
-                "MW_BUILD_TESTER_DIGEST": self.env.get("MW_BUILD_TESTER_DIGEST", ""),
-                "MW_BUILD_PORTAL_DIGEST": self.env.get("MW_BUILD_PORTAL_DIGEST", ""),
-                "MW_BUILD_PLATFORM_REF": self.env.get("MW_BUILD_PLATFORM_REF", ""),
                 "MW_PLUGINS_KEY": self.effective_plugins_key(),
-                "MW_BUILD_REFSET_KEY": self.env.get("MW_BUILD_REFSET_KEY", ""),
-                **platform_scripts_env(os.path.dirname(os.path.abspath(__file__))),
-                **self.run_env,
+                **self.platform_env(),
             }
             # A stage is skipped only when a stage it runs AFTER failed (`after`); its independent siblings still
             # run. `failed` holds every red stage — ran red or was skipped — so a skip propagates to the skipped
@@ -3431,9 +3438,31 @@ class Host:
                                              "— nothing restored for the server"}
         return {"state": "warm", "tip": tip, "key": key, "marker": marker, **decl}
 
+    def platform_env(self) -> dict:
+        """The INSTALLED platform's facts a repository-declared command on this host is handed: the set's identity (what
+        a stage needs to compute the cross-run cache keys the host will recompute), the platform's canonical checkers and
+        the prepared host's facts (`prepared_env`: core's source at the set's commit, the chart, the tester /app, the
+        PostgreSQL snapshot). Every stage gets them, and so does the default branch's warm restore (`warm_nuget`) — a
+        repository whose projects reference the platform cannot restore without them. The reference set itself
+        (MeshWeaverRefs, MW_BUILD_COMPILE_REFS) reaches both through the allow-list (ENV_ALLOW) and the sandbox's
+        read-only roots (sandbox_readonly_roots)."""
+        return {
+            "MW_BUILD_PLATFORM_VERSION": self.platform_version,
+            "MW_BUILD_FRAMEWORK_IDENTITY": self.identity,
+            "MW_BUILD_TESTER_DIGEST": self.env.get("MW_BUILD_TESTER_DIGEST", ""),
+            "MW_BUILD_PORTAL_DIGEST": self.env.get("MW_BUILD_PORTAL_DIGEST", ""),
+            "MW_BUILD_PLATFORM_REF": self.env.get("MW_BUILD_PLATFORM_REF", ""),
+            "MW_BUILD_REFSET_KEY": self.env.get("MW_BUILD_REFSET_KEY", ""),
+            **platform_scripts_env(os.path.dirname(os.path.abspath(__file__))),
+            **self.run_env,
+        }
+
     def warm_nuget(self, repo: str, workdir: str, plan: dict, sink: "EventSink", run_end: float) -> None:
         """Fill `<cache>/nuget` from the DEFAULT BRANCH's tip per `plan` (`nuget_warm_plan`): the tip's OWN restore
-        command, on a host-made checkout of the tip, writing into a fresh host-owned folder; every package it fetched is
+        command, on a host-made checkout of the tip, handed the installed platform as a stage is (`platform_env`, the
+        reference set) and its OWN writable copy of the platform source (`writable_platform_source`, as a prepared
+        input's build gets one — MeshWeaver.Plugins' projects reference the platform, so a bare checkout cannot restore
+        them), writing into a fresh host-owned folder; every package it fetched is
         verified and rebuilt into the cache (`promote_nuget`), and the key is marked once it restored cleanly. A failure
         is SAID (MWPREP003) and never reds the run — its stages still restore what they lack, per run."""
         if plan.get("state") != "warm":
@@ -3460,17 +3489,27 @@ class Host:
             return
         # A FRESH folder, written only by this restore: nothing a stage or a per-run prepared build restored can reach it.
         fetched = os.path.join(workdir, "warm-nuget")
+        # The restore gets what a stage gets of the installed platform (`platform_env`), and — like a prepared input's
+        # build — its OWN writable copy of the platform source: a repository whose projects reference the platform
+        # (MeshWeaver.Plugins: -p:MeshWeaverRoot="$MW_PLATFORM_SOURCE/") restores those projects too, and restore writes
+        # their obj/ into that tree. A host whose image carries no platform source hands none (said by the restore).
+        platform_src = self.env.get("MW_PLATFORM_SOURCE", "")
+        psrc = os.path.join(workdir, "warm-platform")
         try:
             shutil.rmtree(fetched, ignore_errors=True)
             os.makedirs(fetched)
             out = os.path.join(workdir, "warm-out")
             os.makedirs(out, exist_ok=True)
             started = self.clock()
-            rc, text = self._sandboxed_capture(plan["command"], tree, out, workdir,
-                                               {"MW_BUILD_PLATFORM_VERSION": self.platform_version, "MW_BUILD_REPO": repo,
-                                                "NUGET_PACKAGES": fetched},
+            extra = {**self.platform_env(), "MW_BUILD_REPO": repo, "NUGET_PACKAGES": fetched}
+            extra.pop("MW_PLATFORM_SOURCE", None)
+            writable = [fetched]
+            if platform_src and os.path.isdir(platform_src):
+                extra["MW_PLATFORM_SOURCE"] = writable_platform_source(platform_src, psrc)
+                writable.append(psrc)
+            rc, text = self._sandboxed_capture(plan["command"], tree, out, workdir, extra,
                                                [os.path.join(self.cache, "git", f"{repo}.git"), os.path.join(self.cache, "nuget")],
-                                               [fetched], min(left, plan["timeoutMinutes"] * 60))
+                                               writable, min(left, plan["timeoutMinutes"] * 60))
             # Every package fetched came from the TIP's own sources by the TIP's own command, so even a failed restore's
             # complete packages may be promoted; each is verified against what NuGet recorded and rebuilt from its archive.
             np_, nk, nr = promote_nuget(fetched, self.cache, self.log)
@@ -3479,6 +3518,7 @@ class Host:
             return
         finally:
             shutil.rmtree(fetched, ignore_errors=True)
+            shutil.rmtree(psrc, ignore_errors=True)
         secs = int(self.clock() - started)
         if rc != 0 or nr:
             warn(f"the warm NuGet cache was not filled from the default branch's tip {tip[:12]} (restore exit {rc}"
@@ -3609,9 +3649,7 @@ class Host:
             # The build gets its OWN writable copy of the platform source: a `dotnet publish` that references
             # platform projects writes their obj/ and bin/ into that tree, and the image's copy is read-only.
             # A miss is rare (once per platform and key), so the copy is paid once per prepared build.
-            psrc = os.path.join(workdir, "prepared-platform", label, name)
-            shutil.rmtree(psrc, ignore_errors=True)
-            shutil.copytree(platform_src, psrc, symlinks=True)
+            psrc = writable_platform_source(platform_src, os.path.join(workdir, "prepared-platform", label, name))
             left = run_end - self.clock()
             if left <= 0:
                 raise Refusal(f"{name}: the run deadline passed before it was built")
@@ -5472,6 +5510,46 @@ def self_test() -> int:
         check("warm/the declaration and the key are read from the MIRROR at the tip, never from the run's tree",
               any("show" in a_ and a_[-1] == "d" * 40 + ":.github/build-stages.json" for a_ in wlog)
               and any("ls-tree" in a_ and a_[-1] == "d" * 40 for a_ in wlog), wlog)
+        # A repository whose projects REFERENCE THE PLATFORM (MeshWeaver.Plugins: -p:MeshWeaverRoot="$MW_PLATFORM_SOURCE/"
+        # -p:MeshWeaverRefs="$MeshWeaverRefs") restores only with the platform's source and the reference set — and restore
+        # writes obj/ into the platform's projects, so the source must be a WRITABLE copy, never the image's read-only tree.
+        wp_src = os.path.join(tmp, "warm-platform-src")
+        wp_refs = os.path.join(tmp, "warm-platform-refs")
+        wp_crefs = os.path.join(tmp, "warm-platform-crefs")
+        for d_ in (wp_src, wp_refs, wp_crefs):
+            os.makedirs(d_, exist_ok=True)
+        open(os.path.join(wp_src, "Directory.Build.props"), "w").write("<Project/>")
+        wp_seen = os.path.join(tmp, "warm-platform-seen")
+        plugins_like = {"stages": pr_doc["stages"], "restore": {"timeoutMinutes": 10, "command": (
+            f"set -e; printf '%s\\n' \"${{MW_PLATFORM_SOURCE:-}}\" \"${{MeshWeaverRefs:-}}\" \"${{MW_BUILD_COMPILE_REFS:-}}\" "
+            f"\"${{MW_BUILD_TESTER_DIGEST:-}}\" > {wp_seen}; "
+            "test -f \"$MW_PLATFORM_SOURCE/Directory.Build.props\"; test -d \"$MeshWeaverRefs\"; test -d \"$MW_BUILD_COMPILE_REFS\"; "
+            "mkdir -p \"$MW_PLATFORM_SOURCE/src/obj\"; echo assets > \"$MW_PLATFORM_SOURCE/src/obj/project.assets.json\"; "
+            + pkg_good)}}
+        wp_env = dict(wenv, MW_PLATFORM_SOURCE=wp_src, MeshWeaverRefs=wp_refs, MW_BUILD_COMPILE_REFS=wp_crefs)
+        wp_cache = os.path.join(tmp, "warm-platform-cache")
+        posted.clear()
+        host(api_ev(), env=dict(wp_env, MW_BUILD_CACHE=wp_cache), git_runner=tip_git(plugins_like),
+             checkout=checkout_with(pr_doc)).run(claim)
+        seen_wp = open(wp_seen).read().split("\n") if os.path.exists(wp_seen) else []
+        check("warm/a restore whose projects reference the platform gets the platform source and the reference set: it "
+              "restores, its packages are promoted and the key is marked",
+              not codes("MWPREP003") and nuget_packages(os.path.join(wp_cache, "nuget")) == {"demo.pkg/1.0.0"}
+              and marks(wp_cache) == 1 and seen_wp[1:4] == [wp_refs, wp_crefs, keyed_env["MW_BUILD_TESTER_DIGEST"]],
+              (codes("MWPREP003"), seen_wp))
+        check("warm/... the platform source it gets is a WRITABLE COPY: restore's obj/ never lands in the image's tree, "
+              "and the copy is gone afterwards",
+              bool(seen_wp) and seen_wp[0] not in ("", wp_src) and not os.path.exists(os.path.join(wp_src, "src"))
+              and not os.path.exists(seen_wp[0]), seen_wp)
+        # NEGATIVE CONTROL: the same restore on a host whose image carries no platform source cannot restore — so the
+        # case above has a subject — and that is SAID (MWPREP003), marks nothing, and never reds the run.
+        posted.clear()
+        no_src_cache = os.path.join(tmp, "warm-platform-none")
+        host(api_ev(), env=dict({k: v for k, v in wp_env.items() if k != "MW_PLATFORM_SOURCE"}, MW_BUILD_CACHE=no_src_cache),
+             git_runner=tip_git(plugins_like), checkout=checkout_with(pr_doc)).run(claim)
+        check("warm/negative control: without the platform source the same restore fails, said (MWPREP003), nothing marked",
+              len(codes("MWPREP003")) == 1 and marks(no_src_cache) == 0
+              and run_verdict() == [{"kind": "run-finished", "succeeded": True, "error": None}], (codes("MWPREP003"), run_verdict()))
 
         # ── 7c. PREPARED INPUTS: built from the repository's own sources ONCE per (platform, key), installed persistently ──
         for bad_ in ({"prepared": {}}, {"prepared": [{"name": "shelf", "env": "MW_SECRET", "key": "k", "build": "b"}]},
