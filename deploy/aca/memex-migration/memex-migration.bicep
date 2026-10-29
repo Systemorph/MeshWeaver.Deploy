@@ -26,6 +26,18 @@ resource memex_migration 'Microsoft.App/containerApps@2025-07-01' = {
           name: 'memex-uri'
           value: 'postgresql://postgres:${uriComponent(memex_postgres_password_value)}@memex-postgres:5432/memex'
         }
+        {
+          name: 'connectionstrings--orleans'
+          value: 'Host=memex-postgres;Port=5432;Username=postgres;Password=${memex_postgres_password_value};Database=orleans'
+        }
+        {
+          name: 'orleans-password'
+          value: memex_postgres_password_value
+        }
+        {
+          name: 'orleans-uri'
+          value: 'postgresql://postgres:${uriComponent(memex_postgres_password_value)}@memex-postgres:5432/orleans'
+        }
       ]
       activeRevisionsMode: 'Single'
     }
@@ -33,7 +45,7 @@ resource memex_migration 'Microsoft.App/containerApps@2025-07-01' = {
     template: {
       containers: [
         {
-          image: 'ghcr.io/systemorph/memex-migration:latest'
+          image: 'cr.meshweaver.cloud/memex-migration:latest'
           name: 'memex-migration'
           env: [
             {
@@ -67,6 +79,38 @@ resource memex_migration 'Microsoft.App/containerApps@2025-07-01' = {
             {
               name: 'MEMEX_DATABASENAME'
               value: 'memex'
+            }
+            {
+              name: 'ConnectionStrings__orleans'
+              secretRef: 'connectionstrings--orleans'
+            }
+            {
+              name: 'ORLEANS_HOST'
+              value: 'memex-postgres'
+            }
+            {
+              name: 'ORLEANS_PORT'
+              value: '5432'
+            }
+            {
+              name: 'ORLEANS_USERNAME'
+              value: 'postgres'
+            }
+            {
+              name: 'ORLEANS_PASSWORD'
+              secretRef: 'orleans-password'
+            }
+            {
+              name: 'ORLEANS_URI'
+              secretRef: 'orleans-uri'
+            }
+            {
+              name: 'ORLEANS_JDBCCONNECTIONSTRING'
+              value: 'jdbc:postgresql://memex-postgres:5432/orleans'
+            }
+            {
+              name: 'ORLEANS_DATABASENAME'
+              value: 'orleans'
             }
           ]
         }

@@ -16,7 +16,7 @@ their own subscription; they own the infra + data; we ship updates as new offer 
 # 1. Aspire emits the ACA bicep from the dedicated image-based AppHost's `azure` mode:
 # Run from THIS repository's root, so both output paths land here; the AppHost moved from
 # deploy/aspire to MeshWeaver.Plugins, so --apphost points at a sibling Plugins checkout:
-aspire publish --apphost ../MeshWeaver.Plugins/src/Memex.Deploy.AppHost/Memex.Deploy.AppHost.csproj \
+aspire publish --non-interactive --apphost ../MeshWeaver.Plugins/src/Memex.Deploy.AppHost/Memex.Deploy.AppHost.csproj \
     -o deploy/aca -- --mode azure
 # 2. Convert bicep -> ARM JSON:
 az bicep build --file deploy/aca/main.bicep --outfile deploy/marketplace/mainTemplate.json
@@ -37,21 +37,23 @@ template**. Four gaps, each tracked:
    re-scope the nested deployments) or publish as a **Managed Application** (which accepts a
    subscription-scoped appliance). The latter also lets us retain ops access if desired.
 
-2. **Parameterize customer inputs.** The generated ARM bakes the app config (image tag, the
-   `Ai:KeyProtection:MasterKey`, model-provider key, `Features:*`, self-onboarding) as **literals**
-   inside the module resources, so `createUiDefinition` has nothing to bind to yet. Surface them as
-   Aspire **`AddParameter(...)`** in `Memex.Deploy.AppHost` (Aspire renders parameters as ARM
-   `parameters`, secrets as `secureString`); then wire `createUiDefinition.json` `outputs` →
-   those params. The wizard here already collects the intended inputs.
+2. **Parameterize customer inputs.** The two secrets are now template parameters
+   (`memex_postgres_password_value`, `key_protection_master_key_value`, both `secureString`), and
+   `main.bicep` deploys the database, the migration and the portal itself (MeshWeaver.Plugins#4457).
+   The remaining app config (image tag, model-provider key, `Features:*`, self-onboarding) is still
+   baked in as literals, and `createUiDefinition.json`'s `outputs` do not yet name the template's
+   parameters. Surface the rest as Aspire **`AddParameter(...)`** in `Memex.Deploy.AppHost`, then
+   wire `createUiDefinition.json` `outputs` to those params. The wizard here already collects the
+   intended inputs.
 
 3. **Managed Postgres.** The image-based `AddMemex` runs a **pgvector container** (great for
    Compose/Helm self-host). For a production Azure offer, switch the Azure target to **Azure
    Database for PostgreSQL Flexible Server** (the `Backend=Azure` branch of `AddMemex` — the
    Azure-unification work) so the customer's data lives on managed, backed-up infra.
 
-4. **Public images.** `mainTemplate.json` references `ghcr.io/systemorph/memex-portal-ai` +
-   `memex-migration`. These must be **publicly pullable** by arbitrary customer subscriptions —
-   built + pushed by the GHCR CI workflow.
+4. **Public images.** `mainTemplate.json` references the generator's default registry,
+   `cr.meshweaver.cloud/memex-portal-ai` + `memex-migration`. These must be **pullable** by
+   arbitrary customer subscriptions.
 
 ## Non-code, your action (long lead)
 
