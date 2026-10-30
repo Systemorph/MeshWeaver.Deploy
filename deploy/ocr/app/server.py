@@ -12,7 +12,13 @@ The contract is the one MeshWeaver.Plugins' ``MeshWeaver.Ocr`` HttpService engin
 Refusals answer JSON ``{"error": "…"}``: 401 (a key is configured and the bearer is not it), 404, 411
 (no Content-Length), 413 (body or pixel count over the limit), 415 (not an image), 422 (a hint with no
 installed pack), 503 (every admission place taken — refused before the body is read — or every OCR
-slot busy for the whole deadline), 504 (the deadline passed mid-read).
+slot busy for the whole deadline), 504 (the deadline passed while the body was still arriving, or
+mid-read).
+
+ONE deadline, ``OCR_TIMEOUT_SECONDS``, starts when a request is admitted and covers the upload, the
+wait for a slot and the read. ``OCR_READ_TIMEOUT_SECONDS`` only bounds the silence between two receives;
+without the deadline over the upload, a client trickling one byte per read timeout would hold its
+admission place for as long as it liked.
 
 Memory is bounded by ADMISSION, not by the OCR slots: a request takes one of ``OCR_MAX_ADMITTED``
 places BEFORE its body is read and holds it until it is answered, so at most that many bodies are ever
@@ -133,13 +139,47 @@ def make_handler(cfg: Config, run: ocr.Runner = ocr.run_tesseract):
             finally:
                 cfg.admission.release()
 
+        def _read_body(self, size: int, deadline: float) -> bytes | None:
+            """The body, read against the request's ONE deadline; None once that deadline passes.
+
+            ``OCR_READ_TIMEOUT_SECONDS`` bounds the silence between two reads; the deadline bounds the
+            whole upload, so a client that trickles bytes cannot hold its admission place for longer
+            than the request may take. ``read1`` does at most one receive, so every receive waits at
+            most what is left of the deadline.
+            """
+            chunks: list[bytes] = []
+            got = 0
+            try:
+                while got < size:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return None
+                    self.connection.settimeout(min(cfg.read_timeout, remaining))
+                    try:
+                        chunk = self.rfile.read1(min(size - got, 64 * 1024))
+                    except TimeoutError:
+                        if time.monotonic() >= deadline:
+                            return None
+                        raise  # silent for the whole read timeout: dropped, as before
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    got += len(chunk)
+            finally:
+                self.connection.settimeout(cfg.read_timeout)
+            return b"".join(chunks)
+
         def _read_admitted(self, url, size: int):
-            data = self.rfile.read(size)
+            # The deadline starts at admission: reading the body spends the same budget as the OCR.
+            started = time.monotonic()
+            deadline = started + cfg.timeout
+            data = self._read_body(size, deadline)
+            if data is None:
+                log.warning("upload of %d bytes did not arrive within the %.0f s deadline", size, cfg.timeout)
+                return self._send(504, {"error": f"the body did not arrive within {cfg.timeout:.0f} s"}, close=True)
             if len(data) != size:
                 return self._send(400, {"error": "the body ended before Content-Length"}, close=True)
 
-            started = time.monotonic()
-            deadline = started + cfg.timeout
             try:
                 hints = ocr.parse_hints(parse_qs(url.query).get("languages", []), cfg.settings.installed)
             except ocr.Refused as exc:
