@@ -183,7 +183,14 @@ The refusals, and why each one exists:
 {{- /* The declared FLOOR (the record's BuildHostChannel.MinReplicas; core Doc/Architecture/BuildHosts → "Declared host floor").
        hasKey, not `default`: an explicit 0 is the scale-to-zero default, never "unset". */ -}}
 {{- $min := 0 -}}
-{{- if hasKey $c "minReplicas" -}}{{- $min = int $c.minReplicas -}}{{- end -}}
+{{- if hasKey $c "minReplicas" -}}
+{{- /* Whole number FIRST, as stageSlots: `int` truncates, so -0.5 would read as 0 and 2.9 as 2 and pass the range check
+       below as a floor nobody declared (review of #101). */ -}}
+{{- if not (regexMatch "^-?[0-9]+$" (toString $c.minReplicas)) -}}
+{{- fail (printf "buildHosts.%s.minReplicas %v must be a whole number between 0 and the channel's maxReplicas" $name $c.minReplicas) -}}
+{{- end -}}
+{{- $min = int $c.minReplicas -}}
+{{- end -}}
 {{- if or (lt $min 0) (gt $min $max) -}}
 {{- fail (printf "buildHosts.%s.minReplicas %d must be between 0 and the channel's maxReplicas %d" $name $min $max) -}}
 {{- end -}}

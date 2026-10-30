@@ -776,6 +776,8 @@ for entry in \
   "values.build-hosts-zero-replicas.yaml|maxReplicas must be at least 1" \
   "values.build-hosts-floor-above-ceiling.yaml|minReplicas 3 must be between 0 and the channel's maxReplicas 2" \
   "values.build-hosts-negative-floor.yaml|minReplicas -1 must be between 0" \
+  "values.build-hosts-fractional-floor-neg-half.yaml|minReplicas -0.5 must be a whole number" \
+  "values.build-hosts-fractional-floor-above-ceiling.yaml|minReplicas 2.9 must be a whole number" \
   "values.build-hosts-name-collision.yaml|one deployment per name" \
   "values.build-hosts-cache-no-class.yaml|buildHosts.cache.storageClass is required" \
   "values.build-hosts-bad-extra-channel.yaml|not latest, stable or probe*" \
