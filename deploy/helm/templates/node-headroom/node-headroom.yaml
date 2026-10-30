@@ -50,6 +50,12 @@ metadata:
     meshweaver.io/node-pool: {{ $pool | quote }}
 spec:
   replicas: {{ $replicas }}
+  # Release the slot BEFORE replacing it: a surge placeholder on a full pool cannot schedule and
+  # (preemptionPolicy Never, equal priority) cannot displace its predecessor, so the default
+  # surge-first strategy would stall every update of this Deployment at the pool's maxCount.
+  strategy:
+    type: "RollingUpdate"
+    rollingUpdate: { maxSurge: 0, maxUnavailable: 1 }
   selector:
     matchLabels:
       app.kubernetes.io/component: "node-headroom"

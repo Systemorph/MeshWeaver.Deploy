@@ -53,6 +53,7 @@ fi
 
 # ---- 2. one pool -------------------------------------------------------------------------------
 one_out="$(render -f "$TD/values.node-headroom.yaml")" || { report "the one-pool fixture does not render: $one_out"; one_out=""; }
+inspected=1
 problems="$(printf '%s' "$one_out" | inspect | python3 -c '
 import json, sys
 objs = json.load(sys.stdin)
@@ -71,6 +72,8 @@ else:
     d = deps[0]
     if d["metadata"]["name"] != "node-headroom-silos": p.append("the placeholder is not named node-headroom-silos")
     if d["spec"].get("replicas") != 1: p.append("replicas " + repr(d["spec"].get("replicas")) + ", expected the default 1")
+    ru = ((d["spec"].get("strategy") or {}).get("rollingUpdate") or {})
+    if ru.get("maxSurge") != 0 or ru.get("maxUnavailable") != 1: p.append("the placeholder does not roll maxSurge 0 / maxUnavailable 1, so an update stalls on a full pool: " + repr(d["spec"].get("strategy")))
     s = d["spec"]["template"]["spec"]
     if s.get("priorityClassName") != "node-headroom": p.append("the pod does not run under node-headroom")
     if (s.get("nodeSelector") or {}).get("kubernetes.azure.com/agentpool") != "silos": p.append("the pod is not pinned to the silos pool")
@@ -89,8 +92,9 @@ else:
         if sc.get("readOnlyRootFilesystem") is not True or sc.get("allowPrivilegeEscalation") is not False or sc.get("capabilities", {}).get("drop") != ["ALL"]:
             p.append("the container is not read-only / no-escalation / all capabilities dropped")
 print("\n".join(p))
-')"
+')" || inspected=0
 if [ -z "$one_out" ]; then report "the one-pool fixture rendered nothing"
+elif [ "$inspected" != 1 ]; then report "the one-pool inspector itself FAILED (see its error above) — nothing was checked"
 elif [ -n "$problems" ]; then while IFS= read -r line; do report "one pool: $line"; done <<< "$problems"
 else ok "one declared pool renders one negative, non-preempting PriorityClass and one pinned, requests==limits placeholder"; fi
 
