@@ -1,3 +1,4 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- $h := .Values.nodeHeadroom | default dict }}
 {{- $pools := $h.pools | default list }}
 {{- if $pools }}
@@ -93,5 +94,6 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
+{{- end }}
 {{- end }}
 {{- end }}
