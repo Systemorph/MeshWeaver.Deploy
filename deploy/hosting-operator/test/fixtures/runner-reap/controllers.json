@@ -1,0 +1,6 @@
+{"items": [
+  {"metadata": {"namespace": "arc-systems", "name": "arc-gha-rs-controller"},
+   "spec": {"template": {"spec": {"containers": [{"name": "manager", "args": ["--auto-scaling-runner-set-only", "--watch-single-namespace=arc-runners"]}]}}}},
+  {"metadata": {"namespace": "arc-systems-dind", "name": "arc-dind-gha-rs-controller"},
+   "spec": {"template": {"spec": {"containers": [{"name": "manager", "args": ["--auto-scaling-runner-set-only", "--watch-single-namespace=arc-runners-dind"]}]}}}}
+]}

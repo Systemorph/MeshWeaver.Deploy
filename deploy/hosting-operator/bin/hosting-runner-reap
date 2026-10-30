@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# hosting-runner-reap --namespace <arc runner namespace> [--execute --runner <name> [--runner <name> …]]
+#
+# The STUCK-RUNNER census and its remedy (MeshWeaver.Plugins Hosting/InstanceAction, kind `RunnerReap`;
+# Hosting/StuckDetection.md → "Stuck runners"; Memex#879).
+#
+# 🚨 WHY THIS EXISTS. On 2026-10-26 from ~21:24Z the ARC controller of the `aks-silos` scale set stopped
+# seeing its runner pods finish. All 65 runner pods had exited (61 Completed, 4 Error) 13–30 minutes
+# earlier, yet their EphemeralRunner objects still read `phase: Running`, so the set sat at its maximum
+# (72) with ZERO live runners, the listener kept assigning jobs to runners that no longer existed, and
+# 46 runs queued. The controller logged no error. What cleared it was a restart of the controller:
+# a minute later it had re-listed its runners and 36 real pods were running.
+#
+# REPORT (no --execute): READ-ONLY. One census of the namespace — every EphemeralRunner joined to its
+# pod — reported as ONE machine line:
+#
+#   ::hosting:: runner_census=<compact JSON>   {namespace, measuredAt, controller, total, running,
+#                                              busy, podsRunning, suspects[], truncated}
+#
+# `suspects` are the runners ARC still reports `Running` whose pod has EXITED (phase Succeeded/Failed,
+# or its `runner` container terminated) or is GONE, each with when it finished. Whether a suspect is
+# STUCK — exited longer ago than the controller needs to notice — is the control plane's judgement
+# (RunnerCensusJudge), never this script's: a pod that finished three seconds ago is a suspect and
+# not stuck. `busy` counts runners carrying any job marker (a non-zero jobRequestId, a
+# jobRepositoryName or a jobId) — the rule Systemorph/Memex `.github/scripts/ci-runner-busy-count.jq`
+# holds (Memex#865).
+#
+# EXECUTE: the remedy, approved in the mesh. It takes the census AGAIN, keeps only the named runners
+# that are STILL suspects (a runner the controller has caught up with since the census is left alone),
+# and when any remain, RESTARTS the one controller that watches this namespace
+# (`kubectl rollout restart`, then `rollout status`). A restarted controller re-lists its runners and
+# reaps the exited ones itself — the measured remedy. It then re-reads until none of them is still a
+# suspect, or fails naming the ones that are:
+#
+#   ::hosting:: runner_reap_targets=<n>        named runners still stuck when the remedy ran
+#   ::hosting:: runner_controller=<ns>/<name>  the controller restarted (absent when nothing was stuck)
+#   ::hosting:: runner_reaped=<n>              of the targets, how many are no longer suspects
+#   ::hosting:: runner_census=…                the census after the remedy (the last line)
+#
+# 🚨 WHAT IT NEVER DOES: delete an EphemeralRunner or a pod, touch a runner that is not named, touch a
+# runner whose pod is still running, or restart anything but the controller whose arguments name THIS
+# namespace (`--watch-single-namespace=<ns>`). A controller that cannot be identified exactly is a
+# refusal, never a guess.
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
+# shellcheck disable=SC2034  # read by hosting::die in _common.sh
+HOSTING_CMD="hosting-runner-reap"
+
+# ── declared ────────────────────────────────────────────────────────────────────────────────────
+# The suspects listed in one census line — the lane hands back a 24 KB log tail, shared.
+MAX_SUSPECTS="${HOSTING_RUNNER_MAX_SUSPECTS:-80}"
+# How long the remedy waits for the restarted controller to reap the targets (s), and how often it looks.
+REAP_WAIT="${HOSTING_RUNNER_REAP_WAIT:-300}"
+REAP_INTERVAL="${HOSTING_RUNNER_REAP_INTERVAL:-15}"
+
+namespace="" execute=0
+runners=()
+needs_value() { [ $# -ge 2 ] || hosting::die "$1 needs a value"; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --namespace) needs_value "$@"; namespace="$2"; shift 2 ;;
+    --runner)    needs_value "$@"; runners+=("$2"); shift 2 ;;
+    --execute)   execute=1; shift ;;
+    *) hosting::die "unknown argument '$1'" ;;
+  esac
+done
+is_name() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; }
+[ -n "$namespace" ] || hosting::die "--namespace is required (the ARC runner namespace to read)"
+is_name "$namespace" || hosting::die "namespace '$namespace' is not a Kubernetes name"
+if [ "$execute" -eq 1 ]; then
+  [ "${#runners[@]}" -gt 0 ] || hosting::die "--execute names the runners it reaps (--runner <name>) — it never reaps 'whatever is stuck now'"
+else
+  [ "${#runners[@]}" -eq 0 ] || hosting::die "--runner rides --execute only — a report reads the whole namespace"
+fi
+for r in "${runners[@]}"; do
+  is_name "$r" || hosting::die "runner '$r' is not a Kubernetes name"
+done
+
+# ── the census (pure jq over the two listings) ──────────────────────────────────────────────────
+# shellcheck disable=SC2016  # jq program, not shell
+CENSUS_JQ='
+def busy: ((.status.jobRequestId // 0) != 0) or ((.status.jobRepositoryName // "") != "") or ((.status.jobId // "") != "");
+($pods[0].items | map({key: .metadata.name, value: .}) | from_entries) as $p
+| [ $ers[0].items[] | select((.status.phase // "") == "Running") ] as $running
+| [ $running[]
+    | . as $er
+    | ($p[$er.metadata.name]) as $pod
+    | ( if $pod == null then {pod: "Missing", finishedAt: null}
+        else ([ $pod.status.containerStatuses[]? | select(.name == "runner") | .state.terminated | select(. != null) ] | first) as $t
+          | if (($pod.status.phase // "") == "Succeeded" or ($pod.status.phase // "") == "Failed") then
+              {pod: $pod.status.phase,
+               finishedAt: ($t.finishedAt // ([ $pod.status.containerStatuses[]?.state.terminated.finishedAt | select(. != null) ] | max))}
+            elif $t != null then {pod: "RunnerExited", finishedAt: $t.finishedAt}
+            else null end
+        end) as $s
+    | select($s != null)
+    | {name: $er.metadata.name,
+       scaleSet: ($er.metadata.labels["actions.github.com/scale-set-name"] // ""),
+       createdAt: $er.metadata.creationTimestamp,
+       pod: $s.pod, finishedAt: $s.finishedAt, busy: ($er | busy)} ] as $suspects
+| {namespace: $ns, measuredAt: $now, controller: $controller,
+   total: ($ers[0].items | length), running: ($running | length),
+   busy: ([ $ers[0].items[] | select(busy) ] | length),
+   podsRunning: ([ $pods[0].items[] | select((.status.phase // "") == "Running") ] | length),
+   suspects: ($suspects | sort_by(.name) | .[0:($max | tonumber)]),
+   truncated: (($suspects | length) > ($max | tonumber))}'
+
+tmp="$(mktemp -d)"
+trap 'hosting::on_exit; rm -rf "$tmp"' EXIT
+
+# The ONE controller whose arguments name this namespace, as <ns>/<name>; empty when there is not exactly one.
+controller_of() {
+  kubectl get deployments --all-namespaces -l app.kubernetes.io/part-of=gha-rs-controller -o json > "$tmp/controllers.json" \
+    || hosting::die "could not list the ARC controllers (kubectl get deployments -l app.kubernetes.io/part-of=gha-rs-controller)"
+  jq -r --arg ns "$namespace" '
+    [ .items[] | select([ .spec.template.spec.containers[]?.args[]? ] | index("--watch-single-namespace=" + $ns))
+      | "\(.metadata.namespace)/\(.metadata.name)" ]
+    | if length == 1 then .[0] else "" end' "$tmp/controllers.json" \
+    || hosting::die "the ARC controller listing is not readable"
+}
+
+census() {   # writes $tmp/census.json
+  local controller="$1"
+  kubectl -n "$namespace" get ephemeralrunners -o json > "$tmp/ers.json" \
+    || hosting::die "could not read the EphemeralRunners of $namespace — an unreadable census is never an idle or a healthy one"
+  kubectl -n "$namespace" get pods -o json > "$tmp/pods.json" \
+    || hosting::die "could not read the pods of $namespace"
+  jq -c -n --slurpfile ers "$tmp/ers.json" --slurpfile pods "$tmp/pods.json" \
+     --arg ns "$namespace" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg controller "$controller" \
+     --arg max "$MAX_SUSPECTS" "$CENSUS_JQ" > "$tmp/census.json" \
+    || hosting::die "the census of $namespace could not be composed (an EphemeralRunner or pod listing of an unexpected shape)"
+}
+
+controller="$(controller_of)"
+census "$controller"
+
+if [ "$execute" -eq 0 ]; then
+  [ -n "$controller" ] || hosting::log "no single ARC controller names --watch-single-namespace=$namespace — the census stands, a reap could not run"
+  hosting::log "$namespace: $(jq -r '"\(.total) runner(s), \(.running) Running, \(.busy) busy, \(.podsRunning) pod(s) running, \(.suspects | length) Running with an exited or missing pod"' "$tmp/census.json")"
+  hosting::say runner_census "$(cat "$tmp/census.json")"
+  exit 0
+fi
+
+# ── execute: the named runners still stuck, the controller restarted, the reap read back ───────────
+[ -n "$controller" ] || hosting::die "exactly one ARC controller must name --watch-single-namespace=$namespace, and $(jq '.items | length' "$tmp/controllers.json") deployment(s) carry the controller label — refusing to restart a guess"
+printf '%s\n' "${runners[@]}" | sort -u > "$tmp/named"
+jq -r '.suspects[].name' "$tmp/census.json" | sort -u > "$tmp/suspects"
+comm -12 "$tmp/named" "$tmp/suspects" > "$tmp/targets"
+targets="$(grep -c . "$tmp/targets" || true)"
+hosting::say runner_reap_targets "$targets"
+if [ "$targets" -eq 0 ]; then
+  hosting::log "none of the ${#runners[@]} named runner(s) is still Running with an exited pod — the controller caught up; nothing restarted"
+  hosting::say runner_reaped 0
+  hosting::say runner_census "$(cat "$tmp/census.json")"
+  exit 0
+fi
+hosting::log "still stuck: $(paste -sd, "$tmp/targets") — restarting $controller, which re-lists and reaps them"
+cns="${controller%%/*}" cname="${controller#*/}"
+hosting::do kubectl -n "$cns" rollout restart "deployment/$cname" \
+  || hosting::die "the restart of $controller was refused"
+hosting::do kubectl -n "$cns" rollout status "deployment/$cname" --timeout=180s \
+  || hosting::die "$controller did not come back within 180 s after its restart"
+hosting::say runner_controller "$controller"
+
+waited=0 left="$targets"
+while :; do
+  census "$controller"
+  jq -r '.suspects[].name' "$tmp/census.json" | sort -u > "$tmp/suspects"
+  comm -12 "$tmp/targets" "$tmp/suspects" > "$tmp/left"
+  left="$(grep -c . "$tmp/left" || true)"
+  [ "$left" -gt 0 ] && [ "$waited" -lt "$REAP_WAIT" ] || break
+  sleep "$REAP_INTERVAL"; waited=$((waited + REAP_INTERVAL))
+done
+hosting::say runner_reaped "$((targets - left))"
+hosting::say runner_census "$(cat "$tmp/census.json")"
+[ "$left" -eq 0 ] || hosting::die "$controller was restarted, and after ${waited}s $left runner(s) still read Running with an exited pod: $(paste -sd, "$tmp/left") — the restart did not reap them; read the controller's log"
+hosting::log "reaped $targets runner(s): the restarted controller no longer reports them Running"

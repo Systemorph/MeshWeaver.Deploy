@@ -1,0 +1,178 @@
+name: Hosting Operator (scripts + image, no publish)
+
+# The hosting operator's scripts (`deploy/hosting-operator/bin`), their behaviour suite
+# (`deploy/hosting-operator/test`) and the image they run in (`deploy/hosting-operator/Dockerfile`)
+# live HERE, in the public deployment reference, beside the chart, the db chart and the drift scripts
+# the same image bakes (MeshWeaver.Plugins#4755). They moved out of the private MeshWeaver.Plugins so
+# that an estate's aks-ops lane reads them with NO credential — a client estate's own GitHub App is
+# installed on that client's configuration repository and nothing else, so it can never read a
+# private Systemorph repository.
+#
+# 🚨 THIS LANE PROVES, IT NEVER PUBLISHES. The image `hosting-operator` is still built, tagged and
+# pushed by MeshWeaver.Plugins `.github/workflows/hosting-operator.yml`, which checks this
+# repository out at its declared deploy ref and stages the build context from it — and which keeps
+# the one check that needs Plugins: every `hosting-*` command the InstanceAction plan emits ships in
+# bin/. This lane gives a pull request HERE the same evidence a Plugins pull request used to get:
+# the scripts parse and pass shellcheck, no unlisted Key Vault command, and the behaviour suite runs
+# INSIDE the image a lifecycle Job runs.
+#
+# What it cannot prove is the same as before: these scripts drive az/kubectl/helm/psql against a
+# live estate, and the suite covers argument handling, the refusals, the ::hosting:: contract and
+# run.sh's ordering — never what `az` itself does.
+
+on:
+  pull_request:
+    paths:
+      - "deploy/hosting-operator/**"
+      - "deploy/helm/**"
+      - "deploy/helm-db/**"
+      - "deploy/aks/scripts/**"
+      - "deploy/aks/manifests/**"
+      - ".github/workflows/hosting-operator.yml"
+  push:
+    branches: [main]
+    paths:
+      - "deploy/hosting-operator/**"
+      - "deploy/helm/**"
+      - "deploy/helm-db/**"
+      - "deploy/aks/scripts/**"
+      - "deploy/aks/manifests/**"
+      - ".github/workflows/hosting-operator.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosting-operator-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  OPERATOR_DIR: deploy/hosting-operator
+  MW_HOSTING_OPERATOR_PLATFORM_REF: main
+  SHELLCHECK_VERSION: v0.10.0
+  SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
+
+jobs:
+  operator:
+    name: Operator scripts + image (shellcheck, behaviour suite in the image)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve the platform ref (core's Key Vault gate script)
+        id: platform-ref
+        env:
+          REF: ${{ vars.MW_PLATFORM_REF || env.MW_HOSTING_OPERATOR_PLATFORM_REF }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REF:-}" ]; then
+            echo "::error title=No platform ref declared::Neither the repo VARIABLE MW_PLATFORM_REF nor this workflow's MW_HOSTING_OPERATOR_PLATFORM_REF names a platform ref."
+            exit 1
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+      - name: Check out the platform (core's Key Vault gate)
+        uses: actions/checkout@v7
+        with:
+          repository: Systemorph/MeshWeaver
+          ref: ${{ steps.platform-ref.outputs.ref }}
+          path: meshweaver
+          sparse-checkout: |
+            .github/scripts/check-manual-keyvault.py
+          sparse-checkout-cone-mode: false
+
+      - name: Install shellcheck (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          curl -fsSLo "$RUNNER_TEMP/sc.tar.xz" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  $RUNNER_TEMP/sc.tar.xz" | sha256sum -c -
+          python3 -c 'import sys, tarfile; tarfile.open(sys.argv[1], "r:xz").extractall(sys.argv[2], filter="data")' \
+            "$RUNNER_TEMP/sc.tar.xz" "$RUNNER_TEMP"
+          chmod +x "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          mkdir -p "$RUNNER_TEMP/bin"
+          mv "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$RUNNER_TEMP/bin/shellcheck"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/shellcheck" --version
+
+      - name: The operator scripts are actually TRACKED
+        run: |
+          set -euo pipefail
+          tracked=$(git ls-files "$OPERATOR_DIR/bin/" | wc -l | tr -d ' ')
+          if [ "$tracked" -lt 48 ]; then
+            echo "::error::only ${tracked} file(s) tracked under $OPERATOR_DIR/bin/ — expected at least 48 (42 commands + run.sh + _common.sh + _audit.jq + _values_half.py + _dump_analyze_pod.sh + _storage_prune_pod.sh). The floor is the REAL count — raise it with every file added, or a lost file passes."
+            exit 1
+          fi
+          nonexec=$(git ls-files -s "$OPERATOR_DIR"/bin/hosting-* "$OPERATOR_DIR/bin/run.sh" | awk '$1 != "100755"' | wc -l | tr -d ' ')
+          [ "$nonexec" -eq 0 ] || { echo "::error::${nonexec} operator command(s) are not committed executable (mode 100755)"; exit 1; }
+          stubs=$(git ls-files -s "$OPERATOR_DIR/test/stubs/" | wc -l | tr -d ' ')
+          [ "$stubs" -ge 54 ] || { echo "::error::only ${stubs} test stub(s) tracked under $OPERATOR_DIR/test/stubs/ — expected at least 54 (the real count; raise it with every stub added)"; exit 1; }
+          nonexec_stubs=$(git ls-files -s "$OPERATOR_DIR/test/stubs/" | awk '$1 != "100755"' | wc -l | tr -d ' ')
+          [ "$nonexec_stubs" -eq 0 ] || { echo "::error::${nonexec_stubs} test stub(s) are not committed executable (mode 100755)"; exit 1; }
+          echo "${tracked} bin files and ${stubs} stubs tracked, all executable"
+
+      - name: Every script parses
+        run: |
+          set -euo pipefail
+          cd "$OPERATOR_DIR/bin"
+          for f in _common.sh run.sh hosting-*; do
+            bash -n "$f" || { echo "::error::${f} is not valid bash"; exit 1; }
+          done
+          echo "all $(ls _common.sh run.sh hosting-* | wc -l) scripts parse"
+
+      - name: shellcheck
+        run: shellcheck -S warning "$OPERATOR_DIR/bin/_common.sh" "$OPERATOR_DIR/bin/run.sh" "$OPERATOR_DIR"/bin/hosting-*
+
+      - name: No unlisted Key Vault secret command (secrets-write-only-entry)
+        run: |
+          set -euo pipefail
+          python3 meshweaver/.github/scripts/check-manual-keyvault.py --self-test
+          python3 meshweaver/.github/scripts/check-manual-keyvault.py --root "$OPERATOR_DIR" --allow "$OPERATOR_DIR/manual-keyvault.allow"
+
+      - name: Stage the build context (the layout MeshWeaver.Plugins' publish lane stages)
+        id: context
+        run: |
+          set -euo pipefail
+          ctx="$RUNNER_TEMP/ctx"
+          rm -rf "$ctx"
+          mkdir -p "$ctx/aks/operator"
+          cp -a deploy/helm "$ctx/helm"
+          cp -a deploy/helm-db "$ctx/helm-db"
+          cp -a deploy/aks/scripts "$ctx/aks/scripts"
+          cp -a "$OPERATOR_DIR/bin" "$ctx/aks/operator/bin"
+          for need in helm/Chart.yaml helm-db/Chart.yaml aks/scripts/check-chart-drift.sh aks/operator/bin/run.sh; do
+            [ -e "$ctx/$need" ] || { echo "::error::the build context has no ${need}"; exit 1; }
+          done
+          echo "dir=$ctx" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: docker build -f "$OPERATOR_DIR/Dockerfile" -t hosting-operator:ci "${{ steps.context.outputs.dir }}"
+
+      - name: The image carries the scripts, the charts and the tools — and starts the same way
+        run: |
+          set -euo pipefail
+          entry="$(docker image inspect hosting-operator:ci --format '{{json .Config.Entrypoint}}')"
+          [ "$entry" = '["/bin/bash","/opt/hosting/bin/run.sh"]' ] || { echo "::error::ENTRYPOINT is ${entry}"; exit 1; }
+          user="$(docker image inspect hosting-operator:ci --format '{{.Config.User}}')"
+          [ "$user" = "1654" ] || { echo "::error::USER is '${user}', not 1654 (non-root)"; exit 1; }
+          expected="$(cd "$OPERATOR_DIR/bin" && ls hosting-* | sort | tr '\n' ' ')"
+          actual="$(docker run --rm --entrypoint /bin/bash hosting-operator:ci -c 'cd /opt/hosting/bin && ls hosting-* | sort | tr "\n" " "')"
+          [ "$expected" = "$actual" ] || { echo "::error::the image's command set differs from bin/"; echo "bin/:  $expected"; echo "image: $actual"; exit 1; }
+          docker run --rm --entrypoint /bin/bash hosting-operator:ci -c '
+            set -e
+            test -f /opt/hosting/chart/Chart.yaml    || { echo "chart missing"; exit 1; }
+            test -f /opt/hosting/chart-db/Chart.yaml || { echo "db chart missing"; exit 1; }
+            command -v helm kubectl az pg_dump jq crane >/dev/null || { echo "a required tool is missing"; exit 1; }
+            test -f /opt/hosting/drift/check-chart-drift.sh || { echo "drift scripts missing"; exit 1; }
+            python3 -c "import yaml" || { echo "python3/PyYAML missing"; exit 1; }
+          '
+
+      - name: Behaviour tests, inside the image
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/$OPERATOR_DIR/test:/opt/hosting/test:ro" \
+            -v "$PWD/deploy/aks/manifests:/opt/hosting/manifests:ro" \
+            -e HOSTING_RBAC_MANIFEST=/opt/hosting/manifests/hosting-operator/operator-rbac.yaml \
+            -e HOSTING_CHART_TEMPLATES=/opt/hosting/chart/templates \
+            --entrypoint /bin/bash hosting-operator:ci -c 'cd /opt/hosting && bash test/run-tests.sh' | tee "$RUNNER_TEMP/suite.log"
+          grep -Eq '^[0-9]+ passed, 0 failed' "$RUNNER_TEMP/suite.log" || { echo "::error::the suite printed no '<n> passed, 0 failed' line — an exit code is not a verdict"; exit 1; }

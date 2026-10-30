@@ -1,0 +1,12 @@
+{"items": [
+  {"metadata": {"name": "aks-silos-x-runner-stuck1", "creationTimestamp": "2026-10-26T20:50:00Z", "labels": {"actions.github.com/scale-set-name": "aks-silos"}},
+   "status": {"phase": "Running", "jobRepositoryName": "Systemorph/MeshWeaver.Plugins"}},
+  {"metadata": {"name": "aks-silos-x-runner-stuck2", "creationTimestamp": "2026-10-26T20:51:00Z", "labels": {"actions.github.com/scale-set-name": "aks-silos"}},
+   "status": {"phase": "Running"}},
+  {"metadata": {"name": "aks-silos-x-runner-gone", "creationTimestamp": "2026-10-26T20:52:00Z", "labels": {"actions.github.com/scale-set-name": "aks-silos"}},
+   "status": {"phase": "Running"}},
+  {"metadata": {"name": "aks-silos-x-runner-busy", "creationTimestamp": "2026-10-26T21:40:00Z", "labels": {"actions.github.com/scale-set-name": "aks-silos"}},
+   "status": {"phase": "Running", "jobRequestId": 42, "jobRepositoryName": "Systemorph/Memex"}},
+  {"metadata": {"name": "aks-silos-x-runner-pending", "creationTimestamp": "2026-10-26T21:50:00Z", "labels": {"actions.github.com/scale-set-name": "aks-silos"}},
+   "status": {"phase": "Pending"}}
+]}
