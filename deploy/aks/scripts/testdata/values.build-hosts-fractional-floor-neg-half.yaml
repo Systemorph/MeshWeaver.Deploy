@@ -1,0 +1,15 @@
+# A fractional floor — refused, never truncated: -0.5 would truncate to 0 and pass as no floor.
+buildHosts:
+  enabled: true
+  apiUrl: "http://memex-portal-service:8080/api/builds"
+  runnerRepository: "cr.example.com/mw-build-host"
+  testerRepository: "cr.example.com/mw-plugin-test"
+  portalRepository: "cr.example.com/memex-portal-ai"
+  latest:
+    enabled: true
+    maxReplicas: 2
+    minReplicas: -0.5
+    platformVersion: "3.1.10412"
+    testerDigest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    portalDigest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    runnerDigest: "sha256:5555555555555555555555555555555555555555555555555555555555555555"

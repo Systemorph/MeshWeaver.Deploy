@@ -1,0 +1,32 @@
+# =============================================================================
+# memex-local — REGISTRY mode layer (tracked; passed ONLY in registry mode, §17)
+# =============================================================================
+# helm_deploy layers this file right after values.local.defaults.yaml and before
+# the per-install registry file, only when `memex-local registry status` says
+# REGISTRY MODE. The user's overlay is layered after it and still wins.
+#
+# 🚨 SELF-UPDATE FROM THE PUBLIC GHCR (MeshWeaver.Deploy#65). A registry-mode
+# install runs ghcr.io/systemorph/memex-portal-ai (and memex-migration) with no
+# pull secret. Without this layer the self-updater kept the image default — the
+# upstream ACR, listed through a managed identity — and on a Mac every check
+# failed with "ManagedIdentityCredential authentication failed", so the install
+# never rolled its platform and held every package whose floor was above it.
+#
+#   registry          ghcr.io — the registry the install already pulls from. The
+#                     chart derives the repositories systemorph/memex-portal-ai and
+#                     systemorph/memex-migration from the images this release runs.
+#   registryIsPublic  true — tags are listed through the anonymous token flow; the
+#                     portal never sends a credential to GHCR. No imagePullSecret.
+#   canPatch          true — a standalone local cluster has no control instance to
+#                     hand a release to, so the portal patches its own deployments
+#                     (the chart then renders the memex-portal-self-update Role).
+#
+# The `mwr_` registration key cannot stand in for GHCR: cr.meshweaver.cloud checks
+# an `mwi_` instance key, which is minted inside the pod and never reaches the host.
+# Doc/Architecture/LocalColimaMac → "Registry mode updates from public GHCR".
+# =============================================================================
+
+selfUpdate:
+  registry: "ghcr.io"
+  registryIsPublic: true
+  canPatch: true

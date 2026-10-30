@@ -76,8 +76,8 @@ spec:
 {{- range $c := $b.channels }}
 ---
 # build-{{ $c.name }}: the platform set {{ $c.platformVersion }}. Rolled by core's CD writing the two
-# digests into the record (never `kubectl set image`): a NEW replica stages the set before it is
-# Ready (readiness = staged), the old one stops claiming, finishes its run, and exits.
+# digests into the record (never `kubectl set image`): the old replica stops claiming, finishes its
+# run and exits; the NEW one then stages the set before it is Ready (readiness = staged).
 apiVersion: "apps/v1"
 kind: "Deployment"
 metadata:
@@ -104,8 +104,14 @@ spec:
     # A single-node host (a leased-back Mac) cannot fit the new pod beside the old one: drain, then replace.
     type: Recreate
     {{- else }}
+    # DRAIN, THEN REPLACE (MeshWeaver.Plugins Hosting/StandingBuildHosts.md, "How the platform layer follows"):
+    # the old replica gets SIGTERM, stops claiming, finishes the run it holds and exits; the new one is
+    # scheduled on the capacity it frees. A surge-first roll (maxSurge 1 / maxUnavailable 0) needs a node
+    # BEYOND the pool's ceiling for the surge pod — with the ci-build pool full it stays Pending, the old
+    # replica is never removed, and the set change never lands (Memex#863, #885). A host is stateless
+    # and its lease survives a replacement, so nothing needs the old replica to outlive the roll.
     type: RollingUpdate
-    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+    rollingUpdate: { maxSurge: 0, maxUnavailable: 1 }
     {{- end }}
   selector:
     matchLabels:
@@ -338,7 +344,8 @@ spec:
             items: [{ key: {{ $b.registry.keySecretKey | quote }}, path: "key" }]
         {{- end }}
 ---
-# Queue depth → replicas: ONE metrics-api trigger on the build API's anonymous per-channel count,
+# Queue depth → replicas: ONE metrics-api trigger on the build API's anonymous per-channel count, at the
+# namespace-qualified URL (`scalerApiUrl` — KEDA resolves it from its own namespace, never this one),
 # `valueLocation: demand` (= claimable + running), so the metric never drops to zero while a host
 # still holds a run. The scale-down stabilization window is longer than a claim's round trip, so a
 # replica is not removed between two runs it was about to take. A 503 (queue unreadable) leaves the
@@ -362,7 +369,8 @@ metadata:
 spec:
   scaleTargetRef:
     name: "{{ $c.resource }}"
-  minReplicaCount: 0
+  # The record's declared floor (BuildHostChannel.MinReplicas, default 0); a versioned server always scales to zero.
+  minReplicaCount: {{ $c.minReplicas | default 0 }}
   maxReplicaCount: {{ $c.maxReplicas }}
   pollingInterval: {{ $b.pollingInterval }}
   cooldownPeriod: {{ $b.cooldownPeriod }}
@@ -377,7 +385,7 @@ spec:
     - type: metrics-api
       metricType: AverageValue
       metadata:
-        url: "{{ $b.apiUrl }}/queue?{{ $c.queueQuery }}"
+        url: "{{ $b.scalerApiUrl }}/queue?{{ $c.queueQuery }}"
         valueLocation: "demand"
         targetValue: "1"
 {{- end }}

@@ -31,8 +31,9 @@ THE LOOP, and the order that matters:
      claimable → sleep. 409 `stale-set` = this host's set is no longer its lane's → DRAINED: it
      claims nothing and idles, asking again each minute, until SIGTERM (a replica of the new set
      replaces it) or the instance answers its set current again; it never exits on its own, so a
-     record change that is not applied yet cannot crash-loop the host (Memex#885). 200 = a run: `{path, repo, sha, refs, isTrunk, publish, stages}` — `path`
-     is authoritative (a non-latest run's node id is `<sha>-<channel>`). The host then posts the
+     record change that is not applied yet cannot crash-loop the host (Memex#885). 200 = a run: `{path, repo, sha, refs, isTrunk, publish, stages, labels}` — `path`
+     is authoritative; `labels` (the pull request's live labels, which a host has no credential to read) reach every stage
+     as `MW_BUILD_LABELS` (comma-separated; left UNSET when the claim carries none, so the stage says it was not told) (a non-latest run's node id is `<sha>-<channel>`). The host then posts the
      PLAN (`{"kind":"plan","stages":[…]}`, host-emitted only) and keeps the claim's lease with a
      batch at least every 45 s (an empty batch is the heartbeat); every stage route's batches are
      numbered (`seq`) and a retried batch keeps its number. No claim survives a host restart.
@@ -98,6 +99,14 @@ THE LOOP, and the order that matters:
     still had to restore (the warm cache lacked it) is SAID as a warning (MWPREP001); on a trunk
     build it is verified (the .nupkg's SHA-512 against what NuGet recorded) and promoted too. A pull
     request's own restore — and any package source its tree adds — never writes the shared cache.
+    PROVENANCE: a package is promoted (warm restore or trunk build alike) only when its archive is
+    byte-for-byte the one its SOURCE FEED publishes: `.nupkg.metadata` → `source` names the feed's v3
+    service index, and the host reads the published hash the documented v3 way (service index →
+    `RegistrationsBaseUrl` → registration leaf → `catalogEntry` → `packageHash`, SHA512 — over the
+    .nupkg as served, a signed package's repository signature included, so it is compared with the
+    archive's SHA-512, not the metadata's contentHash). A mismatch REFUSES the package; so does a source
+    that cannot be verified (a local folder, not a v3 feed, plain http, no hash published, a 404, a
+    timeout — each request bounded, the whole check within a budget): refused by name, never promoted.
   * `prepared` (optional, beside `stages`): inputs built from the repository's OWN sources that are
     not the run's subject (MeshWeaver.Plugins' module-libraries shelf and Razor build extension,
     `MW_BUILD_MODULE_LIBS` / `MW_BUILD_EXTENSIONS`). The host keys each with the repository's own
@@ -176,6 +185,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
+import gzip
 import json
 import os
 import queue
@@ -185,6 +196,7 @@ import select
 import shutil
 import signal
 import socket
+import unicodedata
 import ssl
 import stat
 import struct
@@ -809,13 +821,17 @@ def nuget_package_problem(pkg_dir: str, pid: str, ver: str) -> Optional[str]:
     return None
 
 
-def materialize_nuget_package(pkg_dir: str, pid: str, ver: str, dest: str) -> None:
+def materialize_nuget_package(pkg_dir: str, pid: str, ver: str, dest: str, expected_sha512: Optional[str] = None) -> None:
     """Rebuild a VERIFIED package folder at `dest` from its archive alone: the .nupkg, its .sha512 and .nupkg.metadata
     (re-written from the verified values), and every archive entry NuGet extracts (the nuspec under its lower-case
-    id) — nothing a stage left beside them. Raises ValueError for an entry that would leave `dest`."""
+    id) — nothing a stage left beside them. Raises ValueError for an entry that would leave `dest`, and — given
+    `expected_sha512`, the hash the source feed published — for an archive whose bytes are not those (read once here,
+    so what is written is what was compared)."""
     nupkg = f"{pid}.{ver}.nupkg"
     with open(os.path.join(pkg_dir, nupkg), "rb") as fh:
         data = fh.read()
+    if expected_sha512 is not None and base64.b64encode(hashlib.sha512(data).digest()).decode() != expected_sha512:
+        raise ValueError("its archive is not the one its source feed publishes")
     with open(os.path.join(pkg_dir, ".nupkg.metadata")) as fh:
         meta = json.load(fh)
     os.makedirs(dest)
@@ -842,6 +858,188 @@ def materialize_nuget_package(pkg_dir: str, pid: str, ver: str, dest: str) -> No
         out_meta["source"] = meta["source"]
     with open(os.path.join(dest, ".nupkg.metadata"), "w") as fh:
         json.dump(out_meta, fh, indent=2)
+
+
+# PROVENANCE: a package enters the shared warm cache only when its archive is byte-for-byte the one its SOURCE FEED
+# publishes (MeshWeaver.Plugins#4493). The checks above prove the archive is consistent with ITSELF (its .sha512, its
+# content hash); a self-consistent archive under a real id/version that did not come from the feed would pass them.
+# NuGet records where a package came from in `.nupkg.metadata` → `source` (the feed's v3 service index URL). The feed's
+# published hash is read the documented v3 way: the service index → its `RegistrationsBaseUrl` resource → the
+# registration LEAF `{base}/{lower id}/{lower version}.json` → its `catalogEntry` → `packageHash` (base64) with
+# `packageHashAlgorithm` SHA512. That hash is over the .nupkg FILE as the feed serves it — a signed package's
+# repository signature included — which is exactly the archive NuGet keeps in the global-packages folder, so it is
+# compared with the archive's SHA-512 (never with the metadata's contentHash, which excludes a signature). A package
+# whose feed cannot be asked or publishes no hash — a local-folder source, a feed that is not v3, an answer that is not
+# one, a timeout, a 404 — is REFUSED, by name: never promoted on a missing answer.
+NUGET_FEED_TIMEOUT_SECONDS = 20
+NUGET_FEED_MAX_BYTES = 16 << 20
+NUGET_FEED_WORKERS = 8
+NUGET_FEED_BUDGET_SECONDS = 600
+# WHICH feeds may vouch for a package: `.nupkg.metadata` → `source` is written by the restore inside the stage, so a
+# stage could name a feed it controls that publishes its forged archive's hash. The source must therefore be one the
+# HOST trusts, configured independently of anything a stage writes: MW_NUGET_TRUSTED_SOURCES (service-index URLs,
+# separated by whitespace or commas), nuget.org's when unset. A package from any other source is refused, by name.
+NUGET_TRUSTED_SOURCES_ENV = "MW_NUGET_TRUSTED_SOURCES"
+NUGET_DEFAULT_TRUSTED_SOURCES = ("https://api.nuget.org/v3/index.json",)
+NUGET_REGISTRATION_TYPES = ("RegistrationsBaseUrl/3.6.0", "RegistrationsBaseUrl/3.4.0", "RegistrationsBaseUrl/3.0.0-rc",
+                            "RegistrationsBaseUrl/3.0.0-beta", "RegistrationsBaseUrl")
+
+
+def nuget_trusted_sources(env: dict) -> tuple:
+    """The service-index URLs this host lets vouch for a package (NUGET_TRUSTED_SOURCES_ENV, else nuget.org's)."""
+    raw = env.get(NUGET_TRUSTED_SOURCES_ENV, "")
+    found = tuple(x for x in re.split(r"[\s,]+", raw) if x)
+    return found or NUGET_DEFAULT_TRUSTED_SOURCES
+
+
+def _source_key(url: str) -> str:
+    """A feed URL compared case-insensitively in scheme and host, without a trailing slash."""
+    u = urllib.parse.urlsplit(url.strip())
+    return urllib.parse.urlunsplit((u.scheme.lower(), u.netloc.lower(), u.path.rstrip("/"), u.query, ""))
+
+
+class HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows a feed's redirect only to another https URL: urllib would follow https → http, and an answer read over
+    plain http could vouch for a package with nobody authenticated."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme != "https":
+            raise ValueError(f"refused a redirect to a non-https URL: {newurl[:200]}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def feed_opener() -> urllib.request.OpenerDirector:
+    """The opener every feed request goes through: redirects only to https (HttpsOnlyRedirect)."""
+    return urllib.request.build_opener(HttpsOnlyRedirect)
+
+
+def read_bounded(r, deadline: float, limit: int, clock: Callable[[], float] = time.monotonic) -> bytes:
+    """Read `r` to its end, refusing past `limit` bytes and past the ABSOLUTE `deadline`: the socket timeout bounds
+    each read, not a response that keeps trickling bytes, so without this a worker could outlive any budget."""
+    chunks: list = []
+    size = 0
+    while True:
+        if clock() >= deadline:
+            raise TimeoutError("the answer did not complete within its deadline")
+        chunk = r.read(64 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > limit:
+            return b"".join(chunks)
+
+
+def feed_get(url: str, timeout: float) -> bytes:
+    """GET one NuGet v3 document over HTTPS — redirects only to https (`feed_opener`) — bounded in time (`timeout`
+    per socket operation AND as an absolute deadline over the whole body, `read_bounded`) and size
+    (NUGET_FEED_MAX_BYTES, after gzip too: nuget.org serves its semver2 registration hive gzip-encoded). Raises on any
+    failure."""
+    if urllib.parse.urlsplit(url).scheme != "https":
+        raise ValueError(f"not an https URL: {url[:200]}")
+    deadline = time.monotonic() + timeout
+    req = urllib.request.Request(url, headers={"Accept": "application/json", "Accept-Encoding": "gzip",
+                                               "User-Agent": "meshweaver-build-host"})
+    with feed_opener().open(req, timeout=timeout) as r:
+        if urllib.parse.urlsplit(r.geturl()).scheme != "https":
+            raise ValueError(f"the answer came from a non-https URL: {r.geturl()[:200]}")
+        data = read_bounded(r, deadline, NUGET_FEED_MAX_BYTES)
+        gz = (r.headers.get("Content-Encoding") or "").lower() == "gzip"
+    if len(data) > NUGET_FEED_MAX_BYTES:
+        raise ValueError(f"the answer exceeds {NUGET_FEED_MAX_BYTES} bytes: {url[:200]}")
+    if gz:
+        with gzip.GzipFile(fileobj=io.BytesIO(data)) as g:
+            data = g.read(NUGET_FEED_MAX_BYTES + 1)
+        if len(data) > NUGET_FEED_MAX_BYTES:
+            raise ValueError(f"the decompressed answer exceeds {NUGET_FEED_MAX_BYTES} bytes: {url[:200]}")
+    return data
+
+
+class NugetFeeds:
+    """The hash each package's SOURCE FEED publishes, read through `get(url, timeout) -> bytes` (`feed_get`; the
+    self-test injects a stand-in, never the network). One service index read per source; every answer must be https,
+    and the source must be one of `trusted` (nuget_trusted_sources — the host's configuration, never the package's)."""
+
+    def __init__(self, get: Callable[[str, float], bytes] = feed_get,
+                 trusted: Sequence[str] = NUGET_DEFAULT_TRUSTED_SOURCES) -> None:
+        self.get = get
+        self.trusted = frozenset(_source_key(t) for t in trusted)
+        self.bases: dict = {}
+        self.lock = threading.Lock()
+
+    def _json(self, url: str) -> object:
+        return json.loads(self.get(url, NUGET_FEED_TIMEOUT_SECONDS))
+
+    def _registrations(self, source: str) -> str:
+        with self.lock:
+            if source in self.bases:
+                return self.bases[source]
+        doc = self._json(source)
+        res = doc.get("resources") if isinstance(doc, dict) else None
+        found = {}
+        for r in res if isinstance(res, list) else []:
+            types = r.get("@type") if isinstance(r, dict) else None
+            for t in (types if isinstance(types, list) else [types]):
+                if isinstance(t, str) and isinstance(r.get("@id"), str):
+                    found.setdefault(t, r["@id"])
+        base = next((found[t] for t in NUGET_REGISTRATION_TYPES if t in found), None)
+        if base is None:
+            raise ValueError("its service index names no RegistrationsBaseUrl resource")
+        with self.lock:
+            self.bases[source] = base
+        return base
+
+    def published_hash(self, source: object, pid: str, ver: str) -> str:
+        """The base64 SHA-512 `source` publishes for `pid`/`ver`. Raises ValueError (naming why) when it cannot be
+        read — the caller then refuses the package."""
+        if not isinstance(source, str) or urllib.parse.urlsplit(source).scheme != "https" \
+                or not source.rstrip("/").lower().endswith("index.json"):
+            raise ValueError(f"its source {str(source)[:120]!r} is not a NuGet v3 feed this host can verify")
+        if _source_key(source) not in self.trusted:
+            raise ValueError(f"its source {source[:120]!r} is not a feed this host trusts ({NUGET_TRUSTED_SOURCES_ENV})")
+        try:
+            base = self._registrations(source)
+            leaf = self._json(f"{base.rstrip('/')}/{urllib.parse.quote(pid.lower())}/{urllib.parse.quote(ver.lower())}.json")
+            entry = leaf.get("catalogEntry") if isinstance(leaf, dict) else None
+            if isinstance(entry, str):
+                entry = self._json(entry)
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            raise ValueError(f"its source feed could not be asked ({type(e).__name__}: {str(e)[:160]})")
+        if not isinstance(entry, dict):
+            raise ValueError("its source feed's registration names no catalog entry")
+        def bare(v: object) -> str:     # build metadata never names another package (and the folder drops it)
+            return str(v).split("+", 1)[0].lower()
+        if str(entry.get("id", "")).lower() != pid.lower() or bare(entry.get("version", "")) != bare(ver):
+            raise ValueError("its source feed's catalog entry names another package")
+        algo, h = entry.get("packageHashAlgorithm"), entry.get("packageHash")
+        if not isinstance(h, str) or not h or str(algo).upper() != "SHA512":
+            raise ValueError("its source feed publishes no SHA512 package hash")
+        return h
+
+    def published_hashes(self, wanted: Sequence[tuple[str, object, str, str]],
+                         budget: float = NUGET_FEED_BUDGET_SECONDS) -> dict:
+        """{key: hash or ValueError} for every (key, source, id, version), asked NUGET_FEED_WORKERS at a time; one not
+        answered within `budget` seconds is a ValueError too. Every request is itself bounded (feed_get)."""
+        out: dict = {}
+        if not wanted:
+            return out
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=NUGET_FEED_WORKERS)
+        try:
+            futs = {pool.submit(self.published_hash, src, pid, ver): key for key, src, pid, ver in wanted}
+            done, _ = concurrent.futures.wait(futs, timeout=budget)
+            for f, key in futs.items():
+                if f not in done:
+                    out[key] = ValueError(f"its source feed did not answer within {int(budget)} s")
+                    continue
+                try:
+                    out[key] = f.result()
+                except ValueError as e:
+                    out[key] = e
+                except Exception as e:   # never an unverdicted promotion: anything else is a refusal too
+                    out[key] = ValueError(f"its source feed could not be asked ({type(e).__name__})")
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        return out
 
 
 PREPARED_OUTPUT_TAIL = 64 * 1024
@@ -943,15 +1141,22 @@ def quarantine_artifacts(root: str, before: dict, dest: str) -> list[str]:
     return sorted(moved)
 
 
-def promote_nuget(restored: str, cache: str, log: Callable[[str], None]) -> tuple[int, int, list[str]]:
+def promote_nuget(restored: str, cache: str, log: Callable[[str], None],
+                  feeds: Optional[NugetFeeds] = None,
+                  budget: float = NUGET_FEED_BUDGET_SECONDS) -> tuple[int, int, list[str]]:
     """Promote the packages a TRUNK build stage restored into the shared warm NuGet cache
     (`<cache>/nuget/<id>/<version>/`, the stages' read-only fallback folder), so the next run restores
-    nothing. Each verified (`nuget_package_problem`), REBUILT from its verified archive in a temp dir
-    (`materialize_nuget_package`) and renamed into place; a
-    package already present is kept (a NuGet id/version is immutable). Returns (promoted, kept, refused)."""
+    nothing. Each verified (`nuget_package_problem`), compared with the hash its SOURCE FEED publishes
+    (`NugetFeeds.published_hash` — a mismatch, or no answer, refuses it), REBUILT from its verified archive in a temp
+    dir (`materialize_nuget_package`) and renamed into place; a
+    package already present is kept (a NuGet id/version is immutable). The feed is asked within `budget` seconds —
+    the caller passes what its RUN has left, so verification never overruns the run; with none left nothing is asked
+    and every candidate is refused (retried by a later run). Returns (promoted, kept, refused)."""
+    feeds = feeds or NugetFeeds()
     root = os.path.join(cache, "nuget")
     os.makedirs(root, exist_ok=True)
     promoted, kept, refused = 0, 0, []
+    candidates: list[tuple[str, object, str, str]] = []
     for entry in sorted(nuget_packages(restored)):
         pid, ver = entry.split("/", 1)
         final = os.path.join(root, pid, ver)
@@ -962,10 +1167,37 @@ def promote_nuget(restored: str, cache: str, log: Callable[[str], None]) -> tupl
         if why:
             refused.append(f"{entry} ({why})")
             continue
+        try:
+            with open(os.path.join(restored, pid, ver, ".nupkg.metadata")) as fh:
+                source = json.load(fh).get("source")
+        except (OSError, ValueError, AttributeError) as e:
+            refused.append(f"{entry} (its source cannot be read: {e})")
+            continue
+        candidates.append((entry, source, pid, ver))
+    budget = min(budget, NUGET_FEED_BUDGET_SECONDS)
+    published = feeds.published_hashes(candidates, budget) if budget > 0 else \
+        {entry: ValueError("the run had no time left to ask its source feed") for entry, _s, _p, _v in candidates}
+    for entry, _source, pid, ver in candidates:
+        final = os.path.join(root, pid, ver)
+        answer = published.get(entry, ValueError("its source feed was not asked"))
+        if isinstance(answer, ValueError):
+            refused.append(f"{entry} ({answer})")
+            continue
+        # The .sha512 was proved to be the archive's own hash (nuget_package_problem); materialize re-hashes the bytes
+        # it actually copies against the same answer, so a swap between the two reads is refused too.
+        try:
+            with open(os.path.join(restored, pid, ver, f"{pid}.{ver}.nupkg.sha512")) as fh:
+                archive_hash = fh.read().strip()
+        except OSError as e:
+            refused.append(f"{entry} (unreadable ({e}))")
+            continue
+        if archive_hash != answer:
+            refused.append(f"{entry} (its archive is not the one its source feed publishes)")
+            continue
         os.makedirs(os.path.join(root, pid), exist_ok=True)
         tmp = tempfile.mkdtemp(prefix=f".{ver}-", dir=os.path.join(root, pid))
         try:
-            materialize_nuget_package(os.path.join(restored, pid, ver), pid, ver, os.path.join(tmp, "p"))
+            materialize_nuget_package(os.path.join(restored, pid, ver), pid, ver, os.path.join(tmp, "p"), answer)
             os.rename(os.path.join(tmp, "p"), final)
             promoted += 1
         except (OSError, ValueError, zipfile.BadZipFile, KeyError, RuntimeError, zlib.error, EOFError) as e:
@@ -1469,6 +1701,25 @@ RUN_MARGIN_SECONDS = 600
 PREPARED_KEY_SECONDS = 300
 
 
+def claim_labels(claim: dict) -> Optional[str]:
+    """The claim's `labels` (the pull request's live labels, carried from the admission by the operations instance) as
+    the comma-separated `MW_BUILD_LABELS` a stage's selectors pass to `ci-change-set.py --labels`; None when the claim
+    carries none or a malformed list — the variable is then left UNSET, so the stage says it was not told rather than
+    classifying an unknown set as known-none. An empty list is "" (known to be none)."""
+    raw = claim.get("labels")
+    # NO count cap: the claim's set is the UNION of every request naming the commit (one build per commit, however many
+    # pull requests name it), so it may hold more than one pull request's 100 — dropping it would drop a `full-run`.
+    # Each name is still a valid label name (validated per request by the instance as well).
+    if not isinstance(raw, list):
+        return None
+    names = []
+    for n in raw:
+        if not isinstance(n, str) or not n.strip() or len(n) > 50 or "," in n or any(unicodedata.category(c) == "Cc" for c in n):
+            return None
+        names.append(n.strip())
+    return ",".join(sorted(set(names)))
+
+
 def run_budget_seconds(stages: list[dict], deadline: float, prepared: Sequence[dict] = (), trunk: bool = True,
                        warm_minutes: float = 0.0, slots: int = 1) -> int:
     """The run's effective budget: the selected stages' summed caps + each declared prepared input's build cap
@@ -1936,7 +2187,11 @@ def read_worker_token(env: dict) -> str:
 ENV_ALLOW = ("PATH", "LANG", "LC_ALL", "TZ", "DOTNET_ROOT", "DOTNET_CLI_TELEMETRY_OPTOUT", "DOTNET_NOLOGO",
              "DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "SSL_CERT_FILE", "SSL_CERT_DIR", "MeshWeaverRefs",
              "MW_BUILD_GATE_HOST", "MW_BUILD_PORTAL_DOTNET", "MW_BUILD_MODULE_LIBS", "MW_BUILD_EXTENSIONS",
-             "MW_BUILD_COMPILE_REFS")
+             "MW_BUILD_COMPILE_REFS",
+             # The image's headless browser (deploy/build-host/Dockerfile): core's `test` shards export
+             # MESHWEAVER_CHROMIUM_PATH for the tests, so the renderer resolves THAT binary, never another
+             # browser on the machine; a stage gets the same three facts the image declares.
+             "MESHWEAVER_CHROMIUM_PATH", "CHROME_BIN", "PLAYWRIGHT_BROWSERS_PATH")
 SCRATCH = "/scratch"
 
 # THE COMPILE REFERENCE SET, PREPARED ONCE PER ROLL (the `portal` init container of
@@ -2613,8 +2868,11 @@ class Host:
                  git_runner: Callable[[list[str], dict], tuple[int, str]] = None,
                  sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic,
-                 capacity: Callable[[], "tuple[float, Optional[int]] | str"] = None) -> None:
+                 capacity: Callable[[], "tuple[float, Optional[int]] | str"] = None,
+                 nuget_feeds: Optional[NugetFeeds] = None) -> None:
         self.env = env
+        # Where a package promoted into the warm NuGet cache is checked against its source feed (promote_nuget).
+        self.nuget_feeds = nuget_feeds or NugetFeeds(trusted=nuget_trusted_sources(env))
         self.api = api
         self.log = log or (lambda s: print(f"build-run: {s}", flush=True))
         self.pull = pull or (lambda cmd: subprocess.run(cmd).returncode)
@@ -3080,6 +3338,11 @@ class Host:
                 "MW_PLUGINS_KEY": self.effective_plugins_key(),
                 **self.platform_env(),
             }
+            # The pull request's LIVE labels, as the admission's change set read them and the claim carries them: a
+            # host holds no credential to read them, so a stage classifies with these or with none (said by the stage).
+            labels = claim_labels(claim)
+            if labels is not None:
+                extra["MW_BUILD_LABELS"] = labels
             # A stage is skipped only when a stage it runs AFTER failed (`after`); its independent siblings still
             # run. `failed` holds every red stage — ran red or was skipped — so a skip propagates to the skipped
             # stage's own dependants. `why` is a RUN-WIDE stop (a prepared input, the run deadline) that ends every
@@ -3195,7 +3458,8 @@ class Host:
                 # promote_nuget keeps a package the warm cache already holds. A build stage runs ALONE, so nothing
                 # writes the folder while it is promoted.
                 if ok and trunk and st["kind"] == "build" and nuget_packages(nuget_dir):
-                    np_, nk, nr = promote_nuget(nuget_dir, self.cache, self.log)
+                    np_, nk, nr = promote_nuget(nuget_dir, self.cache, self.log, self.nuget_feeds,
+                                                budget=run_end - self.clock())
                     sink.add([{"kind": "line", "text": f"warm NuGet cache: {np_} package(s) promoted, {nk} already present"
                                                        + (f", {len(nr)} NOT promoted (unverified)" if nr else "")}])
                     self.deliver(sink)
@@ -3517,8 +3781,9 @@ class Host:
                                                [os.path.join(self.cache, "git", f"{repo}.git"), os.path.join(self.cache, "nuget")],
                                                writable, min(left, plan["timeoutMinutes"] * 60))
             # Every package fetched came from the TIP's own sources by the TIP's own command, so even a failed restore's
-            # complete packages may be promoted; each is verified against what NuGet recorded and rebuilt from its archive.
-            np_, nk, nr = promote_nuget(fetched, self.cache, self.log)
+            # complete packages may be promoted; each is verified against what NuGet recorded AND against the hash its
+            # source feed publishes, and rebuilt from its archive.
+            np_, nk, nr = promote_nuget(fetched, self.cache, self.log, self.nuget_feeds, budget=run_end - self.clock())
         except (subprocess.SubprocessError, OSError) as e:
             warn(f"the warm NuGet cache was not filled: a host-side failure while warming ({type(e).__name__}: {str(e)[:200]})")
             return
@@ -4250,6 +4515,17 @@ def self_test() -> int:
         if not cond:
             failures.append(f"{name}: {detail}")
 
+    # ── 0. the claim's labels → MW_BUILD_LABELS (None = unset: the stage says it was not told) ─────────
+    check("labels/sorted, de-duplicated, trimmed", claim_labels({"labels": ["tests-before-review", " full-run", "full-run"]}) == "full-run,tests-before-review")
+    check("labels/an empty list is known-none ('')", claim_labels({"labels": []}) == "")
+    union = [f"l{i}" for i in range(160)] + ["full-run"]
+    check("labels/an accumulated union beyond one PR's 100 is handed whole, full-run included",
+          (claim_labels({"labels": union}) or "").split(",").count("full-run") == 1 and len(claim_labels({"labels": union}).split(",")) == 161)
+    check("labels/counted in code points, as GitHub and the instance count them", claim_labels({"labels": ["\U0001F680" * 26]}) == "\U0001F680" * 26)
+    for bad in ({}, {"labels": None}, {"labels": "full-run"}, {"labels": [1]}, {"labels": ["a,b"]}, {"labels": [""]},
+                {"labels": ["x" * 51]}, {"labels": ["a\nb"]}, {"labels": ["full-\x7frun"]}, {"labels": ["full-run\x85"]}):
+        check(f"labels/{str(bad)[:30]} is unknown (None), never a partial set", claim_labels(bad) is None, claim_labels(bad))
+
     # ── 1. compiler diagnostics ─────────────────────────────────────────────────────────────
     p = OutputParser("/work/run1/src", "compile-check")
     ev = p.feed("/work/run1/src/Hosting/Build/Source/BuildApi.cs(41,13): error CS0246: The type or "
@@ -4478,6 +4754,11 @@ def self_test() -> int:
                      {"MW_BUILD_PUBLISH": "false"}, "/cache")
     check("env/allow-list only", set(se) == {"PATH", "MeshWeaverRefs", "HOME", "TMPDIR", "NUGET_PACKAGES",
                                              "NUGET_FALLBACK_PACKAGES", "MW_BUILD_PUBLISH"}, sorted(se))
+    be = sandbox_env({"PATH": "/bin", "MESHWEAVER_CHROMIUM_PATH": "/usr/bin/chromium", "CHROME_BIN": "/usr/bin/chromium",
+                      "PLAYWRIGHT_BROWSERS_PATH": "/opt/ms-playwright"}, {}, "/cache")
+    check("env/the image's browser reaches a stage (core's shards export MESHWEAVER_CHROMIUM_PATH)",
+          be.get("MESHWEAVER_CHROMIUM_PATH") == "/usr/bin/chromium" and be.get("CHROME_BIN") == "/usr/bin/chromium"
+          and be.get("PLAYWRIGHT_BROWSERS_PATH") == "/opt/ms-playwright", sorted(be))
     try:
         sandbox_env({}, {"GITHUB_TOKEN": "t"}, "/cache")
         check("env/credential-shaped extra refused", False, "accepted")
@@ -4777,8 +5058,31 @@ def self_test() -> int:
                "MW_BUILD_READY_FILE": os.path.join(tmp, "ready"), "MW_PLUGINS_REGISTRY": "cr.example.com",
                "MW_BUILD_HOST": "build-latest-0"}
 
+        # THE SOURCE FEED's stand-in — never the network. promote_nuget compares every package with the hash its feed
+        # publishes (service index → registration leaf → catalog leaf); this answers from `feed_hashes`
+        # ("id/version" → base64 SHA-512, or None for a catalog entry that publishes no hash) and 404s anything else.
+        feed_hashes: dict = {}
+
+        def stand_in_feed(url, timeout):
+            if not (0 < timeout <= NUGET_FEED_TIMEOUT_SECONDS):
+                raise ValueError(f"unbounded feed request ({timeout})")
+            if url == "https://api.nuget.org/v3/index.json":
+                return json.dumps({"resources": [{"@id": "https://feed.test/v3/search", "@type": "SearchQueryService"},
+                                                 {"@id": "https://feed.test/reg/", "@type": "RegistrationsBaseUrl/3.6.0"}]}).encode()
+            m_ = re.match(r"^https://feed\.test/(reg|cat)/([^/]+)/([^/]+)\.json$", url)
+            key_ = f"{m_[2]}/{m_[3]}" if m_ else None
+            if key_ not in feed_hashes:
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            if m_[1] == "reg":
+                return json.dumps({"@id": url, "catalogEntry": f"https://feed.test/cat/{m_[2]}/{m_[3]}.json"}).encode()
+            leaf_ = {"id": m_[2].upper(), "version": m_[3]}
+            if feed_hashes[key_] is not None:
+                leaf_.update(packageHash=feed_hashes[key_], packageHashAlgorithm="SHA512")
+            return json.dumps(leaf_).encode()
+
         def host(api, **kw):
             kw.setdefault("pull", pull)
+            kw.setdefault("nuget_feeds", NugetFeeds(stand_in_feed))
             # a pull-request run merges onto a base: a fake git that resolves and merges cleanly
             kw.setdefault("git_runner", lambda args, env_: (0, "e" * 40 + "\n" if "rev-parse" in args else ""))
             return Host(env if "env" not in kw else kw.pop("env"), api, log=lambda s: None, sandbox=_EnvSandbox(),
@@ -5151,6 +5455,18 @@ def self_test() -> int:
         check("run/a fresh process per stage", len(rows) == 2 and rows[0][0] != rows[1][0], rows)
         check("run/publish from the claim", all(r[1] == "true" for r in rows), rows)
         check("run/no credential reaches a stage", all(r[2:] == ["none", "none", "none"] for r in rows), rows)
+        # the claim's labels reach every stage as MW_BUILD_LABELS; a claim without them leaves it UNSET (not told)
+        posted_h6 = list(posted)
+        for lbl, want in ((["full-run", "tests-before-review"], "full-run,tests-before-review"), ([], ""), (None, "unset")):
+            seen_l = os.path.join(tmp, "seen-labels")
+            if os.path.exists(seen_l):
+                os.remove(seen_l)
+            hl = host(api_ev(), env=env_s, checkout=checkout_with({"stages": [
+                {"name": "a", "kind": "test", "command": f"echo \"[${{MW_BUILD_LABELS-unset}}]\" >> {seen_l}"}]}))
+            hl.run(dict(claim) if lbl is None else dict(claim, labels=lbl))
+            got = open(seen_l).read().strip() if os.path.exists(seen_l) else "<stage did not run>"
+            check(f"run/claim labels {lbl!r} reach the stage as MW_BUILD_LABELS={want!r}", got == f"[{want}]", got)
+        posted[:] = posted_h6   # the checks below read h6's own events
         rf_ = [e for _, evs in posted for e in evs if e["kind"] == "run-finished"]
         check("run/green run-finished", rf_ == [{"kind": "run-finished", "succeeded": True, "error": None}], rf_)
         check("run/a PR run's outputs never enter the shared cache",
@@ -5277,6 +5593,153 @@ def self_test() -> int:
         open(os.path.join(nulld_, ".nupkg.metadata"), "w").write(json.dumps({"version": 2, "contentHash": None}))
         check("nuget/negative control: a null contentHash over an unreadable archive is refused, not matched",
               nuget_package_problem(nulld_, "demo.pkg", "1.0.0") is not None, nuget_package_problem(nulld_, "demo.pkg", "1.0.0"))
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(unsigned_)     # what the stand-in feed publishes for the fixture package
+
+        # ── PROVENANCE (MeshWeaver.Plugins#4493): a package is promoted only when its archive is the one its SOURCE FEED
+        # publishes. A FORGED package is self-consistent (its .sha512 and contentHash match its own bytes) — every local
+        # check passes — under the real id/version; only the feed's published hash tells it apart.
+        def restored_pkg(root_, bytes_, source_="https://api.nuget.org/v3/index.json"):
+            d_ = os.path.join(root_, "demo.pkg", "1.0.0")
+            shutil.rmtree(root_, ignore_errors=True)
+            os.makedirs(d_)
+            open(os.path.join(d_, "demo.pkg.1.0.0.nupkg"), "wb").write(bytes_)
+            open(os.path.join(d_, "demo.pkg.1.0.0.nupkg.sha512"), "w").write(b64sha(bytes_))
+            meta_ = {"version": 2, "contentHash": nupkg_content_hash(bytes_)}
+            if source_ is not None:
+                meta_["source"] = source_
+            json.dump(meta_, open(os.path.join(d_, ".nupkg.metadata"), "w"))
+            return root_
+        _fz = io.BytesIO()
+        with zipfile.ZipFile(_fz, "w", zipfile.ZIP_DEFLATED) as z:
+            for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net10.0/Demo.dll", b"NOT-the-published-dll"),
+                           ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
+                z.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_)
+        forged_zip = _fz.getvalue()
+        forged_dir = restored_pkg(os.path.join(tmp, "prov-forged"), forged_zip)
+        check("provenance/the forged package passes every LOCAL check (the case has a subject)",
+              nuget_package_problem(os.path.join(forged_dir, "demo.pkg", "1.0.0"), "demo.pkg", "1.0.0") is None)
+        feeds_ = NugetFeeds(stand_in_feed)
+
+        def promote_into(name_, restored_, feeds__=None):
+            cache_ = os.path.join(tmp, f"prov-cache-{name_}")
+            shutil.rmtree(cache_, ignore_errors=True)
+            said_: list = []
+            res_ = promote_nuget(restored_, cache_, said_.append, feeds__ or feeds_)
+            return res_, nuget_packages(os.path.join(cache_, "nuget")), said_
+        (pf_, kf_, rf_), inf_, saidf_ = promote_into("forged", forged_dir)
+        check("provenance/a FORGED package (self-consistent, not the archive its feed publishes) is REFUSED, by name, "
+              "and is NOT in the shared cache",
+              pf_ == 0 and inf_ == set() and len(rf_) == 1 and rf_[0].startswith("demo.pkg/1.0.0")
+              and "not the one its source feed publishes" in rf_[0] and any("demo.pkg/1.0.0" in m_ for m_ in saidf_),
+              (pf_, inf_, rf_, saidf_))
+        (pg_, _, rg_), ing_, _ = promote_into("good", restored_pkg(os.path.join(tmp, "prov-good"), unsigned_))
+        check("provenance/a package whose archive IS the one its feed publishes is promoted",
+              pg_ == 1 and ing_ == {"demo.pkg/1.0.0"} and rg_ == [], (pg_, ing_, rg_))
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(signed_zip)
+        (ps_, _, rs_), ins_, _ = promote_into("signed", restored_pkg(os.path.join(tmp, "prov-signed"), signed_zip))
+        check("provenance/a SIGNED package is compared by its ARCHIVE hash (the feed's packageHash covers the signature) "
+              "— promoted", ps_ == 1 and ins_ == {"demo.pkg/1.0.0"} and rs_ == [], (ps_, ins_, rs_))
+        feed_hashes["demo.pkg/1.0.0"] = nupkg_content_hash(signed_zip)
+        (_, _, rsc_), insc_, _ = promote_into("signed-content", restored_pkg(os.path.join(tmp, "prov-signed-c"), signed_zip))
+        check("provenance/negative control: a feed hash equal to the signed package's CONTENT hash (not its archive) "
+              "is not a match — refused", insc_ == set() and len(rsc_) == 1, rsc_)
+        # UNVERIFIABLE: fail closed — refused by name, never promoted on a missing answer.
+        good_dir = restored_pkg(os.path.join(tmp, "prov-unv"), unsigned_)
+        feed_hashes["demo.pkg/1.0.0"] = None
+        (_, _, rn_), inn_, _ = promote_into("nohash", good_dir)
+        check("provenance/a feed that publishes NO hash: refused, not in the shared cache",
+              inn_ == set() and len(rn_) == 1 and "publishes no SHA512" in rn_[0], rn_)
+        del feed_hashes["demo.pkg/1.0.0"]
+        (_, _, r404_), in404_, _ = promote_into("404", good_dir)
+        check("provenance/a feed that cannot be asked (404): refused, not in the shared cache",
+              in404_ == set() and len(r404_) == 1 and "could not be asked" in r404_[0], r404_)
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(unsigned_)
+
+        def failing_get(url, timeout):
+            raise socket.timeout("timed out")
+        (_, _, rto_), into_, _ = promote_into("timeout", good_dir, NugetFeeds(failing_get))
+        check("provenance/a feed that times out: refused, not in the shared cache",
+              into_ == set() and len(rto_) == 1 and "could not be asked" in rto_[0], rto_)
+
+        def slow_get(url, timeout):
+            time.sleep(0.5)
+            return stand_in_feed(url, timeout)
+        slow_ = NugetFeeds(slow_get).published_hashes([("demo.pkg/1.0.0", "https://api.nuget.org/v3/index.json",
+                                                        "demo.pkg", "1.0.0")], budget=0.05)
+        check("provenance/the feed is asked within a BOUNDED budget: an answer that comes later is a refusal",
+              isinstance(slow_.get("demo.pkg/1.0.0"), ValueError) and "did not answer" in str(slow_["demo.pkg/1.0.0"]), slow_)
+        for label_, src_ in (("a local-folder source", "/home/x/dist/packages"), ("no recorded source", None),
+                             ("a plain-http feed", "http://api.nuget.org/v3/index.json"),
+                             ("a v2 feed", "https://www.nuget.org/api/v2/")):
+            (_, _, rl_), inl_, _ = promote_into("src", restored_pkg(os.path.join(tmp, "prov-src"), unsigned_, src_))
+            check(f"provenance/{label_}: unverifiable, refused, not in the shared cache",
+                  inl_ == set() and len(rl_) == 1 and "not a NuGet v3 feed this host can verify" in rl_[0], rl_)
+        held_ = os.path.join(tmp, "prov-held")
+        promote_nuget(good_dir, held_, lambda m: None, feeds_)
+        check("provenance/a package the cache already holds is KEPT without asking the feed (an id/version is immutable)",
+              promote_nuget(good_dir, held_, lambda m: None, NugetFeeds(failing_get))[:2] == (0, 1))
+        try:
+            feed_get("http://api.nuget.org/v3/index.json", 1)
+            check("provenance/the real fetch refuses a non-https URL before any request", False, "fetched")
+        except ValueError:
+            pass
+        # A REDIRECT to plain http is refused before it is followed; one to https is followed.
+        rd_ = HttpsOnlyRedirect()
+        rq_ = urllib.request.Request("https://api.nuget.org/v3/index.json")
+        try:
+            rd_.redirect_request(rq_, None, 302, "Found", {}, "http://api.nuget.org/v3/index.json")
+            check("provenance/a redirect from https to http is refused", False, "followed")
+        except ValueError:
+            pass
+        check("provenance/a redirect to another https URL is followed",
+              rd_.redirect_request(rq_, None, 302, "Found", {}, "https://api.nuget.org/v3-flat/index.json") is not None)
+        check("provenance/the real fetch's opener refuses http redirects (HttpsOnlyRedirect is installed)",
+              any(isinstance(h_, HttpsOnlyRedirect) for h_ in feed_opener().handlers))
+        # A body that keeps TRICKLING is cut at the absolute deadline (the socket timeout bounds each read only).
+        clock_ = [0.0]
+
+        class Trickle:
+            def read(self, n_):
+                clock_[0] += 1.0
+                return b"x"
+        try:
+            read_bounded(Trickle(), 5.0, NUGET_FEED_MAX_BYTES, clock=lambda: clock_[0])
+            check("provenance/a trickling answer is cut at its absolute deadline", False, "read to the end")
+        except TimeoutError:
+            check("provenance/a trickling answer is cut at its absolute deadline", clock_[0] <= 6.0, clock_[0])
+        # TRUST is the host's, never the package's: a stage that rewrites BOTH the archive and `source` to a feed it
+        # controls (an https v3 feed that publishes the forged archive's hash) is refused.
+        def rogue_feed(url, timeout):
+            if url == "https://rogue.test/v3/index.json":
+                return json.dumps({"resources": [{"@id": "https://feed.test/reg/", "@type": "RegistrationsBaseUrl/3.6.0"}]}).encode()
+            return stand_in_feed(url, timeout)
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(forged_zip)
+        rogue_dir = restored_pkg(os.path.join(tmp, "prov-rogue"), forged_zip, "https://rogue.test/v3/index.json")
+        (pr_, _, rr_), inr_, _ = promote_into("rogue", rogue_dir, NugetFeeds(rogue_feed))
+        check("provenance/a forged archive whose `source` names a feed the STAGE controls is REFUSED (untrusted source)",
+              pr_ == 0 and inr_ == set() and len(rr_) == 1 and "not a feed this host trusts" in rr_[0], (pr_, inr_, rr_))
+        (pt_, _, _), int_, _ = promote_into("rogue-trusted", rogue_dir,
+                                            NugetFeeds(rogue_feed, trusted=("https://rogue.test/v3/index.json",)))
+        check("provenance/negative control: the same feed, trusted by the HOST's configuration, vouches",
+              pt_ == 1 and int_ == {"demo.pkg/1.0.0"}, (pt_, int_))
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(unsigned_)
+        check("provenance/the trusted sources come from the host's env, nuget.org's when unset",
+              nuget_trusted_sources({}) == NUGET_DEFAULT_TRUSTED_SOURCES
+              and nuget_trusted_sources({NUGET_TRUSTED_SOURCES_ENV: "https://a.test/v3/index.json, https://b.test/index.json"})
+              == ("https://a.test/v3/index.json", "https://b.test/index.json"))
+        check("provenance/a trusted source matches case-insensitively in host, with or without a trailing slash",
+              _source_key("https://API.nuget.org/v3/index.json/") == _source_key("https://api.nuget.org/v3/index.json"))
+        # The RUN's remaining time bounds the verification: with none left the feed is never asked and nothing promoted.
+        asked_: list = []
+
+        def counting_get(url, timeout):
+            asked_.append(url)
+            return stand_in_feed(url, timeout)
+        (pb_, _, rb_), inb_, _ = (promote_nuget(good_dir, os.path.join(tmp, "prov-cache-nobudget"), lambda m: None,
+                                                NugetFeeds(counting_get), budget=0),
+                                  nuget_packages(os.path.join(tmp, "prov-cache-nobudget", "nuget")), None)
+        check("provenance/no run time left: the feed is not asked, the package is refused (retried by a later run)",
+              pb_ == 0 and inb_ == set() and asked_ == [] and len(rb_) == 1 and "no time left" in rb_[0], (pb_, inb_, asked_, rb_))
 
         def pkg_fixture(kind_: str) -> str:
             root_ = os.path.join(tmp, f"pkg-{kind_}")
@@ -5291,7 +5754,8 @@ def self_test() -> int:
             open(os.path.join(d_, "lib", "net10.0", "Demo.dll"), "wb").write(b"POISONED" if kind_ == "tamper" else b"the-real-dll")
             if kind_ == "tamper":
                 open(os.path.join(d_, "lib", "net10.0", "Extra.targets"), "w").write("<Project/>")
-            json.dump({"version": 2, "contentHash": "forged" if kind_ == "forged" else nupkg_content_hash(b_)},
+            json.dump({"version": 2, "contentHash": "forged" if kind_ == "forged" else nupkg_content_hash(b_),
+                       "source": "https://api.nuget.org/v3/index.json"},
                       open(os.path.join(d_, ".nupkg.metadata"), "w"))
             return f"cp -R {root_}/. \"$NUGET_PACKAGES\"/"
         warm = os.path.join(cache, "nuget", "demo.pkg", "1.0.0")
@@ -5309,15 +5773,27 @@ def self_test() -> int:
               and sorted(os.listdir(warm)) == [".nupkg.metadata", "demo.pkg.1.0.0.nupkg", "demo.pkg.1.0.0.nupkg.sha512", "demo.pkg.nuspec", "lib"],
               sorted(os.listdir(warm)) if os.path.isdir(warm) else None)
         shutil.rmtree(os.path.join(cache, "nuget"))
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(signed_zip)     # the feed serves the SIGNED archive
         host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("signed")}]})).run(dict(claim, isTrunk=True))
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(unsigned_)
         check("prepared/a SIGNED package (content hash != archive hash) is promoted, its signature extracted as NuGet does",
               os.path.isfile(os.path.join(warm, ".nupkg.metadata")) and os.path.isfile(os.path.join(warm, NUGET_SIGNATURE)))
         shutil.rmtree(os.path.join(cache, "nuget"))
+        # The feed publishes EACH fixture's own archive hash, so provenance PASSES and the refusal under test is the
+        # materialisation's (RuntimeError / zlib.error) — never a provenance mismatch standing in for it.
+        for kind_, zip_ in (("encrypted", encrypted_zip), ("corrupt", corrupt_zip)):
+            feed_hashes["demo.pkg/1.0.0"] = b64sha(zip_)
+            (pm_, _, rm_), inm_, _ = promote_into(f"mat-{kind_}", restored_pkg(os.path.join(tmp, f"prov-mat-{kind_}"), zip_))
+            check(f"provenance/the {kind_} fixture passes provenance and is refused by MATERIALISATION",
+                  pm_ == 0 and inm_ == set() and len(rm_) == 1 and "could not be moved into place" in rm_[0], rm_)
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(encrypted_zip)
         host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("encrypted")}]})).run(dict(claim, isTrunk=True))
         check("prepared/negative control: an ENCRYPTED package (valid hashes, unreadable entry) is refused, never a crash",
               not os.path.exists(warm))
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(corrupt_zip)
         host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("corrupt")}]})).run(dict(claim, isTrunk=True))
         check("prepared/negative control: a CORRUPT-DEFLATE package (valid hashes) is refused, never a crash", not os.path.exists(warm))
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(unsigned_)
         shutil.rmtree(os.path.join(cache, "nuget"), ignore_errors=True)
         host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": "true"}]})).run(dict(claim, isTrunk=True))
         check("prepared/a fresh cache gets <cache>/nuget before any stage runs, with NO prepared inputs declared",
@@ -6816,7 +7292,24 @@ def self_test() -> int:
                     self.end_headers()
                     self.wfile.write(payload)
                     self.wfile.flush()
-                    self.close_connection = True      # the body is never read
+                    self.close_connection = True      # the body is never USED — only discarded, below
+                    # A LINGERING close, as a real server makes one (Kestrel, nginx): the answer is sent BEFORE the
+                    # body is read, then the body is read and thrown away until the client hangs up. An ABORTIVE close
+                    # here — close() with the body still unread — makes the kernel answer with a RST that DISCARDS this
+                    # server's own still-unsent answer (Linux tcp_close, data_was_unread), so the client met an EOF
+                    # with no 413 at all: no client can read an answer that was never transmitted, and the check went
+                    # red on runners whenever the answer was still queued (Deploy main, 2026-10-29: `(0, 'EOF occurred
+                    # in violation of protocol')`). Bounded by the declared length and by the upload's own budget.
+                    self.connection.settimeout(30)
+                    left_ = int(self.headers.get("Content-Length", "0"))
+                    try:
+                        while left_ > 0:
+                            chunk = self.rfile.read1(min(left_, 1 << 16))
+                            if not chunk:
+                                break
+                            left_ -= len(chunk)
+                    except OSError:
+                        pass                          # the client read the answer and hung up: the drain is over
                     return
                 n = int(self.headers.get("Content-Length", "0"))
                 tls_got["body"] = self.rfile.read(n)

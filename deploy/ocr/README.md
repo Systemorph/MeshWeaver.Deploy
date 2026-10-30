@@ -34,7 +34,7 @@ comma-separated and may be repeated. The answer always uses ISO 639-1 codes, mos
 | 415 | not an image, or a non-image `Content-Type` |
 | 422 | a hint with no baked pack; the error names the installed ones |
 | 503 | every admission place (`limits.maxAdmitted`) is taken, refused before the body is read; or every slot (`limits.concurrency`) stayed busy for the whole deadline |
-| 504 | the read did not finish within `limits.timeoutSeconds`; the Tesseract process is killed |
+| 504 | the request did not finish within `limits.timeoutSeconds`. That ONE deadline starts when the request is admitted and covers the upload too, so a client that trickles its body is cut off and its admission place freed; a read still running is killed |
 
 Every refusal is JSON `{"error": "…"}`. The client treats any non-200 as `Failed`.
 

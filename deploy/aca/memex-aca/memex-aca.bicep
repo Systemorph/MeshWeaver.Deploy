@@ -7,6 +7,8 @@ param tags object = { }
 
 param memex_aca_acr_outputs_name string
 
+var resourceToken = uniqueString(resourceGroup().id)
+
 resource memex_aca_mi 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' = {
   name: take('memex_aca_mi-${uniqueString(resourceGroup().id)}', 128)
   location: location
@@ -68,7 +70,7 @@ resource aspireDashboard 'Microsoft.App/managedEnvironments/dotNetComponents@202
 }
 
 resource memex_aca_storageVolume 'Microsoft.Storage/storageAccounts@2024-01-01' = {
-  name: take('memexacastoragevolume${uniqueString(resourceGroup().id)}', 24)
+  name: take('memexacasv${resourceToken}', 24)
   kind: 'StorageV2'
   location: location
   sku: {
@@ -87,7 +89,7 @@ resource storageVolumeFileService 'Microsoft.Storage/storageAccounts/fileService
 }
 
 resource shares_volumes_memex_postgres_0 'Microsoft.Storage/storageAccounts/fileServices/shares@2024-01-01' = {
-  name: take('sharesvolumesmemexpostgres0-${uniqueString(resourceGroup().id)}', 63)
+  name: take('${toLower('memex-postgres')}-${toLower('memexpgdata')}', 60)
   properties: {
     enabledProtocols: 'SMB'
     shareQuota: 1024
@@ -96,7 +98,7 @@ resource shares_volumes_memex_postgres_0 'Microsoft.Storage/storageAccounts/file
 }
 
 resource managedStorage_volumes_memex_postgres_0 'Microsoft.App/managedEnvironments/storages@2025-07-01' = {
-  name: take('managedstoragevolumesmemexpostgres${uniqueString(resourceGroup().id)}', 24)
+  name: 'memex-pgdat-45911a-${resourceToken}'
   properties: {
     azureFile: {
       accountName: memex_aca_storageVolume.name
@@ -109,7 +111,7 @@ resource managedStorage_volumes_memex_postgres_0 'Microsoft.App/managedEnvironme
 }
 
 resource shares_volumes_memex_portal_0 'Microsoft.Storage/storageAccounts/fileServices/shares@2024-01-01' = {
-  name: take('sharesvolumesmemexportal0-${uniqueString(resourceGroup().id)}', 63)
+  name: take('${toLower('memex-portal')}-${toLower('memexportaldata')}', 60)
   properties: {
     enabledProtocols: 'SMB'
     shareQuota: 1024
@@ -118,7 +120,7 @@ resource shares_volumes_memex_portal_0 'Microsoft.Storage/storageAccounts/fileSe
 }
 
 resource managedStorage_volumes_memex_portal_0 'Microsoft.App/managedEnvironments/storages@2025-07-01' = {
-  name: take('managedstoragevolumesmemexportal${uniqueString(resourceGroup().id)}', 24)
+  name: 'data-f01d18-${resourceToken}'
   properties: {
     azureFile: {
       accountName: memex_aca_storageVolume.name
@@ -131,7 +133,7 @@ resource managedStorage_volumes_memex_portal_0 'Microsoft.App/managedEnvironment
 }
 
 resource shares_volumes_memex_portal_1 'Microsoft.Storage/storageAccounts/fileServices/shares@2024-01-01' = {
-  name: take('sharesvolumesmemexportal1-${uniqueString(resourceGroup().id)}', 63)
+  name: take('${toLower('memex-portal')}-${toLower('memexportalcontent')}', 60)
   properties: {
     enabledProtocols: 'SMB'
     shareQuota: 1024
@@ -140,7 +142,7 @@ resource shares_volumes_memex_portal_1 'Microsoft.Storage/storageAccounts/fileSe
 }
 
 resource managedStorage_volumes_memex_portal_1 'Microsoft.App/managedEnvironments/storages@2025-07-01' = {
-  name: take('managedstoragevolumesmemexportal${uniqueString(resourceGroup().id)}', 24)
+  name: 'content-783a85-${resourceToken}'
   properties: {
     azureFile: {
       accountName: memex_aca_storageVolume.name
@@ -152,11 +154,35 @@ resource managedStorage_volumes_memex_portal_1 'Microsoft.App/managedEnvironment
   parent: memex_aca
 }
 
+resource shares_volumes_memex_portal_2 'Microsoft.Storage/storageAccounts/fileServices/shares@2024-01-01' = {
+  name: take('${toLower('memex-portal')}-${toLower('memexportalusers')}', 60)
+  properties: {
+    enabledProtocols: 'SMB'
+    shareQuota: 1024
+  }
+  parent: storageVolumeFileService
+}
+
+resource managedStorage_volumes_memex_portal_2 'Microsoft.App/managedEnvironments/storages@2025-07-01' = {
+  name: 'users-d0af47-${resourceToken}'
+  properties: {
+    azureFile: {
+      accountName: memex_aca_storageVolume.name
+      accountKey: memex_aca_storageVolume.listKeys().keys[0].value
+      accessMode: 'ReadWrite'
+      shareName: shares_volumes_memex_portal_2.name
+    }
+  }
+  parent: memex_aca
+}
+
 output volumes_memex_postgres_0 string = managedStorage_volumes_memex_postgres_0.name
 
 output volumes_memex_portal_0 string = managedStorage_volumes_memex_portal_0.name
 
 output volumes_memex_portal_1 string = managedStorage_volumes_memex_portal_1.name
+
+output volumes_memex_portal_2 string = managedStorage_volumes_memex_portal_2.name
 
 output AZURE_LOG_ANALYTICS_WORKSPACE_NAME string = memex_aca_law.name
 

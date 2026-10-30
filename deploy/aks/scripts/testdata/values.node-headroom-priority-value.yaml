@@ -1,0 +1,5 @@
+# test-node-headroom.sh: refused - the PriorityClass is infra-declared, so the chart takes no priority value.
+nodeHeadroom:
+  priority: -10
+  pools:
+    - { pool: silos, cpu: "4", memory: "8Gi" }

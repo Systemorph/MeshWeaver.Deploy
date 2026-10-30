@@ -18,11 +18,10 @@ __pycache__/
 # macOS
 .DS_Store
 
-# A real `.env` is deployment configuration — hosts, database names, keys. `deploy/.env.example`
-# is the documented surface and is tracked; the filled-in copy beside a compose file never is
-# (moved here with deploy/compose and deploy/compose-ha from the platform repository).
+# A real `.env` is deployment configuration — hosts, database names, keys. The generated
+# `.env.example` beside each compose file is tracked; the filled-in `.env` beside it never is
+# (deploy/GENERATED-TARGETS.md).
 .env
-!deploy/.env.example
 # The compose topology's bind-mounted runtime data.
 deploy/compose/data/
 deploy/compose-ha/data/

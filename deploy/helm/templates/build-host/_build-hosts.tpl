@@ -31,6 +31,16 @@ The refusals, and why each one exists:
 {{- if not (or (hasPrefix "https://" $api) (and (hasPrefix "http://" $api) $local)) -}}
 {{- fail (printf "buildHosts.apiUrl %q must be https, or http to a cluster-local host — the worker token rides on it" $api) -}}
 {{- end -}}
+{{- /* The URL the KEDA trigger polls. KEDA sends that request from ITS OWN namespace (the AKS add-on runs keda-operator
+       in kube-system), where a bare Service name such as `memex-portal-service` resolves to nothing: every poll then
+       errors, the HPA never moves, and the Deployment stays at the one replica it was created with, whatever the
+       demand and maxReplicas say. So a bare name is qualified with the release's namespace here. The hosts run in
+       that namespace and keep the URL as given. Only a host that IS a Service name (one DNS label) is qualified:
+       `localhost`, dotted hosts and IP literals (an IPv6 `[…]` included) are left alone. */ -}}
+{{- $scalerApi := $api -}}
+{{- if and (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $host) (ne $host "localhost") -}}
+{{- $scalerApi = regexReplaceAll "^([a-z]+://)([^/:]+)" $api (printf "${1}${2}.%s.svc.cluster.local" .Release.Namespace) -}}
+{{- end -}}
 {{- $runnerRepo := required "buildHosts.runnerRepository is required when buildHosts.enabled — the mw-build-host image (bash, python3, git, bubblewrap, the .NET SDK, build-run.py); each channel names its digest" $b.runnerRepository -}}
 {{- $testerRepo := required "buildHosts.testerRepository is required when buildHosts.enabled (e.g. cr.example.com/mw-plugin-test)" $b.testerRepository -}}
 {{- $portalRepo := required "buildHosts.portalRepository is required when buildHosts.enabled (e.g. cr.example.com/memex-portal-ai)" $b.portalRepository -}}
@@ -170,7 +180,21 @@ The refusals, and why each one exists:
 {{- if lt $max 1 -}}
 {{- fail (printf "buildHosts.%s.maxReplicas must be at least 1" $name) -}}
 {{- end -}}
-{{- $channels = append $channels (dict "name" $name "platformVersion" $pv "maxReplicas" $max
+{{- /* The declared FLOOR (the record's BuildHostChannel.MinReplicas; core Doc/Architecture/BuildHosts → "Declared host floor").
+       hasKey, not `default`: an explicit 0 is the scale-to-zero default, never "unset". */ -}}
+{{- $min := 0 -}}
+{{- if hasKey $c "minReplicas" -}}
+{{- /* Whole number FIRST, as stageSlots: `int` truncates, so -0.5 would read as 0 and 2.9 as 2 and pass the range check
+       below as a floor nobody declared (review of #101). */ -}}
+{{- if not (regexMatch "^-?[0-9]+$" (toString $c.minReplicas)) -}}
+{{- fail (printf "buildHosts.%s.minReplicas %v must be a whole number between 0 and the channel's maxReplicas" $name $c.minReplicas) -}}
+{{- end -}}
+{{- $min = int $c.minReplicas -}}
+{{- end -}}
+{{- if or (lt $min 0) (gt $min $max) -}}
+{{- fail (printf "buildHosts.%s.minReplicas %d must be between 0 and the channel's maxReplicas %d" $name $min $max) -}}
+{{- end -}}
+{{- $channels = append $channels (dict "name" $name "platformVersion" $pv "maxReplicas" $max "minReplicas" $min
       "tester" (printf "%s@%s" $testerRepo $c.testerDigest) "portal" (printf "%s@%s" $portalRepo $c.portalDigest)
       "runner" (printf "%s@%s" $runnerRepo $c.runnerDigest)
       "testerDigest" $c.testerDigest "portalDigest" $c.portalDigest "runnerDigest" $c.runnerDigest
@@ -232,7 +256,7 @@ The refusals, and why each one exists:
 {{- if gt (len $dns) 63 -}}
 {{- fail (printf "buildHosts.versions[%s] makes the name %q, longer than a DNS label's 63 characters" $ver $dns) -}}
 {{- end -}}
-{{- $channels = append $channels (dict "name" $ver "platformVersion" $ver "maxReplicas" $max
+{{- $channels = append $channels (dict "name" $ver "platformVersion" $ver "maxReplicas" $max "minReplicas" 0
       "tester" (printf "%s@%s" $testerRepo $v.testerDigest) "portal" (printf "%s@%s" $portalRepo $v.portalDigest)
       "runner" (printf "%s@%s" $runnerRepo $v.runnerDigest)
       "testerDigest" $v.testerDigest "portalDigest" $v.portalDigest "runnerDigest" $v.runnerDigest
@@ -268,7 +292,7 @@ The refusals, and why each one exists:
 {{- end -}}
 {{- $np := ($b.networkPolicy | default dict) -}}
 {{- $wi := ($b.workloadIdentity | default dict) -}}
-{{- toYaml (dict "enabled" true "sharedName" $shared "apiUrl" $api "tokenSecret" $tokName "tokenKey" $tokKey
+{{- toYaml (dict "enabled" true "sharedName" $shared "apiUrl" $api "scalerApiUrl" $scalerApi "tokenSecret" $tokName "tokenKey" $tokKey
       "workloadIdentityClientId" (trim ($wi.clientId | default ""))
       "cacheClaim" $cache "cache" $cacheCreate "imagePullSecret" ($b.imagePullSecret | default "")
       "pluginsRegistry" ($b.pluginsRegistry | default "") "pluginsSource" ($b.pluginsSource | default "plugins")

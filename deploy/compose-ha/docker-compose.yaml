@@ -26,7 +26,7 @@ services:
     networks:
       - "aspire"
   memex-migration:
-    image: "ghcr.io/systemorph/memex-migration:latest"
+    image: "cr.meshweaver.cloud/memex-migration:latest"
     environment:
       ConnectionStrings__memex: "Host=memex-postgres;Port=5432;Username=postgres;Password=${MEMEX_POSTGRES_PASSWORD};Database=memex"
       MEMEX_HOST: "memex-postgres"
@@ -36,13 +36,21 @@ services:
       MEMEX_URI: "postgresql://postgres:${MEMEX_POSTGRES_PASSWORD}@memex-postgres:5432/memex"
       MEMEX_JDBCCONNECTIONSTRING: "jdbc:postgresql://memex-postgres:5432/memex"
       MEMEX_DATABASENAME: "memex"
+      ConnectionStrings__orleans: "Host=memex-postgres;Port=5432;Username=postgres;Password=${MEMEX_POSTGRES_PASSWORD};Database=orleans"
+      ORLEANS_HOST: "memex-postgres"
+      ORLEANS_PORT: "5432"
+      ORLEANS_USERNAME: "postgres"
+      ORLEANS_PASSWORD: "${MEMEX_POSTGRES_PASSWORD}"
+      ORLEANS_URI: "postgresql://postgres:${MEMEX_POSTGRES_PASSWORD}@memex-postgres:5432/orleans"
+      ORLEANS_JDBCCONNECTIONSTRING: "jdbc:postgresql://memex-postgres:5432/orleans"
+      ORLEANS_DATABASENAME: "orleans"
     depends_on:
       memex-postgres:
         condition: "service_started"
     networks:
       - "aspire"
   memex-portal:
-    image: "ghcr.io/systemorph/memex-portal-ai:latest"
+    image: "cr.meshweaver.cloud/memex-portal-ai:latest"
     environment:
       ConnectionStrings__memex: "Host=memex-postgres;Port=5432;Username=postgres;Password=${MEMEX_POSTGRES_PASSWORD};Database=memex"
       MEMEX_HOST: "memex-postgres"
@@ -52,26 +60,48 @@ services:
       MEMEX_URI: "postgresql://postgres:${MEMEX_POSTGRES_PASSWORD}@memex-postgres:5432/memex"
       MEMEX_JDBCCONNECTIONSTRING: "jdbc:postgresql://memex-postgres:5432/memex"
       MEMEX_DATABASENAME: "memex"
+      ConnectionStrings__orleans: "Host=memex-postgres;Port=5432;Username=postgres;Password=${MEMEX_POSTGRES_PASSWORD};Database=orleans"
+      ORLEANS_HOST: "memex-postgres"
+      ORLEANS_PORT: "5432"
+      ORLEANS_USERNAME: "postgres"
+      ORLEANS_PASSWORD: "${MEMEX_POSTGRES_PASSWORD}"
+      ORLEANS_URI: "postgresql://postgres:${MEMEX_POSTGRES_PASSWORD}@memex-postgres:5432/orleans"
+      ORLEANS_JDBCCONNECTIONSTRING: "jdbc:postgresql://memex-postgres:5432/orleans"
+      ORLEANS_DATABASENAME: "orleans"
+      Deployment__Record: "{\"namespace\":\"memex\",\"imageRepository\":\"cr.meshweaver.cloud/memex-portal-ai\",\"isPluginRegistry\":false,\"pluginRepos\":[],\"preInstall\":[],\"defaultGrants\":[],\"requiredModules\":[],\"requiredModulesAuthoritative\":false,\"helmRelease\":\"memex\",\"replicas\":2,\"gracePeriodDays\":0,\"inClusterPostgres\":false,\"volumes\":[{\"name\":\"data\",\"claimName\":\"memex-data\",\"mountPath\":\"/data\",\"create\":false,\"readOnly\":false},{\"name\":\"content\",\"claimName\":\"memex-content\",\"mountPath\":\"/mnt/content\",\"create\":false,\"readOnly\":false},{\"name\":\"users\",\"claimName\":\"memex-users\",\"mountPath\":\"/mnt/users\",\"create\":false,\"readOnly\":false}],\"keyVaultSecretClasses\":[],\"vaultValuesKeys\":[],\"inlineEnv\":[],\"gates\":[],\"secretMounts\":[],\"signIn\":{\"enableDevLogin\":false},\"orleansClustering\":\"AdoNet\",\"requiredModuleSlots\":{},\"webhookInboxTargets\":[],\"webhookInbox\":[],\"extraPortalConfig\":{},\"features\":{}}"
       ASPNETCORE_HTTP_PORTS: "8080"
+      Authentication__EnableDevLogin: "false"
+      Authentication__Provider: "Custom"
       Deployment__Backend: "Filesystem"
       Deployment__DataRoot: "/data"
       Deployment__Orleans__Clustering: "AdoNet"
+      Graph__Storage__BasePath: "/data/graph"
+      Graph__Storage__Type: "PostgreSql"
+      Modules__Root: "/data"
+      SelfUpdate__MinRollInterval: "01:00:00"
+      SelfUpdate__Registry: "cr.meshweaver.cloud"
+      Storage__BasePath: "/mnt/content"
       Storage__Name: "content"
       Storage__SourceType: "FileSystem"
-      Storage__BasePath: "/data/content"
-      Graph__Storage__Type: "PostgreSql"
-      Graph__Storage__BasePath: "/data/graph"
       Mcp__BaseUrl: "http://memex-portal:8080"
+      Features__Orleans__Clustering: "AdoNet"
+      Ai__KeyProtection__MasterKey: "${KEY_PROTECTION_MASTER_KEY}"
+    env_file:
+      - ".env"
     ports:
       - "8080"
     volumes:
       - type: "volume"
         target: "/data"
-        source: "memex-data"
+        source: "memex-portal-data"
+        read_only: false
+      - type: "volume"
+        target: "/mnt/content"
+        source: "memex-portal-content"
         read_only: false
       - type: "volume"
         target: "/mnt/users"
-        source: "memex-users"
+        source: "memex-portal-users"
         read_only: false
     depends_on:
       memex-postgres:
@@ -87,7 +117,9 @@ networks:
 volumes:
   memex-pgdata:
     driver: "local"
-  memex-data:
+  memex-portal-data:
     driver: "local"
-  memex-users:
+  memex-portal-content:
+    driver: "local"
+  memex-portal-users:
     driver: "local"

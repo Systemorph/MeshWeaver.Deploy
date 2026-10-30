@@ -1178,8 +1178,11 @@ helm_deploy() {
   #    Self-registry mode keeps today's per-source "<name>/*" entries, assembled below.
   local mode_args=()
   if registry_mode; then
-    mode_args=(-f "$REGISTRY_FILE" --set-json 'pluginCatalog.installByDefault=[]')
+    # The tracked registry-mode layer first (self-update from the public GHCR, MeshWeaver.Deploy#65),
+    # then the per-install registry file. Both are -f layers, so the user's overlay still wins.
+    mode_args=(-f "$share_dir/values.local.registry-mode.yaml" -f "$REGISTRY_FILE" --set-json 'pluginCatalog.installByDefault=[]')
     info "REGISTRY MODE: consuming $(registry_url) as instance '$(registry_instance_id)' — no checkout is mounted; the wizard's selection decides what installs"
+    info "REGISTRY MODE: the portal self-updates from the public ghcr.io/systemorph/memex-portal-ai (no credential sent, no pull secret)"
   else
     mode_args=(-f "$share_dir/values.local.self-registry.yaml")
   fi

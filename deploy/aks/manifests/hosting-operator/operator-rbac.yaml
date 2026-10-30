@@ -141,6 +141,17 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
     verbs: ["get"]
+  # READ-ONLY and CLUSTER-SCOPED, for hosting-deploy's PriorityClass preflight. A PriorityClass is
+  # INFRA-DECLARED (Systemorph/Memex deployments/aks/cluster-bootstrap/, applied by the governed
+  # InfraDeploy) and the chart only REFERENCES one (templates/node-headroom/: `node-headroom`). The
+  # preflight reads each referenced class BEFORE helm and refuses by name when it is absent, instead
+  # of a placeholder Deployment whose pods are rejected by admission with nothing in the release.
+  # `get` only — NO create/update/patch/delete, deliberately: write on priorityclasses would let a
+  # compromised Job mint a high-priority or globalDefault class and preempt every portal. What the
+  # grant discloses: the name, value and description of a class the preflight names, nothing else.
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["get"]
   # For hosting-pv-purge, the Teardown step that releases the Retain-policy PersistentVolumes a
   # deleted namespace leaves behind. PVs are cluster-scoped, so this is the one cluster-scoped
   # DELETE in the file; the script lists by the claim's namespace label, reads each PV's phase,

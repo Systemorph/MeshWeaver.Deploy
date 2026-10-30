@@ -132,6 +132,18 @@ selfUpdate:
   # Without it an instance on the fleet registry boots fine and then never self-updates — every
   # check fails with "no plugin registry is configured on that host".
   registryValidationUrl: ""
+  # 🚨 IS `registry` A PUBLIC REGISTRY? (MeshWeaver.Deploy#65) Default FALSE. True declares that
+  # `registry` lists tags and serves pulls to a caller presenting NO credential — ghcr.io for the
+  # public systemorph/memex-portal-ai package. The self-updater then lists through the anonymous
+  # token flow (the realm is asked for a pull bearer with no Authorization header) and NEVER
+  # resolves or sends this installation's instance key, whatever pluginCatalog holds for that host;
+  # `registryValidationUrl` is not read. A public registry needs no portal.imagePullSecret either.
+  # memex-local sets it in registry mode (registry: ghcr.io), because a local install has no managed
+  # identity for ACR and the mwi_ key cr.meshweaver.cloud checks is minted inside the pod.
+  # A declaration, never an inference: false keeps the keyed rule above exactly. Needs a platform
+  # that carries SelfUpdate:RegistryIsPublic; an older image ignores the key and refuses the listing
+  # by name (no plugin registry on that host), so it sends nothing.
+  registryIsPublic: false
 # ---- Required secrets (Systemorph/Memex#204) ---------------------------------
 # Per-key statement of whether an EMPTY value is legal. EMPTY BY DEFAULT — this enforces exactly
 # what a deployment declares and nothing otherwise.
@@ -400,6 +412,25 @@ hostingOperator:
 # the shared NodeType records name files in it (MeshWeaver#6052).
 replicas:
   portal: 1
+
+# ---- Node-pool headroom: one spare slot per pool (Memex#863) ------------------
+# A portal rolls surge-first (maxSurge 1 / maxUnavailable 0), so its surge pod needs a free slot;
+# on a pool at its autoscaler maximum it stayed Pending and the roll deadlocked. Each entry of
+# `pools` renders a Deployment of `pause` containers on that pool, under the negative-priority
+# PriorityClass `node-headroom`: a real pod that cannot otherwise schedule PREEMPTS a placeholder
+# and lands in its slot at once, and the evicted placeholder goes Pending, which makes the cluster
+# autoscaler add a node for it (below the pool's maxCount). The placeholder is cluster-scoped in
+# effect, so ONE release declares it — the control instance's record (`nodeHeadroom`, rendered by
+# HelmValues); every other release leaves `pools` empty and renders nothing. The cost is the slot:
+# it stays idle. Doc: core Doc/Architecture/DeploymentAKS → "A spare slot per node pool".
+nodeHeadroom:
+  # The placeholders run under PriorityClass `node-headroom` (value -10: below every real workload,
+  # and at the cluster autoscaler's expendable cutoff, so an evicted placeholder still gets a node).
+  # The class is INFRA-DECLARED — Systemorph/Memex deployments/aks/cluster-bootstrap/, applied by the
+  # governed InfraDeploy — and the chart only references it; there is no priority value here.
+  image: "mcr.microsoft.com/oss/kubernetes/pause:3.10@sha256:2b5d81a9d7f04299f45ed1b6822de018188f463914fcbf5592f39087c9adead1"
+  # [{ pool: silos, cpu: "4", memory: "8Gi", replicas: 1 }] — pool = the AKS agentpool name.
+  pools: []
 # ---- Key Vault secrets, DECLARED (renders the SecretProviderClass) ---------
 # The portal's secrets live in Azure Key Vault and reach the pod through the
 # secrets-store CSI driver: a SecretProviderClass names the vault objects, the
@@ -579,7 +610,7 @@ keda:
   # (waiting jobs per pod), a scaling target, not an admission bound — nothing waits on it.
   queueDepth:
     enabled: false
-    url: ""                  # default http://memex-portal-service:8080/api/queues/depth
+    url: ""                  # default http://memex-portal-service.<release namespace>.svc.cluster.local:8080/api/queues/depth (KEDA polls from its own namespace)
     waitingPerReplica: 4
 # ---- External Ollama (local self-host) ------------------------------------
 # Front a host-native Ollama with an in-cluster Service so the portal addresses

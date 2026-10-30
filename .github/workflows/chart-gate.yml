@@ -210,6 +210,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: deploy/aks/scripts/test-build-hosts.sh
 
+      # The node-pool headroom (templates/node-headroom/, Memex#863): the defaults render nothing (the
+      # negative control), a declared pool renders one negative, non-preempting PriorityClass and one
+      # pinned requests==limits placeholder, and the refusals hold. No cluster, no network.
+      - name: Assert the node-pool headroom renders one placeholder per declared pool and nothing by default
+        if: ${{ !cancelled() }}
+        run: deploy/aks/scripts/test-node-headroom.sh
+
       - name: Assert observability installation refuses ephemeral or unverified storage
         if: ${{ !cancelled() }}
         run: python3 deploy/aks/scripts/test-observability-storage.py

@@ -625,6 +625,19 @@ case "$body" in
     ok "helm_deploy layers the registry file OR the self-registry defaults, by mode" ;;
   *) bad "helm_deploy layers the registry file OR the self-registry defaults, by mode" "$body" ;;
 esac
+# MeshWeaver.Deploy#65: registry mode also layers the tracked self-update layer (public GHCR, no
+# credential, canPatch) BEFORE the per-install registry file, so that file and the overlay still win.
+case "$body" in
+  *"values.local.registry-mode.yaml"*'-f "$REGISTRY_FILE"'*)
+    ok "helm_deploy layers the registry-mode self-update values before the registry file" ;;
+  *) bad "helm_deploy layers the registry-mode self-update values before the registry file" "$body" ;;
+esac
+SHARE_DIR_T="$(cd "$(dirname "$CLI")/../share" && pwd)"
+if grep -q '^  registry: "ghcr.io"' "$SHARE_DIR_T/values.local.registry-mode.yaml" \
+   && grep -q '^  registryIsPublic: true' "$SHARE_DIR_T/values.local.registry-mode.yaml" \
+   && grep -q '^  canPatch: true' "$SHARE_DIR_T/values.local.registry-mode.yaml"; then
+  ok "the registry-mode layer self-updates from public ghcr.io and may patch itself"
+else bad "the registry-mode layer self-updates from public ghcr.io and may patch itself" "$(cat "$SHARE_DIR_T/values.local.registry-mode.yaml")"; fi
 # 🚨 In registry mode the chart's installByDefault ["Plugins/*"] must be CLEARED (2026-10-27, the
 # maintainer's laptop): the registry source is named by its URL, so the chart's pattern names a
 # source the install does not have — `[DefaultInstall] 1 InstallByDefault pattern(s) name a source
@@ -632,7 +645,7 @@ esac
 # wildcard. The wizard's manifest decides; self-registry mode keeps its per-source "<name>/*" entries.
 # shellcheck disable=SC2016  # the single-quoted text is the source being searched for
 case "$body" in
-  *'mode_args=(-f "$REGISTRY_FILE" --set-json '"'"'pluginCatalog.installByDefault=[]'"'"')'*)
+  *'mode_args=(-f "$share_dir/values.local.registry-mode.yaml" -f "$REGISTRY_FILE" --set-json '"'"'pluginCatalog.installByDefault=[]'"'"')'*)
     ok "helm_deploy clears the chart's installByDefault in registry mode (the wizard decides)" ;;
   *) bad "helm_deploy clears the chart's installByDefault in registry mode (the wizard decides)" "no --set-json clear in the registry_mode arm: $body" ;;
 esac

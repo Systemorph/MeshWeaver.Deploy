@@ -1,0 +1,4 @@
+# test-node-headroom.sh: refused - fewer than one replica (remove the entry instead).
+nodeHeadroom:
+  pools:
+    - { pool: silos, cpu: "4", memory: "8Gi", replicas: 0 }

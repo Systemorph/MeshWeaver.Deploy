@@ -1,0 +1,5 @@
+# test-node-headroom.sh: refused - one entry per pool.
+nodeHeadroom:
+  pools:
+    - { pool: silos, cpu: "4", memory: "8Gi" }
+    - { pool: silos, cpu: "2", memory: "4Gi" }

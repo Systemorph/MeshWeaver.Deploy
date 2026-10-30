@@ -10,7 +10,8 @@
 #      estate changes until its record turns the hosts on;
 #   3. the fixture renders, per enabled channel, a Deployment with no `replicas` (KEDA owns it),
 #      images by DIGEST, the ci-build toleration + nodeSelector, the worker token from a Secret, the
-#      build-cache claim, readiness on the staged marker, and a ScaledObject with minReplicaCount 0,
+#      build-cache claim, readiness on the staged marker, and a ScaledObject with minReplicaCount = the
+#      channel's declared floor (minReplicas, default 0),
 #      the channel's maxReplicaCount and a metrics-api trigger on <apiUrl>/queue?channel=<c> with
 #      valueLocation demand and a scale-down stabilization window, the worker token as a mounted
 #      FILE (never env), grace = the run deadline, no credential volume but that one and no bake
@@ -100,6 +101,16 @@ browser_problems() {
     || p+=("PLAYWRIGHT_BROWSERS_PATH / CHROME_BIN are not set")
   grep -q 'setpriv --reuid=1654' "$f" && grep -q -- '--print-to-pdf=' "$f" && grep -q '"%PDF"' "$f" \
     || p+=("no smoke print as uid 1654")
+  # THE ACTIONS SHARDS' browser (core's owes item "browser"): the version core's dotnet-test.yml provisions
+  # must equal the portal's, every package of core's .github/chromium-fonts.list must be installed, and the
+  # binary the shards export to the tests (MESHWEAVER_CHROMIUM_PATH) is declared and reaches a stage.
+  grep -q '.github/workflows/dotnet-test.yml' "$f" && grep -q '\[ "$a" != "$v" \]' "$f" \
+    || p+=("the Playwright version is not cross-checked against core's Actions test shards (dotnet-test.yml)")
+  grep -q '.github/chromium-fonts.list' "$f" && grep -q 'dpkg-query' "$f" \
+    && grep -q 'fonts-liberation fonts-noto-color-emoji' "$f" \
+    || p+=("the installed fonts are not checked against core's .github/chromium-fonts.list")
+  grep -q '^ENV MESHWEAVER_CHROMIUM_PATH=/usr/bin/chromium$' "$f" \
+    || p+=("MESHWEAVER_CHROMIUM_PATH (what core's shards export to the tests) is not set")
   local inst user
   inst="$(grep -n 'install --with-deps --only-shell chromium' "$f" | head -1 | cut -d: -f1)"
   user="$(grep -n '^USER 1654' "$f" | head -1 | cut -d: -f1)"
@@ -124,7 +135,15 @@ bmutant "fonts-local.conf not installed" 's#cp /opt/build-host/browser/fonts-loc
 bmutant "amd64-only lookup" 's# -o -name chrome-headless-shell##'
 bmutant "installed after USER 1654" '/^ENV PLAYWRIGHT_BROWSERS_PATH/i\
 USER 1654'
+bmutant "no Actions version cross-check" 's#\[ "$a" != "$v" \]#false#'
+bmutant "no font-list check" 's#dpkg-query#true#'
+bmutant "no MESHWEAVER_CHROMIUM_PATH" '/^ENV MESHWEAVER_CHROMIUM_PATH/d'
 rm -rf "$BMUT"
+if grep -q '"MESHWEAVER_CHROMIUM_PATH", "CHROME_BIN", "PLAYWRIGHT_BROWSERS_PATH"' "$REPO/.github/scripts/build-run.py"; then
+  ok "build-run.py hands the image's browser (MESHWEAVER_CHROMIUM_PATH, CHROME_BIN, PLAYWRIGHT_BROWSERS_PATH) to every stage"
+else
+  report "build-run.py's ENV_ALLOW drops the image's browser variables — a stage's renderer would not resolve the image's browser as core's shards do"
+fi
 if python3 "$REPO/.github/scripts/build-run.py" --self-test; then
   ok "build-run.py passes its self-test"
 else
@@ -160,8 +179,9 @@ mine = [d for d in docs if (d.get("metadata", {}).get("labels") or {}).get("app.
 problems = []
 def find(kind, name):
     return next((d for d in mine if d["kind"] == kind and d["metadata"]["name"] == name), None)
-want = {"latest": ("1111", "2222", "5555", 2, "3.1.10412"), "stable": ("3333", "4444", "6666", 1, "3.1.10388")}
-for ch, (tester, portal, runner, mx, pv) in want.items():
+# latest declares a floor of 1 (the record's BuildHostChannel.MinReplicas); stable states none, so it scales to zero.
+want = {"latest": ("1111", "2222", "5555", 2, "3.1.10412", 1), "stable": ("3333", "4444", "6666", 1, "3.1.10388", 0)}
+for ch, (tester, portal, runner, mx, pv, mn) in want.items():
     dep = find("Deployment", f"build-host-{ch}")
     so = find("ScaledObject", f"build-host-{ch}-scaler")
     if not dep or not so:
@@ -169,6 +189,10 @@ for ch, (tester, portal, runner, mx, pv) in want.items():
     spec = dep["spec"]
     if "replicas" in spec:
         problems.append(f"{ch}: Deployment renders spec.replicas beside a ScaledObject")
+    # DRAIN, THEN REPLACE (Memex#863/#885): a surge pod needs capacity beyond a full ci-build pool and stays
+    # Pending, so a surge-first roll never removes the old replica and the set change never lands.
+    if spec.get("strategy") != {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}}:
+        problems.append(f"{ch}: the roll is not drain-then-replace (maxSurge 0 / maxUnavailable 1): {spec.get('strategy')}")
     pod = spec["template"]["spec"]
     inits = {c["name"]: c for c in pod.get("initContainers", [])}
     if not inits.get("tester", {}).get("image", "").endswith("@sha256:" + tester * 16):
@@ -279,14 +303,17 @@ for ch, (tester, portal, runner, mx, pv) in want.items():
     if any("bake" in v["name"] for v in pod.get("volumes", [])):
         problems.append(f"{ch}: a bake share is mounted")
     s = so["spec"]
-    if s.get("minReplicaCount") != 0 or s.get("maxReplicaCount") != mx:
-        problems.append(f"{ch}: ScaledObject min/max {s.get('minReplicaCount')}/{s.get('maxReplicaCount')} != 0/{mx}")
+    if s.get("minReplicaCount") != mn or s.get("maxReplicaCount") != mx:
+        problems.append(f"{ch}: ScaledObject min/max {s.get('minReplicaCount')}/{s.get('maxReplicaCount')} != {mn}/{mx} — min is the record's declared floor")
     if s.get("scaleTargetRef", {}).get("name") != f"build-host-{ch}":
         problems.append(f"{ch}: ScaledObject targets {s.get('scaleTargetRef')}")
     trig = [t for t in s.get("triggers", []) if t.get("type") == "metrics-api"]
-    url = f"http://memex-portal-service:8080/api/builds/queue?channel={ch}"
+    url = f"http://memex-portal-service.check.svc.cluster.local:8080/api/builds/queue?channel={ch}"  # KEDA polls from its own namespace
     if len(trig) != 1 or trig[0]["metadata"].get("url") != url or trig[0]["metadata"].get("valueLocation") != "demand":
         problems.append(f"{ch}: not ONE metrics-api trigger on {url} valueLocation demand: {trig}")
+    # The HOST keeps the URL as given — it runs in this namespace; only KEDA (another namespace) needs it qualified.
+    if env.get("BUILD_API", {}).get("value") != "http://memex-portal-service:8080/api/builds":
+        problems.append(f"{ch}: the host's BUILD_API must stay the apiUrl as given: {env.get('BUILD_API')}")
     win = s.get("advanced", {}).get("horizontalPodAutoscalerConfig", {}).get("behavior", {}).get("scaleDown", {}).get("stabilizationWindowSeconds")
     if win != 300:
         problems.append(f"{ch}: scale-down stabilization window {win} != 300")
@@ -378,7 +405,7 @@ for v, alias, mx in want:
     if sel.get("meshweaver.io/build-version") != v:
         problems.append(f"{v}: the selector does not pin the version (two versions' pods would mix): {sel}")
     s = so["spec"]
-    url = f"http://memex-portal-service:8080/api/builds/queue?version={v}"
+    url = f"http://memex-portal-service.check.svc.cluster.local:8080/api/builds/queue?version={v}"
     trig = s.get("triggers", [{}])[0].get("metadata", {}).get("url")
     if trig != url or s.get("maxReplicaCount") != int(mx) or s.get("scaleTargetRef", {}).get("name") != n:
         problems.append(f"{v}: ScaledObject not demand-by-version {url} / max {mx} / target {n}: {trig} {s.get('maxReplicaCount')}")
@@ -703,6 +730,31 @@ else
   report "spec api: did not render:"; sed 's/^/    /' "$WORK/upload-spec.err"
 fi
 
+# 3g. the KEDA trigger URL: KEDA polls from its OWN namespace, so a bare Service name is qualified with the release's
+#     namespace (the fixture above pins that case); every other host — a dotted name, an IPv6 literal, localhost — is
+#     polled exactly as given. NEGATIVE CONTROL: the fixture's bare name IS rewritten, so the check can see a rewrite.
+scaler_url() {  # $1 = apiUrl → prints the latest channel's trigger URL, or nothing
+  helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --namespace check \
+    --set-string "buildHosts.apiUrl=$1" 2> "$WORK/scaler.err" \
+  | python3 -c '
+import sys, yaml
+for d in yaml.safe_load_all(sys.stdin):
+    if d and d.get("kind") == "ScaledObject" and d["metadata"]["name"] == "build-host-latest-scaler":
+        print(d["spec"]["triggers"][0]["metadata"]["url"])'
+}
+scaler_bad=0
+for case in \
+  "http://memex-portal-service:8080/api/builds|http://memex-portal-service.check.svc.cluster.local:8080/api/builds/queue?channel=latest" \
+  "http://memex-portal-service.other.svc.cluster.local:8080/api/builds|http://memex-portal-service.other.svc.cluster.local:8080/api/builds/queue?channel=latest" \
+  "https://[2001:db8::1]:8080/api/builds|https://[2001:db8::1]:8080/api/builds/queue?channel=latest" \
+  "http://localhost:8080/api/builds|http://localhost:8080/api/builds/queue?channel=latest"; do
+  got="$(scaler_url "${case%%|*}")"
+  if [ "$got" != "${case#*|}" ]; then
+    report "apiUrl ${case%%|*}: KEDA trigger URL is '${got}', want '${case#*|}'"; sed 's/^/    /' "$WORK/scaler.err"; scaler_bad=1
+  fi
+done
+[ "$scaler_bad" = 0 ] && ok "the KEDA trigger qualifies a bare Service name with the release namespace, and leaves dotted, IPv6 and localhost hosts as given"
+
 # 4. refusals
 for entry in \
   "values.build-hosts-tag-not-digest.yaml|must be a sha256:<64 hex> digest" \
@@ -722,6 +774,10 @@ for entry in \
   "values.build-hosts-versions-old-runner.yaml|versionedRunner is not true" \
   "values.build-hosts-trailing-dash.yaml|ending in a letter or digit" \
   "values.build-hosts-zero-replicas.yaml|maxReplicas must be at least 1" \
+  "values.build-hosts-floor-above-ceiling.yaml|minReplicas 3 must be between 0 and the channel's maxReplicas 2" \
+  "values.build-hosts-negative-floor.yaml|minReplicas -1 must be between 0" \
+  "values.build-hosts-fractional-floor-neg-half.yaml|minReplicas -0.5 must be a whole number" \
+  "values.build-hosts-fractional-floor-above-ceiling.yaml|minReplicas 2.9 must be a whole number" \
   "values.build-hosts-name-collision.yaml|one deployment per name" \
   "values.build-hosts-cache-no-class.yaml|buildHosts.cache.storageClass is required" \
   "values.build-hosts-bad-extra-channel.yaml|not latest, stable or probe*" \
