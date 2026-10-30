@@ -1,0 +1,91 @@
+{{- $h := .Values.nodeHeadroom | default dict }}
+{{- $pools := $h.pools | default list }}
+{{- if $pools }}
+{{- if ge (int $h.priority) 0 }}
+{{- fail (printf "nodeHeadroom.priority %v must be negative: a placeholder at or above a real workload's priority cannot be preempted by it" $h.priority) }}
+{{- end }}
+---
+# Node-pool headroom (Memex#863; core Doc/Architecture/DeploymentAKS → "A spare slot per node pool"):
+# cluster-autoscaler overprovisioning. A placeholder holds one portal-sized slot per declared pool; a
+# real pod that cannot otherwise schedule preempts it, and the autoscaler adds a node for the evicted
+# placeholder, so a surge-first roll always finds room below the pool's maxCount.
+apiVersion: "scheduling.k8s.io/v1"
+kind: "PriorityClass"
+metadata:
+  name: "node-headroom"
+  labels:
+    app.kubernetes.io/name: "{{ .Chart.Name }}"
+    app.kubernetes.io/component: "node-headroom"
+    app.kubernetes.io/instance: "{{ .Release.Name }}"
+value: {{ int $h.priority }}
+globalDefault: false
+# A placeholder never preempts anything itself; it only waits for a node.
+preemptionPolicy: "Never"
+description: "Placeholder pods that hold a spare slot per node pool; every real workload preempts them."
+{{- $seen := dict }}
+{{- range $i, $p := $pools }}
+{{- $pool := required (printf "nodeHeadroom.pools[%d].pool is required" $i) $p.pool | toString }}
+{{- if not (regexMatch "^[a-z][a-z0-9]{0,11}$" $pool) }}
+{{- fail (printf "nodeHeadroom.pools[%d].pool '%s' is not a node pool name" $i $pool) }}
+{{- end }}
+{{- if hasKey $seen $pool }}
+{{- fail (printf "nodeHeadroom.pools[%d].pool '%s' is declared twice" $i $pool) }}
+{{- end }}
+{{- $_ := set $seen $pool true }}
+{{- $cpu := required (printf "nodeHeadroom.pools[%d].cpu is required" $i) $p.cpu | toString }}
+{{- $memory := required (printf "nodeHeadroom.pools[%d].memory is required" $i) $p.memory | toString }}
+{{- $replicas := ternary $p.replicas 1 (hasKey $p "replicas") | int }}
+{{- if lt $replicas 1 }}
+{{- fail (printf "nodeHeadroom.pools[%d].replicas must be at least 1" $i) }}
+{{- end }}
+---
+apiVersion: "apps/v1"
+kind: "Deployment"
+metadata:
+  name: "node-headroom-{{ $pool }}"
+  labels:
+    app.kubernetes.io/name: "{{ $.Chart.Name }}"
+    app.kubernetes.io/component: "node-headroom"
+    app.kubernetes.io/instance: "{{ $.Release.Name }}"
+    meshweaver.io/node-pool: {{ $pool | quote }}
+spec:
+  replicas: {{ $replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: "node-headroom"
+      app.kubernetes.io/instance: "{{ $.Release.Name }}"
+      meshweaver.io/node-pool: {{ $pool | quote }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: "{{ $.Chart.Name }}"
+        app.kubernetes.io/component: "node-headroom"
+        app.kubernetes.io/instance: "{{ $.Release.Name }}"
+        meshweaver.io/node-pool: {{ $pool | quote }}
+    spec:
+      priorityClassName: "node-headroom"
+      # Evicted at once on preemption: the slot is the point, nothing runs in it.
+      terminationGracePeriodSeconds: 0
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.azure.com/agentpool: {{ $pool | quote }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65535
+        runAsGroup: 65535
+        seccompProfile: { type: "RuntimeDefault" }
+      containers:
+        - name: "pause"
+          image: {{ $h.image | quote }}
+          imagePullPolicy: "IfNotPresent"
+          # requests == limits: the slot is exactly one declared pod's size, never more, never less.
+          resources:
+            requests: { cpu: {{ $cpu | quote }}, memory: {{ $memory | quote }} }
+            limits: { cpu: {{ $cpu | quote }}, memory: {{ $memory | quote }} }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+{{- end }}
+{{- end }}

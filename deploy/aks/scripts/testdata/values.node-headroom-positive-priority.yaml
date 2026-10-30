@@ -1,0 +1,5 @@
+# test-node-headroom.sh: refused - a placeholder at priority >= 0 is not preempted by a real workload.
+nodeHeadroom:
+  priority: 0
+  pools:
+    - { pool: silos, cpu: "4", memory: "8Gi" }

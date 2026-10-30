@@ -400,6 +400,23 @@ hostingOperator:
 # the shared NodeType records name files in it (MeshWeaver#6052).
 replicas:
   portal: 1
+
+# ---- Node-pool headroom: one spare slot per pool (Memex#863) ------------------
+# A portal rolls surge-first (maxSurge 1 / maxUnavailable 0), so its surge pod needs a free slot;
+# on a pool at its autoscaler maximum it stayed Pending and the roll deadlocked. Each entry of
+# `pools` renders a Deployment of `pause` containers on that pool, under the negative-priority
+# PriorityClass `node-headroom`: a real pod that cannot otherwise schedule PREEMPTS a placeholder
+# and lands in its slot at once, and the evicted placeholder goes Pending, which makes the cluster
+# autoscaler add a node for it (below the pool's maxCount). The placeholder is cluster-scoped in
+# effect, so ONE release declares it — the control instance's record (`nodeHeadroom`, rendered by
+# HelmValues); every other release leaves `pools` empty and renders nothing. The cost is the slot:
+# it stays idle. Doc: core Doc/Architecture/DeploymentAKS → "A spare slot per node pool".
+nodeHeadroom:
+  # Below every real workload (default priority 0), so any of them may preempt a placeholder.
+  priority: -10
+  image: "mcr.microsoft.com/oss/kubernetes/pause:3.10@sha256:2b5d81a9d7f04299f45ed1b6822de018188f463914fcbf5592f39087c9adead1"
+  # [{ pool: silos, cpu: "4", memory: "8Gi", replicas: 1 }] — pool = the AKS agentpool name.
+  pools: []
 # ---- Key Vault secrets, DECLARED (renders the SecretProviderClass) ---------
 # The portal's secrets live in Azure Key Vault and reach the pod through the
 # secrets-store CSI driver: a SecretProviderClass names the vault objects, the

@@ -1,0 +1,4 @@
+# test-node-headroom.sh: refused - not an AKS node pool name.
+nodeHeadroom:
+  pools:
+    - { pool: Silos_Pool, cpu: "4", memory: "8Gi" }
