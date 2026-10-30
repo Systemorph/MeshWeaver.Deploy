@@ -988,10 +988,96 @@ OUT="$(env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/h
 case "$(cat "$DAEMON")" in *'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/memex/bin"'*) ok "memex-daemon.sh lists /opt/memex/bin LAST (existing installations first)" ;; *) bad "daemon PATH order" "$(grep -n 'export PATH' "$DAEMON")" ;; esac
 rm -rf "$HL"
 
+echo "── auto-update: a Homebrew install follows the tap by default ────"
+# A fake keg: the CLI copied under …/Cellar/memex-local/<v>/libexec, which is what makes it a brew
+# install, plus a brew stub that reads/writes the installed version and the keg's share/ in a state dir.
+AU="$(mktemp -d)"; mkdir -p "$AU/stubs" "$AU/home" "$AU/prefix/bin" "$AU/prefix/opt/memex-local/libexec/share"
+KEG="$AU/prefix/Cellar/memex-local/0.3.1/libexec"; mkdir -p "$KEG"; cp "$CLI" "$KEG/memex-local"
+printf 'chart v1\n' > "$AU/prefix/opt/memex-local/libexec/share/values.yaml"
+cp "$CLI" "$AU/prefix/opt/memex-local/libexec/memex-local"
+printf '0.3.1\n' > "$AU/version"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "$FAKE_LAUNCHCTL_LOG"\nexit 0\n' > "$AU/stubs/launchctl"
+cat > "$AU/stubs/brew" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  --prefix) if [ -n "${2:-}" ]; then printf '%s/opt/%s\n' "$FAKE_PREFIX" "$2"; else printf '%s\n' "$FAKE_PREFIX"; fi ;;
+  list)     printf 'memex-local %s\n' "$(cat "$FAKE_PREFIX/../version")" ;;
+  update)   exit 0 ;;
+  upgrade)  [ -n "${FAKE_UPGRADE_FAILS:-}" ] && { echo "Error: Your Xcode (26.5) is too outdated."; exit 1; }
+            [ -n "${FAKE_NEW_VERSION:-}" ] && printf '%s\n' "$FAKE_NEW_VERSION" > "$FAKE_PREFIX/../version"
+            [ -n "${FAKE_NEW_CHART:-}" ] && printf '%s\n' "$FAKE_NEW_CHART" > "$FAKE_PREFIX/opt/memex-local/libexec/share/values.yaml"
+            exit 0 ;;
+esac
+EOF
+printf '#!/bin/bash\nprintf "%%s|%%s\\n" "$*" "${MEMEX_IN_AUTOUPDATE:-}" >> "$FAKE_UPDATE_LOG"\n' > "$AU/prefix/bin/memex-local"
+chmod +x "$AU/stubs/"* "$AU/prefix/bin/memex-local"
+au() {  # au <script> <lib-call…> — run a function of <script> with the fake toolchain
+  local script="$1"; shift
+  : > "$AU/launchctl.log"; : > "$AU/update.log"
+  OUT="$(env PATH="$AU/stubs:$STUBS:$PATH" HOME="$AU/home" MEMEX_LOCAL_HOME="$AU/home/.memex-local" FAKE_PREFIX="$AU/prefix" \
+    FAKE_LAUNCHCTL_LOG="$AU/launchctl.log" FAKE_UPDATE_LOG="$AU/update.log" MEMEX_LOCAL_SHARE="$HERE/../share" MEMEX_LOCAL_LIB=1 "$@" \
+    bash -c '. "$1"; shift; "$@"' _ "$script" "${AU_CALL[@]}" 2>&1)"; RC=$?
+}
+PL="$AU/home/Library/LaunchAgents/com.memex.local.autoupdate.plist"
+
+AU_CALL=(autoupdate_default); au "$CLI"
+[ ! -f "$PL" ] && ok "a checkout is never armed (not a Homebrew install)" || bad "a checkout is never armed" "$OUT"
+
+AU_CALL=(autoupdate_default); au "$KEG/memex-local"
+case "$(cat "$PL" 2>/dev/null)" in
+  *'<string>com.memex.local.autoupdate</string>'*"<string>$AU/prefix/bin/memex-local</string><string>autoupdate</string><string>_tick</string>"*)
+    ok "a Homebrew install is armed by default, and launchd runs the relinked bin/ entry (not the keg)" ;;
+  *) bad "a Homebrew install is armed by default" "plist: $(cat "$PL" 2>/dev/null) out: $OUT" ;;
+esac
+grep -q "^load $PL" "$AU/launchctl.log" && ok "the agent is loaded into launchd" || bad "the agent is loaded" "$(cat "$AU/launchctl.log")"
+
+AU_CALL=(cmd_autoupdate off); au "$KEG/memex-local"
+AU_CALL=(autoupdate_default); au "$KEG/memex-local"
+[ ! -f "$PL" ] && ok "'autoupdate off' is remembered: up/update do not re-arm it" || bad "off is remembered" "$OUT"
+rm -f "$AU/home/.memex-local/autoupdate.off"
+
+AU_CALL=(autoupdate_default); au "$KEG/memex-local" MEMEX_IN_AUTOUPDATE=1
+[ ! -s "$AU/launchctl.log" ] && ok "the agent's own 'update' never re-arms (that would unload the running job)" || bad "no re-arm inside the agent" "$(cat "$AU/launchctl.log")"
+AU_CALL=(autoupdate_default); au "$KEG/memex-local" MEMEX_HEADLESS=1
+[ ! -s "$AU/launchctl.log" ] && ok "a headless host is never armed" || bad "headless is not armed" "$(cat "$AU/launchctl.log")"
+
+rm -f "$AU/home/.memex-local/autoupdate.checked"
+AU_CALL=(cmd_autoupdate _tick); au "$KEG/memex-local" FAKE_UPGRADE_FAILS=1
+case "$RC:$OUT" in
+  0:*"brew upgrade FAILED"*"Homebrew said: Error: Your Xcode (26.5) is too outdated."*) ok "a refused upgrade keeps Homebrew's own answer and stays on the current version" ;;
+  *) bad "a refused upgrade keeps Homebrew's answer" "rc=$RC $OUT" ;;
+esac
+
+AU_CALL=(cmd_autoupdate _tick); au "$KEG/memex-local" FAKE_NEW_VERSION=0.3.2
+case "$OUT" in *"is current"*|"") ok "the poll is throttled (a second tick inside the interval does nothing)" ;; *) bad "the poll is throttled" "$OUT" ;; esac
+
+rm -f "$AU/home/.memex-local/autoupdate.checked"
+AU_CALL=(cmd_autoupdate _tick); au "$KEG/memex-local" FAKE_NEW_VERSION=0.3.2
+case "$OUT" in *"upgraded 0.3.1 -> 0.3.2"*"chart and share assets unchanged"*) ok "a script-only release upgrades without re-applying the chart" ;; *) bad "script-only release" "$OUT" ;; esac
+[ ! -s "$AU/update.log" ] && ok "… and restarts nothing" || bad "script-only release restarts nothing" "$(cat "$AU/update.log")"
+
+rm -f "$AU/home/.memex-local/autoupdate.checked"
+mkdir -p "$AU/home/.memex-local"; : > "$AU/home/.memex-local/autoroll-tick"
+AU_CALL=(cmd_autoupdate _tick); au "$KEG/memex-local" FAKE_NEW_VERSION=0.3.3 FAKE_NEW_CHART="chart v2"
+case "$(cat "$AU/update.log")" in "update --skip-image|1") ok "a release that changed the chart re-applies it once with update --skip-image, flagged as the agent" ;;
+  *) bad "a changed chart is re-applied" "update.log=$(cat "$AU/update.log") out=$OUT" ;; esac
+cmp -s "$AU/home/.memex-local/autoroll-tick" "$AU/prefix/opt/memex-local/libexec/memex-local" \
+  && ok "the auto-roll's tick copy is refreshed from the new keg" || bad "the auto-roll tick copy is refreshed" "$OUT"
+rm -rf "$AU"
+
+# Static: both entry points arm it, and the acr poll cannot store az's preview warning as a digest.
+for c in cmd_up cmd_update; do
+  body="$(awk -v f="^${c}\\\\(\\\\)" '$0 ~ f { on=1 } on { print } on && /^}$/ { exit }' "$CLI")"
+  case "$body" in *'autoupdate_default'*) ok "${c} arms auto-update" ;; *) bad "${c} arms auto-update" "no autoupdate_default call in ${c}()" ;; esac
+done
+grep -q 'az acr manifest show-metadata .*--only-show-errors 2>&1' "$CLI" \
+  && ok "the acr poll passes --only-show-errors (a preview WARNING was stored as the digest)" \
+  || bad "the acr poll passes --only-show-errors" "$(grep -n 'az acr manifest show-metadata' "$CLI")"
+
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
-for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel backlease llm relay; do
+for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel backlease llm relay autoupdate; do
   case "$help_out" in
     *"$cmd"*) ;;
     *) bad "help documents '$cmd'" "not in the usage text"; continue ;;
