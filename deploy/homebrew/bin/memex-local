@@ -2674,7 +2674,7 @@ still_installing_note() {
 # token already in it, opened in the browser). Shared by `up` and `update` so the two cannot drift.
 hand_into_setup() {
   ok "$1 — this instance has no database yet, opening the first-run setup wizard with its token."
-  cmd_setup
+  cmd_setup --auto
 }
 
 # `memex-local verify` — ask the running install the ONE question `status` used to be unable to
@@ -2698,6 +2698,7 @@ cmd_setup() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-open) open_browser="no" ;;
+      --auto) open_browser="auto" ;;   # hand_into_setup: open only if the login agent has not already
       *) die "setup: unknown flag '$1'" ;;
     esac
     shift
@@ -2769,8 +2770,19 @@ cmd_setup() {
   info "for semantic search. Without embeddings, SQLite can still find parts of stored text;"
   info "PostgreSQL matches node names, paths, descriptions and types. Page text also needs a content index."
 
-  if [ "$open_browser" = "yes" ] && command -v open >/dev/null 2>&1; then
-    open "${url}?token=${token}" >/dev/null 2>&1 || true
+  # One marker per token, shared with the login agent (share/port-forward.sh), so `up`/`update` and the
+  # agent never open the same wizard twice. The marker is named by a DIGEST of the token, never the
+  # token itself — a directory entry is listable by anyone who can traverse the home directory.
+  local marker
+  marker="$LOCAL_HOME/setup-opened.$(printf '%s' "$token" | shasum -a 256 | cut -c1-64)"
+  if [ "$open_browser" = "auto" ] && [ -f "$marker" ]; then
+    info "The wizard for this token was already opened in your browser."
+    return 0
+  fi
+  if [ "$open_browser" != "no" ] && command -v open >/dev/null 2>&1; then
+    if open "${url}?token=${token}" >/dev/null 2>&1; then
+      mkdir -p "$LOCAL_HOME" && : > "$marker"
+    fi
   fi
 }
 
