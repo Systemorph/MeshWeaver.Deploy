@@ -3304,7 +3304,6 @@ class Host:
             return "idle"
         started = self.clock()
         self.sweep_workspaces()
-        repair_nuget_cache(os.path.join(self.cache, "nuget"), self.log)
         workdir = tempfile.mkdtemp(prefix=f"{repo}-{sha[:12]}-", dir=self.work)
         checkout_dir = os.path.join(workdir, "src")
         outputs_dir = os.path.join(workdir, "out")
@@ -3359,6 +3358,9 @@ class Host:
             # longer than the instance's lease, and the checkout posts nothing else.
             self._sink_for(repo, sha, last_stage)
             self.log(f"claimed {path} ({repo}@{sha[:12]}, {'version' if self.version else 'channel'} {self.lane}, trunk={trunk}, publish={publish})")
+            # Under the lease (the heartbeat beats the sink registered above): the mode migration of folders an
+            # older runner rebuilt walks the whole warm cache once, before warming, preparing or any stage.
+            repair_nuget_cache(os.path.join(self.cache, "nuget"), self.log)
             token = self.installation_token(claim)
             try:
                 # The checkout is bounded by the run's deadline: a stalled clone or fetch ends the run
@@ -6074,6 +6076,25 @@ def self_test() -> int:
               "and is marked before the stages run",
               n_warm() == 1 and os.stat(legacy_).st_mode & 0o100 != 0
               and os.path.isfile(os.path.join(warm_pkg, NUGET_MATERIALIZED_MARK)), (n_warm(), oct(os.stat(legacy_).st_mode)))
+        # ... and it runs UNDER THE LEASE (review of #109): a slow migration of a large cache must be beaten for. The
+        # stand-in migration records what renews the lease while it runs — the run's heartbeat thread alive, with the
+        # run's sink as its target; that such a heartbeat renews the lease every period is what the lease/ cases prove,
+        # so however long the migration takes, the claim is kept.
+        seen_lease_: list = []
+        h_lease_ = host(api_ev(), env=wenv, git_runner=tip_git(tip_restore), checkout=checkout_with(pr_doc))
+        real_repair_ = globals()["repair_nuget_cache"]
+
+        def slow_repair_(root_, log_):
+            hb_ = h_lease_.heartbeat
+            seen_lease_.append(hb_ is not None and hb_.thread.is_alive() and hb_.target is not None and not hb_.stop.is_set())
+            return real_repair_(root_, log_)
+        globals()["repair_nuget_cache"] = slow_repair_
+        try:
+            h_lease_.run(claim)
+        finally:
+            globals()["repair_nuget_cache"] = real_repair_
+        check("warm/the cache migration runs once per run, inside the lease: the heartbeat is alive and targets the "
+              "run's sink while it runs", seen_lease_ == [True], seen_lease_)
         posted.clear()
         host(api_ev(), env=wenv, git_runner=tip_git(tip_restore, listing="100644 blob " + "b" * 40 + "\tsrc/A/A.csproj\n"),
              checkout=checkout_with(pr_doc)).run(claim)
