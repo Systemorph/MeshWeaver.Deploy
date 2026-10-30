@@ -132,6 +132,18 @@ selfUpdate:
   # Without it an instance on the fleet registry boots fine and then never self-updates — every
   # check fails with "no plugin registry is configured on that host".
   registryValidationUrl: ""
+  # 🚨 IS `registry` A PUBLIC REGISTRY? (MeshWeaver.Deploy#65) Default FALSE. True declares that
+  # `registry` lists tags and serves pulls to a caller presenting NO credential — ghcr.io for the
+  # public systemorph/memex-portal-ai package. The self-updater then lists through the anonymous
+  # token flow (the realm is asked for a pull bearer with no Authorization header) and NEVER
+  # resolves or sends this installation's instance key, whatever pluginCatalog holds for that host;
+  # `registryValidationUrl` is not read. A public registry needs no portal.imagePullSecret either.
+  # memex-local sets it in registry mode (registry: ghcr.io), because a local install has no managed
+  # identity for ACR and the mwi_ key cr.meshweaver.cloud checks is minted inside the pod.
+  # A declaration, never an inference: false keeps the keyed rule above exactly. Needs a platform
+  # that carries SelfUpdate:RegistryIsPublic; an older image ignores the key and refuses the listing
+  # by name (no plugin registry on that host), so it sends nothing.
+  registryIsPublic: false
 # ---- Required secrets (Systemorph/Memex#204) ---------------------------------
 # Per-key statement of whether an EMPTY value is legal. EMPTY BY DEFAULT — this enforces exactly
 # what a deployment declares and nothing otherwise.
