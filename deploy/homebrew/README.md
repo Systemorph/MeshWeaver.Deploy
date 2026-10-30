@@ -90,6 +90,26 @@ installation does not have`) while overriding the packages the person ticked in 
 The instance manifest the wizard writes carries the selection instead. Self-registry mode keeps
 its per-source `<name>/*` entries.
 
+**A registry-mode install updates its platform from the public GHCR, with no credential**
+(MeshWeaver.Deploy#65). `helm_deploy` layers the tracked
+[`share/values.local.registry-mode.yaml`](share/values.local.registry-mode.yaml) in this mode,
+before the registry file and the overlay (so either can still override it):
+
+| Chart value | Value | Why |
+|---|---|---|
+| `selfUpdate.registry` | `ghcr.io` | the registry the install already pulls `ghcr.io/systemorph/memex-portal-ai` from; the chart derives the repositories `systemorph/memex-portal-ai` / `systemorph/memex-migration` from the images it runs |
+| `selfUpdate.registryIsPublic` | `true` | the portal lists tags through the anonymous token flow and never sends a credential to GHCR; no `portal.imagePullSecret` is needed |
+| `selfUpdate.canPatch` | `true` | a standalone local cluster has no control instance to hand a release to, so the portal patches its own deployments |
+
+Before this, the portal kept the image's default, the upstream ACR listed through a managed
+identity. A Mac has none, so every check failed with `ManagedIdentityCredential authentication
+failed` and the install never rolled. The `mwr_` registration key cannot replace GHCR, because the
+fleet registry checks an `mwi_` instance key that is minted inside the pod. The listing needs a
+platform that carries `SelfUpdate:RegistryIsPublic`. An older image ignores the key and refuses the
+GHCR listing by name, sending nothing; move it once with `memex-local update`, and it updates
+itself after that. What rolls is still `Admin/UpdatePolicy` (Settings → Updates). Full account:
+`Doc/Architecture/LocalColimaMac` → *Registry mode updates from public GHCR*.
+
 ## Use
 
 ```bash
