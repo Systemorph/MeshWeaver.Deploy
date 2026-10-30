@@ -2182,7 +2182,11 @@ def read_worker_token(env: dict) -> str:
 ENV_ALLOW = ("PATH", "LANG", "LC_ALL", "TZ", "DOTNET_ROOT", "DOTNET_CLI_TELEMETRY_OPTOUT", "DOTNET_NOLOGO",
              "DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "SSL_CERT_FILE", "SSL_CERT_DIR", "MeshWeaverRefs",
              "MW_BUILD_GATE_HOST", "MW_BUILD_PORTAL_DOTNET", "MW_BUILD_MODULE_LIBS", "MW_BUILD_EXTENSIONS",
-             "MW_BUILD_COMPILE_REFS")
+             "MW_BUILD_COMPILE_REFS",
+             # The image's headless browser (deploy/build-host/Dockerfile): core's `test` shards export
+             # MESHWEAVER_CHROMIUM_PATH for the tests, so the renderer resolves THAT binary, never another
+             # browser on the machine; a stage gets the same three facts the image declares.
+             "MESHWEAVER_CHROMIUM_PATH", "CHROME_BIN", "PLAYWRIGHT_BROWSERS_PATH")
 SCRATCH = "/scratch"
 
 # THE COMPILE REFERENCE SET, PREPARED ONCE PER ROLL (the `portal` init container of
@@ -4736,6 +4740,11 @@ def self_test() -> int:
                      {"MW_BUILD_PUBLISH": "false"}, "/cache")
     check("env/allow-list only", set(se) == {"PATH", "MeshWeaverRefs", "HOME", "TMPDIR", "NUGET_PACKAGES",
                                              "NUGET_FALLBACK_PACKAGES", "MW_BUILD_PUBLISH"}, sorted(se))
+    be = sandbox_env({"PATH": "/bin", "MESHWEAVER_CHROMIUM_PATH": "/usr/bin/chromium", "CHROME_BIN": "/usr/bin/chromium",
+                      "PLAYWRIGHT_BROWSERS_PATH": "/opt/ms-playwright"}, {}, "/cache")
+    check("env/the image's browser reaches a stage (core's shards export MESHWEAVER_CHROMIUM_PATH)",
+          be.get("MESHWEAVER_CHROMIUM_PATH") == "/usr/bin/chromium" and be.get("CHROME_BIN") == "/usr/bin/chromium"
+          and be.get("PLAYWRIGHT_BROWSERS_PATH") == "/opt/ms-playwright", sorted(be))
     try:
         sandbox_env({}, {"GITHUB_TOKEN": "t"}, "/cache")
         check("env/credential-shaped extra refused", False, "accepted")

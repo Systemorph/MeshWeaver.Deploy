@@ -63,18 +63,32 @@ RUN set -eu \
  && test -f /out/plugin-build/MeshWeaver.Plugin.Build.dll \
  && test -d /out/platform-src/src && test -d /out/platform-src/tools
 
-# The headless browser's VERSION and the font defaults come from the PLATFORM at the set's commit —
-# the portal image's own declaration (deploy/base-images/portal-ai/Dockerfile `ARG PLAYWRIGHT_VERSION=`
-# and its fonts-local.conf), never a literal here: the host follows each platform set exactly as the
-# portal image does, so core's browser/PDF tests run on a host against the browser production ships.
+# The headless browser's VERSION and the font set come from the PLATFORM at the set's commit, never a
+# literal here — and from BOTH places the platform declares them, which must agree:
+#   * the portal image (deploy/base-images/portal-ai/Dockerfile `ARG PLAYWRIGHT_VERSION=`, its
+#     fonts-local.conf) — the browser production ships;
+#   * core's Actions test shards (.github/workflows/dotnet-test.yml `PLAYWRIGHT_VERSION:`, the version every
+#     `test` shard provisions and the `browser-fonts` job checks its font set against) and
+#     .github/chromium-fonts.list (the font packages that job stages and every shard installs).
+# A set whose two versions disagree is refused here, naming both: a host shard would otherwise run a
+# different browser from the Actions shard it replaces, or from production. The font list is checked
+# against what the image installed (final stage), so a host prints with every font an Actions shard has.
 RUN set -eu; \
     f=/src/platform/deploy/base-images/portal-ai/Dockerfile; \
+    w=/src/platform/.github/workflows/dotnet-test.yml; \
+    l=/src/platform/.github/chromium-fonts.list; \
     v="$(sed -n 's/^ARG PLAYWRIGHT_VERSION=\([0-9][0-9.]*\)$/\1/p' "$f" 2>/dev/null | head -n 1)"; \
     if [ -z "$v" ]; then echo "the platform at $PLATFORM_COMMIT declares no 'ARG PLAYWRIGHT_VERSION=<x.y.z>' in deploy/base-images/portal-ai/Dockerfile — the host cannot follow the portal's browser"; exit 1; fi; \
+    a="$(sed -n 's/^  PLAYWRIGHT_VERSION: *\([0-9][0-9.]*\) *$/\1/p' "$w" 2>/dev/null | head -n 1)"; \
+    if [ -z "$a" ]; then echo "the platform at $PLATFORM_COMMIT declares no 'PLAYWRIGHT_VERSION: <x.y.z>' in .github/workflows/dotnet-test.yml — the host cannot follow the Actions test shards' browser"; exit 1; fi; \
+    if [ "$a" != "$v" ]; then echo "the platform at $PLATFORM_COMMIT disagrees with itself: the portal image ships Playwright $v, the Actions test shards provision $a — a host shard cannot match both"; exit 1; fi; \
     if [ ! -s /src/platform/deploy/base-images/portal-ai/fonts-local.conf ]; then echo "the platform at $PLATFORM_COMMIT has no deploy/base-images/portal-ai/fonts-local.conf"; exit 1; fi; \
+    if [ ! -s "$l" ]; then echo "the platform at $PLATFORM_COMMIT has no .github/chromium-fonts.list — the font set the Actions shards install is unknown"; exit 1; fi; \
     mkdir -p /out/browser; \
     printf '%s\n' "$v" > /out/browser/playwright-version; \
-    cp /src/platform/deploy/base-images/portal-ai/fonts-local.conf /out/browser/fonts-local.conf
+    cp /src/platform/deploy/base-images/portal-ai/fonts-local.conf /out/browser/fonts-local.conf; \
+    sed -e 's/#.*//' -e 's/[[:space:]]//g' "$l" | grep -v '^$' > /out/browser/chromium-fonts.list; \
+    [ -s /out/browser/chromium-fonts.list ] || { echo ".github/chromium-fonts.list at $PLATFORM_COMMIT names no package"; exit 1; }
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0
 
@@ -119,16 +133,27 @@ RUN set -eu; \
     /usr/bin/chromium --version; \
     cp /opt/build-host/browser/fonts-local.conf /etc/fonts/local.conf; \
     fc-cache -f > /dev/null; \
+    # THE ACTIONS SHARDS' FONT SET: every package core's `browser-fonts` job stages, plus the two the
+    # GitHub runner image already carries (the list's own header: fonts-liberation, fonts-noto-color-emoji).
+    missing=""; \
+    for p in $(cat /opt/build-host/browser/chromium-fonts.list) fonts-liberation fonts-noto-color-emoji; do \
+      [ "$(dpkg-query -W -f='${db:Status-Status}' "$p" 2>/dev/null)" = installed ] || missing="$missing $p"; \
+    done; \
+    if [ -n "$missing" ]; then echo "the image lacks font package(s)$missing that core's Actions test shards print with (.github/chromium-fonts.list + the runner image)"; exit 1; fi; \
+    echo "font set: $(wc -l < /opt/build-host/browser/chromium-fonts.list) staged packages + the runner's two, $(fc-list | wc -l) faces"; \
     chmod -R a+rX /opt/ms-playwright; \
     smoke="$(mktemp -d)"; chown 1654:1654 "$smoke"; \
     printf '<html><body><h1>mw-build-host</h1><p><b>bold</b> <i>italic</i> &auml;&ouml;&uuml;</p></body></html>' > "$smoke/p.html"; \
     setpriv --reuid=1654 --regid=1654 --clear-groups env HOME="$smoke" \
-      /usr/bin/chromium --headless --no-sandbox --disable-gpu --print-to-pdf="$smoke/p.pdf" "file://$smoke/p.html" > /dev/null 2>&1 || true; \
+      timeout 60 /usr/bin/chromium --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --no-pdf-header-footer \
+        --user-data-dir="$smoke/profile" --print-to-pdf="$smoke/p.pdf" "file://$smoke/p.html" > /dev/null 2>&1 || true; \
     if [ ! -s "$smoke/p.pdf" ] || [ "$(head -c 4 "$smoke/p.pdf")" != "%PDF" ]; then echo "the headless shell did not print a PDF as uid 1654 — a host on this image cannot run core's browser tests"; exit 1; fi; \
     rm -rf "$smoke" /root/.npm /root/.cache; \
     npm cache clean --force; \
     apt-get purge -y gnupg; apt-get autoremove -y; apt-get clean; rm -rf /var/lib/apt/lists/*
-ENV CHROME_BIN=/usr/bin/chromium
+# MESHWEAVER_CHROMIUM_PATH is what core's `test` shards export for the tests (the renderer's first probe);
+# build-run.py hands all three to every stage through its env allow-list.
+ENV CHROME_BIN=/usr/bin/chromium MESHWEAVER_CHROMIUM_PATH=/usr/bin/chromium
 
 # The runner (this repository) and the platform's composer and helpers (the set's commit) — one
 # implementation each, versioned with the image (the chart ships no copy).
