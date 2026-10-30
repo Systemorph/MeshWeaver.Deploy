@@ -15,7 +15,7 @@
             "containers": [
               {
                 "name": "memex-portal",
-                "image": "meshweaver.azurecr.io/memex-portal-ai:3.0.0-rc8.ci.5000",
+                "image": "cr.example.test/memex-portal-ai:3.0.0-rc8.ci.5000",
                 "env": [
                   { "name": "ASPNETCORE_ENVIRONMENT", "value": "Production" },
                   { "name": "MEMEX_DATABASENAME", "value": "memex" },

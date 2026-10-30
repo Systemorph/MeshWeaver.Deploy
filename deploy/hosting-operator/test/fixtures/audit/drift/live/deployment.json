@@ -29,7 +29,7 @@
             "containers": [
               {
                 "name": "memex-portal",
-                "image": "meshweaver.azurecr.io/memex-portal-ai:3.0.0-rc8.ci.5123",
+                "image": "cr.example.test/memex-portal-ai:3.0.0-rc8.ci.5123",
                 "env": [
                   {
                     "name": "ASPNETCORE_ENVIRONMENT",
