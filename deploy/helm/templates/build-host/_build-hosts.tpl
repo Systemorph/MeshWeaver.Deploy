@@ -180,7 +180,14 @@ The refusals, and why each one exists:
 {{- if lt $max 1 -}}
 {{- fail (printf "buildHosts.%s.maxReplicas must be at least 1" $name) -}}
 {{- end -}}
-{{- $channels = append $channels (dict "name" $name "platformVersion" $pv "maxReplicas" $max
+{{- /* The declared FLOOR (the record's BuildHostChannel.MinReplicas; core Doc/Architecture/BuildHosts → "Declared host floor").
+       hasKey, not `default`: an explicit 0 is the scale-to-zero default, never "unset". */ -}}
+{{- $min := 0 -}}
+{{- if hasKey $c "minReplicas" -}}{{- $min = int $c.minReplicas -}}{{- end -}}
+{{- if or (lt $min 0) (gt $min $max) -}}
+{{- fail (printf "buildHosts.%s.minReplicas %d must be between 0 and the channel's maxReplicas %d" $name $min $max) -}}
+{{- end -}}
+{{- $channels = append $channels (dict "name" $name "platformVersion" $pv "maxReplicas" $max "minReplicas" $min
       "tester" (printf "%s@%s" $testerRepo $c.testerDigest) "portal" (printf "%s@%s" $portalRepo $c.portalDigest)
       "runner" (printf "%s@%s" $runnerRepo $c.runnerDigest)
       "testerDigest" $c.testerDigest "portalDigest" $c.portalDigest "runnerDigest" $c.runnerDigest
@@ -242,7 +249,7 @@ The refusals, and why each one exists:
 {{- if gt (len $dns) 63 -}}
 {{- fail (printf "buildHosts.versions[%s] makes the name %q, longer than a DNS label's 63 characters" $ver $dns) -}}
 {{- end -}}
-{{- $channels = append $channels (dict "name" $ver "platformVersion" $ver "maxReplicas" $max
+{{- $channels = append $channels (dict "name" $ver "platformVersion" $ver "maxReplicas" $max "minReplicas" 0
       "tester" (printf "%s@%s" $testerRepo $v.testerDigest) "portal" (printf "%s@%s" $portalRepo $v.portalDigest)
       "runner" (printf "%s@%s" $runnerRepo $v.runnerDigest)
       "testerDigest" $v.testerDigest "portalDigest" $v.portalDigest "runnerDigest" $v.runnerDigest
