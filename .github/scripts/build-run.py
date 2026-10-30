@@ -850,6 +850,25 @@ def repair_nuget_modes(final: str) -> int:
     return changed
 
 
+def repair_nuget_cache(root: str, log: Callable[[str], None]) -> int:
+    """Repair, before a run's first stage, every package folder of the warm cache an older runner rebuilt (no
+    NUGET_MATERIALIZED_MARK). A stage reads such a package IN PLACE from the fallback folder, so it never reaches the
+    run's own restore and `promote_nuget` never sees it — and a held warm key skips promotion altogether. One stat per
+    package once the cache is marked. Returns the number of folders repaired; a folder that cannot be is said, by name."""
+    repaired = 0
+    for entry in sorted(nuget_packages(root)):
+        final = os.path.join(root, *entry.split("/", 1))
+        if os.path.isfile(os.path.join(final, NUGET_MATERIALIZED_MARK)):
+            continue
+        try:
+            changed = repair_nuget_modes(final)
+            repaired += 1
+            log(f"NuGet package {entry}: its file modes repaired to NuGet's ({changed} file(s))")
+        except OSError as e:
+            log(f"NuGet package {entry}: its file modes could NOT be repaired ({e})")
+    return repaired
+
+
 def nuget_package_problem(pkg_dir: str, pid: str, ver: str) -> Optional[str]:
     """Why a restored package folder may NOT enter the shared warm cache, or None. The folder must hold no symlink, its
     `.nupkg` must hash (SHA-512, base64) to the `.nupkg.sha512` NuGet wrote beside it, and the metadata's
@@ -909,7 +928,9 @@ def materialize_nuget_package(pkg_dir: str, pid: str, ver: str, dest: str, expec
             os.makedirs(os.path.dirname(target), exist_ok=True)
             # NuGet's mode (NUGET_EXTRACTED_FILE_MODE), O_EXCL as before: a second entry onto one path is refused.
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, NUGET_EXTRACTED_FILE_MODE)
-            with z.open(info) as src, os.fdopen(fd, "wb") as out:
+            # The output owns the descriptor FIRST, so an entry zipfile cannot open (encrypted, unsupported, malformed)
+            # still closes it — promote_nuget refuses that package and carries on in a long-running host.
+            with os.fdopen(fd, "wb") as out, z.open(info) as src:
                 shutil.copyfileobj(src, out)
     out_meta = {"version": meta.get("version", 2), "contentHash": meta["contentHash"]}
     if isinstance(meta.get("source"), str):
@@ -3283,6 +3304,7 @@ class Host:
             return "idle"
         started = self.clock()
         self.sweep_workspaces()
+        repair_nuget_cache(os.path.join(self.cache, "nuget"), self.log)
         workdir = tempfile.mkdtemp(prefix=f"{repo}-{sha[:12]}-", dir=self.work)
         checkout_dir = os.path.join(workdir, "src")
         outputs_dir = os.path.join(workdir, "out")
@@ -5898,6 +5920,17 @@ def self_test() -> int:
             (pm_, _, rm_), inm_, _ = promote_into(f"mat-{kind_}", restored_pkg(os.path.join(tmp, f"prov-mat-{kind_}"), zip_))
             check(f"provenance/the {kind_} fixture passes provenance and is refused by MATERIALISATION",
                   pm_ == 0 and inm_ == set() and len(rm_) == 1 and "could not be moved into place" in rm_[0], rm_)
+        # An entry zipfile cannot OPEN (the encrypted one) must not leak the output descriptor (review of #109): the
+        # host is long-running and refuses such a package on every run.
+        enc_src_ = os.path.join(restored_pkg(os.path.join(tmp, "fd-enc"), encrypted_zip), "demo.pkg", "1.0.0")
+        fds_before_ = len(os.listdir("/dev/fd"))
+        for i_ in range(20):
+            try:
+                materialize_nuget_package(enc_src_, "demo.pkg", "1.0.0", os.path.join(tmp, f"fd-enc-out-{i_}"))
+            except RuntimeError:
+                pass
+        check("extraction/an entry that cannot be opened closes the output descriptor (no fd leak over 20 refusals)",
+              len(os.listdir("/dev/fd")) == fds_before_, (fds_before_, len(os.listdir("/dev/fd"))))
         feed_hashes["demo.pkg/1.0.0"] = b64sha(encrypted_zip)
         host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("encrypted")}]})).run(dict(claim, isTrunk=True))
         check("prepared/negative control: an ENCRYPTED package (valid hashes, unreadable entry) is refused, never a crash",
@@ -6029,6 +6062,18 @@ def self_test() -> int:
         check("warm/the SECOND run restores nothing — neither the server nor the run",
               n_warm() == 1 and not codes("MWPREP001") and any("holds the default branch's restore" in t_ for t_ in lines_w),
               (n_warm(), codes("MWPREP001"), lines_w))
+        # MODE MIGRATION (review of #109): a package an OLDER runner rebuilt lives ONLY in the cache — the stage reads it
+        # in place from the fallback folder, so it never reaches `restored`, and the held warm key skips promotion. The
+        # run still repairs its modes before any stage (a 0644 protoc stays unexecutable otherwise).
+        legacy_ = os.path.join(warm_pkg, "lib", "net10.0", "Demo.dll")
+        os.remove(os.path.join(warm_pkg, NUGET_MATERIALIZED_MARK))
+        os.chmod(legacy_, 0o644)
+        posted.clear()
+        host(api_ev(), env=wenv, git_runner=tip_git(tip_restore), checkout=checkout_with(pr_doc)).run(claim)
+        check("warm/a cache-only package an older runner rebuilt (held key, nothing restored) has its modes repaired "
+              "and is marked before the stages run",
+              n_warm() == 1 and os.stat(legacy_).st_mode & 0o100 != 0
+              and os.path.isfile(os.path.join(warm_pkg, NUGET_MATERIALIZED_MARK)), (n_warm(), oct(os.stat(legacy_).st_mode)))
         posted.clear()
         host(api_ev(), env=wenv, git_runner=tip_git(tip_restore, listing="100644 blob " + "b" * 40 + "\tsrc/A/A.csproj\n"),
              checkout=checkout_with(pr_doc)).run(claim)
