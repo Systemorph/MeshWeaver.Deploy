@@ -126,9 +126,13 @@ THE LOOP, and the order that matters:
     because it writes the shared $MW_BUILD_OUTPUTS and the host promotes outputs and NuGet packages after it.
     Each concurrent stage keeps its own sandbox, /tmp, scratch, PostgreSQL socket and event route, and hands over
     its OWN `$MW_BUILD_ARTIFACTS` (`<run>/artifacts/<stage>/`), so a sibling can neither see nor contribute to
-    another's receipts; a red stage's directory is quarantined whole — except its `diagnostics/` unit, which a RED
-    stage hands over too, before its failed verdict (red_stage_diagnostics: the logs, .trx files and dumps that say
-    WHY it is red; MeshWeaver.Plugins#4499), serial or fanned out alike. The declared budget is the schedule
+    another's receipts; a red stage's directory is quarantined whole, AFTER the host handed a COPY of everything the
+    red stage added or rewrote over too, before its failed verdict, every receipt marked `"stageState": "failed"`
+    (red_stage_artifacts: a shard's .trx files, markers and logs, the dumps — the evidence of WHY it is red;
+    MeshWeaver.Deploy#52, built on the diagnostics-only hand-over of MeshWeaver.Plugins#4499), serial or fanned out
+    alike. A green stage's receipts are marked `"succeeded"`. A receipt never means "the stage succeeded" by itself:
+    every reader reads the marker (MeshWeaver.Plugins' build API serves it; core's build-artifacts-fetch.py publishes
+    and ratchets only `succeeded`, host-shard-results.py consolidates a red shard on purpose). The declared budget is the schedule
     (`planned_seconds`: the critical path through the slots — and the scheduler is PINNED to that all-caps schedule,
     `cap_schedule`, so a stage finishing early can never push a later one past it), the run deadline still ends every stage not started,
     a 409 on any stage's route kills every sibling in flight and abandons the run, and the pid-namespace leftover
@@ -1068,30 +1072,31 @@ def artifact_snapshot(root: str) -> dict:
     return snap
 
 
-# The one unit a RED stage still hands over (MeshWeaver.Plugins#4499): its diagnostics. A stage writes what explains a
-# failure — per-suite logs, crash .trx files, teardown captures, JIT listings, dumps — under
-# `$MW_BUILD_ARTIFACTS/diagnostics/<anything>`; a green stage hands it over with everything else, and a red one hands over
-# THIS unit alone, before the rest is quarantined. Nothing outside it ever leaves a red stage (a module bundle or a bake
-# a red stage left may be unfinished), and nothing reads a diagnostics receipt as a build output.
-DIAGNOSTICS_UNIT = "diagnostics"
+# The OUTCOME of the stage a receipt comes from (MeshWeaver.Deploy#52). A RED stage hands over everything it added or
+# rewrote — a test shard's results tree, its `diagnostics/` unit (MeshWeaver.Plugins#4499), and also whatever it left
+# unfinished (a half-written bundle) — because that is the evidence of WHY it is red; every one of its receipts says
+# `failed`, so no reader takes it for a green stage's output: the publish lane and the gate-log ratchet read ONLY
+# `succeeded` receipts, and consolidation reads a red shard on purpose. The marker rides on the `artifact` event and, on
+# the API store, on the upload (`stageState=`), where the instance records it on the receipt it writes.
+STAGE_SUCCEEDED = "succeeded"
+STAGE_FAILED = "failed"
 
 
-DIAGNOSTICS_COPY_CHUNK = 8 << 20
+RED_STAGE_COPY_CHUNK = 8 << 20
 
 
-def red_stage_diagnostics(root: str, before: dict, dest: str,
-                          proceed: Callable[[], None] = lambda: None) -> list[str]:
-    """COPY into `dest` every REGULAR file under `<root>/diagnostics/` that a failed stage added or rewrote (anything not
-    in, or different from, `before`), at the same relative path. A symlink, fifo or device is skipped, never followed:
-    a red stage's leftovers are untrusted, and diagnostics are evidence, not a reason to fail the hand-over. The source
-    is left in place for the quarantine. Returns the copied relative paths. `proceed` is called before each file and
-    between bounded chunks of it, and raises to stop: dumps can be large, and an expired or abandoned run must not keep
-    copying them."""
+def red_stage_artifacts(root: str, before: dict, dest: str,
+                        proceed: Callable[[], None] = lambda: None) -> list[str]:
+    """COPY into `dest` every REGULAR file under `root` that a failed stage added or rewrote (anything not in, or
+    different from, `before`), at the same relative path. A symlink, fifo or device is skipped, never followed (nor is a
+    symlinked directory descended): a red stage's leftovers are untrusted, and evidence is not a reason to fail the
+    hand-over. The sources are left in place for the quarantine. Returns the copied relative paths. `proceed` is called
+    before each file and between bounded chunks of it, and raises to stop: results trees and dumps can be large, and an
+    expired or abandoned run must not keep copying them."""
     copied: list[str] = []
-    base_dir = os.path.join(root, DIAGNOSTICS_UNIT)
-    if not os.path.isdir(base_dir) or os.path.islink(base_dir):
+    if not os.path.isdir(root) or os.path.islink(root):
         return copied
-    for base, dirs, names in os.walk(base_dir):
+    for base, dirs, names in os.walk(root):
         dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(base, d))]
         for n in sorted(names):
             full = os.path.join(base, n)
@@ -1105,7 +1110,7 @@ def red_stage_diagnostics(root: str, before: dict, dest: str,
             src_fd = os.open(full, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             with os.fdopen(src_fd, "rb") as src, open(target, "wb") as out:
                 while True:
-                    chunk = src.read(DIAGNOSTICS_COPY_CHUNK)
+                    chunk = src.read(RED_STAGE_COPY_CHUNK)
                     if not chunk:
                         break
                     out.write(chunk)
@@ -3418,7 +3423,7 @@ class Host:
                                             hand_over=lambda: self.hand_over_artifacts(repo, sha, name, art, deadline=run_end,
                                                                                        cancel=cancel),
                                             cancel=cancel,
-                                            hand_over_failed=lambda: self.hand_over_diagnostics(
+                                            hand_over_failed=lambda: self.hand_over_failed_stage(
                                                 repo, sha, name, art, art_before, deadline=run_end, cancel=cancel))
                         done.put((name, ok, None))
                     except BaseException as e:     # Lost, or a host defect: the scheduler decides, never a dead thread
@@ -3461,13 +3466,14 @@ class Host:
                 if not ok:
                     failed.add(name)
                     ran_red.append(name)
-                    # A red stage's artifacts never reach a hand-over. Without fan-out the directory is shared and a later
-                    # sibling's hand-over walks all of it, so what the red stage added or rewrote is quarantined beside the
-                    # run, out of that walk; with fan-out the stage's own directory goes whole.
+                    # A red stage's artifacts never reach a GREEN hand-over. Its own hand-over already sent a COPY of them,
+                    # every receipt marked failed (hand_over_failed_stage). Without fan-out the directory is shared and a
+                    # later sibling's hand-over walks all of it, so what the red stage added or rewrote is quarantined
+                    # beside the run, out of that walk; with fan-out the stage's own directory goes whole.
                     quarantined = quarantine_artifacts(art, art_before, os.path.join(workdir, "failed-artifacts", name))
                     if quarantined:
                         sink.add([{"kind": "line", "text": (f"artifacts: {len(quarantined)} entry(ies) left by the red stage "
-                                                            f"quarantined, never handed over: "
+                                                            f"quarantined, never handed over as a green stage's: "
                                                             f"{', '.join(quarantined[:5])}")[:MAX_LINE]}])
                         self.deliver(sink)
                     failed_at = failed_at or name
@@ -4034,8 +4040,9 @@ class Host:
                   hand_over_failed: Callable[[], tuple[list[dict], Optional[str]]] = None) -> bool:
         """Run ONE stage in a fresh sandboxed process tree; post its events; return success. `cancel` (fan-out): set
         when a sibling stage found the run is no longer this host's — the stage is killed and Lost raised.
-        `hand_over_failed`: what a RED stage still hands over — its diagnostics unit only (red_stage_diagnostics); its
-        receipts are posted before the failed verdict, and a problem with them is named but never turns red green."""
+        `hand_over_failed`: what a RED stage still hands over — everything it added or rewrote (red_stage_artifacts),
+        every receipt marked failed; its receipts are posted before the failed verdict, and a problem with them is named
+        but never turns red green."""
         name, started = st["name"], self.clock()
 
         def abandoned() -> None:
@@ -4125,13 +4132,13 @@ class Host:
                 ok = False
                 note = (note + "; " if note else "") + f"artifact hand-over failed: {problem}"
         elif not ok and hand_over_failed is not None:
-            # The evidence of WHY it is red outlives the sandbox (MeshWeaver.Plugins#4499) — diagnostics only.
+            # The evidence of WHY it is red outlives the sandbox (MeshWeaver.Deploy#52), every receipt marked failed.
             receipts, problem = hand_over_failed()
             events += receipts
             if receipts:
-                events.append({"kind": "line", "text": f"diagnostics: {len(receipts)} file(s) of the red stage handed over"})
+                events.append({"kind": "line", "text": f"red stage: {len(receipts)} file(s) handed over, marked failed"})
             if problem:
-                note = (note + "; " if note else "") + f"diagnostics hand-over failed: {problem}"
+                note = (note + "; " if note else "") + f"red-stage hand-over failed: {problem}"
         abandoned()
         events.append({"kind": "stage-finished", "state": "succeeded" if ok else "failed",
                        "summary": parser.summary(rc, self.clock() - started, note)})
@@ -4161,11 +4168,13 @@ class Host:
 
     def hand_over_artifacts(self, repo: str, sha: str, stage: str, artifacts_dir: str,
                             deadline: Optional[float] = None,
-                            cancel: Optional[threading.Event] = None) -> tuple[list[dict], Optional[str]]:
+                            cancel: Optional[threading.Event] = None,
+                            stage_state: str = STAGE_SUCCEEDED) -> tuple[list[dict], Optional[str]]:
         """H9: upload every file a stage left under `$MW_BUILD_ARTIFACTS/<unit>/` (a module bundle,
         its publication record, the gate bake) to the shared CI artifact store with core's
         `ci-artifact-store.py` (content-addressed, SHA-256), READ IT BACK and re-hash it, and only
-        then return its receipt `{"kind":"artifact","unit","key","sha256","bytes"}`. Returns
+        then return its receipt `{"kind":"artifact","unit","key","sha256","bytes","stageState"}` — `stage_state` the
+        outcome of the stage handing it over (STAGE_SUCCEEDED, or STAGE_FAILED for a red stage's evidence). Returns
         (receipts, the first problem or None); a stage with artifacts and no store is a problem.
         The hand-over is INSIDE the run budget: every store call gets the time left until `deadline`
         (the run's absolute end, on self.clock) and no more, so a stage finishing near the limit
@@ -4189,7 +4198,7 @@ class Host:
             return float("inf") if deadline is None else deadline - self.clock()
 
         if store_url == API_STORE_SPEC:
-            return self.hand_over_through_api(repo, sha, stage, artifacts_dir, files, left, cancel)
+            return self.hand_over_through_api(repo, sha, stage, artifacts_dir, files, left, cancel, stage_state)
         if store_url.startswith(API_STORE_SPEC):
             return [], f"MW_BUILD_ARTIFACT_STORE {store_url!r} is not a store: the API store is exactly {API_STORE_SPEC!r}"
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci-artifact-store.py")
@@ -4231,14 +4240,16 @@ class Host:
                     return receipts, f"the stored {unit} did not read back as sha256 {digest[:12]}… (exit {rc}): {out.strip()[-160:]}"
             finally:
                 shutil.rmtree(readback, ignore_errors=True)
-            receipts.append({"kind": "artifact", "unit": unit, "key": locator, "sha256": digest, "bytes": size})
+            receipts.append({"kind": "artifact", "unit": unit, "key": locator, "sha256": digest, "bytes": size,
+                             "stageState": stage_state})
         return receipts, None
 
-    def hand_over_diagnostics(self, repo: str, sha: str, stage: str, artifacts_dir: str, before: dict,
-                              deadline: Optional[float] = None,
-                              cancel: Optional[threading.Event] = None) -> tuple[list[dict], Optional[str]]:
-        """A RED stage's diagnostics unit — and nothing else of what it left — through the SAME hand-over a green stage
-        uses (store, read-back, receipt), from a private copy so the quarantine still moves the originals."""
+    def hand_over_failed_stage(self, repo: str, sha: str, stage: str, artifacts_dir: str, before: dict,
+                               deadline: Optional[float] = None,
+                               cancel: Optional[threading.Event] = None) -> tuple[list[dict], Optional[str]]:
+        """A RED stage's artifacts — everything it added or rewrote — through the SAME hand-over a green stage uses (store,
+        read-back, receipt), every receipt marked STAGE_FAILED, from a private copy so the quarantine still moves the
+        originals and no later sibling ever receipts them under its own name."""
         def proceed() -> None:
             abandoned(cancel, stage)    # Lost: an abandoned run stages, uploads and receipts nothing more
             if deadline is not None and deadline - self.clock() <= 0:
@@ -4249,21 +4260,23 @@ class Host:
             proceed()
             # Inside the try: on a full work volume this very mkdtemp raises ENOSPC, and that must become this note,
             # never an exception out of run_stage that leaves the stage without a verdict.
-            staged = tempfile.mkdtemp(prefix=".diagnostics-", dir=self.work)
-            if not red_stage_diagnostics(artifacts_dir, before, staged, proceed):
+            staged = tempfile.mkdtemp(prefix=".red-stage-", dir=self.work)
+            if not red_stage_artifacts(artifacts_dir, before, staged, proceed):
                 return [], None
-            return self.hand_over_artifacts(repo, sha, stage, staged, deadline=deadline, cancel=cancel)
+            return self.hand_over_artifacts(repo, sha, stage, staged, deadline=deadline, cancel=cancel,
+                                            stage_state=STAGE_FAILED)
         except _DeadlinePassed:
-            return [], "the run deadline passed while the red stage's diagnostics were staged"
+            return [], "the run deadline passed while the red stage's artifacts were staged"
         except OSError as e:
-            return [], f"the red stage's diagnostics could not be staged ({type(e).__name__}: {str(e)[:160]})"
+            return [], f"the red stage's artifacts could not be staged ({type(e).__name__}: {str(e)[:160]})"
         finally:
             if staged is not None:
                 shutil.rmtree(staged, ignore_errors=True)
 
     def hand_over_through_api(self, repo: str, sha: str, stage: str, artifacts_dir: str, files: list[str],
                               left: Callable[[], float],
-                              cancel: Optional[threading.Event] = None) -> tuple[list[dict], Optional[str]]:
+                              cancel: Optional[threading.Event] = None,
+                              stage_state: str = STAGE_SUCCEEDED) -> tuple[list[dict], Optional[str]]:
         """The API store: PUT each artifact to `{api}/{repo}/{sha}/artifacts/{sha256}` as the run's holder (host + claim id),
         and take the receipt FROM THE SERVER'S ANSWER — the instance hashed what it stored, so a receipt is a byte it holds.
         The answer must name this unit, this sha256, this size and a locator attesting the digest, or the stage fails. A
@@ -4276,7 +4289,7 @@ class Host:
                 return receipts, f"{unit} is not under a unit directory ($MW_BUILD_ARTIFACTS/<unit>/<file>)"
             digest, size = _sha256_file(full), os.path.getsize(full)
             query = {**self.run_scope, "stage": stage, "unit": unit, "host": self.host, "claimId": self.claim_id,
-                     **({"probe": self.probe} if self.probe else {})}
+                     "stageState": stage_state, **({"probe": self.probe} if self.probe else {})}
             path = artifact_path(repo, sha, digest)
             status, answer, pause = 0, None, 2.0
             for attempt in range(1, API_UPLOAD_ATTEMPTS + 1):
@@ -4300,7 +4313,8 @@ class Host:
             problem = api_receipt_problem(answer, unit, digest, size)
             if problem:
                 return receipts, f"the build API's answer for {unit} {problem}"
-            receipts.append({"kind": "artifact", "unit": unit, "key": answer["key"], "sha256": digest, "bytes": size})
+            receipts.append({"kind": "artifact", "unit": unit, "key": answer["key"], "sha256": digest, "bytes": size,
+                             "stageState": stage_state})
         return receipts, None
 
     # -- terminal events are never lost -----------------------------------------------------
@@ -4334,7 +4348,7 @@ class Host:
 
 
 class _DeadlinePassed(Exception):
-    """The run's deadline passed while a red stage's diagnostics were being staged."""
+    """The run's deadline passed while a red stage's artifacts were being staged."""
 
 
 def abandoned(cancel: Optional[threading.Event], stage: str) -> None:
@@ -6373,6 +6387,8 @@ def self_test() -> int:
         check("h9/one receipt per artifact, with unit, key, sha256 and bytes",
               sorted(a["unit"] for a in arts) == ["Store/Store-1.4.2.zip", "Store/Store.publication.json"]
               and all(a["key"].endswith("#sha256=" + a["sha256"]) and a["bytes"] > 0 for a in arts), arts)
+        # NEGATIVE CONTROL for MeshWeaver.Deploy#52: a GREEN stage's receipts are exactly as before, marked succeeded.
+        check("h9/a green stage's receipts are marked succeeded", arts and all(a.get("stageState") == "succeeded" for a in arts), arts)
         kinds_order = [e["kind"] for e in evs if e["kind"] in ("artifact", "stage-finished")]
         check("h9/receipts precede the stage's verdict", kinds_order[-1] == "stage-finished" and kinds_order.count("artifact") == 2, kinds_order)
         check("h9/every upload was read back", [c[2] for c in store_calls] == ["put", "get", "put", "get"], [c[2] for c in store_calls])
@@ -6477,9 +6493,10 @@ def self_test() -> int:
                 else:
                     check(f"h9/negative control: without the quarantine {label} reaches the sibling's hand-over",
                           not clean, (good_fin, good_units))
-        # A RED stage's DIAGNOSTICS outlive its sandbox (MeshWeaver.Plugins#4499): the `diagnostics` unit it wrote is
-        # handed over and receipted before its failed verdict, while everything else it left (an unfinished bundle) is
-        # still quarantined, and a dangling symlink among the diagnostics is skipped rather than failing the hand-over.
+        # A RED stage's ARTIFACTS outlive its sandbox (MeshWeaver.Deploy#52, after the diagnostics of #4499): everything it
+        # added — its diagnostics unit, its results, even an unfinished bundle — is handed over and receipted before its
+        # failed verdict, EVERY receipt marked failed (so no reader publishes or ratchets it), the originals are still
+        # quarantined, and a dangling symlink among them is skipped rather than failing the hand-over.
         red_cmd = ("mkdir -p $MW_BUILD_ARTIFACTS/diagnostics/bad $MW_BUILD_ARTIFACTS/Bad && echo crash > "
                    "$MW_BUILD_ARTIFACTS/diagnostics/bad/suite.log && echo half > $MW_BUILD_ARTIFACTS/Bad/Bad-1.0.0.zip && "
                    "ln -s /nonexistent $MW_BUILD_ARTIFACTS/diagnostics/bad/dangling; exit 1")
@@ -6487,19 +6504,43 @@ def self_test() -> int:
             posted.clear()
             hd = host(api_ev(), env=dict(env_s, MW_BUILD_ARTIFACT_STORE="file:" + store_dir), store_runner=fake_store,
                       checkout=checkout_with({"stages": [{"name": "bad", "kind": "test", "command": red_cmd}]}))
-            if not wired:   # NEGATIVE CONTROL: the runner as it was — a red stage hands over nothing
-                hd.hand_over_diagnostics = lambda *a, **k: ([], None)
+            if not wired:   # NEGATIVE CONTROL: the runner without the red-stage hand-over — a red stage receipts nothing
+                hd.hand_over_failed_stage = lambda *a, **k: ([], None)
             hd.run(claim)
             evs = [e for pth, es in posted if pth.split("/")[-2] == "bad" for e in es]
-            units = sorted(e["unit"] for e in evs if e["kind"] == "artifact")
+            red_arts = [e for e in evs if e["kind"] == "artifact"]
+            units = sorted(e["unit"] for e in red_arts)
             fin = [e for e in evs if e["kind"] == "stage-finished"]
             if wired:
-                check("h9/a red stage hands over its diagnostics (and only them), and stays red",
-                      units == ["diagnostics/bad/suite.log"] and fin and fin[-1]["state"] == "failed", (units, fin))
+                check("h9/a red stage hands over every file it added (diagnostics AND its other units), and stays red",
+                      units == ["Bad/Bad-1.0.0.zip", "diagnostics/bad/suite.log"] and fin and fin[-1]["state"] == "failed",
+                      (units, fin))
+                check("h9/every receipt of a red stage arrives marked failed",
+                      red_arts and all(e.get("stageState") == "failed" for e in red_arts), red_arts)
                 check("h9/the red stage's receipts precede its failed verdict",
                       [e["kind"] for e in evs if e["kind"] in ("artifact", "stage-finished")][-1] == "stage-finished", evs)
+                check("h9/the red stage says how many files it handed over, marked failed",
+                      any(e["kind"] == "line" and e["text"] == "red stage: 2 file(s) handed over, marked failed" for e in evs), evs)
             else:
-                check("h9/negative control: without the diagnostics hand-over a red stage receipts nothing", units == [], units)
+                check("h9/negative control: without the red-stage hand-over a red stage receipts nothing", units == [], units)
+        # The API store carries the marker on the UPLOAD too, so the receipt the instance records says failed.
+        red_puts: list[dict] = []
+
+        def red_put(path, query, data, size, timeout):
+            red_puts.append(dict(query))
+            digest = path.rsplit("/", 1)[1]
+            return 201, {"stage": query["stage"], "unit": query["unit"], "sha256": digest, "bytes": size,
+                         "stageState": query.get("stageState"), "existed": False,
+                         "key": f"api:/build-hosts/R/{'c' * 40}/stable/{query['stage']}/{digest}/{query['unit']}#sha256={digest}"}
+        posted.clear()
+        hr = host(api_ev(((("PUT", "/MeshWeaver.Plugins/"), red_put))), env=dict(env_s, MW_BUILD_ARTIFACT_STORE="api:"),
+                  store_runner=fake_store, checkout=checkout_with({"stages": [{"name": "bad", "kind": "test", "command": red_cmd}]}))
+        hr.run(dict(claim, claimId="claim-red"))
+        evs = [e for pth, es in posted if pth.split("/")[-2] == "bad" for e in es]
+        check("h9-api/a red stage's uploads name stageState=failed, and its receipts say failed",
+              len(red_puts) == 2 and all(q.get("stageState") == "failed" for q in red_puts)
+              and all(e.get("stageState") == "failed" for e in evs if e["kind"] == "artifact")
+              and [e for e in evs if e["kind"] == "stage-finished"][-1]["state"] == "failed", (red_puts, evs))
         droot = tempfile.mkdtemp(prefix="h9d-")
         try:
             os.makedirs(os.path.join(droot, "diagnostics", "x"))
@@ -6512,10 +6553,10 @@ def self_test() -> int:
                 fh.write(b"trx")
             with open(os.path.join(droot, "Mod", "Mod.zip"), "wb") as fh:
                 fh.write(b"rewritten")
-            got_d = red_stage_diagnostics(droot, before_d, droot + "-d")
-            check("h9/diagnostics: only what the red stage ADDED under diagnostics/ is staged — not an older file, not a bundle",
-                  got_d == ["diagnostics/x/new.trx"] and os.path.isfile(os.path.join(droot, "diagnostics", "x", "new.trx")),
-                  got_d)
+            got_d = red_stage_artifacts(droot, before_d, droot + "-d")
+            check("h9/red stage: what it ADDED or REWROTE is staged (a new trx, a rewritten bundle) — never an older file",
+                  got_d == ["Mod/Mod.zip", "diagnostics/x/new.trx"]
+                  and os.path.isfile(os.path.join(droot, "diagnostics", "x", "new.trx")), got_d)
         finally:
             shutil.rmtree(droot, ignore_errors=True)
             shutil.rmtree(droot + "-d", ignore_errors=True)
@@ -6530,33 +6571,33 @@ def self_test() -> int:
             hs = host(api_ev(), env=dict(env_s, MW_BUILD_ARTIFACT_STORE="file:" + store_dir), store_runner=fake_store)
             hs.work = os.path.join(sroot, "no-such-work-volume")
             try:
-                r_, prob_ = hs.hand_over_diagnostics("r", "s", "bad", os.path.join(sroot, "art"), {})
+                r_, prob_ = hs.hand_over_failed_stage("r", "s", "bad", os.path.join(sroot, "art"), {})
                 staged_ok = r_ == [] and bool(prob_) and "could not be staged" in prob_
             except Exception as e:      # the defect: the staging error escaped
                 staged_ok, prob_ = False, repr(e)
-            check("h9/diagnostics: a staging directory the work volume refuses is the note, never an escaped exception",
+            check("h9/red stage: a staging directory the work volume refuses is the note, never an escaped exception",
                   staged_ok, prob_)
             hs.work = sroot
             gone = threading.Event()
             gone.set()
             try:
-                hs.hand_over_diagnostics("r", "s", "bad", os.path.join(sroot, "art"), {}, cancel=gone)
+                hs.hand_over_failed_stage("r", "s", "bad", os.path.join(sroot, "art"), {}, cancel=gone)
                 lost_ok = False
             except Lost:
                 lost_ok = True
-            check("h9/diagnostics: an abandoned run stages nothing (Lost before the first copy)",
-                  lost_ok and not [d for d in os.listdir(sroot) if d.startswith(".diagnostics-")], os.listdir(sroot))
-            r_, prob_ = hs.hand_over_diagnostics("r", "s", "bad", os.path.join(sroot, "art"), {},
-                                                 deadline=hs.clock() - 1)
-            check("h9/diagnostics: an expired run copies nothing and names the deadline",
+            check("h9/red stage: an abandoned run stages nothing (Lost before the first copy)",
+                  lost_ok and not [d for d in os.listdir(sroot) if d.startswith(".red-stage-")], os.listdir(sroot))
+            r_, prob_ = hs.hand_over_failed_stage("r", "s", "bad", os.path.join(sroot, "art"), {},
+                                                  deadline=hs.clock() - 1)
+            check("h9/red stage: an expired run copies nothing and names the deadline",
                   r_ == [] and bool(prob_) and "deadline" in prob_
-                  and not [d for d in os.listdir(sroot) if d.startswith(".diagnostics-")], (r_, prob_))
+                  and not [d for d in os.listdir(sroot) if d.startswith(".red-stage-")], (r_, prob_))
             # A dump larger than two chunks, stopped by the check after the first chunk: only that chunk is written.
             # An unbounded read followed by one check would write the whole file before it could stop.
             big_root = os.path.join(sroot, "big")
             os.makedirs(os.path.join(big_root, "diagnostics", "x"))
             with open(os.path.join(big_root, "diagnostics", "x", "core.dump"), "wb") as fh:
-                fh.truncate(2 * DIAGNOSTICS_COPY_CHUNK + 1)
+                fh.truncate(2 * RED_STAGE_COPY_CHUNK + 1)
             calls = []
 
             class _Stop(Exception):
@@ -6568,13 +6609,13 @@ def self_test() -> int:
                     raise _Stop()
             stopped = False
             try:
-                red_stage_diagnostics(big_root, {}, os.path.join(sroot, "copy"), stop_after_first_chunk)
+                red_stage_artifacts(big_root, {}, os.path.join(sroot, "copy"), stop_after_first_chunk)
             except _Stop:
                 stopped = True
             copied_target = os.path.join(sroot, "copy", "diagnostics", "x", "core.dump")
             written = os.path.getsize(copied_target) if os.path.isfile(copied_target) else -1
-            check("h9/diagnostics: the copy re-checks before each file and between its chunks, and stops mid-file",
-                  stopped and calls == [1, 1] and written == DIAGNOSTICS_COPY_CHUNK, (stopped, calls, written))
+            check("h9/red stage: the copy re-checks before each file and between its chunks, and stops mid-file",
+                  stopped and calls == [1, 1] and written == RED_STAGE_COPY_CHUNK, (stopped, calls, written))
         finally:
             shutil.rmtree(sroot, ignore_errors=True)
         # ── 7d. FAN-OUT: a `parallel` run's independent stages run CONCURRENTLY, within the host's declared slots ──
@@ -6785,8 +6826,9 @@ def self_test() -> int:
               state(one, "s0") == "failed" and state(one, "s1") == "failed"
               and any(e["kind"] == "line" and e["text"].startswith("serial:") for e in one["by"].get("build", [])), one["by"])
 
-        # A RED stage in flight beside a green one: its artifacts are quarantined whole and never handed over, and they
-        # never reach the green sibling's hand-over (each stage has its own directory) — the sibling stays green.
+        # A RED stage in flight beside a green one: its artifacts are handed over MARKED FAILED (MeshWeaver.Deploy#52) and
+        # then quarantined whole, and they never reach the green sibling's hand-over (each stage has its own directory) —
+        # the sibling stays green and its receipts stay marked succeeded.
         fifo = tempfile.mkdtemp(prefix="fifo-", dir=tmp)
         for f in ("ab", "ba"):
             os.mkfifo(os.path.join(fifo, f))
@@ -6806,10 +6848,12 @@ def self_test() -> int:
                 by_q.setdefault(pth.split("/")[-2], []).append(e)
         gfin = [e for e in by_q.get("good", []) if e["kind"] == "stage-finished"]
         gunits = sorted(e["unit"] for e in by_q.get("good", []) if e["kind"] == "artifact")
-        check("fanout/the green sibling stays green and hands over only its own artifacts",
-              gfin and gfin[-1]["state"] == "succeeded" and gunits == ["Good/Good.json"], (gfin, gunits))
-        check("fanout/the red stage hands over nothing and says what it quarantined",
-              not [e for e in by_q.get("bad", []) if e["kind"] == "artifact"]
+        check("fanout/the green sibling stays green and hands over only its own artifacts, marked succeeded",
+              gfin and gfin[-1]["state"] == "succeeded" and gunits == ["Good/Good.json"]
+              and all(e.get("stageState") == "succeeded" for e in by_q.get("good", []) if e["kind"] == "artifact"), (gfin, gunits))
+        bad_arts = [e for e in by_q.get("bad", []) if e["kind"] == "artifact"]
+        check("fanout/the red stage hands over its own files marked failed (never its dangling symlink) and says what it quarantined",
+              [e["unit"] for e in bad_arts] == ["Bad/Bad-1.0.0.zip"] and all(e.get("stageState") == "failed" for e in bad_arts)
               and any(e["kind"] == "line" and "quarantined" in e["text"] for e in by_q.get("bad", [])), by_q.get("bad"))
 
         # LOST: a 409 on one stage's route abandons the RUN — its siblings in flight are killed, not waited out.
