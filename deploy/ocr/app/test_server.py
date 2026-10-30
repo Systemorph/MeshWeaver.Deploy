@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -207,6 +208,57 @@ class Http(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 2.0, "B was refused only after waiting — it was queued, not refused")
         worker.join(30)
         self.assertEqual(first["answer"][0], 200)
+
+    def trickle(self, base, size, pause, stop_after):
+        """Send headers for ``size`` bytes, then one byte every ``pause`` s until answered or ``stop_after``.
+
+        Returns (status or None, seconds until the answer). Each pause is far below the read timeout,
+        so only an ABSOLUTE deadline over the upload can cut this client off.
+        """
+        host, port = base.removeprefix("http://").split(":")
+        sock = socket.create_connection((host, int(port)), timeout=5)
+        self.addCleanup(sock.close)
+        sock.sendall((f"POST /ocr HTTP/1.1\r\nHost: {host}\r\nContent-Type: image/png\r\n"
+                      f"Content-Length: {size}\r\n\r\n").encode())
+        sock.settimeout(pause)
+        t0 = time.monotonic()
+        sent = 0
+        while time.monotonic() - t0 < stop_after:
+            try:
+                answer = sock.recv(4096)
+            except TimeoutError:
+                if sent >= size:
+                    continue      # the whole body is out; wait for the answer
+                try:
+                    sock.sendall(b"\0")
+                    sent += 1
+                except OSError:   # the server closed the connection
+                    break
+                continue
+            if answer:
+                return int(answer.split(b" ", 2)[1]), time.monotonic() - t0
+            break
+        return None, time.monotonic() - t0
+
+    def test_trickling_upload_is_cut_at_the_deadline_and_frees_its_place(self):
+        # One admission place, a 2 s deadline, a 30 s read timeout. A client that sends one byte every
+        # 0.2 s never trips the read timeout; without a deadline over the upload it would hold the only
+        # place for the whole 10 s and every other request would answer 503.
+        base = self.start(fake_runner(), OCR_CONCURRENCY=1, OCR_MAX_ADMITTED=1, OCR_TIMEOUT_SECONDS=2,
+                          OCR_READ_TIMEOUT_SECONDS=30)
+        status, took = self.trickle(base, size=10_000, pause=0.2, stop_after=10)
+        self.assertEqual(status, 504, "the trickling upload was never cut off")
+        self.assertLess(took, 6, f"cut only after {took:.1f} s; the deadline is 2 s")
+        self.assertEqual(self.post(base, png())[0], 200, "the place the trickler held was not freed")
+
+    def test_upload_within_the_deadline_is_not_cut(self):
+        # Negative control: the same trickle, finished well inside the deadline, is read and answered.
+        base = self.start(fake_runner(), OCR_CONCURRENCY=1, OCR_MAX_ADMITTED=1, OCR_TIMEOUT_SECONDS=5,
+                          OCR_READ_TIMEOUT_SECONDS=30)
+        status, _ = self.trickle(base, size=5, pause=0.2, stop_after=10)
+        self.assertIsNotNone(status, "the finished upload was never answered")
+        self.assertNotEqual(status, 504)
+        self.assertEqual(self.post(base, png())[0], 200)
 
     def test_admission_below_concurrency_refuses_to_start(self):
         with self.assertRaises(SystemExit):
