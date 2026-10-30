@@ -1,0 +1,5 @@
+# test-node-headroom.sh: two pools, one PriorityClass.
+nodeHeadroom:
+  pools:
+    - { pool: silos, cpu: "4", memory: "8Gi" }
+    - { pool: cibuildv6, cpu: "3500m", memory: "12Gi", replicas: 2 }
