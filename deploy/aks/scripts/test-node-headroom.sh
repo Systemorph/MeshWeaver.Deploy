@@ -3,16 +3,19 @@
 # The node-pool headroom (templates/node-headroom/, Memex#863; core Doc/Architecture/DeploymentAKS →
 # "A spare slot per node pool"), checked the only ways that can fail without a cluster:
 #
-#   1. NEGATIVE CONTROL — the chart defaults (nodeHeadroom.pools: []) render NO PriorityClass and NO
-#      placeholder Deployment: only the release that declares a pool (the control record's) carries one;
-#   2. one declared pool renders exactly ONE PriorityClass `node-headroom` (negative value,
-#      globalDefault false, preemptionPolicy Never) and ONE Deployment `node-headroom-<pool>` whose pod
-#      runs under that class, is pinned to the pool by kubernetes.azure.com/agentpool, holds requests ==
-#      limits == the declared size, terminates at once (grace 0), runs non-root with a read-only root,
-#      dropped capabilities, no service-account token, and the declared replicas;
-#   3. two pools render two Deployments and still ONE PriorityClass;
-#   4. the refusals hold: a non-negative priority, a pool declared twice, a name that is not a pool
-#      name, and fewer than one replica fail `helm template`, naming why.
+#   1. NEGATIVE CONTROL — the chart defaults (nodeHeadroom.pools: []) render NO placeholder Deployment:
+#      only the release that declares a pool (the control record's) carries one;
+#   2. one declared pool renders exactly ONE Deployment `node-headroom-<pool>` whose pod REFERENCES the
+#      PriorityClass `node-headroom`, is pinned to the pool by kubernetes.azure.com/agentpool, holds
+#      requests == limits == the declared size, terminates at once (grace 0), runs non-root with a
+#      read-only root, dropped capabilities, no service-account token, and the declared replicas;
+#   3. two pools render two Deployments;
+#   4. NO render — default, one pool or two — carries a PriorityClass: the class is INFRA-DECLARED
+#      (Systemorph/Memex deployments/aks/cluster-bootstrap/, applied by the governed InfraDeploy) and the
+#      hosting operator holds no write on priorityclasses, so a chart that rendered one would be refused
+#      by hosting-deploy's preflight on the first release that declares a pool;
+#   5. the refusals hold: a `priority` value (the class is not the chart's), a pool declared twice, a
+#      name that is not a pool name, and fewer than one replica fail `helm template`, naming why.
 #
 # NO SKIP-TRAPDOOR: helm, python3 and PyYAML are asserted; a render that yields nothing is RED.
 set -uo pipefail
@@ -60,13 +63,7 @@ objs = json.load(sys.stdin)
 p = []
 pcs = [o for o in objs if o["kind"] == "PriorityClass"]
 deps = [o for o in objs if o["kind"] == "Deployment"]
-if len(pcs) != 1: p.append(f"{len(pcs)} PriorityClass objects, expected exactly one")
-else:
-    pc = pcs[0]
-    if pc["metadata"]["name"] != "node-headroom": p.append("the PriorityClass is not named node-headroom")
-    if not isinstance(pc.get("value"), int) or pc["value"] >= 0: p.append("the PriorityClass value is not negative: " + repr(pc.get("value")))
-    if pc.get("globalDefault") is not False: p.append("the PriorityClass is not globalDefault: false")
-    if pc.get("preemptionPolicy") != "Never": p.append("the PriorityClass does not say preemptionPolicy: Never")
+if pcs: p.append(f"{len(pcs)} PriorityClass object(s) rendered — the class is infra-declared, the chart must only reference it")
 if len(deps) != 1: p.append(f"{len(deps)} placeholder Deployments, expected exactly one")
 else:
     d = deps[0]
@@ -96,7 +93,7 @@ print("\n".join(p))
 if [ -z "$one_out" ]; then report "the one-pool fixture rendered nothing"
 elif [ "$inspected" != 1 ]; then report "the one-pool inspector itself FAILED (see its error above) — nothing was checked"
 elif [ -n "$problems" ]; then while IFS= read -r line; do report "one pool: $line"; done <<< "$problems"
-else ok "one declared pool renders one negative, non-preempting PriorityClass and one pinned, requests==limits placeholder"; fi
+else ok "one declared pool renders one pinned, requests==limits placeholder that references the infra-declared node-headroom class, and no PriorityClass"; fi
 
 # ---- 3. two pools ------------------------------------------------------------------------------
 two_out="$(render -f "$TD/values.node-headroom-two-pools.yaml")" || { report "the two-pool fixture does not render: $two_out"; two_out=""; }
@@ -106,10 +103,10 @@ objs = json.load(sys.stdin)
 pcs = sum(1 for o in objs if o["kind"] == "PriorityClass")
 deps = sorted((o["metadata"]["name"], o["spec"]["replicas"]) for o in objs if o["kind"] == "Deployment")
 print(pcs, deps)')"
-if [ "$counts" = "1 [('node-headroom-cibuildv6', 2), ('node-headroom-silos', 1)]" ]; then
-  ok "two pools render two placeholders (with their own replicas) under ONE PriorityClass"
+if [ "$counts" = "0 [('node-headroom-cibuildv6', 2), ('node-headroom-silos', 1)]" ]; then
+  ok "two pools render two placeholders (with their own replicas) and no PriorityClass"
 else
-  report "two pools rendered '$counts', expected one PriorityClass and node-headroom-cibuildv6 x2 + node-headroom-silos x1"
+  report "two pools rendered '$counts', expected no PriorityClass and node-headroom-cibuildv6 x2 + node-headroom-silos x1"
 fi
 
 # ---- 4. refusals -------------------------------------------------------------------------------
@@ -123,7 +120,7 @@ refuse() { # fixture, expected substring
     report "$1 failed, but not naming '$2': $out"
   fi
 }
-refuse values.node-headroom-positive-priority.yaml "must be negative"
+refuse values.node-headroom-priority-value.yaml "INFRA-DECLARED"
 refuse values.node-headroom-pool-twice.yaml "is declared twice"
 refuse values.node-headroom-bad-pool.yaml "is not a node pool name"
 refuse values.node-headroom-zero-replicas.yaml "must be at least 1"
