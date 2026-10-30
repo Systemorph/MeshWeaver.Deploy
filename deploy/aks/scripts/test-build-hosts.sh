@@ -100,6 +100,16 @@ browser_problems() {
     || p+=("PLAYWRIGHT_BROWSERS_PATH / CHROME_BIN are not set")
   grep -q 'setpriv --reuid=1654' "$f" && grep -q -- '--print-to-pdf=' "$f" && grep -q '"%PDF"' "$f" \
     || p+=("no smoke print as uid 1654")
+  # THE ACTIONS SHARDS' browser (core's owes item "browser"): the version core's dotnet-test.yml provisions
+  # must equal the portal's, every package of core's .github/chromium-fonts.list must be installed, and the
+  # binary the shards export to the tests (MESHWEAVER_CHROMIUM_PATH) is declared and reaches a stage.
+  grep -q '.github/workflows/dotnet-test.yml' "$f" && grep -q '\[ "$a" != "$v" \]' "$f" \
+    || p+=("the Playwright version is not cross-checked against core's Actions test shards (dotnet-test.yml)")
+  grep -q '.github/chromium-fonts.list' "$f" && grep -q 'dpkg-query' "$f" \
+    && grep -q 'fonts-liberation fonts-noto-color-emoji' "$f" \
+    || p+=("the installed fonts are not checked against core's .github/chromium-fonts.list")
+  grep -q '^ENV MESHWEAVER_CHROMIUM_PATH=/usr/bin/chromium$' "$f" \
+    || p+=("MESHWEAVER_CHROMIUM_PATH (what core's shards export to the tests) is not set")
   local inst user
   inst="$(grep -n 'install --with-deps --only-shell chromium' "$f" | head -1 | cut -d: -f1)"
   user="$(grep -n '^USER 1654' "$f" | head -1 | cut -d: -f1)"
@@ -124,7 +134,15 @@ bmutant "fonts-local.conf not installed" 's#cp /opt/build-host/browser/fonts-loc
 bmutant "amd64-only lookup" 's# -o -name chrome-headless-shell##'
 bmutant "installed after USER 1654" '/^ENV PLAYWRIGHT_BROWSERS_PATH/i\
 USER 1654'
+bmutant "no Actions version cross-check" 's#\[ "$a" != "$v" \]#false#'
+bmutant "no font-list check" 's#dpkg-query#true#'
+bmutant "no MESHWEAVER_CHROMIUM_PATH" '/^ENV MESHWEAVER_CHROMIUM_PATH/d'
 rm -rf "$BMUT"
+if grep -q '"MESHWEAVER_CHROMIUM_PATH", "CHROME_BIN", "PLAYWRIGHT_BROWSERS_PATH"' "$REPO/.github/scripts/build-run.py"; then
+  ok "build-run.py hands the image's browser (MESHWEAVER_CHROMIUM_PATH, CHROME_BIN, PLAYWRIGHT_BROWSERS_PATH) to every stage"
+else
+  report "build-run.py's ENV_ALLOW drops the image's browser variables — a stage's renderer would not resolve the image's browser as core's shards do"
+fi
 if python3 "$REPO/.github/scripts/build-run.py" --self-test; then
   ok "build-run.py passes its self-test"
 else

@@ -153,7 +153,8 @@ RUN set -eu; \
     apt-get purge -y gnupg; apt-get autoremove -y; apt-get clean; rm -rf /var/lib/apt/lists/*
 # MESHWEAVER_CHROMIUM_PATH is what core's `test` shards export for the tests (the renderer's first probe);
 # build-run.py hands all three to every stage through its env allow-list.
-ENV CHROME_BIN=/usr/bin/chromium MESHWEAVER_CHROMIUM_PATH=/usr/bin/chromium
+ENV CHROME_BIN=/usr/bin/chromium
+ENV MESHWEAVER_CHROMIUM_PATH=/usr/bin/chromium
 
 # The runner (this repository) and the platform's composer and helpers (the set's commit) — one
 # implementation each, versioned with the image (the chart ships no copy).
