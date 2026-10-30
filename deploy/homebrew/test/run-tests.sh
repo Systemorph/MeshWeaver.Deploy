@@ -1075,12 +1075,34 @@ grep -q 'az acr manifest show-metadata .*--only-show-errors 2>&1' "$CLI" \
   || bad "the acr poll passes --only-show-errors" "$(grep -n 'az acr manifest show-metadata' "$CLI")"
 
 echo "── down --purge removes the portal's node data, not only the namespace ──"
-down_body="$(awk '/^cmd_down\(\)/{on=1} on{print} on&&/^}$/{exit}' "$CLI")"
-# shellcheck disable=SC2016  # a literal '$PORTAL_DATA_DIR' is the text being searched for
-case "$down_body" in
-  *'--purge'*'colima ssh -- sudo rm -rf "$PORTAL_DATA_DIR"'*) ok "down --purge deletes \$PORTAL_DATA_DIR (instance.json survived a namespace delete)" ;;
-  *) bad "down --purge deletes the portal node data" "no rm of \$PORTAL_DATA_DIR in cmd_down()" ;;
+# Behaviour, not text: run cmd_down against recording stubs (colima/helm/kubectl log their argv).
+DP="$(mktemp -d)"; mkdir -p "$DP/stubs" "$DP/home"
+cat > "$DP/stubs/colima" <<'EOF'
+#!/usr/bin/env bash
+printf 'colima %s\n' "$*" >> "$FAKE_TOOL_LOG"
+[ "$1" = "ssh" ] && [ -n "${FAKE_SSH_FAILS:-}" ] && exit 1
+exit 0
+EOF
+printf '#!/usr/bin/env bash\nprintf "%%s %%s\\n" "$(basename "$0")" "$*" >> "$FAKE_TOOL_LOG"\nexit 0\n' > "$DP/stubs/helm"
+cp "$DP/stubs/helm" "$DP/stubs/kubectl"; chmod +x "$DP/stubs/"*
+down_run() {  # down_run [ENV=…] -- <cmd_down args>
+  : > "$DP/tools.log"
+  OUT="$(env PATH="$DP/stubs:$PATH" HOME="$DP/home" MEMEX_LOCAL_HOME="$DP/home/.memex-local" FAKE_TOOL_LOG="$DP/tools.log" \
+    MEMEX_LOCAL_LIB=1 "$@" bash -c '. "$1"; shift; uninstall_launchd() { :; }; cmd_down "$@"' _ "$CLI" "${DOWN_ARGS[@]}" 2>&1)"; RC=$?
+}
+DOWN_ARGS=(--purge); down_run
+if grep -q '^colima ssh -- sudo rm -rf /var/lib/memex-portal-data$' "$DP/tools.log"; then
+  ok "down --purge deletes the portal's node data (instance.json survived a namespace delete)"
+else bad "down --purge deletes the portal's node data" "tools: $(tr '\n' ';' < "$DP/tools.log") out: $OUT"; fi
+DOWN_ARGS=(); down_run
+if grep -q 'rm -rf' "$DP/tools.log"; then bad "plain down keeps the node data" "tools: $(tr '\n' ';' < "$DP/tools.log")"
+else ok "plain down keeps the portal's node data (only --purge deletes it)"; fi
+DOWN_ARGS=(--purge); down_run FAKE_SSH_FAILS=1
+case "$RC:$OUT" in
+  0:*"remove it by hand: colima ssh -- sudo rm -rf /var/lib/memex-portal-data"*) ok "a failed node delete warns with the exact command to finish it" ;;
+  *) bad "a failed node delete warns with the recovery command" "rc=$RC $OUT" ;;
 esac
+rm -rf "$DP"
 chart_path="$(grep -A1 'name: memex-data' "$HERE/../../helm/templates/memex-portal/deployment.yaml" | grep -o 'path: [^ ]*' | head -1 | cut -d' ' -f2)"
 cli_path="$(sed -n 's/^readonly PORTAL_DATA_DIR="\(.*\)"$/\1/p' "$CLI")"
 if [ -n "$cli_path" ] && grep -q "path: $cli_path\$" "$HERE/../../helm/templates/memex-portal/deployment.yaml"; then
