@@ -98,7 +98,7 @@ resource shares_volumes_memex_postgres_0 'Microsoft.Storage/storageAccounts/file
 }
 
 resource managedStorage_volumes_memex_postgres_0 'Microsoft.App/managedEnvironments/storages@2025-07-01' = {
-  name: take('${toLower('memex-postgres')}-${toLower('memexpgdata')}-${resourceToken}', 32)
+  name: 'memex-pgdat-45911a-${resourceToken}'
   properties: {
     azureFile: {
       accountName: memex_aca_storageVolume.name
@@ -120,7 +120,7 @@ resource shares_volumes_memex_portal_0 'Microsoft.Storage/storageAccounts/fileSe
 }
 
 resource managedStorage_volumes_memex_portal_0 'Microsoft.App/managedEnvironments/storages@2025-07-01' = {
-  name: take('${toLower('memex-portal')}-${toLower('memexportaldata')}-${resourceToken}', 32)
+  name: 'data-f01d18-${resourceToken}'
   properties: {
     azureFile: {
       accountName: memex_aca_storageVolume.name
@@ -142,7 +142,7 @@ resource shares_volumes_memex_portal_1 'Microsoft.Storage/storageAccounts/fileSe
 }
 
 resource managedStorage_volumes_memex_portal_1 'Microsoft.App/managedEnvironments/storages@2025-07-01' = {
-  name: take('${toLower('memex-portal')}-${toLower('memexportalcontent')}-${resourceToken}', 32)
+  name: 'content-783a85-${resourceToken}'
   properties: {
     azureFile: {
       accountName: memex_aca_storageVolume.name
@@ -164,7 +164,7 @@ resource shares_volumes_memex_portal_2 'Microsoft.Storage/storageAccounts/fileSe
 }
 
 resource managedStorage_volumes_memex_portal_2 'Microsoft.App/managedEnvironments/storages@2025-07-01' = {
-  name: take('${toLower('memex-portal')}-${toLower('memexportalusers')}-${resourceToken}', 32)
+  name: 'users-d0af47-${resourceToken}'
   properties: {
     azureFile: {
       accountName: memex_aca_storageVolume.name
