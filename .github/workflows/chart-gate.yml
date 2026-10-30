@@ -416,7 +416,7 @@ jobs:
             .github/dockerhub-mirror.list
             src/MeshWeaver.PluginCatalog/InstanceRegistryAuthenticator.cs
             src/MeshWeaver.PluginCatalog/SyncTokenSigningKeyService.cs
-            src/MeshWeaver.Documentation/Data/Architecture/QueryFanInStallTerminal.md
+            src/MeshWeaver.Mesh.Contract/Services/MeshOperationOptions.cs
           sparse-checkout-cone-mode: false
       - name: Execute the publisher, the init container's fetch and the edge authorization
         env:

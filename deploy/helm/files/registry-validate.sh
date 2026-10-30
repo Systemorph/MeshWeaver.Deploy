@@ -62,7 +62,8 @@
 #         (InstanceRegistryAuthenticator.ReadBudget, Doc/Architecture/InstanceKeyResolution,
 #         "One budget for the whole resolution"); a non-verdict is a 503 + Retry-After by then;
 #   15 s  the plan ladder, only for a resolved key (PlanTierLadder.Read, bounded by
-#         MeshOperationOptions.QueryInitialBudget; 1-minute snapshot, so usually instant);
+#         MeshOperationOptions.QueryInitialBudget = Nest(Nest(Nest(Timeout))) on the source defaults;
+#         1-minute snapshot, so usually instant);
 #   10 s  the token-signing key, only for a resolved key (SyncTokenSigningKeyService.ReadTimeout;
 #         1-minute cache, so usually instant);
 # plus 5 s for the answer to cross the portal's ingress. 10 + 15 + 10 + 5 = 40. A normal answer

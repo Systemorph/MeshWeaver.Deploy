@@ -64,6 +64,7 @@ import concurrent.futures
 import http.server
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -144,8 +145,39 @@ def _seconds(relative: str, pattern: str) -> int:
 # The exchange's sequential budgets (registry-validate.sh's header names each), and the hook's limit.
 RESOLUTION_BUDGET = _seconds("src/MeshWeaver.PluginCatalog/InstanceRegistryAuthenticator.cs",
                              r"ReadBudget \{ get; init; \} = TimeSpan\.FromSeconds\((\d+)\)")
-LADDER_BUDGET = _seconds("src/MeshWeaver.Documentation/Data/Architecture/QueryFanInStallTerminal.md",
-                         r"\| \*\*`QueryInitialBudget`\*\* \|[^\n]*\| \*\*(\d+) s\*\* \|")
+def _ladder_budget() -> int:
+    """MeshOperationOptions.QueryInitialBudget, COMPUTED from the executable source at the declared
+    ref — never a documentation table that can lag it. It is Nest(Nest(Nest(Timeout))) with
+    Nest(t) = max(t - NestingReserve, t * MinNestingFraction); every default and every link of that
+    chain is matched, so a change to any of them is either followed here or RED, never silently
+    stale. (A deployment that overrides Timeout in configuration is outside what source can tell.)"""
+    rel = "src/MeshWeaver.Mesh.Contract/Services/MeshOperationOptions.cs"
+    path = Path(os.environ["MW_PLATFORM_ROOT"]).resolve() / rel
+    src = path.read_text() if path.is_file() else ""
+    shapes = {
+        "timeout": r"private readonly TimeSpan timeout = TimeSpan\.FromSeconds\((\d+)\);",
+        "reserve": r"private readonly TimeSpan nestingReserve = TimeSpan\.FromSeconds\((\d+)\);",
+        "fraction": r"private readonly double minNestingFraction = ([0-9.]+);",
+    }
+    chain = [
+        r"public TimeSpan NestedTimeout => Nest\(Timeout\);",
+        r"public TimeSpan PermissionEstablishmentBudget => Nest\(NestedTimeout\);",
+        r"public TimeSpan QueryInitialBudget => Nest\(PermissionEstablishmentBudget\);",
+        r"Nest\(TimeSpan enclosing\) => TimeSpan\.FromTicks\(Math\.Max\(\s*\(enclosing - NestingReserve\)\.Ticks,\s*"
+        r"\(long\)\(enclosing\.Ticks \* MinNestingFraction\)\)\);",
+    ]
+    found = {k: re.search(p, src) for k, p in shapes.items()}
+    missing = [p for p in list(shapes.values()) + chain if not re.search(p, src)]
+    if missing:
+        raise SystemExit(f"::error::cannot derive QueryInitialBudget from {rel} in MW_PLATFORM_ROOT — /{missing[0]}/ no longer "
+                         "matches; the ladder moved: re-derive registry-validate.sh's EXCHANGE_ANSWER_LIMIT and update this harness")
+    t, reserve, fraction = float(found["timeout"].group(1)), float(found["reserve"].group(1)), float(found["fraction"].group(1))
+    for _ in range(3):
+        t = max(t - reserve, t * fraction)
+    return math.ceil(t)
+
+
+LADDER_BUDGET = _ladder_budget()
 SIGNING_KEY_BUDGET = _seconds("src/MeshWeaver.PluginCatalog/SyncTokenSigningKeyService.cs",
                               r"ReadTimeout = TimeSpan\.FromSeconds\((\d+)\)")
 _limit = re.search(r"^EXCHANGE_ANSWER_LIMIT=(\d+)$", VALIDATE.read_text(), re.M)
