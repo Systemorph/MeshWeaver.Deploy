@@ -729,6 +729,11 @@ data:
   # inferred from name resemblance. It may be set through an overlay's config.memex_portal or a
   # record's extraPortalConfig; the values path below is what the instance record renders.
   SelfUpdate__RegistryValidationUrl: "{{ (.Values.selfUpdate).registryValidationUrl | default .Values.config.memex_portal.SelfUpdate__RegistryValidationUrl | default "" }}"
+  # 🚨 Whether SelfUpdate__Registry is a PUBLIC registry, listed with NO credential
+  # (MeshWeaver.Deploy#65) — selfUpdate.registryIsPublic. A bool, always rendered: "true" makes the
+  # self-updater read through the anonymous token flow and never present the instance key to that
+  # host; "false" (the default) keeps the keyed rule above. An image older than the key ignores it.
+  SelfUpdate__RegistryIsPublic: "{{ if (.Values.selfUpdate).registryIsPublic }}true{{ else }}false{{ end }}"
   {{- if and (.Values.registry).enabled ((.Values.registry).host | default "" | trim) }}
   # 🚨 The OCI host THIS instance's plugin registry declares as its artifact registry
   # (MeshWeaver#4123): served on the bundle index as `artifactRegistry`, it is the one host besides
