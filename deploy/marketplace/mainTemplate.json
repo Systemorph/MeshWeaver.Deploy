@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.44.1.10279",
-      "templateHash": "534124826596101484"
+      "templateHash": "10196681076497441976"
     }
   },
   "parameters": {
@@ -128,7 +128,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.44.1.10279",
-              "templateHash": "4931519855758851228"
+              "templateHash": "9154430259306718536"
             }
           },
           "parameters": {
@@ -262,7 +262,7 @@
             {
               "type": "Microsoft.App/managedEnvironments/storages",
               "apiVersion": "2025-07-01",
-              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), take(format('{0}-{1}-{2}', toLower('memex-postgres'), toLower('memexpgdata'), variables('resourceToken')), 32))]",
+              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), format('memex-pgdat-45911a-{0}', variables('resourceToken')))]",
               "properties": {
                 "azureFile": {
                   "accountName": "[take(format('memexacasv{0}', variables('resourceToken')), 24)]",
@@ -292,7 +292,7 @@
             {
               "type": "Microsoft.App/managedEnvironments/storages",
               "apiVersion": "2025-07-01",
-              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), take(format('{0}-{1}-{2}', toLower('memex-portal'), toLower('memexportaldata'), variables('resourceToken')), 32))]",
+              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), format('data-f01d18-{0}', variables('resourceToken')))]",
               "properties": {
                 "azureFile": {
                   "accountName": "[take(format('memexacasv{0}', variables('resourceToken')), 24)]",
@@ -322,7 +322,7 @@
             {
               "type": "Microsoft.App/managedEnvironments/storages",
               "apiVersion": "2025-07-01",
-              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), take(format('{0}-{1}-{2}', toLower('memex-portal'), toLower('memexportalcontent'), variables('resourceToken')), 32))]",
+              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), format('content-783a85-{0}', variables('resourceToken')))]",
               "properties": {
                 "azureFile": {
                   "accountName": "[take(format('memexacasv{0}', variables('resourceToken')), 24)]",
@@ -352,7 +352,7 @@
             {
               "type": "Microsoft.App/managedEnvironments/storages",
               "apiVersion": "2025-07-01",
-              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), take(format('{0}-{1}-{2}', toLower('memex-portal'), toLower('memexportalusers'), variables('resourceToken')), 32))]",
+              "name": "[format('{0}/{1}', take(format('memexaca{0}', uniqueString(resourceGroup().id)), 24), format('users-d0af47-{0}', variables('resourceToken')))]",
               "properties": {
                 "azureFile": {
                   "accountName": "[take(format('memexacasv{0}', variables('resourceToken')), 24)]",
@@ -371,19 +371,19 @@
           "outputs": {
             "volumes_memex_postgres_0": {
               "type": "string",
-              "value": "[take(format('{0}-{1}-{2}', toLower('memex-postgres'), toLower('memexpgdata'), variables('resourceToken')), 32)]"
+              "value": "[format('memex-pgdat-45911a-{0}', variables('resourceToken'))]"
             },
             "volumes_memex_portal_0": {
               "type": "string",
-              "value": "[take(format('{0}-{1}-{2}', toLower('memex-portal'), toLower('memexportaldata'), variables('resourceToken')), 32)]"
+              "value": "[format('data-f01d18-{0}', variables('resourceToken'))]"
             },
             "volumes_memex_portal_1": {
               "type": "string",
-              "value": "[take(format('{0}-{1}-{2}', toLower('memex-portal'), toLower('memexportalcontent'), variables('resourceToken')), 32)]"
+              "value": "[format('content-783a85-{0}', variables('resourceToken'))]"
             },
             "volumes_memex_portal_2": {
               "type": "string",
-              "value": "[take(format('{0}-{1}-{2}', toLower('memex-portal'), toLower('memexportalusers'), variables('resourceToken')), 32)]"
+              "value": "[format('users-d0af47-{0}', variables('resourceToken'))]"
             },
             "AZURE_LOG_ANALYTICS_WORKSPACE_NAME": {
               "type": "string",
