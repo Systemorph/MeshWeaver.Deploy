@@ -1104,6 +1104,21 @@ so_run FAKE_REDIRECT="https://memex.localhost:8443/login" FAKE_TOKEN=tok3
 so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok4 MEMEX_HEADLESS=1
 [ ! -s "$SO/open.log" ] && ok "a headless host opens nothing" || bad "a headless host opens nothing" "$(cat "$SO/open.log")"
 grep -q '^open_setup_if_waiting &$' "$PF" && ok "the agent runs it in the background, before the forward" || bad "the agent runs it in the background" ""
+named=""; for m in "$SO/home/.memex-local/"setup-opened.*; do case "$m" in *tok*) named="$m" ;; esac; done
+if [ -n "$named" ]; then bad "the marker never names the token" "$named"
+else ok "the marker is named by a digest, never the token itself"; fi
+printf '#!/usr/bin/env bash\nexit 1\n' > "$SO/stubs/open"
+so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok5
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$FAKE_OPEN_LOG"\n' > "$SO/stubs/open"
+so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok5
+[ "$(cat "$SO/open.log")" = "https://memex.localhost:8443/setup?token=tok5" ] \
+  && ok "a failed browser launch writes no marker, so the next start retries" || bad "a failed launch is retried" "$(cat "$SO/open.log")"
+# The CLI's `up`/`update` hand-off honours the same marker; an explicit `memex-local setup` always opens.
+setup_body="$(awk '/^cmd_setup\(\)/{on=1} on{print} on&&/^}$/{exit}' "$CLI")"
+# shellcheck disable=SC2016  # literal source text
+case "$setup_body" in *'setup-opened.$(printf '"'"'%s'"'"' "$token" | shasum -a 256'*'"$open_browser" = "auto" ] && [ -f "$marker" ]'*) ok "cmd_setup --auto skips a wizard the login agent already opened (same digest marker)" ;;
+  *) bad "cmd_setup --auto shares the agent's marker" "" ;; esac
+grep -q '^  cmd_setup --auto$' "$CLI" && ok "hand_into_setup (up/update) uses --auto; manual 'memex-local setup' still reopens" || bad "hand_into_setup uses --auto" ""
 rm -rf "$SO"
 echo "── down --purge removes the portal's node data, not only the namespace ──"
 # Behaviour, not text: run cmd_down against recording stubs (colima/helm/kubectl log their argv).

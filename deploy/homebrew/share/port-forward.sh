@@ -59,11 +59,15 @@ open_setup_if_waiting() {
   token="$(kubectl --context "$KUBE_CONTEXT" logs deploy/memex-portal-deployment -n "${MEMEX_NAMESPACE:-memex}" --tail=-1 2>/dev/null \
            | awk '/^ *Token: /{ t=$2 } END { print t }')"
   [ -n "$token" ] || return 0
-  marker="${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/setup-opened.${token}"
+  # Named by a DIGEST of the token (never the token: a directory entry is listable), shared with the
+  # CLI's `up`/`update` hand-off so the two never open the same wizard twice, and written only after
+  # the browser actually opened, so a failed launch is retried on the next start.
+  marker="${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/setup-opened.$(printf '%s' "$token" | shasum -a 256 | cut -c1-64)"
   [ -f "$marker" ] && return 0
-  mkdir -p "$(dirname "$marker")" && : > "$marker"
   echo "$(date -u +%FT%TZ) first-run setup is waiting — opening the wizard"
-  open "$base/setup?token=${token}"
+  if open "$base/setup?token=${token}"; then
+    mkdir -p "$(dirname "$marker")" && : > "$marker"
+  fi
 }
 open_setup_if_waiting &
 
