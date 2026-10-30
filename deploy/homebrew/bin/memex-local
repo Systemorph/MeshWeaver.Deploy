@@ -62,6 +62,9 @@ readonly OLLAMA_MODEL="${MEMEX_OLLAMA_MODEL:-$_PROFILE_MODEL}"
 # imagePullPolicy: IfNotPresent (deploy/helm/.../deployment.yaml). Both the
 # local-build and ACR-pull paths retag onto these names so k3s finds them (§3).
 readonly PORTAL_IMAGE="ghcr.io/systemorph/memex-portal-ai:latest"
+# The node directory the chart mounts as the portal's /data (deploy/helm/templates/memex-portal/
+# deployment.yaml, persistDataVolume): instance.json, landed modules, caches. Outlives the namespace.
+readonly PORTAL_DATA_DIR="/var/lib/memex-portal-data"
 readonly MIGRATION_IMAGE="ghcr.io/systemorph/memex-migration:latest"
 # The Next.js React GUI (clients/portal-next), served at /next as a FEATURE-FLAGGED
 # opt-in frontend beside the Blazor portal. Built locally into Colima's Docker store
@@ -1263,8 +1266,8 @@ helm_deploy() {
   # `sh -c` so the remote shell parses the &&. Keep stderr (no 2>/dev/null) so a real failure is visible
   # in the warning instead of a silent miss that later surfaces as a crash-looping DataProtection pod.
   local perms_err
-  if ! perms_err="$(colima ssh -- sh -c 'sudo mkdir -p /var/lib/memex-portal-data && sudo chmod 0777 /var/lib/memex-portal-data' 2>&1)"; then
-    warn "could not make /var/lib/memex-portal-data writable on the node — portal may crashloop on DataProtection keys${perms_err:+: $perms_err}"
+  if ! perms_err="$(colima ssh -- sh -c "sudo mkdir -p $PORTAL_DATA_DIR && sudo chmod 0777 $PORTAL_DATA_DIR" 2>&1)"; then
+    warn "could not make $PORTAL_DATA_DIR writable on the node — portal may crashloop on DataProtection keys${perms_err:+: $perms_err}"
   fi
 }
 
@@ -2611,6 +2614,14 @@ cmd_down() {
       helm uninstall "$RELEASE" -n "$NAMESPACE" >/dev/null 2>&1 || true
       kubectl delete namespace "$NAMESPACE" --wait=false >/dev/null 2>&1 || true
       helm uninstall ingress-nginx -n "$INGRESS_NS" >/dev/null 2>&1 || true
+      # 🚨 The portal's /data is a hostPath on the node, NOT in the namespace, so deleting the namespace
+      # leaves it — and with it instance.json (the setup state AND the package selection), the landed
+      # module bundles and the assembly cache. A purge that keeps them is not a purge: the next `up`
+      # skips the first-run wizard and reinstalls the old selection onto the empty database (measured
+      # 2026-10-30: a "purged" Mac came back "already set up" with its 27-package selection).
+      warn "PURGE: deleting the portal's node data $PORTAL_DATA_DIR (instance.json, modules, caches)"
+      colima ssh -- sudo rm -rf "$PORTAL_DATA_DIR" >/dev/null 2>&1 \
+        || warn "could not delete $PORTAL_DATA_DIR on the node — remove it by hand: colima ssh -- sudo rm -rf $PORTAL_DATA_DIR"
     else
       step "Uninstalling Helm release '$RELEASE' (keeps the Postgres PVC — data survives)"
       helm uninstall "$RELEASE" -n "$NAMESPACE" || warn "release '$RELEASE' not found"
