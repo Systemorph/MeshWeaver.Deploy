@@ -29,6 +29,7 @@ Mac). It left the platform repository so that the platform stays framework only 
 | `deploy/helm-db/` | the per-instance database chart | the hosting operator image |
 | `deploy/aks/values.aks.yaml` | the generic AKS overlay (placeholders only) | the chart gate; first-time setup |
 | `deploy/aks/manifests/` | cluster manifests the governed `ApplyClusterManifest` applies, incl. the operator's ClusterRole | the estate's aks-ops lane; the operator's RBAC tests |
+| `deploy/hosting-operator/` | the hosting operator: the `hosting-*` scripts every `Hosting/InstanceAction` step runs (`bin/`), their behaviour suite (`test/`), the Key Vault allow-list and the image's Dockerfile. Public so every estate's aks-ops lane reads them with no credential — a client estate's own App can read nothing of Systemorph's (MeshWeaver.Plugins#4755). Reference material only: fixtures use neutral samples, never an installation's names | `hosting-operator.yml` here (PR gate, no publish); MeshWeaver.Plugins `hosting-operator.yml` (stages it, checks every plan command ships, PUBLISHES the image); the estate's aks-ops lane (reads `bin/` at the operator pin) |
 | `deploy/aks/scripts/` | chart invariants, values-are-read, chart-drift render/compare/record, observability checks, fixtures, setup examples | the chart gate; the operator image (drift scripts) |
 | `deploy/homebrew/` | `memex-local` — CLI, formula, local values, tests, and the ONE toolchain manifest + resolver (`share/tools.manifest`, `share/tools.sh`) both channels read | `homebrew.yml` → the public tap `Systemorph/homebrew-memex` |
 | `deploy/macos/` | the professional Mac distribution: the signed + notarized `.pkg` build, its probe-first postinstall, the optional unattended-host LaunchDaemon, the MDM profile example, the design of record (`README.md`) | `macos-pkg.yml` → the release `memex-local/v<version>` of this repository (signed only; unsigned = labelled artifact) |
@@ -179,6 +180,12 @@ transient). Each calls its lane `@main`; never paste a lane's body in here.
    platform's `main` with every self-test, on every pull request. Not yet in the ruleset: adding it
    is an owner's change to `main pr protection`. (Its publishing jobs run only on
    the three events that read a set — its 15-minute `schedule`, `workflow_dispatch` and `repository_dispatch`; `preflight` is red there on a missing credential.)
+
+`hosting-operator.yml` is path-filtered to `deploy/hosting-operator/**`, the two charts,
+`deploy/aks/scripts/**` and `deploy/aks/manifests/**`, so it is NOT a required check: `Operator scripts
++ image (shellcheck, behaviour suite in the image)` — tracked and executable, parse, shellcheck, core's
+Key Vault gate, the image builds and carries the command set, and the behaviour suite passes INSIDE
+the image. It publishes nothing; MeshWeaver.Plugins' lane is the only publisher.
 
 `homebrew.yml` is path-filtered to `deploy/homebrew/**` and `deploy/helm/**` and therefore NOT a
 required check (a skipped required check reads as satisfied): `memex-local (Linux — …)` and

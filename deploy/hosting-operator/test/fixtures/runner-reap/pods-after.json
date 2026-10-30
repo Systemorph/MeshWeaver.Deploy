@@ -1,0 +1,11 @@
+{"items": [
+  {"metadata": {"name": "aks-silos-x-runner-stuck1"},
+   "status": {"phase": "Succeeded", "containerStatuses": [{"name": "runner", "state": {"terminated": {"exitCode": 0, "finishedAt": "2026-10-26T21:24:16Z"}}}]}},
+  {"metadata": {"name": "aks-silos-x-runner-stuck2"},
+   "status": {"phase": "Running", "containerStatuses": [
+     {"name": "runner", "state": {"terminated": {"exitCode": 143, "finishedAt": "2026-10-26T21:30:00Z"}}},
+     {"name": "postgres", "state": {"running": {"startedAt": "2026-10-26T20:51:10Z"}}}]}},
+  {"metadata": {"name": "aks-silos-x-runner-busy"},
+   "status": {"phase": "Running", "containerStatuses": [{"name": "runner", "state": {"running": {"startedAt": "2026-10-26T21:40:10Z"}}}]}},
+  {"metadata": {"name": "aks-silos-x-runner-pending"}, "status": {"phase": "Pending"}}
+]}

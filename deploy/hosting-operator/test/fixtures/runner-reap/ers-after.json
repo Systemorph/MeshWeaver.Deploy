@@ -1,0 +1,4 @@
+{"items": [
+  {"metadata": {"name": "aks-silos-x-runner-busy", "creationTimestamp": "2026-10-26T21:40:00Z", "labels": {"actions.github.com/scale-set-name": "aks-silos"}},
+   "status": {"phase": "Running", "jobRequestId": 42, "jobRepositoryName": "Systemorph/Memex"}}
+]}

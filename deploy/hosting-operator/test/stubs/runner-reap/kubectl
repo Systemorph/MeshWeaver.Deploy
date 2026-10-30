@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# A stand-in `kubectl` for hosting-runner-reap's behaviour tests. What is tested is what the SCRIPT does
+# with the answers — which runners it calls suspects, which controller it picks, whether it restarts
+# anything, and what it reads back — never kubectl itself.
+#
+#   HOSTING_RR_FIXTURE   directory: controllers.json, ers.json, pods.json, and (served after a restart,
+#                        when present) ers-after.json / pods-after.json
+#   HOSTING_RR_STATE     directory: kubectl.log (one argv per call), restarted (touched by a restart)
+#   HOSTING_RR_FORBID=1  `get ephemeralrunners` answers Forbidden
+set -uo pipefail
+fixture="${HOSTING_RR_FIXTURE:?the runner-reap kubectl stub needs HOSTING_RR_FIXTURE}"
+state="${HOSTING_RR_STATE:?the runner-reap kubectl stub needs HOSTING_RR_STATE}"
+printf '%s\n' "$*" >> "$state/kubectl.log"
+after() { if [ -f "$state/restarted" ] && [ -f "$fixture/$1-after.json" ]; then cat "$fixture/$1-after.json"; else cat "$fixture/$1.json"; fi; }
+case "$*" in
+  "get deployments --all-namespaces -l app.kubernetes.io/part-of=gha-rs-controller -o json") cat "$fixture/controllers.json" ;;
+  "-n "*" get ephemeralrunners -o json")
+    if [ "${HOSTING_RR_FORBID:-0}" = 1 ]; then
+      echo 'Error from server (Forbidden): ephemeralrunners.actions.github.com is forbidden' >&2; exit 1
+    fi
+    after ers ;;
+  "-n "*" get pods -o json") after pods ;;
+  "-n "*" rollout restart deployment/"*) touch "$state/restarted"; echo "deployment.apps/${*##*/} restarted" ;;
+  "-n "*" rollout status deployment/"*) echo "deployment \"${*##*/}\" successfully rolled out" ;;
+  *) echo "kubectl stub (runner-reap): unexpected invocation: $*" >&2; exit 1 ;;
+esac
