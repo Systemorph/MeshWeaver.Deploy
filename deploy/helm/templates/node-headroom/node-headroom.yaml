@@ -2,27 +2,23 @@
 {{- $h := .Values.nodeHeadroom | default dict }}
 {{- $pools := $h.pools | default list }}
 {{- if $pools }}
-{{- if ge (int $h.priority) 0 }}
-{{- fail (printf "nodeHeadroom.priority %v must be negative: a placeholder at or above a real workload's priority cannot be preempted by it" $h.priority) }}
+{{- if hasKey $h "priority" }}
+{{- fail "nodeHeadroom.priority is not a chart value: the PriorityClass node-headroom is INFRA-DECLARED (Systemorph/Memex deployments/aks/cluster-bootstrap/, applied by the governed InfraDeploy) and the chart only references it — change its value there" }}
 {{- end }}
----
-# Node-pool headroom (Memex#863; core Doc/Architecture/DeploymentAKS → "A spare slot per node pool"):
-# cluster-autoscaler overprovisioning. A placeholder holds one portal-sized slot per declared pool; a
-# real pod that cannot otherwise schedule preempts it, and the autoscaler adds a node for the evicted
-# placeholder, so a surge-first roll always finds room below the pool's maxCount.
-apiVersion: "scheduling.k8s.io/v1"
-kind: "PriorityClass"
-metadata:
-  name: "node-headroom"
-  labels:
-    app.kubernetes.io/name: "{{ .Chart.Name }}"
-    app.kubernetes.io/component: "node-headroom"
-    app.kubernetes.io/instance: "{{ .Release.Name }}"
-value: {{ int $h.priority }}
-globalDefault: false
-# A placeholder never preempts anything itself; it only waits for a node.
-preemptionPolicy: "Never"
-description: "Placeholder pods that hold a spare slot per node pool; every real workload preempts them."
+{{- /*
+Node-pool headroom (Memex#863; core Doc/Architecture/DeploymentAKS → "A spare slot per node pool"):
+cluster-autoscaler overprovisioning. A placeholder holds one portal-sized slot per declared pool; a
+real pod that cannot otherwise schedule preempts it, and the autoscaler adds a node for the evicted
+placeholder, so a surge-first roll always finds room below the pool's maxCount.
+
+🚨 The PriorityClass `node-headroom` is NOT rendered here. It is cluster-scoped, and the hosting
+operator that applies this release holds no write on priorityclasses — deliberately: write there
+lets the holder mint a high-priority or globalDefault class. So it is INFRA-DECLARED, once per
+cluster, in Systemorph/Memex deployments/aks/cluster-bootstrap/priorityclass-node-headroom.yaml and
+applied by the governed InfraDeploy (what-if, then deploy). The chart only REFERENCES it, and the
+operator's hosting-deploy preflight refuses a release that references a class the cluster does not
+have, naming the InfraDeploy to apply first.
+*/}}
 {{- $seen := dict }}
 {{- range $i, $p := $pools }}
 {{- $pool := required (printf "nodeHeadroom.pools[%d].pool is required" $i) $p.pool | toString }}

@@ -1,4 +1,4 @@
-# test-node-headroom.sh: two pools, one PriorityClass.
+# test-node-headroom.sh: two pools, two placeholders under the one infra-declared class.
 nodeHeadroom:
   pools:
     - { pool: silos, cpu: "4", memory: "8Gi" }
