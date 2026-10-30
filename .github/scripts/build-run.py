@@ -791,6 +791,64 @@ def _nupkg_content_hash(data: bytes) -> Optional[str]:
 # What NuGet does NOT extract from a .nupkg into its global-packages folder (OPC plumbing).
 NUGET_NOT_EXTRACTED = re.compile(r"^(?:\[Content_Types\]\.xml$|_rels/|package/)", re.I)
 
+# The mode NuGet creates every extracted file with on Linux and macOS (NuGet.Packaging NuGetExtractionFileIO: 0766, the
+# process umask applied by open(2)), so a package's native tools stay runnable from the global-packages folder — e.g.
+# Grpc.Tools' tools/linux_x64/protoc, which the build EXECUTES from there. A folder this host rebuilt must be the
+# folder NuGet would have written: a file created with Python's default 0666 lost the execute bit, and every build
+# that compiles a .proto failed with MSB6003 "Permission denied" from the warm cache (MeshWeaver.Plugins#4478).
+NUGET_EXTRACTED_FILE_MODE = 0o766
+# Written LAST into a package folder this host rebuilt with NuGet's file modes. A folder without it was rebuilt by an
+# older runner (files 0666 & ~umask), and `promote_nuget` repairs its modes before keeping it. NuGet ignores the file.
+NUGET_MATERIALIZED_MARK = ".mw-materialized-v2"
+
+
+def nuget_entry_parts(filename: str) -> list[str]:
+    """The path segments a .nupkg entry is extracted to, as NuGet places it on disk: empty segments collapse (an entry
+    named `analyzers/cs//X.dll` — Nerdbank.MessagePack 1.2.4 ships one — lands at `analyzers/cs/X.dll`, exactly as
+    a POSIX path with `//` resolves). Raises ValueError for an entry that would leave the package folder: absolute,
+    a backslash, a `.`/`..` segment, or no segment at all."""
+    name = urllib.parse.unquote(filename)
+    raw = name.split("/")
+    if name.startswith("/") or "\\" in name or any(x in (".", "..") for x in raw):
+        raise ValueError(f"archive entry {filename!r} would leave the package folder")
+    parts = [x for x in raw if x]
+    if not parts:
+        raise ValueError(f"archive entry {filename!r} would leave the package folder")
+    return parts
+
+
+def nuget_extracted_mode(probe_dir: str) -> int:
+    """NUGET_EXTRACTED_FILE_MODE with this process's umask applied — read off a file the kernel created with it (no
+    os.umask round-trip, which would race any thread creating files meanwhile)."""
+    probe = tempfile.mkdtemp(prefix=".mode-", dir=probe_dir)
+    try:
+        fd = os.open(os.path.join(probe, "m"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, NUGET_EXTRACTED_FILE_MODE)
+        try:
+            return os.fstat(fd).st_mode & 0o777
+        finally:
+            os.close(fd)
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+
+
+def repair_nuget_modes(final: str) -> int:
+    """Give every extracted file of a package folder an OLDER runner rebuilt the mode NuGet would have, then mark it.
+    Only mode bits change — no byte the provenance check verified moves — and a chmod is atomic for a reader building
+    from the folder meanwhile. Returns the number of files whose mode changed."""
+    mode = nuget_extracted_mode(os.path.dirname(final))
+    changed = 0
+    for root, _dirs, files in os.walk(final):
+        for n in files:
+            p = os.path.join(root, n)
+            if os.path.islink(p) or not os.path.isfile(p) or n == NUGET_MATERIALIZED_MARK:
+                continue
+            if os.stat(p).st_mode & 0o777 != mode:
+                os.chmod(p, mode)
+                changed += 1
+    with open(os.path.join(final, NUGET_MATERIALIZED_MARK), "w") as fh:
+        fh.write("nuget-file-modes\n")
+    return changed
+
 
 def nuget_package_problem(pkg_dir: str, pid: str, ver: str) -> Optional[str]:
     """Why a restored package folder may NOT enter the shared warm cache, or None. The folder must hold no symlink, its
@@ -844,18 +902,20 @@ def materialize_nuget_package(pkg_dir: str, pid: str, ver: str, dest: str, expec
             name = urllib.parse.unquote(info.filename)
             if info.is_dir() or NUGET_NOT_EXTRACTED.match(name):
                 continue
-            if "/" not in name and name.lower().endswith(".nuspec"):
-                name = f"{pid}.nuspec"
-            parts = name.split("/")
-            if name.startswith("/") or "\\" in name or any(x in ("", ".", "..") for x in parts):
-                raise ValueError(f"archive entry {info.filename!r} would leave the package folder")
+            parts = nuget_entry_parts(info.filename)
+            if len(parts) == 1 and parts[0].lower().endswith(".nuspec"):
+                parts = [f"{pid}.nuspec"]
             target = os.path.join(dest, *parts)
             os.makedirs(os.path.dirname(target), exist_ok=True)
-            with z.open(info) as src, open(target, "xb") as out:
+            # NuGet's mode (NUGET_EXTRACTED_FILE_MODE), O_EXCL as before: a second entry onto one path is refused.
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, NUGET_EXTRACTED_FILE_MODE)
+            with z.open(info) as src, os.fdopen(fd, "wb") as out:
                 shutil.copyfileobj(src, out)
     out_meta = {"version": meta.get("version", 2), "contentHash": meta["contentHash"]}
     if isinstance(meta.get("source"), str):
         out_meta["source"] = meta["source"]
+    with open(os.path.join(dest, NUGET_MATERIALIZED_MARK), "w") as fh:
+        fh.write("nuget-file-modes\n")
     with open(os.path.join(dest, ".nupkg.metadata"), "w") as fh:
         json.dump(out_meta, fh, indent=2)
 
@@ -1162,6 +1222,13 @@ def promote_nuget(restored: str, cache: str, log: Callable[[str], None],
         final = os.path.join(root, pid, ver)
         if os.path.isfile(os.path.join(final, ".nupkg.metadata")):
             kept += 1
+            if not os.path.isfile(os.path.join(final, NUGET_MATERIALIZED_MARK)):
+                # Rebuilt by an older runner without NuGet's file modes: a native tool in it cannot be executed.
+                try:
+                    changed = repair_nuget_modes(final)
+                    log(f"NuGet package {entry}: kept, its file modes repaired to NuGet's ({changed} file(s))")
+                except OSError as e:
+                    log(f"NuGet package {entry}: kept, but its file modes could NOT be repaired ({e})")
             continue
         why = nuget_package_problem(os.path.join(restored, pid, ver), pid, ver)
         if why:
@@ -5678,6 +5745,51 @@ def self_test() -> int:
         promote_nuget(good_dir, held_, lambda m: None, feeds_)
         check("provenance/a package the cache already holds is KEPT without asking the feed (an id/version is immutable)",
               promote_nuget(good_dir, held_, lambda m: None, NugetFeeds(failing_get))[:2] == (0, 1))
+
+        # ── EXTRACTION PARITY (MeshWeaver.Plugins#4478): a rebuilt folder is the folder NuGet would have written. Two
+        # host-only reds came from it: Grpc.Tools' protoc kept no execute bit (MSB6003 "Permission denied" from the warm
+        # cache), and Nerdbank.MessagePack 1.2.4 — whose archive names `analyzers/cs//…dll` — was refused outright.
+        _tz = io.BytesIO()
+        with zipfile.ZipFile(_tz, "w", zipfile.ZIP_DEFLATED) as z:
+            for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("tools/linux_x64/protoc", b"#!/bin/sh\necho ran\n"),
+                           ("analyzers/cs//Demo.CodeFixes.dll", b"codefix-dll"),
+                           ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
+                z.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_)
+        tools_zip = _tz.getvalue()
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(tools_zip)
+        (pt_, _, rt_), int_, _ = promote_into("tools", restored_pkg(os.path.join(tmp, "prov-tools"), tools_zip))
+        tdir_ = os.path.join(tmp, "prov-cache-tools", "nuget", "demo.pkg", "1.0.0")
+        protoc_ = os.path.join(tdir_, "tools", "linux_x64", "protoc")
+        check("extraction/an entry with an EMPTY segment (`analyzers/cs//X.dll`) is promoted at the path NuGet writes",
+              pt_ == 1 and rt_ == [] and os.path.isfile(os.path.join(tdir_, "analyzers", "cs", "Demo.CodeFixes.dll")),
+              (pt_, rt_))
+        check("extraction/an extracted file keeps NuGet's EXECUTE bit (0766 & ~umask), so protoc runs from the cache",
+              os.path.isfile(protoc_) and os.stat(protoc_).st_mode & 0o100 != 0
+              and subprocess.run([protoc_], capture_output=True, text=True).stdout.strip() == "ran",
+              oct(os.stat(protoc_).st_mode) if os.path.isfile(protoc_) else "absent")
+        check("extraction/a rebuilt folder carries the materialized mark", os.path.isfile(os.path.join(tdir_, NUGET_MATERIALIZED_MARK)))
+        for bad_ in ("a/../b.dll", "./b.dll", "/abs.dll", "a\\b.dll", "//", "%2e%2e/b.dll"):
+            try:
+                nuget_entry_parts(bad_)
+                check(f"extraction/negative control: {bad_!r} would leave the package folder — refused", False, "accepted")
+            except ValueError:
+                pass
+        check("extraction/empty segments collapse, nothing else changes", nuget_entry_parts("a//b///c.dll") == ["a", "b", "c.dll"])
+        # REPAIR: a folder an OLDER runner rebuilt (no mark, files 0644) is kept, and its modes are repaired — the
+        # bytes are not touched, and a second pass changes nothing.
+        os.remove(os.path.join(tdir_, NUGET_MATERIALIZED_MARK))
+        os.chmod(protoc_, 0o644)
+        said_rep_: list = []
+        rep_ = promote_nuget(restore_dir_ := os.path.join(tmp, "prov-tools"), os.path.join(tmp, "prov-cache-tools"),
+                             said_rep_.append, NugetFeeds(failing_get))
+        check("extraction/an older runner's folder is KEPT (the feed is not asked) and its modes are repaired",
+              rep_[:2] == (0, 1) and os.stat(protoc_).st_mode & 0o100 != 0
+              and os.path.isfile(os.path.join(tdir_, NUGET_MATERIALIZED_MARK))
+              and any("modes repaired" in m_ for m_ in said_rep_), (rep_, oct(os.stat(protoc_).st_mode), said_rep_))
+        said_rep2_: list = []
+        promote_nuget(restore_dir_, os.path.join(tmp, "prov-cache-tools"), said_rep2_.append, NugetFeeds(failing_get))
+        check("extraction/a marked folder is not repaired again", not any("modes" in m_ for m_ in said_rep2_), said_rep2_)
+        feed_hashes["demo.pkg/1.0.0"] = b64sha(unsigned_)
         try:
             feed_get("http://api.nuget.org/v3/index.json", 1)
             check("provenance/the real fetch refuses a non-https URL before any request", False, "fetched")
@@ -5770,7 +5882,7 @@ def self_test() -> int:
         htr.run(dict(claim, isTrunk=True))
         check("prepared/a trunk build's verified restore is promoted into the warm cache",
               os.path.isfile(os.path.join(warm, ".nupkg.metadata")) and nuget_packages(os.path.join(cache, "nuget")) == {"demo.pkg/1.0.0"}
-              and sorted(os.listdir(warm)) == [".nupkg.metadata", "demo.pkg.1.0.0.nupkg", "demo.pkg.1.0.0.nupkg.sha512", "demo.pkg.nuspec", "lib"],
+              and sorted(os.listdir(warm)) == [NUGET_MATERIALIZED_MARK, ".nupkg.metadata", "demo.pkg.1.0.0.nupkg", "demo.pkg.1.0.0.nupkg.sha512", "demo.pkg.nuspec", "lib"],
               sorted(os.listdir(warm)) if os.path.isdir(warm) else None)
         shutil.rmtree(os.path.join(cache, "nuget"))
         feed_hashes["demo.pkg/1.0.0"] = b64sha(signed_zip)     # the feed serves the SIGNED archive
