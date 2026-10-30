@@ -1074,6 +1074,19 @@ grep -q 'az acr manifest show-metadata .*--only-show-errors 2>&1' "$CLI" \
   && ok "the acr poll passes --only-show-errors (a preview WARNING was stored as the digest)" \
   || bad "the acr poll passes --only-show-errors" "$(grep -n 'az acr manifest show-metadata' "$CLI")"
 
+echo "── down --purge removes the portal's node data, not only the namespace ──"
+down_body="$(awk '/^cmd_down\(\)/{on=1} on{print} on&&/^}$/{exit}' "$CLI")"
+# shellcheck disable=SC2016  # a literal '$PORTAL_DATA_DIR' is the text being searched for
+case "$down_body" in
+  *'--purge'*'colima ssh -- sudo rm -rf "$PORTAL_DATA_DIR"'*) ok "down --purge deletes \$PORTAL_DATA_DIR (instance.json survived a namespace delete)" ;;
+  *) bad "down --purge deletes the portal node data" "no rm of \$PORTAL_DATA_DIR in cmd_down()" ;;
+esac
+chart_path="$(grep -A1 'name: memex-data' "$HERE/../../helm/templates/memex-portal/deployment.yaml" | grep -o 'path: [^ ]*' | head -1 | cut -d' ' -f2)"
+cli_path="$(sed -n 's/^readonly PORTAL_DATA_DIR="\(.*\)"$/\1/p' "$CLI")"
+if [ -n "$cli_path" ] && grep -q "path: $cli_path\$" "$HERE/../../helm/templates/memex-portal/deployment.yaml"; then
+  ok "PORTAL_DATA_DIR ($cli_path) is the hostPath the chart mounts"
+else bad "PORTAL_DATA_DIR is the chart's hostPath" "cli='$cli_path' chart='$chart_path'"; fi
+
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
