@@ -1088,14 +1088,18 @@ cp "$DP/stubs/helm" "$DP/stubs/kubectl"; chmod +x "$DP/stubs/"*
 down_run() {  # down_run [ENV=…] -- <cmd_down args>
   : > "$DP/tools.log"
   OUT="$(env PATH="$DP/stubs:$PATH" HOME="$DP/home" MEMEX_LOCAL_HOME="$DP/home/.memex-local" FAKE_TOOL_LOG="$DP/tools.log" \
-    MEMEX_LOCAL_LIB=1 "$@" bash -c '. "$1"; shift; uninstall_launchd() { :; }; cmd_down "$@"' _ "$CLI" "${DOWN_ARGS[@]}" 2>&1)"; RC=$?
+    MEMEX_LOCAL_LIB=1 "$@" bash -c '. "$1"; shift; uninstall_launchd() { :; }; cmd_down "$@"' _ "$CLI" ${DOWN_ARGS[@]+"${DOWN_ARGS[@]}"} 2>&1)"; RC=$?
 }
 DOWN_ARGS=(--purge); down_run
 if grep -q '^colima ssh -- sudo rm -rf /var/lib/memex-portal-data$' "$DP/tools.log"; then
   ok "down --purge deletes the portal's node data (instance.json survived a namespace delete)"
 else bad "down --purge deletes the portal's node data" "tools: $(tr '\n' ';' < "$DP/tools.log") out: $OUT"; fi
 DOWN_ARGS=(); down_run
-if grep -q 'rm -rf' "$DP/tools.log"; then bad "plain down keeps the node data" "tools: $(tr '\n' ';' < "$DP/tools.log")"
+# The absence of a delete counts only if cmd_down actually ran: it must exit 0 AND reach the tools
+# (an aborted invocation — e.g. bash 3.2 + set -u on an empty array — leaves an empty log too).
+if [ "$RC" -ne 0 ] || ! grep -q '^helm ' "$DP/tools.log"; then
+  bad "plain down keeps the node data" "cmd_down did not run: rc=$RC tools: $(tr '\n' ';' < "$DP/tools.log") out: $OUT"
+elif grep -q 'rm -rf' "$DP/tools.log"; then bad "plain down keeps the node data" "tools: $(tr '\n' ';' < "$DP/tools.log")"
 else ok "plain down keeps the portal's node data (only --purge deletes it)"; fi
 DOWN_ARGS=(--purge); down_run FAKE_SSH_FAILS=1
 case "$RC:$OUT" in
