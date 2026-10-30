@@ -1,4 +1,4 @@
-{{- if .Values.networkPolicy.enabled }}
+{{- if and .Values.enabled .Values.networkPolicy.enabled }}
 # Ingress to the extractor only from the named namespaces, on the service port only. Egress is not
 # restricted here: the pod needs the API server for TokenReview and nothing else, and the cluster's
 # own egress policy (if any) governs that.

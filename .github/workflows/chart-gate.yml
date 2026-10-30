@@ -217,6 +217,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: deploy/aks/scripts/test-node-headroom.sh
 
+      # The whisper and s1-extract service charts' top-level `enabled` switch (#38): ON by default with
+      # a render byte-identical to an undeclared one (estates already run both), and `enabled: false`
+      # renders nothing — not even s1-extract's cluster-wide auth-delegator binding — while the enabled
+      # charts still refuse their missing required values (the negative control). No cluster, no network.
+      - name: Assert the whisper and s1-extract charts render by default and nothing when disabled
+        if: ${{ !cancelled() }}
+        run: deploy/aks/scripts/test-service-chart-switches.sh
+
       - name: Assert observability installation refuses ephemeral or unverified storage
         if: ${{ !cancelled() }}
         run: python3 deploy/aks/scripts/test-observability-storage.py
