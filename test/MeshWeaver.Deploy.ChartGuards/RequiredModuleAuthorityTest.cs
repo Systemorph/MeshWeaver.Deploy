@@ -1,16 +1,16 @@
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
-using MeshWeaver.Deployment;
+using MeshWeaver.Hosting.Deployment;
 using Xunit;
 
 namespace MeshWeaver.Deploy.ChartGuards;
 
 /// <summary>
 /// What a record can and cannot SAY about the modules an instance requires (#4476) — the one fact
-/// that reads the CHART, moved here with it. Everything else in the platform's
-/// <c>MeshWeaver.Deployment.Contract.Test.RequiredModuleAuthorityTest</c> pins the contract's own
-/// rendering and stayed there.
+/// that reads the CHART, moved here with it. Everything else in
+/// <c>RequiredModuleAuthorityTest</c> beside the record (MeshWeaver.Plugins,
+/// <c>MeshWeaver.SelfUpdate.Aks.Test</c>) pins the contract's own rendering and stayed there.
 /// </summary>
 public class RequiredModuleAuthorityTest
 {

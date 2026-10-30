@@ -25,7 +25,7 @@ THE RULES, in order, per config.memex_portal key:
        • a key that is not a valid ConfigMap key ([-._a-zA-Z0-9]+);
        • a map or a list — an environment variable carries one string;
        • a Modules__Required__N slot the literal block does not carry (outside 0..19). That block's
-         ceiling is a contract MeshWeaver.Deployment.Contract's ChartModuleSlotProblems states and
+         ceiling is a contract the Deployment record's ChartModuleSlotProblems states and
          a Deployment record's plan already refuses; passing the slot through would make the chart
          and that rule disagree, so the chart refuses it too.
   4. Otherwise → rendered as `<key>: "<value | toString | trim>"` (a whole number without a decimal
