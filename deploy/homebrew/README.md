@@ -209,6 +209,29 @@ This covers gaps G1 and G4 of the Mac host gap analysis. A headless host still n
 remaining gaps closed: a pull credential that is not a person's `az login`, Colima at boot, and a
 reachable hostname.
 
+## Auto-update of the CLI and its chart — on by default
+
+A Homebrew install keeps **itself** current: `memex-local up` and `memex-local update` arm a
+launchd agent (`com.memex.local.autoupdate`) on every Homebrew install, and every 6 hours it
+runs `brew update` + `brew upgrade memex-local`. When a release changed the vendored chart or
+the `share/` assets, the agent re-applies them with `memex-local update --skip-image`, which
+keeps the running images and restarts the portal once. A release that changed only the script
+restarts nothing. It also refreshes the auto-roll's tick copy, so that agent never keeps
+running an old CLI.
+
+```bash
+memex-local autoupdate status   # RUNNING / OFF, and the last line of ~/.memex-local/autoupdate.log
+memex-local autoupdate off      # stop it; remembered, so `up`/`update` do not re-arm it
+memex-local autoupdate on       # resume
+```
+
+Why it is the default (2026-10-30): the portal image and the packages already update in
+place, but registry mode's in-pod image self-updater is switched on by a values layer that
+ships **with the CLI**. A CLI that is never upgraded therefore also leaves the image updater
+in detect-only mode. A checkout (run-from-checkout) and a headless `.pkg` host are never armed.
+When Homebrew refuses (an outdated Xcode, an untrusted tap), the log line carries Homebrew's
+own message, and the agent retries on the next window.
+
 ## Auto-update (auto-roll) — the local equivalent of AKS self-update
 
 On AKS the portal self-updates by polling ACR and patching its own Deployment

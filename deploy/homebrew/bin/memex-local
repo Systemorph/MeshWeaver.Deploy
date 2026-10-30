@@ -2567,6 +2567,7 @@ cmd_up() {
     warn "portal rollout not complete — check 'memex-local logs' / 'memex-local status'"
 
   install_launchd                                 # §7
+  autoupdate_default                              # the CLI + chart follow the tap (default on a brew install)
   [ "$with_obs" = "yes" ] && cmd_observability    # §11 (opt-in)
   # §14 — and it can FAIL. `up` used to end green on a portal with no sign-in page and no view
   # packs (MeshWeaver#2367); a command that cannot report that is not a verification.
@@ -2860,6 +2861,7 @@ cmd_update() {
   fi
   info "A rollout invalidates the old port-forward binding — refreshing it (§8/§14)"
   install_launchd
+  autoupdate_default                              # the CLI + chart follow the tap (default on a brew install)
   # §14 — `update` verified NOTHING before this: it printed "update complete" straight after the
   # rollout, which is exactly how MeshWeaver#2367's portal reported success while unusable.
   verify_usable --wait 600 --repair; verdict=$?
@@ -3072,6 +3074,11 @@ COMMANDS:
                   keep the mounted Plugins checkout on origin/main so modules and
                   plugin content auto-roll too (restart-as-fan-out, as in prod).
                   The local equivalent of the AKS in-pod self-update.
+  autoupdate <on|off|status>
+                  Keep THIS CLI and its chart current from the Homebrew tap: a launchd
+                  agent runs brew upgrade memex-local every 6h and re-applies the chart
+                  (update --skip-image) when a release changed it. ON by default — \`up\`
+                  and \`update\` arm it on every Homebrew install; \`off\` is remembered.
   setup [--no-open]
                   Print the FIRST-RUN WIZARD's URL (the one-time token already in it)
                   and open it; \`up\` and \`update\` do this for you when the portal is
@@ -3297,7 +3304,7 @@ PLIST
         # 🚨 Same rule as image_pull_acr: keep Azure's answer. Guessing "(az not logged in /
         # offline?)" in a line that repeats every polling window is worse than saying nothing —
         # a missing AcrPull role reads as a transient network blip forever.
-        rdigest="$(az acr manifest show-metadata -r "${ACR%%.*}" -n "memex-portal-ai:$AUTOROLL_ACR_TAG" --query digest -o tsv 2>&1)" \
+        rdigest="$(az acr manifest show-metadata -r "${ACR%%.*}" -n "memex-portal-ai:$AUTOROLL_ACR_TAG" --query digest -o tsv --only-show-errors 2>&1)" \
           || { racr_err="$rdigest"; rdigest=""; }
         rlast="$(cat "$AUTOROLL_ACR_STATE" 2>/dev/null || true)"
         if [ -z "$rdigest" ]; then
@@ -3407,6 +3414,154 @@ PLIST
   esac
 }
 
+# ── auto-update: the CLI and its chart follow the published tap on their own ─────────────────
+# "default homebrew install must be auto-updating" (maintainer, 2026-10-30). The portal IMAGE and the
+# packages already update in place (registry mode's in-pod self-updater; the module registry), but the
+# CLI and the chart it vendors moved only when someone typed `brew upgrade` — and the chart IS what
+# switches the in-pod self-updater on (values.local.registry-mode.yaml), so a stale CLI also left the
+# image detect-only. Measured on the maintainer's laptop that day: CLI 0.2.19155 from 2026-10-25, its
+# share/ without the registry-mode layer, and the self-updater failing every check against an ACR it
+# has no identity for.
+#
+# `up` and `update` arm a launchd agent on every Homebrew install (opt out: `autoupdate off`, which is
+# remembered). Every AUTOUPDATE_INTERVAL_MIN it runs `brew update` + `brew upgrade memex-local`; when the
+# version moved it refreshes the auto-roll's tick copy, and when the vendored chart or share assets
+# changed — not on every release, most of which change only the script — it re-applies the chart
+# with `update --skip-image`, which keeps the images and restarts the portal once.
+readonly AUTOUPDATE_LABEL="com.memex.local.autoupdate"
+readonly AUTOUPDATE_PLIST="$HOME/Library/LaunchAgents/${AUTOUPDATE_LABEL}.plist"
+readonly AUTOUPDATE_LOG="$LOCAL_HOME/autoupdate.log"
+readonly AUTOUPDATE_OFF="$LOCAL_HOME/autoupdate.off"           # written by `autoupdate off`; `up`/`update` honour it
+readonly AUTOUPDATE_CHECKED="$LOCAL_HOME/autoupdate.checked"   # mtime throttles the brew poll
+readonly AUTOUPDATE_INTERVAL_MIN="${MEMEX_AUTOUPDATE_INTERVAL_MIN:-360}"
+readonly AUTOUPDATE_FORMULA="memex-local"
+
+# The CLI is a Homebrew install iff this script runs from a keg (…/Cellar/memex-local/<version>/libexec).
+# A checkout is somebody's working tree and is never upgraded behind their back.
+is_brew_install() {
+  case "$SELF_DIR" in */Cellar/"$AUTOUPDATE_FORMULA"/*) return 0 ;; *) return 1 ;; esac
+}
+
+# One digest over the files a release can change BESIDE the script: the vendored chart and share/.
+_autoupdate_assets_digest() {
+  local keg="$1"
+  [ -d "$keg/share" ] || { printf 'none'; return; }
+  (cd "$keg/share" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-64)
+}
+
+# Called at the end of `up`/`update`. Arms the agent unless this is not a Homebrew install, the
+# person opted out, or we are INSIDE the agent's own `update` (re-arming would unload the running job).
+autoupdate_default() {
+  [ -n "${MEMEX_IN_AUTOUPDATE:-}" ] && return 0
+  [ "$HEADLESS" = "1" ] && return 0                # a .pkg host: no GUI session for a LaunchAgent, and not a keg
+  is_brew_install || return 0
+  if [ -f "$AUTOUPDATE_OFF" ]; then
+    info "auto-update is OFF on this Mac (memex-local autoupdate on to follow releases again)"
+    return 0
+  fi
+  cmd_autoupdate on --quiet
+}
+
+cmd_autoupdate() {
+  local action="${1:-status}"; [ $# -gt 0 ] && shift
+  case "$action" in
+    on)
+      local quiet=""
+      [ "${1:-}" = "--quiet" ] && quiet=1
+      is_brew_install || die "autoupdate follows the Homebrew tap, and this CLI runs from $SELF_DIR — not a Homebrew install. Keep a checkout current with git."
+      need brew brew
+      mkdir -p "$LOCAL_HOME" "$(dirname "$AUTOUPDATE_PLIST")"
+      rm -f "$AUTOUPDATE_OFF"
+      # launchd runs the PATH entry, not the keg: Homebrew relinks bin/ on every upgrade, so the agent
+      # always starts the CURRENT version, and a keg path would vanish with `brew cleanup`.
+      local self
+      self="$(brew --prefix)/bin/memex-local"
+      cat > "$AUTOUPDATE_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${AUTOUPDATE_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>${self}</string><string>autoupdate</string><string>_tick</string></array>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>${HOME}</string>${CHANNEL:+
+    <key>MEMEX_CHANNEL</key><string>${CHANNEL}</string>}${HOST_PROFILE:+
+    <key>MEMEX_PROFILE</key><string>${HOST_PROFILE}</string>}
+  </dict>
+  <key>StandardOutPath</key><string>${AUTOUPDATE_LOG}</string>
+  <key>StandardErrorPath</key><string>${AUTOUPDATE_LOG}</string>
+</dict></plist>
+PLIST
+      launchctl unload "$AUTOUPDATE_PLIST" >/dev/null 2>&1 || true
+      launchctl load "$AUTOUPDATE_PLIST"
+      if [ -n "$quiet" ]; then
+        info "auto-update ON — memex-local follows the Homebrew tap every ${AUTOUPDATE_INTERVAL_MIN}m (memex-local autoupdate off to stop)"
+      else
+        ok "Auto-update ON — brew upgrade $AUTOUPDATE_FORMULA every ${AUTOUPDATE_INTERVAL_MIN}m; a changed chart is re-applied (update --skip-image). Log: $AUTOUPDATE_LOG"
+      fi
+      ;;
+    off)
+      launchctl unload "$AUTOUPDATE_PLIST" >/dev/null 2>&1 || true
+      rm -f "$AUTOUPDATE_PLIST"
+      mkdir -p "$LOCAL_HOME"; : > "$AUTOUPDATE_OFF"
+      ok "Auto-update OFF — remembered, so 'up'/'update' will not re-arm it (memex-local autoupdate on to resume)."
+      ;;
+    status)
+      if launchctl list 2>/dev/null | grep -q "$AUTOUPDATE_LABEL"; then ok "Auto-update: RUNNING"
+      elif [ -f "$AUTOUPDATE_OFF" ]; then info "Auto-update: OFF (opted out)"
+      else info "Auto-update: stopped"; fi
+      info "cli:       $(is_brew_install && echo "Homebrew install ($SELF_DIR)" || echo "not a Homebrew install ($SELF_DIR) — never upgraded automatically")"
+      info "last:      $(tail -1 "$AUTOUPDATE_LOG" 2>/dev/null || echo none)"
+      ;;
+    _tick)
+      [ -z "$(find "$AUTOUPDATE_CHECKED" -mmin "-$AUTOUPDATE_INTERVAL_MIN" 2>/dev/null)" ] || exit 0
+      mkdir -p "$LOCAL_HOME"; touch "$AUTOUPDATE_CHECKED"
+      local keg before after abefore aafter out
+      keg="$(brew --prefix "$AUTOUPDATE_FORMULA" 2>/dev/null)/libexec"
+      before="$(brew list --versions "$AUTOUPDATE_FORMULA" 2>/dev/null | awk '{print $NF}')"
+      abefore="$(_autoupdate_assets_digest "$keg")"
+      # 🚨 Keep Homebrew's answer: an outdated Xcode or an untrusted tap refuses every upgrade, and
+      # a line that says only "failed" every six hours is a silence with a timestamp.
+      if ! out="$(brew update --quiet 2>&1 && brew upgrade "$AUTOUPDATE_FORMULA" 2>&1)"; then
+        printf '%s autoupdate: brew upgrade FAILED — staying on %s, will retry. Homebrew said: %s\n' \
+          "$(date -u +%FT%TZ)" "${before:-?}" "$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-600)"
+        exit 0
+      fi
+      after="$(brew list --versions "$AUTOUPDATE_FORMULA" 2>/dev/null | awk '{print $NF}')"
+      if [ "$before" = "$after" ]; then
+        printf '%s autoupdate: %s %s is current\n' "$(date -u +%FT%TZ)" "$AUTOUPDATE_FORMULA" "${after:-?}"
+        exit 0
+      fi
+      keg="$(brew --prefix "$AUTOUPDATE_FORMULA")/libexec"
+      aafter="$(_autoupdate_assets_digest "$keg")"
+      printf '%s autoupdate: %s upgraded %s -> %s\n' "$(date -u +%FT%TZ)" "$AUTOUPDATE_FORMULA" "${before:-?}" "$after"
+      # The auto-roll runs a COPY of the script (see AUTOROLL_TICK_SCRIPT); refresh it, or it keeps
+      # ticking the old CLI forever.
+      if [ -f "$AUTOROLL_TICK_SCRIPT" ]; then
+        install -m 0755 "$keg/memex-local" "$AUTOROLL_TICK_SCRIPT" \
+          && printf '%s autoupdate: auto-roll tick refreshed to %s\n' "$(date -u +%FT%TZ)" "$after"
+      fi
+      if [ "$abefore" = "$aafter" ]; then
+        printf '%s autoupdate: chart and share assets unchanged — nothing to re-apply\n' "$(date -u +%FT%TZ)"
+      elif ! colima_running; then
+        printf '%s autoupdate: chart changed but Colima is not running — the next up/update applies it\n' "$(date -u +%FT%TZ)"
+      else
+        printf '%s autoupdate: chart changed — re-applying it (update --skip-image)\n' "$(date -u +%FT%TZ)"
+        if MEMEX_IN_AUTOUPDATE=1 "$(brew --prefix)/bin/memex-local" update --skip-image; then
+          printf '%s autoupdate: chart re-applied on %s\n' "$(date -u +%FT%TZ)" "$after"
+        else
+          printf '%s autoupdate: update --skip-image FAILED on %s — its output is above; will retry on the next release\n' "$(date -u +%FT%TZ)" "$after"
+        fi
+      fi
+      ;;
+    *) die "usage: memex-local autoupdate {on|off|status}" ;;
+  esac
+}
+
 main() {
   local cmd="${1:-help}"; shift || true
   case "$cmd" in
@@ -3424,6 +3579,7 @@ main() {
     relay)         cmd_relay "$@" ;;
     verify)        cmd_verify "$@" ;;
     autoroll)      cmd_autoroll "$@" ;;
+    autoupdate)    cmd_autoupdate "$@" ;;
     port-forward)  cmd_port_forward "$@" ;;
     observability) cmd_observability "$@" ;;
     doctor)        cmd_doctor "$@" ;;

@@ -212,13 +212,13 @@ jobs:
     steps:
       - name: Every publish input exists
         env:
-          APP_ID: ${{ secrets.DEPENDENT_DISPATCH_APP_ID }}
-          APP_KEY: ${{ secrets.DEPENDENT_DISPATCH_APP_PRIVATE_KEY }}
+          APP_ID: ${{ secrets.MESHWEAVER_APP_ID }}
+          APP_KEY: ${{ secrets.MESHWEAVER_APP_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           missing=()
-          [ -n "$APP_ID" ]  || missing+=("secrets.DEPENDENT_DISPATCH_APP_ID — the GitHub App (installed org-wide, Contents: Read + Write) that pushes to $TAP_REPO")
-          [ -n "$APP_KEY" ] || missing+=("secrets.DEPENDENT_DISPATCH_APP_PRIVATE_KEY — its private key")
+          [ -n "$APP_ID" ]  || missing+=("secrets.MESHWEAVER_APP_ID — the meshweaver-cloud App (installed org-wide, Contents: Read + Write) that pushes to $TAP_REPO")
+          [ -n "$APP_KEY" ] || missing+=("secrets.MESHWEAVER_APP_PRIVATE_KEY — its private key")
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::the tap cannot be published — provision:"
             for m in "${missing[@]}"; do echo "  • $m"; done
@@ -241,8 +241,8 @@ jobs:
         id: app
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ secrets.DEPENDENT_DISPATCH_APP_ID }}
-          private-key: ${{ secrets.DEPENDENT_DISPATCH_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.MESHWEAVER_APP_ID }}
+          private-key: ${{ secrets.MESHWEAVER_APP_PRIVATE_KEY }}
           owner: Systemorph
           repositories: homebrew-memex
 
