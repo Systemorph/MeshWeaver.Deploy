@@ -402,8 +402,9 @@ jobs:
           fi
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
           echo "core ref: $REF"
-      # Core is PUBLIC: no token. Only the scripts the harness executes, plus the mirror list the
-      # Docker Hub resolver reads beside them.
+      # Core is PUBLIC: no token. Only the scripts the harness executes, the mirror list the
+      # Docker Hub resolver reads beside them, and the three files that state the token exchange's
+      # budgets, which the registry hook's limit is held against (case C, MeshWeaver#7484).
       - name: Check out core (the publisher, the ORAS pin, the Docker Hub mirror resolver)
         uses: actions/checkout@v7
         with:
@@ -413,6 +414,9 @@ jobs:
           sparse-checkout: |
             .github/scripts
             .github/dockerhub-mirror.list
+            src/MeshWeaver.PluginCatalog/InstanceRegistryAuthenticator.cs
+            src/MeshWeaver.PluginCatalog/SyncTokenSigningKeyService.cs
+            src/MeshWeaver.Documentation/Data/Architecture/QueryFanInStallTerminal.md
           sparse-checkout-cone-mode: false
       - name: Execute the publisher, the init container's fetch and the edge authorization
         env:

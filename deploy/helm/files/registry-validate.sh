@@ -100,17 +100,28 @@ fail() {
   echo "registry-validate: $1 — $2 from $url for account '$user'${said:+ ($said)}" >&2
   exit "$3"
 }
+# 🚨 The TIMEOUT is decided FIRST, whatever status line was printed before it: a 200 whose body
+# stalled mid-transfer, or a redirect whose target stalled, printed a status and then never finished.
+# Read off the status, the first would authorize from a PARTIAL body and the second would read as
+# "unexpected status" — both are no answer.
+case "$rc:$said" in
+  143:*|124:*|*'timed out'*)
+    fail no-answer "no complete answer within ${EXCHANGE_ANSWER_LIMIT}s (the exchange's own budgets sum to less)${status:+; last status $status}" 4 ;;
+esac
 case "$status" in
-  200) ;;
+  200)
+    # A 200 grants only from a transfer wget COMPLETED. Any other failure after the status line
+    # (connection reset mid-body, a short read) leaves a body nobody may parse scopes from.
+    if [ "$rc" -ne 0 ]; then
+      fail error "the exchange answered 200 but the transfer failed (wget exited $rc)" 3
+    fi ;;
   401|403) exit 1 ;;
   503) fail unavailable "the exchange answered 503: it reached no verdict on the key and asks for a retry" 6 ;;
   5[0-9][0-9]) fail server-error "the exchange answered $status" 7 ;;
   ?*) fail error "the exchange answered $status, which is neither a grant nor a refusal" 3 ;;
   *)
-    # No status line at all: the request got no answer.
-    case "$rc:$said" in
-      143:*|124:*|*'timed out'*)
-        fail no-answer "no answer within ${EXCHANGE_ANSWER_LIMIT}s (the exchange's own budgets sum to less)" 4 ;;
+    # No status line at all: the request never got an answer.
+    case "$said" in
       *"bad address"*|*"can't connect"*|*"resolve"*|*"Connection refused"*|*"Network is unreachable"*)
         fail unreachable "the exchange could not be reached" 5 ;;
       *) fail error "wget exited $rc with no status line" 3 ;;

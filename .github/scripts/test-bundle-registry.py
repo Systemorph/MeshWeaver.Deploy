@@ -161,7 +161,13 @@ OUTCOME_KEYS = {
     "mwi_server_error": (0, 500),
     "mwi_fault": (0, 502),
     "mwi_stall": (HOOK_LIMIT + 5, None),
+    # A 200 whose status line and a COMPLETE scope array arrive, and then the rest of the body never
+    # does: a hook that reads the status before the timeout would authorize from the partial body.
+    "mwi_partial_grant": (0, "partial-200"),
+    # A redirect whose target then stalls: the last status printed is the 3xx, the outcome a stall.
+    "mwi_redirect_stall": (0, "redirect-then-stall"),
 }
+STALL_AFTER_REDIRECT = "/stall-after-redirect"
 
 checks = 0
 failures: list[str] = []
@@ -348,11 +354,15 @@ class Stub(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == STALL_AFTER_REDIRECT:  # case C's redirect target — not an exchange request
+            time.sleep(HOOK_LIMIT + 5); return
         Stub.seen.append({"method": "GET", "path": self.path})
         self.send_response(405)
         self.end_headers()
 
     def do_POST(self):
+        if self.path == STALL_AFTER_REDIRECT:
+            time.sleep(HOOK_LIMIT + 5); return
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length)
         auth = self.headers.get("Authorization") or ""
@@ -366,6 +376,21 @@ class Stub(http.server.BaseHTTPRequestHandler):
             time.sleep(delay)
             if status is None:
                 return  # held open, then closed without a response — the hook must have given up by now
+            if status == "partial-200":
+                part = b'{"accessToken":"mwa_x","tokenType":"Bearer","expiresIn":900,"scope":["Plugins/*"],'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(part) + 64))
+                self.end_headers()
+                self.wfile.write(part); self.wfile.flush()
+                time.sleep(HOOK_LIMIT + 5)
+                return
+            if status == "redirect-then-stall":
+                self.send_response(302)
+                self.send_header("Location", STALL_AFTER_REDIRECT)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             data = b'{"error":"stub"}'
             self.send_response(status)
             if status == 503:
@@ -810,7 +835,7 @@ def case_indefinite(work: Path, containers: Containers, auth_image: str, auth_po
     with concurrent.futures.ThreadPoolExecutor(len(OUTCOME_KEYS)) as pool:
         futures = {key: pool.submit(token_request, accounts[key], key) for key in OUTCOME_KEYS}
         answers = {key: f.result() for key, f in futures.items()}
-    print(f"  (the five token requests took {time.monotonic() - started:.0f}s together)")
+    print(f"  (the {len(OUTCOME_KEYS)} token requests took {time.monotonic() - started:.0f}s together)")
 
     want = {
         "mwi_unavailable": ("6", "unavailable"),
@@ -818,6 +843,8 @@ def case_indefinite(work: Path, containers: Containers, auth_image: str, auth_po
         "mwi_server_error": ("7", "server-error"),
         "mwi_fault": ("7", "server-error"),
         "mwi_stall": ("4", "no-answer"),
+        "mwi_partial_grant": ("4", "no-answer"),     # never a grant from a partial body
+        "mwi_redirect_stall": ("4", "no-answer"),    # the last status was the redirect's
     }
     for key, (code, _) in want.items():
         status, body = answers[key]
