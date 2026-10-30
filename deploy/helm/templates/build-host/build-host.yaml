@@ -369,7 +369,8 @@ metadata:
 spec:
   scaleTargetRef:
     name: "{{ $c.resource }}"
-  minReplicaCount: 0
+  # The record's declared floor (BuildHostChannel.MinReplicas, default 0); a versioned server always scales to zero.
+  minReplicaCount: {{ $c.minReplicas | default 0 }}
   maxReplicaCount: {{ $c.maxReplicas }}
   pollingInterval: {{ $b.pollingInterval }}
   cooldownPeriod: {{ $b.cooldownPeriod }}

@@ -10,7 +10,8 @@
 #      estate changes until its record turns the hosts on;
 #   3. the fixture renders, per enabled channel, a Deployment with no `replicas` (KEDA owns it),
 #      images by DIGEST, the ci-build toleration + nodeSelector, the worker token from a Secret, the
-#      build-cache claim, readiness on the staged marker, and a ScaledObject with minReplicaCount 0,
+#      build-cache claim, readiness on the staged marker, and a ScaledObject with minReplicaCount = the
+#      channel's declared floor (minReplicas, default 0),
 #      the channel's maxReplicaCount and a metrics-api trigger on <apiUrl>/queue?channel=<c> with
 #      valueLocation demand and a scale-down stabilization window, the worker token as a mounted
 #      FILE (never env), grace = the run deadline, no credential volume but that one and no bake
@@ -178,8 +179,9 @@ mine = [d for d in docs if (d.get("metadata", {}).get("labels") or {}).get("app.
 problems = []
 def find(kind, name):
     return next((d for d in mine if d["kind"] == kind and d["metadata"]["name"] == name), None)
-want = {"latest": ("1111", "2222", "5555", 2, "3.1.10412"), "stable": ("3333", "4444", "6666", 1, "3.1.10388")}
-for ch, (tester, portal, runner, mx, pv) in want.items():
+# latest declares a floor of 1 (the record's BuildHostChannel.MinReplicas); stable states none, so it scales to zero.
+want = {"latest": ("1111", "2222", "5555", 2, "3.1.10412", 1), "stable": ("3333", "4444", "6666", 1, "3.1.10388", 0)}
+for ch, (tester, portal, runner, mx, pv, mn) in want.items():
     dep = find("Deployment", f"build-host-{ch}")
     so = find("ScaledObject", f"build-host-{ch}-scaler")
     if not dep or not so:
@@ -301,8 +303,8 @@ for ch, (tester, portal, runner, mx, pv) in want.items():
     if any("bake" in v["name"] for v in pod.get("volumes", [])):
         problems.append(f"{ch}: a bake share is mounted")
     s = so["spec"]
-    if s.get("minReplicaCount") != 0 or s.get("maxReplicaCount") != mx:
-        problems.append(f"{ch}: ScaledObject min/max {s.get('minReplicaCount')}/{s.get('maxReplicaCount')} != 0/{mx}")
+    if s.get("minReplicaCount") != mn or s.get("maxReplicaCount") != mx:
+        problems.append(f"{ch}: ScaledObject min/max {s.get('minReplicaCount')}/{s.get('maxReplicaCount')} != {mn}/{mx} — min is the record's declared floor")
     if s.get("scaleTargetRef", {}).get("name") != f"build-host-{ch}":
         problems.append(f"{ch}: ScaledObject targets {s.get('scaleTargetRef')}")
     trig = [t for t in s.get("triggers", []) if t.get("type") == "metrics-api"]
@@ -772,6 +774,10 @@ for entry in \
   "values.build-hosts-versions-old-runner.yaml|versionedRunner is not true" \
   "values.build-hosts-trailing-dash.yaml|ending in a letter or digit" \
   "values.build-hosts-zero-replicas.yaml|maxReplicas must be at least 1" \
+  "values.build-hosts-floor-above-ceiling.yaml|minReplicas 3 must be between 0 and the channel's maxReplicas 2" \
+  "values.build-hosts-negative-floor.yaml|minReplicas -1 must be between 0" \
+  "values.build-hosts-fractional-floor-neg-half.yaml|minReplicas -0.5 must be a whole number" \
+  "values.build-hosts-fractional-floor-above-ceiling.yaml|minReplicas 2.9 must be a whole number" \
   "values.build-hosts-name-collision.yaml|one deployment per name" \
   "values.build-hosts-cache-no-class.yaml|buildHosts.cache.storageClass is required" \
   "values.build-hosts-bad-extra-channel.yaml|not latest, stable or probe*" \
