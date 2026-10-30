@@ -31,12 +31,50 @@
 # catalog and the landing — not here; the edge grants the source's bundle repositories and
 # nothing above them.
 #
-# 401/403 from the exchange denies. Anything that is not a definite 200 or a definite 401/403 —
-# DNS failure, timeout, a 5xx, a redirect chain ending elsewhere, an unparseable body — is exit 3
-# (ERROR), never a pass and never a quiet deny that would read as "wrong key" to the caller.
-# Busybox only (Alpine): wget -S prints the status line to stderr, the body goes to a file.
+# 401/403 from the exchange denies. Anything that is not a definite 200 or a definite 401/403 is
+# an ERROR — never a pass, and never a quiet deny that would read as "wrong key" to the caller.
+#
+# 🚨 Which error is NOT one bucket (MeshWeaver#7484). docker_auth answers every error exit with
+# the same HTTP 500, so a ten-second stall, a retryable 503 and a crashing exchange used to reach
+# the caller as one bare 500 with nothing to tell them apart. docker_auth DOES pass the exit code
+# through — the 500's body reads `Authentication failed (bad return code from command: N)` — and
+# logs this hook's stderr at Error (`Ext command error: N <stderr>`), so each indefinite outcome
+# gets its own code and its own line:
+#
+#   exit  outcome      meaning                                               retry?
+#   3     error        this hook cannot work: no URL, a 200 without a scope, an unexpected
+#                      status (3xx/4xx other than 401/403), an unclassified wget failure
+#   4     no-answer    the exchange did not answer within EXCHANGE_ANSWER_LIMIT   yes, then look at the exchange
+#   5     unreachable  DNS or the connection failed — the request never arrived   yes, then look at the network
+#   6     unavailable  the exchange answered 503: it could not reach a verdict  yes — it says so (Retry-After)
+#   7     server-error the exchange answered another 5xx (502 = it faulted)       look at the exchange's log
+#
+# docker_auth's ext_auth contract (auth_server/authn/ext_auth.go, examples/reference.yml):
+# "0 - allow, 1 - deny, 2 - no match, other - error" — every code above 2 is an error, so 4–7
+# are inside the contract and docker_auth treats them exactly as it treats 3.
+#
+# The limit is DERIVED from the exchange's own budgets, never chosen: the hook must outwait the
+# exchange's slowest answer, or the exchange's correct 503 arrives after the hook has hung up and
+# is reported as a stall (MeshWeaver#7484 — the hook waited ten seconds, exactly one budget). The
+# exchange (`POST /api/instances/token`, MeshWeaver.Plugins InstanceTokenEndpoints) runs, in
+# sequence, each bounded by its own documented budget (core, src/MeshWeaver.PluginCatalog):
+#   10 s  the key resolution — index, instance and grant reads under ONE deadline
+#         (InstanceRegistryAuthenticator.ReadBudget, Doc/Architecture/InstanceKeyResolution,
+#         "One budget for the whole resolution"); a non-verdict is a 503 + Retry-After by then;
+#   15 s  the plan ladder, only for a resolved key (PlanTierLadder.Read, bounded by
+#         MeshOperationOptions.QueryInitialBudget; 1-minute snapshot, so usually instant);
+#   10 s  the token-signing key, only for a resolved key (SyncTokenSigningKeyService.ReadTimeout;
+#         1-minute cache, so usually instant);
+# plus 5 s for the answer to cross the portal's ingress. 10 + 15 + 10 + 5 = 40. A normal answer
+# takes ~0.2 s; the limit is reached only when the exchange itself is stuck. The registry's own
+# ingress gives /auth 3600 s (templates/registry/ingress.yaml), so the caller is not cut first.
+# `timeout` bounds the WHOLE request (busybox wget -T is a per-read idle limit only).
+#
+# Busybox only (Alpine): wget -S prints the status line to stderr, the body goes to a file. On an
+# error status busybox prints only the status line — no Retry-After header, no body.
 #
 #   MEMEX_VALIDATION_URL   the exchange URL (registry.validationUrl)   required
+EXCHANGE_ANSWER_LIMIT=40
 read -r user password
 if [ -z "$password" ]; then
   exit 1
@@ -47,16 +85,36 @@ if [ -z "$url" ]; then
   exit 3
 fi
 body=$(mktemp) || exit 3
-trap 'rm -f "$body"' EXIT
+wlog=$(mktemp) || exit 3
+trap 'rm -f "$body" "$wlog"' EXIT
 # An empty JSON body is a valid request (~0.2 s) — NOT the plugin catalog, which renders in full:
-# measured 14–18 s for a valid key, past the 10 s cap.
-status=$(wget -T 10 -qS -O "$body" --post-data='{}' --header='Content-Type: application/json' \
-  --header="Authorization: Bearer $password" "$url" 2>&1 \
-  | sed -n 's/^ *HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p' | tail -n 1)
+# measured 14–18 s for a valid key.
+# wget's stderr carries the RESPONSE status line and its own error line — never the request, so
+# never the key; it is safe to quote from below.
+timeout "$EXCHANGE_ANSWER_LIMIT" wget -T "$EXCHANGE_ANSWER_LIMIT" -qS -O "$body" --post-data='{}' \
+  --header='Content-Type: application/json' --header="Authorization: Bearer $password" "$url" 2>"$wlog"
+rc=$?
+status=$(sed -n 's/^ *HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p' "$wlog" | tail -n 1)
+said=$(grep '^wget: ' "$wlog" | tail -n 1)
+fail() {
+  echo "registry-validate: $1 — $2 from $url for account '$user'${said:+ ($said)}" >&2
+  exit "$3"
+}
 case "$status" in
   200) ;;
   401|403) exit 1 ;;
-  *) echo "registry-validate: no definite answer from $url for account '$user' (status '$status')" >&2; exit 3 ;;
+  503) fail unavailable "the exchange answered 503: it reached no verdict on the key and asks for a retry" 6 ;;
+  5[0-9][0-9]) fail server-error "the exchange answered $status" 7 ;;
+  ?*) fail error "the exchange answered $status, which is neither a grant nor a refusal" 3 ;;
+  *)
+    # No status line at all: the request got no answer.
+    case "$rc:$said" in
+      143:*|124:*|*'timed out'*)
+        fail no-answer "no answer within ${EXCHANGE_ANSWER_LIMIT}s (the exchange's own budgets sum to less)" 4 ;;
+      *"bad address"*|*"can't connect"*|*"resolve"*|*"Connection refused"*|*"Network is unreachable"*)
+        fail unreachable "the exchange could not be reached" 5 ;;
+      *) fail error "wget exited $rc with no status line" 3 ;;
+    esac ;;
 esac
 
 # The exchange answers System.Text.Json Web defaults: compact, camelCase, `"scope":["…","…"]`.

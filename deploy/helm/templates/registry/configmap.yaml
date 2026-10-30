@@ -95,8 +95,12 @@ data:
 #      name: the password is a MeshWeaver instance key, validated by presenting it as a bearer to
 #      the portal's key→token exchange. docker_auth's contract (auth_server/authn/ext_auth.go):
 #      "<user> <password>" on stdin, exit 0 = allow, 1 = deny, 2 = no match (try the next
-#      authenticator), 3 = error — and on 0, a JSON `{"labels": {…}}` on stdout that the ACL can
-#      match with `${labels:<name>}` placeholders (auth_server/authz/acl.go).
+#      authenticator), anything else = error — and on 0, a JSON `{"labels": {…}}` on stdout that
+#      the ACL can match with `${labels:<name>}` placeholders (auth_server/authz/acl.go). Every
+#      error is an HTTP 500 to the caller, so the hook tells its errors apart by exit code, which
+#      docker_auth carries into the 500's body (`bad return code from command: N`) and logs with
+#      the hook's stderr: 3 error, 4 no answer in time, 5 unreachable, 6 the exchange answered 503
+#      (retryable), 7 another 5xx (MeshWeaver#7484; the table is in registry-validate.sh).
 #
 # 🚨 Per-repository authorization of PLUGIN BUNDLES rides on those labels, and on nothing else
 # (Doc/Architecture/PluginBundlesInTheRegistry → "Authorization"). docker_auth 1.14.0 also has an
