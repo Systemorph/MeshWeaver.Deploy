@@ -14,7 +14,7 @@
 #      image.tag, s1-extract without image.repository), so (3) is the switch, not a broken render.
 #
 # NO SKIP-TRAPDOOR: helm, python3 and PyYAML are asserted; a render that yields nothing where objects
-# are expected is RED.
+# are expected is RED, and a render the parser could not read is RED — never an empty, passing, kind list.
 set -uo pipefail
 
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,7 +37,7 @@ print(",".join(sorted(d.get("kind", "?") for d in docs)))
 kinds() { python3 -c "$KINDS"; }
 
 WHISPER_REQ=(--set image.tag=1.7.4-flix-large-v3-q8-abc1234)
-S1_REQ=(--set image.repository=registry.example/s1-extract --set 'auth.allowedServiceAccounts[0]=system:serviceaccount:memex:portal')
+S1_REQ=(--set image.repository=registry.example/s1-extract --set 'auth.allowedServiceAccounts[0]=system:serviceaccount:acme:portal')
 
 check_chart() {
   local name="$1" chart="$2" expected="$3"; shift 3
@@ -46,7 +46,7 @@ check_chart() {
   # ---- 1. the default renders the full set ---------------------------------------------------
   local def on off k
   def="$(helm template t "$chart" "${req[@]}" 2>&1)" || { report "$name: the default does not render: $def"; return; }
-  k="$(printf '%s' "$def" | kinds)"
+  k="$(printf '%s' "$def" | kinds)" || { report "$name: could not parse the default render"; return; }
   if [ "$k" = "$expected" ]; then
     ok "$name: the default (enabled: true) renders [$k]"
   else
@@ -69,7 +69,9 @@ check_chart() {
     else
       off="$(helm template t "$chart" --set enabled=false 2>&1)" || { report "$name: enabled=false ($variant) refused — a disabled chart must need no values: $off"; continue; }
     fi
-    k="$(printf '%s' "$off" | kinds)"
+    # A parse failure must never read as "no objects": an empty kind list counts only when the
+    # parser itself succeeded.
+    k="$(printf '%s' "$off" | kinds)" || { report "$name: could not parse the enabled=false ($variant) render"; continue; }
     if [ -z "$k" ]; then
       ok "$name: enabled=false ($variant) renders no object"
     else
@@ -87,7 +89,7 @@ if helm template t "$WHISPER" >/dev/null 2>&1; then
 else
   ok "whisper: the enabled chart still refuses a missing image.tag"
 fi
-if helm template t "$S1" --set 'auth.allowedServiceAccounts[0]=system:serviceaccount:memex:portal' >/dev/null 2>&1; then
+if helm template t "$S1" --set 'auth.allowedServiceAccounts[0]=system:serviceaccount:acme:portal' >/dev/null 2>&1; then
   report "s1-extract: the enabled chart rendered without image.repository — the refusal is gone, so (3) proves nothing"
 else
   ok "s1-extract: the enabled chart still refuses a missing image.repository"
