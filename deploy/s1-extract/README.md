@@ -49,10 +49,15 @@ network) and sets `HF_HUB_OFFLINE`.
 
 ## Install
 
-The chart is `deploy/s1-extract/helm`. Required values:
+The chart is `deploy/s1-extract/helm`. It is **on by default** (`enabled: true`): it rendered
+unconditionally before the switch existed and estates run it, so an undeclared switch renders exactly
+what it always did. `enabled: false` renders nothing at all, including the cluster-wide
+`system:auth-delegator` ClusterRoleBinding, and then needs none of the values below
+(`deploy/aks/scripts/test-service-chart-switches.sh` asserts both). Required values when enabled:
 
 | Value | What |
 |---|---|
+| `enabled` | `false` to render nothing. Default `true`. |
 | `image.repository` | `<registry>/s1-extract`. The chart fails without it. |
 | `auth.allowedServiceAccounts` | `system:serviceaccount:<ns>:<sa>` of each caller. The chart fails when this is empty. |
 | `networkPolicy.allowedNamespaces` | the callers' namespaces. Empty means nothing is admitted. |

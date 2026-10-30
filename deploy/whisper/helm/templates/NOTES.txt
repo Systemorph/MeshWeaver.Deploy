@@ -1,3 +1,4 @@
+{{- if .Values.enabled }}
 whisper-swiss-german is deploying.
 
 The server is cluster-internal (Service type {{ .Values.service.type }}) at:
@@ -28,3 +29,4 @@ To transcribe, POST an audio file to /inference:
     kubectl run -it --rm curl --image=curlimages/curl --restart=Never -- \
       -F file=@your-audio.wav -F language={{ .Values.model.language }} -F response_format=json \
       http://{{ include "whisper.fullname" . }}:{{ .Values.service.port }}/inference
+{{- end }}

@@ -1,5 +1,11 @@
 # Values for s1-extract (deploy/s1-extract/Dockerfile). ClusterIP only, never an Ingress.
 
+# ON BY DEFAULT (opt-out), unlike ocr and ollama: this chart rendered unconditionally before the switch
+# existed, and estates already run it, so the default keeps every existing render byte-identical. Set
+# `enabled: false` in an estate overlay to render nothing — including the cluster-wide
+# system:auth-delegator ClusterRoleBinding (MeshWeaver.Deploy#38).
+enabled: true
+
 # The name the chart's resources are called by (templates/_helpers.tpl). Empty keeps the chart's own
 # name; set it only to run a second copy of the chart beside the first.
 nameOverride: ""

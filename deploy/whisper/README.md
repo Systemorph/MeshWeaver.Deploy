@@ -32,6 +32,14 @@ Then point the portal at it (appsettings or the portal's Speech settings):
 "Speech": { "Endpoint": "http://localhost:8080", "Enabled": true, "Language": "de" }
 ```
 
+## Chart
+
+The chart is `deploy/whisper/helm`. It is **on by default** (`enabled: true`): it rendered
+unconditionally before the switch existed and estates run it, so an undeclared switch renders exactly
+what it always did. `enabled: false` in an estate overlay renders nothing at all and then needs no
+`image.tag`; enabled, the chart still refuses a missing or model-less tag.
+`deploy/aks/scripts/test-service-chart-switches.sh` (chart gate) asserts both.
+
 ## Model licence
 
 **Default: [Flix-AI/flix-swissgerman-full](https://huggingface.co/Flix-AI/flix-swissgerman-full) —

@@ -1,3 +1,4 @@
+{{- if .Values.enabled }}
 {{- if not .Values.image.repository }}
 {{- fail "image.repository is required (<registry>/s1-extract) — the image carries the model" }}
 {{- end }}
@@ -97,3 +98,4 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- end }}

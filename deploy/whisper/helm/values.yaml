@@ -4,6 +4,11 @@
 #   Speech__Endpoint = http://<release>-whisper-swiss-german:8080
 #   Speech__Enabled  = true
 
+# ON BY DEFAULT (opt-out), unlike ocr and ollama: this chart rendered unconditionally before the switch
+# existed, and estates already run it, so the default keeps every existing render byte-identical. Set
+# `enabled: false` in an estate overlay to render nothing (MeshWeaver.Deploy#38).
+enabled: true
+
 # The name the chart's resources are called by (templates/_helpers.tpl). Empty keeps the chart's own
 # name; set it only to run a second copy of the chart beside the first.
 nameOverride: ""
