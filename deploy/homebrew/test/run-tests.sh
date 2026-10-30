@@ -1074,6 +1074,38 @@ grep -q 'az acr manifest show-metadata .*--only-show-errors 2>&1' "$CLI" \
   && ok "the acr poll passes --only-show-errors (a preview WARNING was stored as the digest)" \
   || bad "the acr poll passes --only-show-errors" "$(grep -n 'az acr manifest show-metadata' "$CLI")"
 
+echo "── the login agent opens the setup wizard when a first start is waiting ──"
+PF="$HERE/../share/port-forward.sh"
+SO="$(mktemp -d)"; mkdir -p "$SO/stubs" "$SO/home"
+# Only the function is exercised: the script itself starts Colima and execs the forward.
+awk '/^open_setup_if_waiting\(\) \{/{on=1} on{print} on&&/^}$/{exit}' "$PF" > "$SO/fn.sh"
+cat > "$SO/stubs/curl" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in *redirect_url*) printf '%s' "${FAKE_REDIRECT:-}" ;; *) printf '%s' "${FAKE_ROOT_CODE:-302}" ;; esac
+EOF
+printf '#!/usr/bin/env bash\nprintf "info: Banner\\n  Token: %%s\\n" "$FAKE_TOKEN"\n' > "$SO/stubs/kubectl"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$FAKE_OPEN_LOG"\n' > "$SO/stubs/open"
+chmod +x "$SO/stubs/"*
+so_run() {
+  : > "$SO/open.log"
+  OUT="$(env PATH="$SO/stubs:$PATH" HOME="$SO/home" MEMEX_LOCAL_HOME="$SO/home/.memex-local" FAKE_OPEN_LOG="$SO/open.log" \
+    HOST_PORT=8443 KUBE_CONTEXT=colima "$@" bash -c '. "$1"; open_setup_if_waiting' _ "$SO/fn.sh" 2>&1)"
+}
+so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok1
+[ "$(cat "$SO/open.log")" = "https://memex.localhost:8443/setup?token=tok1" ] \
+  && ok "a waiting first start opens the wizard with its token" || bad "a waiting first start opens the wizard" "open: $(cat "$SO/open.log") out: $OUT"
+so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok1
+[ ! -s "$SO/open.log" ] && ok "the same token is not reopened (KeepAlive restarts the agent)" || bad "same token not reopened" "$(cat "$SO/open.log")"
+so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok2
+[ "$(cat "$SO/open.log")" = "https://memex.localhost:8443/setup?token=tok2" ] \
+  && ok "a new portal process (new token) opens it again" || bad "a new token reopens" "$(cat "$SO/open.log")"
+so_run FAKE_REDIRECT="https://memex.localhost:8443/login" FAKE_TOKEN=tok3
+[ ! -s "$SO/open.log" ] && ok "a set-up instance opens nothing" || bad "a set-up instance opens nothing" "$(cat "$SO/open.log")"
+so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok4 MEMEX_HEADLESS=1
+[ ! -s "$SO/open.log" ] && ok "a headless host opens nothing" || bad "a headless host opens nothing" "$(cat "$SO/open.log")"
+grep -q '^open_setup_if_waiting &$' "$PF" && ok "the agent runs it in the background, before the forward" || bad "the agent runs it in the background" ""
+rm -rf "$SO"
+
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
