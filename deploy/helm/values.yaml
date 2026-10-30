@@ -889,6 +889,13 @@ ingress:
   # a tlsSecret and neither an issuer nor a hand-written cert-manager annotation is refused by
   # deploy/aks/scripts/check-chart-invariants.sh — that shape serves another host's certificate.
   clusterIssuer: ""
+  # A spinner page while the portal has no ready endpoint (booting, restarting, landing its first
+  # modules) instead of the controller's bare 503 — templates/memex-portal/boot-page.yaml. Off in the
+  # neutral chart; the Homebrew defaults turn it on.
+  bootPage:
+    enabled: false
+    title: ""       # default "Memex is starting"
+    image: ""       # default nginxinc/nginx-unprivileged:1.27-alpine
   annotations:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
