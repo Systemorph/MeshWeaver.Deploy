@@ -155,7 +155,7 @@ jobs:
           # term that grows after the preload is bounded by one of these (MeshWeaver#7678 — the unbounded
           # llama-server prompt cache OOMKilled the first install).
           for kv in OLLAMA_CONTEXT_LENGTH=8192 OLLAMA_NUM_PARALLEL=1 OLLAMA_MAX_LOADED_MODELS=2 \
-                    OLLAMA_KEEP_ALIVE=-1 LLAMA_ARG_CACHE_RAM=512 LLAMA_ARG_CTX_CHECKPOINTS=4; do
+                    LLAMA_ARG_CACHE_RAM=512 LLAMA_ARG_CTX_CHECKPOINTS=4; do
             grep -A1 -- "- name: ${kv%%=*}\$" <<<"$on" | grep -q "value: \"${kv#*=}\"" \
               || { echo "::error::the Deployment does not carry ${kv} — the declared memory budget is not rendered"; exit 1; }
           done
