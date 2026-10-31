@@ -35,6 +35,10 @@ HOW IT STAYS HONEST
 * The stub records every exchange it saw; the harness asserts the validator POSTed with the
   bearer, and that a wrong publisher password never reached it (docker_auth's static account
   short-circuits — if it did not, the publisher's password would be presented to memex).
+* An exchange that gives NO definite answer — a 503, a late 503, a 5xx, a stall, no server at all —
+  must reach the caller as distinguishable outcomes (MeshWeaver#7484): read off docker_auth's own
+  500 body (the hook's exit code) and its log line, and the hook's limit is held against the
+  exchange's budgets READ from the platform checkout, so a budget raised there reds here.
 * Every case prints its denominator, and a run that asserted nothing FAILS.
 
 WHAT THIS HARNESS CANNOT PROVE
@@ -56,16 +60,20 @@ install-oras.sh (ONE pin, sha256-verified) unless $ORAS names a binary at that p
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import http.server
 import io
 import json
+import math
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -121,6 +129,77 @@ SCOPES = {
     "mwi_pro": ["Plugins/*@pro"],
     "mwi_edu": ["Plugins/Edu"],
 }
+
+
+def _seconds(relative: str, pattern: str) -> int:
+    """One of the exchange's budgets, read from the platform checkout at the declared ref — never a
+    copy of the number here, so a platform change to a budget is judged against the hook's limit."""
+    path = Path(os.environ["MW_PLATFORM_ROOT"]).resolve() / relative
+    m = re.search(pattern, path.read_text()) if path.is_file() else None
+    if not m:
+        raise SystemExit(f"::error::cannot read the exchange budget /{pattern}/ from {relative} in MW_PLATFORM_ROOT — "
+                         "the budget moved; re-derive registry-validate.sh's EXCHANGE_ANSWER_LIMIT and update this harness")
+    return int(m.group(1))
+
+
+# The exchange's sequential budgets (registry-validate.sh's header names each), and the hook's limit.
+RESOLUTION_BUDGET = _seconds("src/MeshWeaver.PluginCatalog/InstanceRegistryAuthenticator.cs",
+                             r"ReadBudget \{ get; init; \} = TimeSpan\.FromSeconds\((\d+)\)")
+def _ladder_budget() -> int:
+    """MeshOperationOptions.QueryInitialBudget, COMPUTED from the executable source at the declared
+    ref — never a documentation table that can lag it. It is Nest(Nest(Nest(Timeout))) with
+    Nest(t) = max(t - NestingReserve, t * MinNestingFraction); every default and every link of that
+    chain is matched, so a change to any of them is either followed here or RED, never silently
+    stale. (A deployment that overrides Timeout in configuration is outside what source can tell.)"""
+    rel = "src/MeshWeaver.Mesh.Contract/Services/MeshOperationOptions.cs"
+    path = Path(os.environ["MW_PLATFORM_ROOT"]).resolve() / rel
+    src = path.read_text() if path.is_file() else ""
+    shapes = {
+        "timeout": r"private readonly TimeSpan timeout = TimeSpan\.FromSeconds\((\d+)\);",
+        "reserve": r"private readonly TimeSpan nestingReserve = TimeSpan\.FromSeconds\((\d+)\);",
+        "fraction": r"private readonly double minNestingFraction = ([0-9.]+);",
+    }
+    chain = [
+        r"public TimeSpan NestedTimeout => Nest\(Timeout\);",
+        r"public TimeSpan PermissionEstablishmentBudget => Nest\(NestedTimeout\);",
+        r"public TimeSpan QueryInitialBudget => Nest\(PermissionEstablishmentBudget\);",
+        r"Nest\(TimeSpan enclosing\) => TimeSpan\.FromTicks\(Math\.Max\(\s*\(enclosing - NestingReserve\)\.Ticks,\s*"
+        r"\(long\)\(enclosing\.Ticks \* MinNestingFraction\)\)\);",
+    ]
+    found = {k: re.search(p, src) for k, p in shapes.items()}
+    missing = [p for p in list(shapes.values()) + chain if not re.search(p, src)]
+    if missing:
+        raise SystemExit(f"::error::cannot derive QueryInitialBudget from {rel} in MW_PLATFORM_ROOT — /{missing[0]}/ no longer "
+                         "matches; the ladder moved: re-derive registry-validate.sh's EXCHANGE_ANSWER_LIMIT and update this harness")
+    t, reserve, fraction = float(found["timeout"].group(1)), float(found["reserve"].group(1)), float(found["fraction"].group(1))
+    for _ in range(3):
+        t = max(t - reserve, t * fraction)
+    return math.ceil(t)
+
+
+LADDER_BUDGET = _ladder_budget()
+SIGNING_KEY_BUDGET = _seconds("src/MeshWeaver.PluginCatalog/SyncTokenSigningKeyService.cs",
+                              r"ReadTimeout = TimeSpan\.FromSeconds\((\d+)\)")
+_limit = re.search(r"^EXCHANGE_ANSWER_LIMIT=(\d+)$", VALIDATE.read_text(), re.M)
+HOOK_LIMIT = int(_limit.group(1)) if _limit else 0
+
+# Indefinite answers of the exchange (MeshWeaver#7484): key → (seconds before answering, status);
+# status None = the request is held open and never answered within the hook's limit.
+OUTCOME_KEYS = {
+    "mwi_unavailable": (0, 503),
+    # The exchange's CORRECT 503 when its reads hang: it arrives once the resolution budget is spent.
+    # A hook whose limit is that same budget hangs up first and reports a stall instead (the defect).
+    "mwi_late_unavailable": (RESOLUTION_BUDGET + 1, 503),
+    "mwi_server_error": (0, 500),
+    "mwi_fault": (0, 502),
+    "mwi_stall": (HOOK_LIMIT + 5, None),
+    # A 200 whose status line and a COMPLETE scope array arrive, and then the rest of the body never
+    # does: a hook that reads the status before the timeout would authorize from the partial body.
+    "mwi_partial_grant": (0, "partial-200"),
+    # A redirect whose target then stalls: the last status printed is the 3xx, the outcome a stall.
+    "mwi_redirect_stall": (0, "redirect-then-stall"),
+}
+STALL_AFTER_REDIRECT = "/stall-after-redirect"
 
 checks = 0
 failures: list[str] = []
@@ -307,11 +386,15 @@ class Stub(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == STALL_AFTER_REDIRECT:  # case C's redirect target — not an exchange request
+            time.sleep(HOOK_LIMIT + 5); return
         Stub.seen.append({"method": "GET", "path": self.path})
         self.send_response(405)
         self.end_headers()
 
     def do_POST(self):
+        if self.path == STALL_AFTER_REDIRECT:
+            time.sleep(HOOK_LIMIT + 5); return
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length)
         auth = self.headers.get("Authorization") or ""
@@ -320,6 +403,35 @@ class Stub(http.server.BaseHTTPRequestHandler):
         key = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
         if self.path != "/api/instances/token":
             self.send_response(404); self.end_headers(); return
+        if key in OUTCOME_KEYS:
+            delay, status = OUTCOME_KEYS[key]
+            time.sleep(delay)
+            if status is None:
+                return  # held open, then closed without a response — the hook must have given up by now
+            if status == "partial-200":
+                part = b'{"accessToken":"mwa_x","tokenType":"Bearer","expiresIn":900,"scope":["Plugins/*"],'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(part) + 64))
+                self.end_headers()
+                self.wfile.write(part); self.wfile.flush()
+                time.sleep(HOOK_LIMIT + 5)
+                return
+            if status == "redirect-then-stall":
+                self.send_response(302)
+                self.send_header("Location", STALL_AFTER_REDIRECT)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            data = b'{"error":"stub"}'
+            self.send_response(status)
+            if status == 503:
+                self.send_header("Retry-After", "5")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if key in SCOPES:
             payload = {"accessToken": "mwa_x", "tokenType": "Bearer", "expiresIn": 900, "scope": SCOPES[key]}
             data = json.dumps(payload, separators=(",", ":")).encode()
@@ -719,7 +831,73 @@ auth:
     expect(r.returncode == 0 and tree(root / IDENTITY / "Plugins") == tree(pub), f"bundle-fetch with the pod's credential materialises the publication byte for byte (exit {r.returncode}, stderr: {r.stderr.strip()[:200]})")
     r = run(["sh", str(FETCH)], env=dict(fenv, BUNDLES_ROOT=str(work / "root-anon")))
     expect(r.returncode == 1, "bundle-fetch without a credential exits 1")
+    case_indefinite(work, containers, auth_image, auth_port, auth_dir)
     server.shutdown()
+
+
+# ---------------------------------------------------------------------------------------------
+# Case C — an exchange that gives no definite answer (MeshWeaver#7484), as the CALLER sees it.
+# ---------------------------------------------------------------------------------------------
+def case_indefinite(work: Path, containers: Containers, auth_image: str, auth_port: int, auth_dir: Path) -> None:
+    print("\n== C. the exchange gives no definite answer: each outcome reaches the caller distinguishably")
+    budgets = RESOLUTION_BUDGET + LADDER_BUDGET + SIGNING_KEY_BUDGET
+    expect(HOOK_LIMIT > budgets,
+           f"the hook's EXCHANGE_ANSWER_LIMIT ({HOOK_LIMIT}s) outwaits the exchange's sequential budgets "
+           f"({RESOLUTION_BUDGET}s resolution + {LADDER_BUDGET}s plan ladder + {SIGNING_KEY_BUDGET}s signing key = {budgets}s, "
+           "read from the platform), so the exchange's own 503 can reach it")
+
+    def token_request(account: str, key: str) -> tuple[int, str]:
+        """The registry client's token request against docker_auth: (status, body)."""
+        req = urllib.request.Request(
+            f"http://localhost:{auth_port}/auth?service=cr.example.test&scope=repository:memex-portal-ai:pull",
+            headers={"Authorization": "Basic " + base64.b64encode(f"{account}:{key}".encode()).decode()})
+        try:
+            with urllib.request.urlopen(req, timeout=HOOK_LIMIT + 30) as resp:
+                return resp.status, resp.read().decode(errors="replace")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode(errors="replace")
+
+    def code_of(body: str) -> str:
+        m = re.search(r"bad return code from command: (\d+)", body)
+        return m.group(1) if m else f"none in {body.strip()[:120]!r}"
+
+    # Concurrently: the stall alone takes the hook's whole limit.
+    accounts = {key: "acct-" + key.removeprefix("mwi_").replace("_", "-") for key in OUTCOME_KEYS}
+    started = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(len(OUTCOME_KEYS)) as pool:
+        futures = {key: pool.submit(token_request, accounts[key], key) for key in OUTCOME_KEYS}
+        answers = {key: f.result() for key, f in futures.items()}
+    print(f"  (the {len(OUTCOME_KEYS)} token requests took {time.monotonic() - started:.0f}s together)")
+
+    want = {
+        "mwi_unavailable": ("6", "unavailable"),
+        "mwi_late_unavailable": ("6", "unavailable"),
+        "mwi_server_error": ("7", "server-error"),
+        "mwi_fault": ("7", "server-error"),
+        "mwi_stall": ("4", "no-answer"),
+        "mwi_partial_grant": ("4", "no-answer"),     # never a grant from a partial body
+        "mwi_redirect_stall": ("4", "no-answer"),    # the last status was the redirect's
+    }
+    for key, (code, _) in want.items():
+        status, body = answers[key]
+        expect(status == 500 and code_of(body) == code,
+               f"{key:22} → HTTP {status}, exit code {code_of(body)} in docker_auth's answer (expected 500 with code {code})")
+
+    log = containers.logs(f"mw-bundle-auth-{os.getpid()}")
+    for key, (code, outcome) in want.items():
+        line = f"Ext command error: {code} registry-validate: {outcome} — "
+        expect(any(line in ln and f"account '{accounts[key]}'" in ln for ln in log.splitlines()),
+               f"{key:22} → docker_auth's log names the outcome: '{line}…account '{accounts[key]}''")
+    expect("mwi_" not in log, "…and still no instance key appears in docker_auth's log")
+
+    # Unreachable: the hook itself, in the image docker_auth runs it in, against a port nothing serves.
+    closed = free_port()
+    r = run(["docker", "run", "--rm", "-i", "--add-host", "host.docker.internal:host-gateway",
+             "-e", f"MEMEX_VALIDATION_URL=http://host.docker.internal:{closed}/api/instances/token",
+             "-v", f"{auth_dir / 'validate.sh'}:/etc/docker_auth/validate.sh:ro",
+             "--entrypoint", "/etc/docker_auth/validate.sh", auth_image], input="acct-unreachable mwi_unreachable")
+    expect(r.returncode == 5 and "registry-validate: unreachable — " in r.stderr and "mwi_" not in r.stderr,
+           f"an exchange nobody answers on → exit 5 'unreachable' (exit {r.returncode}, stderr {r.stderr.strip()[:200]!r})")
 
 
 def main() -> int:
