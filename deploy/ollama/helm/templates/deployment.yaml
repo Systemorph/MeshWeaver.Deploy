@@ -71,6 +71,16 @@ spec:
               value: {{ .Values.ollama.numParallel | int64 | quote }}
             - name: OLLAMA_MAX_QUEUE
               value: {{ .Values.ollama.maxQueue | int64 | quote }}
+            # The rest of the declared memory budget (values.yaml → `ollama:` and the sum above `resources`).
+            - name: OLLAMA_MAX_LOADED_MODELS
+              value: {{ .Values.ollama.maxLoadedModels | int64 | quote }}
+            - name: OLLAMA_KEEP_ALIVE
+              value: {{ .Values.ollama.keepAlive | toString | quote }}
+            # Read by each llama-server process Ollama starts (it inherits this environment).
+            - name: LLAMA_ARG_CACHE_RAM
+              value: {{ .Values.ollama.promptCacheMiB | int64 | quote }}
+            - name: LLAMA_ARG_CTX_CHECKPOINTS
+              value: {{ .Values.ollama.contextCheckpoints | int64 | quote }}
             - name: HOME
               value: /tmp
           ports:
