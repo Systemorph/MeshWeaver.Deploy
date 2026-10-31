@@ -1,0 +1,109 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
+{{- if and .Values.ingress.enabled ((.Values.ingress.bootPage).enabled) }}
+# ---- Boot page: what a browser sees while the portal is not ready ---------------------------------
+# The maintainer, 2026-10-30, after a fresh install answered a bare 503 for minutes while it landed
+# its modules: "we must bring spinner and stuff while it is booting". ingress-nginx sends a request
+# to the ingress's `default-backend` whenever the portal Service has NO ready endpoint, so the page
+# shows exactly while the portal boots, restarts or lands its first modules, and never once it is
+# ready. Every path answers 503 (an API client still reads "not yet"), with a body that tells a
+# person what is happening and reloads itself.
+---
+apiVersion: "v1"
+kind: "ConfigMap"
+metadata:
+  name: "memex-boot-page"
+  labels:
+    app.kubernetes.io/name: "{{ .Chart.Name }}"
+    app.kubernetes.io/component: "memex-boot-page"
+    app.kubernetes.io/instance: "{{ .Release.Name }}"
+data:
+  default.conf: |
+    server {
+      listen 8080 default_server;
+      server_tokens off;
+      # The portal Ingress admits bodies up to its own proxy-body-size; this backend must not answer
+      # 413 for one of them, or an upload during a restart gets a final error instead of a retryable 503.
+      client_max_body_size 0;
+      location = /boot.html { internal; root /usr/share/nginx/html; add_header Cache-Control "no-store" always; add_header Retry-After "5" always; }
+      location / { error_page 503 /boot.html; return 503; }
+    }
+  boot.html: |
+    <!doctype html>
+    <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta http-equiv="refresh" content="5"><title>{{ .Values.ingress.bootPage.title | default "Memex is starting" }}</title>
+    <style>
+      :root { color-scheme: light dark; --bg:#f6f7f9; --fg:#1b1f24; --muted:#5b6470; --accent:#3b82f6; }
+      @media (prefers-color-scheme: dark) { :root { --bg:#0b0d10; --fg:#e8eaed; --muted:#9aa3ad; --accent:#7cc4fa; } }
+      html,body { height:100%; margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+      main { min-height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:20px; padding:16px; text-align:center; }
+      .spin { width:44px; height:44px; border-radius:50%; border:4px solid color-mix(in srgb, var(--accent) 22%, transparent); border-top-color:var(--accent); animation:s 0.9s linear infinite; }
+      @keyframes s { to { transform:rotate(360deg); } }
+      h1 { margin:0; font-size:22px; font-weight:600; }
+      p { margin:0; color:var(--muted); max-width:34em; }
+      @media (prefers-reduced-motion: reduce) { .spin { animation-duration:3s; } }
+    </style></head>
+    <body><main role="status" aria-live="polite">
+      <div class="spin" aria-hidden="true"></div>
+      <h1>{{ .Values.ingress.bootPage.title | default "Memex is starting" }}</h1>
+      <p>It is starting up, or installing the apps you picked. A first start can take a few minutes. This page reloads by itself.</p>
+    </main></body></html>
+---
+apiVersion: "apps/v1"
+kind: "Deployment"
+metadata:
+  name: "memex-boot-page"
+  labels:
+    app.kubernetes.io/name: "{{ .Chart.Name }}"
+    app.kubernetes.io/component: "memex-boot-page"
+    app.kubernetes.io/instance: "{{ .Release.Name }}"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: "{{ .Chart.Name }}"
+      app.kubernetes.io/component: "memex-boot-page"
+      app.kubernetes.io/instance: "{{ .Release.Name }}"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: "{{ .Chart.Name }}"
+        app.kubernetes.io/component: "memex-boot-page"
+        app.kubernetes.io/instance: "{{ .Release.Name }}"
+      annotations:
+        checksum/boot-page: {{ printf "%s%s" (.Values.ingress.bootPage.title | default "") .Chart.Version | sha256sum | trunc 16 | quote }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: "boot-page"
+          image: {{ .Values.ingress.bootPage.image | default "nginxinc/nginx-unprivileged:1.27-alpine" | quote }}
+          imagePullPolicy: "IfNotPresent"
+          ports: [ { name: "http", containerPort: 8080 } ]
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
+          resources: { requests: { cpu: "5m", memory: "8Mi" }, limits: { memory: "32Mi" } }
+          readinessProbe: { tcpSocket: { port: 8080 }, periodSeconds: 5 }
+          volumeMounts:
+            - { name: "page", mountPath: "/etc/nginx/conf.d/default.conf", subPath: "default.conf" }
+            - { name: "page", mountPath: "/usr/share/nginx/html/boot.html", subPath: "boot.html" }
+      volumes:
+        - name: "page"
+          configMap: { name: "memex-boot-page" }
+---
+apiVersion: "v1"
+kind: "Service"
+metadata:
+  name: "memex-boot-page"
+  labels:
+    app.kubernetes.io/name: "{{ .Chart.Name }}"
+    app.kubernetes.io/component: "memex-boot-page"
+    app.kubernetes.io/instance: "{{ .Release.Name }}"
+spec:
+  type: "ClusterIP"
+  selector:
+    app.kubernetes.io/name: "{{ .Chart.Name }}"
+    app.kubernetes.io/component: "memex-boot-page"
+    app.kubernetes.io/instance: "{{ .Release.Name }}"
+  ports:
+    - { name: "http", protocol: "TCP", port: 8080, targetPort: 8080 }
+{{- end }}
+{{- end }}

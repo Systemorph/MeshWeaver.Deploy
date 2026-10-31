@@ -538,6 +538,30 @@ if [ -d "$DB_CHART" ]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# The boot page (templates/memex-portal/boot-page.yaml): what a browser sees while the portal has no
+# ready endpoint. Three renders over the memex-local layers, the shape that enables it: enabled
+# (objects + the Ingress default backend + the 503 contract in the nginx config), disabled (nothing
+# renders, no Ingress names it) and a hand-written default-backend (it wins). The response contract
+# itself is exercised against the configured image by check-boot-page-serves.sh.
+# ---------------------------------------------------------------------------
+BOOT_LAYERS=( -f "$REPO/deploy/helm/values.yaml" -f "$REPO/deploy/homebrew/share/values.local.defaults.yaml" --set ingress.enabled=true )
+for bcase in enabled disabled override; do
+  bargs=( template release "$CHART" --namespace check "${BOOT_LAYERS[@]}" )
+  case "$bcase" in
+    disabled) bargs+=( --set ingress.bootPage.enabled=false ) ;;
+    override) bargs+=( --set-string 'ingress.annotations.nginx\.ingress\.kubernetes\.io/default-backend=custom-backend' ) ;;
+  esac
+  bout="$WORK/boot-$bcase.yaml"
+  if ! helm "${bargs[@]}" > "$bout" 2> "$bout.err"; then
+    report "boot page ($bcase) does not render — helm template FAILED:"; sed 's/^/    /' "$bout.err"
+  elif python3 "$SELF_DIR/check-boot-page.py" "$bcase" "$bout"; then
+    ok "boot page ($bcase) — renders the wiring it promises"
+  else
+    fail=1
+  fi
+done
+
 if [ "$fail" -eq 0 ]; then
   echo
   echo "All $rendered values combinations render a self-consistent deployment, and all $refused refusal controls hold."

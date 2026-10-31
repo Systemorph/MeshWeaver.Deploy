@@ -49,6 +49,11 @@ metadata:
     {{- $_ := set $ann $k $v }}
     {{- end }}
     {{- end }}
+    {{- /* The boot page (boot-page.yaml) answers while the portal has no ready endpoint. Set before
+         ingress.annotations, so a hand-written default-backend still wins. */}}
+    {{- if (.Values.ingress.bootPage).enabled }}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/default-backend" "memex-boot-page" }}
+    {{- end }}
     {{- range $k, $v := (.Values.ingress.annotations | default dict) }}
     {{- $_ := set $ann $k $v }}
     {{- end }}

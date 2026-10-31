@@ -92,3 +92,7 @@ config:
 # wins (it is passed last).
 ingress:
   clusterIssuer: "none"
+  # A spinner while the portal boots or lands its first modules, instead of a bare 503
+  # (maintainer, 2026-10-30: "we must bring spinner and stuff while it is booting").
+  bootPage:
+    enabled: true
