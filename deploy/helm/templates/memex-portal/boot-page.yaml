@@ -1,4 +1,5 @@
-{{- if and (eq (include "memex.portal.enabled" .) "true") .Values.ingress.enabled ((.Values.ingress.bootPage).enabled) }}
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
+{{- if and .Values.ingress.enabled ((.Values.ingress.bootPage).enabled) }}
 # ---- Boot page: what a browser sees while the portal is not ready ---------------------------------
 # The maintainer, 2026-10-30, after a fresh install answered a bare 503 for minutes while it landed
 # its modules: "we must bring spinner and stuff while it is booting". ingress-nginx sends a request
@@ -101,4 +102,5 @@ spec:
     app.kubernetes.io/instance: "{{ .Release.Name }}"
   ports:
     - { name: "http", protocol: "TCP", port: 8080, targetPort: 8080 }
+{{- end }}
 {{- end }}
