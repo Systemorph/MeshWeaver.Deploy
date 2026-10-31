@@ -151,6 +151,20 @@ jobs:
           [ "$kinds" = "kind: Deployment kind: NetworkPolicy kind: Pod kind: Service " ] \
             || { echo "::error::enabled chart rendered [$kinds]"; exit 1; }
           grep -q '^  egress: \[\]' <<<"$on" || { echo "::error::the NetworkPolicy does not deny egress"; exit 1; }
+          # The declared memory budget (values.yaml, the sum above `resources`) reaches the container: every
+          # term that grows after the preload is bounded by one of these (MeshWeaver#7678 — the unbounded
+          # llama-server prompt cache OOMKilled the first install).
+          for kv in OLLAMA_CONTEXT_LENGTH=8192 OLLAMA_NUM_PARALLEL=1 OLLAMA_MAX_LOADED_MODELS=2 \
+                    OLLAMA_KEEP_ALIVE=-1 LLAMA_ARG_CACHE_RAM=512 LLAMA_ARG_CTX_CHECKPOINTS=4; do
+            grep -A1 -- "- name: ${kv%%=*}\$" <<<"$on" | grep -q "value: \"${kv#*=}\"" \
+              || { echo "::error::the Deployment does not carry ${kv} — the declared memory budget is not rendered"; exit 1; }
+          done
+          # Negative control: an override must change what renders, or the loop above checks nothing.
+          if helm template ollama deploy/ollama/helm --set enabled=true --set image.repository=$ACR/$REPO \
+               --set image.tag=$LINE-0000000 --set ollama.promptCacheMiB=8192 \
+               | grep -A1 -- '- name: LLAMA_ARG_CACHE_RAM$' | grep -q 'value: "512"'; then
+            echo "::error::promptCacheMiB=8192 still rendered 512 — the budget check cannot fail"; exit 1
+          fi
           # The helm-test pod must NOT carry the Service's selector labels (the Service would route to it).
           pod_name=$(awk '/^kind: Pod/{p=1} p&&/app.kubernetes.io\/name:/{print; exit}' <<<"$on")
           grep -q 'ollama-smoke' <<<"$pod_name" \
@@ -164,7 +178,7 @@ jobs:
               echo "::error::enabled with the moving tag '$moving' rendered — the immutable-tag refusal is gone"; exit 1
             fi
           done
-          echo "chart: nothing by default; enabled → $kinds; egress denied; no tag or a moving tag → refused"
+          echo "chart: nothing by default; enabled → $kinds; egress denied; memory budget rendered; no tag or a moving tag → refused"
 
   # 🧊 THE ~24 GB OF WEIGHTS ARE UPLOADED IN THEIR OWN JOB — AND ONLY WHEN THEY CHANGED.
   # Deploy#32's first main run (40493629457) was cut at 45 min INSIDE the push: build 4.5 min, layer

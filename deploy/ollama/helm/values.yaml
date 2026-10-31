@@ -36,22 +36,62 @@ models:
   embedding: bge-m3
   embeddingDimensions: 1024
 
-# Ollama's own knobs (Dockerfile ENV defaults; set here per instance).
+# Ollama's own knobs, and the llama-server knobs behind them. Together they are the DECLARED MEMORY BUDGET:
+# every term that can grow is bounded here, so the worst case is a sum you can read (the table above
+# `resources`). Each is rendered as an env var on the container; Ollama starts one llama-server process per
+# loaded model and hands it its whole environment, so the LLAMA_ARG_* values reach both.
 ollama:
   # Default context per request. qwen3.6's own maximum is 262,144 tokens, whose KV cache alone exceeds a
-  # CPU node; 8192 holds a page image (~1–2k tokens) plus a long answer. A request may still ask for more.
+  # CPU node; 8192 holds a page image (~1–2k tokens) plus a long answer. A caller of Ollama's NATIVE API may
+  # still send its own num_ctx (the /v1 endpoints cannot); no platform caller does.
   contextLength: 8192
   # Generations per model at a time. On CPU a second parallel generation halves each one's speed and
-  # doubles the KV cache, so 1 keeps latency predictable; the rest queue (maxQueue) inside their deadlines.
+  # multiplies the KV cache, the recurrent state and the checkpoints by the same factor, so 1 keeps latency
+  # predictable and the budget small; the rest queue (maxQueue) inside their deadlines.
   numParallel: 1
   maxQueue: 64
+  # Models resident at once. The image bakes exactly two (vision + embedding) on a read-only root, so 2 is
+  # all of them: no third can be pulled, and neither evicts the other.
+  maxLoadedModels: 2
+  # Keep both resident forever: a 23 GB reload per request is the cost to avoid, and it also means the
+  # resident set never changes after the preload.
+  keepAlive: "-1"
+  # 🚨 llama-server's host-memory PROMPT CACHE (--cache-ram, env LLAMA_ARG_CACHE_RAM), per llama-server
+  # process. Its upstream default is 8192 MiB and Ollama does not pass the flag, so before this value the
+  # vision model's runner grew by up to 8 GiB of saved prompt states AFTER the preload — the term that took
+  # the pod from ~26 GiB to its 32 GiB limit and an OOMKill. 512 keeps a few recent prompts reusable.
+  promptCacheMiB: 512
+  # llama-server's context checkpoints per slot (--ctx-checkpoints, env LLAMA_ARG_CTX_CHECKPOINTS). qwen3.6
+  # is a hybrid model: each checkpoint stores the recurrent state of its 30 linear-attention layers
+  # (~63 MiB), and the upstream default of 32 is ~2 GiB per slot. 4 still lets a diverging prompt resume
+  # from a recent point instead of from the start.
+  contextCheckpoints: 4
 
 service:
   type: ClusterIP
   port: 11434
 
-# 🚨 SIZED FOR THE BAKED MODELS ON A CPU NODE. qwen3.6 Q4_K_M is 21.7 GB of weights + a 0.9 GB vision
-# projector, bge-m3 1.2 GB, plus the KV cache at contextLength and the compute buffers: ~26 GiB resident.
+# 🚨 SIZED FOR THE BAKED MODELS ON A CPU NODE, BY A DECLARED BUDGET. The worst case with the `ollama:` values
+# above, every term at its bound (GiB = 2^30 bytes; numParallel = 1):
+#
+#   qwen3.6 weights, Q4_K_M, 21.7 GB (repacked for the CPU into anonymous memory)     20.21
+#   qwen3.6 vision projector, 0.9 GB                                                  0.84
+#   bge-m3 weights, 1.2 GB                                                            1.12
+#   qwen3.6 KV cache: 11 full-attention layers (10 + the MTP draft layer) × K+V
+#     × 2 KV heads × 256 dims × 2 B = 22 KiB/token × contextLength 8192              0.17
+#   qwen3.6 recurrent state: 30 linear-attention layers × ~2.1 MiB                    0.06
+#   qwen3.6 context checkpoints: contextCheckpoints 4 × ~63 MiB                       0.25
+#   prompt cache: promptCacheMiB 512 × 2 llama-server processes                       1.00
+#   bge-m3 KV cache, upper bound: 24 layers × K+V × 1024 × 2 B × 8192                 0.75
+#   compute buffers (LLM graph, vision encoder, embedding), reserved at load —
+#     an ALLOWANCE, not yet read off a load log                                       3.00
+#   Ollama server + 2 llama-server processes                                          0.50
+#                                                                            total   27.90
+#
+# against the 32 GiB limit: 4.1 GiB (13 %) of headroom. With the upstream defaults (promptCacheMiB 8192,
+# contextCheckpoints 32) the same sum is 36.6 GiB with the prompt cache of the vision runner alone full,
+# and 44.6 GiB with both — over the limit, which is what OOMKilled the first install (MeshWeaver#7678).
+# Raising contextLength or numParallel moves the KV, state and checkpoint rows; redo the sum first.
 # The memory request is what the scheduler must find on ONE node — read the pool's free allocatable
 # before raising it (the doc's "Capacity" section has the 2026-10-25 reading).
 # CPU: generation is memory-bandwidth-bound and Ollama runs one thread per core it sees; the limit caps
