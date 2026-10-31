@@ -143,6 +143,10 @@ jobs:
       - run: pip install pyyaml
       - name: Render every values combination and assert it is self-consistent
         run: deploy/aks/scripts/check-chart-invariants.sh
+      # The boot page's response contract, run in the image the chart names: every path answers 503
+      # with Retry-After: 5, no-store and the spinner page, including an upload over nginx's 1m default.
+      - name: Serve the rendered boot page and assert its 503 contract
+        run: deploy/aks/scripts/check-boot-page-serves.sh
 
       # The other direction: the step above asks whether the RENDER is coherent, this one asks
       # whether every key the VALUES set survives into it at all. A key the chart does not

@@ -21,6 +21,9 @@ data:
     server {
       listen 8080 default_server;
       server_tokens off;
+      # The portal Ingress admits bodies up to its own proxy-body-size; this backend must not answer
+      # 413 for one of them, or an upload during a restart gets a final error instead of a retryable 503.
+      client_max_body_size 0;
       location = /boot.html { internal; root /usr/share/nginx/html; add_header Cache-Control "no-store" always; add_header Retry-After "5" always; }
       location / { error_page 503 /boot.html; return 503; }
     }
