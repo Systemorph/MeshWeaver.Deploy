@@ -183,7 +183,7 @@ jobs:
           if [ -e /opt/memex ] || [ -e /etc/paths.d/memex ] || [ -e /Library/LaunchDaemons/com.memex.local.daemon.plist ]; then echo "::error::uninstall left files behind"; exit 1; fi
 
       - name: Upload the unsigned packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: memex-local-${{ steps.ver.outputs.version }}-unsigned
           path: |
@@ -325,7 +325,7 @@ jobs:
           echo "temporary signing material removed"
 
       - name: Upload the packages (whatever their label)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: memex-local-${{ steps.ver.outputs.version }}-main
           path: |
