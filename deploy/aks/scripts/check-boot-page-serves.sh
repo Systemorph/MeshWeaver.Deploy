@@ -67,6 +67,9 @@ check() { # label, extra curl args…, url — prints headers then body; stdin m
 check "GET /" http://127.0.0.1:8080/ < /dev/null
 check "GET /some/deep/path?x=1" 'http://127.0.0.1:8080/some/deep/path?x=1' < /dev/null
 # Over nginx's 1m default client_max_body_size: must still be the retryable 503, never a 413.
-head -c 2000000 /dev/zero | check "POST 2 MB body" -X POST --data-binary @- http://127.0.0.1:8080/api/upload
+# The body comes from a file on stdin, never a pipe: a piped `check` runs in a subshell and its
+# `fail` would never reach the exit status.
+head -c 2000000 /dev/zero > "$WORK/big.bin"
+check "POST 2 MB body" -X POST --data-binary @- http://127.0.0.1:8080/api/upload < "$WORK/big.bin"
 [ "$fail" -ne 0 ] && docker logs "$NAME" 2>&1 | tail -20
 exit "$fail"
