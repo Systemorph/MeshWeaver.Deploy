@@ -116,7 +116,7 @@ jobs:
           /bin/bash deploy/macos/test/run-tests.sh
 
       - name: Vendored toolchain cache (keyed by the manifest)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/vendor-cache
           key: memex-vendor-${{ hashFiles('deploy/homebrew/share/tools.manifest') }}
@@ -247,7 +247,7 @@ jobs:
         run: echo "version=0.3.$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Vendored toolchain cache (keyed by the manifest)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/vendor-cache
           key: memex-vendor-${{ hashFiles('deploy/homebrew/share/tools.manifest') }}
