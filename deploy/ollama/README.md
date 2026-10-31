@@ -52,7 +52,7 @@ but the immutable `<ollama>-<models>-<short sha>` that CI publishes
 | `models.vision`, `models.embedding`, `models.embeddingDimensions` | the names the image was built with (`qwen3.6`, `bge-m3`, 1024), preloaded and smoke-tested |
 | `ollama.contextLength` | default context per request (8192). qwen3.6's 262,144 maximum does not fit a CPU node |
 | `ollama.numParallel`, `ollama.maxQueue` | generations per model at a time (1) and the queue behind them (64) |
-| `ollama.maxLoadedModels`, `ollama.keepAlive` | both baked models resident (2), forever (`-1`) |
+| `ollama.maxLoadedModels` | both baked models resident (2). They stay loaded forever because the image's preload sends `keep_alive: -1`; the chart offers no keep-alive value, since Ollama would ignore it for preloaded models |
 | `ollama.promptCacheMiB`, `ollama.contextCheckpoints` | llama-server's host prompt cache per runner (512 MiB; upstream default 8192) and checkpoints per slot (4; upstream 32) — the two terms that grow after the preload |
 | `resources` | requests 4 vCPU / 28 GiB, limits 12 vCPU / 32 GiB. The ESTIMATED worst case under the values above is 27.9 GiB (term by term in `values.yaml` above `resources`). It includes an unmeasured 3 GiB compute allowance and does not bound a very large image's vision transient, so peak use still needs validating on the target node |
 

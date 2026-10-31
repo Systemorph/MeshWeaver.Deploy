@@ -55,9 +55,11 @@ ollama:
   # Models resident at once. The image bakes exactly two (vision + embedding) on a read-only root, so 2 is
   # all of them: no third can be pulled, and neither evicts the other.
   maxLoadedModels: 2
-  # Keep both resident forever: a 23 GB reload per request is the cost to avoid, and it also means the
-  # resident set never changes after the preload.
-  keepAlive: "-1"
+  # NO keepAlive here, deliberately. Both models stay resident forever, and the IMAGE decides that, not the
+  # chart: entrypoint.sh loads each one with `"keep_alive": -1`, and Ollama (0.33.2 server/sched.go) applies
+  # OLLAMA_KEEP_ALIVE only when a model LOADS and changes a loaded runner's duration only for a request that
+  # sends keep_alive itself (the portal's /v1 calls do not). A chart value would be inert. The budget below
+  # assumes both models resident, which is what the image does.
   # 🚨 llama-server's host-memory PROMPT CACHE (--cache-ram, env LLAMA_ARG_CACHE_RAM), per llama-server
   # process. Its upstream default is 8192 MiB and Ollama does not pass the flag, so before this value the
   # vision model's runner grew by up to 8 GiB of saved prompt states AFTER the preload — the term that took
