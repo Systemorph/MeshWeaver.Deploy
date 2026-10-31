@@ -37,8 +37,10 @@ models:
   embeddingDimensions: 1024
 
 # Ollama's own knobs, and the llama-server knobs behind them. Together they are the DECLARED MEMORY BUDGET:
-# every term that can grow is bounded here, so the worst case is a sum you can read (the table above
-# `resources`). Each is rendered as an env var on the container; Ollama starts one llama-server process per
+# every term that grows AFTER the preload (prompt cache, checkpoints, models resident) is bounded here, and
+# the table above `resources` sums the result. That sum is an ESTIMATE, not a proven bound: the compute
+# buffers are an unmeasured allowance, and a very large image's vision-encoder transient is not bounded by
+# any value here (see the table). Each is rendered as an env var on the container; Ollama starts one llama-server process per
 # loaded model and hands it its whole environment, so the LLAMA_ARG_* values reach both.
 ollama:
   # Default context per request. qwen3.6's own maximum is 262,144 tokens, whose KV cache alone exceeds a
@@ -71,8 +73,9 @@ service:
   type: ClusterIP
   port: 11434
 
-# 🚨 SIZED FOR THE BAKED MODELS ON A CPU NODE, BY A DECLARED BUDGET. The worst case with the `ollama:` values
-# above, every term at its bound (GiB = 2^30 bytes; numParallel = 1):
+# 🚨 SIZED FOR THE BAKED MODELS ON A CPU NODE, BY A DECLARED BUDGET. The ESTIMATED worst case with the
+# `ollama:` values above (GiB = 2^30 bytes; numParallel = 1). Every row is bounded by a value here EXCEPT
+# the compute-buffer row, which is an allowance:
 #
 #   qwen3.6 weights, Q4_K_M, 21.7 GB (repacked for the CPU into anonymous memory)     20.21
 #   qwen3.6 vision projector, 0.9 GB                                                  0.84
@@ -86,9 +89,14 @@ service:
 #   compute buffers (LLM graph, vision encoder, embedding), reserved at load —
 #     an ALLOWANCE, not yet read off a load log                                       3.00
 #   Ollama server + 2 llama-server processes                                          0.50
-#                                                                            total   27.90
+#                                                                  estimated total   27.90
 #
-# against the 32 GiB limit: 4.1 GiB (13 %) of headroom. With the upstream defaults (promptCacheMiB 8192,
+# against the 32 GiB limit: an ESTIMATED 4.1 GiB (13 %) of headroom — not a guarantee. NOT bounded by this
+# chart: (a) the compute buffers, until a load log on the target node replaces the allowance with a
+# reading; (b) the vision encoder's transient for a very large image (flash attention resolves to off on a
+# GPU-less node, and the image-token cap comes from the model); (c) a native-API caller sending its own
+# num_ctx. Peak use must be validated on the target node (a 24 h Sample after the apply) before the limit
+# is called sufficient. With the upstream defaults (promptCacheMiB 8192,
 # contextCheckpoints 32) the same sum is 36.6 GiB with the prompt cache of the vision runner alone full,
 # and 44.6 GiB with both — over the limit, which is what OOMKilled the first install (MeshWeaver#7678).
 # Raising contextLength or numParallel moves the KV, state and checkpoint rows; redo the sum first.

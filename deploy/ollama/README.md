@@ -54,6 +54,6 @@ but the immutable `<ollama>-<models>-<short sha>` that CI publishes
 | `ollama.numParallel`, `ollama.maxQueue` | generations per model at a time (1) and the queue behind them (64) |
 | `ollama.maxLoadedModels`, `ollama.keepAlive` | both baked models resident (2), forever (`-1`) |
 | `ollama.promptCacheMiB`, `ollama.contextCheckpoints` | llama-server's host prompt cache per runner (512 MiB; upstream default 8192) and checkpoints per slot (4; upstream 32) — the two terms that grow after the preload |
-| `resources` | requests 4 vCPU / 28 GiB, limits 12 vCPU / 32 GiB. The worst case under the values above is 27.9 GiB; the sum, term by term, is in `values.yaml` above `resources` |
+| `resources` | requests 4 vCPU / 28 GiB, limits 12 vCPU / 32 GiB. The ESTIMATED worst case under the values above is 27.9 GiB (term by term in `values.yaml` above `resources`). It includes an unmeasured 3 GiB compute allowance and does not bound a very large image's vision transient, so peak use still needs validating on the target node |
 
 With release name `ollama`, the portal's base URL is `http://ollama:11434/v1`.
