@@ -39,6 +39,38 @@ colima status >/dev/null 2>&1 || colima start
 KUBE_CONTEXT="${MEMEX_KUBE_CONTEXT:-colima}"
 until kubectl --context "$KUBE_CONTEXT" get ns ingress-nginx >/dev/null 2>&1; do sleep 2; done
 
+# 2b. A first start that nobody finished: open the setup wizard, token already in the URL. The
+#     maintainer, 2026-10-30: "can we do the memex local setup at startup?" — an instance that boots
+#     into the wizard and waits for someone to type `memex-local setup` looks broken. Runs in the
+#     background (the forward below must start first, or there is nothing to open), only in a GUI
+#     session, and once per TOKEN: the token is minted per portal process, so a KeepAlive restart of
+#     this agent does not reopen the same page, while a portal restart (a new token) does.
+open_setup_if_waiting() {
+  [ "${MEMEX_HEADLESS:-}" = "1" ] && return 0
+  command -v open >/dev/null 2>&1 || return 0
+  local base="https://${MEMEX_HOSTNAME:-memex.localhost}:${HOST_PORT}" location token marker
+  for _ in $(seq 1 90); do
+    location="$(curl -k -sS -o /dev/null -w '%{redirect_url}' --max-time 5 "$base/" 2>/dev/null || true)"
+    [ -n "$location" ] && break
+    [ "$(curl -k -sS -o /dev/null -w '%{http_code}' --max-time 5 "$base/" 2>/dev/null)" = "200" ] && return 0
+    sleep 2
+  done
+  case "$location" in */setup) ;; *) return 0 ;; esac
+  token="$(kubectl --context "$KUBE_CONTEXT" logs deploy/memex-portal-deployment -n "${MEMEX_NAMESPACE:-memex}" --tail=-1 2>/dev/null \
+           | awk '/^ *Token: /{ t=$2 } END { print t }')"
+  [ -n "$token" ] || return 0
+  # Named by a DIGEST of the token (never the token: a directory entry is listable), shared with the
+  # CLI's `up`/`update` hand-off so the two never open the same wizard twice, and written only after
+  # the browser actually opened, so a failed launch is retried on the next start.
+  marker="${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/setup-opened.$(printf '%s' "$token" | shasum -a 256 | cut -c1-64)"
+  [ -f "$marker" ] && return 0
+  echo "$(date -u +%FT%TZ) first-run setup is waiting — opening the wizard"
+  if open "$base/setup?token=${token}"; then
+    mkdir -p "$(dirname "$marker")" && : > "$marker"
+  fi
+}
+open_setup_if_waiting &
+
 # 3. Forward the portless URLs AND the legacy port: one process carries all three
 #    mappings, so http://memex.localhost and https://memex.localhost work directly
 #    (macOS allows unprivileged binds below 1024 since Mojave — still NO sudo) and
