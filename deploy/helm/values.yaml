@@ -989,9 +989,19 @@ registry:
     accountName: ""               # (required) the Azure Storage account; the workload identity
                                   #            needs Storage Blob Data Contributor on it
     container: "registry"
-  # The namespace's workload-identity service account (the portal's, by default): the pods carry
-  # `azure.workload.identity/use: "true"` and the storage driver authenticates as it.
-  serviceAccount: "memex-portal-sa"
+  # The ServiceAccount both registry pods run as: the pods carry `azure.workload.identity/use: "true"`
+  # and the storage driver authenticates as the identity this account is federated to. Blank → the
+  # portal's own `memex-portal-sa` (an account the portal chart owns), or `memex-registry-sa` when
+  # workloadIdentity.clientId below is set.
+  serviceAccount: ""
+  # The registry's OWN workload identity: blob write on storage.container and nothing else. Set its
+  # client id and the chart creates a DEDICATED ServiceAccount (serviceAccount above, never the
+  # portal's) annotated with it and with no Kubernetes token mounted, so the registry no longer writes
+  # its blobs as the namespace's portal identity. The identity needs a federated credential for
+  # system:serviceaccount:<namespace>:<that account>. Empty → no account is created and the registry
+  # runs as the portal's, exactly as before.
+  workloadIdentity:
+    clientId: ""
   keyVault:
     name: ""                      # (required) the vault
     tenantId: ""                  # falls back to keyVaultSecrets.tenantId

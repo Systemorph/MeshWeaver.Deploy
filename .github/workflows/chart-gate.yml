@@ -221,6 +221,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: deploy/aks/scripts/test-node-headroom.sh
 
+      # The hosted registry's OWN workload identity (templates/registry/serviceaccount.yaml, Memex#922):
+      # without a client id nothing new renders and both registry pods run as the portal's account (the
+      # negative control); with one, ONE annotated, tokenless ServiceAccount renders and both pods run as
+      # it; a non-GUID id and the portal's own account beside an id are refused. No cluster, no network.
+      - name: Assert the registry runs as its own identity only when the record names one
+        if: ${{ !cancelled() }}
+        run: deploy/aks/scripts/test-registry-identity.sh
+
       # The whisper and s1-extract service charts' top-level `enabled` switch (#38): ON by default with
       # a render byte-identical to an undeclared one (estates already run both), and `enabled: false`
       # renders nothing — not even s1-extract's cluster-wide auth-delegator binding — while the enabled
