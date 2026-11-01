@@ -3292,6 +3292,134 @@ ma_refuses "a binding to a person or group is refused" "subject Group devs is no
 rm -rf "$_ma_root"
 unset _ma_out _ma_rc _ma_log _ma_sent _ma_root _ma_good
 
+echo
+echo "── hosting-manifest-delete: the inverse of the apply — a plan of named objects, bound to its digest ──"
+# The DeleteClusterManifest action's one command (Systemorph/Memex#314). What is tested: the plan (a
+# manifest's objects ∪ an explicit list) and its digest, the HARD DENY LIST of the kept secret-writer path,
+# the refusals, that `check` never deletes, the delete order, and that the delete READS EVERY OBJECT BACK
+# and fails on one that stayed. The cluster is the stub's state file: a delete removes the line.
+MD_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/manifest-delete" && pwd)"
+_md_root="$(mktemp -d)"; mkdir -p "$_md_root/demo"
+md_fixture() {  # md_fixture <name> <parsed json>
+  printf 'kind: List # fixture\n' > "$_md_root/demo/$1.yaml"; printf '%s\n' "$2" > "$_md_root/demo/$1.yaml.json"
+}
+md() {  # md <live objects ("<res> <ns|-> <name>" lines)> [env…] -- <args…>; sets $_md_out $_md_rc $_md_log $_md_live
+  local live="$1" envs=(); shift
+  while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  _md_state="$(mktemp -d)"; printf '%s' "$live" > "$_md_state/live"
+  _md_out="$(env "${envs[@]+"${envs[@]}"}" PATH="$MD_STUBS:$PATH" HOSTING_MD_STATE="$_md_state" HOSTING_MANIFESTS_ROOT="$_md_root" hosting-manifest-delete "$@" 2>&1)"; _md_rc=$?
+  _md_log="$(cat "$_md_state/kubectl.log" 2>/dev/null || true)"; _md_live="$(cat "$_md_state/live")"; rm -rf "$_md_state"
+}
+md_sha_of() { if command -v sha256sum >/dev/null 2>&1; then printf '%s' "$1" | sha256sum | cut -d' ' -f1; else printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; fi; }
+# Shaped like the retired job-runner path: a token and its account in a portal namespace, the RBAC in an
+# ops namespace, an admission policy, and the ops namespace itself. Plus an explicit SA in that portal.
+md_fixture jobpath \
+  '{"kind":"ServiceAccount","metadata":{"name":"runner","namespace":"portal"}}
+{"kind":"Secret","type":"kubernetes.io/service-account-token","metadata":{"name":"runner-token","namespace":"portal"}}
+{"kind":"Role","metadata":{"name":"runner","namespace":"ops"}}
+{"kind":"RoleBinding","metadata":{"name":"runner","namespace":"ops"}}
+{"kind":"ValidatingAdmissionPolicy","metadata":{"name":"runner-fence"}}
+{"kind":"ValidatingAdmissionPolicyBinding","metadata":{"name":"runner-fence"}}
+{"kind":"Namespace","metadata":{"name":"ops"}}'
+_md_live_all='serviceaccounts portal runner
+secrets portal runner-token
+roles.rbac.authorization.k8s.io ops runner
+rolebindings.rbac.authorization.k8s.io ops runner
+validatingadmissionpolicies.admissionregistration.k8s.io - runner-fence
+namespaces - ops
+serviceaccounts ops runner
+serviceaccounts portal stray
+serviceaccounts portal keep-me'
+# The digest is the sha256 of the canonical plan, computed HERE independently of the script.
+_md_canon="$(printf '%s\n' \
+  'Namespace||ops' 'Role|ops|runner' 'RoleBinding|ops|runner' 'Secret|portal|runner-token' \
+  'ServiceAccount|portal|runner' 'ServiceAccount|portal|stray' \
+  'ValidatingAdmissionPolicy||runner-fence' 'ValidatingAdmissionPolicyBinding||runner-fence' | LC_ALL=C sort -u)"$'\n'
+_md_digest="$(md_sha_of "$_md_canon")"
+
+md "$_md_live_all" -- check --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"::hosting:: deletion_objects=8"*"::hosting:: deletion_digest=sha256:${_md_digest}"*"::hosting:: deletion_present=7"*"::hosting:: deletion_check=sha256:${_md_digest}"*) true ;; *) false ;; esac \
+  && ok "check: the plan is the manifest's objects plus the explicit one, and its digest is the canonical plan's" || bad "delete check" "rc ${_md_rc}: ${_md_out}"
+case "$_md_out" in *"absent    ValidatingAdmissionPolicyBinding runner-fence"*"present   Namespace ops"*) ok "…naming each object present or absent" ;; *) bad "present/absent lines" "${_md_out}" ;; esac
+case "$_md_out" in *"contains  ops: serviceaccounts/runner — deleted with the namespace"*) ok "…and what a namespace delete takes with it" ;; *) bad "namespace contents" "${_md_out}" ;; esac
+if printf '%s\n' "$_md_log" | grep -v -- '--dry-run' | grep -q ' delete '; then bad "check never deletes" "kubectl saw: ${_md_log}"
+elif [ "$_md_live" != "$_md_live_all" ]; then bad "check never deletes" "the cluster changed: ${_md_live}"
+else ok "check never deletes — the only deletes it sends are server dry runs"; fi
+md "$_md_live_all" -- check --object ServiceAccount/portal/stray --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray
+case "$_md_out" in *"deletion_digest=sha256:${_md_digest}"*) ok "the digest does not depend on argument order or a repeated object" ;; *) bad "digest order" "${_md_out}" ;; esac
+
+md "$_md_live_all" -- delete --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray --sha256 "sha256:${_md_digest}"
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"::hosting:: deletion_absent=8"*"::hosting:: manifest_deleted=sha256:${_md_digest}"*) true ;; *) false ;; esac \
+  && ok "delete with the approved digest deletes and reads every object back absent" || bad "delete" "rc ${_md_rc}: ${_md_out}"
+if [ "$_md_live" = 'serviceaccounts portal keep-me' ]; then ok "…leaving exactly what the plan does not name"
+else bad "what the delete left" "live: ${_md_live}"; fi
+_md_order="$(printf '%s\n' "$_md_log" | grep -- '--wait=true' | sed 's/^kubectl //; s/^-n [^ ]* //' | cut -d' ' -f2 | tr '\n' ' ')"
+case "$_md_order" in "rolebindings.rbac.authorization.k8s.io roles.rbac.authorization.k8s.io secrets serviceaccounts serviceaccounts validatingadmissionpolicies.admissionregistration.k8s.io namespaces ")
+  ok "…in dependency order: bindings, roles, tokens, accounts, policies, the namespace LAST — and nothing absent is deleted" ;;
+  *) bad "delete order" "deleted: ${_md_order}" ;; esac
+
+md "$_md_live_all" -- delete --manifest demo/jobpath.yaml
+[ "$_md_rc" -ne 0 ] && [ -z "$_md_log" ] && case "$_md_out" in *"delete needs --sha256"*) true ;; *) false ;; esac \
+  && ok "delete without a digest is refused before kubectl is asked anything" || bad "delete without digest" "rc ${_md_rc}; kubectl: ${_md_log}; ${_md_out}"
+md "$_md_live_all" -- delete --manifest demo/jobpath.yaml --sha256 "sha256:${_md_digest}"
+if [ "$_md_rc" -ne 0 ] && case "$_md_out" in *"not the objects that were approved"*) true ;; *) false ;; esac \
+   && ! printf '%s\n' "$_md_log" | grep -q ' delete ' && [ "$_md_live" = "$_md_live_all" ]; then
+  ok "a plan that is not the approved one (an object fewer) is refused, nothing deleted"
+else bad "digest mismatch" "rc ${_md_rc}; kubectl: ${_md_log}; ${_md_out}"; fi
+
+md "$_md_live_all" MW_MD_STUCK=runner-token -- delete --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray --sha256 "$_md_digest"
+[ "$_md_rc" -ne 0 ] && case "$_md_out" in *"deletion_absent"*) false ;; *"REMAINS   Secret portal/runner-token"*"still on the cluster after the delete"*) true ;; *) false ;; esac \
+  && ok "an object still there after its delete is RED, named, and no absence is reported" || bad "stuck object" "rc ${_md_rc}: ${_md_out}"
+md "$_md_live_all" MW_MD_REFUSE_READ=secrets -- delete --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray --sha256 "$_md_digest"
+[ "$_md_rc" -ne 0 ] && [ "$_md_live" = "$_md_live_all" ] && case "$_md_out" in *"REFUSED, not absent"*"UNKNOWN"*) true ;; *) false ;; esac \
+  && ok "a refused read is UNKNOWN, never 'absent' — and nothing is deleted" || bad "refused read" "rc ${_md_rc}; live: ${_md_live}; ${_md_out}"
+md "$_md_live_all" MW_MD_DENY_DELETE=ops -- delete --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray --sha256 "$_md_digest"
+[ "$_md_rc" -ne 0 ] && [ "$_md_live" = "$_md_live_all" ] && case "$_md_out" in *"would not admit deleting Namespace ops"*) true ;; *) false ;; esac \
+  && ok "a delete the server would not admit stops the run before anything is deleted" || bad "server refusal" "rc ${_md_rc}; live: ${_md_live}; ${_md_out}"
+md "" -- delete --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray --sha256 "$_md_digest"
+[ "$_md_rc" -eq 0 ] && ! printf '%s\n' "$_md_log" | grep -q -- '--wait=true' && case "$_md_out" in *"deletion_present=0"*"deletion_absent=8"*) true ;; *) false ;; esac \
+  && ok "a plan already gone deletes nothing and still verifies every object absent (a re-run is safe)" || bad "already gone" "rc ${_md_rc}; ${_md_out}"
+
+# 🚨 THE KEPT WRITER PATH (Memex#314): every object of secret-writer.yaml is refused, whatever names it,
+# before kubectl is asked anything.
+for _md_kept in Namespace/memex-secrets ServiceAccount/memex-secrets/hosting-secret-writer Role/memex-secrets/hosting-secret-jobrunner \
+    RoleBinding/memex-secrets/hosting-secret-jobrunner ClusterRole/hosting-secret-writer ClusterRoleBinding/hosting-secret-writer \
+    ValidatingAdmissionPolicy/hosting-secret-writer-restart-only ValidatingAdmissionPolicyBinding/hosting-secret-writer-restart-only \
+    ServiceAccount/control/hosting-secret-jobrunner Secret/control/hosting-jobrunner-token Secret/memex-secrets/anything; do
+  md "" -- check --object "$_md_kept"
+  if [ "$_md_rc" -ne 0 ] && [ -z "$_md_log" ] && case "$_md_out" in *"::hosting::"*) false ;; *"KEPT"*|*"a Namespace is deleted only when a committed manifest names it"*) true ;; *) false ;; esac; then
+    ok "the kept writer path is refused: ${_md_kept}"
+  else bad "kept object ${_md_kept}" "rc ${_md_rc}; kubectl: ${_md_log}; ${_md_out}"; fi
+done
+md_fixture writer \
+  '{"kind":"Namespace","metadata":{"name":"memex-secrets"}}
+{"kind":"ServiceAccount","metadata":{"name":"hosting-secret-jobrunner","namespace":"control"}}'
+md "" -- check --manifest demo/writer.yaml
+[ "$_md_rc" -ne 0 ] && case "$_md_out" in *"refused   Namespace memex-secrets: KEPT"*"refused   ServiceAccount control/hosting-secret-jobrunner: KEPT"*) true ;; *) false ;; esac \
+  && ! printf '%s\n' "$_md_log" | grep -q ' get ' \
+  && ok "…and so is a manifest naming them (the namespace included), before the cluster is read" || bad "kept via manifest" "rc ${_md_rc}; ${_md_out}"
+# Negative control: the deny list is exact — the retired job-runner in the old portal namespace, and a
+# differently named token in control's namespace, are deletable.
+md $'serviceaccounts memex hosting-jobrunner\nsecrets control hosting-jobrunner-token-old' -- check --object ServiceAccount/memex/hosting-jobrunner --object Secret/control/hosting-jobrunner-token-old
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"deletion_present=2"*) true ;; *) false ;; esac \
+  && ok "negative control: objects outside the kept set (memex/hosting-jobrunner, a differently named control token) are admitted" || bad "deny list too wide" "rc ${_md_rc}; ${_md_out}"
+
+refuses_hard "a typed Namespace is refused (only a committed manifest may name one)" "a Namespace is deleted only when a committed manifest names it" hosting-manifest-delete check --object Namespace/memex
+refuses_hard "a cluster-scoped kind with a namespace is refused" "is cluster-scoped" hosting-manifest-delete check --object ClusterRole/ns/x
+refuses_hard "a namespaced kind without one is refused" "is namespaced" hosting-manifest-delete check --object ServiceAccount/x
+refuses_hard "a kind outside the lane's set is refused (a Deployment)" "kind Deployment is not one this lane deletes" hosting-manifest-delete check --object Deployment/memex/memex-portal-deployment
+refuses_hard "an object name that is not a DNS name is refused" "is not a DNS name" hosting-manifest-delete check --object 'ServiceAccount/memex/x;id'
+refuses_hard "a system: object is refused" "is not a DNS name" hosting-manifest-delete check --object ClusterRoleBinding/system:node
+refuses_hard "a path out of deploy/aks/manifests is refused" "is not a path under deploy/aks/manifests" hosting-manifest-delete check --manifest ../etc/x.yaml
+refuses_hard "the mode is check or delete" "check or delete" hosting-manifest-delete apply --manifest demo/jobpath.yaml
+refuses_hard "a plan names something" "name what to delete" hosting-manifest-delete check
+md_fixture unscoped '{"kind":"Role","metadata":{"name":"r"}}'
+md "" -- check --manifest demo/unscoped.yaml
+[ "$_md_rc" -ne 0 ] && case "$_md_out" in *"a namespaced kind with no namespace"*) true ;; *) false ;; esac \
+  && ok "a manifest object of a namespaced kind with no namespace is refused, never resolved against a default" || bad "unscoped" "${_md_out}"
+rm -rf "$_md_root"
+unset _md_out _md_rc _md_log _md_live _md_root _md_digest _md_canon _md_live_all _md_order _md_kept _md_state
+
 echo "── hosting-kv-status / hosting-kv-state: status and lifecycle from METADATA, never a value ──"
 # The write-only secret GUI's read side (policy secrets-write-only-entry): existence, enabled,
 # dates, soft-delete and the write-time tags — from `list` alone. The stub is the WRITER identity:

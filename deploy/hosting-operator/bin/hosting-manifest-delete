@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# hosting-manifest-delete (check | delete) [--manifest <path under deploy/aks/manifests>]
+#                         [--object <Kind>/<namespace>/<name> | --object <Kind>/<name>]… [--sha256 <hex>]
+#
+# The inverse of hosting-manifest-apply, and the ONE way a cluster object the platform created — a
+# ServiceAccount, its token, the RBAC that binds it, an admission policy, the namespace that held them —
+# leaves the cluster: the `DeleteClusterManifest` InstanceAction on the control instance, which the
+# config repository's aks-ops lane runs (Systemorph/Memex aks-ops.yml). The dry run (`check`) is a read
+# and runs unattended; the delete runs only on the lane's MUTATE leg, with a mesh approval that binds the
+# PLAN's sha256 (below). Never from a laptop, never from an operator Job: like the apply, this script
+# refuses to run anywhere the manifests directory is not beside it.
+#
+# WHAT IT DELETES — the PLAN — is the union of
+#   * every object a committed manifest names (`--manifest`: the file is kept in the repository as the
+#     RECORD of what to delete, and is deleted from the repository only after the objects are gone), and
+#   * an explicit `--object` list, for an object no committed file names any more (a ServiceAccount a
+#     manifest once placed in another namespace). Namespaced kinds are `<Kind>/<namespace>/<name>`,
+#     cluster-scoped kinds `<Kind>/<name>`. A Namespace can NOT be named this way — only by a committed
+#     manifest — so a typed list can never take a portal's namespace down.
+# The plan digest is the sha256 of the plan's canonical text: one `<Kind>|<namespace>|<name>` line per
+# object, sorted, deduplicated, each ending in a newline (an empty namespace for a cluster-scoped kind).
+# It binds WHAT is deleted, not the file's bytes: a comment edited in the manifest changes nothing, an
+# object added to it changes the digest and voids the approval.
+#
+#   check  — prints the plan (`object` lines), the plan digest (`::hosting:: deletion_digest=sha256:<hex>`,
+#            the value the real request must carry), and for each object whether it is PRESENT or ABSENT
+#            on the cluster (a read this identity is refused is UNKNOWN and fails the check — never
+#            "absent"). For a present object it asks the API server whether the delete WOULD be admitted
+#            (`kubectl delete --dry-run=server`, persisted nowhere). For a Namespace it names what else
+#            still lives in it, because deleting a namespace deletes everything inside. Deletes nothing.
+#            With --sha256, refuses a plan whose digest differs.
+#   delete — REQUIRES --sha256 and refuses a mismatch, runs every check above on the same bytes, deletes
+#            in dependency order (bindings, roles, tokens, accounts, cluster bindings and roles,
+#            admission bindings and policies, namespaces LAST), then READS EACH OBJECT BACK and fails
+#            naming every one that is still there (`::hosting:: deletion_absent=<n>` only when all are).
+#
+# 🚨 THE KEPT WRITER PATH IS A HARD DENY LIST (Systemorph/Memex#314). The secret-writer path of
+# hosting-operator/secret-writer.yaml stays when the hosting-operator Job path goes, and nothing on this
+# lane may delete it — whatever a plan, a manifest or an approval says:
+#   * namespace memex-secrets, and every object in it;
+#   * ClusterRole / ClusterRoleBinding hosting-secret-writer;
+#   * ValidatingAdmissionPolicy / ValidatingAdmissionPolicyBinding hosting-secret-writer-restart-only;
+#   * ServiceAccount control/hosting-secret-jobrunner and Secret control/hosting-jobrunner-token (the
+#     token the control portal mounts);
+#   * the namespaces control, default and kube-*.
+# A plan naming any of them is refused before the API server is asked anything.
+#
+# The other refusals: a kind outside Namespace, ServiceAccount, Secret, Role, RoleBinding, ClusterRole,
+# ClusterRoleBinding, ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding (the kinds the apply
+# lane applies — nothing else was ever created this way); a name or namespace that is not a DNS name; a
+# namespaced kind with no namespace; any `system:` object.
+# shellcheck source=_common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
+# shellcheck disable=SC2034  # read by hosting::die in _common.sh, which shellcheck does not follow here
+HOSTING_CMD="hosting-manifest-delete"
+
+mode="${1:-}"
+[ $# -gt 0 ] && shift
+case "$mode" in
+  check|delete) ;;
+  *) hosting::die "the first argument is check or delete, not '${mode}'" ;;
+esac
+manifest="" sha="" objects=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --manifest) manifest="${2:-}"; shift 2 ;;
+    --object)   objects+=("${2:-}"); shift 2 ;;
+    --sha256)   sha="${2:-}";      shift 2 ;;
+    *) hosting::die "unknown argument '$1'" ;;
+  esac
+done
+[ -n "$manifest" ] || [ "${#objects[@]}" -gt 0 ] \
+  || hosting::die "name what to delete: --manifest <path under deploy/aks/manifests>, one or more --object <Kind>/<namespace>/<name>, or both"
+[ -z "$manifest" ] || [[ "$manifest" =~ ^[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)*\.yaml$ ]] \
+  || hosting::die "--manifest '${manifest}' is not a path under deploy/aks/manifests (lowercase segments, ending .yaml, no '..')"
+sha="${sha#sha256:}"
+[ -z "$sha" ] || [[ "$sha" =~ ^[0-9a-f]{64}$ ]] \
+  || hosting::die "--sha256 must be 64 lowercase hex characters (optionally prefixed sha256:)"
+[ "$mode" = check ] || [ -n "$sha" ] \
+  || hosting::die "delete needs --sha256: the approval binds the plan's digest, and a delete that names none would delete whatever the checkout's manifest names today"
+
+command -v jq >/dev/null 2>&1 || hosting::die "jq is not installed here"
+command -v kubectl >/dev/null 2>&1 || hosting::die "kubectl is not installed here"
+
+# kind → "<resource for kubectl> <scope> <order>". Order is the delete order: what refers to a thing goes
+# before the thing (a binding before its role and its subject), and a Namespace goes last.
+kind_info() {
+  case "$1" in
+    RoleBinding)                      echo "rolebindings.rbac.authorization.k8s.io namespaced 1" ;;
+    Role)                             echo "roles.rbac.authorization.k8s.io namespaced 2" ;;
+    Secret)                           echo "secrets namespaced 3" ;;
+    ServiceAccount)                   echo "serviceaccounts namespaced 4" ;;
+    ClusterRoleBinding)               echo "clusterrolebindings.rbac.authorization.k8s.io cluster 5" ;;
+    ClusterRole)                      echo "clusterroles.rbac.authorization.k8s.io cluster 6" ;;
+    ValidatingAdmissionPolicyBinding) echo "validatingadmissionpolicybindings.admissionregistration.k8s.io cluster 7" ;;
+    ValidatingAdmissionPolicy)        echo "validatingadmissionpolicies.admissionregistration.k8s.io cluster 8" ;;
+    Namespace)                        echo "namespaces cluster 9" ;;
+    *) echo "" ;;
+  esac
+}
+DNS_NAME='^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$'
+DNS_LABEL='^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$'
+
+# 🚨 The kept writer path (header). Answers the reason, or nothing.
+denied() { # kind namespace name
+  local k="$1" ns="$2" n="$3"
+  case "$ns" in
+    memex-secrets) echo "everything in namespace memex-secrets is the kept secret-writer path"; return ;;
+  esac
+  case "$k/$n" in
+    Namespace/memex-secrets) echo "the secret-writer path's namespace is kept"; return ;;
+    Namespace/control|Namespace/default|Namespace/kube-*) echo "namespace ${n} is never deleted by this lane"; return ;;
+    ClusterRole/hosting-secret-writer|ClusterRoleBinding/hosting-secret-writer)
+      echo "the secret writer's cluster grant is kept"; return ;;
+    ValidatingAdmissionPolicy/hosting-secret-writer-restart-only|ValidatingAdmissionPolicyBinding/hosting-secret-writer-restart-only)
+      echo "the secret writer's restart-only admission policy is kept"; return ;;
+  esac
+  case "$k/$ns/$n" in
+    ServiceAccount/control/hosting-secret-jobrunner) echo "the control portal's secret job-runner is kept"; return ;;
+    Secret/control/hosting-jobrunner-token)          echo "the token the control portal mounts for the secret writer is kept"; return ;;
+  esac
+  case "$n" in
+    system:*) echo "a system: object is never deleted by this lane"; return ;;
+  esac
+}
+
+work="$(mktemp -d)" || hosting::die "could not create a working directory"
+trap 'hosting::on_exit; rm -rf "$work"' EXIT
+: > "$work/plan.tsv"
+
+# ── the plan: the manifest's objects ─────────────────────────────────────────────────────────────────
+if [ -n "$manifest" ]; then
+  root="${HOSTING_MANIFESTS_ROOT:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../manifests}"
+  [ -d "$root" ] \
+    || hosting::die "no manifests directory at ${root}: this command runs from a MeshWeaver.Deploy checkout (the aks-ops lane checks out deploy/aks/manifests beside the scripts), never in the operator image"
+  root_real="$(readlink -f "$root")"
+  file="${root_real}/${manifest}"
+  [ -f "$file" ] || hosting::die "no manifest at deploy/aks/manifests/${manifest} in this checkout"
+  [ ! -L "$file" ] || hosting::die "deploy/aks/manifests/${manifest} is a symlink — refused; the plan reads committed files only"
+  file_real="$(readlink -f "$file")"
+  case "$file_real" in
+    "${root_real}"/*) ;;
+    *) hosting::die "deploy/aks/manifests/${manifest} resolves outside deploy/aks/manifests" ;;
+  esac
+  # The objects, as kubectl's own parser reads THE FILE — `create --dry-run=client`, persisted nowhere.
+  # Only kind, namespace and name are kept: a delete needs nothing else, so a placeholder in an
+  # annotation (the operator ServiceAccount's client id) does not stop a file being a deletion record.
+  kubectl create --dry-run=client -f "$file_real" -o json > "$work/parsed.json" 2>"$work/err" \
+    || hosting::die "kubectl could not parse deploy/aks/manifests/${manifest}: $(head -1 "$work/err")"
+  jq -rs '[.[] | if .kind == "List" then .items[] else . end][]
+          | "\(.kind // "")|\(.metadata.namespace // "")|\(.metadata.name // "")"' "$work/parsed.json" > "$work/from-manifest" 2>"$work/err" \
+    || hosting::die "could not read the parsed objects of deploy/aks/manifests/${manifest}: $(head -1 "$work/err")"
+  [ -s "$work/from-manifest" ] || hosting::die "deploy/aks/manifests/${manifest} holds no object"
+  while IFS='|' read -r k ns n; do
+    # A cluster-scoped kind carries no namespace, whatever the parser filled in; a namespaced one keeps
+    # the namespace the file gives it (none is refused below).
+    case "$(kind_info "$k")" in *" namespaced "*) ;; *) ns="" ;; esac
+    printf '%s|%s|%s|%s\n' "$k" "$ns" "$n" "manifest" >> "$work/plan.tsv"
+  done < "$work/from-manifest"
+  hosting::log "manifest  deploy/aks/manifests/${manifest} ($(wc -l < "$work/from-manifest" | tr -d ' ') object(s))"
+fi
+
+# ── the plan: the explicit objects ───────────────────────────────────────────────────────────────────
+for o in "${objects[@]+"${objects[@]}"}"; do
+  IFS=/ read -r k a b extra <<<"$o"
+  [ -z "${extra:-}" ] || hosting::die "--object '${o}' is not <Kind>/<namespace>/<name> or <Kind>/<name>"
+  if [ -n "${b:-}" ]; then ns="$a"; n="$b"; else ns=""; n="${a:-}"; fi
+  info="$(kind_info "$k")"
+  [ -n "$info" ] || hosting::die "--object '${o}': kind ${k} is not one this lane deletes"
+  [ "$k" != Namespace ] \
+    || hosting::die "--object '${o}': a Namespace is deleted only when a committed manifest names it (--manifest) — deleting a namespace deletes everything in it, and a typed name is one keystroke from a portal's"
+  case "$info" in
+    *" namespaced "*) [ -n "$ns" ] || hosting::die "--object '${o}': ${k} is namespaced — write <Kind>/<namespace>/<name>" ;;
+    *)                [ -z "$ns" ] || hosting::die "--object '${o}': ${k} is cluster-scoped — write <Kind>/<name>" ;;
+  esac
+  printf '%s|%s|%s|%s\n' "$k" "$ns" "$n" "object" >> "$work/plan.tsv"
+done
+
+# ── validate the plan, BEFORE the API server is asked anything ───────────────────────────────────────
+problems=""
+while IFS='|' read -r k ns n src; do
+  id="${k} ${ns:+${ns}/}${n:-<unnamed>}"
+  info="$(kind_info "$k")"
+  if [ -z "$info" ]; then problems="${problems}${id}: kind ${k:-?} is not one this lane deletes"$'\n'; continue; fi
+  [[ "$n" =~ $DNS_NAME ]] || { problems="${problems}${id}: '${n}' is not a DNS name"$'\n'; continue; }
+  case "$info" in
+    *" namespaced "*)
+      [ -n "$ns" ] || { problems="${problems}${id}: a namespaced kind with no namespace (the ${src} must say where)"$'\n'; continue; }
+      [[ "$ns" =~ $DNS_LABEL ]] || { problems="${problems}${id}: namespace '${ns}' is not a DNS label"$'\n'; continue; } ;;
+  esac
+  why="$(denied "$k" "$ns" "$n")"
+  [ -z "$why" ] || problems="${problems}${id}: KEPT — ${why}"$'\n'
+done < "$work/plan.tsv"
+if [ -n "$problems" ]; then
+  printf '%s' "$problems" | while IFS= read -r p; do hosting::log "refused   ${p}"; done
+  hosting::die "the plan names $(printf '%s' "$problems" | grep -c .) object(s) this lane does not delete (listed above). Nothing was sent to the API server."
+fi
+
+# Canonical plan text → digest. Sorted, deduplicated, newline-terminated.
+cut -d'|' -f1-3 "$work/plan.tsv" | LC_ALL=C sort -u > "$work/canonical"
+count="$(grep -c . "$work/canonical")"
+[ "$count" -gt 0 ] || hosting::die "the plan holds no object"
+if command -v sha256sum >/dev/null 2>&1; then
+  digest="$(sha256sum "$work/canonical" | cut -d' ' -f1)"
+else
+  digest="$(shasum -a 256 "$work/canonical" | cut -d' ' -f1)"
+fi
+[[ "$digest" =~ ^[0-9a-f]{64}$ ]] || hosting::die "could not hash the plan"
+while IFS='|' read -r k ns n; do hosting::log "object    ${k} ${ns:+${ns}/}${n}"; done < "$work/canonical"
+hosting::say deletion_objects "$count"
+hosting::say deletion_digest "sha256:${digest}"
+if [ -n "$sha" ] && [ "$sha" != "$digest" ]; then
+  hosting::die "this plan is sha256:${digest}, and the request names sha256:${sha} — these are not the objects that were approved. Nothing was deleted. Re-run the dry run, read the plan it lists, and request the delete with that digest."
+fi
+
+# The delete order: by kind order, then the canonical order within a kind.
+while IFS='|' read -r k ns n; do
+  printf '%s|%s|%s|%s\n' "$(kind_info "$k" | cut -d' ' -f3)" "$k" "$ns" "$n"
+done < "$work/canonical" | LC_ALL=C sort -t'|' -k1,1n -k2,2 -k3,3 -k4,4 | cut -d'|' -f2-4 > "$work/ordered"
+
+# present_of <kind> <ns> <name>: 0 present, 1 absent; dies on a refused or failed read — UNKNOWN is
+# never "absent", or a refusal would let a check report a plan as already done.
+present_of() {
+  local res ns_args=()
+  res="$(kind_info "$1" | cut -d' ' -f1)"
+  [ -z "$2" ] || ns_args=(-n "$2")
+  hosting::probe output kubectl "${ns_args[@]+"${ns_args[@]}"}" get "$res" "$3" --ignore-not-found -o name
+  case $? in
+    0) return 0 ;;
+    2) hosting::die "REFUSED, not absent: this identity may not read ${1} ${2:+$2/}${3} — whether it exists is UNKNOWN, so nothing was decided. Refused: ${HOSTING_PROBE_ERR}" ;;
+    *) [ -z "$HOSTING_PROBE_ERR" ] || hosting::die "could not read ${1} ${2:+$2/}${3}: ${HOSTING_PROBE_ERR} — whether it exists is UNKNOWN, so nothing was decided"
+       return 1 ;;
+  esac
+}
+
+# ── the check (both modes): present or absent, and the server's own answer for each present object ───
+present=0
+: > "$work/present"
+while IFS='|' read -r k ns n; do
+  res="$(kind_info "$k" | cut -d' ' -f1)"
+  ns_args=(); [ -z "$ns" ] || ns_args=(-n "$ns")
+  if present_of "$k" "$ns" "$n"; then
+    present=$((present+1)); printf '%s|%s|%s\n' "$k" "$ns" "$n" >> "$work/present"
+    if ! kubectl "${ns_args[@]+"${ns_args[@]}"}" delete "$res" "$n" --dry-run=server > "$work/out" 2>"$work/err"; then
+      hosting::die "the API server would not admit deleting ${k} ${ns:+${ns}/}${n}: $(head -1 "$work/err"). Nothing was deleted."
+    fi
+    hosting::log "present   ${k} ${ns:+${ns}/}${n} — the server would admit its delete"
+    if [ "$k" = Namespace ]; then
+      # What a namespace delete takes with it: every object still in it is NAMED, so the approver sees
+      # the cascade instead of discovering it.
+      for inner in serviceaccounts secrets configmaps roles.rbac.authorization.k8s.io rolebindings.rbac.authorization.k8s.io jobs.batch cronjobs.batch pods deployments.apps; do
+        if ! kubectl -n "$n" get "$inner" -o name > "$work/inner" 2>"$work/err"; then
+          hosting::die "could not list ${inner} in namespace ${n}: $(head -1 "$work/err") — what its delete would take with it is UNKNOWN, so nothing was decided"
+        fi
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          case "$line" in */default|*/kube-root-ca.crt) continue ;; esac   # created by Kubernetes in every namespace
+          hosting::log "contains  ${n}: ${line} — deleted with the namespace"
+        done < "$work/inner"
+      done
+    fi
+  else
+    hosting::log "absent    ${k} ${ns:+${ns}/}${n} — nothing to delete"
+  fi
+done < "$work/ordered"
+hosting::say deletion_present "$present"
+
+if [ "$mode" = check ]; then
+  hosting::say deletion_check "sha256:${digest}"
+  exit 0
+fi
+
+if hosting::dry; then
+  hosting::log "(dry run) would delete ${present} present object(s) of the plan sha256:${digest}"
+  exit 0
+fi
+
+# ── the delete, in order ─────────────────────────────────────────────────────────────────────────────
+hosting::step "Delete the ${present} present object(s) of plan sha256:${digest}"
+while IFS='|' read -r k ns n; do
+  res="$(kind_info "$k" | cut -d' ' -f1)"
+  ns_args=(); [ -z "$ns" ] || ns_args=(-n "$ns")
+  # --wait: a namespace (and anything with a finalizer) is gone only once its finalizers have run; the
+  # read-back below is what decides, and a delete that has not finished by its deadline reads PRESENT.
+  if ! kubectl "${ns_args[@]+"${ns_args[@]}"}" delete "$res" "$n" --ignore-not-found --wait=true --timeout=300s > "$work/out" 2>"$work/err"; then
+    hosting::die "deleting ${k} ${ns:+${ns}/}${n} failed: $(head -1 "$work/err"). Objects deleted before it are gone; it and the rest are not. Fix the cause and re-request — the plan's digest is unchanged, and an absent object is skipped."
+  fi
+  hosting::log "deleted   ${k} ${ns:+${ns}/}${n}"
+done < "$work/present"
+
+# ── VERIFY ABSENCE: every object of the plan, read back ──────────────────────────────────────────────
+hosting::step "Read back every object of plan sha256:${digest}"
+remaining=0
+while IFS='|' read -r k ns n; do
+  if present_of "$k" "$ns" "$n"; then
+    remaining=$((remaining+1)); hosting::log "REMAINS   ${k} ${ns:+${ns}/}${n}"
+  else
+    hosting::log "gone      ${k} ${ns:+${ns}/}${n}"
+  fi
+done < "$work/ordered"
+[ "$remaining" -eq 0 ] \
+  || hosting::die "${remaining} object(s) of the plan are still on the cluster after the delete (listed above as REMAINS). The action did NOT complete."
+hosting::say deletion_absent "$count"
+hosting::say manifest_deleted "sha256:${digest}"
