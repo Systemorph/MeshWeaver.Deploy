@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# A stand-in `az` for hosting-db-retire's tests: the server's admin password BY NAME
+# (hosting::pg_password) and the size of the archive the drop is bound to (`az storage blob show`).
+# Records every argv in $HOSTING_DBRT_STATE/az.log. The archive's size is the file `blob-size`
+# (absent = the blob does not exist).
+set -uo pipefail
+state="${HOSTING_DBRT_STATE:?the az stub needs HOSTING_DBRT_STATE}"
+printf 'az %s\n' "$*" >> "$state/az.log"
+case "${1:-} ${2:-} ${3:-}" in
+  "keyvault secret show")
+    name=""
+    while [ $# -gt 0 ]; do case "$1" in --name) name="${2:-}"; shift 2 ;; *) shift ;; esac; done
+    [ "$name" = "memex-postgres-password" ] && { echo "fake-server-password-NEVER-PRINTED"; exit 0; }
+    echo "ERROR: (SecretNotFound) A secret with (name/id) ${name} was not found in this key vault." >&2; exit 3 ;;
+  "storage blob show")
+    [ -f "$state/blob-size" ] || { echo "ERROR: The specified blob does not exist." >&2; exit 3; }
+    cat "$state/blob-size"; exit 0 ;;
+esac
+echo "az stub: unexpected invocation: $*" >&2
+exit 1

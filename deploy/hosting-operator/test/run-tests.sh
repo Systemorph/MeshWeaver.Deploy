@@ -4290,6 +4290,150 @@ else
 fi
 rm -rf "$_dbr_state"
 
+# ── hosting-db-retire: retire a database no record claims — check, (backup, verify), drop ──────────
+# Systemorph/Memex#923, MeshWeaver.Plugins kind RetireDatabase. `check` READS (in a dry run too — it is
+# the what-if); `drop` drops only after the archive it names is readable and not empty, never under a
+# session, never a server database, and proves absence after. Pinned: every refusal that protects
+# data, the order (archive read before DROP), the password by name and never on an argv, a lying
+# server, and the control that a present, idle database with a non-empty archive IS dropped.
+echo
+echo "── hosting-db-retire: check reads, drop only behind a readable archive, absence proved ──"
+DBRT_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/db-retire" && pwd)"
+DBRT_URI="https://backups.example.blob.core.windows.net/retired/oldcopy-20261101.dump"
+DBRT_ARGS=(--database oldcopy --server pg.postgres.database.azure.com --user acmeowner --vault kv-example --password-secret memex-postgres-password)
+_dbrt_new() { _dbrt_state="$(mktemp -d)"; printf 'postgres\nacmedb\noldcopy\n' > "$_dbrt_state/dbs"; echo 2048 > "$_dbrt_state/blob-size"; }
+_dbrt() { _dbrt_out="$(env -u PGPASSWORD -u HOSTING_DRY_RUN PATH="$DBRT_STUBS:$PATH" HOSTING_DBRT_STATE="$_dbrt_state" "$@" 2>&1)"; _dbrt_rc=$?
+  _dbrt_log="$(cat "$_dbrt_state/pg.log" 2>/dev/null || true)"; _dbrt_az="$(cat "$_dbrt_state/az.log" 2>/dev/null || true)"; }
+
+# check, present and idle: reports state, size, sessions — and issues no statement that changes anything
+_dbrt_new; echo 123456 > "$_dbrt_state/size"; _dbrt hosting-db-retire check "${DBRT_ARGS[@]}"
+if [ "$_dbrt_rc" -eq 0 ] && printf '%s' "$_dbrt_out" | grep -q '::hosting:: retire_state=present' \
+   && printf '%s' "$_dbrt_out" | grep -q '::hosting:: size_bytes=123456' \
+   && printf '%s' "$_dbrt_out" | grep -q '::hosting:: sessions=0' \
+   && ! printf '%s' "$_dbrt_log" | grep -q 'DROP\|ALTER\|CREATE\|COMMENT'; then
+  ok "check reads a present database's size and sessions and changes nothing"
+else
+  bad "check reports present, size, sessions" "rc=${_dbrt_rc} out: ${_dbrt_out} log: ${_dbrt_log}"
+fi
+case "$_dbrt_az" in *"keyvault secret show --vault-name kv-example --name memex-postgres-password --query value"*) ok "…the password is read by NAME from the vault" ;; *) bad "password read by name" "az: ${_dbrt_az}" ;; esac
+case "$_dbrt_out$_dbrt_log" in *NEVER-PRINTED*) bad "the password is never printed nor on an argv" "seen: ${_dbrt_out}" ;; *) ok "the password is never printed nor on an argv" ;; esac
+rm -rf "$_dbrt_state"
+
+# check in a DRY RUN still reads (it IS the what-if) — and says "absent" for a database already gone
+_dbrt_new; printf 'postgres\nacmedb\n' > "$_dbrt_state/dbs"; _dbrt env HOSTING_DRY_RUN=true hosting-db-retire check "${DBRT_ARGS[@]}"
+if [ "$_dbrt_rc" -eq 0 ] && printf '%s' "$_dbrt_out" | grep -q '::hosting:: retire_state=absent' && [ -s "$_dbrt_state/pg.log" ]; then
+  ok "a dry-run check reads the server and reports an already-absent database as absent (the what-if)"
+else
+  bad "dry-run check reports absent" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+_dbrt_new; printf 'postgres\nacmedb\n' > "$_dbrt_state/dbs"; _dbrt hosting-db-retire check "${DBRT_ARGS[@]}"
+if [ "$_dbrt_rc" -ne 0 ] && printf '%s' "$_dbrt_out" | grep -q 'already absent'; then
+  ok "a real check of an absent database fails the plan before any backup — nothing to back up or drop"
+else
+  bad "real check refuses an absent database" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+
+# check with a session connected: a real run refuses, a dry run says it would
+_dbrt_new; echo 1 > "$_dbrt_state/sessions"; _dbrt hosting-db-retire check "${DBRT_ARGS[@]}"
+if [ "$_dbrt_rc" -ne 0 ] && printf '%s' "$_dbrt_out" | grep -q '1 session(s) are connected to oldcopy'; then
+  ok "a real check refuses a database something is still connected to"
+else
+  bad "real check refuses on a session" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+_dbrt_new; echo 1 > "$_dbrt_state/sessions"; _dbrt env HOSTING_DRY_RUN=true hosting-db-retire check "${DBRT_ARGS[@]}"
+if [ "$_dbrt_rc" -eq 0 ] && printf '%s' "$_dbrt_out" | grep -q '::hosting:: sessions=1' && printf '%s' "$_dbrt_out" | grep -q 'a real run would REFUSE'; then
+  ok "a dry-run check names the session a real run would refuse on"
+else
+  bad "dry-run check names the session" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+
+# drop: the control — an idle database behind a readable, non-empty archive IS dropped and proved gone
+_dbrt_new; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
+if [ "$_dbrt_rc" -eq 0 ] && ! grep -qx oldcopy "$_dbrt_state/dbs" && grep -qx acmedb "$_dbrt_state/dbs" \
+   && printf '%s' "$_dbrt_out" | grep -q '::hosting:: retired=oldcopy'; then
+  ok "drop drops an idle database behind a readable archive — and nothing else — and reports retired=<db>"
+else
+  bad "drop drops and reports" "rc=${_dbrt_rc} out: ${_dbrt_out} dbs: $(cat "$_dbrt_state/dbs")"
+fi
+case "$_dbrt_az" in *"storage blob show --blob-url ${DBRT_URI} --auth-mode login"*) ok "…the archive is read by its URL before the drop" ;; *) bad "archive read before the drop" "az: ${_dbrt_az}" ;; esac
+_drop_line="$(printf '%s\n' "$_dbrt_log" | grep -n 'DROP DATABASE "oldcopy"' | head -1 | cut -d: -f1)"
+_last_exists="$(printf '%s\n' "$_dbrt_log" | grep -n "datname = 'oldcopy'" | tail -1 | cut -d: -f1)"
+[ -n "$_drop_line" ] && [ -n "$_last_exists" ] && [ "$_drop_line" -lt "$_last_exists" ] \
+  && ok "…and the server is asked AGAIN after the drop — absence is read back, not assumed" \
+  || bad "absence is read back after the drop" "log: ${_dbrt_log}"
+case "$_dbrt_log" in *"PGPASSWORD=unset"*) bad "every psql got the password through the environment" "log: ${_dbrt_log}" ;; *) ok "every psql got the password through the environment" ;; esac
+rm -rf "$_dbrt_state"
+
+# drop: no archive, or an empty one → refused, nothing dropped
+_dbrt_new; rm -f "$_dbrt_state/blob-size"; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
+if [ "$_dbrt_rc" -ne 0 ] && grep -qx oldcopy "$_dbrt_state/dbs" && ! printf '%s' "$_dbrt_log" | grep -q 'DROP' \
+   && printf '%s' "$_dbrt_out" | grep -q 'is NOT dropped'; then
+  ok "drop refuses when the archive it is bound to cannot be read — nothing is dropped"
+else
+  bad "drop refuses a missing archive" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+_dbrt_new; echo 0 > "$_dbrt_state/blob-size"; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
+if [ "$_dbrt_rc" -ne 0 ] && grep -qx oldcopy "$_dbrt_state/dbs" && ! printf '%s' "$_dbrt_log" | grep -q 'DROP'; then
+  ok "drop refuses a ZERO-byte archive — an empty archive is no backup"
+else
+  bad "drop refuses an empty archive" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+
+# drop: a session connected → refused, nothing dropped
+_dbrt_new; echo 2 > "$_dbrt_state/sessions"; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
+if [ "$_dbrt_rc" -ne 0 ] && grep -qx oldcopy "$_dbrt_state/dbs" && ! printf '%s' "$_dbrt_log" | grep -q 'DROP'; then
+  ok "drop refuses while a session is connected — nothing is dropped under it"
+else
+  bad "drop refuses on a session" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+
+# drop: a server that answers DROP but keeps the database → a failed step, never retired=
+_dbrt_new; touch "$_dbrt_state/sticky-drop"; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
+if [ "$_dbrt_rc" -ne 0 ] && printf '%s' "$_dbrt_out" | grep -q 'still listed' && ! printf '%s' "$_dbrt_out" | grep -q 'retired=oldcopy'; then
+  ok "a DROP the server reports but does not perform is a failed step, never retired=<db>"
+else
+  bad "a lying drop fails" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+
+# drop dry run: narrates, reads no secret, issues no statement
+_dbrt_new; _dbrt env HOSTING_DRY_RUN=true hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
+if [ "$_dbrt_rc" -eq 0 ] && [ ! -s "$_dbrt_state/pg.log" ] && [ ! -s "$_dbrt_state/az.log" ] && printf '%s' "$_dbrt_out" | grep -q 'retired=dry-run' \
+   && grep -qx oldcopy "$_dbrt_state/dbs"; then
+  ok "a dry-run drop reads no secret, issues no statement and drops nothing"
+else
+  bad "a dry-run drop touches nothing" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+
+# refusals before anything is read or reported
+for _sysdb in postgres template0 template1 azure_maintenance azure_sys; do
+  refuses_hard "hosting-db-retire refuses the server's own database ${_sysdb}" "one of the server's own databases" \
+    env HOSTING_DRY_RUN=true hosting-db-retire drop --database "$_sysdb" --server pg.test --user u --store-uri "$DBRT_URI"
+done
+refuses_hard "hosting-db-retire refuses a database name it would have to quote" "not a plain lower-case Postgres name" \
+  env HOSTING_DRY_RUN=true hosting-db-retire check --database 'old";drop' --server pg.test --user u
+refuses_hard "hosting-db-retire refuses an upper-case name" "not a plain lower-case Postgres name" \
+  env HOSTING_DRY_RUN=true hosting-db-retire check --database 'OldCopy' --server pg.test --user u
+refuses_hard "hosting-db-retire needs a verb" "missing verb" hosting-db-retire
+refuses_hard "hosting-db-retire refuses an unknown verb" "unknown verb" hosting-db-retire purge --database oldcopy --server pg.test --user u
+refuses_hard "drop names the archive it is bound to" "missing required flag --store-uri" \
+  env HOSTING_DRY_RUN=true hosting-db-retire drop --database oldcopy --server pg.test --user u
+refuses_hard "drop refuses an archive that is not an https blob URL" "is not an https blob URL" \
+  env HOSTING_DRY_RUN=true hosting-db-retire drop --database oldcopy --server pg.test --user u --store-uri 'file:///etc/passwd'
+refuses_hard "check takes no archive" "rides drop only" \
+  env HOSTING_DRY_RUN=true hosting-db-retire check --database oldcopy --server pg.test --user u --store-uri "$DBRT_URI"
+refuses_hard "hosting-db-retire refuses a login given empty" "was given EMPTY" \
+  env HOSTING_DRY_RUN=true hosting-db-retire check --database oldcopy --server pg.test --user ''
+unset _dbrt_out _dbrt_rc _dbrt_log _dbrt_az _dbrt_state _drop_line _last_exists _sysdb
+
 echo
 echo "── hosting-inventory: node counts per partition schema, READ-ONLY by the server's own rule ──"
 # The Inventory action's one step (MeshWeaver.Plugins Hosting/InstanceAction, kind Inventory). It may run

@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# hosting-db-retire check --database <db> --server <pg host> --user <login>
+#                         [--vault <key vault> --password-secret <vault object>]
+# hosting-db-retire drop  --database <db> --server <pg host> --user <login> --store-uri <archive uri>
+#                         [--vault <key vault> --password-secret <vault object>]
+#
+# RETIRE A DATABASE NO DEPLOYMENT RECORD CLAIMS (Systemorph/Memex#923; MeshWeaver.Plugins
+# Hosting/InstanceAction, kind `RetireDatabase`). The governed plan is four steps, in this order:
+#
+#   1. hosting-db-retire check   — what is there: the database, its size, its sessions (a READ)
+#   2. hosting-backup            — dump it to the estate's backup store (custom format, --overwrite false)
+#   3. hosting-verify-backup     — read the archive back: size > 0, pg_restore --list, table data
+#   4. hosting-db-retire drop    — DROP it, then read the server back and prove it is gone
+#
+# run.sh stops at the first failing step, so the drop is reached ONLY after the archive has been read
+# back. The drop re-checks that the archive it names exists and is not empty (`az storage blob show`)
+# before it drops anything — a plan whose steps were reordered, or that named another archive, is
+# refused here rather than trusted.
+#
+# WHO DECIDES WHICH DATABASE MAY GO. Not this script: it cannot see the deployment records. The plan
+# (MeshWeaver.Plugins) refuses a database the record it runs under declares, and the estate's aks-ops
+# classifier refuses one ANY committed record (mesh/Deployments/*.json) declares — before a step runs.
+# This script holds the line it CAN hold: the server's own databases (postgres, template0, template1,
+# azure_maintenance, azure_sys) are refused by name, a name it would have to quote is refused, and a
+# database with a session connected is never dropped under it.
+#
+# check  is a READ and runs for real in a dry run too. That is deliberate and the one difference from
+#        the other database verbs (which read no secret in a rehearsal): the dry run of a retirement IS
+#        the what-if the approver reads, and "already absent" (the retirement's acceptance) is a fact
+#        about the server that no narration can state. It issues SELECTs against `postgres` only —
+#        never a statement that changes anything — with the same by-name password read and the same
+#        identity an Inventory's unattended read already uses. On a real run it REFUSES an absent
+#        database (nothing to back up, nothing to drop) and one with a session connected (nothing has
+#        been changed yet, so this is the cheapest place to stop).
+# drop   in a dry run narrates and reads nothing. On a real run: the archive exists and is not empty,
+#        the database still exists, no session is connected, DROP DATABASE, then the server is asked
+#        again and the database must be gone.
+#
+# Output contract (the ::hosting:: lines the mesh reads):
+#   retire_database=<db>      the database the step is about
+#   retire_state=present|absent   what `check` read on the server
+#   size_bytes=<n>            pg_database_size of the database (`check`, when present)
+#   sessions=<n>              other sessions connected to it (`check`, when present)
+#   retired=<db>              `drop` dropped it AND read the server back without it — the ONLY success
+#   retired=dry-run           a rehearsal of `drop`
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
+# shellcheck disable=SC2034  # read by hosting::die in _common.sh, which shellcheck does not follow here
+HOSTING_CMD="hosting-db-retire"
+
+# The server's own databases. Never a retirement's target, whatever a plan says.
+SYSTEM_DATABASES=" postgres template0 template1 azure_maintenance azure_sys "
+
+verb="${1:-}"
+[ $# -gt 0 ] && shift
+case "$verb" in
+  check|drop) ;;
+  "") hosting::die "missing verb — check (read what is there) or drop (drop it, after its archive was verified)" ;;
+  *)  hosting::die "unknown verb '${verb}' — check or drop" ;;
+esac
+
+database="" server="" user="" vault="" password_secret="" store_uri=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --database)        database="${2:-}";        shift 2 ;;
+    --server)          server="${2:-}";          shift 2 ;;
+    --user)            user="${2:-}"; user_given=1; shift 2 ;;
+    --vault)           vault="${2:-}";           shift 2 ;;
+    --password-secret) password_secret="${2:-}"; shift 2 ;;
+    --store-uri)       store_uri="${2:-}";       shift 2 ;;
+    *) hosting::die "unknown argument '$1'" ;;
+  esac
+done
+
+hosting::need_flag database "$database"
+hosting::need_flag server "$server"
+# A Postgres identifier the statements below double-quote and single-quote: lower-case letters,
+# digits and underscore only, so nothing in it can close a quote; at most Postgres' 63 bytes.
+[[ "$database" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] \
+  || hosting::die "database '${database}' is not a plain lower-case Postgres name (a-z, 0-9, _; at most 63) — refusing to interpolate it into SQL"
+case "$SYSTEM_DATABASES" in
+  *" ${database} "*) hosting::die "${database} is one of the server's own databases — a retirement never drops it" ;;
+esac
+hosting::safe_host server "$server"
+[ -z "$vault" ] || hosting::safe_name vault "$vault"
+[ -z "$password_secret" ] || hosting::safe_name password-secret "$password_secret"
+[ "${user_given:-0}" = 0 ] || [ -n "$user" ] || hosting::die "--user was given EMPTY: the plan rendered no login (the record states no databaseUsername). Refusing rather than falling back to PGUSER."
+pg_user="${user:-${PGUSER:-}}"
+[ -n "$pg_user" ] || hosting::die "no database login: pass --user <the record's databaseUsername> (the plan does), or export PGUSER by hand. There is no default."
+hosting::safe_name user "$pg_user"
+
+if [ "$verb" = drop ]; then
+  hosting::need_flag store-uri "$store_uri"
+  [[ "$store_uri" =~ ^https://[A-Za-z0-9.-]+/[A-Za-z0-9._/-]+$ ]] \
+    || hosting::die "--store-uri '${store_uri}' is not an https blob URL — the drop names the archive it was verified against"
+elif [ -n "$store_uri" ]; then
+  hosting::die "--store-uri rides drop only — check reads the server, not the archive"
+fi
+
+hosting::say retire_database "$database"
+
+if [ "$verb" = drop ] && hosting::dry; then
+  hosting::log "DRY-RUN would confirm ${store_uri} exists and is not empty, then DROP DATABASE ${database} on ${server} and read the server back without it"
+  hosting::say retired dry-run
+  exit 0
+fi
+
+# The admin password is read from the vault by NAME (Memex#132) — see hosting::pg_password.
+hosting::pg_password "$vault" "$password_secret"
+
+# One query against the maintenance database; prints the single value. A failed query is a FAILED
+# query (non-zero), never an empty answer — the callers below branch on the status.
+q() { psql -h "$server" -U "$pg_user" -d postgres -v ON_ERROR_STOP=1 -tAc "$1"; }
+trimmed() { printf '%s' "$1" | tr -d '[:space:]'; }
+
+exists() {  # exists <db> → prints 1 or 0; non-zero when the server could not be asked
+  local answer
+  answer="$(q "SELECT count(*) FROM pg_database WHERE datname = '$1'")" || return 1
+  answer="$(trimmed "$answer")"
+  [ "$answer" = 0 ] || [ "$answer" = 1 ] || return 1
+  printf '%s' "$answer"
+}
+
+sessions() {  # sessions <db> → prints the count of OTHER sessions connected to it
+  local answer
+  answer="$(q "SELECT count(*) FROM pg_stat_activity WHERE datname = '$1' AND pid <> pg_backend_pid()")" || return 1
+  answer="$(trimmed "$answer")"
+  [[ "$answer" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$answer"
+}
+
+if [ "$verb" = check ]; then
+  present="$(exists "$database")" || hosting::die "could not ask ${server} whether ${database} exists — nothing was read, nothing was changed"
+  if [ "$present" = 0 ]; then
+    hosting::say retire_state absent
+    hosting::dry && { hosting::log "${database} is already absent on ${server} — a retirement has nothing left to do"; exit 0; }
+    hosting::die "${database} does not exist on ${server} — already absent: there is nothing to back up and nothing to drop"
+  fi
+  size="$(q "SELECT pg_database_size(oid) FROM pg_database WHERE datname = '${database}'")" \
+    || hosting::die "could not read the size of ${database} — nothing was changed"
+  size="$(trimmed "$size")"
+  [[ "$size" =~ ^[0-9]+$ ]] || hosting::die "the server answered '${size}' for the size of ${database}, not a number of bytes — nothing was changed"
+  active="$(sessions "$database")" || hosting::die "could not count the sessions on ${database} — nothing was changed"
+  hosting::say retire_state present
+  hosting::say size_bytes "$size"
+  hosting::say sessions "$active"
+  hosting::log "${database} on ${server}: ${size} bytes, ${active} other session(s) connected"
+  if [ "$active" != 0 ]; then
+    hosting::dry && { hosting::log "a real run would REFUSE here: ${active} session(s) are connected to ${database}"; exit 0; }
+    hosting::die "${active} session(s) are connected to ${database} — something still uses the database a retirement assumes nobody does. Find what connects before retiring it; nothing was changed"
+  fi
+  exit 0
+fi
+
+# ── drop ───────────────────────────────────────────────────────────────────────────────────────
+# The archive the plan just verified must still be there and not empty: a reordered plan, or one that
+# names another archive, stops here — before anything is dropped.
+hosting::probe output az storage blob show --blob-url "$store_uri" --auth-mode login --query properties.contentLength -o tsv
+case "$?" in
+  2) hosting::die "REFUSED, not absent: this identity may not read ${store_uri}, so whether the archive exists is UNKNOWN — and ${database} is NOT dropped. Refused: ${HOSTING_PROBE_ERR}" ;;
+  1) hosting::die "could not read ${store_uri} — the archive this drop is bound to is absent or unreadable, so ${database} is NOT dropped. az said: ${HOSTING_PROBE_ERR:-nothing}" ;;
+esac
+archive_size="$(trimmed "$HOSTING_PROBE_OUT")"
+[[ "$archive_size" =~ ^[0-9]+$ ]] && [ "$archive_size" -gt 0 ] \
+  || hosting::die "${store_uri} reports '${archive_size}' bytes — an archive that is empty (or unsized) is no backup, so ${database} is NOT dropped"
+hosting::log "archive ${store_uri}: ${archive_size} bytes"
+
+present="$(exists "$database")" || hosting::die "could not ask ${server} whether ${database} exists — nothing was dropped"
+[ "$present" = 1 ] || hosting::die "${database} does not exist on ${server} — nothing to drop (was it dropped by another run?)"
+active="$(sessions "$database")" || hosting::die "could not count the sessions on ${database} — nothing was dropped"
+[ "$active" = 0 ] || hosting::die "${active} session(s) are connected to ${database} — refusing to drop it under them; nothing was dropped"
+
+printf '  + psql -h %s -U %s -d postgres -c %s\n' "$server" "$pg_user" "DROP DATABASE \"${database}\"" >&2
+q "DROP DATABASE \"${database}\"" >/dev/null || hosting::die "DROP DATABASE ${database} failed — the database is still there"
+gone="$(exists "$database")" || hosting::die "${database} was dropped but the server could not be asked again — its absence is NOT confirmed"
+[ "$gone" = 0 ] || hosting::die "DROP DATABASE ${database} reported success but the database is still listed"
+hosting::log "${database} dropped on ${server}; its archive is ${store_uri} (${archive_size} bytes)"
+hosting::say retired "$database"
