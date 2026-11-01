@@ -1189,6 +1189,120 @@ case "$_sa_log" in *"ad app"*|*"secret set"*) bad "…and touches neither Graph 
 case "$_sa_out" in *"signin_secret=would-create"*) ok "…reporting would-create" ;; *) bad "would-create" "said: ${_sa_out}" ;; esac
 rm -rf "$_sa_state"
 unset _sa_out _sa_rc _sa_log _sa_state
+echo "── hosting-signin-redirect: the shared throwaway sign-in app gains and loses one host's URI ──"
+# MeshWeaver.Plugins#4336 — a throwaway instance signs in through the fleet's ONE shared app; Entra
+# has no wildcard redirect URI, so Provision adds https://<host>/signin-microsoft and Teardown
+# removes it (and the credential Provision added under the deployment id). The stub keeps the app's
+# URIs in a mutable state, so every read-back reads what the PATCH wrote. 🚨 Stub FIRST on PATH.
+SR_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/signin-redirect" && pwd)"
+sr() {  # sr [env…] -- <args…>
+  local envs=()
+  while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  _sr_state="$(mktemp -d)"
+  _sr_out="$(env "${envs[@]}" PATH="$SR_STUBS:$PATH" HOSTING_SR_STATE="$_sr_state" hosting-signin-redirect "$@" 2>&1)"; _sr_rc=$?
+  _sr_log="$(cat "$_sr_state/az.log" 2>/dev/null || true)"
+  _sr_uris="$(cat "$_sr_state/uris.json" 2>/dev/null || true)"
+}
+SR_ID=0e5a1d2c-0000-4000-8000-00000000a0a2
+SR_OTHER="https://other.example.test/signin-microsoft"
+SR_MINE="https://acme.meshweaver.cloud/signin-microsoft"
+
+# add, absent → PATCHed with BOTH URIs, read back, reported added.
+sr -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -eq 0 ] && ok "signin-redirect add: an absent URI is added" || bad "add absent" "exited ${_sr_rc}: ${_sr_out}"
+[ "$_sr_uris" = "[\"${SR_OTHER}\",\"${SR_MINE}\"]" ] && ok "…appended, every other instance's URI kept" || bad "add keeps others" "app now lists: ${_sr_uris}"
+case "$_sr_out" in *"::hosting:: signin_redirect=added"*) ok "…reported added" ;; *) bad "added fact" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+
+# add, present → kept, no PATCH.
+sr HOSTING_SR_URIS="[\"${SR_MINE}\"]" -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -eq 0 ] && ok "add over a present URI succeeds (idempotent)" || bad "add present" "exited ${_sr_rc}: ${_sr_out}"
+case "$_sr_log" in *"rest --method PATCH"*) bad "…without writing" "az saw: ${_sr_log}" ;; *) ok "…without writing" ;; esac
+case "$_sr_out" in *"::hosting:: signin_redirect=kept"*) ok "…reported kept" ;; *) bad "kept fact" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+
+# 🚨 an UNTAGGED app is not the shared app → refused before any write.
+sr HOSTING_SR_TAGS='[]' -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -ne 0 ] && ok "an app WITHOUT the shared-app tag is refused" || bad "untagged refused" "exited 0: ${_sr_out}"
+case "$_sr_out" in *"does not carry the tag 'meshweaver-shared-throwaway-signin'"*) ok "…naming the tag" ;; *) bad "untagged message" "said: ${_sr_out}" ;; esac
+case "$_sr_log" in *"rest --method PATCH"*) bad "…and writes nothing" "az saw: ${_sr_log}" ;; *) ok "…and writes nothing" ;; esac
+rm -rf "$_sr_state"
+# negative control for the tag check: the tag among others passes.
+sr HOSTING_SR_TAGS='["x","meshweaver-shared-throwaway-signin"]' -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -eq 0 ] && ok "…while the tag among other tags is accepted (negative control)" || bad "tag among others" "exited ${_sr_rc}: ${_sr_out}"
+rm -rf "$_sr_state"
+
+# 🚨 the redirect-URI limit: 256 for a work-or-school app → refused, nothing dropped.
+sr HOSTING_SR_URIS="$(jq -cn '[range(256) | "https://t\(.).example.test/signin-microsoft"]')" -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -ne 0 ] && ok "an app at 256 redirect URIs refuses the 257th" || bad "limit refused" "exited 0: ${_sr_out}"
+case "$_sr_out" in *"already carries 256 redirect URIs"*"limit for its audience (AzureADMyOrg) is 256"*) ok "…naming the count and the limit" ;; *) bad "limit message" "said: ${_sr_out}" ;; esac
+case "$_sr_log" in *"rest --method PATCH"*) bad "…and drops nobody's URI to make room" "az saw: ${_sr_log}" ;; *) ok "…and drops nobody's URI to make room" ;; esac
+rm -rf "$_sr_state"
+# negative control: 255 leaves room for one more.
+sr HOSTING_SR_URIS="$(jq -cn '[range(255) | "https://t\(.).example.test/signin-microsoft"]')" -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -eq 0 ] && ok "…while 255 leaves room for the 256th (negative control)" || bad "255 has room" "exited ${_sr_rc}: ${_sr_out}"
+[ "$(jq 'length' <<<"$_sr_uris")" = "256" ] && ok "…and the app then lists 256" || bad "256 after add" "app lists $(jq 'length' <<<"$_sr_uris")"
+rm -rf "$_sr_state"
+# an app that also takes personal accounts is held to 100.
+sr HOSTING_SR_AUDIENCE=AzureADandPersonalMicrosoftAccount HOSTING_SR_URIS="$(jq -cn '[range(100) | "https://t\(.).example.test/signin-microsoft"]')" -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -ne 0 ] && ok "an app that also takes personal accounts is held to 100" || bad "personal limit" "exited 0: ${_sr_out}"
+case "$_sr_out" in *"is 100"*) ok "…naming 100" ;; *) bad "personal limit message" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+
+# a PATCH that changed nothing is caught by the read-back → RED.
+sr HOSTING_SR_PATCH_IGNORED=1 -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -ne 0 ] && ok "a write the read-back does not show is a failed step" || bad "read-back catches" "exited 0: ${_sr_out}"
+case "$_sr_out" in *"not among its redirect URIs on read-back"*) ok "…naming the read-back" ;; *) bad "read-back message" "said: ${_sr_out}" ;; esac
+case "$_sr_out" in *"signin_redirect=added"*) bad "…and never reports added" "said: ${_sr_out}" ;; *) ok "…and never reports added" ;; esac
+rm -rf "$_sr_state"
+
+# Graph denied → RED naming the right, nothing written.
+sr HOSTING_SR_GRAPH_DENIED=1 -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -ne 0 ] && ok "an identity without the Graph right is a RED step" || bad "denied red" "exited 0"
+case "$_sr_out" in *"Application.ReadWrite.OwnedBy"*"ownership"*) ok "…naming the right and the ownership" ;; *) bad "denied message" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+
+# remove → the URI goes, others stay, read back; the deployment's credential goes, others stay.
+sr HOSTING_SR_URIS="[\"${SR_OTHER}\",\"${SR_MINE}\"]" HOSTING_SR_CREDS=$'11111111-1111-1111-1111-111111111111 acme\n22222222-2222-2222-2222-222222222222 other' -- remove --client-id $SR_ID --host acme.meshweaver.cloud --credential acme
+[ "$_sr_rc" -eq 0 ] && ok "signin-redirect remove: the URI and the instance's credential are removed" || bad "remove" "exited ${_sr_rc}: ${_sr_out}"
+[ "$_sr_uris" = "[\"${SR_OTHER}\"]" ] && ok "…only this host's URI left the app" || bad "remove keeps others" "app now lists: ${_sr_uris}"
+[ "$(cat "$_sr_state/creds")" = "22222222-2222-2222-2222-222222222222 other" ] && ok "…only the credential named for this deployment was deleted" || bad "credential scope" "creds now: $(cat "$_sr_state/creds")"
+case "$_sr_out" in *"signin_redirect=removed"*"signin_credential=removed-1"*) ok "…reported removed + removed-1" ;; *) bad "remove facts" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+
+# remove the LAST URI → the app is left with an empty list, not an error.
+sr HOSTING_SR_URIS="[\"${SR_MINE}\"]" -- remove --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -eq 0 ] && [ "$_sr_uris" = "[]" ] && ok "removing the last URI leaves an empty list" || bad "remove last" "rc=${_sr_rc} uris=${_sr_uris}: ${_sr_out}"
+rm -rf "$_sr_state"
+
+# remove when already gone → nothing written, said so (a re-requested Teardown).
+sr -- remove --client-id $SR_ID --host acme.meshweaver.cloud --credential acme
+[ "$_sr_rc" -eq 0 ] && ok "remove over an absent URI and credential succeeds (re-requested Teardown)" || bad "remove absent" "exited ${_sr_rc}: ${_sr_out}"
+case "$_sr_log" in *"rest --method PATCH"*|*"credential delete"*) bad "…and writes nothing" "az saw: ${_sr_log}" ;; *) ok "…and writes nothing" ;; esac
+case "$_sr_out" in *"signin_redirect=absent"*"signin_credential=absent"*) ok "…reported absent + absent" ;; *) bad "absent facts" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+
+# dry runs read but never write.
+sr HOSTING_DRY_RUN=true -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -eq 0 ] && ok "a dry-run add succeeds" || bad "dry add" "exited ${_sr_rc}: ${_sr_out}"
+case "$_sr_log" in *"rest --method PATCH"*) bad "…and writes nothing" "az saw: ${_sr_log}" ;; *) ok "…and writes nothing" ;; esac
+case "$_sr_out" in *"signin_redirect=would-add"*) ok "…reporting would-add" ;; *) bad "would-add" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+sr HOSTING_DRY_RUN=true HOSTING_SR_URIS="[\"${SR_MINE}\"]" HOSTING_SR_CREDS='11111111-1111-1111-1111-111111111111 acme' -- remove --client-id $SR_ID --host acme.meshweaver.cloud --credential acme
+[ "$_sr_rc" -eq 0 ] && ok "a dry-run remove succeeds" || bad "dry remove" "exited ${_sr_rc}: ${_sr_out}"
+case "$_sr_log" in *"rest --method PATCH"*|*"credential delete"*) bad "…and writes nothing" "az saw: ${_sr_log}" ;; *) ok "…and writes nothing" ;; esac
+case "$_sr_out" in *"signin_redirect=would-remove"*"signin_credential=would-remove-1"*) ok "…reporting would-remove" ;; *) bad "would-remove" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+
+refuses_hard "signin-redirect needs a verb"                   "must be 'add' or 'remove'"      hosting-signin-redirect --client-id $SR_ID --host a.test
+refuses_hard "signin-redirect needs --host"                   "missing required flag --host"   hosting-signin-redirect add --client-id $SR_ID
+refuses_hard "signin-redirect needs --client-id"              "missing required flag --client-id" hosting-signin-redirect add --host a.test
+refuses_hard "signin-redirect refuses a client id that is not a GUID" "is not an Entra application" hosting-signin-redirect add --client-id 'x;id' --host a.test
+refuses_hard "signin-redirect refuses a host with a space"    "is not a hostname"              hosting-signin-redirect add --client-id $SR_ID --host 'a.test x'
+refuses_hard "signin-redirect refuses --credential on add"    "applies to 'remove' only"       hosting-signin-redirect add --client-id $SR_ID --host a.test --credential acme
+refuses_hard "signin-redirect refuses a credential with a metacharacter" "is not a plain name" hosting-signin-redirect remove --client-id $SR_ID --host a.test --credential "a'b"
+refuses_hard "signin-redirect rejects unknown flags"          "unknown argument"               hosting-signin-redirect add --client-id $SR_ID --host a.test --nope 1
+unset _sr_out _sr_rc _sr_log _sr_state _sr_uris
 echo "── hosting-image-mirror: the pinned images reach the fleet registry, once, verified ──"
 # MeshWeaver.Plugins#1722 — cr.meshweaver.cloud serves only what was pushed to it; a record pinning
 # a tag it lacks sent a human to `crane copy` (runbook step 4). The crane stub keeps a two-registry

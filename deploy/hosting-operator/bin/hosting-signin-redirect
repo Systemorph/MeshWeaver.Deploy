@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# hosting-signin-redirect add    --client-id <shared app id> --host <host>
+# hosting-signin-redirect remove --client-id <shared app id> --host <host> [--credential <deployment id>]
+#
+# The fleet's SHARED sign-in app for throwaway and test instances (MeshWeaver.Plugins#4336,
+# MeshWeaver.Plugins `Hosting/SharedTestSignInApp`). One Entra app registration, owned by the
+# operator identity, that every record with `signIn.sharedThrowawayApp: true` names as its
+# `microsoftClientId`. Entra has NO wildcard web redirect URI, so each instance's
+# https://<host>/signin-microsoft is ADDED by its governed Provision and REMOVED by its Teardown —
+# here, through Graph, as the operator identity. Never by hand.
+#
+#   add     the host's redirect URI joins the app's web redirect URIs. Present → kept. Absent → the
+#           app's list is PATCHed with the URI appended and READ BACK: the step is green only when
+#           the URI is on the app AND every URI that was there before still is.
+#   remove  the host's redirect URI leaves the list (absent → nothing to do), read back absent.
+#           With --credential, every client credential whose display name is exactly that deployment
+#           id — the one the Provision's "Ensure sign-in app secret" step added with --append — is
+#           deleted and the listing read back empty. No other credential is touched.
+#
+# 🚨 THE APP MUST CARRY THE TAG `meshweaver-shared-throwaway-signin`. It is how this script knows
+# it is editing the SHARED app and not an app registered for one production instance whose id a
+# record mis-declared: an untagged app is refused before anything is read further or written. The
+# owner sets the tag once, when registering the app (the one-time step in the manual).
+#
+# 🚨 THE REDIRECT-URI LIMIT. Entra caps an app that signs in work or school accounts at 256 redirect
+# URIs (100 if it also accepts personal Microsoft accounts) — every platform counted together. An add
+# that would exceed the limit is REFUSED with the count and the instruction to tear down a throwaway
+# instance first; it is never truncated, and no other instance's URI is ever dropped to make room.
+#
+# 🚨 A READ-MODIFY-WRITE, and Graph offers no compare-and-swap on an application's redirect URIs.
+# Two throwaway Provisions or Teardowns of DIFFERENT deployments running in the same seconds can lose
+# one URI, or keep one a Teardown had just removed (the aks-ops lane serialises per deployment, not
+# across). Each run reads back only ITS OWN URI — the one it can vouch for — and the Provision's
+# later "Ensure sign-in app secret" step re-verifies it once more. A lost URI is repaired by
+# re-requesting that Provision (`add` is idempotent); a kept stale one by re-requesting the Teardown.
+#
+# Needs Graph `Application.ReadWrite.OwnedBy` and ownership of the app (MeshWeaver.Plugins
+# `Hosting/SharedTestSignInApp` → the one-time step). A refusal from Graph is RED with the hand
+# command — no instance is ever reported as reachable through a URI that was not written.
+# shellcheck source=_common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
+# shellcheck disable=SC2034  # read by hosting::die in _common.sh, which shellcheck does not follow here
+HOSTING_CMD="hosting-signin-redirect"
+
+SHARED_APP_TAG="meshweaver-shared-throwaway-signin"
+# Entra's documented maximum for an app whose audience is work or school accounts; the stricter
+# personal-account limit applies when the app's sign-in audience includes personal accounts.
+REDIRECT_LIMIT_ORG=256
+REDIRECT_LIMIT_PERSONAL=100
+
+verb="${1:-}"
+[ $# -gt 0 ] && shift
+case "$verb" in add|remove) ;; *) hosting::die "first argument must be 'add' or 'remove', got '${verb}'" ;; esac
+
+client_id="" host="" credential=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client-id)  client_id="${2:-}";  shift 2 ;;
+    --host)       host="${2:-}";       shift 2 ;;
+    --credential) credential="${2:-}"; shift 2 ;;
+    *) hosting::die "unknown argument '$1'" ;;
+  esac
+done
+hosting::need_flag client-id "$client_id"
+hosting::need_flag host "$host"
+hosting::safe_host host "$host"
+[[ "$client_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+  || hosting::die "client-id '${client_id}' is not an Entra application (client) id — refusing to interpolate it into a command"
+if [ -n "$credential" ]; then
+  [ "$verb" = "remove" ] || hosting::die "--credential applies to 'remove' only"
+  hosting::safe_name credential "$credential"
+fi
+
+redirect="https://${host}/signin-microsoft"
+graph_app="https://graph.microsoft.com/v1.0/applications(appId='${client_id}')"
+
+# read_app — the tags, the audience and the web redirect URIs, or RED naming the right.
+read_app() {
+  local out
+  if ! out="$(az ad app show --id "$client_id" --query '{tags: tags, audience: signInAudience, uris: web.redirectUris}' -o json 2>/dev/null)"; then
+    hosting::die "could not read app ${client_id} — the operator identity needs Graph Application.ReadWrite.OwnedBy AND ownership of the shared app (the one-time step in MeshWeaver.Plugins Hosting/SharedTestSignInApp). Nothing was changed."
+  fi
+  printf '%s' "$out"
+}
+
+# write_uris <json array> — PATCH the app's web redirect URIs to exactly this list.
+write_uris() {
+  local body
+  body="$(jq -cn --argjson uris "$1" '{web: {redirectUris: $uris}}')" \
+    || hosting::die "could not compose the redirect-URI patch for app ${client_id}"
+  if hosting::dry; then
+    printf '  DRY-RUN would run: az rest --method PATCH --uri %s (web.redirectUris: %s entries)\n' "$graph_app" "$(jq 'length' <<<"$1")" >&2
+    return 0
+  fi
+  printf '  + az rest --method PATCH --uri %s (web.redirectUris: %s entries)\n' "$graph_app" "$(jq 'length' <<<"$1")" >&2
+  az rest --method PATCH --uri "$graph_app" --headers "Content-Type=application/json" --body "$body" --output none 2>/dev/null \
+    || hosting::die "Graph refused to update the redirect URIs of app ${client_id} — the operator identity needs Application.ReadWrite.OwnedBy and ownership of the app. Nothing was changed. By hand: az ad app update --id ${client_id} --web-redirect-uris <every current URI> ${redirect}"
+}
+
+app="$(read_app)"
+jq -e --arg t "$SHARED_APP_TAG" '(.tags // []) | index($t) != null' <<<"$app" >/dev/null \
+  || hosting::die "app ${client_id} does not carry the tag '${SHARED_APP_TAG}' — it is not the fleet's shared throwaway sign-in app, and this step refuses to edit the redirect URIs of an app registered for one instance. Either the record names the wrong microsoftClientId, or the shared app was registered without the tag (the one-time step: az ad app update --id ${client_id} --set tags='[\"${SHARED_APP_TAG}\"]')."
+before="$(jq -c '.uris // []' <<<"$app")"
+count="$(jq 'length' <<<"$before")"
+audience="$(jq -r '.audience // ""' <<<"$app")"
+case "$audience" in
+  *Personal*) limit=$REDIRECT_LIMIT_PERSONAL ;;
+  *) limit=$REDIRECT_LIMIT_ORG ;;
+esac
+present=false
+jq -e --arg u "$redirect" 'index($u) != null' <<<"$before" >/dev/null && present=true
+hosting::say signin_redirect_count "$count"
+hosting::say signin_redirect_limit "$limit"
+
+if [ "$verb" = "add" ]; then
+  hosting::step "Add the instance's redirect URI to the shared sign-in app"
+  if [ "$present" = true ]; then
+    hosting::log "keep    ${redirect} (already on app ${client_id})"
+    hosting::say signin_redirect kept
+    exit 0
+  fi
+  if [ "$count" -ge "$limit" ]; then
+    hosting::die "app ${client_id} already carries ${count} redirect URIs — Entra's limit for its audience (${audience:-unknown}) is ${limit}. Tear down a throwaway instance that uses the shared app (its Teardown removes its URI) and re-request; no other instance's URI is dropped to make room."
+  fi
+  after="$(jq -c --arg u "$redirect" '. + [$u]' <<<"$before")"
+  write_uris "$after"
+  if hosting::dry; then
+    hosting::log "(dry run) would add ${redirect} to app ${client_id} (${count} → $((count + 1)) of ${limit})"
+    hosting::say signin_redirect would-add
+    exit 0
+  fi
+  readback="$(read_app | jq -c '.uris // []')"
+  jq -e --arg u "$redirect" 'index($u) != null' <<<"$readback" >/dev/null \
+    || hosting::die "app ${client_id} was patched but ${redirect} is not among its redirect URIs on read-back — refusing to report a sign-in that would fail with AADSTS50011"
+  hosting::log "added   ${redirect} to app ${client_id} (read back; $((count + 1)) of ${limit})"
+  hosting::say signin_redirect added
+  exit 0
+fi
+
+# ── remove ────────────────────────────────────────────────────────────────────────────────────
+hosting::step "Remove the instance's redirect URI from the shared sign-in app"
+if [ "$present" = true ]; then
+  after="$(jq -c --arg u "$redirect" 'map(select(. != $u))' <<<"$before")"
+  write_uris "$after"
+  if hosting::dry; then
+    hosting::log "(dry run) would remove ${redirect} from app ${client_id}"
+    hosting::say signin_redirect would-remove
+  else
+    readback="$(read_app | jq -c '.uris // []')"
+    jq -e --arg u "$redirect" 'index($u) == null' <<<"$readback" >/dev/null \
+      || hosting::die "app ${client_id} was patched but still lists ${redirect} on read-back"
+    hosting::log "removed ${redirect} from app ${client_id} (read back)"
+    hosting::say signin_redirect removed
+  fi
+else
+  hosting::log "absent  ${redirect} (not on app ${client_id} — nothing to remove)"
+  hosting::say signin_redirect absent
+fi
+
+[ -n "$credential" ] || exit 0
+hosting::step "Remove the instance's client credential from the shared sign-in app"
+if ! keys="$(az ad app credential list --id "$client_id" --query "[?displayName=='${credential}'].keyId" -o tsv 2>/dev/null)"; then
+  hosting::die "could not list the credentials of app ${client_id} — the operator identity needs Application.ReadWrite.OwnedBy and ownership of the app. The redirect URI step above stands; nothing else was changed."
+fi
+if [ -z "$keys" ]; then
+  hosting::log "absent  credential '${credential}' (none on app ${client_id})"
+  hosting::say signin_credential absent
+  exit 0
+fi
+n=0
+while IFS= read -r key; do
+  [ -n "$key" ] || continue
+  [[ "$key" =~ ^[0-9a-fA-F-]{36}$ ]] || hosting::die "credential key id '${key}' is not a GUID — refusing"
+  hosting::do az ad app credential delete --id "$client_id" --key-id "$key" --output none \
+    || hosting::die "could not delete credential '${credential}' (${key}) from app ${client_id}"
+  n=$((n + 1))
+done <<<"$keys"
+if hosting::dry; then
+  hosting::say signin_credential "would-remove-${n}"
+  exit 0
+fi
+left="$(az ad app credential list --id "$client_id" --query "[?displayName=='${credential}'].keyId" -o tsv 2>/dev/null)" \
+  || hosting::die "credential '${credential}' was deleted from app ${client_id} but the listing could not be read back"
+[ -z "$left" ] || hosting::die "app ${client_id} still lists credential '${credential}' after the delete: ${left}"
+hosting::log "removed ${n} credential(s) '${credential}' from app ${client_id} (read back)"
+hosting::say signin_credential "removed-${n}"
