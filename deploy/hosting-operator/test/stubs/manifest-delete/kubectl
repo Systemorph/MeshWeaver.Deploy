@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# A stand-in `kubectl` for hosting-manifest-delete. Not a YAML parser: the "parse" answers the JSON fixture
+# that sits beside the manifest (<file>.json). The cluster is a state file of live objects, one
+# `<resource> <namespace|-> <name>` line each, so a delete REMOVES the line and the read-back sees it go.
+#
+#   HOSTING_MD_STATE   directory: kubectl.log (every argv), live (the objects on the "cluster")
+#   MW_MD_REFUSE_READ  a resource whose `get` answers Forbidden
+#   MW_MD_STUCK        a name whose `delete` reports success but leaves the object in place (a finalizer
+#                      that never runs) — the read-back must catch it
+#   MW_MD_DENY_DELETE  a name whose server-side dry-run delete is refused
+#
+#   kubectl create --dry-run=client -f <file> -o json   → <file>.json
+#   kubectl [-n <ns>] get <res> <name> --ignore-not-found -o name → "<res>/<name>" when live, nothing otherwise
+#   kubectl -n <ns> get <res> -o name                   → every live <res> in <ns>
+#   kubectl [-n <ns>] delete <res> <name> --dry-run=server → "<res> "<name>" deleted (server dry run)"
+#   kubectl [-n <ns>] delete <res> <name> --ignore-not-found --wait=true --timeout=…  → removes it
+set -uo pipefail
+state="${HOSTING_MD_STATE:?the kubectl stub needs HOSTING_MD_STATE}"
+printf 'kubectl %s\n' "$*" >> "$state/kubectl.log"
+touch "$state/live"
+ns="-"
+if [ "${1:-}" = "-n" ]; then ns="$2"; shift 2; fi
+verb="${1:-}"; shift || true
+case "$verb" in
+  create)
+    file=""; prev=""
+    for a in "$@"; do [ "$prev" = "-f" ] && file="$a"; prev="$a"; done
+    cat "${file}.json" ;;
+  get)
+    res="$1"; shift
+    if [ -n "${MW_MD_REFUSE_READ:-}" ] && [ "$res" = "$MW_MD_REFUSE_READ" ]; then
+      echo "Error from server (Forbidden): ${res} is forbidden: User \"x\" cannot get resource" >&2; exit 1
+    fi
+    if [ "${1:-}" = "-o" ]; then   # a list of every <res> in the namespace
+      while read -r r n name || [ -n "${r:-}" ]; do [ "$r" = "$res" ] && [ "$n" = "$ns" ] && echo "${res%%.*}/${name}"; done < "$state/live"
+      exit 0
+    fi
+    name="$1"
+    while read -r r n nm || [ -n "${r:-}" ]; do [ "$r" = "$res" ] && [ "$n" = "$ns" ] && [ "$nm" = "$name" ] && echo "${res%%.*}/${name}"; done < "$state/live"
+    exit 0 ;;
+  delete)
+    res="$1"; name="$2"
+    case "$*" in
+      *--dry-run=server*)
+        if [ -n "${MW_MD_DENY_DELETE:-}" ] && [ "$name" = "$MW_MD_DENY_DELETE" ]; then
+          echo "Error from server (Forbidden): ${res} \"${name}\" is forbidden: cannot delete" >&2; exit 1
+        fi
+        echo "${res%%.*} \"${name}\" deleted (server dry run)"; exit 0 ;;
+    esac
+    if [ -n "${MW_MD_STUCK:-}" ] && [ "$name" = "$MW_MD_STUCK" ]; then echo "${res%%.*} \"${name}\" deleted"; exit 0; fi
+    grep -v -x -F "${res} ${ns} ${name}" "$state/live" > "$state/live.next" || true
+    mv "$state/live.next" "$state/live"
+    # A namespace takes everything in it along, as the API server's namespace controller does.
+    if [ "$res" = namespaces ]; then
+      grep -v " ${name} " "$state/live" > "$state/live.next" || true
+      mv "$state/live.next" "$state/live"
+    fi
+    echo "${res%%.*} \"${name}\" deleted" ;;
+  *) echo "kubectl stub: unexpected invocation: $*" >&2; exit 1 ;;
+esac

@@ -99,14 +99,14 @@ jobs:
         run: |
           set -euo pipefail
           tracked=$(git ls-files "$OPERATOR_DIR/bin/" | wc -l | tr -d ' ')
-          if [ "$tracked" -lt 48 ]; then
-            echo "::error::only ${tracked} file(s) tracked under $OPERATOR_DIR/bin/ — expected at least 48 (42 commands + run.sh + _common.sh + _audit.jq + _values_half.py + _dump_analyze_pod.sh + _storage_prune_pod.sh). The floor is the REAL count — raise it with every file added, or a lost file passes."
+          if [ "$tracked" -lt 49 ]; then
+            echo "::error::only ${tracked} file(s) tracked under $OPERATOR_DIR/bin/ — expected at least 49 (43 commands + run.sh + _common.sh + _audit.jq + _values_half.py + _dump_analyze_pod.sh + _storage_prune_pod.sh). The floor is the REAL count — raise it with every file added, or a lost file passes."
             exit 1
           fi
           nonexec=$(git ls-files -s "$OPERATOR_DIR"/bin/hosting-* "$OPERATOR_DIR/bin/run.sh" | awk '$1 != "100755"' | wc -l | tr -d ' ')
           [ "$nonexec" -eq 0 ] || { echo "::error::${nonexec} operator command(s) are not committed executable (mode 100755)"; exit 1; }
           stubs=$(git ls-files -s "$OPERATOR_DIR/test/stubs/" | wc -l | tr -d ' ')
-          [ "$stubs" -ge 54 ] || { echo "::error::only ${stubs} test stub(s) tracked under $OPERATOR_DIR/test/stubs/ — expected at least 54 (the real count; raise it with every stub added)"; exit 1; }
+          [ "$stubs" -ge 55 ] || { echo "::error::only ${stubs} test stub(s) tracked under $OPERATOR_DIR/test/stubs/ — expected at least 55 (the real count; raise it with every stub added)"; exit 1; }
           nonexec_stubs=$(git ls-files -s "$OPERATOR_DIR/test/stubs/" | awk '$1 != "100755"' | wc -l | tr -d ' ')
           [ "$nonexec_stubs" -eq 0 ] || { echo "::error::${nonexec_stubs} test stub(s) are not committed executable (mode 100755)"; exit 1; }
           echo "${tracked} bin files and ${stubs} stubs tracked, all executable"

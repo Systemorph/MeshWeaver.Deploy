@@ -1,5 +1,15 @@
 # hosting-operator — the identity an instance lifecycle run uses
 
+> 🗑️ **Retiring (Systemorph/Memex#314).** The `hosting-operator` Job path — `namespace.yaml`,
+> `operator-serviceaccount.yaml`, `operator-rbac.yaml`, `jobrunner.yaml` — has no caller any more. Its
+> objects leave the cluster through the governed **`DeleteClusterManifest`** action
+> (`deploy/hosting-operator/bin/hosting-manifest-delete`: an approved plan of named objects bound to its
+> digest, deleted in dependency order and read back absent), never `kubectl delete` from a workstation.
+> **These four files stay here until the cluster objects are gone: they ARE the record of what to
+> delete.** `secret-writer.yaml` is KEPT, and `hosting-manifest-delete` refuses every object it names
+> (a hard deny list, tested in `deploy/hosting-operator/test/run-tests.sh`). `operator-rbac.yaml` is also
+> what `check-rbac-coverage.sh` reads; its removal is a separate, later change.
+
 Applied on the **control instance's** cluster only. Three principals, deliberately separate:
 
 | Principal | Can | Cannot |
