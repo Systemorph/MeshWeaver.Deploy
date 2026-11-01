@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# A stand-in psql for hosting-db-retire's tests (Systemorph/Memex#923). It plays ONE Flexible Server
+# from files in $HOSTING_DBRT_STATE and records every invocation (PGPASSWORD set/unset, never the
+# value) in $HOSTING_DBRT_STATE/pg.log:
+#   dbs          the databases that exist, one per line
+#   sessions     what pg_stat_activity counts for any database (default 0)
+#   size         what pg_database_size answers (default 4096)
+#   fail-on      a substring: the first statement containing it fails (exit 1), nothing changes
+#   sticky-drop  present: DROP DATABASE answers success but removes nothing (a lying server)
+# Not a mock of Postgres: it asserts nothing about SQL semantics — only which statements the script
+# issues, in which order, and what it does when one of them fails.
+set -uo pipefail
+state="${HOSTING_DBRT_STATE:?the psql stub needs HOSTING_DBRT_STATE}"
+sqltext="" db=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    -tAc|-c) sqltext="${args[$((i + 1))]}" ;;
+    -d)      db="${args[$((i + 1))]}" ;;
+  esac
+done
+printf 'psql PGPASSWORD=%s db=%s sql=%s\n' "$([ -n "${PGPASSWORD:-}" ] && echo set || echo unset)" "$db" "$sqltext" >> "$state/pg.log"
+fail_on="$(cat "$state/fail-on" 2>/dev/null || true)"
+if [ -n "$fail_on" ] && [[ "$sqltext" == *"$fail_on"* ]]; then
+  : > "$state/fail-on"
+  echo "ERROR:  stub refused: ${fail_on}" >&2; exit 1
+fi
+touch "$state/dbs"
+case "$sqltext" in
+  *"count(*) FROM pg_database WHERE datname = '"*)
+    name="$(printf '%s' "$sqltext" | sed -n "s/.*datname = '\\([^']*\\)'.*/\\1/p")"
+    grep -qx "$name" "$state/dbs" && echo 1 || echo 0 ;;
+  *pg_database_size*) cat "$state/size" 2>/dev/null || echo 4096 ;;
+  *pg_stat_activity*) cat "$state/sessions" 2>/dev/null || echo 0 ;;
+  "DROP DATABASE "*)
+    name="$(printf '%s' "$sqltext" | sed -n 's/^DROP DATABASE "\([a-z0-9_]*\)".*/\1/p')"
+    if [ ! -e "$state/sticky-drop" ]; then
+      grep -vx "$name" "$state/dbs" > "$state/dbs.new"; mv "$state/dbs.new" "$state/dbs"
+    fi
+    echo "DROP DATABASE" ;;
+  *) echo "psql stub: unexpected statement: ${sqltext}" >&2; exit 1 ;;
+esac
+exit 0
