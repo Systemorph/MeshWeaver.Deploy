@@ -40,9 +40,11 @@ import json, sys, yaml
 docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if isinstance(d, dict)]
 def comp(d): return ((d.get("metadata") or {}).get("labels") or {}).get("app.kubernetes.io/component", "")
 sas = [d for d in docs if d.get("kind") == "ServiceAccount" and comp(d) == "memex-registry"]
-deps = {d["metadata"]["name"]: (d["spec"]["template"]["spec"].get("serviceAccountName"))
-        for d in docs if d.get("kind") == "Deployment" and comp(d).startswith("memex-registry")}
-print(json.dumps({"sas": sas, "deps": deps}))
+regdeps = [d for d in docs if d.get("kind") == "Deployment" and comp(d).startswith("memex-registry")]
+deps = {d["metadata"]["name"]: d["spec"]["template"]["spec"].get("serviceAccountName") for d in regdeps}
+idsum = {d["metadata"]["name"]: ((d["spec"]["template"].get("metadata") or {}).get("annotations") or {}).get("checksum/identity")
+         for d in regdeps}
+print(json.dumps({"sas": sas, "deps": deps, "idsum": idsum}))
 '
 inspect() { python3 -c "$INSPECT"; }
 
@@ -58,7 +60,9 @@ if j["sas"]: p.append(f"{len(j['"'"'sas'"'"'])} registry ServiceAccount(s) rende
 if len(j["deps"]) != 2: p.append(f"expected the two registry Deployments, found {sorted(j['"'"'deps'"'"'])}")
 for name, sa in j["deps"].items():
     if sa != "memex-portal-sa": p.append(f"{name} runs as {sa!r}, not the portal account memex-portal-sa")
-print("; ".join(p))')"
+for name, s in j["idsum"].items():
+    if s is not None: p.append(f"{name} carries a checksum/identity annotation with no client id")
+print("; ".join(p))')" || { report "no client id ($variant serviceAccount): the inspection itself failed, so there is no evidence"; continue; }
   if [ -z "$verdict" ]; then ok "no client id ($variant serviceAccount): no registry ServiceAccount, both registry pods run as memex-portal-sa"
   else report "no client id ($variant serviceAccount): $verdict"; fi
 done
@@ -82,12 +86,35 @@ else:
 if len(j["deps"]) != 2: p.append(f"expected the two registry Deployments, found {sorted(j['"'"'deps'"'"'])}")
 for name, sa in j["deps"].items():
     if sa != want: p.append(f"{name} runs as {sa!r}, not {want!r}")
-print("; ".join(p))')"
+for name, s in j["idsum"].items():
+    if not s: p.append(f"{name} carries no checksum/identity annotation, so a changed client id would not roll it")
+print("; ".join(p))')" || { report "a client id ($expected): the inspection itself failed, so there is no evidence"; return; }
   if [ -z "$verdict" ]; then ok "a client id renders ONE annotated, tokenless account $expected and both registry pods run as it"
   else report "a client id ($expected): $verdict"; fi
 }
 check_dedicated memex-registry-sa --set registry.serviceAccount= --set registry.workloadIdentity.clientId="$CLIENT_ID"
 check_dedicated registry-writer --set registry.serviceAccount=registry-writer --set registry.workloadIdentity.clientId="$CLIENT_ID"
+
+# ---- 2b. a changed client id under the same account name rolls both registry pods -------------
+OTHER_ID="66666666-7777-8888-9999-000000000000"
+roll_verdict() {
+  local a b
+  a="$(render --set registry.serviceAccount= --set registry.workloadIdentity.clientId="$CLIENT_ID" | inspect)" || return 1
+  b="$(render --set registry.serviceAccount= --set registry.workloadIdentity.clientId="$OTHER_ID" | inspect)" || return 1
+  A="$a" B="$b" python3 -c '
+import json, os
+a = json.loads(os.environ["A"])["idsum"]; b = json.loads(os.environ["B"])["idsum"]; p = []
+if len(a) != 2 or sorted(a) != sorted(b): p.append(f"expected the two registry Deployments in both renders, found {sorted(a)} / {sorted(b)}")
+for name in a:
+    if not a[name] or a[name] == b.get(name): p.append(f"{name}: the pod template does not change with the client id")
+print("; ".join(p))'
+}
+if verdict="$(roll_verdict)"; then
+  if [ -z "$verdict" ]; then ok "a changed client id under the same account changes both registry pod templates (they roll)"
+  else report "a changed client id: $verdict"; fi
+else
+  report "a changed client id: the render or the inspection failed, so there is no evidence"
+fi
 
 # ---- 3. refusals -------------------------------------------------------------------------------
 refuses() {
