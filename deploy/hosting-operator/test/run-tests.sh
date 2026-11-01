@@ -1189,6 +1189,120 @@ case "$_sa_log" in *"ad app"*|*"secret set"*) bad "…and touches neither Graph 
 case "$_sa_out" in *"signin_secret=would-create"*) ok "…reporting would-create" ;; *) bad "would-create" "said: ${_sa_out}" ;; esac
 rm -rf "$_sa_state"
 unset _sa_out _sa_rc _sa_log _sa_state
+echo "── hosting-signin-redirect: the shared throwaway sign-in app gains and loses one host's URI ──"
+# MeshWeaver.Plugins#4336 — a throwaway instance signs in through the fleet's ONE shared app; Entra
+# has no wildcard redirect URI, so Provision adds https://<host>/signin-microsoft and Teardown
+# removes it (and the credential Provision added under the deployment id). The stub keeps the app's
+# URIs in a mutable state, so every read-back reads what the PATCH wrote. 🚨 Stub FIRST on PATH.
+SR_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/signin-redirect" && pwd)"
+sr() {  # sr [env…] -- <args…>
+  local envs=()
+  while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  _sr_state="$(mktemp -d)"
+  _sr_out="$(env "${envs[@]}" PATH="$SR_STUBS:$PATH" HOSTING_SR_STATE="$_sr_state" hosting-signin-redirect "$@" 2>&1)"; _sr_rc=$?
+  _sr_log="$(cat "$_sr_state/az.log" 2>/dev/null || true)"
+  _sr_uris="$(cat "$_sr_state/uris.json" 2>/dev/null || true)"
+}
+SR_ID=0e5a1d2c-0000-4000-8000-00000000a0a2
+SR_OTHER="https://other.example.test/signin-microsoft"
+SR_MINE="https://acme.meshweaver.cloud/signin-microsoft"
+
+# add, absent → PATCHed with BOTH URIs, read back, reported added.
+sr -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -eq 0 ] && ok "signin-redirect add: an absent URI is added" || bad "add absent" "exited ${_sr_rc}: ${_sr_out}"
+[ "$_sr_uris" = "[\"${SR_OTHER}\",\"${SR_MINE}\"]" ] && ok "…appended, every other instance's URI kept" || bad "add keeps others" "app now lists: ${_sr_uris}"
+case "$_sr_out" in *"::hosting:: signin_redirect=added"*) ok "…reported added" ;; *) bad "added fact" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+
+# add, present → kept, no PATCH.
+sr HOSTING_SR_URIS="[\"${SR_MINE}\"]" -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -eq 0 ] && ok "add over a present URI succeeds (idempotent)" || bad "add present" "exited ${_sr_rc}: ${_sr_out}"
+case "$_sr_log" in *"rest --method PATCH"*) bad "…without writing" "az saw: ${_sr_log}" ;; *) ok "…without writing" ;; esac
+case "$_sr_out" in *"::hosting:: signin_redirect=kept"*) ok "…reported kept" ;; *) bad "kept fact" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+
+# 🚨 an UNTAGGED app is not the shared app → refused before any write.
+sr HOSTING_SR_TAGS='[]' -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -ne 0 ] && ok "an app WITHOUT the shared-app tag is refused" || bad "untagged refused" "exited 0: ${_sr_out}"
+case "$_sr_out" in *"does not carry the tag 'meshweaver-shared-throwaway-signin'"*) ok "…naming the tag" ;; *) bad "untagged message" "said: ${_sr_out}" ;; esac
+case "$_sr_log" in *"rest --method PATCH"*) bad "…and writes nothing" "az saw: ${_sr_log}" ;; *) ok "…and writes nothing" ;; esac
+rm -rf "$_sr_state"
+# negative control for the tag check: the tag among others passes.
+sr HOSTING_SR_TAGS='["x","meshweaver-shared-throwaway-signin"]' -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -eq 0 ] && ok "…while the tag among other tags is accepted (negative control)" || bad "tag among others" "exited ${_sr_rc}: ${_sr_out}"
+rm -rf "$_sr_state"
+
+# 🚨 the redirect-URI limit: 256 for a work-or-school app → refused, nothing dropped.
+sr HOSTING_SR_URIS="$(jq -cn '[range(256) | "https://t\(.).example.test/signin-microsoft"]')" -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -ne 0 ] && ok "an app at 256 redirect URIs refuses the 257th" || bad "limit refused" "exited 0: ${_sr_out}"
+case "$_sr_out" in *"already carries 256 redirect URIs"*"limit for its audience (AzureADMyOrg) is 256"*) ok "…naming the count and the limit" ;; *) bad "limit message" "said: ${_sr_out}" ;; esac
+case "$_sr_log" in *"rest --method PATCH"*) bad "…and drops nobody's URI to make room" "az saw: ${_sr_log}" ;; *) ok "…and drops nobody's URI to make room" ;; esac
+rm -rf "$_sr_state"
+# negative control: 255 leaves room for one more.
+sr HOSTING_SR_URIS="$(jq -cn '[range(255) | "https://t\(.).example.test/signin-microsoft"]')" -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -eq 0 ] && ok "…while 255 leaves room for the 256th (negative control)" || bad "255 has room" "exited ${_sr_rc}: ${_sr_out}"
+[ "$(jq 'length' <<<"$_sr_uris")" = "256" ] && ok "…and the app then lists 256" || bad "256 after add" "app lists $(jq 'length' <<<"$_sr_uris")"
+rm -rf "$_sr_state"
+# an app that also takes personal accounts is held to 100.
+sr HOSTING_SR_AUDIENCE=AzureADandPersonalMicrosoftAccount HOSTING_SR_URIS="$(jq -cn '[range(100) | "https://t\(.).example.test/signin-microsoft"]')" -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -ne 0 ] && ok "an app that also takes personal accounts is held to 100" || bad "personal limit" "exited 0: ${_sr_out}"
+case "$_sr_out" in *"is 100"*) ok "…naming 100" ;; *) bad "personal limit message" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+
+# a PATCH that changed nothing is caught by the read-back → RED.
+sr HOSTING_SR_PATCH_IGNORED=1 -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -ne 0 ] && ok "a write the read-back does not show is a failed step" || bad "read-back catches" "exited 0: ${_sr_out}"
+case "$_sr_out" in *"not among its redirect URIs on read-back"*) ok "…naming the read-back" ;; *) bad "read-back message" "said: ${_sr_out}" ;; esac
+case "$_sr_out" in *"signin_redirect=added"*) bad "…and never reports added" "said: ${_sr_out}" ;; *) ok "…and never reports added" ;; esac
+rm -rf "$_sr_state"
+
+# Graph denied → RED naming the right, nothing written.
+sr HOSTING_SR_GRAPH_DENIED=1 -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -ne 0 ] && ok "an identity without the Graph right is a RED step" || bad "denied red" "exited 0"
+case "$_sr_out" in *"Application.ReadWrite.OwnedBy"*"ownership"*) ok "…naming the right and the ownership" ;; *) bad "denied message" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+
+# remove → the URI goes, others stay, read back; the deployment's credential goes, others stay.
+sr HOSTING_SR_URIS="[\"${SR_OTHER}\",\"${SR_MINE}\"]" HOSTING_SR_CREDS=$'11111111-1111-1111-1111-111111111111 acme\n22222222-2222-2222-2222-222222222222 other' -- remove --client-id $SR_ID --host acme.meshweaver.cloud --credential acme
+[ "$_sr_rc" -eq 0 ] && ok "signin-redirect remove: the URI and the instance's credential are removed" || bad "remove" "exited ${_sr_rc}: ${_sr_out}"
+[ "$_sr_uris" = "[\"${SR_OTHER}\"]" ] && ok "…only this host's URI left the app" || bad "remove keeps others" "app now lists: ${_sr_uris}"
+[ "$(cat "$_sr_state/creds")" = "22222222-2222-2222-2222-222222222222 other" ] && ok "…only the credential named for this deployment was deleted" || bad "credential scope" "creds now: $(cat "$_sr_state/creds")"
+case "$_sr_out" in *"signin_redirect=removed"*"signin_credential=removed-1"*) ok "…reported removed + removed-1" ;; *) bad "remove facts" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+
+# remove the LAST URI → the app is left with an empty list, not an error.
+sr HOSTING_SR_URIS="[\"${SR_MINE}\"]" -- remove --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -eq 0 ] && [ "$_sr_uris" = "[]" ] && ok "removing the last URI leaves an empty list" || bad "remove last" "rc=${_sr_rc} uris=${_sr_uris}: ${_sr_out}"
+rm -rf "$_sr_state"
+
+# remove when already gone → nothing written, said so (a re-requested Teardown).
+sr -- remove --client-id $SR_ID --host acme.meshweaver.cloud --credential acme
+[ "$_sr_rc" -eq 0 ] && ok "remove over an absent URI and credential succeeds (re-requested Teardown)" || bad "remove absent" "exited ${_sr_rc}: ${_sr_out}"
+case "$_sr_log" in *"rest --method PATCH"*|*"credential delete"*) bad "…and writes nothing" "az saw: ${_sr_log}" ;; *) ok "…and writes nothing" ;; esac
+case "$_sr_out" in *"signin_redirect=absent"*"signin_credential=absent"*) ok "…reported absent + absent" ;; *) bad "absent facts" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+
+# dry runs read but never write.
+sr HOSTING_DRY_RUN=true -- add --client-id $SR_ID --host acme.meshweaver.cloud
+[ "$_sr_rc" -eq 0 ] && ok "a dry-run add succeeds" || bad "dry add" "exited ${_sr_rc}: ${_sr_out}"
+case "$_sr_log" in *"rest --method PATCH"*) bad "…and writes nothing" "az saw: ${_sr_log}" ;; *) ok "…and writes nothing" ;; esac
+case "$_sr_out" in *"signin_redirect=would-add"*) ok "…reporting would-add" ;; *) bad "would-add" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+sr HOSTING_DRY_RUN=true HOSTING_SR_URIS="[\"${SR_MINE}\"]" HOSTING_SR_CREDS='11111111-1111-1111-1111-111111111111 acme' -- remove --client-id $SR_ID --host acme.meshweaver.cloud --credential acme
+[ "$_sr_rc" -eq 0 ] && ok "a dry-run remove succeeds" || bad "dry remove" "exited ${_sr_rc}: ${_sr_out}"
+case "$_sr_log" in *"rest --method PATCH"*|*"credential delete"*) bad "…and writes nothing" "az saw: ${_sr_log}" ;; *) ok "…and writes nothing" ;; esac
+case "$_sr_out" in *"signin_redirect=would-remove"*"signin_credential=would-remove-1"*) ok "…reporting would-remove" ;; *) bad "would-remove" "said: ${_sr_out}" ;; esac
+rm -rf "$_sr_state"
+
+refuses_hard "signin-redirect needs a verb"                   "must be 'add' or 'remove'"      hosting-signin-redirect --client-id $SR_ID --host a.test
+refuses_hard "signin-redirect needs --host"                   "missing required flag --host"   hosting-signin-redirect add --client-id $SR_ID
+refuses_hard "signin-redirect needs --client-id"              "missing required flag --client-id" hosting-signin-redirect add --host a.test
+refuses_hard "signin-redirect refuses a client id that is not a GUID" "is not an Entra application" hosting-signin-redirect add --client-id 'x;id' --host a.test
+refuses_hard "signin-redirect refuses a host with a space"    "is not a hostname"              hosting-signin-redirect add --client-id $SR_ID --host 'a.test x'
+refuses_hard "signin-redirect refuses --credential on add"    "applies to 'remove' only"       hosting-signin-redirect add --client-id $SR_ID --host a.test --credential acme
+refuses_hard "signin-redirect refuses a credential with a metacharacter" "is not a plain name" hosting-signin-redirect remove --client-id $SR_ID --host a.test --credential "a'b"
+refuses_hard "signin-redirect rejects unknown flags"          "unknown argument"               hosting-signin-redirect add --client-id $SR_ID --host a.test --nope 1
+unset _sr_out _sr_rc _sr_log _sr_state _sr_uris
 echo "── hosting-image-mirror: the pinned images reach the fleet registry, once, verified ──"
 # MeshWeaver.Plugins#1722 — cr.meshweaver.cloud serves only what was pushed to it; a record pinning
 # a tag it lacks sent a human to `crane copy` (runbook step 4). The crane stub keeps a two-registry
@@ -3178,6 +3292,134 @@ ma_refuses "a binding to a person or group is refused" "subject Group devs is no
 rm -rf "$_ma_root"
 unset _ma_out _ma_rc _ma_log _ma_sent _ma_root _ma_good
 
+echo
+echo "── hosting-manifest-delete: the inverse of the apply — a plan of named objects, bound to its digest ──"
+# The DeleteClusterManifest action's one command (Systemorph/Memex#314). What is tested: the plan (a
+# manifest's objects ∪ an explicit list) and its digest, the HARD DENY LIST of the kept secret-writer path,
+# the refusals, that `check` never deletes, the delete order, and that the delete READS EVERY OBJECT BACK
+# and fails on one that stayed. The cluster is the stub's state file: a delete removes the line.
+MD_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/manifest-delete" && pwd)"
+_md_root="$(mktemp -d)"; mkdir -p "$_md_root/demo"
+md_fixture() {  # md_fixture <name> <parsed json>
+  printf 'kind: List # fixture\n' > "$_md_root/demo/$1.yaml"; printf '%s\n' "$2" > "$_md_root/demo/$1.yaml.json"
+}
+md() {  # md <live objects ("<res> <ns|-> <name>" lines)> [env…] -- <args…>; sets $_md_out $_md_rc $_md_log $_md_live
+  local live="$1" envs=(); shift
+  while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  _md_state="$(mktemp -d)"; printf '%s' "$live" > "$_md_state/live"
+  _md_out="$(env "${envs[@]+"${envs[@]}"}" PATH="$MD_STUBS:$PATH" HOSTING_MD_STATE="$_md_state" HOSTING_MANIFESTS_ROOT="$_md_root" hosting-manifest-delete "$@" 2>&1)"; _md_rc=$?
+  _md_log="$(cat "$_md_state/kubectl.log" 2>/dev/null || true)"; _md_live="$(cat "$_md_state/live")"; rm -rf "$_md_state"
+}
+md_sha_of() { if command -v sha256sum >/dev/null 2>&1; then printf '%s' "$1" | sha256sum | cut -d' ' -f1; else printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; fi; }
+# Shaped like the retired job-runner path: a token and its account in a portal namespace, the RBAC in an
+# ops namespace, an admission policy, and the ops namespace itself. Plus an explicit SA in that portal.
+md_fixture jobpath \
+  '{"kind":"ServiceAccount","metadata":{"name":"runner","namespace":"portal"}}
+{"kind":"Secret","type":"kubernetes.io/service-account-token","metadata":{"name":"runner-token","namespace":"portal"}}
+{"kind":"Role","metadata":{"name":"runner","namespace":"ops"}}
+{"kind":"RoleBinding","metadata":{"name":"runner","namespace":"ops"}}
+{"kind":"ValidatingAdmissionPolicy","metadata":{"name":"runner-fence"}}
+{"kind":"ValidatingAdmissionPolicyBinding","metadata":{"name":"runner-fence"}}
+{"kind":"Namespace","metadata":{"name":"ops"}}'
+_md_live_all='serviceaccounts portal runner
+secrets portal runner-token
+roles.rbac.authorization.k8s.io ops runner
+rolebindings.rbac.authorization.k8s.io ops runner
+validatingadmissionpolicies.admissionregistration.k8s.io - runner-fence
+namespaces - ops
+serviceaccounts ops runner
+serviceaccounts portal stray
+serviceaccounts portal keep-me'
+# The digest is the sha256 of the canonical plan, computed HERE independently of the script.
+_md_canon="$(printf '%s\n' \
+  'Namespace||ops' 'Role|ops|runner' 'RoleBinding|ops|runner' 'Secret|portal|runner-token' \
+  'ServiceAccount|portal|runner' 'ServiceAccount|portal|stray' \
+  'ValidatingAdmissionPolicy||runner-fence' 'ValidatingAdmissionPolicyBinding||runner-fence' | LC_ALL=C sort -u)"$'\n'
+_md_digest="$(md_sha_of "$_md_canon")"
+
+md "$_md_live_all" -- check --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"::hosting:: deletion_objects=8"*"::hosting:: deletion_digest=sha256:${_md_digest}"*"::hosting:: deletion_present=7"*"::hosting:: deletion_check=sha256:${_md_digest}"*) true ;; *) false ;; esac \
+  && ok "check: the plan is the manifest's objects plus the explicit one, and its digest is the canonical plan's" || bad "delete check" "rc ${_md_rc}: ${_md_out}"
+case "$_md_out" in *"absent    ValidatingAdmissionPolicyBinding runner-fence"*"present   Namespace ops"*) ok "…naming each object present or absent" ;; *) bad "present/absent lines" "${_md_out}" ;; esac
+case "$_md_out" in *"contains  ops: serviceaccounts/runner — deleted with the namespace"*) ok "…and what a namespace delete takes with it" ;; *) bad "namespace contents" "${_md_out}" ;; esac
+if printf '%s\n' "$_md_log" | grep -v -- '--dry-run' | grep -q ' delete '; then bad "check never deletes" "kubectl saw: ${_md_log}"
+elif [ "$_md_live" != "$_md_live_all" ]; then bad "check never deletes" "the cluster changed: ${_md_live}"
+else ok "check never deletes — the only deletes it sends are server dry runs"; fi
+md "$_md_live_all" -- check --object ServiceAccount/portal/stray --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray
+case "$_md_out" in *"deletion_digest=sha256:${_md_digest}"*) ok "the digest does not depend on argument order or a repeated object" ;; *) bad "digest order" "${_md_out}" ;; esac
+
+md "$_md_live_all" -- delete --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray --sha256 "sha256:${_md_digest}"
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"::hosting:: deletion_absent=8"*"::hosting:: manifest_deleted=sha256:${_md_digest}"*) true ;; *) false ;; esac \
+  && ok "delete with the approved digest deletes and reads every object back absent" || bad "delete" "rc ${_md_rc}: ${_md_out}"
+if [ "$_md_live" = 'serviceaccounts portal keep-me' ]; then ok "…leaving exactly what the plan does not name"
+else bad "what the delete left" "live: ${_md_live}"; fi
+_md_order="$(printf '%s\n' "$_md_log" | grep -- '--wait=true' | sed 's/^kubectl //; s/^-n [^ ]* //' | cut -d' ' -f2 | tr '\n' ' ')"
+case "$_md_order" in "rolebindings.rbac.authorization.k8s.io roles.rbac.authorization.k8s.io secrets serviceaccounts serviceaccounts validatingadmissionpolicies.admissionregistration.k8s.io namespaces ")
+  ok "…in dependency order: bindings, roles, tokens, accounts, policies, the namespace LAST — and nothing absent is deleted" ;;
+  *) bad "delete order" "deleted: ${_md_order}" ;; esac
+
+md "$_md_live_all" -- delete --manifest demo/jobpath.yaml
+[ "$_md_rc" -ne 0 ] && [ -z "$_md_log" ] && case "$_md_out" in *"delete needs --sha256"*) true ;; *) false ;; esac \
+  && ok "delete without a digest is refused before kubectl is asked anything" || bad "delete without digest" "rc ${_md_rc}; kubectl: ${_md_log}; ${_md_out}"
+md "$_md_live_all" -- delete --manifest demo/jobpath.yaml --sha256 "sha256:${_md_digest}"
+if [ "$_md_rc" -ne 0 ] && case "$_md_out" in *"not the objects that were approved"*) true ;; *) false ;; esac \
+   && ! printf '%s\n' "$_md_log" | grep -q ' delete ' && [ "$_md_live" = "$_md_live_all" ]; then
+  ok "a plan that is not the approved one (an object fewer) is refused, nothing deleted"
+else bad "digest mismatch" "rc ${_md_rc}; kubectl: ${_md_log}; ${_md_out}"; fi
+
+md "$_md_live_all" MW_MD_STUCK=runner-token -- delete --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray --sha256 "$_md_digest"
+[ "$_md_rc" -ne 0 ] && case "$_md_out" in *"deletion_absent"*) false ;; *"REMAINS   Secret portal/runner-token"*"still on the cluster after the delete"*) true ;; *) false ;; esac \
+  && ok "an object still there after its delete is RED, named, and no absence is reported" || bad "stuck object" "rc ${_md_rc}: ${_md_out}"
+md "$_md_live_all" MW_MD_REFUSE_READ=secrets -- delete --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray --sha256 "$_md_digest"
+[ "$_md_rc" -ne 0 ] && [ "$_md_live" = "$_md_live_all" ] && case "$_md_out" in *"REFUSED, not absent"*"UNKNOWN"*) true ;; *) false ;; esac \
+  && ok "a refused read is UNKNOWN, never 'absent' — and nothing is deleted" || bad "refused read" "rc ${_md_rc}; live: ${_md_live}; ${_md_out}"
+md "$_md_live_all" MW_MD_DENY_DELETE=ops -- delete --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray --sha256 "$_md_digest"
+[ "$_md_rc" -ne 0 ] && [ "$_md_live" = "$_md_live_all" ] && case "$_md_out" in *"would not admit deleting Namespace ops"*) true ;; *) false ;; esac \
+  && ok "a delete the server would not admit stops the run before anything is deleted" || bad "server refusal" "rc ${_md_rc}; live: ${_md_live}; ${_md_out}"
+md "" -- delete --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray --sha256 "$_md_digest"
+[ "$_md_rc" -eq 0 ] && ! printf '%s\n' "$_md_log" | grep -q -- '--wait=true' && case "$_md_out" in *"deletion_present=0"*"deletion_absent=8"*) true ;; *) false ;; esac \
+  && ok "a plan already gone deletes nothing and still verifies every object absent (a re-run is safe)" || bad "already gone" "rc ${_md_rc}; ${_md_out}"
+
+# 🚨 THE KEPT WRITER PATH (Memex#314): every object of secret-writer.yaml is refused, whatever names it,
+# before kubectl is asked anything.
+for _md_kept in Namespace/memex-secrets ServiceAccount/memex-secrets/hosting-secret-writer Role/memex-secrets/hosting-secret-jobrunner \
+    RoleBinding/memex-secrets/hosting-secret-jobrunner ClusterRole/hosting-secret-writer ClusterRoleBinding/hosting-secret-writer \
+    ValidatingAdmissionPolicy/hosting-secret-writer-restart-only ValidatingAdmissionPolicyBinding/hosting-secret-writer-restart-only \
+    ServiceAccount/control/hosting-secret-jobrunner Secret/control/hosting-jobrunner-token Secret/memex-secrets/anything; do
+  md "" -- check --object "$_md_kept"
+  if [ "$_md_rc" -ne 0 ] && [ -z "$_md_log" ] && case "$_md_out" in *"::hosting::"*) false ;; *"KEPT"*|*"a Namespace is deleted only when a committed manifest names it"*) true ;; *) false ;; esac; then
+    ok "the kept writer path is refused: ${_md_kept}"
+  else bad "kept object ${_md_kept}" "rc ${_md_rc}; kubectl: ${_md_log}; ${_md_out}"; fi
+done
+md_fixture writer \
+  '{"kind":"Namespace","metadata":{"name":"memex-secrets"}}
+{"kind":"ServiceAccount","metadata":{"name":"hosting-secret-jobrunner","namespace":"control"}}'
+md "" -- check --manifest demo/writer.yaml
+[ "$_md_rc" -ne 0 ] && case "$_md_out" in *"refused   Namespace memex-secrets: KEPT"*"refused   ServiceAccount control/hosting-secret-jobrunner: KEPT"*) true ;; *) false ;; esac \
+  && ! printf '%s\n' "$_md_log" | grep -q ' get ' \
+  && ok "…and so is a manifest naming them (the namespace included), before the cluster is read" || bad "kept via manifest" "rc ${_md_rc}; ${_md_out}"
+# Negative control: the deny list is exact — the retired job-runner in the old portal namespace, and a
+# differently named token in control's namespace, are deletable.
+md $'serviceaccounts memex hosting-jobrunner\nsecrets control hosting-jobrunner-token-old' -- check --object ServiceAccount/memex/hosting-jobrunner --object Secret/control/hosting-jobrunner-token-old
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"deletion_present=2"*) true ;; *) false ;; esac \
+  && ok "negative control: objects outside the kept set (memex/hosting-jobrunner, a differently named control token) are admitted" || bad "deny list too wide" "rc ${_md_rc}; ${_md_out}"
+
+refuses_hard "a typed Namespace is refused (only a committed manifest may name one)" "a Namespace is deleted only when a committed manifest names it" hosting-manifest-delete check --object Namespace/memex
+refuses_hard "a cluster-scoped kind with a namespace is refused" "is cluster-scoped" hosting-manifest-delete check --object ClusterRole/ns/x
+refuses_hard "a namespaced kind without one is refused" "is namespaced" hosting-manifest-delete check --object ServiceAccount/x
+refuses_hard "a kind outside the lane's set is refused (a Deployment)" "kind Deployment is not one this lane deletes" hosting-manifest-delete check --object Deployment/memex/memex-portal-deployment
+refuses_hard "an object name that is not a DNS name is refused" "is not a DNS name" hosting-manifest-delete check --object 'ServiceAccount/memex/x;id'
+refuses_hard "a system: object is refused" "is not a DNS name" hosting-manifest-delete check --object ClusterRoleBinding/system:node
+refuses_hard "a path out of deploy/aks/manifests is refused" "is not a path under deploy/aks/manifests" hosting-manifest-delete check --manifest ../etc/x.yaml
+refuses_hard "the mode is check or delete" "check or delete" hosting-manifest-delete apply --manifest demo/jobpath.yaml
+refuses_hard "a plan names something" "name what to delete" hosting-manifest-delete check
+md_fixture unscoped '{"kind":"Role","metadata":{"name":"r"}}'
+md "" -- check --manifest demo/unscoped.yaml
+[ "$_md_rc" -ne 0 ] && case "$_md_out" in *"a namespaced kind with no namespace"*) true ;; *) false ;; esac \
+  && ok "a manifest object of a namespaced kind with no namespace is refused, never resolved against a default" || bad "unscoped" "${_md_out}"
+rm -rf "$_md_root"
+unset _md_out _md_rc _md_log _md_live _md_root _md_digest _md_canon _md_live_all _md_order _md_kept _md_state
+
 echo "── hosting-kv-status / hosting-kv-state: status and lifecycle from METADATA, never a value ──"
 # The write-only secret GUI's read side (policy secrets-write-only-entry): existence, enabled,
 # dates, soft-delete and the write-time tags — from `list` alone. The stub is the WRITER identity:
@@ -4289,6 +4531,150 @@ else
   bad "a dry run touches nothing" "rc=${_dbr_rc} out: ${_dbr_out}"
 fi
 rm -rf "$_dbr_state"
+
+# ── hosting-db-retire: retire a database no record claims — check, (backup, verify), drop ──────────
+# Systemorph/Memex#923, MeshWeaver.Plugins kind RetireDatabase. `check` READS (in a dry run too — it is
+# the what-if); `drop` drops only after the archive it names is readable and not empty, never under a
+# session, never a server database, and proves absence after. Pinned: every refusal that protects
+# data, the order (archive read before DROP), the password by name and never on an argv, a lying
+# server, and the control that a present, idle database with a non-empty archive IS dropped.
+echo
+echo "── hosting-db-retire: check reads, drop only behind a readable archive, absence proved ──"
+DBRT_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/db-retire" && pwd)"
+DBRT_URI="https://backups.example.blob.core.windows.net/retired/oldcopy-20261101.dump"
+DBRT_ARGS=(--database oldcopy --server pg.postgres.database.azure.com --user acmeowner --vault kv-example --password-secret memex-postgres-password)
+_dbrt_new() { _dbrt_state="$(mktemp -d)"; printf 'postgres\nacmedb\noldcopy\n' > "$_dbrt_state/dbs"; echo 2048 > "$_dbrt_state/blob-size"; }
+_dbrt() { _dbrt_out="$(env -u PGPASSWORD -u HOSTING_DRY_RUN PATH="$DBRT_STUBS:$PATH" HOSTING_DBRT_STATE="$_dbrt_state" "$@" 2>&1)"; _dbrt_rc=$?
+  _dbrt_log="$(cat "$_dbrt_state/pg.log" 2>/dev/null || true)"; _dbrt_az="$(cat "$_dbrt_state/az.log" 2>/dev/null || true)"; }
+
+# check, present and idle: reports state, size, sessions — and issues no statement that changes anything
+_dbrt_new; echo 123456 > "$_dbrt_state/size"; _dbrt hosting-db-retire check "${DBRT_ARGS[@]}"
+if [ "$_dbrt_rc" -eq 0 ] && printf '%s' "$_dbrt_out" | grep -q '::hosting:: retire_state=present' \
+   && printf '%s' "$_dbrt_out" | grep -q '::hosting:: size_bytes=123456' \
+   && printf '%s' "$_dbrt_out" | grep -q '::hosting:: sessions=0' \
+   && ! printf '%s' "$_dbrt_log" | grep -q 'DROP\|ALTER\|CREATE\|COMMENT'; then
+  ok "check reads a present database's size and sessions and changes nothing"
+else
+  bad "check reports present, size, sessions" "rc=${_dbrt_rc} out: ${_dbrt_out} log: ${_dbrt_log}"
+fi
+case "$_dbrt_az" in *"keyvault secret show --vault-name kv-example --name memex-postgres-password --query value"*) ok "…the password is read by NAME from the vault" ;; *) bad "password read by name" "az: ${_dbrt_az}" ;; esac
+case "$_dbrt_out$_dbrt_log" in *NEVER-PRINTED*) bad "the password is never printed nor on an argv" "seen: ${_dbrt_out}" ;; *) ok "the password is never printed nor on an argv" ;; esac
+rm -rf "$_dbrt_state"
+
+# check in a DRY RUN still reads (it IS the what-if) — and says "absent" for a database already gone
+_dbrt_new; printf 'postgres\nacmedb\n' > "$_dbrt_state/dbs"; _dbrt env HOSTING_DRY_RUN=true hosting-db-retire check "${DBRT_ARGS[@]}"
+if [ "$_dbrt_rc" -eq 0 ] && printf '%s' "$_dbrt_out" | grep -q '::hosting:: retire_state=absent' && [ -s "$_dbrt_state/pg.log" ]; then
+  ok "a dry-run check reads the server and reports an already-absent database as absent (the what-if)"
+else
+  bad "dry-run check reports absent" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+_dbrt_new; printf 'postgres\nacmedb\n' > "$_dbrt_state/dbs"; _dbrt hosting-db-retire check "${DBRT_ARGS[@]}"
+if [ "$_dbrt_rc" -ne 0 ] && printf '%s' "$_dbrt_out" | grep -q 'already absent'; then
+  ok "a real check of an absent database fails the plan before any backup — nothing to back up or drop"
+else
+  bad "real check refuses an absent database" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+
+# check with a session connected: a real run refuses, a dry run says it would
+_dbrt_new; echo 1 > "$_dbrt_state/sessions"; _dbrt hosting-db-retire check "${DBRT_ARGS[@]}"
+if [ "$_dbrt_rc" -ne 0 ] && printf '%s' "$_dbrt_out" | grep -q '1 session(s) are connected to oldcopy'; then
+  ok "a real check refuses a database something is still connected to"
+else
+  bad "real check refuses on a session" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+_dbrt_new; echo 1 > "$_dbrt_state/sessions"; _dbrt env HOSTING_DRY_RUN=true hosting-db-retire check "${DBRT_ARGS[@]}"
+if [ "$_dbrt_rc" -eq 0 ] && printf '%s' "$_dbrt_out" | grep -q '::hosting:: sessions=1' && printf '%s' "$_dbrt_out" | grep -q 'a real run would REFUSE'; then
+  ok "a dry-run check names the session a real run would refuse on"
+else
+  bad "dry-run check names the session" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+
+# drop: the control — an idle database behind a readable, non-empty archive IS dropped and proved gone
+_dbrt_new; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
+if [ "$_dbrt_rc" -eq 0 ] && ! grep -qx oldcopy "$_dbrt_state/dbs" && grep -qx acmedb "$_dbrt_state/dbs" \
+   && printf '%s' "$_dbrt_out" | grep -q '::hosting:: retired=oldcopy'; then
+  ok "drop drops an idle database behind a readable archive — and nothing else — and reports retired=<db>"
+else
+  bad "drop drops and reports" "rc=${_dbrt_rc} out: ${_dbrt_out} dbs: $(cat "$_dbrt_state/dbs")"
+fi
+case "$_dbrt_az" in *"storage blob show --blob-url ${DBRT_URI} --auth-mode login"*) ok "…the archive is read by its URL before the drop" ;; *) bad "archive read before the drop" "az: ${_dbrt_az}" ;; esac
+_drop_line="$(printf '%s\n' "$_dbrt_log" | grep -n 'DROP DATABASE "oldcopy"' | head -1 | cut -d: -f1)"
+_last_exists="$(printf '%s\n' "$_dbrt_log" | grep -n "datname = 'oldcopy'" | tail -1 | cut -d: -f1)"
+[ -n "$_drop_line" ] && [ -n "$_last_exists" ] && [ "$_drop_line" -lt "$_last_exists" ] \
+  && ok "…and the server is asked AGAIN after the drop — absence is read back, not assumed" \
+  || bad "absence is read back after the drop" "log: ${_dbrt_log}"
+case "$_dbrt_log" in *"PGPASSWORD=unset"*) bad "every psql got the password through the environment" "log: ${_dbrt_log}" ;; *) ok "every psql got the password through the environment" ;; esac
+rm -rf "$_dbrt_state"
+
+# drop: no archive, or an empty one → refused, nothing dropped
+_dbrt_new; rm -f "$_dbrt_state/blob-size"; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
+if [ "$_dbrt_rc" -ne 0 ] && grep -qx oldcopy "$_dbrt_state/dbs" && ! printf '%s' "$_dbrt_log" | grep -q 'DROP' \
+   && printf '%s' "$_dbrt_out" | grep -q 'is NOT dropped'; then
+  ok "drop refuses when the archive it is bound to cannot be read — nothing is dropped"
+else
+  bad "drop refuses a missing archive" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+_dbrt_new; echo 0 > "$_dbrt_state/blob-size"; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
+if [ "$_dbrt_rc" -ne 0 ] && grep -qx oldcopy "$_dbrt_state/dbs" && ! printf '%s' "$_dbrt_log" | grep -q 'DROP'; then
+  ok "drop refuses a ZERO-byte archive — an empty archive is no backup"
+else
+  bad "drop refuses an empty archive" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+
+# drop: a session connected → refused, nothing dropped
+_dbrt_new; echo 2 > "$_dbrt_state/sessions"; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
+if [ "$_dbrt_rc" -ne 0 ] && grep -qx oldcopy "$_dbrt_state/dbs" && ! printf '%s' "$_dbrt_log" | grep -q 'DROP'; then
+  ok "drop refuses while a session is connected — nothing is dropped under it"
+else
+  bad "drop refuses on a session" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+
+# drop: a server that answers DROP but keeps the database → a failed step, never retired=
+_dbrt_new; touch "$_dbrt_state/sticky-drop"; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
+if [ "$_dbrt_rc" -ne 0 ] && printf '%s' "$_dbrt_out" | grep -q 'still listed' && ! printf '%s' "$_dbrt_out" | grep -q 'retired=oldcopy'; then
+  ok "a DROP the server reports but does not perform is a failed step, never retired=<db>"
+else
+  bad "a lying drop fails" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+
+# drop dry run: narrates, reads no secret, issues no statement
+_dbrt_new; _dbrt env HOSTING_DRY_RUN=true hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
+if [ "$_dbrt_rc" -eq 0 ] && [ ! -s "$_dbrt_state/pg.log" ] && [ ! -s "$_dbrt_state/az.log" ] && printf '%s' "$_dbrt_out" | grep -q 'retired=dry-run' \
+   && grep -qx oldcopy "$_dbrt_state/dbs"; then
+  ok "a dry-run drop reads no secret, issues no statement and drops nothing"
+else
+  bad "a dry-run drop touches nothing" "rc=${_dbrt_rc} out: ${_dbrt_out}"
+fi
+rm -rf "$_dbrt_state"
+
+# refusals before anything is read or reported
+for _sysdb in postgres template0 template1 azure_maintenance azure_sys; do
+  refuses_hard "hosting-db-retire refuses the server's own database ${_sysdb}" "one of the server's own databases" \
+    env HOSTING_DRY_RUN=true hosting-db-retire drop --database "$_sysdb" --server pg.test --user u --store-uri "$DBRT_URI"
+done
+refuses_hard "hosting-db-retire refuses a database name it would have to quote" "not a plain lower-case Postgres name" \
+  env HOSTING_DRY_RUN=true hosting-db-retire check --database 'old";drop' --server pg.test --user u
+refuses_hard "hosting-db-retire refuses an upper-case name" "not a plain lower-case Postgres name" \
+  env HOSTING_DRY_RUN=true hosting-db-retire check --database 'OldCopy' --server pg.test --user u
+refuses_hard "hosting-db-retire needs a verb" "missing verb" hosting-db-retire
+refuses_hard "hosting-db-retire refuses an unknown verb" "unknown verb" hosting-db-retire purge --database oldcopy --server pg.test --user u
+refuses_hard "drop names the archive it is bound to" "missing required flag --store-uri" \
+  env HOSTING_DRY_RUN=true hosting-db-retire drop --database oldcopy --server pg.test --user u
+refuses_hard "drop refuses an archive that is not an https blob URL" "is not an https blob URL" \
+  env HOSTING_DRY_RUN=true hosting-db-retire drop --database oldcopy --server pg.test --user u --store-uri 'file:///etc/passwd'
+refuses_hard "check takes no archive" "rides drop only" \
+  env HOSTING_DRY_RUN=true hosting-db-retire check --database oldcopy --server pg.test --user u --store-uri "$DBRT_URI"
+refuses_hard "hosting-db-retire refuses a login given empty" "was given EMPTY" \
+  env HOSTING_DRY_RUN=true hosting-db-retire check --database oldcopy --server pg.test --user ''
+unset _dbrt_out _dbrt_rc _dbrt_log _dbrt_az _dbrt_state _drop_line _last_exists _sysdb
 
 echo
 echo "── hosting-inventory: node counts per partition schema, READ-ONLY by the server's own rule ──"
