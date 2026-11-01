@@ -5513,10 +5513,70 @@ _cd_run clean
 [ "$_cd_rc" -eq 0 ] && case "$_cd_out" in *"::hosting:: chart_drift_verdict=clean"*"::hosting:: chart_drift_divergences=0"*"::hosting:: chart_drift_compared=41"*) true ;; *) false ;; esac \
   && ok "a clean comparison reports verdict=clean with the compared count" || bad "clean comparison" "rc ${_cd_rc}; out: ${_cd_out}"
 case "$(cat "$_cd/args")" in
-  *"--via kubectl"*"-f $_cd/chart/values.yaml -f ./deployments/aks/memex/values.memex.public.yaml"*) ok "it compares in-cluster against the chart + the estate's committed overlay" ;;
+  *"--via kubectl"*"-f $_cd/chart/values.yaml -f ./deployments/aks/memex/values.memex.public.yaml"*) ok "legacy (no --values): it compares in-cluster against the chart + the estate's committed overlay" ;;
   *) bad "it compares in-cluster against the chart + the estate's committed overlay" "args: $(cat "$_cd/args")" ;; esac
 case "$(cat "$_cd/args")" in *aks-invoke*) bad "it never uses the aks-invoke transport" "args: $(cat "$_cd/args")" ;;
   *) ok "it never uses the aks-invoke transport (the cluster-admin path it retires)" ;; esac
+case "$_cd_out" in *"::hosting:: chart_drift_render=overlay"*"LEGACY"*|*"LEGACY"*"::hosting:: chart_drift_render=overlay"*) ok "the legacy overlay comparison says it is the overlay, not what a deploy installs" ;;
+  *) bad "the legacy overlay comparison names itself" "out: ${_cd_out}" ;; esac
+
+# ── RECORD MODE: the desired side is what hosting-deploy installs (MeshWeaver#5844) ────────────────
+# 🚨 The shape this pins, measured on four instances: the overlay comparison reported AZURE_CLIENT_ID
+# (pearl, build) and PluginCatalog__InstanceId/HomeUrl (memex, memex-cloud) as PENDING DELETIONS,
+# although every deploy installs them — the first through hosting-deploy's own `--set
+# selfUpdate.azureClientId`, the others through the record's render, neither of which the overlay
+# render saw. So: with --values/--database the drift scripts get the RECORD's render (never the
+# overlay) and EXACTLY the --set flags hosting-deploy hands helm for the same inputs. The parity is
+# asserted against hosting-deploy itself, run through its own stubs — not against a copied list,
+# which would agree with itself and with nothing else.
+_cdr_fix="$(mktemp -d)"; cp -R "$DP_FIXTURES/." "$_cdr_fix/"; _cdr_log="$_cdr_fix/calls.log"; : > "$_cdr_log"
+mkdir -p "$_cdr_fix/identity"; printf '11111111-2222-3333-4444-555555555555\n' > "$_cdr_fix/identity/example-portal-mi"
+printf '%s' "cr.example.test/memex-control:3.0.0-ci.10043" > "$_cdr_fix/running-image"
+_cdr_vals="$_cd/estate/hosting-values.yaml"
+printf '# GENERATED from the Hosting/Deployment record by HelmValues\nreplicas:\n  portal: 2\npluginCatalog:\n  instanceId: "memex"\n' > "$_cdr_vals"
+_cdr_env=( PATH="$DP_STUBS:$PATH" HOSTING_DEPLOY_FIXTURE="$_cdr_fix" HOSTING_DEPLOY_STUB_LOG="$_cdr_log"
+           AZ_PORTAL_IDENTITY=example-portal-mi AZ_RESOURCE_GROUP=memex-aks-rg )
+_cd_run clean "${_cdr_env[@]}" -- --database memex --values "$_cdr_vals"
+_cdr_args="$(cat "$_cd/args")"
+if [ "$_cd_rc" -eq 0 ] && case "$_cd_out" in *"::hosting:: chart_drift_render=record"*"::hosting:: chart_drift_verdict=clean"*) true ;; *) false ;; esac; then
+  ok "record mode reports chart_drift_render=record and its verdict"
+else bad "record mode reports chart_drift_render=record" "rc ${_cd_rc}; out: ${_cd_out}"; fi
+case "$_cdr_args" in
+  *"-f $_cd/chart/values.yaml -f $_cdr_vals "*) case "$_cdr_args" in *values.memex.public.yaml*) bad "record mode never reads the overlay" "args: ${_cdr_args}" ;;
+                                                   *) ok "record mode renders the chart + the RECORD's render, and never the committed overlay" ;; esac ;;
+  *) bad "record mode renders the chart + the record's render" "args: ${_cdr_args}" ;; esac
+case "$_cdr_args" in *"--set selfUpdate.azureClientId=11111111-2222-3333-4444-555555555555"*) ok "record mode carries the deploy's own selfUpdate.azureClientId — AZURE_CLIENT_ID is no longer a false PENDING DELETION" ;;
+  *) bad "record mode carries the deploy's selfUpdate.azureClientId" "args: ${_cdr_args}" ;; esac
+# The parity: hosting-deploy, same namespace/database/values, no --image (a Reconcile keeps the image).
+: > "$_cdr_log"
+(cd "$_cd/estate" && env "${_cdr_env[@]}" HOSTING_CHART=/tmp hosting-deploy --namespace memex --release memex --database memex --values "$_cdr_vals" >/dev/null 2>&1); _cdr_drc=$?
+_cdr_up="$(grep '^helm upgrade' "$_cdr_log" | head -1)"
+_cdr_sets_deploy="$(printf '%s\n' "$_cdr_up" | grep -oE -- '--set [^ ]+' | sort)"
+_cdr_sets_drift="$(printf '%s\n' "$_cdr_args" | grep -oE -- '--set [^ ]+' | sort)"
+if [ "$_cdr_drc" -eq 0 ] && [ -n "$_cdr_sets_deploy" ] && [ "$_cdr_sets_deploy" = "$_cdr_sets_drift" ]; then
+  ok "the Audit's --set flags are EXACTLY hosting-deploy's for the same record ($(printf '%s\n' "$_cdr_sets_drift" | wc -l | tr -d ' ') flags, one shared composition)"
+else
+  bad "the Audit's --set flags equal hosting-deploy's" "deploy rc ${_cdr_drc}; deploy: ${_cdr_sets_deploy:-<none>} | drift: ${_cdr_sets_drift:-<none>}"
+fi
+# NEGATIVE CONTROL for the parity: a different identity changes both sides — and the drift side by name.
+printf '99999999-2222-3333-4444-555555555555\n' > "$_cdr_fix/identity/example-portal-mi"
+_cd_run clean "${_cdr_env[@]}" -- --database memex --values "$_cdr_vals"
+case "$(cat "$_cd/args")" in *"selfUpdate.azureClientId=99999999-"*) ok "the client id the Audit renders is READ (a changed identity changes it), never a constant" ;;
+  *) bad "the Audit reads the client id" "args: $(cat "$_cd/args")" ;; esac
+printf 'replicas: {}\n' > "$_cd/estate/not-a-render.yaml"
+_cd_run clean "${_cdr_env[@]}" -- --database memex --values "$_cd/estate/not-a-render.yaml"
+[ "$_cd_rc" -ne 0 ] && case "$_cd_out" in *"chart_drift_verdict"*) false ;; *"HelmValues header"*) true ;; *) false ;; esac \
+  && ok "a values file that is not the record's render is refused, never compared" || bad "non-render values refused" "rc ${_cd_rc}; out: ${_cd_out}"
+_cd_run clean "${_cdr_env[@]}" -- --database memex
+[ "$_cd_rc" -ne 0 ] && case "$_cd_out" in *"--database was given without --values"*) true ;; *) false ;; esac \
+  && ok "--database without --values is refused — never a silent fall-back to the overlay" || bad "--database alone refused" "rc ${_cd_rc}; out: ${_cd_out}"
+_cd_run clean "${_cdr_env[@]}" -- --values "$_cdr_vals"
+[ "$_cd_rc" -ne 0 ] && case "$_cd_out" in *"missing required flag --database"*) true ;; *) false ;; esac \
+  && ok "--values without --database is refused" || bad "--values alone refused" "rc ${_cd_rc}; out: ${_cd_out}"
+_cd_run clean "${_cdr_env[@]}" -- --database memex --values "$_cdr_vals" --overlay "$_cd/estate/deployments/aks/memex/values.memex.public.yaml"
+[ "$_cd_rc" -ne 0 ] && case "$_cd_out" in *"two different desired sides"*) true ;; *) false ;; esac \
+  && ok "--values with --overlay is refused (one desired side)" || bad "--values with --overlay refused" "rc ${_cd_rc}; out: ${_cd_out}"
+rm -rf "$_cdr_fix"; unset _cdr_fix _cdr_log _cdr_vals _cdr_env _cdr_args _cdr_up _cdr_drc _cdr_sets_deploy _cdr_sets_drift
 _cd_run drift
 [ "$_cd_rc" -eq 0 ] && case "$_cd_out" in *"::hosting:: chart_drift_verdict=drift"*"::hosting:: chart_drift_divergences=3"*"::hosting:: chart_drift_compared=41"*) true ;; *) false ;; esac \
   && ok "drift is a FINDING: exit 0, verdict=drift, divergences counted" || bad "drift is a finding" "rc ${_cd_rc}; out: ${_cd_out}"

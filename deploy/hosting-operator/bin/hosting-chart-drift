@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# hosting-chart-drift --namespace <ns> --release <name> [--estate <dir>] [--overlay <file>]
-#                     [--records <dir>] [--expect-patch <file>] [--chart <dir>]
+# hosting-chart-drift --namespace <ns> --release <name> --database <db> --values <file>
+#                     [--estate <dir>] [--records <dir>] [--expect-patch <file>] [--chart <dir>]
+# hosting-chart-drift --namespace <ns> --release <name> [--overlay <file>] …   (LEGACY, see below)
 #
 # Does the cluster run what the CHART describes? The governed home of the Chart Drift comparison
 # (Doc/Architecture/ChartDriftSemantics): the second step of an `Audit` InstanceAction, run on the
@@ -22,8 +23,24 @@
 #                         ChartDriftSemantics' COLLIDES / SHADOWS / OFF-RECORD / CLUSTER-ONLY /
 #                         CHART-ONLY / DIFFERS
 #
+# 🚨 WHAT "THE CHART" MEANS HERE IS WHAT A DEPLOY INSTALLS (MeshWeaver#5844). With --values (the
+# record's render, the SAME file hosting-deploy is given: HelmValues in the Hosting plugin, shipped
+# as $HOSTING_VALUES_FILE) and --database, the desired side is composed exactly as hosting-deploy
+# composes it: the chart, the record's render, the Key Vault values half in its declared shape (the
+# drift scripts' render-only placeholder — this check never holds the half), and the per-instance
+# --set flags from _release_sets.sh, the ONE file both commands source (selfUpdate.azureClientId,
+# the database name, the TLS secret, the image). So a finding means "a Reconcile would change
+# this" — nothing else.
+#
+# LEGACY, without --values: the desired side is the COMMITTED OVERLAY below instead. That is not
+# what a deploy renders — it misses the record's projection and every --set flag, so it reports the
+# deploy's own values as pending deletions and stale overlay values as DIFFERS (#5844 measured both
+# on four instances). It is kept only until every caller passes --values, and every run in it says so
+# (`chart_drift_render=overlay`).
+#
 # THE INPUTS, all read from the ESTATE checkout (the config repository the lane runs in) unless named:
-#   <estate>/deployments/aks/<ns>/values.<release>.public.yaml   the secret-free overlay (required)
+#   --values <file>                                               the record's render (record mode)
+#   <estate>/deployments/aks/<ns>/values.<release>.public.yaml   the secret-free overlay (legacy mode only)
 #   <estate>/deployments/aks/<ns>/portal-patch.json             the declared post-helm patch (optional)
 #   <estate>/mesh/Deployments/                                  the Deployment records (required)
 #   the chart                                                    $HOSTING_CHART, else /opt/hosting/chart
@@ -34,6 +51,7 @@
 #
 # THE OUTPUT is the drift script's own report (findings name keys; values are compared, never printed)
 # plus the lines the Hosting plugin records on the instance's audit:
+#   ::hosting:: chart_drift_render=record|overlay   which desired side was compared (see above)
 #   ::hosting:: chart_drift_verdict=clean|drift
 #   ::hosting:: chart_drift_divergences=N        ::hosting:: chart_drift_compared=M
 #
@@ -49,11 +67,13 @@ HOSTING_CMD="hosting-chart-drift"
 
 SELF_BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 
-namespace="" release="" estate="." overlay="" records="" expect_patch="" chart="${HOSTING_CHART:-/opt/hosting/chart}"
+namespace="" release="" database="" values="" estate="." overlay="" records="" expect_patch="" chart="${HOSTING_CHART:-/opt/hosting/chart}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --namespace)    namespace="${2:-}";    shift 2 ;;
     --release)      release="${2:-}";      shift 2 ;;
+    --database)     database="${2:-}";     shift 2 ;;
+    --values)       values="${2:-}";       shift 2 ;;
     --estate)       estate="${2:-}";       shift 2 ;;
     --overlay)      overlay="${2:-}";      shift 2 ;;
     --records)      records="${2:-}";      shift 2 ;;
@@ -67,8 +87,18 @@ hosting::need_flag namespace "$namespace"
 hosting::need_flag release "$release"
 hosting::safe_name namespace "$namespace"
 hosting::safe_name release "$release"
+# Record mode needs BOTH halves of what hosting-deploy is given; one without the other is a caller bug,
+# never a reason to fall back to the overlay.
+if [ -n "$values" ] || [ -n "$database" ]; then
+  [ -n "$values" ] || hosting::die "--database was given without --values — the record's render is what a deploy installs; without it there is nothing to compare the cluster against"
+  hosting::need_flag database "$database"
+  hosting::safe_name database "$database"
+  [ -z "$overlay" ] || hosting::die "--overlay and --values name two different desired sides — the record's render IS what a deploy installs, so the overlay has no part in a record-mode comparison"
+fi
 
-overlay="${overlay:-${estate}/deployments/aks/${namespace}/values.${release}.public.yaml}"
+if [ -z "$values" ]; then
+  overlay="${overlay:-${estate}/deployments/aks/${namespace}/values.${release}.public.yaml}"
+fi
 records="${records:-${estate}/mesh/Deployments}"
 if [ -z "$expect_patch" ] && [ -f "${estate}/deployments/aks/${namespace}/portal-patch.json" ]; then
   expect_patch="${estate}/deployments/aks/${namespace}/portal-patch.json"
@@ -89,8 +119,19 @@ done
 # ── every input, or a refusal naming it ─────────────────────────────────────────────────────────
 [ -d "$chart" ] \
   || hosting::die "the chart is not at '${chart}' — set HOSTING_CHART to the operator checkout's deploy/helm. Rendering anything else compares the cluster against a chart nobody deployed."
+if [ -n "$values" ]; then
+  # The same three refusals hosting-deploy makes about this file: a missing, empty or hand-written
+  # file is not the record's render, and comparing against it is not a measurement.
+  [ -f "$values" ] \
+    || hosting::die "the rendered values file '${values}' does not exist — it is the record's render (HelmValues in the Hosting plugin, \$HOSTING_VALUES_FILE), the same file hosting-deploy installs."
+  [ -s "$values" ] \
+    || hosting::die "the rendered values file '${values}' is EMPTY — the record rendered nothing, which is a bug in the caller, not an instance with no configuration."
+  grep -q "^# GENERATED from the Hosting/Deployment record" "$values" \
+    || hosting::die "'${values}' does not carry the HelmValues header — it is not a rendered record, so it is not what a deploy installs."
+else
 [ -f "$overlay" ] \
   || hosting::die "the committed overlay '${overlay}' does not exist — the estate repository carries the SECRET-FREE half of each release's values there. Without it the render is the chart's defaults, which nobody deployed: a comparison against it is not a measurement."
+fi
 [ -d "$records" ] \
   || hosting::die "the Deployment records folder '${records}' does not exist — the running image is compared against the record that owns ${namespace}/${release}, and with no records there is nothing to compare it against."
 [ -z "$expect_patch" ] || [ -f "$expect_patch" ] \
@@ -101,7 +142,12 @@ trap 'hosting::on_exit; rm -rf "$work"' EXIT
 
 hosting::dry && hosting::log "dry run requested — the comparison is read-only, so it runs for real"
 hosting::log "chart     ${chart}"
-hosting::log "overlay   ${overlay}"
+if [ -n "$values" ]; then
+  hosting::log "render    the record's render ${values} + the deploy's own --set flags (what a Reconcile installs)"
+else
+  hosting::log "overlay   ${overlay}"
+  hosting::log "render    LEGACY: the committed overlay, NOT what a deploy installs (no record projection, no --set flags) — pass --values/--database (MeshWeaver#5844)"
+fi
 hosting::log "records   ${records}"
 hosting::log "patch     ${expect_patch:-none declared — a post-helm addition is reported as drift}"
 hosting::log "scripts   ${drift_dir}"
@@ -114,8 +160,28 @@ python3 "${drift_dir}/chart-drift-record.py" \
 # ── the comparison ──────────────────────────────────────────────────────────────────────────────
 # In-cluster transport: the lane's kubeconfig (or the Job's ServiceAccount). Never `aks-invoke` —
 # that transport is the cluster-admin path this command exists to retire.
-args=( -n "$namespace" -r "$release" --via kubectl -c "$chart"
-       -f "${chart}/values.yaml" -f "$overlay" --record "$work/record.json" )
+if [ -n "$values" ]; then
+  # Exactly hosting-deploy's composition: the shared file sets `sets` from namespace/database/values
+  # and the image (empty here, so — as in a Reconcile — the image the namespace already runs).
+  # shellcheck disable=SC2034  # read by _release_sets.sh, sourced next
+  image=""
+  # shellcheck source=_release_sets.sh
+  source "${SELF_BIN}/_release_sets.sh"
+  args=( -n "$namespace" -r "$release" --via kubectl -c "$chart"
+         -f "${chart}/values.yaml" -f "$values" --record "$work/record.json" )
+  i=0
+  # shellcheck disable=SC2154  # `sets` is assigned by _release_sets.sh (its contract)
+  while [ "$i" -lt "${#sets[@]}" ]; do
+    [ "${sets[$i]}" = "--set" ] || hosting::die "the release's flags carry '${sets[$i]}' where '--set' was expected — _release_sets.sh changed shape, and passing it on unread would compare against a render the deploy does not make"
+    args+=( --set "${sets[$((i+1))]}" )
+    i=$((i+2))
+  done
+  hosting::say chart_drift_render record
+else
+  args=( -n "$namespace" -r "$release" --via kubectl -c "$chart"
+         -f "${chart}/values.yaml" -f "$overlay" --record "$work/record.json" )
+  hosting::say chart_drift_render overlay
+fi
 [ -z "$expect_patch" ] || args+=( --expect-patch "$expect_patch" )
 bash "${drift_dir}/check-chart-drift.sh" "${args[@]}" 2>&1 | tee "$work/drift.log"
 rc=${PIPESTATUS[0]}

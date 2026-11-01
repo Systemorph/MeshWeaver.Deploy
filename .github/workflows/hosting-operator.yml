@@ -121,7 +121,7 @@ jobs:
           echo "all $(ls _common.sh run.sh hosting-* | wc -l) scripts parse"
 
       - name: shellcheck
-        run: shellcheck -S warning "$OPERATOR_DIR/bin/_common.sh" "$OPERATOR_DIR/bin/run.sh" "$OPERATOR_DIR"/bin/hosting-*
+        run: shellcheck -S warning "$OPERATOR_DIR/bin/_common.sh" "$OPERATOR_DIR/bin/_release_sets.sh" "$OPERATOR_DIR/bin/run.sh" "$OPERATOR_DIR"/bin/hosting-*
 
       - name: No unlisted Key Vault secret command (secrets-write-only-entry)
         run: |
