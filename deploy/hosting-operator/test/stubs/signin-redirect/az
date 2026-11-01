@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# A stand-in `az` for hosting-signin-redirect's behaviour tests (MeshWeaver.Plugins#4336). Records
+# every invocation verbatim and answers Graph from a small, MUTABLE state, so a PATCH is visible to
+# the read-back that follows it:
+#
+#   HOSTING_SR_STATE            directory: az.log (every argv), uris.json (the app's web redirect URIs,
+#                               a JSON array; seeded from HOSTING_SR_URIS), creds (lines "<keyId> <displayName>")
+#   HOSTING_SR_URIS             JSON array the app starts with (default: one unrelated URI)
+#   HOSTING_SR_TAGS             JSON array of the app's tags (default: the shared-app tag)
+#   HOSTING_SR_AUDIENCE         signInAudience (default AzureADMyOrg)
+#   HOSTING_SR_CREDS            newline-separated "<keyId> <displayName>" the app starts with
+#   HOSTING_SR_GRAPH_DENIED=1   every Graph call fails as an identity with no right does
+#   HOSTING_SR_PATCH_IGNORED=1  the PATCH answers success but changes nothing (the read-back must catch it)
+set -uo pipefail
+state="${HOSTING_SR_STATE:?the az stub needs HOSTING_SR_STATE}"
+printf 'az %s\n' "$*" >> "$state/az.log"
+[ -f "$state/uris.json" ] || printf '%s' "${HOSTING_SR_URIS-[\"https://other.example.test/signin-microsoft\"]}" > "$state/uris.json"
+[ -f "$state/creds" ] || printf '%s\n' "${HOSTING_SR_CREDS-}" | sed '/^$/d' > "$state/creds"
+denied() { [ "${HOSTING_SR_GRAPH_DENIED:-0}" = "1" ] && { echo "ERROR: Insufficient privileges to complete the operation." >&2; exit 1; }; return 0; }
+
+case "${1:-} ${2:-} ${3:-}" in
+  "ad app show")
+    denied
+    jq -cn --argjson tags "${HOSTING_SR_TAGS-[\"meshweaver-shared-throwaway-signin\"]}" \
+           --arg aud "${HOSTING_SR_AUDIENCE:-AzureADMyOrg}" --slurpfile uris "$state/uris.json" \
+           '{tags: $tags, audience: $aud, uris: $uris[0]}'
+    exit 0 ;;
+  "ad app credential")
+    denied
+    case "${4:-}" in
+      list)
+        q=""; while [ $# -gt 0 ]; do case "$1" in --query) q="${2:-}"; shift 2 ;; *) shift ;; esac; done
+        name="$(printf '%s' "$q" | sed -n "s/.*displayName=='\([^']*\)'.*/\1/p")"
+        # Pure bash: the operator image this suite runs in carries no awk.
+        while read -r id dn; do [ "$dn" = "$name" ] && printf '%s\n' "$id"; done < "$state/creds" || true
+        exit 0 ;;
+      delete)
+        key=""; while [ $# -gt 0 ]; do case "$1" in --key-id) key="${2:-}"; shift 2 ;; *) shift ;; esac; done
+        : > "$state/creds.new" || exit 1
+        while read -r id dn; do [ "$id" = "$key" ] || printf '%s %s\n' "$id" "$dn" >> "$state/creds.new" || exit 1; done < "$state/creds"
+        mv "$state/creds.new" "$state/creds" || exit 1
+        exit 0 ;;
+    esac ;;
+  "rest --method PATCH")
+    denied
+    body=""; while [ $# -gt 0 ]; do case "$1" in --body) body="${2:-}"; shift 2 ;; *) shift ;; esac; done
+    [ "${HOSTING_SR_PATCH_IGNORED:-0}" = "1" ] && exit 0
+    printf '%s' "$body" | jq -c '.web.redirectUris' > "$state/uris.json"; exit 0 ;;
+esac
+echo "az stub: unexpected invocation: $*" >&2
+exit 1
