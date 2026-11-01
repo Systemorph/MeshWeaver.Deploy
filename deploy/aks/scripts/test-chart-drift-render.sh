@@ -252,10 +252,90 @@ else
   echo "  ok   wrote no render"
 fi
 
+# ---- 6. THE DEPLOY'S --set FLAGS reach the render (MeshWeaver#5844) --------
+# The false-drift shape measured on four instances: the live portal carries an inline AZURE_CLIENT_ID
+# because hosting-deploy passes `--set selfUpdate.azureClientId=<the portal identity>`, and helm's
+# manifest owns it — but a render WITHOUT that flag has no such entry, so the comparator reported a
+# value every deploy installs as a PENDING DELETION. The render must carry what the deploy installs.
+# The first half is the control: without the flag the entry is absent, so the second half can fail.
+echo "case: the deploy's --set flags reach the render (selfUpdate.azureClientId → inline AZURE_CLIENT_ID)"
+client="11111111-2222-3333-4444-555555555555"
+has_client_id() {  # has_client_id <render> → prints the portal container's inline AZURE_CLIENT_ID value
+  python3 - "$1" <<'PYEOF'
+import sys, yaml
+for doc in yaml.safe_load_all(open(sys.argv[1])):
+    if doc and doc.get("kind") == "Deployment" and doc["metadata"]["name"] == "memex-portal-deployment":
+        for c in doc["spec"]["template"]["spec"]["containers"]:
+            if c.get("name") == "memex-portal":
+                for e in c.get("env") or []:
+                    if e.get("name") == "AZURE_CLIENT_ID":
+                        print(e.get("value", ""))
+PYEOF
+}
+out="$(run_render "$CHART" "$WORK/no-set.yaml")"; rc=$?
+expect_pass "render without the flag" "$out" "$rc"
+if [ -z "$(has_client_id "$WORK/no-set.yaml")" ]; then
+  echo "  ok   CONTROL: without the deploy's flag the render has no AZURE_CLIENT_ID (the false PENDING DELETION)"
+else
+  echo "::error::the fixture already renders AZURE_CLIENT_ID without the flag — this case could not fail."
+  fail=1
+fi
+out="$(python3 "$RENDER" --chart "$CHART" --namespace check --release rel --out "$WORK/with-set.yaml" \
+        -f "$BASE" -f "$FIXTURE" --set "selfUpdate.azureClientId=$client" \
+        --set "config.memex_portal.MEMEX_DATABASENAME=checkdb" 2>&1)"; rc=$?
+expect_pass "render with the deploy's flags" "$out" "$rc"
+if [ "$(has_client_id "$WORK/with-set.yaml")" = "$client" ]; then
+  echo "  ok   with the deploy's flag the render carries the deploy's AZURE_CLIENT_ID"
+else
+  echo "::error::--set selfUpdate.azureClientId did not reach the rendered portal container:"
+  printf '%s\n' "$out" | sed 's/^/    /'; fail=1
+fi
+case "$out" in *"Placeholder independence PROVED"*) echo "  ok   …and the placeholder proof still holds with the flags applied" ;;
+  *) echo "::error::no independence proof with the flags applied"; printf '%s\n' "$out" | sed 's/^/    /'; fail=1 ;; esac
+# A --set must also decide what this script READS, as it decides what helm renders: here the
+# database host, which shapes the placeholder connection string. The fixture's host is overridden.
+out="$(python3 "$RENDER" --chart "$CHART" --namespace check --release rel --out "$WORK/set-host.yaml" \
+        -f "$BASE" -f "$FIXTURE" --set "config.memex_portal.MEMEX_HOST=set-host.example.test" 2>&1)"; rc=$?
+expect_pass "render with a --set database host" "$out" "$rc"
+# The placeholder connection string — built by THIS script from the values it reads — not the
+# ConfigMap's MEMEX_HOST, which helm renders from the flag whether or not this script read it.
+if grep -q 'ConnectionStrings__orleans: "Host=set-host.example.test;' "$WORK/set-host.yaml"; then
+  echo "  ok   a --set database host decides the placeholder's host, as it decides the deploy's"
+else
+  echo "::error::the --set MEMEX_HOST did not reach the render the placeholder was shaped from"; fail=1
+fi
+# A --set is TYPED as helm types it: `postgres.enabled=false` is false, not the truthy string "false".
+# Read as a string, the placeholder decision skipped the connection string helm then refused to render
+# without (review of #128). The fixture already runs an external database, so this must still render.
+out="$(python3 "$RENDER" --chart "$CHART" --namespace check --release rel --out "$WORK/set-bool.yaml" \
+        -f "$BASE" -f "$FIXTURE" --set "postgres.enabled=false" 2>&1)"; rc=$?
+expect_pass "a boolean --set (postgres.enabled=false) is read as helm reads it" "$out" "$rc"
+# One flag, two assignments, as helm reads it: each host lands on its own half — never one host string
+# carrying the second assignment.
+out="$(python3 "$RENDER" --chart "$CHART" --namespace check --release rel --out "$WORK/set-multi.yaml" \
+        -f "$BASE" -f "$FIXTURE" \
+        --set "config.memex_portal.MEMEX_HOST=multi-a.example.test,config.memex_migration.MEMEX_HOST=multi-b.example.test" 2>&1)"; rc=$?
+expect_pass "a multi-assignment --set" "$out" "$rc"
+if grep -q 'ConnectionStrings__orleans: "Host=multi-a.example.test;' "$WORK/set-multi.yaml" \
+   && grep -q 'ConnectionStrings__orleans: "Host=multi-b.example.test;' "$WORK/set-multi.yaml" \
+   && ! grep -q 'Host=multi-a.example.test,config' "$WORK/set-multi.yaml"; then
+  echo "  ok   a comma-separated --set is two assignments, each half gets its own host"
+else
+  echo "::error::a multi-assignment --set was not split as helm splits it"; fail=1
+fi
+# A form this reader cannot place exactly is REFUSED, never read around while helm applies it.
+out="$(python3 "$RENDER" --chart "$CHART" --namespace check --release rel --out "$WORK/set-list.yaml" \
+        -f "$BASE" -f "$FIXTURE" --set "extraEnv[0].name=X" 2>&1)"; rc=$?
+expect_red "a list-index --set" "$out" "$rc" "does not parse"
+# check-chart-drift.sh: a trailing valued flag is refused, never a hang (`shift 2` would not shift).
+out="$(bash "$SELF_DIR/check-chart-drift.sh" -n ns --set 2>&1)"; rc=$?
+expect_red "a trailing --set with no value" "$out" "$rc" "--set needs a value"
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "chart-drift-render: the record-driven shape renders, the placeholder is provably inert, and"
-  echo "all four controls hold — two leaks, the uncomparable render, and the no-host refusal."
+  echo "all four controls hold — two leaks, the uncomparable render, and the no-host refusal — and the"
+  echo "deploy's --set flags reach the render (MeshWeaver#5844)."
 else
   echo "::error::chart-drift-render self-test FAILED — see the findings above."
 fi

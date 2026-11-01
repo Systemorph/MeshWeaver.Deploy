@@ -74,11 +74,19 @@ src/MeshWeaver.Documentation/Data/Architecture/ChartDriftRenderWithoutSecrets.md
 what was measured about it and how to re-measure. This script is deliberately silent about it
 rather than implying a coverage it does not have.
 
-  usage: chart-drift-render.py --chart DIR --namespace NS --release NAME --out FILE [--record FACTS] -f VALUES...
+THE DEPLOY'S `--set` FLAGS (MeshWeaver#5844). `--set K=V` is passed to helm after every `-f`, exactly
+as hosting-deploy passes its per-instance flags (the operator's _release_sets.sh — the database name,
+the TLS secret, the image, `selfUpdate.azureClientId`). They are applied to the merged values this
+script READS as well, so a flag that names the database host decides the placeholder's host the way
+it decides the deploy's. Without them the render is not what a deploy installs, and the comparison
+reports the deploy's own values as drift.
+
+  usage: chart-drift-render.py --chart DIR --namespace NS --release NAME --out FILE [--record FACTS]
+                               -f VALUES... [--set KEY=VALUE...]
   exit 0 = FILE holds the render, and the compared objects are independent of the placeholder
   exit 1 = the chart could not be rendered, or the placeholder reaches the comparison
 """
-import argparse, copy, json, os, subprocess, sys, tempfile
+import argparse, copy, json, os, re, subprocess, sys, tempfile
 
 import yaml
 
@@ -150,8 +158,42 @@ def deep_merge(base, over):
     return over
 
 
-def merged_values(chart, values_files):
-    """The chart's own values.yaml plus every -f in order — what helm computes for `.Values`."""
+HELM_INT = re.compile(r"[-+]?[0-9]+")
+
+
+def helm_scalar(value):
+    """A `--set` value typed the way helm's strvals types it: true/false -> bool, null -> None, an integer
+    -> int, anything else -> the string. Read as a plain string, `--set postgres.enabled=false` would be
+    the TRUTHY "false" here while helm sees false — and the placeholder decision would disagree with the
+    render it shapes (review of MeshWeaver.Deploy#128)."""
+    if value in ("true", "false"):
+        return value == "true"
+    if value == "null":
+        return None
+    if HELM_INT.fullmatch(value):
+        return int(value)
+    return value
+
+
+def parse_set(flag):
+    """Every assignment in one `--set` flag, as helm reads it: `a.b=x,c.d=y` -> [(["a","b"], x), (["c","d"], y)]
+    with each value typed by `helm_scalar`. Raises ValueError for a form this reader cannot place exactly
+    (list indices, escapes, a part with no `=`): helm WOULD apply it, so reading around it would let the
+    render and the values this script decides from disagree — refused instead, never skipped."""
+    if "\\" in flag or "[" in flag or "{" in flag:
+        raise ValueError(f"--set '{flag}' uses list indices, braces or escapes, which this reader does not parse")
+    out = []
+    for part in flag.split(","):
+        key, sep, value = part.partition("=")
+        if not sep or not key or not all(key.split(".")):
+            raise ValueError(f"--set '{flag}': '{part}' is not a plain dotted key=value assignment")
+        out.append((key.split("."), helm_scalar(value)))
+    return out
+
+
+def merged_values(chart, values_files, sets=()):
+    """The chart's own values.yaml plus every -f in order, then every --set — what helm computes for
+    `.Values` (a --set wins over every file, whatever its position on the command line)."""
     merged = {}
     for path in [os.path.join(chart, "values.yaml")] + list(values_files):
         if not os.path.exists(path):
@@ -160,6 +202,12 @@ def merged_values(chart, values_files):
             loaded = yaml.safe_load(fh)
         if isinstance(loaded, dict):
             merged = deep_merge(merged, loaded)
+    for flag in sets:
+        for path, value in parse_set(flag):
+            over = value
+            for part in reversed(path):
+                over = {part: over}
+            merged = deep_merge(merged, over)
     return merged
 
 
@@ -247,12 +295,14 @@ def declared_keys(record_path):
         return None
 
 
-def render(chart, namespace, release, values_files, extra, out_path):
+def render(chart, namespace, release, values_files, extra, out_path, sets=()):
     args = ["helm", "template", release, chart, "--namespace", namespace]
     for path in values_files:
         args += ["-f", path]
     if extra:
         args += ["-f", extra]
+    for flag in sets:
+        args += ["--set", flag]
     proc = subprocess.run(args, capture_output=True, text=True)
     if proc.returncode != 0:
         err("helm template FAILED — cannot determine what the chart describes:")
@@ -393,9 +443,16 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("-f", "--values", action="append", default=[])
     parser.add_argument("--record", default="")
+    parser.add_argument("--set", dest="sets", action="append", default=[])
     args = parser.parse_args()
 
-    values = merged_values(args.chart, args.values)
+    try:
+        values = merged_values(args.chart, args.values, args.sets)
+    except ValueError as e:
+        err(f"cannot render the chart for a drift comparison: {e}.",
+            "Every --set shapes both the render and what this script reads from the values; one it cannot",
+            "read exactly is refused rather than skipped (the two would disagree).")
+        return 1
     declared = []
     if args.record:
         declared = declared_keys(args.record)
@@ -413,7 +470,7 @@ def main():
         # so a run that wrongly took this path fails at `helm template` rather than passing.
         print("No render-only placeholder was needed: the supplied values already carry every "
               "connection string the chart requires, so this render uses committed values only.")
-        return 0 if render(args.chart, args.namespace, args.release, args.values, None, args.out) else 1
+        return 0 if render(args.chart, args.namespace, args.release, args.values, None, args.out, args.sets) else 1
 
     injected = ", ".join(f"secrets.{half}.{leaf}" for half in sorted(stub["secrets"])
                          for leaf in sorted(stub["secrets"][half]))
@@ -430,7 +487,7 @@ def main():
             with open(stub_path, "w") as fh:
                 yaml.safe_dump(build_placeholder_values(values, placeholder, declared), fh)
             out = args.out if i == 0 else os.path.join(work, "desired-b.yaml")
-            if not render(args.chart, args.namespace, args.release, args.values, stub_path, out):
+            if not render(args.chart, args.namespace, args.release, args.values, stub_path, out, args.sets):
                 return 1
             renders.append(out)
         if not prove_independent(*renders):

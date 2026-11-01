@@ -158,6 +158,11 @@ set -uo pipefail
 
 NS="" ; RELEASE="" ; CHART="" ; VIA="kubectl" ; RG="" ; AKS="" ; EXPECT_PATCH="" ; RECORD_FACTS=""
 VALUES=()
+# `--set` flags, in order, exactly as the deploy passes them to helm (hosting-deploy's per-instance
+# flags, composed by the operator's _release_sets.sh — MeshWeaver#5844). Without them the render is
+# not what a deploy installs: `selfUpdate.azureClientId` alone decides whether the portal carries an
+# inline AZURE_CLIENT_ID.
+SETS=()
 
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CHART_DEFAULT="$SELF_DIR/../../helm"
@@ -172,10 +177,16 @@ usage() {
 }
 
 while [ $# -gt 0 ]; do
+  # A valued flag with nothing after it: `shift 2` would fail WITHOUT shifting and loop forever.
+  case "$1" in
+    -n|--namespace|-r|--release|-f|--values|--set|-c|--chart|--via|-g|--resource-group|--aks|--expect-patch|--record)
+      [ $# -ge 2 ] || { echo "::error::$1 needs a value"; usage; } ;;
+  esac
   case "$1" in
     -n|--namespace)     NS="${2:-}"; shift 2 ;;
     -r|--release)       RELEASE="${2:-}"; shift 2 ;;
     -f|--values)        VALUES+=("${2:-}"); shift 2 ;;
+    --set)              SETS+=("${2:-}"); shift 2 ;;
     -c|--chart)         CHART="${2:-}"; shift 2 ;;
     --via)              VIA="${2:-}"; shift 2 ;;
     -g|--resource-group) RG="${2:-}"; shift 2 ;;
@@ -264,6 +275,7 @@ trap 'rm -rf "$WORK"' EXIT
 # ---------------------------------------------------------------------------
 render_args=( --chart "$CHART" --namespace "$NS" --release "$RELEASE" --out "$WORK/desired.yaml" )
 for v in ${VALUES[@]+"${VALUES[@]}"}; do render_args+=( -f "$v" ); done
+for v in ${SETS[@]+"${SETS[@]}"}; do render_args+=( --set "$v" ); done
 # The record's declared values-half keys shape the placeholder half (policy one-values-half-per-release).
 render_args+=( --record "$RECORD_FACTS" )
 if ! python3 "$SELF_DIR/chart-drift-render.py" "${render_args[@]}"; then
