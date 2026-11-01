@@ -177,6 +177,11 @@ usage() {
 }
 
 while [ $# -gt 0 ]; do
+  # A valued flag with nothing after it: `shift 2` would fail WITHOUT shifting and loop forever.
+  case "$1" in
+    -n|--namespace|-r|--release|-f|--values|--set|-c|--chart|--via|-g|--resource-group|--aks|--expect-patch|--record)
+      [ $# -ge 2 ] || { echo "::error::$1 needs a value"; usage; } ;;
+  esac
   case "$1" in
     -n|--namespace)     NS="${2:-}"; shift 2 ;;
     -r|--release)       RELEASE="${2:-}"; shift 2 ;;

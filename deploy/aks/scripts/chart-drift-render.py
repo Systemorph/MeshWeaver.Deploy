@@ -86,7 +86,7 @@ reports the deploy's own values as drift.
   exit 0 = FILE holds the render, and the compared objects are independent of the placeholder
   exit 1 = the chart could not be rendered, or the placeholder reaches the comparison
 """
-import argparse, copy, json, os, subprocess, sys, tempfile
+import argparse, copy, json, os, re, subprocess, sys, tempfile
 
 import yaml
 
@@ -158,15 +158,37 @@ def deep_merge(base, over):
     return over
 
 
-def parse_set(flag):
-    """`a.b.c=value` -> (["a", "b", "c"], "value"), or None for a flag this reader cannot place.
+HELM_INT = re.compile(r"[-+]?[0-9]+")
 
-    Only the plain dotted form hosting-deploy emits is read here; helm itself still parses every flag
-    for the render. A flag with list indices, escapes or several pairs is passed to helm, not read."""
-    key, sep, value = flag.partition("=")
-    if not sep or not key or any(c in key for c in "[]\\,"):
+
+def helm_scalar(value):
+    """A `--set` value typed the way helm's strvals types it: true/false -> bool, null -> None, an integer
+    -> int, anything else -> the string. Read as a plain string, `--set postgres.enabled=false` would be
+    the TRUTHY "false" here while helm sees false — and the placeholder decision would disagree with the
+    render it shapes (review of MeshWeaver.Deploy#128)."""
+    if value in ("true", "false"):
+        return value == "true"
+    if value == "null":
         return None
-    return key.split("."), value
+    if HELM_INT.fullmatch(value):
+        return int(value)
+    return value
+
+
+def parse_set(flag):
+    """Every assignment in one `--set` flag, as helm reads it: `a.b=x,c.d=y` -> [(["a","b"], x), (["c","d"], y)]
+    with each value typed by `helm_scalar`. Raises ValueError for a form this reader cannot place exactly
+    (list indices, escapes, a part with no `=`): helm WOULD apply it, so reading around it would let the
+    render and the values this script decides from disagree — refused instead, never skipped."""
+    if "\\" in flag or "[" in flag or "{" in flag:
+        raise ValueError(f"--set '{flag}' uses list indices, braces or escapes, which this reader does not parse")
+    out = []
+    for part in flag.split(","):
+        key, sep, value = part.partition("=")
+        if not sep or not key or not all(key.split(".")):
+            raise ValueError(f"--set '{flag}': '{part}' is not a plain dotted key=value assignment")
+        out.append((key.split("."), helm_scalar(value)))
+    return out
 
 
 def merged_values(chart, values_files, sets=()):
@@ -181,14 +203,11 @@ def merged_values(chart, values_files, sets=()):
         if isinstance(loaded, dict):
             merged = deep_merge(merged, loaded)
     for flag in sets:
-        parsed = parse_set(flag)
-        if parsed is None:
-            continue
-        path, value = parsed
-        over = value
-        for part in reversed(path):
-            over = {part: over}
-        merged = deep_merge(merged, over)
+        for path, value in parse_set(flag):
+            over = value
+            for part in reversed(path):
+                over = {part: over}
+            merged = deep_merge(merged, over)
     return merged
 
 
@@ -427,7 +446,13 @@ def main():
     parser.add_argument("--set", dest="sets", action="append", default=[])
     args = parser.parse_args()
 
-    values = merged_values(args.chart, args.values, args.sets)
+    try:
+        values = merged_values(args.chart, args.values, args.sets)
+    except ValueError as e:
+        err(f"cannot render the chart for a drift comparison: {e}.",
+            "Every --set shapes both the render and what this script reads from the values; one it cannot",
+            "read exactly is refused rather than skipped (the two would disagree).")
+        return 1
     declared = []
     if args.record:
         declared = declared_keys(args.record)

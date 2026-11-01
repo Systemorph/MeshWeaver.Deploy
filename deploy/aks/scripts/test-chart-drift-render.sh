@@ -304,6 +304,32 @@ if grep -q 'ConnectionStrings__orleans: "Host=set-host.example.test;' "$WORK/set
 else
   echo "::error::the --set MEMEX_HOST did not reach the render the placeholder was shaped from"; fail=1
 fi
+# A --set is TYPED as helm types it: `postgres.enabled=false` is false, not the truthy string "false".
+# Read as a string, the placeholder decision skipped the connection string helm then refused to render
+# without (review of #128). The fixture already runs an external database, so this must still render.
+out="$(python3 "$RENDER" --chart "$CHART" --namespace check --release rel --out "$WORK/set-bool.yaml" \
+        -f "$BASE" -f "$FIXTURE" --set "postgres.enabled=false" 2>&1)"; rc=$?
+expect_pass "a boolean --set (postgres.enabled=false) is read as helm reads it" "$out" "$rc"
+# One flag, two assignments, as helm reads it: each host lands on its own half — never one host string
+# carrying the second assignment.
+out="$(python3 "$RENDER" --chart "$CHART" --namespace check --release rel --out "$WORK/set-multi.yaml" \
+        -f "$BASE" -f "$FIXTURE" \
+        --set "config.memex_portal.MEMEX_HOST=multi-a.example.test,config.memex_migration.MEMEX_HOST=multi-b.example.test" 2>&1)"; rc=$?
+expect_pass "a multi-assignment --set" "$out" "$rc"
+if grep -q 'ConnectionStrings__orleans: "Host=multi-a.example.test;' "$WORK/set-multi.yaml" \
+   && grep -q 'ConnectionStrings__orleans: "Host=multi-b.example.test;' "$WORK/set-multi.yaml" \
+   && ! grep -q 'Host=multi-a.example.test,config' "$WORK/set-multi.yaml"; then
+  echo "  ok   a comma-separated --set is two assignments, each half gets its own host"
+else
+  echo "::error::a multi-assignment --set was not split as helm splits it"; fail=1
+fi
+# A form this reader cannot place exactly is REFUSED, never read around while helm applies it.
+out="$(python3 "$RENDER" --chart "$CHART" --namespace check --release rel --out "$WORK/set-list.yaml" \
+        -f "$BASE" -f "$FIXTURE" --set "extraEnv[0].name=X" 2>&1)"; rc=$?
+expect_red "a list-index --set" "$out" "$rc" "does not parse"
+# check-chart-drift.sh: a trailing valued flag is refused, never a hang (`shift 2` would not shift).
+out="$(bash "$SELF_DIR/check-chart-drift.sh" -n ns --set 2>&1)"; rc=$?
+expect_red "a trailing --set with no value" "$out" "$rc" "--set needs a value"
 
 echo
 if [ "$fail" -eq 0 ]; then
