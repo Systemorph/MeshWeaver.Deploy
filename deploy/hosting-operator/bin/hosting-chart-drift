@@ -29,8 +29,12 @@
 # composes it: the chart, the record's render, the Key Vault values half in its declared shape (the
 # drift scripts' render-only placeholder — this check never holds the half), and the per-instance
 # --set flags from _release_sets.sh, the ONE file both commands source (selfUpdate.azureClientId,
-# the database name, the TLS secret, the image). So a finding means "a Reconcile would change
-# this" — nothing else.
+# the database name, the TLS secret, the image). So a finding is a real difference between what a
+# Reconcile installs and what the cluster runs — never an artefact of comparing against an input no
+# deploy reads. Whether the next Reconcile REMOVES it still depends on the class (core
+# Doc/Architecture/ChartDriftSemantics): a PENDING DELETION and a rendered inline env entry are reset
+# by the upgrade; a never-owned CLUSTER-ONLY key and a SHADOWS entry survive it and need explicit
+# retirement first.
 #
 # LEGACY, without --values: the desired side is the COMMITTED OVERLAY below instead. That is not
 # what a deploy renders — it misses the record's projection and every --set flag, so it reports the
