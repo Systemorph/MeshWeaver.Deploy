@@ -20,6 +20,11 @@ registry:
     accountName: "exampleregistrystore"
     container: "registry"
   serviceAccount: "memex-portal-sa"
+  # The registry's own identity: set a client id (and drop serviceAccount, or name a dedicated one)
+  # and the chart creates `memex-registry-sa` annotated with it — blob write moves off the portal's
+  # identity. Empty here so this example renders the portal-account shape the chart gate pins.
+  workloadIdentity:
+    clientId: ""
   keyVault:
     name: "example-vault"
     tenantId: "00000000-0000-0000-0000-000000000000"

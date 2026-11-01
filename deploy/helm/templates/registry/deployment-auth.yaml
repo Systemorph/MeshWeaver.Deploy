@@ -36,6 +36,13 @@ spec:
         azure.workload.identity/use: "true"
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/registry/configmap.yaml") . | sha256sum }}
+{{- if $r.workloadIdentityClientId }}
+        # The workload-identity webhook injects the client id at pod CREATION and the pod template
+        # names only the account, so a changed client id under the same account name must roll the
+        # pods, or they keep the old identity until its grant is retired. Absent without a client id,
+        # so that render is unchanged.
+        checksum/identity: {{ $r.workloadIdentityClientId | sha256sum | quote }}
+{{- end }}
     spec:
       serviceAccountName: {{ $r.serviceAccount | quote }}
       containers:

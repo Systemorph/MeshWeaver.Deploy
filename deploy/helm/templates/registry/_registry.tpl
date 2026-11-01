@@ -50,6 +50,24 @@ start. The one exception is deliberate and safe: `publisher.passwordBcrypt` is a
        this URL. A default naming one installation's portal would send every OTHER installation's
        instance keys there, and authenticate them against the wrong authority. */ -}}
 {{- $validationUrl := required "registry.validationUrl is required when registry.enabled — the portal key→token exchange that validates every instance key presented at this registry (e.g. https://portal.example.com/api/instances/token). There is no default: docker_auth sends each login's instance key to this URL, so it must name YOUR installation's validator" (($r.validationUrl | default "") | toString | trim) -}}
+{{- /* The registry's OWN workload identity (registry.workloadIdentity.clientId). Set → the chart creates
+       a dedicated ServiceAccount for the registry pods (templates/registry/serviceaccount.yaml); it
+       may never be the portal's `memex-portal-sa`, which the portal chart owns and federates to the
+       portal identity — annotating that one would move the PORTAL onto the registry's identity. */ -}}
+{{- $wi := ($r.workloadIdentity | default dict) -}}
+{{- $wiClientId := (($wi.clientId | default "") | toString | trim) -}}
+{{- $serviceAccount := (($r.serviceAccount | default "") | toString | trim) -}}
+{{- if not $serviceAccount -}}
+{{- $serviceAccount = ternary "memex-registry-sa" "memex-portal-sa" (ne $wiClientId "") -}}
+{{- end -}}
+{{- if $wiClientId -}}
+{{- if not (regexMatch "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" $wiClientId) -}}
+{{- fail (printf "registry.workloadIdentity.clientId %q is not a client id (a GUID) — it is the registry identity's client id, annotated on the registry's own ServiceAccount" $wiClientId) -}}
+{{- end -}}
+{{- if eq $serviceAccount "memex-portal-sa" -}}
+{{- fail "registry.workloadIdentity.clientId is set but registry.serviceAccount is the portal's memex-portal-sa — a dedicated identity needs a dedicated account (leave serviceAccount blank for memex-registry-sa); annotating the portal's account would move the portal onto the registry's identity" -}}
+{{- end -}}
+{{- end -}}
 {{- $notificationUrl := ($notifications.url | default "") -}}
 {{- $notificationSecretObject := ($kv.notificationSecretObject | default "") -}}
 {{- if and $notificationUrl (not $notificationSecretObject) -}}
@@ -61,7 +79,8 @@ start. The one exception is deliberate and safe: `publisher.passwordBcrypt` is a
       "authImage" $authImage
       "issuer" ($r.issuer | default "memex-registry")
       "replicas" (int ($r.replicas | default 1))
-      "serviceAccount" ($r.serviceAccount | default "memex-portal-sa")
+      "serviceAccount" $serviceAccount
+      "workloadIdentityClientId" $wiClientId
       "accountName" $accountName
       "container" ($storage.container | default "registry")
       "vaultName" $vaultName
