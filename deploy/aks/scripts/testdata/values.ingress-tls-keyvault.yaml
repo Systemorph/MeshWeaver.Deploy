@@ -1,0 +1,15 @@
+# An estate whose Ingress objects are served by its OWN ingress-nginx, with the certificate in Key
+# Vault (MeshWeaver.Deploy#130). No app routing add-on reads `tls-cert-keyvault-uri` there, so the
+# chart must render a SecretProviderClass that syncs `tlsSecret` as a kubernetes.io/tls Secret and
+# mount it on the portal pod — the Secret then comes from the chart alone. Neutral sample names.
+ingress:
+  enabled: true
+  className: "nginx-internal"
+  host: "portal.example.com"
+  tlsSecret: "portal-tls"
+  tlsFromKeyVault:
+    certificate: "portal-example-com"
+keyVaultSecrets:
+  vaultName: "kv-example"
+  tenantId: "00000000-0000-0000-0000-000000000000"
+  identityClientId: "11111111-1111-1111-1111-111111111111"

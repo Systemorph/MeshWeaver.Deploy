@@ -554,6 +554,31 @@ curl -sS -o /dev/null -w "%{http_code} verify=%{ssl_verify_result}\n" \
   --resolve <host>:443:$IP https://<host>/
 ```
 
+### TLS from a Key Vault certificate (an estate on its own ingress-nginx)
+
+The `kubernetes.azure.com/tls-cert-keyvault-uri` annotation is read only by the AKS app routing
+add-on. An estate whose Ingress objects are served by its own ingress-nginx controllers has nothing
+that turns that annotation into a Secret. For that estate, name the vault certificate in the
+overlay and the chart has the Key Vault CSI driver create the Secret:
+
+```yaml
+ingress:
+  tlsSecret: "portal-tls"
+  clusterIssuer: ""                       # or "none"; never an issuer: one writer per Secret
+  tlsFromKeyVault:
+    certificate: "portal-example-com"     # the vault CERTIFICATE object's name
+# vault, tenant and reader identity fall back to keyVaultSecrets.*
+```
+
+The chart renders a SecretProviderClass with a `kubernetes.io/tls` secret object named
+`ingress.tlsSecret`. Its `tls.key` and `tls.crt` both come from the certificate read as a secret,
+which is its PEM bundle with the full chain, so the served chain includes the intermediate. The
+portal pod mounts that class, because the driver creates and refreshes the Secret only while a pod
+mounts it. A fresh or reset namespace gets the Secret from the chart alone. A new version of the
+vault certificate reaches the Secret on the driver's rotation poll with no deploy, provided the
+cluster's Key Vault Secrets Provider runs with secret rotation enabled. The reader identity needs
+secret GET on the vault. The chart refuses the render when a cert-manager issuer is also set.
+
 ### Default SSL certificate (cluster-wide, one-time)
 
 Without it, any client that connects **without SNI** gets the self-signed

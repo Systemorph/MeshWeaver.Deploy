@@ -889,6 +889,25 @@ ingress:
   # a tlsSecret and neither an issuer nor a hand-written cert-manager annotation is refused by
   # deploy/aks/scripts/check-chart-invariants.sh — that shape serves another host's certificate.
   clusterIssuer: ""
+  # The TLS Secret from a Key Vault CERTIFICATE, created and rotated by the Key Vault CSI driver
+  # (MeshWeaver.Deploy#130) — for an estate whose Ingress objects are served by its own
+  # ingress-nginx, where no app routing add-on reads `kubernetes.azure.com/tls-cert-keyvault-uri`.
+  # Set `certificate` to the vault certificate object's NAME and the chart renders a
+  # SecretProviderClass with a `kubernetes.io/tls` secretObject named `tlsSecret` (tls.key + tls.crt,
+  # the full chain), mounted on the portal pod: a fresh namespace gets the Secret from the chart
+  # alone, and a renewed vault certificate reaches it on the driver's rotation poll — the cluster's
+  # Key Vault Secrets Provider must run with secret rotation ENABLED for that half.
+  # Empty (the default) renders nothing. Exclusive with clusterIssuer (leave it empty or `none`):
+  # two writers to one Secret overwrite each other. Vault coordinates fall back to keyVaultSecrets.
+  # NAMES ONLY — no certificate or key material is ever in values.
+  tlsFromKeyVault:
+    certificate: ""               # vault certificate object name; empty = off
+    vaultName: ""                 # falls back to keyVaultSecrets.vaultName
+    tenantId: ""                  # falls back to keyVaultSecrets.tenantId
+    identityClientId: ""          # falls back to keyVaultSecrets.identityClientId
+    name: ""                      # SecretProviderClass name; default memex-ingress-tls-keyvault
+    volumeName: ""                # pod volume; default ingress-tls
+    mountPath: ""                 # default /mnt/ingress-tls (nothing reads it; the mount drives the sync)
   # A spinner page while the portal has no ready endpoint (booting, restarting, landing its first
   # modules) instead of the controller's bare 503 — templates/memex-portal/boot-page.yaml. Off in the
   # neutral chart; the Homebrew defaults turn it on.

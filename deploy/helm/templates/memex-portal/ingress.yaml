@@ -3,7 +3,14 @@
 {{- $tls := .Values.ingress.tlsSecret | default "" }}
 {{- $issuer := .Values.ingress.clusterIssuer | default "" }}
 {{- $handWritten := hasKey (.Values.ingress.annotations | default dict) "cert-manager.io/cluster-issuer" }}
-{{- if and $tls (not $issuer) (not $handWritten) }}
+{{- /* ingress.tlsFromKeyVault (MeshWeaver.Deploy#130): the CSI driver creates the Secret from a vault
+       certificate. That IS an issuer reaching the ingress — and it must be the ONLY one: cert-manager
+       writing the same Secret would race the driver, each overwriting the other's certificate. */}}
+{{- $fromVault := (include "memex.ingressTlsFromKeyVault" . | fromYaml).certificate }}
+{{- if and $fromVault (or (and $issuer (ne $issuer "none")) $handWritten) }}
+{{- fail (printf "ingress.tlsFromKeyVault.certificate is %q AND a cert-manager issuer is set for the same Secret %q. Pick ONE writer: the CSI driver (from the vault) or cert-manager — two writers overwrite each other's certificate. Leave ingress.clusterIssuer empty (or none) when the certificate comes from Key Vault." $fromVault $tls) }}
+{{- end }}
+{{- if and $tls (not $issuer) (not $handWritten) (not $fromVault) }}
 {{- fail (printf "ingress.tlsSecret is %q but NO issuer reaches the ingress. Set ingress.clusterIssuer (the fleet's is letsencrypt-prod), or ingress.clusterIssuer=none when that Secret is created by other means. An ingress naming a TLS secret nobody issues serves ANOTHER host's certificate: fabrikam.example.com served CN=memex.meshweaver.cloud for nine hours on 2026-09-15." $tls) }}
 {{- end }}
 # ---- Portal Ingress (TLS termination at the ingress controller) ------------
@@ -60,7 +67,11 @@ metadata:
     {{- if and $issuer (ne $issuer "none") (not $handWritten) }}
     cert-manager.io/cluster-issuer: {{ $issuer | quote }}
     {{- end }}
-    {{- if eq $issuer "none" }}
+    {{- if $fromVault }}
+    # This Secret is created and rotated by the Key Vault CSI driver from a vault certificate
+    # (ingress.tlsFromKeyVault; the SecretProviderClass is in ingress-tls-secretproviderclass.yaml).
+    meshweaver.io/tls-secret: "key-vault"
+    {{- else if eq $issuer "none" }}
     # Deliberate: this Secret is created by other means. Written down so a reader of the live
     # object can tell an opt-out from a forgotten issuer.
     meshweaver.io/tls-secret: "pre-provisioned"

@@ -476,6 +476,16 @@ spec:
               mountPath: "{{ $class.mountPath }}"
               readOnly: true
 {{- end }}
+{{- /* The Ingress TLS certificate class (ingress.tlsFromKeyVault). Nothing reads the files: the
+       mount exists because the CSI driver creates and rotates the synced kubernetes.io/tls Secret
+       only while a pod mounts the volume. Portal only — the migration Job has no use for it. */}}
+{{- with (include "memex.ingressTlsFromKeyVault" . | fromYaml) }}
+{{- if .certificate }}
+            - name: "{{ .volumeName }}"
+              mountPath: "{{ .mountPath }}"
+              readOnly: true
+{{- end }}
+{{- end }}
 {{- /* ⚠️ LEGACY: extra mounts the chart does not own — the mount half of .Values.extraVolumes
        (typically a HAND-MADE secrets-store CSI volume, whose mount is what makes the driver sync
        its k8s Secret and keep rotating it). Prefer .Values.keyVaultSecrets, which renders the
@@ -754,6 +764,16 @@ spec:
             readOnly: true
             volumeAttributes:
               secretProviderClass: "{{ $class.name }}"
+{{- end }}
+{{- with (include "memex.ingressTlsFromKeyVault" . | fromYaml) }}
+{{- if .certificate }}
+        - name: "{{ .volumeName }}"
+          csi:
+            driver: "secrets-store.csi.k8s.io"
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: "{{ .name }}"
+{{- end }}
 {{- end }}
 {{- /* ⚠️ LEGACY: extra volumes the chart does not own — typically the secrets-store CSI volume
        behind a HAND-MADE SecretProviderClass. Prefer .Values.keyVaultSecrets, which renders the
