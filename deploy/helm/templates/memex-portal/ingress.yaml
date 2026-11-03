@@ -7,8 +7,11 @@
        certificate. That IS an issuer reaching the ingress — and it must be the ONLY one: cert-manager
        writing the same Secret would race the driver, each overwriting the other's certificate. */}}
 {{- $fromVault := (include "memex.ingressTlsFromKeyVault" . | fromYaml).certificate }}
-{{- if and $fromVault (or (and $issuer (ne $issuer "none")) $handWritten) }}
-{{- fail (printf "ingress.tlsFromKeyVault.certificate is %q AND a cert-manager issuer is set for the same Secret %q. Pick ONE writer: the CSI driver (from the vault) or cert-manager — two writers overwrite each other's certificate. Leave ingress.clusterIssuer empty (or none) when the certificate comes from Key Vault." $fromVault $tls) }}
+{{- /* The namespaced `cert-manager.io/issuer` annotation is a writer too: ingress.annotations is copied
+       onto the Ingress, so cert-manager would issue into the CSI-managed Secret just the same. */}}
+{{- $handWrittenNamespaced := hasKey (.Values.ingress.annotations | default dict) "cert-manager.io/issuer" }}
+{{- if and $fromVault (or (and $issuer (ne $issuer "none")) $handWritten $handWrittenNamespaced) }}
+{{- fail (printf "ingress.tlsFromKeyVault.certificate is %q AND a cert-manager issuer is set for the same Secret %q. Pick ONE writer: the CSI driver (from the vault) or cert-manager — two writers overwrite each other's certificate. Leave ingress.clusterIssuer empty (or none), and set neither cert-manager.io/cluster-issuer nor cert-manager.io/issuer in ingress.annotations, when the certificate comes from Key Vault." $fromVault $tls) }}
 {{- end }}
 {{- if and $tls (not $issuer) (not $handWritten) (not $fromVault) }}
 {{- fail (printf "ingress.tlsSecret is %q but NO issuer reaches the ingress. Set ingress.clusterIssuer (the fleet's is letsencrypt-prod), or ingress.clusterIssuer=none when that Secret is created by other means. An ingress naming a TLS secret nobody issues serves ANOTHER host's certificate: fabrikam.example.com served CN=memex.meshweaver.cloud for nine hours on 2026-09-15." $tls) }}

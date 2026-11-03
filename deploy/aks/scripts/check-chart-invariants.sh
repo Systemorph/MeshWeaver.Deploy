@@ -163,6 +163,9 @@ COMBOS=(
   # comes from a Key Vault certificate through the CSI driver — the only combination that renders
   # the ingress-tls SecretProviderClass; the evidence check below reads it by name.
   "a host whose TLS Secret is synced from Key Vault (fixture)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.ingress-tls-keyvault.yaml"
+  # The same, with a certificate whose valid vault name reads as a YAML number. The evidence check
+  # below asserts every objectName stays the string "2026" — unquoted it is an integer the API rejects.
+  "a host whose TLS Secret is synced from a numeric-named Key Vault certificate (fixture)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.ingress-tls-keyvault-numeric-name.yaml"
   # 🚨 Cookie session affinity as the RECORD renders it (MeshWeaver#6825): HelmValues writes the typed
   # block under ingress.sessionAffinity.*, which the chart did not read, so a record-only render
   # dropped affinity from every multi-replica Blazor portal. The evidence check below the loop reads
@@ -458,6 +461,27 @@ else
   report "ingress.tlsFromKeyVault: the fixture must render a SecretProviderClass with a kubernetes.io/tls secretObject named after ingress.tlsSecret (tls.key and tls.crt from the vault certificate), a CSI volume for it MOUNTED by the portal container, the meshweaver.io/tls-secret=key-vault marker and no cert-manager issuer, and the AKS overlay must render no such class (MeshWeaver.Deploy#130)"
 fi
 
+# A vault certificate name that reads as a YAML number ("2026") must render as the STRING in every
+# objectName — the provider's objects array and both tls secretObject keys. Unquoted, the API server
+# rejects the SecretProviderClass and TLS provisioning never starts (MeshWeaver.Deploy#130).
+kv_tls_numeric="$(render_of "a host whose TLS Secret is synced from a numeric-named Key Vault certificate (fixture)")"
+if [ -f "$kv_tls_numeric" ] && python3 - "$kv_tls_numeric" <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+spcs = [d for d in docs if d["kind"] == "SecretProviderClass" and any(o.get("type") == "kubernetes.io/tls" for o in d["spec"].get("secretObjects") or [])]
+assert len(spcs) == 1, len(spcs)
+spc = spcs[0]
+names = [x["objectName"] for o in spc["spec"]["secretObjects"] if o.get("type") == "kubernetes.io/tls" for x in o["data"]]
+objs = [yaml.safe_load(o) for o in yaml.safe_load(spc["spec"]["parameters"]["objects"])["array"]]
+names += [o["objectName"] for o in objs]
+assert len(names) == 3 and all(n == "2026" and isinstance(n, str) for n in names), [(n, type(n).__name__) for n in names]
+PY
+then
+  ok "ingress.tlsFromKeyVault: a numeric-looking vault certificate name renders as the string \"2026\" in all three objectNames"
+else
+  report "ingress.tlsFromKeyVault: a vault certificate named \"2026\" must render as a STRING objectName in the objects array and in both tls secretObject keys — an unquoted scalar becomes an integer the API server rejects (MeshWeaver.Deploy#130)"
+fi
+
 # The bake-gate evidence (MeshWeaver#4588, #5544). Invariant 10b — an armed PreWarm__GateReadiness
 # is read by the readinessProbe on /ready, and the rollout deadline covers a cold bake — is
 # CONDITIONAL, so it is satisfied just as well by a set of renders where nothing ever arms the gate.
@@ -498,6 +522,7 @@ REFUSALS=(
   "an external database whose values string names the in-cluster Service (the explicit-placeholder refusal)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.external-db-explicit-in-cluster-host.yaml|names the in-cluster Service memex-postgres-service"
   "a TLS secret with no issuer reaching the ingress (the fabrikam certificate refusal)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.ingress-no-issuer.yaml|NO issuer reaches the ingress"
   "a Key Vault TLS Secret AND a cert-manager issuer for it (two writers, MeshWeaver.Deploy#130)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.ingress-tls-keyvault-and-issuer.yaml|Pick ONE writer"
+  "a Key Vault TLS Secret AND a hand-written namespaced cert-manager.io/issuer annotation (two writers, MeshWeaver.Deploy#130)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.ingress-tls-keyvault-and-namespaced-issuer.yaml|Pick ONE writer"
   "a database release AND the bundled Postgres (two answers to which database)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.db-release-with-bundled-postgres.yaml|exclusive with postgres.enabled"
   # Plugins#1738: an executor the portal would silently read as Job must fail the render.
   "a misspelled operator executor|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.operator-executor-misspelled.yaml|must be Job or Actions"
