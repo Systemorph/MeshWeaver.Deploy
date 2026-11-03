@@ -836,17 +836,23 @@ az aks command invoke -g <rg> -n <cluster> --command \
 #    published tags before step 4 and pick one; a tag you did not see in the registry is not a
 #    tag you can deploy:
 az acr repository show-tags -n <acrName> --repository memex-log-watcher -o tsv
-#    🌐 An estate with no ACR access reads the SAME image from the fleet registry,
-#    cr.meshweaver.cloud: the lane mirrors every tag there by digest (same manifest, read back),
-#    and any valid instance key may pull it — the registry ACL grants `pull` on every
-#    non-`plugins/` repository to any authenticated account, so no extra grant is needed. List
-#    the tags with the instance key (any account name, the key as the password), e.g.
-#      crane auth login cr.meshweaver.cloud -u instance -p "$INSTANCE_KEY"
-#      crane ls cr.meshweaver.cloud/memex-log-watcher
-#    and pin a <version> tag (MAJOR.MINOR.PATCH, the highest one listed) in the estate's mirror
-#    lane and manifest. `:latest` is the declared moving label (core .github/release-channels.json)
-#    and is what the reference estate runs; an estate whose rule is "declared, not derived" pins
-#    the version it read instead.
+#    Pin a <major>.<minor>.<patch> tag. The lane derives it as the highest published version
+#    plus one, so it only moves forward. :latest moves on every publish (it is the declared
+#    moving label in core's .github/release-channels.json), and :<sha7> names a Plugins commit
+#    rather than a release.
+#
+#    🌐 An estate that pulls ONLY from the fleet registry (<fleet-registry>, with its
+#    `<prefix>PluginCatalog-RegistryToken` instance key) reads the SAME image there: the lane
+#    copies every tag to the fleet registry by digest (same manifest, read back). The fleet
+#    registry has its own storage and is not a read-through cache of the ACR, so this push is the
+#    only way the image reaches it. The route is the same as for memex-portal-ai: read
+#      GET https://<fleet-registry>/v2/memex-log-watcher/tags/list
+#    with the instance key (any account name, the key as the password; or
+#    `crane auth login <fleet-registry> -u instance -p "$INSTANCE_KEY"` then
+#    `crane ls <fleet-registry>/memex-log-watcher`), then pin a version tag in the estate's
+#    mirror lane and manifest. No per-key grant is needed: the registry ACL lets any
+#    authenticated instance key pull any image repository outside `plugins/` (the last rule in
+#    deploy/helm/templates/registry/configmap.yaml).
 
 # 4. Apply the Deployment + PVC (edit the image tag + watched namespaces in the manifest first).
 az aks command invoke -g <rg> -n <cluster> \
