@@ -836,6 +836,17 @@ az aks command invoke -g <rg> -n <cluster> --command \
 #    published tags before step 4 and pick one; a tag you did not see in the registry is not a
 #    tag you can deploy:
 az acr repository show-tags -n <acrName> --repository memex-log-watcher -o tsv
+#    🌐 An estate with no ACR access reads the SAME image from the fleet registry,
+#    cr.meshweaver.cloud: the lane mirrors every tag there by digest (same manifest, read back),
+#    and any valid instance key may pull it — the registry ACL grants `pull` on every
+#    non-`plugins/` repository to any authenticated account, so no extra grant is needed. List
+#    the tags with the instance key (any account name, the key as the password), e.g.
+#      crane auth login cr.meshweaver.cloud -u instance -p "$INSTANCE_KEY"
+#      crane ls cr.meshweaver.cloud/memex-log-watcher
+#    and pin a <version> tag (MAJOR.MINOR.PATCH, the highest one listed) in the estate's mirror
+#    lane and manifest. `:latest` is the declared moving label (core .github/release-channels.json)
+#    and is what the reference estate runs; an estate whose rule is "declared, not derived" pins
+#    the version it read instead.
 
 # 4. Apply the Deployment + PVC (edit the image tag + watched namespaces in the manifest first).
 az aks command invoke -g <rg> -n <cluster> \
