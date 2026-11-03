@@ -1,0 +1,14 @@
+# A Key Vault certificate whose valid name reads as a YAML number. Every objectName the chart renders
+# must stay the STRING "2026": an unquoted scalar becomes an integer, and the API server rejects the
+# SecretProviderClass, so TLS provisioning never starts (MeshWeaver.Deploy#130).
+ingress:
+  enabled: true
+  className: "nginx-internal"
+  host: "portal.example.com"
+  tlsSecret: "portal-tls"
+  tlsFromKeyVault:
+    certificate: "2026"
+keyVaultSecrets:
+  vaultName: "kv-example"
+  tenantId: "00000000-0000-0000-0000-000000000000"
+  identityClientId: "11111111-1111-1111-1111-111111111111"

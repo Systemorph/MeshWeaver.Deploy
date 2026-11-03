@@ -63,3 +63,44 @@ NAMES ONLY. No value of any secret is in values, in this helper, or in any rende
 {{- end -}}
 {{- toYaml $classes -}}
 {{- end -}}
+
+{{- /*
+The Ingress TLS certificate, synced from Key Vault by the CSI driver (ingress.tlsFromKeyVault,
+MeshWeaver.Deploy#130). Renders the resolved block as YAML, or NOTHING when the ingress is off or
+`ingress.tlsFromKeyVault.certificate` is empty — so every estate that has not opted in (the app
+routing add-on's `tls-cert-keyvault-uri` estates, cert-manager estates) renders byte-identically.
+
+🚨 WHY IT EXISTS. Only the AKS app routing add-on turns a vault certificate into the Secret the
+Ingress names. An estate that serves its Ingress objects with its own ingress-nginx controllers
+has no component that creates that Secret, so it was created by hand from the vault certificate —
+and again after every namespace reset and at every certificate renewal. The CSI driver can do it:
+a SecretProviderClass whose `secretObjects` entry has type `kubernetes.io/tls` makes the driver
+create the Secret while a pod mounts the volume, and keep it current within its rotation interval.
+
+ONE OBJECT, TWO KEYS. A vault CERTIFICATE read with `objectType: secret` is its PEM bundle — the
+private key and the certificate CHAIN (leaf and intermediates). For a `kubernetes.io/tls` Secret the
+driver splits that one object into `tls.key` and `tls.crt`, so both keys name the same object, and
+the served chain carries the intermediate certificate.
+
+The vault coordinates fall back to `keyVaultSecrets`, like every other class. The SPC name, volume
+and mount path are the chart's own and differ from every `keyVaultSecrets` default, so the two
+classes can never collide on a pod volume or a synced Secret.
+
+NAMES ONLY: `certificate` is the vault certificate object's NAME. No value is in values or render.
+*/ -}}
+{{- define "memex.ingressTlsFromKeyVault" -}}
+{{- $t := ((.Values.ingress).tlsFromKeyVault | default dict) -}}
+{{- if and (.Values.ingress).enabled $t.certificate -}}
+{{- $fallback := (.Values.keyVaultSecrets | default dict) -}}
+{{- $secret := required "ingress.tlsFromKeyVault.certificate is set, so ingress.tlsSecret must name the Secret the CSI driver creates" (.Values.ingress).tlsSecret -}}
+{{- toYaml (dict
+      "certificate" $t.certificate
+      "secretName" $secret
+      "name" ($t.name | default "memex-ingress-tls-keyvault")
+      "volumeName" ($t.volumeName | default "ingress-tls")
+      "mountPath" ($t.mountPath | default "/mnt/ingress-tls")
+      "vaultName" (required "ingress.tlsFromKeyVault.vaultName is required (or keyVaultSecrets.vaultName)" ($t.vaultName | default $fallback.vaultName))
+      "tenantId" (required "ingress.tlsFromKeyVault.tenantId is required (or keyVaultSecrets.tenantId)" ($t.tenantId | default $fallback.tenantId))
+      "identityClientId" (required "ingress.tlsFromKeyVault.identityClientId is required (or keyVaultSecrets.identityClientId) — the Key Vault Secrets Provider add-on's identity, which needs secret GET on the vault" ($t.identityClientId | default $fallback.identityClientId))) -}}
+{{- end -}}
+{{- end -}}
