@@ -845,12 +845,18 @@ az acr repository show-tags -n <acrName> --repository memex-log-watcher -o tsv
 #    `<prefix>PluginCatalog-RegistryToken` instance key) reads the SAME image there: the lane
 #    copies every tag to the fleet registry by digest (same manifest, read back). The fleet
 #    registry has its own storage and is not a read-through cache of the ACR, so this push is the
-#    only way the image reaches it. The route is the same as for memex-portal-ai: read
-#      GET https://<fleet-registry>/v2/memex-log-watcher/tags/list
-#    with the instance key (any account name, the key as the password; or
-#    `crane auth login <fleet-registry> -u instance -p "$INSTANCE_KEY"` then
-#    `crane ls <fleet-registry>/memex-log-watcher`), then pin a version tag in the estate's
-#    mirror lane and manifest. No per-key grant is needed: the registry ACL lets any
+#    only way the image reaches it. List the tags with a registry-aware client, which performs
+#    the bearer-token exchange the registry requires (any account name, the instance key as the
+#    password):
+#      crane auth login <fleet-registry> -u instance -p "$INSTANCE_KEY"
+#      crane ls <fleet-registry>/memex-log-watcher
+#    A raw `GET /v2/memex-log-watcher/tags/list` with the key as a Basic-auth password answers
+#    401: the registry accepts only a bearer token. Over plain HTTP, first exchange the key at
+#    the realm the 401's `WWW-Authenticate` header names (realm `https://<fleet-registry>/auth`, service `<fleet-registry>`):
+#      curl -u "instance:$INSTANCE_KEY" \
+#        "https://<fleet-registry>/auth?service=<fleet-registry>&scope=repository:memex-log-watcher:pull"
+#    and send the returned `token` as `Authorization: Bearer <token>` on the tags/list GET.
+#    Then pin a version tag in the estate's mirror lane and manifest. No per-key grant is needed: the registry ACL lets any
 #    authenticated instance key pull any image repository outside `plugins/` (the last rule in
 #    deploy/helm/templates/registry/configmap.yaml).
 
