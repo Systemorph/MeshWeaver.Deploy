@@ -57,6 +57,8 @@ a hand-over) goes through the same reader with the same rules.
     platform-set-dispatch.py runner-choice --runner r.json --version V
         → lines: runner_tag, runner_digest, runner_rev, superseded (space-separated digests of the
           set's OLDER runners) — what the hand-over sends for set V
+    platform-set-dispatch.py core-sha --core7 C --run-id N --run-head-sha S
+        → line: core_sha — the set's full commit, read off its CD run (a 7-char lookup can be ambiguous)
     platform-set-dispatch.py --self-test
 
 DISCOVERY (the pull). A set is PROMOTED when `mw-plugin-test` carries its version tag (main-cd
@@ -532,6 +534,27 @@ def seal_gate(version: str, exit_code: int, output: str) -> dict:
     raise Refusal(f"the resolver could not say whether {version} is sealed (exit {exit_code}): {tail or 'no output'}")
 
 
+def core_sha(core7: str, run_id: str, run_head_sha: str) -> dict:
+    """The FULL platform commit of a set, from the CD run its staging tag names (Deploy#136).
+
+    A set's manifest names its commit by seven characters (`staging-<core7>-<run id>`), and seven
+    characters are NOT a name: GitHub's commits API answers 422 "No commit found" for an AMBIGUOUS
+    abbreviation exactly as for an absent one (measured: `0a2e7e9` prefixes two objects of the
+    platform repository, so set 3.1.12386 failed discovery on every tick and the lane stayed red).
+    The same tag names the CD run, and the run names its commit in full — so the full sha is the
+    run's `head_sha`, and the abbreviation is the CHECK: a run whose commit does not start with
+    `core7` is a mismatch, red, never a guess.
+    """
+    if not re.fullmatch(r"[0-9a-f]{7}", core7 or ""):
+        raise Refusal(f"core7 {core7!r} is not seven hex characters")
+    if not re.fullmatch(r"[0-9]+", run_id or ""):
+        raise Refusal(f"run id {run_id!r} is not a number")
+    head = _sha(run_head_sha, f"head_sha of CD run {run_id}", allow_empty=False)
+    if not head.startswith(core7):
+        raise Refusal(f"CD run {run_id} built {head}, not the commit {core7} its staging tag names")
+    return {"core_sha": head}
+
+
 def _self_test() -> int:
     a, b, c = "a" * 40, "b" * 40, "c" * 40
     good = {"schema": 1, "run": {"url": "https://github.com/o/r/actions/runs/1", "coreSha": a},
@@ -873,6 +896,15 @@ def _self_test() -> int:
           cli_refusal, lambda o: o["rc"] == 1 and o["out"] == ""
           and "::error::the platform's hand-over is refused" in o["err"])
 
+    full = "0a2e7e9b7fbf842deb61f11aff34553bc1dd2c3c"
+    check("core-sha: the run's full head sha, when it starts with the tag's core7 (an AMBIGUOUS abbreviation resolves)",
+          lambda: core_sha("0a2e7e9", "41350417088", full), lambda o: o == {"core_sha": full})
+    check("core-sha: a run that built another commit is refused", lambda: core_sha("0a2e7e8", "41350417088", full), REFUSED)
+    check("core-sha: an empty head sha (the run could not be read) is refused", lambda: core_sha("0a2e7e9", "1", ""), REFUSED)
+    check("core-sha: a short head sha is refused", lambda: core_sha("0a2e7e9", "1", "0a2e7e9"), REFUSED)
+    check("core-sha: a malformed core7 is refused", lambda: core_sha("0A2E7E9", "1", full), REFUSED)
+    check("core-sha: a non-numeric run id is refused", lambda: core_sha("0a2e7e9", "x", full), REFUSED)
+
     if fails:
         print("platform-set-dispatch self-test FAILED:")
         for f in fails:
@@ -906,6 +938,10 @@ def main(argv: list[str]) -> int:
     c.add_argument("--run-core-sha", required=True)
     c.add_argument("--set-version", default="")
     c.add_argument("--set-core-sha", default="")
+    cs = sub.add_parser("core-sha", help="the full platform commit of a set, from its CD run (never a 7-char lookup)")
+    cs.add_argument("--core7", required=True)
+    cs.add_argument("--run-id", required=True)
+    cs.add_argument("--run-head-sha", required=True, help="the CD run's head_sha (actions/runs/<id>)")
     sg = sub.add_parser("seal-gate", help="whether the newest armed set may be handed to build-latest (sealed?)")
     sg.add_argument("--version", required=True)
     sg.add_argument("--exit", type=int, required=True, help="the resolver's exit code")
@@ -924,10 +960,12 @@ def main(argv: list[str]) -> int:
             out = runner_choice(json.loads(a.runner.read_text()), _version(a.version, "--version"))
         elif a.cmd == "claim":
             out = claim(a.run_url, a.run_core_sha, a.set_version, a.set_core_sha)
+        elif a.cmd == "core-sha":
+            out = core_sha(a.core7, a.run_id, a.run_head_sha)
         elif a.cmd == "seal-gate":
             out = seal_gate(a.version, a.exit, a.output.read_text(encoding="utf-8", errors="replace"))
         else:
-            ap.error("read, discover, claim, runner-key, runner-choice, seal-gate or --self-test")
+            ap.error("read, discover, claim, runner-key, runner-choice, core-sha, seal-gate or --self-test")
     # 🚨 A refusal goes to STDERR. Every caller redirects stdout into a file it parses (`> seal-gate`,
     # `> claim`, `> found`, `> runner-choice`), so an `::error::` printed there never reached the log:
     # the step went RED naming nothing (Copilot on Deploy#82). GitHub reads workflow commands on both.

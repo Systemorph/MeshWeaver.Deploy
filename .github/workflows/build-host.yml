@@ -295,19 +295,23 @@ jobs:
             --runner-rev "$RUNNER_REV" > "$RUNNER_TEMP/found"
           cat "$RUNNER_TEMP/found"
           get() { sed -n "s/^$1=//p" "$RUNNER_TEMP/found"; }
-          # The registry names a commit by its seven characters; the platform's PUBLIC history names
-          # it in full. An abbreviation it cannot resolve is red, never a guess.
+          # The registry names a commit by its seven characters, and seven characters are not a name:
+          # the commits API answers 422 for an AMBIGUOUS abbreviation exactly as for an absent one
+          # (Deploy#136 — `0a2e7e9` prefixes two objects, so every tick went red on set 3.1.12386).
+          # The same staging tag names the CD run, and the run names its commit in full: read it
+          # there, and keep the abbreviation as the check. A mismatch is red, never a guess.
           full() {
-            local s
-            s=$(gh api "repos/$PLATFORM_REPO/commits/$1" --jq .sha) || { echo "::error::platform commit $1 cannot be resolved" >&2; return 1; }
-            case "$s" in "$1"*) printf '%s' "$s" ;; *) echo "::error::platform commit $1 resolved to $s" >&2; return 1 ;; esac
+            local h
+            h=$(gh api "repos/$PLATFORM_REPO/actions/runs/$2" --jq .head_sha) || { echo "::error::CD run $2 (platform commit $1) cannot be read" >&2; return 1; }
+            python3 .github/scripts/platform-set-dispatch.py core-sha --core7 "$1" --run-id "$2" --run-head-sha "$h" | sed -n 's/^core_sha=//p'
           }
           need=$(get need_version)
           if [ -n "$need" ]; then
-            run_id=$(get need_run_id); core=$(full "$(get need_core7)"); version="$need"
+            run_id=$(get need_run_id); core=$(full "$(get need_core7)" "$run_id"); version="$need"
           else
-            run_id=$(get promoted_run_id); core=$(full "$(get promoted_core7)"); version=""
+            run_id=$(get promoted_run_id); core=$(full "$(get promoted_core7)" "$run_id"); version=""
           fi
+          [ -n "$core" ] || { echo "::error::the set's platform commit could not be established" >&2; exit 1; }
           {
             echo "run_url=https://github.com/$PLATFORM_REPO/actions/runs/$run_id"
             echo "run_core_sha=$core"
