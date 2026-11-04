@@ -57,8 +57,9 @@ a hand-over) goes through the same reader with the same rules.
     platform-set-dispatch.py runner-choice --runner r.json --version V
         → lines: runner_tag, runner_digest, runner_rev, superseded (space-separated digests of the
           set's OLDER runners) — what the hand-over sends for set V
-    platform-set-dispatch.py core-sha --core7 C --run-id N --run-head-sha S
-        → line: core_sha — the set's full commit, read off its CD run (a 7-char lookup can be ambiguous)
+    platform-set-dispatch.py core-sha --core7 C --run-id N --version V --receipt-log L
+        → line: core_sha — the set's full commit, read off its build's bake receipt (a 7-char lookup
+          can be ambiguous, and the run's head_sha need not be the commit it built)
     platform-set-dispatch.py --self-test
 
 DISCOVERY (the pull). A set is PROMOTED when `mw-plugin-test` carries its version tag (main-cd
@@ -534,24 +535,50 @@ def seal_gate(version: str, exit_code: int, output: str) -> dict:
     raise Refusal(f"the resolver could not say whether {version} is sealed (exit {exit_code}): {tail or 'no output'}")
 
 
-def core_sha(core7: str, run_id: str, run_head_sha: str) -> dict:
-    """The FULL platform commit of a set, from the CD run its staging tag names (Deploy#136).
+RECEIPT_LINE = re.compile(r"(?:^|\s)bake published:\s+(.*)$")
+
+
+def core_sha(core7: str, run_id: str, version: str, receipt_log: str) -> dict:
+    """The FULL platform commit of a set, from its build's own bake RECEIPT (Deploy#136).
 
     A set's manifest names its commit by seven characters (`staging-<core7>-<run id>`), and seven
     characters are NOT a name: GitHub's commits API answers 422 "No commit found" for an AMBIGUOUS
-    abbreviation exactly as for an absent one (measured: `0a2e7e9` prefixes two objects of the
+    abbreviation exactly as for an absent one (measured: `0a2e7e9` prefixes two commits of the
     platform repository, so set 3.1.12386 failed discovery on every tick and the lane stayed red).
-    The same tag names the CD run, and the run names its commit in full — so the full sha is the
-    run's `head_sha`, and the abbreviation is the CHECK: a run whose commit does not start with
-    `core7` is a mismatch, red, never a guess.
+
+    Nor is the CD run's `head_sha` the set's commit: `main-cd.yml` targets the newest commit CI has
+    vouched for, which can be an OLDER one than the commit that triggered the run (or a newer tip),
+    and derives the staging tag from THAT. The commit the build actually took is what its bake
+    receipt records — `bake published: … source-sha=<40 hex> … release=<version>` (core
+    Doc/Architecture/BakePublicationReceipt) — so that is read, from the logs of the run the staging
+    tag names, and the abbreviation is the CHECK. Every receipt for the set must name the same
+    commit; a receipt naming another release, none at all, two different commits, or a commit not
+    starting with `core7` is a refusal, red, never a guess.
     """
     if not re.fullmatch(r"[0-9a-f]{7}", core7 or ""):
         raise Refusal(f"core7 {core7!r} is not seven hex characters")
     if not re.fullmatch(r"[0-9]+", run_id or ""):
         raise Refusal(f"run id {run_id!r} is not a number")
-    head = _sha(run_head_sha, f"head_sha of CD run {run_id}", allow_empty=False)
+    version = _version(version, "--version")
+    shas = set()
+    for line in receipt_log.splitlines():
+        # The step's script is echoed into the log with its `echo`/variables — never a receipt.
+        if "\x1b[36;1m" in line or "[36;1m" in line or "$" in line:
+            continue
+        m = RECEIPT_LINE.search(line)
+        if not m:
+            continue
+        fields = dict(f.split("=", 1) for f in m.group(1).split() if "=" in f)
+        if fields.get("release") != version:
+            continue
+        shas.add(_sha(fields.get("source-sha"), f"source-sha of CD run {run_id}'s receipt for {version}", allow_empty=False))
+    if not shas:
+        raise Refusal(f"CD run {run_id} carries no bake receipt for release {version} — its source commit is not recorded")
+    if len(shas) > 1:
+        raise Refusal(f"CD run {run_id}'s receipts for {version} name {len(shas)} different commits: {', '.join(sorted(shas))}")
+    head = next(iter(shas))
     if not head.startswith(core7):
-        raise Refusal(f"CD run {run_id} built {head}, not the commit {core7} its staging tag names")
+        raise Refusal(f"CD run {run_id}'s receipt records {head}, not the commit {core7} its staging tag names")
     return {"core_sha": head}
 
 
@@ -897,13 +924,34 @@ def _self_test() -> int:
           and "::error::the platform's hand-over is refused" in o["err"])
 
     full = "0a2e7e9b7fbf842deb61f11aff34553bc1dd2c3c"
-    check("core-sha: the run's full head sha, when it starts with the tag's core7 (an AMBIGUOUS abbreviation resolves)",
-          lambda: core_sha("0a2e7e9", "41350417088", full), lambda o: o == {"core_sha": full})
-    check("core-sha: a run that built another commit is refused", lambda: core_sha("0a2e7e8", "41350417088", full), REFUSED)
-    check("core-sha: an empty head sha (the run could not be read) is refused", lambda: core_sha("0a2e7e9", "1", ""), REFUSED)
-    check("core-sha: a short head sha is refused", lambda: core_sha("0a2e7e9", "1", "0a2e7e9"), REFUSED)
-    check("core-sha: a malformed core7 is refused", lambda: core_sha("0A2E7E9", "1", full), REFUSED)
-    check("core-sha: a non-numeric run id is refused", lambda: core_sha("0a2e7e9", "x", full), REFUSED)
+    trigger = "8736992d186dba5030ce7d5e3e848de650eacbd9"
+
+    def receipt(sha, release="3.1.12386", arch="linux-x64"):
+        return (f"2026-11-01T21:38:39.5Z bake published: identity=c003e001 arch={arch} source=meshweaver-content "
+                f"source-sha={sha} bundles=1 surface=true targets-published=2 release={release} release-markers=2")
+    echoed = "2026-11-01T21:38:00.1Z \x1b[36;1m  echo \"bake published: source-sha=$SHA release=$RELEASE_VERSION\"\x1b[0m"
+    check("core-sha: the receipt's full source-sha, when it starts with the tag's core7 (an AMBIGUOUS abbreviation resolves)",
+          lambda: core_sha("0a2e7e9", "41350417088", "3.1.12386", receipt(full)), lambda o: o == {"core_sha": full})
+    check("core-sha: a RECONCILE-selected set — the run was triggered by another commit, the receipt names the one it built",
+          lambda: core_sha("0a2e7e9", "41350417088", "3.1.12386",
+                           f"2026-11-01T21:15:35Z Target: {full} (0a2e7e9), entered via push (head {trigger})\n" + receipt(full)),
+          lambda o: o == {"core_sha": full})
+    check("core-sha: both architectures' receipts naming the one commit pass",
+          lambda: core_sha("0a2e7e9", "1", "3.1.12386", receipt(full) + "\n" + receipt(full, arch="linux-arm64")),
+          lambda o: o == {"core_sha": full})
+    check("core-sha: a receipt whose commit is not the tag's core7 is refused",
+          lambda: core_sha("0a2e7e9", "1", "3.1.12386", receipt(trigger)), REFUSED)
+    check("core-sha: receipts naming two different commits are refused",
+          lambda: core_sha("0a2e7e9", "1", "3.1.12386", receipt(full) + "\n" + receipt("0a2e7e9" + "e" * 33)), REFUSED)
+    check("core-sha: a receipt for ANOTHER release is not this set's — refused when it is the only one",
+          lambda: core_sha("0a2e7e9", "1", "3.1.12386", receipt(full, release="3.1.12385")), REFUSED)
+    check("core-sha: the step's echoed script is never read as a receipt",
+          lambda: core_sha("0a2e7e9", "1", "3.1.12386", echoed), REFUSED)
+    check("core-sha: no receipt at all (the logs could not be read) is refused",
+          lambda: core_sha("0a2e7e9", "1", "3.1.12386", ""), REFUSED)
+    check("core-sha: a short source-sha is refused", lambda: core_sha("0a2e7e9", "1", "3.1.12386", receipt("0a2e7e9")), REFUSED)
+    check("core-sha: a malformed core7 is refused", lambda: core_sha("0A2E7E9", "1", "3.1.12386", receipt(full)), REFUSED)
+    check("core-sha: a non-numeric run id is refused", lambda: core_sha("0a2e7e9", "x", "3.1.12386", receipt(full)), REFUSED)
 
     if fails:
         print("platform-set-dispatch self-test FAILED:")
@@ -941,7 +989,8 @@ def main(argv: list[str]) -> int:
     cs = sub.add_parser("core-sha", help="the full platform commit of a set, from its CD run (never a 7-char lookup)")
     cs.add_argument("--core7", required=True)
     cs.add_argument("--run-id", required=True)
-    cs.add_argument("--run-head-sha", required=True, help="the CD run's head_sha (actions/runs/<id>)")
+    cs.add_argument("--version", required=True, help="the set's version (the receipt's release=)")
+    cs.add_argument("--receipt-log", type=Path, required=True, help="the CD run's bake job log(s), concatenated")
     sg = sub.add_parser("seal-gate", help="whether the newest armed set may be handed to build-latest (sealed?)")
     sg.add_argument("--version", required=True)
     sg.add_argument("--exit", type=int, required=True, help="the resolver's exit code")
@@ -961,7 +1010,7 @@ def main(argv: list[str]) -> int:
         elif a.cmd == "claim":
             out = claim(a.run_url, a.run_core_sha, a.set_version, a.set_core_sha)
         elif a.cmd == "core-sha":
-            out = core_sha(a.core7, a.run_id, a.run_head_sha)
+            out = core_sha(a.core7, a.run_id, a.version, a.receipt_log.read_text(encoding="utf-8", errors="replace"))
         elif a.cmd == "seal-gate":
             out = seal_gate(a.version, a.exit, a.output.read_text(encoding="utf-8", errors="replace"))
         else:

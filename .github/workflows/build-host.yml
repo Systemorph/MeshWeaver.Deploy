@@ -297,19 +297,31 @@ jobs:
           get() { sed -n "s/^$1=//p" "$RUNNER_TEMP/found"; }
           # The registry names a commit by its seven characters, and seven characters are not a name:
           # the commits API answers 422 for an AMBIGUOUS abbreviation exactly as for an absent one
-          # (Deploy#136 — `0a2e7e9` prefixes two objects, so every tick went red on set 3.1.12386).
-          # The same staging tag names the CD run, and the run names its commit in full: read it
-          # there, and keep the abbreviation as the check. A mismatch is red, never a guess.
-          full() {
-            local h
-            h=$(gh api "repos/$PLATFORM_REPO/actions/runs/$2" --jq .head_sha) || { echo "::error::CD run $2 (platform commit $1) cannot be read" >&2; return 1; }
-            python3 .github/scripts/platform-set-dispatch.py core-sha --core7 "$1" --run-id "$2" --run-head-sha "$h" | sed -n 's/^core_sha=//p'
+          # (Deploy#136 — `0a2e7e9` prefixes two commits, so every tick went red on set 3.1.12386).
+          # Nor is the CD run's head_sha the set's commit: main-cd targets the newest CI-vouched
+          # commit, which need not be the one that triggered the run. The commit the build TOOK is
+          # recorded in its bake receipt (`bake published: … source-sha=… release=<version>`), so it
+          # is read from the logs of the run the staging tag names; the abbreviation is the check.
+          # No receipt, two commits, or a mismatch is red, never a guess.
+          full() {  # $1 core7, $2 run id, $3 the set's version
+            local log="$RUNNER_TEMP/receipt-$2.log" jobs
+            jobs=$(gh api "repos/$PLATFORM_REPO/actions/runs/$2/jobs?per_page=100" \
+              --jq '.jobs[] | select(.conclusion == "success" and (.name | startswith("Bake platform content"))) | .id') \
+              || { echo "::error::CD run $2 (platform commit $1) cannot be read" >&2; return 1; }
+            [ -n "$jobs" ] || { echo "::error::CD run $2 has no successful bake job — set $3's source commit is not recorded" >&2; return 1; }
+            : > "$log"
+            for j in $jobs; do
+              gh api "repos/$PLATFORM_REPO/actions/jobs/$j/logs" >> "$log" \
+                || { echo "::error::the log of CD run $2's bake job $j cannot be read" >&2; return 1; }
+            done
+            python3 .github/scripts/platform-set-dispatch.py core-sha --core7 "$1" --run-id "$2" --version "$3" \
+              --receipt-log "$log" | sed -n 's/^core_sha=//p'
           }
           need=$(get need_version)
           if [ -n "$need" ]; then
-            run_id=$(get need_run_id); core=$(full "$(get need_core7)" "$run_id"); version="$need"
+            run_id=$(get need_run_id); core=$(full "$(get need_core7)" "$run_id" "$need"); version="$need"
           else
-            run_id=$(get promoted_run_id); core=$(full "$(get promoted_core7)" "$run_id"); version=""
+            run_id=$(get promoted_run_id); core=$(full "$(get promoted_core7)" "$run_id" "$(get promoted_version)"); version=""
           fi
           [ -n "$core" ] || { echo "::error::the set's platform commit could not be established" >&2; exit 1; }
           {
