@@ -295,19 +295,38 @@ jobs:
             --runner-rev "$RUNNER_REV" > "$RUNNER_TEMP/found"
           cat "$RUNNER_TEMP/found"
           get() { sed -n "s/^$1=//p" "$RUNNER_TEMP/found"; }
-          # The registry names a commit by its seven characters; the platform's PUBLIC history names
-          # it in full. An abbreviation it cannot resolve is red, never a guess.
-          full() {
-            local s
-            s=$(gh api "repos/$PLATFORM_REPO/commits/$1" --jq .sha) || { echo "::error::platform commit $1 cannot be resolved" >&2; return 1; }
-            case "$s" in "$1"*) printf '%s' "$s" ;; *) echo "::error::platform commit $1 resolved to $s" >&2; return 1 ;; esac
+          # The registry names a commit by its seven characters, and seven characters are not a name:
+          # the commits API answers 422 for an AMBIGUOUS abbreviation exactly as for an absent one
+          # (Deploy#136 — `0a2e7e9` prefixes two commits, so every tick went red on set 3.1.12386).
+          # Nor is the CD run's head_sha the set's commit: main-cd targets the newest CI-vouched
+          # commit, which need not be the one that triggered the run. The commit the build TOOK is
+          # recorded by the run the staging tag names: its "Resolve the target commit" job prints
+          # `Target: <sha> (<core7>)` as it derives that tag — present whether or not the run's own
+          # bake succeeded (a later reconcile may have repaired it) — and its bake receipt, when it
+          # baked, says the same. Jobs of EVERY attempt (`filter=all`, paginated): a retry cancelled
+          # before it created jobs leaves the latest attempt empty while an earlier one holds the
+          # record. The abbreviation is the check; no record, two commits, or a mismatch is red.
+          full() {  # $1 core7, $2 run id, $3 the set's version
+            local log="$RUNNER_TEMP/provenance-$2.log" jobs
+            jobs=$(gh api --paginate "repos/$PLATFORM_REPO/actions/runs/$2/jobs?filter=all&per_page=100" \
+              --jq '.jobs[] | select(.conclusion == "success" and ((.name | startswith("Resolve the target commit")) or (.name | startswith("Bake platform content")))) | .id') \
+              || { echo "::error::CD run $2 (platform commit $1) cannot be read" >&2; return 1; }
+            [ -n "$jobs" ] || { echo "::error::CD run $2 has no successful target or bake job in any attempt — set $3's source commit is not recorded" >&2; return 1; }
+            : > "$log"
+            for j in $jobs; do
+              gh api "repos/$PLATFORM_REPO/actions/jobs/$j/logs" >> "$log" \
+                || { echo "::error::the log of CD run $2's job $j cannot be read" >&2; return 1; }
+            done
+            python3 .github/scripts/platform-set-dispatch.py core-sha --core7 "$1" --run-id "$2" --version "$3" \
+              --provenance-log "$log" | sed -n 's/^core_sha=//p'
           }
           need=$(get need_version)
           if [ -n "$need" ]; then
-            run_id=$(get need_run_id); core=$(full "$(get need_core7)"); version="$need"
+            run_id=$(get need_run_id); core=$(full "$(get need_core7)" "$run_id" "$need"); version="$need"
           else
-            run_id=$(get promoted_run_id); core=$(full "$(get promoted_core7)"); version=""
+            run_id=$(get promoted_run_id); core=$(full "$(get promoted_core7)" "$run_id" "$(get promoted_version)"); version=""
           fi
+          [ -n "$core" ] || { echo "::error::the set's platform commit could not be established" >&2; exit 1; }
           {
             echo "run_url=https://github.com/$PLATFORM_REPO/actions/runs/$run_id"
             echo "run_core_sha=$core"
