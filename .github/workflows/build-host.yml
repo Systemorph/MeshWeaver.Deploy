@@ -313,8 +313,14 @@ jobs:
               || { echo "::error::CD run $2 (platform commit $1) cannot be read" >&2; return 1; }
             [ -n "$jobs" ] || { echo "::error::CD run $2 has no successful target or bake job in any attempt — set $3's source commit is not recorded" >&2; return 1; }
             : > "$log"
+            # The log is fetched with curl, not `gh api`: a job log carries ANSI colour codes, and the
+            # runner's gh refuses to emit a response that contains terminal escape sequences ("pass
+            # --allow-escape-sequences to output it anyway") even into a file. That refusal held every
+            # scheduled tick red from the first set after #137, so `latest` stayed on 3.1.12524 while
+            # 3.1.12586+ sealed. curl writes the bytes as served, on any gh version; same token.
             for j in $jobs; do
-              gh api "repos/$PLATFORM_REPO/actions/jobs/$j/logs" >> "$log" \
+              curl -fsSL --retry 2 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$PLATFORM_REPO/actions/jobs/$j/logs" >> "$log" \
                 || { echo "::error::the log of CD run $2's job $j cannot be read" >&2; return 1; }
             done
             python3 .github/scripts/platform-set-dispatch.py core-sha --core7 "$1" --run-id "$2" --version "$3" \
