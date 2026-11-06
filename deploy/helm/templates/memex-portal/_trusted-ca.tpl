@@ -74,10 +74,21 @@ bundleFile: {{ printf "%s/ca-bundle.crt" (($t.mountPath | default "/etc/memex/tr
       for dir in /run/memex-trusted-ca/*; do
         [ -d "$dir" ] || continue
         found=0
-        for f in "$dir"/*; do
+        # Dot-prefixed keys (.ca.crt) are valid ConfigMap/Secret keys; `.[!.]*` takes them and
+        # still skips the projection's `..data` / `..<timestamp>` entries, as does the -f test.
+        for f in "$dir"/* "$dir"/.[!.]*; do
           [ -f "$f" ] || continue
           case "$(cat "$f")" in
             *"-----BEGIN CERTIFICATE-----"*)
+              # Every certificate block must PARSE — a BEGIN/END pair around bad data would
+              # otherwise start a pod that trusts nothing new. openssl ships with the image's
+              # ca-certificates package; storeutl counts what it could actually decode.
+              markers=$(grep -c -- "-----BEGIN CERTIFICATE-----" "$f")
+              parsed=$(openssl storeutl -noout -certs "$f" 2>/dev/null | sed -n 's/^Total found: *//p')
+              if [ "${parsed:-0}" -ne "$markers" ]; then
+                echo "trusted-ca-bundle: ERROR $f holds $markers certificate block(s) but only ${parsed:-0} parse — refusing to start a pod with a malformed trust anchor" >&2
+                exit 1
+              fi
               printf '\n' >> "$out.tmp"
               cat "$f" >> "$out.tmp"
               found=$((found + 1)) ;;
