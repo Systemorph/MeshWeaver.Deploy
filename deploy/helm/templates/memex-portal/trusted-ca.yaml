@@ -1,0 +1,19 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
+{{- $t := include "memex.trustedCa" . | fromYaml -}}
+{{- if $t.pem }}
+---
+# The INLINE half of trustedCertificateAuthorities (_trusted-ca.tpl): a CA certificate is public
+# material, so it may live in values and render as a ConfigMap. Rendered only when `pem` is set.
+apiVersion: "v1"
+kind: "ConfigMap"
+metadata:
+  name: "memex-trusted-ca"
+  labels:
+    app.kubernetes.io/name: "{{ .Chart.Name }}"
+    app.kubernetes.io/component: "memex-portal"
+    app.kubernetes.io/instance: "{{ .Release.Name }}"
+data:
+  ca.crt: |
+    {{- $t.pem | nindent 4 }}
+{{- end }}
+{{- end }}

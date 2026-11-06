@@ -579,6 +579,34 @@ vault certificate reaches the Secret on the driver's rotation poll with no deplo
 cluster's Key Vault Secrets Provider runs with secret rotation enabled. The reader identity needs
 secret GET on the vault. The chart refuses the render when a cert-manager issuer is also set.
 
+### Trusting the estate's own certificate authority (MeshWeaver.Deploy#138)
+
+The certificate above is what the instance PRESENTS. When it is issued by the estate's internal CA,
+the pods must also TRUST that CA, or every TLS call they make to such a host fails with *"The SSL
+connection could not be established"*: the self-updater's hand-over to a private control host, the
+control instance's probe of a working instance's public `/health`, and a database behind a
+certificate from the same CA (otherwise reachable only with `TrustServerCertificate=True`).
+
+```yaml
+trustedCertificateAuthorities:
+  secret: "internal-ca"    # a Secret the estate creates, e.g. synced by a keyVaultSecrets class
+  # configMap: "internal-ca"   # or a ConfigMap
+  # pem: |                     # or inline: a CA certificate is public material
+  #   -----BEGIN CERTIFICATE-----
+```
+
+How it works, and why the system roots stay: .NET on Linux reads OpenSSL's default certificate FILE
+and DIRECTORY, and `SSL_CERT_FILE` / `SSL_CERT_DIR` each REPLACE one of them, so pointing either at
+the estate's bundle alone would drop the public roots. Instead a `trusted-ca-bundle` init container
+(the portal image) writes one file, the image's system bundle (`systemBundle`, default
+`/etc/ssl/certs/ca-certificates.crt`) followed by every declared PEM, into a pod-local emptyDir. The
+portal, the migration Job and its rehearsal read that file through `SSL_CERT_FILE`. `SSL_CERT_DIR`
+stays unset, so the default directory is read as well. The init container refuses to start the pod
+when the system bundle is missing or a declared source holds no certificate. Declaring nothing
+renders nothing. `check-chart-invariants.sh` (invariant 22 and the evidence check after it) holds the
+shape. A changed ConfigMap or Secret reaches a pod when it next starts. An inline `pem` edit rolls
+the pods by itself.
+
 ### Default SSL certificate (cluster-wide, one-time)
 
 Without it, any client that connects **without SNI** gets the self-signed

@@ -1,0 +1,21 @@
+# An estate with private hosts and an internal-CA certificate (MeshWeaver.Deploy#138): the pods
+# trust that CA in ADDITION to the system roots. All three sources at once, so invariant 22 and the
+# evidence check in check-chart-invariants.sh see every branch of templates/memex-portal/_trusted-ca.tpl.
+# The certificate below is a throwaway self-signed sample (CN "Example Internal Root CA", key
+# discarded) — public material, as every CA certificate is.
+trustedCertificateAuthorities:
+  pem: |
+    -----BEGIN CERTIFICATE-----
+    MIIBqTCCAU6gAwIBAgIUL01LxRaUC+BBKbfBSenmUQcbBmowCgYIKoZIzj0EAwIw
+    OTEhMB8GA1UEAwwYRXhhbXBsZSBJbnRlcm5hbCBSb290IENBMRQwEgYDVQQKDAtl
+    eGFtcGxlLmNvbTAgFw0yNjExMDYwNzI1MjNaGA8yMTI2MTAxMzA3MjUyM1owOTEh
+    MB8GA1UEAwwYRXhhbXBsZSBJbnRlcm5hbCBSb290IENBMRQwEgYDVQQKDAtleGFt
+    cGxlLmNvbTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABIE3gTIoTF9zVZ+3JcVc
+    UMMXDiulY6WbUw8ArzMqyuIeKXAuToI5njt+N2zx8scM929sCL79saSKIpbftxcI
+    PPujMjAwMB0GA1UdDgQWBBROkRJRekA2y7za590nDvb6qSd9SzAPBgNVHRMBAf8E
+    BTADAQH/MAoGCCqGSM49BAMCA0kAMEYCIQCuvcO2xxTPQSM6dDxqIQ/NGtsIZg38
+    nUf/jwwML92rrwIhAMUT79MzM0gkn+pXymwjpYcOZLlVbta5XtPU34oOUhRV
+    -----END CERTIFICATE-----
+  configMap: "estate-internal-ca"
+  # e.g. the Secret the Key Vault CSI driver syncs from a class declared under keyVaultSecrets
+  secret: "estate-internal-ca-kv"
