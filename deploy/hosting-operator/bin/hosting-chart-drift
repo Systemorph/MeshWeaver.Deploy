@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# hosting-chart-drift --namespace <ns> --release <name> --database <db> --values <file>
+# hosting-chart-drift --cluster <cluster> --namespace <ns> --release <name> --database <db> --values <file>
 #                     [--estate <dir>] [--records <dir>] [--expect-patch <file>] [--chart <dir>]
-# hosting-chart-drift --namespace <ns> --release <name> [--overlay <file>] …   (LEGACY, see below)
+# hosting-chart-drift --cluster <cluster> --namespace <ns> --release <name> [--overlay <file>] …   (LEGACY, see below)
+#
+# --cluster names the AUDITED cluster (the record's own `cluster`, which the Audit plan passes). It is
+# REQUIRED: the record that owns <ns>/<release> is the one that runs on THIS cluster, and records of
+# one configuration repository legitimately share the conventional names across clusters, planned
+# and retired instances (MeshWeaver.Deploy#144). Without it the owner cannot be decided — red.
 #
 # Does the cluster run what the CHART describes? The governed home of the Chart Drift comparison
 # (Doc/Architecture/ChartDriftSemantics): the second step of an `Audit` InstanceAction, run on the
@@ -67,9 +72,10 @@ HOSTING_CMD="hosting-chart-drift"
 
 SELF_BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 
-namespace="" release="" database="" values="" estate="." overlay="" records="" expect_patch="" chart="${HOSTING_CHART:-/opt/hosting/chart}"
+cluster="" namespace="" release="" database="" values="" estate="." overlay="" records="" expect_patch="" chart="${HOSTING_CHART:-/opt/hosting/chart}"
 while [ $# -gt 0 ]; do
   case "$1" in
+    --cluster)      cluster="${2:-}";      shift 2 ;;
     --namespace)    namespace="${2:-}";    shift 2 ;;
     --release)      release="${2:-}";      shift 2 ;;
     --database)     database="${2:-}";     shift 2 ;;
@@ -83,8 +89,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+hosting::need_flag cluster "$cluster"
 hosting::need_flag namespace "$namespace"
 hosting::need_flag release "$release"
+hosting::safe_name cluster "$cluster"
 hosting::safe_name namespace "$namespace"
 hosting::safe_name release "$release"
 # Record mode needs BOTH halves of what hosting-deploy is given; one without the other is a caller bug,
@@ -141,6 +149,7 @@ work="$(mktemp -d)"
 trap 'hosting::on_exit; rm -rf "$work"' EXIT
 
 hosting::dry && hosting::log "dry run requested — the comparison is read-only, so it runs for real"
+hosting::log "cluster   ${cluster} (only records running on it can own ${namespace}/${release})"
 hosting::log "chart     ${chart}"
 if [ -n "$values" ]; then
   hosting::log "render    the record's render ${values} + the deploy's own --set flags (what a Reconcile installs)"
@@ -154,8 +163,8 @@ hosting::log "scripts   ${drift_dir}"
 
 # ── the record's facts (exactly one record must own the pair) ──────────────────────────────────
 python3 "${drift_dir}/chart-drift-record.py" \
-  --records "$records" --namespace "$namespace" --release "$release" --out "$work/record.json" \
-  || hosting::die "no single Deployment record owns ${namespace}/${release} under ${records} (chart-drift-record.py names why above) — the comparison cannot be decided, and an undecidable comparison is a failure, never a skip."
+  --records "$records" --cluster "$cluster" --namespace "$namespace" --release "$release" --out "$work/record.json" \
+  || hosting::die "no single Deployment record owns ${namespace}/${release} on cluster ${cluster} under ${records} (chart-drift-record.py names why above) — the comparison cannot be decided, and an undecidable comparison is a failure, never a skip."
 
 # ── the comparison ──────────────────────────────────────────────────────────────────────────────
 # In-cluster transport: the lane's kubeconfig (or the Job's ServiceAccount). Never `aks-invoke` —
