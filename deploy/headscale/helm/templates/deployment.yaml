@@ -1,0 +1,112 @@
+{{- if .Values.enabled }}
+{{- include "headscale.validate" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "headscale.fullname" . }}
+  labels:
+    {{- include "headscale.labels" . | nindent 4 }}
+spec:
+  # ONE replica, always: the state is a sqlite file on a ReadWriteOnce volume. Recreate, never a surge —
+  # two pods on one database is corruption, and a surge pod could not mount the volume anyway.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "headscale.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "headscale.selectorLabels" . | nindent 8 }}
+      annotations:
+        # A config or policy change rolls the pod (headscale reads both at start).
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      # headscale calls nothing in the cluster, not even the API server.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: headscale
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "-c", "/etc/headscale/config.yaml"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /etc/headscale, readOnly: true }
+            - { name: data, mountPath: /var/lib/headscale }
+            - { name: run, mountPath: /var/run/headscale }
+            {{- if .Values.oidc.enabled }}
+            - { name: oidc-secret, mountPath: {{ include "headscale.oidcSecretDir" . }}, readOnly: true }
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "headscale.fullname" . }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "headscale.fullname" . }}-data
+        - name: run
+          emptyDir: {}
+        {{- if .Values.oidc.enabled }}
+        - name: oidc-secret
+          {{- if .Values.oidc.clientSecret.existingSecret }}
+          secret:
+            secretName: {{ .Values.oidc.clientSecret.existingSecret }}
+            items:
+              - { key: client_secret, path: client_secret }
+          {{- else }}
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ include "headscale.fullname" . }}-oidc
+          {{- end }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

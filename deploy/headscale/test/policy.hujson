@@ -1,0 +1,7 @@
+// The smoke's policy: the chart's default (helm/values.yaml → policy), every member reaches every
+// member. The smoke checks that headscale ACCEPTS it, not what it allows.
+{
+  "acls": [
+    { "action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:member:*"] }
+  ]
+}

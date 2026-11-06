@@ -1,0 +1,33 @@
+{{- if and .Values.enabled .Values.networkPolicy.enabled }}
+{{- include "headscale.validate" . }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "headscale.fullname" . }}
+  labels:
+    {{- include "headscale.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "headscale.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - { port: http, protocol: TCP }
+      {{- with .Values.networkPolicy.ingressNamespaces }}
+      from:
+        {{- range . }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      {{- end }}
+  egress:
+    # DNS, to resolve the OIDC issuer and the DERP map host.
+    - ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+    # HTTPS out: the OIDC issuer and the DERP map. Nothing else leaves the pod.
+    - ports:
+        - { port: 443, protocol: TCP }
+{{- end }}

@@ -1,0 +1,15 @@
+# A local DERP map for the offline build: headscale refuses to start with an empty one, and the build
+# fetches nothing from the internet. The deployed chart uses Tailscale's public DERP map
+# (values.yaml → derp.urls) until the fleet runs its own relay.
+regions:
+  900:
+    regionid: 900
+    regioncode: smoke
+    regionname: Smoke (never contacted)
+    nodes:
+      - name: 900a
+        regionid: 900
+        hostname: derp.example.com
+        stunport: 3478
+        stunonly: false
+        derpport: 443
