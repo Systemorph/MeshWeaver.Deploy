@@ -51,6 +51,10 @@
 #  20. a crash dump lands in <root>/$(MEMEX_POD_NAME)/ on a    or every roll deletes the dump (the
 #      dedicated claim or /data, root normalised, and the     09-26 and 10-07 dumps were lost so)
 #      retention script runs as init container AND postStart
+#  22. additional trusted CAs: SSL_CERT_FILE only ever names  or a pod trusts only the estate's CA
+#      the bundle trusted-ca-bundle wrote FIRST from the       (every public call fails) or nothing;
+#      system CAs + the estate's, mounted; no SSL_CERT_DIR;    the migration's DB TLS diverges
+#      the portal and the migration Job agree
 #  21. /next renders ONE whole shape: bundled (portal config, or /next 503s, or a second
 #      container + Service `next` ports, ingress to them, no     server is left behind by a roll
 #      portal-next Deployment) or the override (its own         (policy portal-next-in-platform-image)
@@ -221,6 +225,10 @@ COMBOS=(
   # the hosts — a build host must not perturb the portal's shape. Its own shape and refusals are
   # asserted by test-build-hosts.sh.
   "the standing build hosts, both channels (fixture)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.build-hosts.yaml"
+  # MeshWeaver.Deploy#138: an estate with private hosts and an internal CA. The only combination that
+  # renders the trusted-ca-bundle init container, so without it invariant 22 has no subject; the
+  # evidence check below asserts which containers read the bundle.
+  "AKS overlay + an internal CA trusted from all three sources (fixture)|deploy/helm/values.yaml:deploy/aks/values.aks.yaml:deploy/aks/scripts/testdata/values.trusted-ca.yaml"
 )
 
 WORK="$(mktemp -d)"
@@ -371,6 +379,50 @@ if [ -f "$source_render" ] && [ -f "$defaults_render" ] \
   ok "a plugin source's own credential reaches the ConfigMap by reference — stated renders trimmed, a blank tokenKey renders blank, absent and null render no key, the defaults render none"
 else
   report "plugin source credentials: the fixture must render exactly Sources__1__TokenKey=\"PluginCatalog:SourceTokens:Extensions\" and Sources__2__InstallationOwner=\"fabrikam\" (trimmed), Sources__3__TokenKey=\"\" (a blank tokenKey is a DECLARATION the portal refuses — dropping it reads the repository with the instance's App or anonymously), NO credential key for the undeclared source 0 and the null tokenKey of source 4, and the chart defaults must render none"
+fi
+
+# The trusted-CA evidence (MeshWeaver.Deploy#138). Read by NAME: invariant 22 holds just as well when
+# NO render carries the bundle, so the fixture must render it on the portal, the migration and its
+# rehearsal, from all three sources, with the inline ConfigMap; and the chart defaults must render
+# none of it, so an estate that declares nothing is unchanged.
+ca_render="$(render_of "AKS overlay + an internal CA trusted from all three sources (fixture)")"
+if [ -f "$ca_render" ] && [ -f "$defaults_render" ] && python3 - "$ca_render" "$defaults_render" <<'PY'
+import sys, yaml
+def docs(p):
+    return [d for d in yaml.safe_load_all(open(p)) if d]
+def pods(ds):
+    out = {}
+    for d in ds:
+        comp = ((d.get("metadata") or {}).get("labels") or {}).get("app.kubernetes.io/component")
+        if d.get("kind") in ("Deployment", "Job") and comp in ("memex-portal", "memex-migration") \
+                and d["metadata"]["name"] != "portal-next-deployment":
+            out[comp] = d["spec"]["template"]["spec"]
+    return out
+def readers(spec):
+    return sorted(c["name"] for c in (spec.get("initContainers") or []) + spec["containers"]
+                  if any(e.get("name") == "SSL_CERT_FILE" for e in (c.get("env") or [])))
+on, off = docs(sys.argv[1]), docs(sys.argv[2])
+p_on, p_off = pods(on), pods(off)
+assert readers(p_on["memex-portal"]) == ["memex-portal"], readers(p_on["memex-portal"])
+assert readers(p_on["memex-migration"]) == ["memex-migration", "memex-migration-rehearsal"], readers(p_on["memex-migration"])
+for spec in p_on.values():
+    vols = {v["name"]: v for v in spec["volumes"]}
+    assert vols["trusted-ca-inline"]["configMap"]["name"] == "memex-trusted-ca", vols
+    assert vols["trusted-ca-configmap"]["configMap"]["name"] == "estate-internal-ca", vols
+    assert vols["trusted-ca-secret"]["secret"]["secretName"] == "estate-internal-ca-kv", vols
+    assert "trusted-ca-bundle" in [c["name"] for c in spec["initContainers"]], spec["initContainers"]
+cm = [d for d in on if d.get("kind") == "ConfigMap" and d["metadata"]["name"] == "memex-trusted-ca"]
+assert cm and "BEGIN CERTIFICATE" in cm[0]["data"]["ca.crt"], cm
+for spec in p_off.values():
+    names = [c["name"] for c in (spec.get("initContainers") or []) + spec["containers"]]
+    assert "trusted-ca-bundle" not in names and not readers(spec), names
+    assert not any(v["name"].startswith("trusted-ca") for v in (spec.get("volumes") or [])), spec.get("volumes")
+assert not any(d.get("kind") == "ConfigMap" and d["metadata"]["name"] == "memex-trusted-ca" for d in off)
+PY
+then
+  ok "an internal CA reaches the portal, the migration and its rehearsal through ONE bundle built from the system CAs plus all three sources; the defaults render none of it"
+else
+  report "trustedCertificateAuthorities: the fixture must render the trusted-ca-bundle init container on the portal and the migration Job, SSL_CERT_FILE on memex-portal, memex-migration and memex-migration-rehearsal, a volume per source and the memex-trusted-ca ConfigMap — and the chart defaults none of it (MeshWeaver.Deploy#138)"
 fi
 
 # The session-affinity evidence (MeshWeaver#6825). Read by NAME: the record's typed block must reach

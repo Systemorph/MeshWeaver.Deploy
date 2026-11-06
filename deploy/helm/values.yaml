@@ -587,6 +587,44 @@ extraEnvFrom: []
 #       readOnly: true
 extraVolumes: []
 extraVolumeMounts: []
+# ---- Additional certificate authorities the portal AND the migration Job trust (MeshWeaver.Deploy#138)
+# For an estate whose hosts are private and whose certificates come from its own internal CA (the
+# Key Vault certificate route, ingress.tlsFromKeyVault): without this the pods trust only the public
+# roots, so the self-updater's hand-over to the control instance, the control instance's probe of a
+# working instance's public /health, and a database behind a certificate from that CA all fail with
+# "The SSL connection could not be established".
+#
+# Declare one or more PEM sources; any combination, each contributes every key it holds:
+#   pem        inline PEM text (a CA certificate is public material) → ConfigMap `memex-trusted-ca`
+#   configMap  the NAME of a ConfigMap the estate creates
+#   secret     the NAME of a Secret the estate creates — on the Key Vault route, the Secret the CSI
+#              driver syncs from a class declared under keyVaultSecrets / keyVaultSecretClasses
+#              (that class's volume is mounted on both pods, which is what makes the driver write it)
+#
+# 🚨 The system roots are KEPT. Pointing SSL_CERT_FILE or SSL_CERT_DIR at the estate's bundle alone
+# would REPLACE that half of the runtime's trust store. Instead the `trusted-ca-bundle` init
+# container (portal image, `sh` + `cat`) writes ONE file — `systemBundle` followed by every declared
+# PEM — into a pod-local emptyDir at `mountPath`, and the portal, the migration and its rehearsal
+# read it through SSL_CERT_FILE; SSL_CERT_DIR stays unset, so the default directory is read too. The
+# init container REFUSES (the pod does not start, and its log names the path) when `systemBundle` is
+# missing or a source holds no certificate. A changed ConfigMap/Secret reaches a pod at its next
+# start; an inline `pem` edit rolls the pods by itself (checksum/trusted-ca).
+#
+# Nothing declared (the default) renders nothing — the chart's output is unchanged.
+#   trustedCertificateAuthorities:
+#     secret: "internal-ca-kv"          # synced by the CSI driver from the vault object holding the PEM
+#     # pem: |
+#     #   -----BEGIN CERTIFICATE-----
+#     #   …
+#     #   -----END CERTIFICATE-----
+trustedCertificateAuthorities:
+  pem: ""
+  configMap: ""
+  secret: ""
+  # The image's own system bundle (Debian/Ubuntu and Alpine both keep it here).
+  systemBundle: "/etc/ssl/certs/ca-certificates.crt"
+  # Where the combined bundle is written; SSL_CERT_FILE is <mountPath>/ca-bundle.crt.
+  mountPath: "/etc/memex/trusted-ca"
 # ---- KEDA autoscaling (portal) --------------------------------------------
 # HA deployments autoscale the portal via a KEDA ScaledObject (templates/
 # memex-portal/scaledobject.yaml) instead of a fixed replica count. Off by
