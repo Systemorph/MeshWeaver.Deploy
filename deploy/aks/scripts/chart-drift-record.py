@@ -3,11 +3,25 @@
 The RECORD half of Chart Drift (MeshWeaver#4685): find the ONE committed Deployment record that owns
 <namespace>/<release> and write the facts of it the check reads.
 
-    chart-drift-record.py --records DIR --namespace NS --release NAME --out FILE
+    chart-drift-record.py --records DIR --cluster CLUSTER --namespace NS --release NAME --out FILE
 
 DIR is the config repository's `mesh/Deployments/` folder — the same records the overlays under
 `deployments/aks/<ns>/` are generated from. A record owns the pair when its content names
-`namespace: NS` and `helmRelease: NAME`.
+`namespace: NS` and `helmRelease: NAME` AND it occupies the AUDITED cluster (MeshWeaver.Deploy#144):
+
+  * its `status` is one that occupies a cluster — Live (blank reads Live, as DeploymentContent says),
+    Provisioning or Suspended (a suspended release still stands in its namespace) — and
+  * its `cluster` names CLUSTER (compared without regard to letter case, as Azure names are).
+
+Records of one configuration repository legitimately share the conventional `namespace`/`helmRelease`
+names: a Planned instance with no cluster yet, a Retired or Decommissioned reference record, an
+instance on another estate's cluster. None of those runs on the audited cluster, so none is a
+candidate; each is NAMED as left out, so a wrong status or cluster reads as what it is.
+
+🚨 Two refusals keep the narrowing from guessing (an undecidable comparison is a failure):
+  * a status this script does not know — the vocabulary is open, so an unknown value is never read as
+    "occupies" or "does not": it is named and the run is red;
+  * a record that occupies a cluster but names none — whether it runs HERE cannot be decided.
 
 Written, and nothing else of the record:
   * {"record", "imageRepository", "updatePolicy", "updatePattern", "pinnedImageTag"} — the image the
@@ -24,6 +38,15 @@ import argparse, json, os, sys
 
 IMAGE_FIELDS = ("imageRepository", "updatePolicy", "updatePattern", "pinnedImageTag")
 
+# The record lifecycle (DeploymentContent.Status, platform `MeshWeaver.Deployment.Contract`), split by
+# whether a release of that record stands on its cluster. Compared case-insensitively, trimmed.
+OCCUPYING = frozenset({"live", "provisioning", "suspended"})
+NOT_OCCUPYING = frozenset({"planned", "retired", "decommissioned", "torndown"})
+
+
+def text(v):
+    return v.strip() if isinstance(v, str) else ""
+
 
 def content_of(doc):
     c = doc.get("content") if isinstance(doc, dict) else None
@@ -33,6 +56,7 @@ def content_of(doc):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--records", required=True)
+    ap.add_argument("--cluster", default="")
     ap.add_argument("--namespace", required=True)
     ap.add_argument("--release", required=True)
     ap.add_argument("--out", required=True)
@@ -43,7 +67,16 @@ def main():
               f"cannot be read, so the running image cannot be tested against it.")
         return 1
 
-    owners, unreadable = [], []
+    cluster = (a.cluster or "").strip()
+    if not cluster:
+        print("::error::no audited cluster was named (--cluster) — several records may share the "
+              f"namespace '{a.namespace}' and release '{a.release}' across clusters, so which one owns "
+              "the release on THIS cluster cannot be decided without it. The Audit plan passes the "
+              "record's cluster; a caller that does not is a caller bug, never a reason to count every "
+              "record.")
+        return 1
+
+    owners, unreadable, left_out, undecidable = [], [], [], []
     for name in sorted(os.listdir(a.records)):
         if not name.endswith(".json") or name == "index.json":
             continue
@@ -54,21 +87,43 @@ def main():
             unreadable.append(f"{name} ({e})")
             continue
         c = content_of(doc)
-        if (c.get("namespace") or "").strip() == a.namespace and \
-           (c.get("helmRelease") or "").strip() == a.release:
-            owners.append((f"Deployments/{name[:-5]}", c))
+        if text(c.get("namespace")) != a.namespace or text(c.get("helmRelease")) != a.release:
+            continue
+        rid = f"Deployments/{name[:-5]}"
+        status = text(c.get("status")) or "Live"
+        on = text(c.get("cluster"))
+        if status.lower() in NOT_OCCUPYING:
+            left_out.append(f"{rid} (status {status})")
+        elif status.lower() not in OCCUPYING:
+            undecidable.append(f"{rid} has status '{status}', which this check does not know — "
+                               "whether its release stands on a cluster cannot be decided")
+        elif not on:
+            undecidable.append(f"{rid} is {status} but names no cluster — whether it runs on "
+                               f"'{cluster}' cannot be decided")
+        elif on.lower() != cluster.lower():
+            left_out.append(f"{rid} (cluster {on})")
+        else:
+            owners.append((rid, c))
 
     if unreadable:
         # An unreadable record could be the owner; deciding without it would be deciding on a subset.
         print("::error::these Deployment records could not be parsed, so which record owns "
               f"{a.namespace}/{a.release} cannot be decided: " + "; ".join(unreadable))
         return 1
+    skipped = ("; left out as not running on this cluster: " + ", ".join(left_out)) if left_out else ""
+    if undecidable:
+        print(f"::error::which Deployment record owns namespace '{a.namespace}' release "
+              f"'{a.release}' on cluster '{cluster}' cannot be decided: " + "; ".join(undecidable)
+              + skipped + ". Fix the records, not this check.")
+        return 1
     if len(owners) != 1:
         which = ", ".join(o[0] for o in owners) or "none"
         print(f"::error::{len(owners)} Deployment record(s) own namespace '{a.namespace}' release "
-              f"'{a.release}' ({which}) — exactly one must, or the cluster cannot be tested against "
-              f"a record. Fix the records, not this check.")
+              f"'{a.release}' on cluster '{cluster}' ({which}) — exactly one must, or the cluster "
+              f"cannot be tested against a record{skipped}. Fix the records, not this check.")
         return 1
+    for line in left_out:
+        print(f"left out (not running on cluster '{cluster}'): {line}")
 
     record, c = owners[0]
     facts = {"record": record}

@@ -5487,6 +5487,7 @@ printf 'config: {}\n' > "$_cd/estate/deployments/aks/memex/values.memex.public.y
 cat > "$_cd/scripts/chart-drift-record.py" <<'PYEOF'
 import os, sys
 out = sys.argv[sys.argv.index("--out") + 1]
+open(os.environ["CD_STUB_RECORD_ARGS"], "w").write(" ".join(sys.argv[1:]))
 if os.environ.get("CD_STUB_RECORD") == "none":
     print("::error::no Deployment record owns memex/memex")
     sys.exit(1)
@@ -5506,7 +5507,7 @@ _cd_run() { # _cd_run <mode> [extra env...] -- [extra args...]
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
   _cd_out="$(cd "$_cd/estate" && env ${envs[@]+"${envs[@]}"} HOSTING_DRIFT_SCRIPTS="$_cd/scripts" HOSTING_CHART="$_cd/chart" \
-    CD_STUB_MODE="$mode" CD_STUB_ARGS="$_cd/args" hosting-chart-drift --namespace memex --release memex "$@" 2>&1)"; _cd_rc=$?
+    CD_STUB_MODE="$mode" CD_STUB_ARGS="$_cd/args" CD_STUB_RECORD_ARGS="$_cd/record-args" hosting-chart-drift --cluster aks-example --namespace memex --release memex "$@" 2>&1)"; _cd_rc=$?
 }
 : > "$_cd/args"
 _cd_run clean
@@ -5586,6 +5587,10 @@ _cd_run unreadable
 _cd_run clean CD_STUB_RECORD=none
 [ "$_cd_rc" -ne 0 ] && case "$_cd_out" in *"chart_drift_verdict"*) false ;; *"no single Deployment record owns"*) true ;; *) false ;; esac \
   && ok "no owning record is RED, never compared" || bad "no owning record" "rc ${_cd_rc}; out: ${_cd_out}"
+# MeshWeaver.Deploy#144: the record that owns the release is the one RUNNING on the audited cluster, so
+# the audited cluster reaches the record script — and without it nothing is decided.
+case "$(cat "$_cd/record-args" 2>/dev/null)" in *"--cluster aks-example"*"--namespace memex --release memex"*) ok "the audited cluster reaches the record script (only records running on it can own the release)" ;;
+  *) bad "the audited cluster reaches the record script" "record args: $(cat "$_cd/record-args" 2>/dev/null)" ;; esac
 _cd_run clean HOSTING_DRY_RUN=true
 [ "$_cd_rc" -eq 0 ] && case "$_cd_out" in *"::hosting:: chart_drift_verdict=clean"*) true ;; *) false ;; esac \
   && ok "a dry run compares for real (read-only)" || bad "dry run" "rc ${_cd_rc}; out: ${_cd_out}"
@@ -5595,11 +5600,15 @@ _cd_run clean -- --overlay "$_cd/estate/nope.yaml"
 _cd_run clean -- --records "$_cd/estate/nope"
 [ "$_cd_rc" -ne 0 ] && case "$_cd_out" in *"Deployment records folder"*) true ;; *) false ;; esac \
   && ok "a missing records folder is refused by name" || bad "missing records" "rc ${_cd_rc}; out: ${_cd_out}"
-refuses "chart drift needs --namespace" "missing required flag --namespace" hosting-chart-drift --release r
-refuses "chart drift needs --release"   "missing required flag --release"   hosting-chart-drift --namespace n
-refuses "chart drift rejects unknown flags" "unknown argument" hosting-chart-drift --namespace n --release r --via aks-invoke
+refuses_hard "chart drift needs --cluster (no input naming the audited cluster is RED)" "missing required flag --cluster" \
+  hosting-chart-drift --namespace n --release r
+refuses "chart drift needs --namespace" "missing required flag --namespace" hosting-chart-drift --cluster c --release r
+refuses "chart drift needs --release"   "missing required flag --release"   hosting-chart-drift --cluster c --namespace n
+refuses "chart drift rejects unknown flags" "unknown argument" hosting-chart-drift --cluster c --namespace n --release r --via aks-invoke
 refuses_hard "chart drift namespace with a metacharacter" "is not a plain name" \
-  hosting-chart-drift --namespace 'n; kubectl delete ns --all' --release r
+  hosting-chart-drift --cluster c --namespace 'n; kubectl delete ns --all' --release r
+refuses_hard "chart drift cluster with a metacharacter" "is not a plain name" \
+  hosting-chart-drift --cluster 'c; kubectl delete ns --all' --namespace n --release r
 rm -rf "$_cd"; unset _cd _cd_out _cd_rc
 
 echo

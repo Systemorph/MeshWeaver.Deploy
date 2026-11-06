@@ -456,36 +456,105 @@ else
 fi
 rm -rf "$TMPI"
 
-# ---- 6. the policy comes from exactly ONE record ----------------------------
-echo "case: the facts of exactly ONE Deployment record"
+# ---- 6. the policy comes from exactly ONE record ON THE AUDITED CLUSTER ------
+# MeshWeaver.Deploy#144: records of one configuration repository share the conventional namespace and
+# release across clusters, planned and retired instances. Only a record that RUNS on the audited
+# cluster is a candidate; among those, exactly one must own the pair.
+echo "case: the facts of exactly ONE Deployment record on the audited cluster"
 POL="$SELF_DIR/chart-drift-record.py"
 TMPR="$(mktemp -d)"
-mkdir -p "$TMPR/one" "$TMPR/two" "$TMPR/none"
-printf '%s\n' '{"id":"a","content":{"namespace":"ns1","helmRelease":"rel1","imageRepository":"r/p","updatePolicy":"Continuous","updatePattern":"3.*","vaultValuesKeys":["MEMEX_PASSWORD"," Anthropic__ApiKey"],"keyVaultSecrets":{"x":"must-not-be-copied"}}}' > "$TMPR/one/a.json"
-printf '%s\n' '{"id":"b","content":{"namespace":"ns2","helmRelease":"rel1","updatePattern":"9.*"}}' > "$TMPR/one/b.json"
+rec() {  # rec <dir> <file> <json content>
+  mkdir -p "$TMPR/$1"; printf '{"id":"%s","content":%s}\n' "${2%.json}" "$3" > "$TMPR/$1/$2"
+}
+pol() {  # pol <dir> [extra args] — runs the record script against <dir>, namespace ns1 release rel1
+  local d="$1"; shift
+  python3 "$POL" --records "$TMPR/$d" --namespace ns1 --release rel1 --out "$TMPR/$d.out.json" "$@" 2>&1
+}
+A='{"namespace":"ns1","helmRelease":"rel1","cluster":"aks-a","status":"Live","imageRepository":"r/p","updatePolicy":"Continuous","updatePattern":"3.*","vaultValuesKeys":["MEMEX_PASSWORD"," Anthropic__ApiKey"],"keyVaultSecrets":{"x":"must-not-be-copied"}}'
+rec one a.json "$A"
+rec one b.json '{"namespace":"ns2","helmRelease":"rel1","cluster":"aks-a","updatePattern":"9.*"}'
 printf '%s\n' '{"id":"index"}' > "$TMPR/one/index.json"
-cp "$TMPR/one/a.json" "$TMPR/two/a.json"; cp "$TMPR/one/a.json" "$TMPR/two/a2.json"
-cp "$TMPR/one/b.json" "$TMPR/none/b.json"
-if python3 "$POL" --records "$TMPR/one" --namespace ns1 --release rel1 --out "$TMPR/p.json" >/dev/null \
-   && python3 -c "import json,sys; p=json.load(open(sys.argv[1])); sys.exit(0 if p=={'record':'Deployments/a','imageRepository':'r/p','updatePolicy':'Continuous','updatePattern':'3.*','pinnedImageTag':None,'vaultValuesKeys':['Anthropic__ApiKey','MEMEX_PASSWORD']} else 1)" "$TMPR/p.json"; then
+if pol one --cluster aks-a >/dev/null \
+   && python3 -c "import json,sys; p=json.load(open(sys.argv[1])); sys.exit(0 if p=={'record':'Deployments/a','imageRepository':'r/p','updatePolicy':'Continuous','updatePattern':'3.*','pinnedImageTag':None,'vaultValuesKeys':['Anthropic__ApiKey','MEMEX_PASSWORD']} else 1)" "$TMPR/one.out.json"; then
   echo "  ok   the owning record's image fields and declared key NAMES, and nothing else, are written"
 else
-  echo "::error::the image policy was not the owning record's four fields:"; cat "$TMPR/p.json" 2>/dev/null; fail=1
+  echo "::error::the image policy was not the owning record's four fields:"; cat "$TMPR/one.out.json" 2>/dev/null; fail=1
 fi
-mkdir -p "$TMPR/bad"
-printf '%s\n' '{"id":"a","content":{"namespace":"ns1","helmRelease":"rel1","updatePattern":"3.*","vaultValuesKeys":"MEMEX_PASSWORD"}}' > "$TMPR/bad/a.json"
-if python3 "$POL" --records "$TMPR/bad" --namespace ns1 --release rel1 --out "$TMPR/r.json" >/dev/null; then
+# The shape of the estate in #144: Live here + Planned with no cluster + Retired elsewhere → ONE owner.
+rec estate live.json "$A"
+rec estate planned.json '{"namespace":"ns1","helmRelease":"rel1","status":"Planned","updatePattern":"9.*"}'
+rec estate retired.json '{"namespace":"ns1","helmRelease":"rel1","status":"Retired","cluster":"aks-b","updatePattern":"8.*"}'
+rec estate gone.json '{"namespace":"ns1","helmRelease":"rel1","status":"decommissioned","cluster":"aks-a"}'
+o="$(pol estate --cluster AKS-A)"; rc=$?
+if [ "$rc" -eq 0 ] && python3 -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))['record']=='Deployments/live' else 1)" "$TMPR/estate.out.json" \
+   && echo "$o" | grep -q 'Deployments/planned (status Planned)' && echo "$o" | grep -q 'Deployments/retired (status Retired)' \
+   && echo "$o" | grep -q 'Deployments/gone (status decommissioned)'; then
+  echo "  ok   Live here + Planned (no cluster) + Retired + Decommissioned → the Live record owns it, the rest are NAMED as left out"
+else
+  echo "::error::the Live record on the audited cluster was not the one owner (rc=$rc):"; echo "$o" | sed 's/^/      /'; fail=1
+fi
+# A blank status reads Live (DeploymentContent: null is treated as Live); Suspended still stands.
+rec blank a.json '{"namespace":"ns1","helmRelease":"rel1","cluster":"aks-a","updatePattern":"3.*"}'
+rec susp a.json '{"namespace":"ns1","helmRelease":"rel1","cluster":"aks-a","status":"Suspended","updatePattern":"3.*"}'
+for d in blank susp; do
+  if pol "$d" --cluster aks-a >/dev/null; then echo "  ok   a $d-status record on the audited cluster owns the release"
+  else echo "::error::a $d-status record on the audited cluster did not own the release"; fail=1; fi
+done
+# Two records RUNNING on the audited cluster are a real ambiguity → refused, naming both.
+rec two a.json "$A"; rec two a2.json "$A"
+o="$(pol two --cluster aks-a)"; rc=$?
+if [ "$rc" -ne 0 ] && echo "$o" | grep -q "2 Deployment record(s)" && echo "$o" | grep -q 'Deployments/a2'; then
+  echo "  ok   two Live records on the audited cluster → fails RED, naming both"
+else
+  echo "::error::two Live records on one cluster must fail closed (rc=$rc):"; echo "$o" | sed 's/^/      /'; fail=1
+fi
+# A Live record on ANOTHER cluster is not counted: alone it leaves none (red), beside the owner it is left out.
+rec other x.json '{"namespace":"ns1","helmRelease":"rel1","cluster":"aks-b","status":"Live"}'
+o="$(pol other --cluster aks-a)"; rc=$?
+if [ "$rc" -ne 0 ] && echo "$o" | grep -q "0 Deployment record(s)" && echo "$o" | grep -q 'Deployments/x (cluster aks-b)'; then
+  echo "  ok   a Live record on ANOTHER cluster is not counted (alone: none owns it → RED, and it is named)"
+else
+  echo "::error::a Live record on another cluster was counted (rc=$rc):"; echo "$o" | sed 's/^/      /'; fail=1
+fi
+rec other a.json "$A"
+if pol other --cluster aks-a >/dev/null \
+   && python3 -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))['record']=='Deployments/a' else 1)" "$TMPR/other.out.json"; then
+  echo "  ok   beside a Live record on another cluster, the audited cluster's record is the one owner"
+else
+  echo "::error::a Live record on another cluster made the owner ambiguous"; fail=1
+fi
+# No input naming the cluster → RED, never "count every record".
+o="$(pol one)"; rc=$?
+o2="$(pol one --cluster '  ')"; rc2=$?
+if [ "$rc" -ne 0 ] && [ "$rc2" -ne 0 ] && echo "$o" | grep -q 'no audited cluster was named' \
+   && echo "$o2" | grep -q 'no audited cluster was named'; then
+  echo "  ok   no --cluster (absent or blank) → fails RED and names the missing input"
+else
+  echo "::error::a run without the audited cluster did not fail closed (rc=$rc/$rc2):"; echo "$o" | sed 's/^/      /'; fail=1
+fi
+# The open vocabulary: an unknown status, or an occupying record naming no cluster, is undecidable → RED.
+rec unknown a.json '{"namespace":"ns1","helmRelease":"rel1","cluster":"aks-a","status":"Hibernating"}'
+rec nocluster a.json '{"namespace":"ns1","helmRelease":"rel1","status":"Live"}'
+for d in unknown nocluster; do
+  o="$(pol "$d" --cluster aks-a)"; rc=$?
+  if [ "$rc" -ne 0 ] && echo "$o" | grep -q 'cannot be decided'; then
+    echo "  ok   $d → fails RED as undecidable, never guessed"
+  else
+    echo "::error::'$d' must fail closed as undecidable (rc=$rc):"; echo "$o" | sed 's/^/      /'; fail=1
+  fi
+done
+rec bad a.json '{"namespace":"ns1","helmRelease":"rel1","cluster":"aks-a","updatePattern":"3.*","vaultValuesKeys":"MEMEX_PASSWORD"}'
+if pol bad --cluster aks-a >/dev/null; then
   echo "::error::a non-list vaultValuesKeys must fail closed — it exited 0"; fail=1
 else
   echo "  ok   a malformed (non-list) vaultValuesKeys → fails RED, never read as 'no keys'"
 fi
-for d in two none; do
-  if python3 "$POL" --records "$TMPR/$d" --namespace ns1 --release rel1 --out "$TMPR/q.json" >/dev/null; then
-    echo "::error::'$d' owning records must fail closed — it exited 0"; fail=1
-  else
-    echo "  ok   $d owning record(s) → fails RED"
-  fi
-done
+rec none b.json '{"namespace":"ns2","helmRelease":"rel1","cluster":"aks-a"}'
+if pol none --cluster aks-a >/dev/null; then
+  echo "::error::'none' owning records must fail closed — it exited 0"; fail=1
+else
+  echo "  ok   none owning record(s) → fails RED"
+fi
 rm -rf "$TMPR"
 
 # ---- 7. a fieldRef the API server defaulted is the SAME ref ------------------
