@@ -22,6 +22,10 @@ spec:
       annotations:
         # A config or policy change rolls the pod (headscale reads both at start).
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        # So does a change of WHERE the OIDC client secret comes from (vault, identity, object, or an
+        # existing Secret's name): headscale reads client_secret_path once at start, so without this an
+        # upgrade would succeed while logins kept using the old credential.
+        checksum/oidc-secret-source: {{ include (print $.Template.BasePath "/secretproviderclass.yaml") . | cat | printf "%s|%s" .Values.oidc.clientSecret.existingSecret | sha256sum }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

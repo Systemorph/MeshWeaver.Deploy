@@ -141,6 +141,13 @@ jobs:
           grep -q 'client_secret_path: /var/run/secrets/headscale-oidc/client_secret' <<<"$on" \
             || { echo "::error::the config does not read the OIDC secret from the mount"; exit 1; }
           grep -qE '^[[:space:]]*secretObjects:' <<<"$on" && { echo "::error::the SecretProviderClass syncs a Kubernetes Secret — the secret must stay a file"; exit 1; }
+          # A change of WHERE the OIDC secret comes from must roll the pod (headscale reads it once at start).
+          sum() { helm template hs deploy/headscale/helm -f ci-values.yaml "${oidc[@]}" --set 'oidc.allowedDomains[0]=example.com' "$@" | grep 'checksum/oidc-secret-source'; }
+          [ -n "$(sum "${kv[@]}")" ] || { echo "::error::the pod template carries no checksum of the OIDC secret source"; exit 1; }
+          [ "$(sum "${kv[@]}")" != "$(sum "${kv[@]}" --set oidc.clientSecret.keyVault.objectName=other)" ] \
+            || { echo "::error::changing the Key Vault object does not change the pod template — the upgrade would keep the old secret"; exit 1; }
+          [ "$(sum --set oidc.clientSecret.existingSecret=s1)" != "$(sum --set oidc.clientSecret.existingSecret=s2)" ] \
+            || { echo "::error::changing the existing Secret does not change the pod template"; exit 1; }
           refuse() { local why="$1"; shift
             if helm template hs deploy/headscale/helm "$@" >/dev/null 2>&1; then echo "::error::rendered although $why"; exit 1; fi; }
           refuse "enabled without image.tag"            -f ci-values.yaml --set image.tag=
