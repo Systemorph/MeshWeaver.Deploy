@@ -90,8 +90,15 @@ def main():
         if text(c.get("namespace")) != a.namespace or text(c.get("helmRelease")) != a.release:
             continue
         rid = f"Deployments/{name[:-5]}"
-        status = text(c.get("status")) or "Live"
+        raw_status = c.get("status")
         on = text(c.get("cluster"))
+        if raw_status is not None and not isinstance(raw_status, str):
+            # Only an absent, null or blank TEXT status reads Live (DeploymentContent). Any other
+            # JSON type is a malformed record, never a lifecycle: undecidable, named, refused.
+            undecidable.append(f"{rid} has a non-text status {json.dumps(raw_status)} — "
+                               "whether its release stands on a cluster cannot be decided")
+            continue
+        status = text(raw_status) or "Live"
         if status.lower() in NOT_OCCUPYING:
             left_out.append(f"{rid} (status {status})")
         elif status.lower() not in OCCUPYING:

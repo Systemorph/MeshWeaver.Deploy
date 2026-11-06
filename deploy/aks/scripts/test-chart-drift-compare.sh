@@ -535,7 +535,10 @@ fi
 # The open vocabulary: an unknown status, or an occupying record naming no cluster, is undecidable → RED.
 rec unknown a.json '{"namespace":"ns1","helmRelease":"rel1","cluster":"aks-a","status":"Hibernating"}'
 rec nocluster a.json '{"namespace":"ns1","helmRelease":"rel1","status":"Live"}'
-for d in unknown nocluster; do
+# A status that is not TEXT (42, true, an object) is a malformed record, never "blank reads Live".
+rec numstatus a.json '{"namespace":"ns1","helmRelease":"rel1","cluster":"aks-a","status":42}'
+rec objstatus a.json '{"namespace":"ns1","helmRelease":"rel1","cluster":"aks-a","status":{"phase":"Live"}}'
+for d in unknown nocluster numstatus objstatus; do
   o="$(pol "$d" --cluster aks-a)"; rc=$?
   if [ "$rc" -ne 0 ] && echo "$o" | grep -q 'cannot be decided'; then
     echo "  ok   $d → fails RED as undecidable, never guessed"
