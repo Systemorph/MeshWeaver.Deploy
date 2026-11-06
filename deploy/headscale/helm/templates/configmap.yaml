@@ -1,0 +1,87 @@
+{{- if .Values.enabled }}
+{{- include "headscale.validate" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "headscale.fullname" . }}
+  labels:
+    {{- include "headscale.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    server_url: https://{{ .Values.host }}
+    # TLS ends at the ingress; headscale serves plain HTTP inside the cluster.
+    listen_addr: 0.0.0.0:{{ .Values.service.port }}
+    # Metrics and gRPC stay on loopback: nothing outside the pod reaches them. The CLI uses the socket.
+    metrics_listen_addr: 127.0.0.1:9090
+    grpc_listen_addr: 127.0.0.1:50443
+    grpc_allow_insecure: false
+    noise:
+      private_key_path: /var/lib/headscale/noise_private.key
+    prefixes:
+      v4: {{ .Values.prefixes.v4 }}
+      v6: {{ .Values.prefixes.v6 }}
+      allocation: sequential
+    derp:
+      server:
+        enabled: false
+      urls:
+        {{- toYaml .Values.derp.urls | nindent 8 }}
+      paths: []
+      auto_update_enabled: {{ .Values.derp.autoUpdate }}
+      update_frequency: {{ .Values.derp.updateFrequency }}
+    disable_check_updates: true
+    node:
+      expiry: {{ .Values.node.expiry }}
+    database:
+      type: sqlite
+      sqlite:
+        path: /var/lib/headscale/db.sqlite
+        write_ahead_log: true
+    log:
+      level: {{ .Values.log.level }}
+      format: json
+    policy:
+      mode: file
+      path: /etc/headscale/policy.hujson
+    dns:
+      magic_dns: {{ .Values.dns.magicDns }}
+      base_domain: {{ .Values.dns.baseDomain }}
+      override_local_dns: {{ .Values.dns.overrideLocalDns }}
+      nameservers:
+        global:
+          {{- if .Values.dns.nameservers }}
+          {{- toYaml .Values.dns.nameservers | nindent 10 }}
+          {{- else }} []
+          {{- end }}
+    unix_socket: /var/run/headscale/headscale.sock
+    unix_socket_permission: "0770"
+    logtail:
+      enabled: false
+    {{- if .Values.oidc.enabled }}
+    oidc:
+      only_start_if_oidc_is_available: true
+      issuer: {{ .Values.oidc.issuer | quote }}
+      client_id: {{ .Values.oidc.clientId | quote }}
+      client_secret_path: {{ include "headscale.oidcSecretDir" . }}/client_secret
+      scope: {{ toJson .Values.oidc.scope }}
+      email_verified_required: {{ .Values.oidc.emailVerifiedRequired }}
+      use_expiry_from_token: {{ .Values.oidc.useExpiryFromToken }}
+      {{- with .Values.oidc.allowedDomains }}
+      allowed_domains: {{ toJson . }}
+      {{- end }}
+      {{- with .Values.oidc.allowedGroups }}
+      allowed_groups: {{ toJson . }}
+      {{- end }}
+      {{- with .Values.oidc.allowedUsers }}
+      allowed_users: {{ toJson . }}
+      {{- end }}
+      {{- with .Values.oidc.extraParams }}
+      extra_params: {{ toJson . }}
+      {{- end }}
+      pkce:
+        enabled: {{ .Values.oidc.pkce }}
+        method: S256
+    {{- end }}
+  policy.hujson: |
+    {{- .Values.policy | nindent 4 }}
+{{- end }}

@@ -1,0 +1,10 @@
+apiVersion: v2
+name: headscale
+description: >-
+  The fleet's private network control server: Headscale (the open-source Tailscale control plane)
+  behind the cluster's HTTPS ingress, so machines join one network with the stock Tailscale client.
+  Members sign in through OIDC. Renders NOTHING unless `enabled: true`. See deploy/headscale/README.md.
+type: application
+version: 0.1.0
+# The upstream release the image carries (deploy/headscale/Dockerfile).
+appVersion: "0.29.7"

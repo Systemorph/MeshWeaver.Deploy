@@ -1,0 +1,123 @@
+# headscale — the fleet's private network control server. Reference values: NEUTRAL placeholders only
+# (this repository is public). An installation's host, vault, tenant and identity live in its estate's
+# private overlay. Renders NOTHING unless enabled.
+enabled: false
+nameOverride: ""
+
+image:
+  repository: ""        # required: <registry>/headscale
+  tag: ""               # required: the immutable <version>-<short sha> tag (the chart refuses any other shape)
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# The public name Tailscale clients reach: server_url is https://<host>. Required.
+host: ""                # e.g. headscale.example.com
+
+ingress:
+  enabled: true
+  className: ""         # required when enabled (the cluster's HTTPS ingress class)
+  # The TLS source — one of the two. A Tailscale client refuses a control server without a valid certificate.
+  clusterIssuer: ""     # cert-manager ClusterIssuer that issues tlsSecret
+  tlsSecret: ""         # defaults to <fullname>-tls
+  # The control protocol (ts2021) is an HTTP Upgrade held open for the client's whole session: the proxy
+  # must pass the upgrade, must not buffer, and must not cut an idle stream. These are ingress-nginx's names
+  # (also the AKS application-routing add-on's); another controller needs its own equivalents.
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+
+service:
+  port: 8080
+
+# The private address space machines are numbered from (Tailscale's CGNAT range and ULA by default).
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+
+dns:
+  magicDns: true
+  # Required: the suffix machines get (<machine>.<baseDomain>). Must NOT contain `host`. A name under the
+  # reserved `.internal` TLD collides with nothing public.
+  baseDomain: ""        # e.g. tailnet.internal
+  # false: a machine keeps its own resolvers; MagicDNS names are answered alongside them.
+  overrideLocalDns: false
+  nameservers: []
+
+# The relays machines fall back to when no direct path exists. Tailscale's public DERP map until the
+# fleet runs its own relay (an embedded DERP needs UDP 3478 for STUN, which an HTTP ingress cannot carry).
+derp:
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
+  autoUpdate: true
+  updateFrequency: 3h
+
+# Machines stay registered until removed (0 = no forced expiry; an OIDC member re-authenticates on
+# their own sign-in's terms only if useExpiryFromToken).
+node:
+  expiry: 0
+
+# Who may JOIN — sign-in through an OpenID Connect provider. `tailscale up --login-server https://<host>`
+# opens a browser; an admitted account registers the machine with no admin step.
+oidc:
+  enabled: false
+  issuer: ""            # e.g. https://login.microsoftonline.com/<tenant-id>/v2.0
+  clientId: ""
+  scope: ["openid", "profile", "email"]
+  # Entra ID sends no `email_verified` claim; a SINGLE-TENANT issuer (the tenant in the URL) is what makes
+  # the email trustworthy there. Leave true for a provider that does send it.
+  emailVerifiedRequired: true
+  # At least one of the three is required (the chart refuses an unrestricted login).
+  allowedDomains: []
+  allowedGroups: []
+  allowedUsers: []
+  useExpiryFromToken: false
+  pkce: true
+  extraParams: {}       # e.g. { domain_hint: example.com }
+  # The client secret is never a chart value. Either a Secret you created (key `client_secret`)…
+  clientSecret:
+    existingSecret: ""
+    # …or a Key Vault secret mounted through the Secrets Store CSI driver (Azure provider), read as a
+    # FILE by headscale (client_secret_path) — no Kubernetes Secret is synced.
+    keyVault:
+      vaultName: ""
+      tenantId: ""
+      identityClientId: ""   # the CSI add-on's user-assigned identity (clientId)
+      objectName: ""         # the vault secret's name
+
+# The network policy (who reaches whom), HuJSON, headscale's `policy.mode: file`. The default lets every
+# member reach every member's machines and nothing else; tighten it in the overlay.
+policy: |
+  {
+    "acls": [
+      { "action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:member:*"] }
+    ]
+  }
+
+log:
+  level: info
+
+persistence:
+  # The sqlite database, the Noise private key (losing it un-registers every machine) and the DERP state.
+  size: 1Gi
+  storageClass: ""      # cluster default when empty
+  # Kept when the release is uninstalled: deleting it deletes the network's identity.
+  keepOnUninstall: true
+
+networkPolicy:
+  enabled: true
+  # Namespaces whose pods may reach the HTTP port: the ingress controller's. Empty = any namespace.
+  ingressNamespaces: []
+  # Egress: DNS everywhere, HTTPS (443) to anywhere — the OIDC issuer and the DERP map are public endpoints.
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

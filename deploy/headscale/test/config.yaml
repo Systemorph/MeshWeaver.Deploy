@@ -1,0 +1,43 @@
+# The smoke's config: the SAME shape the chart renders (helm/templates/configmap.yaml), with the
+# public URL on loopback and OIDC off (the build has no identity provider). The CI lane also runs
+# `headscale configtest` on the chart's OWN rendered config, so the two cannot drift silently.
+server_url: http://127.0.0.1:8080
+listen_addr: 127.0.0.1:8080
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+noise:
+  private_key_path: /tmp/hs/noise_private.key
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+derp:
+  server:
+    enabled: false
+  urls: []
+  paths:
+    - /test/derp.yaml
+  auto_update_enabled: false
+disable_check_updates: true
+database:
+  type: sqlite
+  sqlite:
+    path: /tmp/hs/db.sqlite
+    write_ahead_log: true
+log:
+  level: info
+  format: text
+policy:
+  mode: file
+  path: /test/policy.hujson
+dns:
+  magic_dns: true
+  base_domain: tailnet.example.com
+  override_local_dns: false
+  nameservers:
+    global: []
+unix_socket: /tmp/hs/headscale.sock
+unix_socket_permission: "0770"
+logtail:
+  enabled: false
