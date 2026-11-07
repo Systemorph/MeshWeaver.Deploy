@@ -20,11 +20,14 @@ buildHosts:
   rolloutStrategy: "Recreate"
   nodeSelector: null
   tolerations: null
-  # Sized for a 16 CPU / 100 GiB build VM (the first Mac's `build` profile, 2026-11-07): up to four 4-CPU replicas.
+  # Sized for a 16 CPU / 100 GiB-memory / 300 GiB-disk build VM (the first Mac's `build` profile, 2026-11-07): up to four
+  # 4-CPU replicas.
   resources:
     requests: { cpu: "4", memory: 20Gi }
     limits: { cpu: "4", memory: 24Gi }
-  workSizeLimit: 12Gi
+  # A modules stage writes past 12 GiB (measured on the first Mac, 2026-11-07: "Usage of EmptyDir volume work exceeds the
+  # limit 12Gi" evicted the replica mid-run). 40 GiB each: 4 replicas + the 20 GiB cache + the images fit a 300 GiB VM disk.
+  workSizeLimit: 40Gi
   # Fan-out within a replica: 4 stages of a `parallel` run at once within its 4 CPU / 24 GiB limit; the chart default (8)
   # would exceed the replica's cgroup, and the runner refuses to start on that.
   stageSlots: 4
