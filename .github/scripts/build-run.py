@@ -1758,8 +1758,12 @@ def artifact_path(repo: str, sha: str, digest: str) -> str:
 # length and sha256 while it stores it under the instance's own root and records the receipt. A transport failure or a
 # 5xx is retried at most API_UPLOAD_ATTEMPTS times in all, with a doubling pause, inside the run budget; anything else —
 # and the last failed attempt — fails the stage, naming the answer. Never a silent pass.
+# 10 attempts with the pause doubling from 2 s and capped at 60 s wait ~5 min in all (2+4+…+32+60·4 ≈ 302 s): a stage's
+# whole verdict is lost when its hand-over fails, and the 503 that cost one (Plugins fee21cf7, 2026-11-07, "artifact
+# hand-over 503 after 4 attempts" — then ~14 s of patience) fell inside a control-database throttling window that lasted
+# minutes, not seconds (Plugins Hosting/CiProfile.md §7). Still bounded by the run budget, which every pause respects.
 API_STORE_SPEC = "api:"
-API_UPLOAD_ATTEMPTS = 4
+API_UPLOAD_ATTEMPTS = 10
 
 
 def events_path(repo: str, sha: str, stage: str) -> str:
