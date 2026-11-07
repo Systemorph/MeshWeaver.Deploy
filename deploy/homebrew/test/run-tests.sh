@@ -1702,7 +1702,12 @@ rm -rf "$BH"
 
 echo "── buildhost priority: fleet jobs at the lowest priority, every idle core otherwise ──"
 GOV="$HERE/../share/buildhost-priority.sh"
-gov() { env MEMEX_BUILD_PRIO_LIB=1 bash -c 'set -u; . "$0"; shift; "$@"' "$GOV" _ "$@"; }
+# Isolated from the machine's own governor: an empty MEMEX_LOCAL_HOME (no recorded buildhost-priority.env to
+# load) and the policy defaults pinned, so an installed override cannot change what these tests expect.
+GOVHOME="$(mktemp -d)"
+gov() { env -u COLIMA_HOME -u MEMEX_BUILD_PROFILE MEMEX_LOCAL_HOME="$GOVHOME" MEMEX_BUILD_PRIO_YIELD_AT=200 MEMEX_BUILD_PRIO_RESUME_BELOW=150 \
+  MEMEX_BUILD_PRIO_RESUME_AFTER=15 MEMEX_BUILD_PRIO_OLLAMA_BUSY=10 MEMEX_BUILD_PRIO_INTERVAL=2 MEMEX_BUILD_PRIO_LIB=1 \
+  bash -c 'set -u; . "$0"; shift; "$@"' "$GOV" _ "$@"; }
 [ "$(gov decide full 250 0 0 2)" = "yield 0" ] && ok "others above two cores → the build VM yields at once" || bad "yield on others" "$(gov decide full 250 0 0 2)"
 [ "$(gov decide full 100 12 0 2)" = "yield 0" ] && ok "Ollama computing → the build VM yields, however idle the rest" || bad "yield on ollama" "$(gov decide full 100 12 0 2)"
 [ "$(gov decide full 199 9 0 2)" = "full 0" ] && ok "below both thresholds the build VM keeps every idle core" || bad "full when idle" "$(gov decide full 199 9 0 2)"
@@ -1716,12 +1721,12 @@ printf '  0 20:00.00 kernel_task\n  10 0:03.50 /usr/bin/foo\n  20 2:00:00.00 VZ\
   && ok "CPU is the delta since the last sample (h:mm:ss parsed), excluding the build VM and kernel_task; Ollama (serve, runner, llama-server) counted apart" || bad "sample_cpu" "$(cat "$GT/r1") / $(cat "$GT/r2")"
 mkdir -p "$GT/home/.colima/_lima/colima-build" "$GT/stubs"; : > "$GT/home/.colima/_lima/colima-build/disk"
 printf '#!/bin/bash\n[ "$1" = -t ] && case "$2" in */colima-build/disk) echo 4242 ;; esac\n' > "$GT/stubs/lsof"; chmod +x "$GT/stubs/lsof"
-[ "$(env PATH="$GT/stubs:$PATH" HOME="$GT/home" COLIMA_HOME= MEMEX_BUILD_PRIO_LIB=1 bash -c '. "$0"; vm_pids' "$GOV")" = 4242 ] \
+[ "$(env PATH="$GT/stubs:$PATH" HOME="$GT/home" MEMEX_LOCAL_HOME="$GOVHOME" COLIMA_HOME= MEMEX_BUILD_PRIO_LIB=1 bash -c '. "$0"; vm_pids' "$GOV")" = 4242 ] \
   && ok "the build VM process is the one holding the build profile's disk open — never found by name" || bad "vm_pids" ""
-[ "$(env HOME="$GT/home" MEMEX_BUILD_PRIO_LIB=1 MEMEX_BUILD_PROFILE=default bash -c '. "$0"; instance_dir default' "$GOV")" = "$GT/home/.colima/_lima/colima" ] \
+[ "$(env -u COLIMA_HOME HOME="$GT/home" MEMEX_LOCAL_HOME="$GOVHOME" MEMEX_BUILD_PRIO_LIB=1 MEMEX_BUILD_PROFILE=default bash -c '. "$0"; instance_dir default' "$GOV")" = "$GT/home/.colima/_lima/colima" ] \
   && ok "profile default maps to Lima instance colima, any other to colima-<profile>" || bad "instance_dir" ""
 rm -rf "$GT"
-OUT="$(bash "$GOV" --install --profile 'Bad Name' 2>&1)" && bad "a bad profile was accepted" "$OUT" || ok "the governor refuses a profile that is not a Colima profile name"
+OUT="$(env MEMEX_LOCAL_HOME="$GOVHOME" bash "$GOV" --install --profile 'Bad Name' 2>&1)" && bad "a bad profile was accepted" "$OUT" || ok "the governor refuses a profile that is not a Colima profile name"
 GH="$(mktemp -d)"; mkdir -p "$GH/stubs"
 for t in launchctl taskpolicy lsof; do printf '#!/bin/bash\necho "%s $*" >> "%s/log"\nexit 0\n' "$t" "$GH" > "$GH/stubs/$t"; done; chmod +x "$GH/stubs/"*
 gh_env() { env PATH="$GH/stubs:$PATH" HOME="$GH" MEMEX_LOCAL_HOME="$GH/.ml" "$@"; }
@@ -1749,7 +1754,7 @@ echo "$SP $(ps -o lstart= -p "$SP" | tr -s ' ' '_' | sed 's/^_//; s/_$//')" > "$
 gh_env bash "$GOV" --uninstall >/dev/null 2>&1
 kill -0 "$SP" 2>/dev/null && ok "a pid record that names another process (a reused pid after a reboot) is never signalled" || bad "stale pid signalled" ""
 kill "$SP" 2>/dev/null
-rm -rf "$GH"
+rm -rf "$GH" "$GOVHOME"
 grep -q 'MEMEX_HEADLESS=1 .*buildhost-priority.sh" --install' "$HERE/../../macos/libexec/memex-daemon.sh" \
   && ok "the unattended daemon starts the governor headless after every boot, once installed" || bad "daemon starts governor" ""
 
