@@ -1474,10 +1474,78 @@ grep -q 'memex-local/certs-digest: "none"' <<<"$R0" && grep -q 'tls internal' <<
 case "$(ct "$CLI" cert status 2>&1)" in *"studio-2.net.example.test"*) ok "cert status names the configured domain" ;; *) bad "cert status" "$(ct "$CLI" cert status 2>&1)" ;; esac
 rm -rf "$CT"
 
+echo "── internal on: the fleet default — the private-network name, its certificate, sign-in, over the network only ──"
+IN="$(mktemp -d)"; mkdir -p "$IN/stubs" "$IN/home"
+cat > "$IN/stubs/tailscale" <<STUB
+#!/bin/bash
+echo "\$@" >> "$IN/ts.log"
+case "\$*" in *"status --json"*) printf '%s' '{"BackendState":"Running","Self":{"DNSName":"studio-2.net.example.test."}}' ;; esac
+exit 0
+STUB
+chmod +x "$IN/stubs/tailscale"
+cat > "$IN/stubs/kubectl" <<STUB
+#!/bin/bash
+echo "\$@" >> "$IN/k.log"
+case "\$*" in
+  *"configmap memex-portal-config"*"Microsoft__ClientId"*) printf '%s' "\${FAKE_CM_ID:-}" ;;
+  *"configmap memex-portal-config"*"EnableDevLogin"*) printf '%s' "\${FAKE_CM_DEV:-}" ;;
+  *"configmap memex-portal-config"*"InvitationOnly"*) printf '%s' "\${FAKE_CM_INV-true}" ;;
+  *"rollout status"*) exit "\${FAKE_ROLLOUT_RC:-0}" ;;
+esac
+exit 0
+STUB
+chmod +x "$IN/stubs/kubectl"
+inn() { env PATH="$IN/stubs:$STUBS:$PATH" HOME="$IN/home" MEMEX_LOCAL_HOME="$IN/home/.memex-local" "$@"; }
+IL="$IN/home/.memex-local/internal.yaml"
+OUT="$(printf '' | inn "$CLI" internal on --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "internal on refuses an empty secret" "exited 0" ;; *"empty or too short"*) ok "internal on refuses an EMPTY secret (a failed 'az … |' pipes nothing) and writes nothing" ;; *) bad "empty secret refusal" "$OUT" ;; esac
+[ ! -f "$IL" ] && ok "a refused internal on writes no layer" || bad "no layer on refusal" "$(cat "$IL")"
+OUT="$(printf 's3cret\n' | inn "$CLI" internal on --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "a too-short secret is refused" "exited 0" ;; *"too short"*) ok "a too-short secret is refused" ;; *) bad "short secret" "$OUT" ;; esac
+OUT="$(printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn "$CLI" internal on --tenant common --client-id c-1 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "a multi-directory tenant is refused" "exited 0" ;; *"a named directory"*) ok "a multi-directory tenant is refused" ;; *) bad "tenant refusal" "$OUT" ;; esac
+OUT="$(printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn "$CLI" internal on --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "internal on writes the layer" || bad "internal on" "rc=$RC: $OUT"
+case "$OUT" in *abcdefghijklmnopqrstuvwxyz0123*) bad "internal on never prints the secret" "$OUT" ;; *) ok "internal on never prints the secret" ;; esac
+grep -q '^#Host: studio-2.net.example.test$' "$IL" && grep -q 'Authentication__Microsoft__ClientId: "c-1"' "$IL" && grep -q 'Authentication__Microsoft__TenantId: "t-1"' "$IL" \
+  && grep -q 'Features__Onboarding__InvitationOnly: "true"' "$IL" && [ "$(ls -l "$IL" | cut -c1-10)" = "-rw-------" ] \
+  && ok "the layer: the private-network name (read from tailscale), Microsoft sign-in, invitation-only, 0600" || bad "internal layer" "$(sed 's/ClientSecret: .*/ClientSecret: <redacted>/' "$IL")"
+grep -q 'Authentication__EnableDevLogin: "false"' "$IL" && ok "internal only turns the passwordless development sign-in OFF explicitly" || bad "dev login off" "$(grep -c DevLogin "$IL")"
+[ -s "$IN/k.log" ] && ! grep -v -- '^--context colima ' "$IN/k.log" | grep -q . \
+  && ok "every kubectl call of internal on is pinned to the LOCAL cluster (--context colima): a private key never lands in another context" || bad "kubectl context" "$(cat "$IN/k.log")"
+! grep -q -- 'serve --bg' "$IN/ts.log" && case "$OUT" in *"NOT opened yet"*) true ;; *) false ;; esac \
+  && ok "the private network is NOT opened while the running portal lacks the sign-in (no exposure before update)" || bad "serve before sign-in" "$(cat "$IN/ts.log")"
+printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn env FAKE_CM_ID=c-1 FAKE_CM_DEV=true "$CLI" internal on --tenant t-1 --client-id c-1 >/dev/null 2>&1
+! grep -q -- 'serve --bg' "$IN/ts.log" && ok "nor while the running portal still has the development sign-in on" || bad "serve with dev login" "$(cat "$IN/ts.log")"
+printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn env FAKE_CM_ID=c-1 FAKE_CM_DEV=false FAKE_CM_INV=false "$CLI" internal on --tenant t-1 --client-id c-1 >/dev/null 2>&1
+! grep -q -- 'serve --bg' "$IN/ts.log" && ok "nor while the running portal is not invitation-only" || bad "serve without invitation-only" "$(cat "$IN/ts.log")"
+printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn env FAKE_CM_ID=c-1 FAKE_CM_DEV=false FAKE_ROLLOUT_RC=1 "$CLI" internal on --tenant t-1 --client-id c-1 >/dev/null 2>&1
+! grep -q -- 'serve --bg' "$IN/ts.log" && ok "nor before the portal's rollout has completed (the configmap changes before the pods)" || bad "serve before rollout" "$(cat "$IN/ts.log")"
+printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn env FAKE_CM_ID=c-1 FAKE_CM_DEV=false "$CLI" internal on --tenant t-1 --client-id c-1 >/dev/null 2>&1
+grep -q -- 'serve --bg --tcp 443 tcp://127.0.0.1:8443' "$IN/ts.log" && ok "once the portal carries the sign-in, tailscale serve forwards TCP 443 to the loopback front door (TLS passthrough)" || bad "tailscale serve" "$(cat "$IN/ts.log")"
+grep -q 'internal_args=(--set-string "config.memex_portal.Authentication__EnableDevLogin=false"' "$CLI" && grep -q -- '--set-string "config.memex_portal.Features__Onboarding__InvitationOnly=true")' "$CLI" && grep -q '    -f "$OVERLAY" \\$' "$CLI" \
+  && awk '/-f "\$OVERLAY" \\$/{o=NR} /internal_args\[@\]\+/{i=NR} END{exit !(o && i==o+1)}' "$CLI" \
+  && ok "helm: dev sign-in forced off and invitation-only forced on AFTER the overlay (an overlay cannot undo either)" || bad "dev login after overlay" "order"
+case "$OUT" in *"https://studio-2.net.example.test/signin-microsoft"*"/auth/callback/Microsoft"*"/auth/ea/callback"*) ok "internal on names the three redirect URIs to register" ;; *) bad "redirect URIs" "$OUT" ;; esac
+grep -q 'mode_args+=(-f "$INTERNAL_FILE")' "$CLI" && ok "helm_deploy layers the internal-only file" || bad "helm layer" "missing"
+M="$(inn env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; internal_ingress_manifest studio-2.net.example.test "nginx.ingress.kubernetes.io/proxy-body-size: \"50m\""' "$CLI")"
+grep -q 'name: memex-portal-net$' <<<"$M" && grep -q 'secretName: memex-portal-net-tls' <<<"$M" && grep -q 'host: "studio-2.net.example.test"' <<<"$M" \
+  && grep -q 'service: { name: memex-portal-service, port: { number: 8080 } }' <<<"$M" && grep -q '    nginx.ingress.kubernetes.io/proxy-body-size: "50m"' <<<"$M" \
+  && ok "a SEPARATE Ingress for the name: its own TLS Secret, the portal's annotations, the portal service" || bad "internal ingress manifest" "$M"
+# The front door binds loopback only while internal-only (the network reaches it through tailscale serve).
+PFI="$HERE/../share/port-forward.sh"
+pfi=$(env MEMEX_LOCAL_HOME="$IN/home/.memex-local" MEMEX_HEADLESS=1 MEMEX_PORT=8443 bash -c '
+  colima() { return 0; }; kubectl() { case "$*" in *port-forward*) printf "%s\n" "$*" ;; *) return 0 ;; esac; }; export -f colima kubectl
+  sed "s#^\( *\)exec kubectl#\1kubectl#; s#^exec kubectl#kubectl#" "$1" | bash 2>/dev/null | grep port-forward | head -n 1' _ "$PFI" 2>/dev/null | grep -o -- '--address .*')
+[ "$pfi" = "--address 127.0.0.1,::1 8443:443" ] && ok "internal only: the front door binds loopback only" || bad "internal front door" "$pfi"
+inn "$CLI" internal off >/dev/null 2>&1
+[ ! -f "$IL" ] && grep -q -- 'serve --tcp 443 off' "$IN/ts.log" && ok "internal off removes the layer and the tailscale serve" || bad "internal off" "$(cat "$IN/ts.log")"
+rm -rf "$IN"
+
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
-for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert backlease fleet llm relay publish autoupdate; do
+for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease fleet llm relay publish autoupdate; do
   case "$help_out" in
     *"$cmd"*) ;;
     *) bad "help documents '$cmd'" "not in the usage text"; continue ;;

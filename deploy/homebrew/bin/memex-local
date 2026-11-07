@@ -145,6 +145,12 @@ readonly LLM_FILE="$LOCAL_HOME/llm.yaml"
 # a chat or printed. lego keeps the account and the certificates under $CERT_DIR/lego; a launchd agent
 # re-runs `cert issue` daily, which renews only within 30 days of expiry.
 readonly CERT_DIR="$LOCAL_HOME/certs"
+# ── INTERNAL ONLY (`memex-local internal on`) — the fleet default: the portal answers at this Mac's private-network
+# name with its trusted certificate, over the private network only. One values layer (the sign-in and
+# invitation-only admission, 0600), a separate Ingress for that name, and tailscale serve TCP 443 → the front door.
+readonly INTERNAL_FILE="$LOCAL_HOME/internal.yaml"
+readonly INTERNAL_INGRESS="memex-portal-net"
+readonly INTERNAL_TLS_SECRET="memex-portal-net-tls"
 readonly CERT_ENV="$CERT_DIR/dns01.env"
 readonly CERT_SECRET="$CERT_DIR/dns01.secret"
 readonly CERT_PLIST_LABEL="com.memex.local.cert"
@@ -870,8 +876,15 @@ cert_install() {
   done
   [ "${#args[@]}" -gt 0 ] || return 0
   colima_running || { info "the stack is not running — the certificate reaches the entry point at the next 'publish on'"; return 0; }
-  kubectl -n "$NAMESPACE" create secret generic memex-network-entry-certs ${args[@]+"${args[@]}"} --dry-run=client -o yaml \
-    | kubectl -n "$NAMESPACE" apply -f - >/dev/null 2>&1 || { warn "could not write the Secret memex-network-entry-certs"; return 1; }
+  # the internal-only Ingress serves the configured name with its own TLS Secret
+  local d; d="$(cert_value CERT_DOMAIN)"
+  if [ -n "$d" ] && [ -f "$(cert_file "$d" crt)" ] && [ -f "$(cert_file "$d" key)" ]; then
+    local_kubectl -n "$NAMESPACE" create secret tls "$INTERNAL_TLS_SECRET" --cert="$(cert_file "$d" crt)" --key="$(cert_file "$d" key)" --dry-run=client -o yaml \
+      | local_kubectl -n "$NAMESPACE" apply -f - >/dev/null 2>&1 && ok "certificate for $d handed to the internal Ingress (Secret $INTERNAL_TLS_SECRET)" \
+      || warn "could not write the Secret $INTERNAL_TLS_SECRET"
+  fi
+  local_kubectl -n "$NAMESPACE" create secret generic memex-network-entry-certs ${args[@]+"${args[@]}"} --dry-run=client -o yaml \
+    | local_kubectl -n "$NAMESPACE" apply -f - >/dev/null 2>&1 || { warn "could not write the Secret memex-network-entry-certs"; return 1; }
   ok "certificate(s) handed to the network entry point (Secret memex-network-entry-certs)"
   if [ -f "$LOCAL_HOME/network-entry.yaml" ] && [ -f "$PUBLISH_FILE" ]; then
     info "re-rendering the entry point onto the certificate: memex-local publish on is re-run by the next 'memex-local update'; applying now"
@@ -879,7 +892,7 @@ cert_install() {
     names="$(awk -F'"' '/memex-local\/caddyfile-hosts:/ { print $2; exit }' "$LOCAL_HOME/network-entry.yaml")"
     # shellcheck disable=SC2086
     render_network_entry "$share/network-entry.yaml" $names > "$LOCAL_HOME/network-entry.yaml" \
-      && kubectl -n "$NAMESPACE" apply -f "$LOCAL_HOME/network-entry.yaml" >/dev/null 2>&1 \
+      && local_kubectl -n "$NAMESPACE" apply -f "$LOCAL_HOME/network-entry.yaml" >/dev/null 2>&1 \
       && ok "network entry point re-rendered (serves the trusted certificate for $(cert_value CERT_DOMAIN))"
   fi
 }
@@ -996,6 +1009,145 @@ overlay_drop_empty() {
 
 # The keys the public-name layer owns, which an empty overlay placeholder must not erase.
 readonly PUBLISH_OWNED_KEYS=(Authentication__Microsoft__ClientId Authentication__Microsoft__TenantId Authentication__Microsoft__ClientSecret)
+
+# ---------------------------------------------------------------------------
+# §18d — INTERNAL ONLY (`memex-local internal on|status|off`) — the fleet default (Hosting/MacStudioFleet §2b.3)
+# ---------------------------------------------------------------------------
+internal_value() { awk -v k="$1" '$1 == "#"k":" { print $2; exit } $1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$INTERNAL_FILE" 2>/dev/null; }
+
+# The separate Ingress for the private-network name. Separate because the chart's ONE tlsSecret covers every
+# host, and pointing it at this name's certificate would break memex.localhost. Its annotations are the
+# portal Ingress's own (read live), minus the bookkeeping ones. Pure over its arguments: prints the manifest.
+internal_ingress_manifest() {
+  local host="$1" annotations="$2" class="${3:-nginx}"
+  printf 'apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: %s\n  labels: { app.kubernetes.io/managed-by: memex-local, app.kubernetes.io/component: memex-portal-net }\n' "$INTERNAL_INGRESS"
+  if [ -n "$annotations" ]; then printf '  annotations:\n'; printf '%s\n' "$annotations" | sed 's/^/    /'; fi
+  printf 'spec:\n  ingressClassName: %s\n  tls:\n    - hosts: ["%s"]\n      secretName: %s\n' "$class" "$host" "$INTERNAL_TLS_SECRET"
+  printf '  rules:\n    - host: "%s"\n      http:\n        paths:\n          - path: /\n            pathType: Prefix\n            backend: { service: { name: memex-portal-service, port: { number: 8080 } } }\n' "$host"
+}
+
+# The portal Ingress's annotations, one `key: "value"` line each, without kubectl/helm/cert-manager bookkeeping.
+portal_ingress_annotations() {
+  local_kubectl -n "$NAMESPACE" get ingress memex-portal -o go-template='{{range $k, $v := .metadata.annotations}}{{$k}}: {{printf "%q" $v}}{{"\n"}}{{end}}' 2>/dev/null \
+    | grep -Ev '^(kubectl\.kubernetes\.io/|meta\.helm\.sh/|cert-manager\.io/)' || true
+}
+
+# The local cluster's kubectl — pinned to MEMEX_KUBE_CONTEXT (default colima, as publish ca and
+# share/port-forward.sh), so a private key or an Ingress never lands in whatever cluster the
+# current context happens to name (an operator's Mac also holds cloud contexts).
+local_kubectl() { kubectl --context "${MEMEX_KUBE_CONTEXT:-colima}" "$@"; }
+
+# Restart the front door only where one is already installed, so it re-reads internal.yaml now
+# (loopback-only while internal, all interfaces again after off) instead of at the next update.
+restart_front_door() {
+  if [ "$HEADLESS" = "1" ]; then
+    [ -f "$PF_PID" ] || return 0
+    kill "$(cat "$PF_PID")" 2>/dev/null || true; rm -f "$PF_PID"
+  else
+    [ -f "$PLIST_DST" ] || return 0
+  fi
+  if install_launchd >/dev/null 2>&1; then ok "front door restarted ($1)"; else warn "could not restart the front door — run 'memex-local port-forward'"; fi
+}
+
+# Open the private network to this Mac (tailscale serve TCP 443 -> the loopback front door) ONLY once
+# the running portal carries this layer's sign-in with the development sign-in off — never in the
+# window between writing the layer and the update that applies it.
+internal_serve_when_signed_in() {
+  local want got dev inv
+  want="$(internal_value Authentication__Microsoft__ClientId)"
+  got="$(local_kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__Microsoft__ClientId}' 2>/dev/null || true)"
+  dev="$(local_kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__EnableDevLogin}' 2>/dev/null || true)"
+  inv="$(local_kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Features__Onboarding__InvitationOnly}' 2>/dev/null || true)"
+  if [ -z "$want" ] || [ "$got" != "$want" ] || [ "$dev" = "true" ] || [ "$inv" != "true" ]; then
+    info "the private network is NOT opened yet: the running portal does not carry this sign-in (dev sign-in: ${dev:-unset}) — 'memex-local update' applies it and opens it"
+    return 1
+  fi
+  # The configmap changes before the pods do: only a COMPLETED rollout serves the new sign-in.
+  if ! local_kubectl -n "$NAMESPACE" rollout status deployment/memex-portal-deployment --timeout=300s >/dev/null 2>&1; then
+    info "the private network is NOT opened yet: the portal's rollout has not completed — 'memex-local update' opens it once it has"
+    return 1
+  fi
+  if publish_tailscale serve --bg --tcp 443 "tcp://127.0.0.1:${HOST_PORT}" >/dev/null 2>&1; then
+    ok "the private network reaches this Mac on TCP 443 (tailscale serve → the loopback front door, TLS passed through)"
+  else
+    warn "could not set up 'tailscale serve --tcp 443 tcp://127.0.0.1:${HOST_PORT}'"; return 1
+  fi
+}
+
+cmd_internal() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    on)
+      local tenant="" client_id="" secret="" host
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --tenant) shift; tenant="${1:?--tenant needs the directory id}" ;;
+          --client-id) shift; client_id="${1:?--client-id needs the app registration client id}" ;;
+          *) die "internal on: unknown flag '$1'" ;;
+        esac; shift
+      done
+      case "$tenant" in ''|common|organizations|consumers) die "internal on: --tenant <directory id> is required — a named directory, never common/organizations/consumers" ;; esac
+      [ -n "$client_id" ] || die "internal on: --client-id <id> is required (the sign-in app with this Mac's redirect URIs on its private-network name)"
+      case "$client_id" in *[!A-Za-z0-9._-]*) die "internal on: --client-id contains characters a client id never has" ;; esac
+      [ -t 0 ] && die "internal on: pipe the client secret on STDIN — it is never an argument and never printed"
+      secret="$(cat)"; secret="${secret%$'\n'}"
+      # 🚨 an EMPTY secret is refused, never written: \`az ad app credential reset … |\` pipes nothing when az fails
+      # (e.g. the app's password-credential limit), and an empty secret silently breaks the sign-in
+      [ "${#secret}" -ge 16 ] || die "internal on: the client secret on STDIN is empty or too short (${#secret} characters) — did the command producing it fail? Nothing was written"
+      case "$secret" in *'"'*|*'\\'*|*$'\n'*) die "internal on: the client secret contains a quote, backslash or newline" ;; esac
+      host="$(tailnet_name)"
+      [ -n "$host" ] || die "internal on: this Mac has no private-network name yet — join the network first (MeshWeaver.Plugins Hosting/MacStudioOnboarding step 4)"
+      [ -f "$(cert_file "$host" crt)" ] || warn "no trusted certificate for $host yet — run 'memex-local cert config … < secret' and 'memex-local cert issue'; until then the name has no certificate"
+      mkdir -p "$LOCAL_HOME"
+      ( umask 077; cat > "$INTERNAL_FILE" ) <<YAML
+# memex-local INTERNAL ONLY — managed by \`memex-local internal\`; re-run \`on\` to change, \`off\` to delete.
+# This Mac's portal answers at https://${host} over the private network only (Hosting/MacStudioFleet §2b.3).
+#Host: ${host}
+config:
+  memex_portal:
+    Authentication__Microsoft__ClientId: "${client_id}"
+    Authentication__Microsoft__TenantId: "${tenant}"
+    Features__Onboarding__InvitationOnly: "true"
+    Authentication__EnableDevLogin: "false"
+secrets:
+  memex_portal:
+    Authentication__Microsoft__ClientSecret: "${secret}"
+YAML
+      chmod 600 "$INTERNAL_FILE"; unset secret
+      local dropped; dropped="$(overlay_drop_empty ${PUBLISH_OWNED_KEYS[@]+"${PUBLISH_OWNED_KEYS[@]}"})"
+      [ -n "$dropped" ] && ok "removed empty overlay placeholder(s) that would erase the sign-in: $(printf '%s' "$dropped" | tr '\n' ' ')"
+      ok "internal-only layer written: $INTERNAL_FILE (https://${host}, sign-in Microsoft, invitation-only; the secret never printed)"
+      cert_install >/dev/null 2>&1 || true
+      if colima_running; then
+        internal_ingress_manifest "$host" "$(portal_ingress_annotations)" > "$LOCAL_HOME/internal-ingress.yaml" \
+          && local_kubectl -n "$NAMESPACE" apply -f "$LOCAL_HOME/internal-ingress.yaml" >/dev/null 2>&1 \
+          && ok "Ingress $INTERNAL_INGRESS applied (host $host, TLS Secret $INTERNAL_TLS_SECRET)" \
+          || warn "could not apply the Ingress $INTERNAL_INGRESS ($LOCAL_HOME/internal-ingress.yaml)"
+      fi
+      restart_front_door "loopback only — the private network is the only way in"
+      internal_serve_when_signed_in || true
+      info "Register on the sign-in app exactly: https://${host}/signin-microsoft, https://${host}/auth/callback/Microsoft, https://${host}/auth/ea/callback"
+      info "Apply it: memex-local update   (the portal takes the sign-in, then the private network is opened; the first person to sign in becomes the administrator — the owner)"
+      ;;
+    status)
+      if [ ! -f "$INTERNAL_FILE" ]; then info "not internal-only — memex-local internal on --tenant <id> --client-id <id> < secret"; return 0; fi
+      local host got_id; host="$(internal_value Host)"
+      ok "INTERNAL ONLY — https://${host} over the private network (sign-in Microsoft, invitation-only)"
+      got_id="$(local_kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__Microsoft__ClientId}' 2>/dev/null || true)"
+      if [ -n "$got_id" ] && [ "$got_id" = "$(internal_value Authentication__Microsoft__ClientId)" ]; then ok "the running portal's config carries the client id of this layer"; else warn "the running portal's config does NOT carry this layer's client id (${got_id:-<none>}) — run 'memex-local update'"; fi
+      local_kubectl -n "$NAMESPACE" get ingress "$INTERNAL_INGRESS" >/dev/null 2>&1 && ok "Ingress $INTERNAL_INGRESS present" || warn "Ingress $INTERNAL_INGRESS missing — re-run 'memex-local internal on'"
+      [ -n "$(cert_expiry "$host")" ] && ok "certificate for $host valid until $(cert_expiry "$host")" || warn "no trusted certificate for $host — memex-local cert issue"
+      publish_tailscale serve status 2>/dev/null | sed 's/^/  /' || true
+      ;;
+    off)
+      publish_tailscale serve --tcp 443 off >/dev/null 2>&1 || true
+      local_kubectl -n "$NAMESPACE" delete ingress "$INTERNAL_INGRESS" --ignore-not-found >/dev/null 2>&1 || true
+      if [ -f "$INTERNAL_FILE" ]; then rm -f "$INTERNAL_FILE"; ok "internal-only OFF — the next 'memex-local update' drops its sign-in"; else info "internal-only was not on"; fi
+      restart_front_door "all interfaces again"
+      ;;
+    *) die "usage: memex-local internal {on --tenant <id> --client-id <id> < secret | status | off}" ;;
+  esac
+}
 
 cmd_publish() {
   local sub="${1:-status}"; shift || true
@@ -1848,7 +2000,7 @@ helm_deploy() {
   #    Cleared, the instance manifest the first-run wizard writes decides what installs (it
   #    projects the ticked packages as PluginCatalog:InstallByDefault:N and names the registry).
   #    Self-registry mode keeps today's per-source "<name>/*" entries, assembled below.
-  local mode_args=()
+  local mode_args=() internal_args=()
   if registry_mode; then
     # The tracked registry-mode layer first (self-update from the public GHCR, MeshWeaver.Deploy#65),
     # then the per-install registry file. Both are -f layers, so the user's overlay still wins.
@@ -1876,6 +2028,16 @@ helm_deploy() {
   if fleet_host; then
     mode_args+=(-f "$share_dir/values.local.fleet-host.yaml")
     info "FLEET HOST: the Hosting app is part of this Mac's first instance (InstallByDefault Plugins/Hosting + the baseline)"
+  fi
+  # INTERNAL-ONLY layer (`memex-local internal on`): the sign-in for this Mac's private-network name, invitation-only.
+  if [ -f "$INTERNAL_FILE" ]; then
+    overlay_drop_empty ${PUBLISH_OWNED_KEYS[@]+"${PUBLISH_OWNED_KEYS[@]}"} >/dev/null
+    mode_args+=(-f "$INTERNAL_FILE")
+    # After the overlay (a --set beats every -f): the overlay must not re-open the passwordless
+    # development sign-in on a portal the private network reaches.
+    internal_args=(--set-string "config.memex_portal.Authentication__EnableDevLogin=false"
+                   --set-string "config.memex_portal.Features__Onboarding__InvitationOnly=true")
+    info "INTERNAL ONLY: answers at https://$(internal_value Host) over the private network (sign-in Microsoft, invitation-only)"
   fi
   # PUBLIC NAME layer (`memex-local publish on`): the additional host, its sign-in, invitation-only.
   if [ -f "$PUBLISH_FILE" ]; then
@@ -1937,6 +2099,7 @@ helm_deploy() {
     -f "$share_dir/values.local.defaults.yaml" \
     ${mode_args[@]+"${mode_args[@]}"} \
     -f "$OVERLAY" \
+    ${internal_args[@]+"${internal_args[@]}"} \
     --set persistDataVolume=true \
     --set "config.memex_portal.Bootstrap__Secret=$LOCAL_BOOTSTRAP_SECRET" \
     ${plugin_args[@]+"${plugin_args[@]}"} \
@@ -1958,6 +2121,7 @@ helm_deploy() {
   if ! perms_err="$(colima ssh -- sh -c "sudo mkdir -p $PORTAL_DATA_DIR && sudo chmod 0777 $PORTAL_DATA_DIR" 2>&1)"; then
     warn "could not make $PORTAL_DATA_DIR writable on the node — portal may crashloop on DataProtection keys${perms_err:+: $perms_err}"
   fi
+  if [ -f "$INTERNAL_FILE" ]; then internal_serve_when_signed_in || true; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -3789,6 +3953,12 @@ COMMANDS:
                   printed, only their sha256 fingerprints), runs backlease enroll, starts Ollama
                   under launchd, and updates from the public GHCR. 'status' shows the fingerprints.
   backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] | status | off
+  internal on --tenant <id> --client-id <id> < secret | status | off
+                  INTERNAL ONLY — the fleet default: the portal answers at this Mac's private-network
+                  name (https://<machine>.net.<domain>) over the private network only, with its
+                  trusted certificate ('cert'), Microsoft sign-in and invitation-only admission. A
+                  separate Ingress for that name, tailscale serve TCP 443 → the loopback front door.
+                  The client secret is read from STDIN (an empty one is refused), never printed.
   cert config --domain <machine>.net.<domain> --email <e> --client-id <id> --tenant <id> --subscription <id>
        --resource-group <rg> --zone <zone> < secret | issue | status
                   A PUBLICLY TRUSTED certificate for this Mac's private-network name (Let's Encrypt over
@@ -4373,6 +4543,7 @@ main() {
     llm)           cmd_llm "$@" ;;
     publish)       cmd_publish "$@" ;;
     cert)          cmd_cert "$@" ;;
+    internal)      cmd_internal "$@" ;;
     relay)         cmd_relay "$@" ;;
     verify)        cmd_verify "$@" ;;
     autoroll)      cmd_autoroll "$@" ;;
