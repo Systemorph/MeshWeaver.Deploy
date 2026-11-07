@@ -1316,6 +1316,51 @@ kids_after=$(pgrep -f "sleep 307" | wc -l | tr -d ' ')
 [ "$kids_before" -ge 2 ] && [ "$kids_after" = 0 ] && ok "stopping the published forward stops both forwards (${kids_before} → 0)" || bad "supervisor stops both forwards" "before=$kids_before after=$kids_after"
 grep -q '<key>MEMEX_LOCAL_HOME</key>' "$HERE/../share/com.memex.local.plist" && grep -q -- '-e "s|__LOCAL_HOME__|${LOCAL_HOME}|g"' "$CLI" \
   && ok "the LaunchAgent carries the state directory the forward reads publish.yaml from" || bad "MEMEX_LOCAL_HOME reaches the LaunchAgent" "plist or sed missing"
+# An empty overlay placeholder for a key the layer owns would ERASE the sign-in (the overlay is layered last).
+OV="$PB/home/.memex-local/values.local.yaml"
+printf 'config:\n  memex_portal:\n    Authentication__Provider: ""\n    Authentication__Microsoft__ClientId: ""\n    Authentication__Microsoft__TenantId: ""\n    KeepMe: "x"\n' > "$OV"; chmod 600 "$OV"
+OUT="$(printf 's3cret-value\n' | pb "$CLI" publish on --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+! grep -q 'Authentication__Microsoft__ClientId: ""' "$OV" && ! grep -q 'Authentication__Microsoft__TenantId: ""' "$OV" \
+  && grep -q 'Authentication__Provider: ""' "$OV" && grep -q 'KeepMe: "x"' "$OV" \
+  && ok "publish on removes ONLY the empty overlay placeholders of the keys it owns" || bad "overlay placeholders" "$(cat "$OV")"
+case "$OUT" in *"removed empty overlay placeholder"*"Authentication__Microsoft__ClientId"*) ok "publish on says which placeholders it removed" ;; *) bad "placeholder report" "$OUT" ;; esac
+[ "$(ls -l "$OV" | cut -c1-10)" = "-rw-------" ] && ok "the overlay keeps its 0600 mode" || bad "overlay mode" "$(ls -l "$OV")"
+printf 'config:\n  memex_portal:\n    Authentication__Microsoft__ClientId: "mine"\n' > "$OV"
+printf 's3cret-value\n' | pb "$CLI" publish on --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1 >/dev/null 2>&1
+grep -q 'Authentication__Microsoft__ClientId: "mine"' "$OV" && ok "a REAL overlay value is kept (and still wins)" || bad "real overlay value kept" "$(cat "$OV")"
+rm -f "$OV"
+# publish status checks what the portal ACTUALLY got (the rendered config), not the layer.
+cat > "$PB/stubs/kubectl" <<'STUB'
+#!/bin/bash
+case "$*" in
+  *"get configmap memex-portal-config"*ClientId*) printf '%s' "${FAKE_CLIENT_ID:-}" ;;
+  *"get configmap memex-portal-config"*TenantId*) printf '%s' "${FAKE_TENANT_ID:-}" ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "$PB/stubs/kubectl"
+case "$(pb env FAKE_CLIENT_ID=c-1 FAKE_TENANT_ID=t-1 "$CLI" publish status 2>&1)" in *"running portal's config carries the Microsoft client id and tenant"*) ok "publish status confirms the rendered config carries the sign-in" ;; *) bad "status: rendered config ok" "$(pb env FAKE_CLIENT_ID=c-1 FAKE_TENANT_ID=t-1 "$CLI" publish status 2>&1)" ;; esac
+case "$(pb env FAKE_CLIENT_ID= FAKE_TENANT_ID= "$CLI" publish status 2>&1)" in *"does NOT carry this layer's Microsoft sign-in"*) ok "publish status warns when the rendered config lost the client id" ;; *) bad "status: rendered config missing" "$(pb "$CLI" publish status 2>&1)" ;; esac
+rm -f "$PB/stubs/kubectl"
+# A user-space tailscaled under the person's home: its socket is used without being told.
+TSOCK="$(mktemp -d "${TMPDIR:-/tmp}/tss.XXXXXX")"; mkdir -p "$PB/home/.tailscale"
+python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$PB/home/.tailscale/tailscaled.sock" 2>/dev/null
+if [ -S "$PB/home/.tailscale/tailscaled.sock" ]; then
+  : > "$PB/ts.log"; pb env -u MEMEX_TAILSCALE_SOCKET MEMEX_LOCAL_LIB=1 bash -c '. "$0"; publish_tailscale status' "$CLI" >/dev/null 2>&1
+  grep -q -- "--socket=$PB/home/.tailscale/tailscaled.sock status" "$PB/ts.log" && ok "a user-space tailscaled's socket under the home is used automatically" || bad "tailscale socket auto-detect" "$(cat "$PB/ts.log")"
+  : > "$PB/ts.log"; pb env MEMEX_TAILSCALE_SOCKET=/custom.sock MEMEX_LOCAL_LIB=1 bash -c '. "$0"; publish_tailscale status' "$CLI" >/dev/null 2>&1
+  grep -q -- "--socket=/custom.sock status" "$PB/ts.log" && ok "MEMEX_TAILSCALE_SOCKET still wins" || bad "explicit socket wins" "$(cat "$PB/ts.log")"
+  rm -f "$PB/home/.tailscale/tailscaled.sock"
+else
+  printf '  skip  tailscale socket auto-detect — this host cannot create a unix socket here\n'
+fi
+rm -rf "$TSOCK"
+# The network entry point: the caddy binary carries a FILE capability, so a pod with every capability dropped
+# must add NET_BIND_SERVICE back or the exec is refused (CrashLoopBackOff); the bridge strips the file cap instead.
+grep -q 'capabilities: { drop: \["ALL"\], add: \["NET_BIND_SERVICE"\] }' "$HERE/../share/network-entry.yaml" \
+  && ok "the network entry point adds NET_BIND_SERVICE back (caddy's file capability)" || bad "network-entry capabilities" "$(grep -n capabilities "$HERE/../share/network-entry.yaml")"
+grep -q 'setcap -r /usr/bin/caddy' "$HERE/../../tailnet-bridge/Dockerfile" && grep -q 'test -z "$(getcap /usr/local/bin/caddy)"' "$HERE/../../tailnet-bridge/Dockerfile" \
+  && ok "the bridge image strips caddy's file capability and its test stage proves it" || bad "bridge caddy file cap" "missing in deploy/tailnet-bridge/Dockerfile"
 pb "$CLI" publish off >/dev/null 2>&1
 [ ! -f "$LAYER" ] && ok "publish off removes the layer" || bad "publish off" "layer still there"
 grep -q -- 'serve --tcp 443 off' "$PB/ts.log" && ok "publish off stops the tailscale serve" || bad "publish off serve" "$(cat "$PB/ts.log")"

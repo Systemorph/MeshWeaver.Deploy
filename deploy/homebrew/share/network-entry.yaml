@@ -54,7 +54,11 @@ spec:
             - { name: XDG_DATA_HOME, value: /tmp/caddy }
             - { name: XDG_CONFIG_HOME, value: /tmp/caddy }
           ports: [{ name: https, containerPort: 8443 }]
-          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          # 🚨 NET_BIND_SERVICE back, nothing else: the caddy binary of the image carries the FILE capability
+          # cap_net_bind_service, and with every capability dropped (and no privilege escalation) the kernel refuses
+          # to exec it at all — "exec /usr/bin/caddy: operation not permitted", a CrashLoopBackOff, although it
+          # listens on 8443 (measured on the first fleet Mac, 2026-11-07).
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"], add: ["NET_BIND_SERVICE"] } }
           readinessProbe: { tcpSocket: { port: https }, periodSeconds: 10 }
           resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { memory: 128Mi } }
           volumeMounts:
