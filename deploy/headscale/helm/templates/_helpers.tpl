@@ -113,6 +113,11 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- if not (regexMatch "^[a-z0-9]([-a-z0-9._]*[a-z0-9])?$" (toString $k.user)) }}
 {{- fail (printf "preauthKeys.keys[%s]: user %q is required and must be a plain lower-case name" $k.name (toString $k.user)) }}
 {{- end }}
+{{- range $t := ($k.tags | default list) }}
+{{- if not (regexMatch "^tag:[a-z0-9]([-a-z0-9]*[a-z0-9])?$" (toString $t)) }}
+{{- fail (printf "preauthKeys.keys[%s]: tag %q is not tag:<lower-case name>" $k.name (toString $t)) }}
+{{- end }}
+{{- end }}
 {{- $valid := int (default 720 $k.validHours) }}
 {{- $renew := int (default 168 $k.renewHours) }}
 {{- if or (lt $valid 1) (lt $renew 1) (ge $renew $valid) }}

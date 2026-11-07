@@ -1284,14 +1284,36 @@ grep -q '^    - "mac-1.example.com"$' "$LAYER" && grep -q 'Authentication__Micro
   && grep -q 'Authentication__Microsoft__TenantId: "t-1"' "$LAYER" && grep -q 'Features__Onboarding__InvitationOnly: "true"' "$LAYER" \
   && grep -q 'Authentication__Microsoft__ClientSecret: "s3cret-value"' "$LAYER" \
   && ok "the layer: additional host, provider + tenant, invitation-only, the secret" || bad "the layer's content" "$(sed 's/ClientSecret: .*/ClientSecret: <redacted>/' "$LAYER")"
-grep -q -- 'serve --bg --tcp 443 tcp://127.0.0.1:8443' "$PB/ts.log" && ok "publish on points tailscale serve at the loopback front door's port" || bad "tailscale serve" "$(cat "$PB/ts.log" 2>/dev/null)"
+grep -q -- 'serve --bg --tcp 443 tcp://127.0.0.1:8446' "$PB/ts.log" && ok "publish on serves the network the ENTRY POINT's port only (not the front door)" || bad "tailscale serve" "$(cat "$PB/ts.log" 2>/dev/null)"
 case "$(pb "$CLI" publish status 2>&1)" in *"https://mac-1.example.com, sign-in: Microsoft (tenant t-1), admission: invitation-only"*) ok "publish status reads the layer back" ;; *) bad "publish status" "$(pb "$CLI" publish status 2>&1)" ;; esac
 # The front door: loopback only while published, every interface otherwise (kubectl is the suite's stub).
 PF="$HERE/../share/port-forward.sh"
 pfaddr() { env PATH="$PB/stubs:$STUBS:$PATH" MEMEX_LOCAL_HOME="$PB/home/.memex-local" MEMEX_HEADLESS=1 MEMEX_PORT=8443 bash -c '
   colima() { return 0; }; kubectl() { case "$*" in *port-forward*) printf "%s\n" "$*" ;; *) return 0 ;; esac; }; export -f colima kubectl
-  sed "s#^\( *\)exec kubectl#\1kubectl#; s#^exec kubectl#kubectl#" "$1" | bash | grep -m1 port-forward' _ "$PF" 2>/dev/null | grep -o -- '--address .*'; }
+  sed "s#^\( *\)exec kubectl#\1kubectl#; s#^exec kubectl#kubectl#" "$1" | bash 2>/dev/null | grep port-forward | grep -v memex-network-entry | head -n 1' _ "$PF" 2>/dev/null | grep -o -- '--address .*'; }
 [ "$(pfaddr)" = "--address 127.0.0.1,::1 8443:443" ] && ok "published: the front door binds loopback only, on the unprivileged port alone" || bad "published front door" "$(pfaddr)"
+E="$PB/home/.memex-local/network-entry.yaml"
+grep -q 'header_up X-MeshWeaver-Provenance tailnet' "$E" && grep -q 'https://mac-1.example.com:8443 {' "$E" && ! grep -q '__HOST__' "$E" \
+  && ok "the entry point marks every request and serves the public name only" || bad "network entry manifest" "$(head -40 "$E" 2>/dev/null)"
+grep -q 'svc/memex-network-entry' "$PF" && grep -q -- '"${entry_port}:8443"' "$PF" && ok "published: the entry point has its own loopback forward" || bad "entry forward" "missing in port-forward.sh"
+# The entry port may not collide with the front door or the e2e portal (traffic there carries no mark).
+OUT="$(printf 's3cret' | env MEMEX_ENTRY_PORT=8444 PATH="$PB/stubs:$STUBS:$PATH" HOME="$PB/home" MEMEX_LOCAL_HOME="$PB/home/.memex-local" "$CLI" publish on --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "publish refuses an entry port on the e2e port" "exited 0" ;; *"collides with port 8444"*) ok "publish refuses an entry port that collides with the e2e portal's" ;; *) bad "entry port collision" "$OUT" ;; esac
+OUT="$(printf 's3cret' | env MEMEX_ENTRY_PORT=8443 PATH="$PB/stubs:$STUBS:$PATH" HOME="$PB/home" MEMEX_LOCAL_HOME="$PB/home/.memex-local" "$CLI" publish on --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "publish refuses the front door's port" "exited 0" ;; *"collides with port 8443"*) ok "publish refuses an entry port that collides with the front door's" ;; *) bad "front-door collision" "$OUT" ;; esac
+grep -q 'collides' /dev/null; [ -f "$LAYER" ] && grep -q 'mac-1.example.com' "$LAYER" && ok "(the layer from the earlier publish is untouched by the refusals)" || true
+# Stopping the published forward stops BOTH forwards and the entry retry loop (no orphan holds a port).
+# kubectl/colima are exported FUNCTIONS: the script prepends /opt/homebrew/bin to PATH, so a PATH stub
+# would lose to a real kubectl.
+SUP="$(mktemp -d "${TMPDIR:-/tmp}/pfsup.XXXXXX")"; mkdir -p "$SUP/home/.memex-local"; : > "$SUP/home/.memex-local/publish.yaml"
+env MEMEX_LOCAL_HOME="$SUP/home/.memex-local" MEMEX_HEADLESS=1 MEMEX_PORT=8443 bash -c '
+  colima() { return 0; }; kubectl() { case "$*" in *port-forward*) exec sleep 307 ;; *) return 0 ;; esac; }; export -f colima kubectl
+  exec bash "$1"' _ "$PF" >/dev/null 2>&1 &
+SPID=$!; sleep 2
+kids_before=$(pgrep -f "sleep 307" | wc -l | tr -d ' ')
+kill -TERM "$SPID"; wait "$SPID" 2>/dev/null; sleep 1
+kids_after=$(pgrep -f "sleep 307" | wc -l | tr -d ' ')
+[ "$kids_before" -ge 2 ] && [ "$kids_after" = 0 ] && ok "stopping the published forward stops both forwards (${kids_before} → 0)" || bad "supervisor stops both forwards" "before=$kids_before after=$kids_after"
 grep -q '<key>MEMEX_LOCAL_HOME</key>' "$HERE/../share/com.memex.local.plist" && grep -q -- '-e "s|__LOCAL_HOME__|${LOCAL_HOME}|g"' "$CLI" \
   && ok "the LaunchAgent carries the state directory the forward reads publish.yaml from" || bad "MEMEX_LOCAL_HOME reaches the LaunchAgent" "plist or sed missing"
 pb "$CLI" publish off >/dev/null 2>&1
