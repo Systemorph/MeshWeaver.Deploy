@@ -20,15 +20,21 @@ buildHosts:
   rolloutStrategy: "Recreate"
   nodeSelector: null
   tolerations: null
+  # Sized for a 16 CPU / 100 GiB-memory / 300 GiB-disk build VM (the first Mac's `build` profile, 2026-11-07): up to four
+  # 4-CPU replicas. The CPU REQUEST sits half a core under the limit, as `memex-local buildhost plan` sizes it: k3s, KEDA
+  # and the kubelet request CPU too, and four replicas requesting all 16 cores would leave the fourth Pending at peak
+  # (first-attach.sh checks floor AND peak against what the node has left).
   resources:
-    requests: { cpu: "4", memory: 8Gi }
-    limits: { cpu: "6", memory: 12Gi }
-  workSizeLimit: 12Gi
-  # Fan-out within the VM: 2 stages of a `parallel` run at once (3 CPU / 6 GiB each of the 6 CPU / 12 GiB limit); the
-  # chart default (8) would exceed the Mac's cgroup, and the runner refuses to start on that.
-  stageSlots: 2
+    requests: { cpu: "3500m", memory: 20Gi }
+    limits: { cpu: "4", memory: 24Gi }
+  # A modules stage writes past 12 GiB (measured on the first Mac, 2026-11-07: "Usage of EmptyDir volume work exceeds the
+  # limit 12Gi" evicted the replica mid-run). 40 GiB each: 4 replicas + the 20 GiB cache + the images fit a 300 GiB VM disk.
+  workSizeLimit: 40Gi
+  # Fan-out within a replica: 4 stages of a `parallel` run at once within its 4 CPU / 24 GiB limit; the chart default (8)
+  # would exceed the replica's cgroup, and the runner refuses to start on that.
+  stageSlots: 4
   cacheClaimName: "build-cache-mac"
-  # The Mac's only class is node-local; one replica owns the cache.
+  # The Mac's only class is node-local; the replicas share it on the one node (ReadWriteOnce is per node).
   cache: {create: true, storageClass: "local-path", size: "20Gi", accessMode: "ReadWriteOnce"}
   # bwrap needs a fresh /proc per stage, which only an Unmasked /proc allows, and Kubernetes grants that only to a pod in
   # its own user namespace (hostUsers: false) — hence the dedicated containerd profile first-attach.sh checks for.
@@ -47,8 +53,8 @@ buildHosts:
   extraChannels: ["mac"]
   mac:
     enabled: true
-    maxReplicas: 1
+    maxReplicas: 4
     # A STANDING replica (the declared floor): the Mac is offered always-on, and its one replica must not depend on the
     # anonymous queue count answering — while `GET /api/builds/queue` answers 503 KEDA keeps the CURRENT replica count, so
     # a floor of 0 left the host at zero and a routed `mac` run waited forever (the first Mac's attach, 2026-11-07).
-    minReplicas: 1
+    minReplicas: 2
