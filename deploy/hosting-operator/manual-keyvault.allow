@@ -23,6 +23,7 @@ bin/hosting-kv-copy  — TRANSITIONAL: copyFrom reads the source value to write 
 bin/hosting-kv-rotate  — TRANSITIONAL: reads the vaulted registry key to compare before rotating
 bin/hosting-registry-register  — TRANSITIONAL: reads the held instance key and the bootstrap key to call the registry
 bin/hosting-registry-coupon  — TRANSITIONAL: reads the registry's coupon-mint credential to call the registry; writes the minted coupon through --file, existence checked with `list`
+bin/hosting-tailnet-key  — writes the minted single-use Headscale pre-auth key through a mode-600 --file, tagged with metadata only; confirms by list-versions, no value read
 bin/hosting-signin-app  — writes the minted Entra client secret through --file; existence is checked with `list`, no value read
 bin/hosting-image-mirror  — TRANSITIONAL: reads the registry publisher password to push the mirror
 bin/hosting-pull-secret  — TRANSITIONAL: reads the registry pull key to render the image pull Secret
