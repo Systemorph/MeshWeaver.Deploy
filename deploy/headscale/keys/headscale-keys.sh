@@ -68,9 +68,13 @@ declaration_of() { jq -c '{user, reusable: (.reusable // false), ephemeral: (.ep
 
 # Expire one key and confirm headscale no longer accepts it (an already expired or deleted key is done).
 revoke() {
-  local id="$1" now; now=$(date +%s)
+  local id="$1" now
   case "$id" in ''|*[!0-9]*) return 0 ;; esac
   hs preauthkeys expire -i "$id" >/dev/null 2>&1
+  # "now" is read AFTER the expiry, plus a second: headscale stamps the expiry with its own clock, which
+  # can be a fraction of a second past a "now" taken before the call (measured: a CI pass read a key it
+  # had just expired as still valid).
+  now=$(( $(date +%s) + 1 ))
   [ "$(hs preauthkeys list -o json 2>/dev/null | jq -r --argjson id "$id" --argjson now "$now" \
         '[.[]? | select(.id == $id)][0] | if . == null then "done" elif (.expiration.seconds // 0) <= $now then "done" else "valid" end')" = done ]
 }

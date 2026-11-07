@@ -91,13 +91,33 @@ if [ -f "${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/publish.yaml" ]; then
   # tailscale serve forwards the network's TCP 443 here, and the proxy behind it marks every request.
   # Held in a restart loop beside the front door; the front door is the process launchd watches.
   entry_port="${MEMEX_ENTRY_PORT:-8444}"
-  ( while true; do
+  # This script stays the SUPERVISOR (no exec): launchd's KeepAlive and the headless PF_PID both track
+  # this process, and stopping it must stop BOTH forwards — the entry loop, its active kubectl, and the
+  # front door — so a restart never leaves an old process holding a port or a second retry loop.
+  ( trap 'kill "$child" 2>/dev/null; exit 0' TERM INT
+    while true; do
       kubectl --context "$KUBE_CONTEXT" port-forward -n "${MEMEX_NAMESPACE:-memex}" svc/memex-network-entry \
-        --address 127.0.0.1,::1 "${entry_port}:8443"
+        --address 127.0.0.1,::1 "${entry_port}:8443" &
+      child=$!
+      wait "$child"
       sleep 5
     done ) &
-  exec kubectl --context "$KUBE_CONTEXT" port-forward -n ingress-nginx svc/ingress-nginx-controller \
-      --address 127.0.0.1,::1 "${HOST_PORT}:443"
+  entry_loop=$!
+  kubectl --context "$KUBE_CONTEXT" port-forward -n ingress-nginx svc/ingress-nginx-controller \
+      --address 127.0.0.1,::1 "${HOST_PORT}:443" &
+  front_door=$!
+  stop_both() {
+    kill "$front_door" 2>/dev/null
+    kill "$entry_loop" 2>/dev/null   # its trap stops its active kubectl
+    wait "$front_door" "$entry_loop" 2>/dev/null
+    command -v tools_deactivate >/dev/null 2>&1 && tools_deactivate
+  }
+  trap 'stop_both; exit 0' TERM INT
+  trap stop_both EXIT
+  # The front door is what this agent is for: when it ends, the entry forward ends with it, and the
+  # non-zero exit lets launchd (or the headless daemon) start both again.
+  wait "$front_door"
+  exit 1
 fi
 exec kubectl --context "$KUBE_CONTEXT" port-forward -n ingress-nginx svc/ingress-nginx-controller \
     --address 0.0.0.0,:: 80:80 443:443 "${HOST_PORT}:443"

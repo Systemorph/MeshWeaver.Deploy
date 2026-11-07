@@ -1290,12 +1290,24 @@ case "$(pb "$CLI" publish status 2>&1)" in *"https://mac-1.example.com, sign-in:
 PF="$HERE/../share/port-forward.sh"
 pfaddr() { env PATH="$PB/stubs:$STUBS:$PATH" MEMEX_LOCAL_HOME="$PB/home/.memex-local" MEMEX_HEADLESS=1 MEMEX_PORT=8443 bash -c '
   colima() { return 0; }; kubectl() { case "$*" in *port-forward*) printf "%s\n" "$*" ;; *) return 0 ;; esac; }; export -f colima kubectl
-  sed "s#^\( *\)exec kubectl#\1kubectl#; s#^exec kubectl#kubectl#" "$1" | bash | grep -m1 port-forward' _ "$PF" 2>/dev/null | grep -o -- '--address .*'; }
+  sed "s#^\( *\)exec kubectl#\1kubectl#; s#^exec kubectl#kubectl#" "$1" | bash 2>/dev/null | grep port-forward | grep -v memex-network-entry | head -n 1' _ "$PF" 2>/dev/null | grep -o -- '--address .*'; }
 [ "$(pfaddr)" = "--address 127.0.0.1,::1 8443:443" ] && ok "published: the front door binds loopback only, on the unprivileged port alone" || bad "published front door" "$(pfaddr)"
 E="$PB/home/.memex-local/network-entry.yaml"
 grep -q 'header_up X-MeshWeaver-Provenance tailnet' "$E" && grep -q 'https://mac-1.example.com:8443 {' "$E" && ! grep -q '__HOST__' "$E" \
   && ok "the entry point marks every request and serves the public name only" || bad "network entry manifest" "$(head -40 "$E" 2>/dev/null)"
 grep -q 'svc/memex-network-entry' "$PF" && grep -q -- '"${entry_port}:8443"' "$PF" && ok "published: the entry point has its own loopback forward" || bad "entry forward" "missing in port-forward.sh"
+# Stopping the published forward stops BOTH forwards and the entry retry loop (no orphan holds a port).
+# kubectl/colima are exported FUNCTIONS: the script prepends /opt/homebrew/bin to PATH, so a PATH stub
+# would lose to a real kubectl.
+SUP="$(mktemp -d "${TMPDIR:-/tmp}/pfsup.XXXXXX")"; mkdir -p "$SUP/home/.memex-local"; : > "$SUP/home/.memex-local/publish.yaml"
+env MEMEX_LOCAL_HOME="$SUP/home/.memex-local" MEMEX_HEADLESS=1 MEMEX_PORT=8443 bash -c '
+  colima() { return 0; }; kubectl() { case "$*" in *port-forward*) exec sleep 307 ;; *) return 0 ;; esac; }; export -f colima kubectl
+  exec bash "$1"' _ "$PF" >/dev/null 2>&1 &
+SPID=$!; sleep 2
+kids_before=$(pgrep -f "sleep 307" | wc -l | tr -d ' ')
+kill -TERM "$SPID"; wait "$SPID" 2>/dev/null; sleep 1
+kids_after=$(pgrep -f "sleep 307" | wc -l | tr -d ' ')
+[ "$kids_before" -ge 2 ] && [ "$kids_after" = 0 ] && ok "stopping the published forward stops both forwards (${kids_before} → 0)" || bad "supervisor stops both forwards" "before=$kids_before after=$kids_after"
 grep -q '<key>MEMEX_LOCAL_HOME</key>' "$HERE/../share/com.memex.local.plist" && grep -q -- '-e "s|__LOCAL_HOME__|${LOCAL_HOME}|g"' "$CLI" \
   && ok "the LaunchAgent carries the state directory the forward reads publish.yaml from" || bad "MEMEX_LOCAL_HOME reaches the LaunchAgent" "plist or sed missing"
 pb "$CLI" publish off >/dev/null 2>&1
