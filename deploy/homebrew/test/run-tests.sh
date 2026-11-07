@@ -1059,8 +1059,101 @@ grep -q 'image_pull_ghcr() {' "$CLI" && ! awk '/^image_pull_ghcr\(\) \{/,/^}$/' 
   && ok "image_pull_ghcr exists and calls no az" || bad "image_pull_ghcr without az" "$(awk '/^image_pull_ghcr\(\) \{/,/^}$/' "$CLI")"
 awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI" | grep -q 'install_ollama_agent' && ! awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI" | grep -q 'nohup ollama' \
   && ok "setup_ollama starts Ollama under launchd, not as a nohup'd process" || bad "setup_ollama under launchd" "still nohup or no agent"
-grep -q '<key>OLLAMA_HOST</key><string>0.0.0.0:11434</string>' "$CLI" && grep -q '<key>KeepAlive</key><true/>' "$CLI" \
-  && ok "the Ollama agent binds every interface (the VM reaches it) and is kept alive" || bad "ollama agent plist" "missing OLLAMA_HOST or KeepAlive"
+grep -q '<key>OLLAMA_HOST</key><string>${1:-127.0.0.1}:11434</string>' "$CLI" && grep -q '<key>KeepAlive</key><true/>' "$CLI" \
+  && grep -q 'install_ollama_agent 127.0.0.1' <<<"$(awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI")" \
+  && ok "the Ollama agent binds the Mac's LOOPBACK by default (unauthenticated: never LAN-wide by default) and is kept alive" || bad "ollama agent plist" "bind or KeepAlive"
+# ollama_vm_reach: proven from inside the VM; LAN-wide only as a loud fallback, refusable.
+OV="$(mktemp -d)"; mkdir -p "$OV/stubs" "$OV/home/Library/LaunchAgents" "$OV/home/.memex-local"
+cat > "$OV/stubs/colima" <<STUB
+#!/bin/bash
+case "\$*" in status*) exit 0 ;; *"ip route"*) echo "default via 192.168.5.2 dev eth0" ;; *"curl"*) exit "\${FAKE_VM_REACH_RC:-0}" ;; esac
+exit 0
+STUB
+cat > "$OV/stubs/launchctl" <<STUB
+#!/bin/bash
+echo "\$@" >> "$OV/lc.log"; exit 0
+STUB
+cat > "$OV/stubs/ollama" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+chmod +x "$OV/stubs/"*
+ovr() { env PATH="$OV/stubs:$STUBS:$PATH" HOME="$OV/home" MEMEX_LOCAL_HOME="$OV/home/.memex-local" MEMEX_LOCAL_LIB=1 "$@"; }
+OUT="$(ovr bash -c '. "$0"; ollama_vm_reach' "$CLI" 2>&1)"
+case "$OUT" in *"reaches Ollama at 192.168.5.2:11434"*) ok "ollama_vm_reach proves the VM reaches the loopback Ollama from INSIDE the VM" ;; *) bad "vm reach ok" "$OUT" ;; esac
+touch "$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist"
+OUT="$(ovr env FAKE_VM_REACH_RC=7 bash -c '. "$0"; ollama_vm_reach' "$CLI" 2>&1)"
+P="$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist"
+case "$OUT" in *"EVERY interface"*) grep -q '<string>0.0.0.0:11434</string>' "$P" && ok "unreachable on loopback: the agent moves to every interface, LOUDLY" || bad "lan fallback plist" "$(cat "$P")" ;; *) bad "lan fallback" "$OUT" ;; esac
+rm -f "$P"; touch "$P"
+OUT="$(ovr env FAKE_VM_REACH_RC=7 MEMEX_OLLAMA_ALLOW_LAN=0 bash -c '. "$0"; ollama_vm_reach' "$CLI" 2>&1)"
+case "$OUT" in *"refuses a LAN-wide bind"*) [ ! -s "$P" ] && ok "MEMEX_OLLAMA_ALLOW_LAN=0 refuses the LAN-wide bind (and says the portal has no model)" || bad "allow lan 0 wrote" "$(cat "$P")" ;; *) bad "allow lan 0" "$OUT" ;; esac
+lsof_says() { printf '%s\n' "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME" "ollama 1 u 3u IPv4 0 0t0 TCP $1 (LISTEN)" > "$OV/lsof.out"; }
+cat > "$OV/stubs/lsof" <<STUB
+#!/bin/bash
+cat "$OV/lsof.out" 2>/dev/null
+STUB
+chmod +x "$OV/stubs/lsof"
+lsof_says '127.0.0.1:11434'; ovr bash -c '. "$0"; ollama_listens_lan' "$CLI" && bad "loopback listener read as LAN" "" || ok "an Ollama on 127.0.0.1 is read as loopback-only"
+lsof_says '*:11434'; ovr bash -c '. "$0"; ollama_listens_lan' "$CLI" && ok "an Ollama on every interface (*:11434) is read as LAN-reachable" || bad "*:11434 not LAN" ""
+: > "$OV/lsof.out"; ovr bash -c '. "$0"; ollama_listens_lan' "$CLI" && bad "no listener read as LAN" "" || ok "no listener is not LAN-reachable"
+SO="$(awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI")"
+grep -q 'if ollama_listens_lan; then' <<<"$SO" && grep -q 'rebinding it to 127.0.0.1' <<<"$SO" && grep -q 'NOT run by memex-local' <<<"$SO" && grep -q 'ollama_vm_reach || true' <<<"$SO" \
+  && ok "an ALREADY running Ollama is checked: memex-local's own is rebound to loopback, a foreign one is named (refused under ALLOW_LAN=0); a failed VM reach never aborts the join" || bad "existing ollama migration" "$SO"
+# setup_ollama end to end against an ALREADY running Ollama (curl answers) with a foreign LAN listener:
+# warned and carried on by default (never an errexit abort), refused under MEMEX_OLLAMA_ALLOW_LAN=0;
+# and memex-local's own agent is rebound, then RE-CHECKED (a foreign process may still hold the port).
+cat > "$OV/stubs/curl" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+chmod +x "$OV/stubs/curl"
+lsof_says '*:11434'; rm -f "$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist"
+OUT="$(ovr env MEMEX_OLLAMA_MODEL=none bash -c 'set -euo pipefail; . "$0"; setup_ollama; echo SETUP_DONE' "$CLI" 2>&1)"
+case "$OUT" in *"NOT run by memex-local"*SETUP_DONE*) ok "a foreign LAN Ollama is named and the setup carries on (no errexit abort)" ;; *) bad "foreign ollama default" "$OUT" ;; esac
+OUT="$(ovr env MEMEX_OLLAMA_MODEL=none MEMEX_OLLAMA_ALLOW_LAN=0 bash -c 'set -euo pipefail; . "$0"; setup_ollama; echo SETUP_DONE' "$CLI" 2>&1)"
+case "$OUT" in *SETUP_DONE*) bad "ALLOW_LAN=0 continued past a foreign LAN Ollama" "$OUT" ;; *"refuses to continue"*) ok "MEMEX_OLLAMA_ALLOW_LAN=0 refuses to continue with a foreign LAN Ollama" ;; *) bad "allow lan 0 foreign" "$OUT" ;; esac
+touch "$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist"
+OUT="$(ovr env MEMEX_OLLAMA_MODEL=none bash -c 'set -euo pipefail; . "$0"; setup_ollama; echo SETUP_DONE' "$CLI" 2>&1)"
+case "$OUT" in *"rebinding it to 127.0.0.1"*"NOT run by memex-local"*SETUP_DONE*) grep -q '<string>127.0.0.1:11434</string>' "$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist" && ok "memex-local's own agent is rebound to loopback, then the port is RE-CHECKED (a listener still beyond loopback is named)" || bad "rebind plist" "" ;; *) bad "rebind then recheck" "$OUT" ;; esac
+rm -rf "$OV"
+FJ0="$(awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI")"
+grep -q '( cmd_observability ) || warn' <<<"$FJ0" && ok "a failing observability install fails its own step loudly, never the whole join" || bad "observability subshell" ""
+# The emptyDir Loki of an earlier install is migrated ONCE (immutable volumeClaimTemplates); a
+# persistent one, or none, is left alone. kubectl is pinned to the local cluster.
+OM="$(mktemp -d)"; mkdir -p "$OM/stubs"
+cat > "$OM/stubs/kubectl" <<STUB
+#!/bin/bash
+echo "\$@" >> "$OM/k.log"
+case "\$*" in
+  *"get statefulset loki -o jsonpath"*) printf '%s' "\${FAKE_TEMPLATES:-}"; exit "\${FAKE_READ_RC:-0}" ;;
+  *"get statefulset loki"*) exit "\${FAKE_STS_RC:-0}" ;;
+esac
+exit 0
+STUB
+chmod +x "$OM/stubs/kubectl"
+om() { env PATH="$OM/stubs:$STUBS:$PATH" HOME="$OM" MEMEX_LOCAL_HOME="$OM/.memex-local" MEMEX_LOCAL_LIB=1 "$@"; }
+OUT="$(om bash -c 'set -euo pipefail; . "$0"; observability_migrate_loki; echo DONE' "$CLI" 2>&1)"
+grep -q -- '--context colima -n monitoring delete statefulset loki' "$OM/k.log" && case "$OUT" in *"discarded"*DONE*) true ;; *) false ;; esac \
+  && ok "an emptyDir Loki is recreated once, announced (its logs are discarded), on the LOCAL cluster" || bad "loki migration" "$OUT / $(cat "$OM/k.log")"
+: > "$OM/k.log"; om env FAKE_TEMPLATES=storage bash -c 'set -euo pipefail; . "$0"; observability_migrate_loki' "$CLI" >/dev/null 2>&1
+! grep -q 'delete' "$OM/k.log" && ok "a Loki that already has its claim template is left alone" || bad "persistent loki deleted" "$(cat "$OM/k.log")"
+: > "$OM/k.log"; om env FAKE_STS_RC=1 bash -c 'set -euo pipefail; . "$0"; observability_migrate_loki' "$CLI" >/dev/null 2>&1
+! grep -q 'delete' "$OM/k.log" && ok "no Loki yet: nothing to migrate" || bad "no loki deleted" "$(cat "$OM/k.log")"
+: > "$OM/k.log"; om env FAKE_READ_RC=1 bash -c 'set -euo pipefail; . "$0"; observability_migrate_loki' "$CLI" >/dev/null 2>&1
+! grep -q 'delete' "$OM/k.log" && ok "a FAILED read of the claim templates deletes nothing (it is not 'no template')" || bad "failed read deleted" "$(cat "$OM/k.log")"
+rm -rf "$OM"
+grep -q 'helm --kube-context "${MEMEX_KUBE_CONTEXT:-colima}" upgrade --install loki grafana/loki-stack' "$CLI" && ok "the observability release is pinned to the local cluster's context, like the migration" || bad "observability helm context" ""
+grep -q 'storage.tsdb.retention.size: 6GB' "$HERE/../share/values.observability.yaml" && grep -q 'persistentVolume: { size: 8Gi }' "$HERE/../share/values.observability.yaml" \
+  && ok "Prometheus is capped by SIZE too (6 GB on the chart's 8Gi volume — an existing PVC is never asked to grow)" || bad "prometheus size cap" ""
+# Observability: sized values, layered by the command; fleet join installs it by default.
+OBS="$HERE/../share/values.observability.yaml"
+grep -q 'retention: 7d' "$OBS" && grep -q 'retention_period: 168h' "$OBS" && grep -q 'alertmanager: { enabled: false }' "$OBS" && [ "$(grep -c 'limits: { memory:' "$OBS")" = 4 ] \
+  && ok "observability is sized for the VM: memory limits on all four, 7 days of logs and metrics, no alertmanager" || bad "observability sizing" "$(cat "$OBS")"
+OB="$(awk '/^cmd_observability\(\) \{/,/^}$/' "$CLI")"; grep -q 'values.observability.yaml' <<<"$OB" && ok "memex-local observability layers the sized values" || bad "observability values layer" "missing"
+FJ="$(awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI")"
+grep -q 'with_obs="yes"' <<<"$FJ" && grep -q 'cmd_observability' <<<"$FJ" && grep -q -- '--no-observability) with_obs="no"' <<<"$FJ" \
+  && ok "fleet join installs observability by default (--no-observability skips it)" || bad "fleet join observability" "missing"
 
 echo "── headless host: install_launchd holds the forward as a process, no LaunchAgent ──"
 HL="$(mktemp -d)"; mkdir -p "$HL/stubs" "$HL/home"
@@ -1542,10 +1635,81 @@ inn "$CLI" internal off >/dev/null 2>&1
 [ ! -f "$IL" ] && grep -q -- 'serve --tcp 443 off' "$IN/ts.log" && ok "internal off removes the layer and the tailscale serve" || bad "internal off" "$(cat "$IN/ts.log")"
 rm -rf "$IN"
 
+echo "── buildhost: build runners sized from the host, KEDA, no helm by hand ──"
+lib() { env MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c 'set -euo pipefail; . "$0"; shift; "$@"' "$CLI" _ "$@"; }
+P="$(lib buildhost_plan 18 128 8 16 0)"
+[ "$P" = "$(printf 'vm_cpu=16\nvm_mem=104\nrunners_min=1\nrunners_max=4\nrunner_cpu=4\nrunner_cpu_request=3500m\nrunner_mem_request=20\nrunner_mem_limit=24\nstage_slots=4\nstage_total=16')" ] \
+  && ok "an 18-core / 128 GiB Mac: build VM 16 CPU / 104 GiB, runners 1…4 × 4 CPU (request 3.5: system pods fit), 20–24 GiB, 4 stage slots = 16 stage containers" || bad "plan 18/128" "$P"
+P="$(lib buildhost_plan 18 128 8 16 23)"
+grep -q '^vm_mem=81$' <<<"$P" && grep -q '^runner_mem_limit=19$' <<<"$P" && grep -q '^runner_mem_request=15$' <<<"$P" \
+  && ok "the largest local model's memory is kept out of the build VM (23 GiB model → 81 GiB VM, 19 GiB runners)" || bad "plan with model" "$P"
+P="$(lib buildhost_plan 12 36 4 8 0)"
+grep -q '^runners_max=2$' <<<"$P" && grep -q '^runner_mem_limit=8$' <<<"$P" && ok "a smaller Mac gets fewer runners (12 cores → 2), never an over-committed one" || bad "plan small" "$P"
+P="$(lib buildhost_plan 5 64 4 8 0 2>&1)" && bad "a 5-core host is refused" "$P" || { grep -q 'at least 6' <<<"$P" && ok "a host without room for one runner is refused, with the reason" || bad "few cores reason" "$P"; }
+P="$(lib buildhost_plan 18 32 8 16 0 2>&1)" && bad "a memory-starved host is refused" "$P" || { grep -q 'needs at least 8 GiB' <<<"$P" && ok "a host without memory for one runner is refused, with the arithmetic" || bad "low memory reason" "$P"; }
+P="$(env MEMEX_BUILD_MIN_WARM=9 MEMEX_LOCAL_LIB=1 bash -c '. "$0"; buildhost_plan 18 128 8 16 0' "$CLI")"
+grep -q '^runners_min=4$' <<<"$P" && ok "the warm floor never exceeds the ceiling" || bad "min clamp" "$P"
+M="$(env MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c '. "$0"; ollama() { printf "%s\n" "NAME ID SIZE MODIFIED" "qwen3.6:latest abc 23.4 GB 2 days ago" "qwen2.5:0.5b def 397 MB 3 days ago"; }; largest_model_gib' "$CLI")"
+[ "$M" = 24 ] && ok "the largest model's size is read from 'ollama list' and rounded UP (23.4 GB → 24)" || bad "largest model" "$M"
+# apply against recording stubs: a missing VM is created at the plan; an installed release is sized; never the portal's context.
+BH="$(mktemp -d)"; mkdir -p "$BH/stubs"
+for t in colima helm kubectl; do cat > "$BH/stubs/$t" <<STUB
+#!/bin/bash
+# Version probes (the toolchain resolver's floor check) are answered at the manifest's version; nothing reaches a real binary.
+case "\$*" in *version*) case "$t" in colima) echo "colima version 0.10.3" ;; kubectl) echo "Client Version: v1.37.1" ;; helm) echo "v4.3.1+gabc" ;; esac; exit 0 ;; esac
+echo "$t \$*" >> "$BH/log"
+case "$t \$*" in
+  "colima list"*) printf '%s' "\${FAKE_COLIMA_LIST:-}" ;;
+  "helm "*" status build-host-mac"*) exit "\${FAKE_RELEASE_RC:-1}" ;;
+esac
+exit 0
+STUB
+done; chmod +x "$BH/stubs/"*
+# PATH holds the stubs and the system directories ONLY (no Homebrew), and MEMEX_PREFIX names an empty
+# prefix: the resolver can find no real colima, helm or kubectl — a test must never start a VM.
+mkdir -p "$BH/prefix"
+bh() { env PATH="$BH/stubs:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" MEMEX_PREFIX="$BH/prefix" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
+OUT="$(bh "$CLI" buildhost apply 2>&1)"
+grep -q 'colima start -p build --cpu 16 --memory 104 --disk 100 --runtime containerd --kubernetes' "$BH/log" && grep -q 'kubectl --context colima-build get crd scaledobjects.keda.sh' "$BH/log" \
+  && case "$OUT" in *"first attach installs it"*) true ;; *) false ;; esac \
+  && ok "apply creates the build VM at the plan (containerd, k3s), checks KEDA in colima-build, and names the first attach for a missing release" || bad "apply create" "$OUT / $(cat "$BH/log")"
+: > "$BH/log"
+OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
+grep -q 'helm --kube-context colima-build -n build-mac upgrade build-host-mac .* --reuse-values --set buildHosts.mac.minReplicas=1 --set buildHosts.mac.maxReplicas=4 --set-string buildHosts.resources.requests.cpu=3500m --set-string buildHosts.resources.requests.memory=20Gi --set-string buildHosts.resources.limits.cpu=4 --set-string buildHosts.resources.limits.memory=24Gi --set buildHosts.stageSlots=4' "$BH/log" \
+  && ! grep -q 'colima start\|colima stop' "$BH/log" \
+  && ok "an installed release is sized in place (--reuse-values, its own context); a VM that covers the plan is not restarted" || bad "apply size" "$OUT / $(cat "$BH/log")"
+: > "$BH/log"
+OUT="$(bh FAKE_COLIMA_LIST=$'{"name":"default","cpus":8,"memory":17179869184}\n{"name":"build","status":"Running","cpus":8,"memory":25769803776}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
+! grep -q 'colima stop' "$BH/log" && grep -q 'maxReplicas=2 ' "$BH/log" && case "$OUT" in *"apply --resize"*) true ;; *) false ;; esac \
+  && ok "a smaller VM is NOT restarted without --resize: the runners are sized to what it has, and the resize is named" || bad "apply no resize" "$OUT / $(cat "$BH/log")"
+: > "$BH/log"
+bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":8,"memory":25769803776}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize >/dev/null 2>&1
+grep -q 'colima stop -p build' "$BH/log" && grep -q 'colima start -p build --cpu 16 --memory 104' "$BH/log" && grep -q 'maxReplicas=4 ' "$BH/log" \
+  && ok "--resize restarts the build VM at the plan and sizes the runners to it" || bad "apply resize" "$(cat "$BH/log")"
+: > "$BH/log"
+bh FAKE_COLIMA_LIST='{"name":"build","status":"Stopped","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply >/dev/null 2>&1
+grep -q '^colima start -p build$' "$BH/log" && grep -q 'upgrade build-host-mac' "$BH/log" && ok "a STOPPED build VM is started before its release is sized (never a helm call against a stopped cluster)" || bad "stopped vm" "$(cat "$BH/log")"
+grep -q 'kubectl --context colima-build -n keda wait --for=condition=Available deployment --all' "$BH/log" && ok "KEDA is checked for Available deployments, not only its CRD" || bad "keda health" "$(cat "$BH/log")"
+OUT="$(bh MEMEX_HOST_MEM_GIB=abc "$CLI" buildhost plan 2>&1)" && bad "a non-numeric probe was used" "$OUT" || { case "$OUT" in *"instead of a whole number"*) ok "a host probe that is not a whole number stops the plan (never sized from 0)" ;; *) bad "probe validation" "$OUT" ;; esac; }
+rm -rf "$BH"
+FJB="$(awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI")"
+grep -q '( cmd_buildhost apply ) || warn' <<<"$FJB" && grep -q -- '--no-buildhost) with_build="no"' <<<"$FJB" \
+  && ok "fleet join runs buildhost apply by default (--no-buildhost skips it), and a failure there never ends the join" || bad "fleet join buildhost" ""
+# back-lease: the owner DECLARES how full a leased Mac may get.
+[ "$(lib percent_arg 85 --x)" = 85 ] && [ "$(lib percent_arg 85% --x)" = 85 ] && ok "a threshold is a whole percentage (85 or 85%)" || bad "percent ok" ""
+lib percent_arg 5 --x >/dev/null 2>&1 && bad "5% accepted" "" || ok "a threshold below 10% is refused"
+lib percent_arg 99 --x >/dev/null 2>&1 && bad "99% accepted" "" || ok "a threshold above 95% is refused"
+lib percent_arg 0.7 --x >/dev/null 2>&1 && bad "0.7 accepted" "" || ok "a fraction is refused (whole percentages only)"
+BL="$(mktemp -d)"
+env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$BL" HOME="$BL" bash -c '. "$0"; write_backlease_file https://control.example.test mac-1 30 "" 85 60 90 80' "$CLI" >/dev/null 2>&1
+grep -q 'Hosting__BackLease__HostLoadMax: "85%"' "$BL/backlease.yaml" && grep -q 'Hosting__BackLease__HostMemoryMax: "60%"' "$BL/backlease.yaml" && grep -q 'Hosting__BackLease__VmCpuMax: "90%"' "$BL/backlease.yaml" && grep -q 'Hosting__BackLease__VmMemoryMax: "80%"' "$BL/backlease.yaml" \
+  && ok "the back-lease layer declares the host load/memory and VM CPU/memory ceilings for the heartbeat" || bad "backlease thresholds" "$(ls "$BL"; cat "$BL"/backlease.yaml 2>/dev/null)"
+rm -rf "$BL"
+
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
-for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease fleet llm relay publish autoupdate; do
+for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease buildhost fleet llm relay publish autoupdate; do
   case "$help_out" in
     *"$cmd"*) ;;
     *) bad "help documents '$cmd'" "not in the usage text"; continue ;;
