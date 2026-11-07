@@ -327,8 +327,8 @@ rolled in place; the **migration** is re-run as a Job (it has no Deployment).
 | §5 mkcert TLS | `mkcert -install` + mint cert + `kubectl create secret tls memex-portal-tls` | `setup_tls()` |
 | §6 Hostname | `memex.localhost` (auto-resolves), port `8443` | constants `HOSTNAME_LOCAL` / `HOST_PORT` |
 | §7 Durable access | `port-forward.sh` + `com.memex.local.plist`, `launchctl bootstrap` | `install_launchd()` (assets in `share/`) |
-| §10 Local LLM | `OLLAMA_HOST=0.0.0.0:11434 ollama serve`; `ollama pull qwen3.6`; `ollama cp … qwen3.6-code` | `setup_ollama()` + overlay `ollama.external` + `OpenAICompatible__*` |
-| §11 Observability | `helm upgrade --install loki grafana/loki-stack …` | `cmd_observability()` |
+| §10 Local LLM | `OLLAMA_HOST=127.0.0.1:11434 ollama serve` (the VM reaches it through its gateway; proven from inside the VM, LAN-wide only as a loud fallback); `ollama pull qwen3.6`; `ollama cp … qwen3.6-code` | `setup_ollama()` + overlay `ollama.external` + `OpenAICompatible__*` |
+| §11 Observability | `helm upgrade --install loki grafana/loki-stack -f share/values.observability.yaml` (sized for the VM; `fleet join` runs it) | `cmd_observability()` |
 | §12 Instance identity | `Portal__InstanceName/Color` | overlay `config.memex_portal` |
 | §14 Verify | assert the portal is USABLE — it serves, `/login` is routed, and the DefaultViews/GraphViews packs are present | `verify_usable()` (`up` / `update` / `verify`; behaviour-tested in `test/run-tests.sh`) |
 | §14 Troubleshoot (stale forward) | restart the port-forward after a rollout | `cmd_port_forward()`; `update` auto-refreshes it |

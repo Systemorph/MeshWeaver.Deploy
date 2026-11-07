@@ -1059,8 +1059,43 @@ grep -q 'image_pull_ghcr() {' "$CLI" && ! awk '/^image_pull_ghcr\(\) \{/,/^}$/' 
   && ok "image_pull_ghcr exists and calls no az" || bad "image_pull_ghcr without az" "$(awk '/^image_pull_ghcr\(\) \{/,/^}$/' "$CLI")"
 awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI" | grep -q 'install_ollama_agent' && ! awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI" | grep -q 'nohup ollama' \
   && ok "setup_ollama starts Ollama under launchd, not as a nohup'd process" || bad "setup_ollama under launchd" "still nohup or no agent"
-grep -q '<key>OLLAMA_HOST</key><string>0.0.0.0:11434</string>' "$CLI" && grep -q '<key>KeepAlive</key><true/>' "$CLI" \
-  && ok "the Ollama agent binds every interface (the VM reaches it) and is kept alive" || bad "ollama agent plist" "missing OLLAMA_HOST or KeepAlive"
+grep -q '<key>OLLAMA_HOST</key><string>${1:-127.0.0.1}:11434</string>' "$CLI" && grep -q '<key>KeepAlive</key><true/>' "$CLI" \
+  && awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI" | grep -q 'install_ollama_agent 127.0.0.1' \
+  && ok "the Ollama agent binds the Mac's LOOPBACK by default (unauthenticated: never LAN-wide by default) and is kept alive" || bad "ollama agent plist" "bind or KeepAlive"
+# ollama_vm_reach: proven from inside the VM; LAN-wide only as a loud fallback, refusable.
+OV="$(mktemp -d)"; mkdir -p "$OV/stubs" "$OV/home/Library/LaunchAgents" "$OV/home/.memex-local"
+cat > "$OV/stubs/colima" <<STUB
+#!/bin/bash
+case "\$*" in status*) exit 0 ;; *"ip route"*) echo "default via 192.168.5.2 dev eth0" ;; *"curl"*) exit "\${FAKE_VM_REACH_RC:-0}" ;; esac
+exit 0
+STUB
+cat > "$OV/stubs/launchctl" <<STUB
+#!/bin/bash
+echo "\$@" >> "$OV/lc.log"; exit 0
+STUB
+cat > "$OV/stubs/ollama" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+chmod +x "$OV/stubs/"*
+ovr() { env PATH="$OV/stubs:$STUBS:$PATH" HOME="$OV/home" MEMEX_LOCAL_HOME="$OV/home/.memex-local" MEMEX_LOCAL_LIB=1 "$@"; }
+OUT="$(ovr bash -c '. "$0"; ollama_vm_reach' "$CLI" 2>&1)"
+case "$OUT" in *"reaches Ollama at 192.168.5.2:11434"*) ok "ollama_vm_reach proves the VM reaches the loopback Ollama from INSIDE the VM" ;; *) bad "vm reach ok" "$OUT" ;; esac
+touch "$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist"
+OUT="$(ovr env FAKE_VM_REACH_RC=7 bash -c '. "$0"; ollama_vm_reach' "$CLI" 2>&1)"
+P="$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist"
+case "$OUT" in *"EVERY interface"*) grep -q '<string>0.0.0.0:11434</string>' "$P" && ok "unreachable on loopback: the agent moves to every interface, LOUDLY" || bad "lan fallback plist" "$(cat "$P")" ;; *) bad "lan fallback" "$OUT" ;; esac
+rm -f "$P"; touch "$P"
+OUT="$(ovr env FAKE_VM_REACH_RC=7 MEMEX_OLLAMA_ALLOW_LAN=0 bash -c '. "$0"; ollama_vm_reach' "$CLI" 2>&1)"
+case "$OUT" in *"refuses a LAN-wide bind"*) [ ! -s "$P" ] && ok "MEMEX_OLLAMA_ALLOW_LAN=0 refuses the LAN-wide bind (and says the portal has no model)" || bad "allow lan 0 wrote" "$(cat "$P")" ;; *) bad "allow lan 0" "$OUT" ;; esac
+rm -rf "$OV"
+# Observability: sized values, layered by the command; fleet join installs it by default.
+OBS="$HERE/../share/values.observability.yaml"
+grep -q 'retention: 7d' "$OBS" && grep -q 'retention_period: 168h' "$OBS" && grep -q 'alertmanager: { enabled: false }' "$OBS" && [ "$(grep -c 'limits: { memory:' "$OBS")" = 4 ] \
+  && ok "observability is sized for the VM: memory limits on all four, 7 days of logs and metrics, no alertmanager" || bad "observability sizing" "$(cat "$OBS")"
+awk '/^cmd_observability\(\) \{/,/^}$/' "$CLI" | grep -q 'values.observability.yaml' && ok "memex-local observability layers the sized values" || bad "observability values layer" "missing"
+awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI" | grep -q 'with_obs="yes"' && awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI" | grep -q 'cmd_observability' && awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI" | grep -q -- '--no-observability) with_obs="no"' \
+  && ok "fleet join installs observability by default (--no-observability skips it)" || bad "fleet join observability" "missing"
 
 echo "── headless host: install_launchd holds the forward as a process, no LaunchAgent ──"
 HL="$(mktemp -d)"; mkdir -p "$HL/stubs" "$HL/home"

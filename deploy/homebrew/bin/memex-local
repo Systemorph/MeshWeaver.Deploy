@@ -1393,7 +1393,7 @@ cmd_fleet() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
     join)
-      local control="" id="" open_link="yes" code_file="" do_update="yes"
+      local control="" id="" open_link="yes" code_file="" do_update="yes" with_obs="yes"
       while [ $# -gt 0 ]; do
         case "$1" in
           --control)   shift; control="${1:?--control needs the control instance URL}" ;;
@@ -1401,6 +1401,7 @@ cmd_fleet() {
           --no-open)   open_link="no" ;;
           --code-file) shift; code_file="${1:?--code-file needs a path}" ;;   # absent → print the link, exit 3 (unattended)
           --no-update) do_update="no" ;;
+          --no-observability) with_obs="no" ;;
           *) die "fleet join: unknown flag '$1'" ;;
         esac
         shift
@@ -1472,6 +1473,10 @@ cmd_fleet() {
       if [ "$do_update" = "yes" ] && colima_running; then
         setup_ollama
         cmd_update
+        if [ "$with_obs" = "yes" ]; then
+          step "Observability (Grafana, Loki, Promtail, Prometheus — sized for the VM)"
+          cmd_observability || warn "observability did not install — re-run 'memex-local observability'"
+        fi
       else
         info "Apply it: memex-local update"
       fi
@@ -1491,7 +1496,7 @@ cmd_fleet() {
         info "not joined — memex-local fleet join --control https://<control-instance> --id <id>"
       fi
       ;;
-    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] | status}" ;;
+    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] [--no-observability] | status}" ;;
   esac
 }
 
@@ -2153,7 +2158,7 @@ apply_logging() {
 # ---------------------------------------------------------------------------
 # A launchd login agent running `ollama serve` with OLLAMA_HOST=0.0.0.0:11434: it starts at login and
 # restarts on exit, which the nohup'd process it replaces never did (a rebooted Mac had no model).
-install_ollama_agent() {
+install_ollama_agent() {                 # $1 = bind address (default 127.0.0.1 — never LAN-wide unless it must be)
   local bin; bin="$(command -v ollama)" || die "ollama is not on PATH — brew install ollama"
   mkdir -p "$HOME/Library/LaunchAgents" "$LOCAL_HOME"
   cat > "$OLLAMA_PLIST_DST" <<PLIST
@@ -2163,7 +2168,7 @@ install_ollama_agent() {
 <dict>
   <key>Label</key><string>${OLLAMA_PLIST_LABEL}</string>
   <key>ProgramArguments</key><array><string>${bin}</string><string>serve</string></array>
-  <key>EnvironmentVariables</key><dict><key>OLLAMA_HOST</key><string>0.0.0.0:11434</string></dict>
+  <key>EnvironmentVariables</key><dict><key>OLLAMA_HOST</key><string>${1:-127.0.0.1}:11434</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>${LOCAL_HOME}/ollama.log</string>
@@ -2175,11 +2180,31 @@ PLIST
   launchctl bootstrap "gui/$(id -u)" "$OLLAMA_PLIST_DST"
 }
 
+# Ollama has no authentication, so it must never listen LAN-wide by default. The portal in the VM reaches
+# it at the VM's gateway (llm_host_ip), which Colima's user-mode network maps to the Mac's loopback; this
+# PROVES that from inside the VM. Only when the VM cannot reach a loopback listener does the agent move to
+# every interface, LOUDLY (MEMEX_OLLAMA_ALLOW_LAN=0 refuses that and leaves the portal without a model).
+ollama_vm_reach() {
+  colima_running || return 0
+  local ip; ip="$(llm_host_ip)"
+  if colima ssh -- curl -fsS --max-time 5 "http://${ip}:11434/api/version" >/dev/null 2>&1; then
+    ok "the VM reaches Ollama at ${ip}:11434 (the Mac's loopback — not reachable from the LAN or the private network)"
+    return 0
+  fi
+  [ -f "$OLLAMA_PLIST_DST" ] || { warn "the VM cannot reach Ollama at ${ip}:11434, and this Ollama is not memex-local's agent — bind it where the VM reaches it"; return 1; }
+  if [ "${MEMEX_OLLAMA_ALLOW_LAN:-1}" = "0" ]; then
+    warn "the VM cannot reach Ollama on the Mac's loopback, and MEMEX_OLLAMA_ALLOW_LAN=0 refuses a LAN-wide bind — the portal has no local model"
+    return 1
+  fi
+  warn "the VM cannot reach Ollama on the Mac's loopback: binding it to EVERY interface (LAN-reachable, unauthenticated) — restrict with the macOS firewall, or MEMEX_OLLAMA_ALLOW_LAN=0"
+  install_ollama_agent 0.0.0.0
+}
+
 setup_ollama() {
   step "Wiring host-native Ollama (Metal GPU) — model ${OLLAMA_MODEL} as qwen3.6-code (§10)"
   if ! curl -fsS "http://127.0.0.1:11434/api/version" >/dev/null 2>&1; then
-    info "Starting 'ollama serve' under launchd ($OLLAMA_PLIST_LABEL), bound to 0.0.0.0:11434 so the VM can reach it"
-    install_ollama_agent
+    info "Starting 'ollama serve' under launchd ($OLLAMA_PLIST_LABEL), bound to the Mac's loopback (127.0.0.1:11434)"
+    install_ollama_agent 127.0.0.1
     # Wait on readiness rather than a fixed sleep.
     local i=0
     until curl -fsS "http://127.0.0.1:11434/api/version" >/dev/null 2>&1; do
@@ -2189,6 +2214,7 @@ setup_ollama() {
   else
     info "ollama already serving on :11434"
   fi
+  ollama_vm_reach
   if [ "$OLLAMA_MODEL" = "none" ]; then
     info "MEMEX_OLLAMA_MODEL=none — not pulling a chat model; the portal's qwen3.6-code will not answer until you alias one"
   else
@@ -3839,10 +3865,11 @@ cmd_observability() {                            # §11
   fi
   helm repo add grafana https://grafana.github.io/helm-charts >/dev/null 2>&1 || true
   helm repo update grafana >/dev/null 2>&1 || helm repo update >/dev/null 2>&1 || true
+  # Sized for the shared VM (share/values.observability.yaml: requests, memory limits, 7 days).
   helm upgrade --install loki grafana/loki-stack \
     -n "$MONITORING_NS" --create-namespace \
-    --set grafana.enabled=true,prometheus.enabled=true,promtail.enabled=true \
-    --set grafana.adminPassword="$gpw" --set grafana.service.type=ClusterIP
+    -f "$(resolve_share)/values.observability.yaml" \
+    --set grafana.adminPassword="$gpw"
   ok "Observability installed. Grafana admin password: $gpw_file"
   info "View dashboards:  kubectl -n $MONITORING_NS port-forward svc/loki-grafana 3000:80"
   info "Then open http://localhost:3000  (user: admin)  — query {namespace=\"memex\"}"
@@ -3944,14 +3971,16 @@ COMMANDS:
   llm use [--model qwen3.6] [--residency Eu|Global] | status | off
                   LOCAL MODEL: the Mac own Ollama serves the portal utility tier (inbox
                   triage, reply drafts, calendar suggestions). Addressed by IP; apply with update.
-  fleet join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] | status
+  fleet join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] [--no-observability] | status
                   JOIN THIS MAC TO THE FLEET in one command (MeshWeaver.Plugins Hosting/MacStudioFleet
                   §2b): prints a link to the control instance's approval page with this Mac's key
                   fingerprint; a global administrator approves it there and the page shows an
                   enrolment code sealed to this Mac's throw-away key; paste it here. Then writes
                   ~/.memex-local/fleet.yaml (the heartbeat and announcement keys, 0600 — never
                   printed, only their sha256 fingerprints), runs backlease enroll, starts Ollama
-                  under launchd, and updates from the public GHCR. 'status' shows the fingerprints.
+                  under launchd on the Mac's loopback, updates from the public GHCR and installs
+                  the observability stack sized for the VM (--no-observability skips it).
+                  'status' shows the fingerprints.
   backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] | status | off
   internal on --tenant <id> --client-id <id> < secret | status | off
                   INTERNAL ONLY — the fleet default: the portal answers at this Mac's private-network
