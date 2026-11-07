@@ -3066,6 +3066,19 @@ cmd_logs() {
   exec kubectl logs $follow --tail="$tail" "$target" -n "$NAMESPACE"
 }
 
+# The image source `update` really uses: what its flags chose, except that INSIDE the autoupdate agent a
+# registry-mode `--skip-image` re-apply follows the public GHCR image (MacStudioFleet §2b) — unless the
+# install follows a release channel (that is ACR's, behind a sign-in), or MEMEX_AUTOUPDATE_IMAGE=0.
+autoupdate_image_source() {
+  local source="$1" channel="${2:-}"
+  if [ "$source" = "skip" ] && [ -n "${MEMEX_IN_AUTOUPDATE:-}" ] && [ "${MEMEX_AUTOUPDATE_IMAGE:-1}" != "0" ] \
+     && [ -z "$channel" ] && registry_mode; then
+    printf 'ghcr'
+  else
+    printf '%s' "$source"
+  fi
+}
+
 cmd_update() {
   local image_source="build" acr_tag="$ACR_DEFAULT_TAG" rebuild_base="" channel="$CHANNEL" verdict
   registry_mode && image_source="ghcr"             # §17 — same default as `up`: the public GHCR, anonymously
@@ -3097,8 +3110,9 @@ cmd_update() {
   # registry mode the image is the public GHCR one (anonymous, no Azure sign-in), so inside the agent the
   # re-apply follows it too: a template that needs a newer platform (a package's minMeshVersion) then
   # lands in the same pass instead of waiting for a person to run `update`. MEMEX_AUTOUPDATE_IMAGE=0 opts out.
-  if [ "$image_source" = "skip" ] && [ -n "${MEMEX_IN_AUTOUPDATE:-}" ] && [ "${MEMEX_AUTOUPDATE_IMAGE:-1}" != "0" ] && registry_mode; then
-    image_source="ghcr"
+  local chosen; chosen="$(autoupdate_image_source "$image_source" "$channel")"
+  if [ "$chosen" != "$image_source" ]; then
+    image_source="$chosen"
     info "autoupdate in registry mode: following the public GHCR image as well as the chart"
   fi
   preflight

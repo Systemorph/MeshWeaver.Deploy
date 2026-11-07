@@ -1032,10 +1032,19 @@ printf 'pluginCatalog:\n  registryUrl: "https://memex.example.test"\n' > "$FH/ho
 [ "$(fh_lib MEMEX_FLEET_HOST=0)" = "no" ] && ok "MEMEX_FLEET_HOST=0 opts out" || bad "opt-out" "$(fh_lib MEMEX_FLEET_HOST=0)"
 rm "$FH/home/.memex-local/backlease.yaml"; : > "$FH/home/.memex-local/fleet.yaml"
 [ "$(fh_lib)" = "yes" ] && ok "a joined Mac (fleet join) is a fleet host" || bad "fleet join → fleet host" "$(fh_lib)"
-# (sed, not awk: mawk on the Linux runner reads `\{` differently)
-upd_body="$(sed -n '/^cmd_update() {/,/^}$/p' "$CLI")"
-grep -q 'image_source="ghcr"' <<<"$upd_body" && grep -q 'MEMEX_IN_AUTOUPDATE' <<<"$upd_body" \
-  && ok "inside the autoupdate agent, a registry-mode update --skip-image still follows the public GHCR image" || bad "autoupdate follows GHCR" "missing in cmd_update"
+# The real decision, exercised (MEMEX_LOCAL_LIB=1 sources the functions): registry mode inside the agent
+# follows GHCR; outside the agent, outside registry mode, with a channel, or opted out, --skip-image stays.
+ais() { env HOME="$FH/home" MEMEX_LOCAL_HOME="$FH/home/.memex-local" MEMEX_LOCAL_LIB=1 "$@" bash -c ". \"$CLI\"; autoupdate_image_source \"\$0\" \"\$1\"" "$AIS_SRC" "$AIS_CH"; }
+AIS_SRC=skip AIS_CH=""
+[ "$(ais MEMEX_IN_AUTOUPDATE=1)" = "ghcr" ] && ok "inside the agent, a registry-mode --skip-image re-apply follows the public GHCR image" || bad "agent + registry → ghcr" "$(ais MEMEX_IN_AUTOUPDATE=1)"
+[ "$(ais)" = "skip" ] && ok "a person's --skip-image is honoured (outside the agent)" || bad "outside agent stays skip" "$(ais)"
+[ "$(ais MEMEX_IN_AUTOUPDATE=1 MEMEX_AUTOUPDATE_IMAGE=0)" = "skip" ] && ok "MEMEX_AUTOUPDATE_IMAGE=0 opts out" || bad "opt-out" "$(ais MEMEX_IN_AUTOUPDATE=1 MEMEX_AUTOUPDATE_IMAGE=0)"
+AIS_CH="3-latest"; [ "$(ais MEMEX_IN_AUTOUPDATE=1)" = "skip" ] && ok "an install following a release channel is not moved to GHCR" || bad "channel stays" "$(ais MEMEX_IN_AUTOUPDATE=1)"; AIS_CH=""
+AIS_SRC=build; [ "$(ais MEMEX_IN_AUTOUPDATE=1)" = "build" ] && ok "only --skip-image is affected (an explicit source is kept)" || bad "explicit source kept" "$(ais MEMEX_IN_AUTOUPDATE=1)"; AIS_SRC=skip
+rm -f "$FH/home/.memex-local/registry.yaml"
+[ "$(ais MEMEX_IN_AUTOUPDATE=1)" = "skip" ] && ok "not in registry mode: the agent's re-apply stays chart-only" || bad "self-registry stays skip" "$(ais MEMEX_IN_AUTOUPDATE=1)"
+printf 'pluginCatalog:\n  registryUrl: "https://memex.example.test"\n' > "$FH/home/.memex-local/registry.yaml"
+grep -q 'chosen="$(autoupdate_image_source "$image_source" "$channel")"' "$CLI" && ok "cmd_update applies the decision" || bad "cmd_update uses autoupdate_image_source" "missing"
 grep -q 'mode_args+=(-f "$share_dir/values.local.fleet-host.yaml")' "$CLI" && ok "helm_deploy layers the fleet-host template" || bad "helm_deploy layers fleet-host" "missing"
 rm -rf "$FH"
 
