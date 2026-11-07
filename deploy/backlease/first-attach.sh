@@ -67,7 +67,10 @@ kubectl config get-contexts "$ctx" >/dev/null 2>&1 || { echo "ERROR: no kubectl 
 k() { kubectl --context "$ctx" "$@"; }
 vm() { colima ssh -p "$profile" -- "$@"; }
 runtime="$(k get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}')"
-[[ "$runtime" == containerd://* ]] || { echo "ERROR: profile $profile runs '$runtime' — the build host needs containerd (a user-namespaced pod). Nothing was changed." >&2; exit 1; }
+# containerd 2 or newer: the chart's sandbox.userNamespace needs it (deploy/helm/values.yaml), and a 1.x runtime would
+# take the AppArmor profile and the Secrets and then fail to start the pod.
+[[ "$runtime" =~ ^containerd://v?([0-9]+)\. ]] && [ "${BASH_REMATCH[1]}" -ge 2 ] \
+  || { echo "ERROR: profile $profile runs '$runtime' — the build host needs containerd 2 or newer (a user-namespaced pod). Nothing was changed." >&2; exit 1; }
 
 # ── preconditions: everything is CHECKED before anything is changed ──────────────────────────────────────────
 echo "== 0/4 preconditions"
