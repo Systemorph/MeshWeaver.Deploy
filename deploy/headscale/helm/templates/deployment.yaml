@@ -38,9 +38,14 @@ spec:
       # headscale calls nothing in the cluster, not even the API server. The keys sidecar alone mounts a
       # token (its own projected volume below), bound to a Role over the declared Secrets only.
       automountServiceAccountToken: false
-      {{- if .Values.preauthKeys.enabled }}
-      serviceAccountName: {{ include "headscale.fullname" . }}-keys
-      {{- end }}
+      # 🚨 ALWAYS explicit, both fields. Kubernetes copies serviceAccountName into the deprecated
+      # serviceAccount field of the live pod template; an upgrade that merely OMITS serviceAccountName
+      # leaves that copy behind and the API server defaults the name back from it. Disabling preauthKeys
+      # then made every new pod reference the deleted <fullname>-keys account ("error looking up service
+      # account … not found") — so name `default` instead.
+      {{- $sa := ternary (printf "%s-keys" (include "headscale.fullname" .)) "default" .Values.preauthKeys.enabled }}
+      serviceAccountName: {{ $sa }}
+      serviceAccount: {{ $sa }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
