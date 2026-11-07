@@ -1059,8 +1059,101 @@ grep -q 'image_pull_ghcr() {' "$CLI" && ! awk '/^image_pull_ghcr\(\) \{/,/^}$/' 
   && ok "image_pull_ghcr exists and calls no az" || bad "image_pull_ghcr without az" "$(awk '/^image_pull_ghcr\(\) \{/,/^}$/' "$CLI")"
 awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI" | grep -q 'install_ollama_agent' && ! awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI" | grep -q 'nohup ollama' \
   && ok "setup_ollama starts Ollama under launchd, not as a nohup'd process" || bad "setup_ollama under launchd" "still nohup or no agent"
-grep -q '<key>OLLAMA_HOST</key><string>0.0.0.0:11434</string>' "$CLI" && grep -q '<key>KeepAlive</key><true/>' "$CLI" \
-  && ok "the Ollama agent binds every interface (the VM reaches it) and is kept alive" || bad "ollama agent plist" "missing OLLAMA_HOST or KeepAlive"
+grep -q '<key>OLLAMA_HOST</key><string>${1:-127.0.0.1}:11434</string>' "$CLI" && grep -q '<key>KeepAlive</key><true/>' "$CLI" \
+  && grep -q 'install_ollama_agent 127.0.0.1' <<<"$(awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI")" \
+  && ok "the Ollama agent binds the Mac's LOOPBACK by default (unauthenticated: never LAN-wide by default) and is kept alive" || bad "ollama agent plist" "bind or KeepAlive"
+# ollama_vm_reach: proven from inside the VM; LAN-wide only as a loud fallback, refusable.
+OV="$(mktemp -d)"; mkdir -p "$OV/stubs" "$OV/home/Library/LaunchAgents" "$OV/home/.memex-local"
+cat > "$OV/stubs/colima" <<STUB
+#!/bin/bash
+case "\$*" in status*) exit 0 ;; *"ip route"*) echo "default via 192.168.5.2 dev eth0" ;; *"curl"*) exit "\${FAKE_VM_REACH_RC:-0}" ;; esac
+exit 0
+STUB
+cat > "$OV/stubs/launchctl" <<STUB
+#!/bin/bash
+echo "\$@" >> "$OV/lc.log"; exit 0
+STUB
+cat > "$OV/stubs/ollama" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+chmod +x "$OV/stubs/"*
+ovr() { env PATH="$OV/stubs:$STUBS:$PATH" HOME="$OV/home" MEMEX_LOCAL_HOME="$OV/home/.memex-local" MEMEX_LOCAL_LIB=1 "$@"; }
+OUT="$(ovr bash -c '. "$0"; ollama_vm_reach' "$CLI" 2>&1)"
+case "$OUT" in *"reaches Ollama at 192.168.5.2:11434"*) ok "ollama_vm_reach proves the VM reaches the loopback Ollama from INSIDE the VM" ;; *) bad "vm reach ok" "$OUT" ;; esac
+touch "$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist"
+OUT="$(ovr env FAKE_VM_REACH_RC=7 bash -c '. "$0"; ollama_vm_reach' "$CLI" 2>&1)"
+P="$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist"
+case "$OUT" in *"EVERY interface"*) grep -q '<string>0.0.0.0:11434</string>' "$P" && ok "unreachable on loopback: the agent moves to every interface, LOUDLY" || bad "lan fallback plist" "$(cat "$P")" ;; *) bad "lan fallback" "$OUT" ;; esac
+rm -f "$P"; touch "$P"
+OUT="$(ovr env FAKE_VM_REACH_RC=7 MEMEX_OLLAMA_ALLOW_LAN=0 bash -c '. "$0"; ollama_vm_reach' "$CLI" 2>&1)"
+case "$OUT" in *"refuses a LAN-wide bind"*) [ ! -s "$P" ] && ok "MEMEX_OLLAMA_ALLOW_LAN=0 refuses the LAN-wide bind (and says the portal has no model)" || bad "allow lan 0 wrote" "$(cat "$P")" ;; *) bad "allow lan 0" "$OUT" ;; esac
+lsof_says() { printf '%s\n' "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME" "ollama 1 u 3u IPv4 0 0t0 TCP $1 (LISTEN)" > "$OV/lsof.out"; }
+cat > "$OV/stubs/lsof" <<STUB
+#!/bin/bash
+cat "$OV/lsof.out" 2>/dev/null
+STUB
+chmod +x "$OV/stubs/lsof"
+lsof_says '127.0.0.1:11434'; ovr bash -c '. "$0"; ollama_listens_lan' "$CLI" && bad "loopback listener read as LAN" "" || ok "an Ollama on 127.0.0.1 is read as loopback-only"
+lsof_says '*:11434'; ovr bash -c '. "$0"; ollama_listens_lan' "$CLI" && ok "an Ollama on every interface (*:11434) is read as LAN-reachable" || bad "*:11434 not LAN" ""
+: > "$OV/lsof.out"; ovr bash -c '. "$0"; ollama_listens_lan' "$CLI" && bad "no listener read as LAN" "" || ok "no listener is not LAN-reachable"
+SO="$(awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI")"
+grep -q 'if ollama_listens_lan; then' <<<"$SO" && grep -q 'rebinding it to 127.0.0.1' <<<"$SO" && grep -q 'NOT run by memex-local' <<<"$SO" && grep -q 'ollama_vm_reach || true' <<<"$SO" \
+  && ok "an ALREADY running Ollama is checked: memex-local's own is rebound to loopback, a foreign one is named (refused under ALLOW_LAN=0); a failed VM reach never aborts the join" || bad "existing ollama migration" "$SO"
+# setup_ollama end to end against an ALREADY running Ollama (curl answers) with a foreign LAN listener:
+# warned and carried on by default (never an errexit abort), refused under MEMEX_OLLAMA_ALLOW_LAN=0;
+# and memex-local's own agent is rebound, then RE-CHECKED (a foreign process may still hold the port).
+cat > "$OV/stubs/curl" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+chmod +x "$OV/stubs/curl"
+lsof_says '*:11434'; rm -f "$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist"
+OUT="$(ovr env MEMEX_OLLAMA_MODEL=none bash -c 'set -euo pipefail; . "$0"; setup_ollama; echo SETUP_DONE' "$CLI" 2>&1)"
+case "$OUT" in *"NOT run by memex-local"*SETUP_DONE*) ok "a foreign LAN Ollama is named and the setup carries on (no errexit abort)" ;; *) bad "foreign ollama default" "$OUT" ;; esac
+OUT="$(ovr env MEMEX_OLLAMA_MODEL=none MEMEX_OLLAMA_ALLOW_LAN=0 bash -c 'set -euo pipefail; . "$0"; setup_ollama; echo SETUP_DONE' "$CLI" 2>&1)"
+case "$OUT" in *SETUP_DONE*) bad "ALLOW_LAN=0 continued past a foreign LAN Ollama" "$OUT" ;; *"refuses to continue"*) ok "MEMEX_OLLAMA_ALLOW_LAN=0 refuses to continue with a foreign LAN Ollama" ;; *) bad "allow lan 0 foreign" "$OUT" ;; esac
+touch "$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist"
+OUT="$(ovr env MEMEX_OLLAMA_MODEL=none bash -c 'set -euo pipefail; . "$0"; setup_ollama; echo SETUP_DONE' "$CLI" 2>&1)"
+case "$OUT" in *"rebinding it to 127.0.0.1"*"NOT run by memex-local"*SETUP_DONE*) grep -q '<string>127.0.0.1:11434</string>' "$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist" && ok "memex-local's own agent is rebound to loopback, then the port is RE-CHECKED (a listener still beyond loopback is named)" || bad "rebind plist" "" ;; *) bad "rebind then recheck" "$OUT" ;; esac
+rm -rf "$OV"
+FJ0="$(awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI")"
+grep -q '( cmd_observability ) || warn' <<<"$FJ0" && ok "a failing observability install fails its own step loudly, never the whole join" || bad "observability subshell" ""
+# The emptyDir Loki of an earlier install is migrated ONCE (immutable volumeClaimTemplates); a
+# persistent one, or none, is left alone. kubectl is pinned to the local cluster.
+OM="$(mktemp -d)"; mkdir -p "$OM/stubs"
+cat > "$OM/stubs/kubectl" <<STUB
+#!/bin/bash
+echo "\$@" >> "$OM/k.log"
+case "\$*" in
+  *"get statefulset loki -o jsonpath"*) printf '%s' "\${FAKE_TEMPLATES:-}"; exit "\${FAKE_READ_RC:-0}" ;;
+  *"get statefulset loki"*) exit "\${FAKE_STS_RC:-0}" ;;
+esac
+exit 0
+STUB
+chmod +x "$OM/stubs/kubectl"
+om() { env PATH="$OM/stubs:$STUBS:$PATH" HOME="$OM" MEMEX_LOCAL_HOME="$OM/.memex-local" MEMEX_LOCAL_LIB=1 "$@"; }
+OUT="$(om bash -c 'set -euo pipefail; . "$0"; observability_migrate_loki; echo DONE' "$CLI" 2>&1)"
+grep -q -- '--context colima -n monitoring delete statefulset loki' "$OM/k.log" && case "$OUT" in *"discarded"*DONE*) true ;; *) false ;; esac \
+  && ok "an emptyDir Loki is recreated once, announced (its logs are discarded), on the LOCAL cluster" || bad "loki migration" "$OUT / $(cat "$OM/k.log")"
+: > "$OM/k.log"; om env FAKE_TEMPLATES=storage bash -c 'set -euo pipefail; . "$0"; observability_migrate_loki' "$CLI" >/dev/null 2>&1
+! grep -q 'delete' "$OM/k.log" && ok "a Loki that already has its claim template is left alone" || bad "persistent loki deleted" "$(cat "$OM/k.log")"
+: > "$OM/k.log"; om env FAKE_STS_RC=1 bash -c 'set -euo pipefail; . "$0"; observability_migrate_loki' "$CLI" >/dev/null 2>&1
+! grep -q 'delete' "$OM/k.log" && ok "no Loki yet: nothing to migrate" || bad "no loki deleted" "$(cat "$OM/k.log")"
+: > "$OM/k.log"; om env FAKE_READ_RC=1 bash -c 'set -euo pipefail; . "$0"; observability_migrate_loki' "$CLI" >/dev/null 2>&1
+! grep -q 'delete' "$OM/k.log" && ok "a FAILED read of the claim templates deletes nothing (it is not 'no template')" || bad "failed read deleted" "$(cat "$OM/k.log")"
+rm -rf "$OM"
+grep -q 'helm --kube-context "${MEMEX_KUBE_CONTEXT:-colima}" upgrade --install loki grafana/loki-stack' "$CLI" && ok "the observability release is pinned to the local cluster's context, like the migration" || bad "observability helm context" ""
+grep -q 'storage.tsdb.retention.size: 6GB' "$HERE/../share/values.observability.yaml" && grep -q 'persistentVolume: { size: 8Gi }' "$HERE/../share/values.observability.yaml" \
+  && ok "Prometheus is capped by SIZE too (6 GB on the chart's 8Gi volume — an existing PVC is never asked to grow)" || bad "prometheus size cap" ""
+# Observability: sized values, layered by the command; fleet join installs it by default.
+OBS="$HERE/../share/values.observability.yaml"
+grep -q 'retention: 7d' "$OBS" && grep -q 'retention_period: 168h' "$OBS" && grep -q 'alertmanager: { enabled: false }' "$OBS" && [ "$(grep -c 'limits: { memory:' "$OBS")" = 4 ] \
+  && ok "observability is sized for the VM: memory limits on all four, 7 days of logs and metrics, no alertmanager" || bad "observability sizing" "$(cat "$OBS")"
+OB="$(awk '/^cmd_observability\(\) \{/,/^}$/' "$CLI")"; grep -q 'values.observability.yaml' <<<"$OB" && ok "memex-local observability layers the sized values" || bad "observability values layer" "missing"
+FJ="$(awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI")"
+grep -q 'with_obs="yes"' <<<"$FJ" && grep -q 'cmd_observability' <<<"$FJ" && grep -q -- '--no-observability) with_obs="no"' <<<"$FJ" \
+  && ok "fleet join installs observability by default (--no-observability skips it)" || bad "fleet join observability" "missing"
 
 echo "── headless host: install_launchd holds the forward as a process, no LaunchAgent ──"
 HL="$(mktemp -d)"; mkdir -p "$HL/stubs" "$HL/home"
