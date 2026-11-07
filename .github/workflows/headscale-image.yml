@@ -160,6 +160,51 @@ jobs:
           refuse "OIDC admits every account"            -f ci-values.yaml "${oidc[@]}" "${kv[@]}"
           refuse "OIDC has no client-secret source"     -f ci-values.yaml "${oidc[@]}" --set 'oidc.allowedDomains[0]=example.com'
           refuse "OIDC names two secret sources"        -f ci-values.yaml "${oidc[@]}" "${kv[@]}" --set 'oidc.allowedDomains[0]=example.com' --set oidc.clientSecret.existingSecret=s
+          # Declared pre-auth keys: the sidecar, its Secret per key, and RBAC over exactly those Secrets.
+          keys=(--set preauthKeys.enabled=true --set preauthKeys.image.repository=registry.example.com/headscale-keys
+                --set 'preauthKeys.keys[0].name=bridge' --set 'preauthKeys.keys[0].user=tailnet-bridge'
+                --set 'preauthKeys.keys[0].reusable=true' --set 'preauthKeys.keys[0].ephemeral=true')
+          pk=$(helm template hs deploy/headscale/helm -f ci-values.yaml "${keys[@]}")
+          pkinds=$(grep -E '^kind:' <<<"$pk" | sort | tr '\n' ' ')
+          [ "$pkinds" = "kind: ConfigMap kind: ConfigMap kind: Deployment kind: Ingress kind: NetworkPolicy kind: PersistentVolumeClaim kind: Role kind: RoleBinding kind: Secret kind: Service kind: ServiceAccount " ] \
+            || { echo "::error::preauthKeys rendered [$pkinds]"; exit 1; }
+          python3 - "$pk" <<'PY'
+          import sys, yaml
+          docs = [d for d in yaml.safe_load_all(sys.argv[1]) if d]
+          role = next(d for d in docs if d["kind"] == "Role")
+          rules = role["rules"]
+          assert len(rules) == 1, f"the keys Role has {len(rules)} rules, expected 1"
+          r = rules[0]
+          assert r["resources"] == ["secrets"] and sorted(r["verbs"]) == ["get", "patch", "update"], f"the keys Role grants {r}"
+          assert r["resourceNames"] == ["hs-headscale-preauth-bridge"], f"the keys Role is not limited to the declared Secret: {r.get('resourceNames')}"
+          dep = next(d for d in docs if d["kind"] == "Deployment")
+          pod = dep["spec"]["template"]["spec"]
+          assert pod["automountServiceAccountToken"] is False, "the pod automounts a token"
+          by = {c["name"]: c for c in pod["containers"]}
+          assert set(by) == {"headscale", "keys"}, f"containers {set(by)}"
+          assert not any(m["name"] == "keys-token" for m in by["headscale"].get("volumeMounts", [])), "the server container mounts the keys token"
+          assert any(m["name"] == "keys-token" for m in by["keys"]["volumeMounts"]), "the keys sidecar has no token"
+          assert by["keys"]["image"].endswith("headscale-keys:0.29.7-0000000"), f"keys image {by['keys']['image']}"
+          sec = next(d for d in docs if d["kind"] == "Secret")
+          assert sec["metadata"]["annotations"].get("helm.sh/resource-policy") == "keep", "the key Secret is not kept"
+          assert not sec.get("data"), "the chart rendered key material"
+          print("preauthKeys: one Role over exactly the declared Secret (get/update/patch), token in the sidecar only, Secret kept and empty")
+          PY
+          # A long release name keeps every key's Secret distinct (names are never truncated).
+          long=$(printf 'r%.0s' $(seq 1 45))
+          names=$(helm template "$long" deploy/headscale/helm -f ci-values.yaml "${keys[@]}" --set 'preauthKeys.keys[1].name=mac' --set 'preauthKeys.keys[1].user=fleet' \
+                  | awk '/^kind: Secret/{s=1} s && /^  name:/{print $2; s=0}' | sort -u | wc -l | tr -d ' ')
+          [ "$names" = 2 ] || { echo "::error::two declared keys rendered $names distinct Secret name(s) under a long release name"; exit 1; }
+          # The pod template hashes the DECLARATION only (a key renewal must not restart the server).
+          grep -q 'checksum/preauth-keys:' <<<"$pk" || { echo "::error::no declaration checksum on the pod template"; exit 1; }
+          a=$(helm template hs deploy/headscale/helm -f ci-values.yaml "${keys[@]}" | grep 'checksum/preauth-keys')
+          b=$(helm template hs deploy/headscale/helm -f ci-values.yaml "${keys[@]}" --set 'preauthKeys.keys[0].user=other' | grep 'checksum/preauth-keys')
+          [ "$a" != "$b" ] || { echo "::error::changing a declared key does not change the pod template"; exit 1; }
+          refuse "preauthKeys has no image"             -f ci-values.yaml "${keys[@]}" --set preauthKeys.image.repository=
+          refuse "preauthKeys declares no key"          -f ci-values.yaml --set preauthKeys.enabled=true --set preauthKeys.image.repository=r/k
+          refuse "a key name is not a DNS label"        -f ci-values.yaml "${keys[@]}" --set 'preauthKeys.keys[0].name=Bad_Name'
+          refuse "a key has no user"                    -f ci-values.yaml "${keys[@]}" --set 'preauthKeys.keys[0].user='
+          refuse "renewHours is not below validHours"   -f ci-values.yaml "${keys[@]}" --set 'preauthKeys.keys[0].validHours=24' --set 'preauthKeys.keys[0].renewHours=24'
           echo "chart: nothing by default; enabled → $kinds; OIDC secret stays a mounted file; every refusal holds"
 
   # main (push or dispatch): build the same way, push both tags, read them back.
@@ -195,38 +240,50 @@ jobs:
       # base image and the package installs are not reproducible, so a second push would put different
       # bytes under the approved name. Only a registry that ANSWERED "not found" means absent; a timeout,
       # a throttle or an auth failure is RED (the same rule as ollama-image.yml and build-host.yml).
+      # Two images from ONE commit: the server (`headscale`, the upstream bytes) and the keys sidecar
+      # (`headscale-keys`, target keys-release). Each is write-once on its own: a rerun after a partial
+      # publish pushes only the one that is missing, never re-pushes the other.
       - name: Is this commit already published?
         id: published
         run: |
           set -euo pipefail
           tag="${LINE}-${GITHUB_SHA::7}"
-          exists=false
-          if docker buildx imagetools inspect "$ACR/headscale:$tag" --format '{{json .Manifest.Digest}}' \
-               >/dev/null 2>"$RUNNER_TEMP/inspect.err"; then
-            exists=true
-          elif ! grep -qiE 'not found|manifest unknown|MANIFEST_UNKNOWN|NAME_UNKNOWN' "$RUNNER_TEMP/inspect.err"; then
-            cat "$RUNNER_TEMP/inspect.err"
-            echo "::error::could not establish whether headscale:$tag exists (the registry did not answer 'not found') — refusing to rebuild over a tag that may be there"
-            exit 1
-          fi
-          echo "exists=$exists" >> "$GITHUB_OUTPUT"
-          if [ "$exists" = true ]; then
-            echo "headscale:$tag is already published — not rebuilt, not re-pushed (write-once)"
-          else
-            echo "headscale:$tag is confirmed absent (the registry answered not found) — building it"
-          fi
+          for repo in headscale headscale-keys; do
+            exists=false
+            if docker buildx imagetools inspect "$ACR/$repo:$tag" --format '{{json .Manifest.Digest}}' \
+                 >/dev/null 2>"$RUNNER_TEMP/inspect.err"; then
+              exists=true
+            elif ! grep -qiE 'not found|manifest unknown|MANIFEST_UNKNOWN|NAME_UNKNOWN' "$RUNNER_TEMP/inspect.err"; then
+              cat "$RUNNER_TEMP/inspect.err"
+              echo "::error::could not establish whether $repo:$tag exists (the registry did not answer 'not found') — refusing to rebuild over a tag that may be there"
+              exit 1
+            fi
+            echo "${repo//-/_}=$exists" >> "$GITHUB_OUTPUT"
+            if [ "$exists" = true ]; then
+              echo "$repo:$tag is already published — not rebuilt, not re-pushed (write-once)"
+            else
+              echo "$repo:$tag is confirmed absent (the registry answered not found) — building it"
+            fi
+          done
       - name: Build
-        if: steps.published.outputs.exists == 'false'
+        if: steps.published.outputs.headscale == 'false' || steps.published.outputs.headscale_keys == 'false'
         run: |
           set -euo pipefail
           short="${GITHUB_SHA::7}"
           docker build -t "$ACR/headscale:${LINE}-${short}" deploy/headscale
+          docker build --target keys-release -t "$ACR/headscale-keys:${LINE}-${short}" deploy/headscale
       - name: Push headscale:<line>-<sha>
-        if: steps.published.outputs.exists == 'false'
+        if: steps.published.outputs.headscale == 'false'
         run: |
           set -euo pipefail
           short="${GITHUB_SHA::7}"
           docker push "$ACR/headscale:${LINE}-${short}"
+      - name: Push headscale-keys:<line>-<sha>
+        if: steps.published.outputs.headscale_keys == 'false'
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA::7}"
+          docker push "$ACR/headscale-keys:${LINE}-${short}"
       # ONE INVARIANT: the moving line names the NEWEST PUBLISHED `<line>-<sha7>` tag, "newest" in main's
       # first-parent order. `converge-line` recomputes that on EVERY publish run from the registry's own tag
       # list (what was really published: a dispatch on any main commit, a multi-commit push's tip) and
@@ -252,8 +309,11 @@ jobs:
           short="${GITHUB_SHA::7}"
           immutable=$(docker buildx imagetools inspect "$ACR/headscale:${LINE}-${short}" --format '{{json .Manifest.Digest}}' | tr -d '"')
           [ -n "$immutable" ] || { echo "::error::headscale:${LINE}-${short} is not in the registry"; exit 1; }
+          keys=$(docker buildx imagetools inspect "$ACR/headscale-keys:${LINE}-${short}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          [ -n "$keys" ] || { echo "::error::headscale-keys:${LINE}-${short} is not in the registry"; exit 1; }
           newest="${{ steps.line.outputs.newest }}"
           line_digest="${{ steps.line.outputs.digest }}"
-          echo "headscale:${LINE}-${short} = ${immutable} (built: ${{ steps.published.outputs.exists == 'false' }}); :${LINE} -> ${newest::7} ${line_digest}"
+          echo "headscale:${LINE}-${short} = ${immutable} (built: ${{ steps.published.outputs.headscale == 'false' }}); headscale-keys:${LINE}-${short} = ${keys}; :${LINE} -> ${newest::7} ${line_digest}"
           echo "### headscale published" >> "$GITHUB_STEP_SUMMARY"
           echo "\`$ACR/headscale:${LINE}-${short}\` — \`${immutable}\`. An estate overlay names this immutable tag." >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$ACR/headscale-keys:${LINE}-${short}\` — \`${keys}\` (the declared pre-auth keys sidecar, \`preauthKeys.image\`)." >> "$GITHUB_STEP_SUMMARY"

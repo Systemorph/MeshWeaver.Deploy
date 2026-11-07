@@ -1,6 +1,15 @@
 {{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- if .Values.ingress.enabled }}
 {{- $tls := .Values.ingress.tlsSecret | default "" }}
+{{- /* ingress.additionalHosts: further names the SAME portal answers at (e.g. a public name reached
+       through the private network's ingress bridge, deploy/tailnet-bridge). Every Ingress below
+       carries every host with the same paths; the TLS block lists them all with the one Secret. */}}
+{{- $hosts := prepend (.Values.ingress.additionalHosts | default list) .Values.ingress.host | uniq }}
+{{- range $h := (.Values.ingress.additionalHosts | default list) }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" (toString $h)) }}
+{{- fail (printf "ingress host %q is not a lower-case DNS name (ingress.additionalHosts)" (toString $h)) }}
+{{- end }}
+{{- end }}
 {{- $issuer := .Values.ingress.clusterIssuer | default "" }}
 {{- $handWritten := hasKey (.Values.ingress.annotations | default dict) "cert-manager.io/cluster-issuer" }}
 {{- /* ingress.tlsFromKeyVault (MeshWeaver.Deploy#130): the CSI driver creates the Secret from a vault
@@ -86,13 +95,16 @@ spec:
   ingressClassName: {{ .Values.ingress.className | quote }}
   tls:
     - hosts:
-        - {{ .Values.ingress.host | quote }}
+        {{- range $h := $hosts }}
+        - {{ $h | quote }}
+        {{- end }}
       secretName: {{ .Values.ingress.tlsSecret | quote }}
   rules:
-    - host: {{ .Values.ingress.host | quote }}
+{{- range $h := $hosts }}
+    - host: {{ $h | quote }}
       http:
         paths:
-{{- $nextMode := include "memex.portalNext.mode" . }}
+{{- $nextMode := include "memex.portalNext.mode" $ }}
 {{- if ne $nextMode "off" }}
           # ---- Next.js React GUI (FEATURE-FLAGGED — see .Values.portalNext) ---
           # nginx matches the LONGEST prefix first regardless of order, so /next/*
@@ -122,7 +134,8 @@ spec:
               service:
                 name: "memex-portal-service"
                 port:
-                  number: {{ .Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+                  number: {{ $.Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+{{- end }}
 {{- if (.Values.grpc).enabled }}
 # ---- Native gRPC on the SAME host (backend-protocol is per-Ingress-resource) ----
 # ONLY the bidi participant connection (meshweaver.v1.Mesh/Open) is native gRPC — a second Ingress
@@ -150,10 +163,13 @@ spec:
   ingressClassName: {{ .Values.ingress.className | quote }}
   tls:
     - hosts:
-        - {{ .Values.ingress.host | quote }}
+        {{- range $h := $hosts }}
+        - {{ $h | quote }}
+        {{- end }}
       secretName: {{ .Values.ingress.tlsSecret | quote }}
   rules:
-    - host: {{ .Values.ingress.host | quote }}
+{{- range $h := $hosts }}
+    - host: {{ $h | quote }}
       http:
         paths:
           - path: "/meshweaver.v1.Mesh/Open"
@@ -162,7 +178,8 @@ spec:
               service:
                 name: "memex-portal-service"
                 port:
-                  number: {{ .Values.grpc.port }}
+                  number: {{ $.Values.grpc.port }}
+{{- end }}
 {{- end }}
 # ---- MCP + its OAuth flow pinned to ONE pod (stateful per-pod sessions) ------
 # /mcp (Streamable HTTP) and its OAuth endpoints (/register /authorize /token) keep session +
@@ -190,10 +207,13 @@ spec:
   ingressClassName: {{ .Values.ingress.className | quote }}
   tls:
     - hosts:
-        - {{ .Values.ingress.host | quote }}
+        {{- range $h := $hosts }}
+        - {{ $h | quote }}
+        {{- end }}
       secretName: {{ .Values.ingress.tlsSecret | quote }}
   rules:
-    - host: {{ .Values.ingress.host | quote }}
+{{- range $h := $hosts }}
+    - host: {{ $h | quote }}
       http:
         paths:
           - path: "/mcp"
@@ -202,27 +222,28 @@ spec:
               service:
                 name: "memex-portal-service"
                 port:
-                  number: {{ .Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+                  number: {{ $.Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
           - path: "/register"
             pathType: "Prefix"
             backend:
               service:
                 name: "memex-portal-service"
                 port:
-                  number: {{ .Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+                  number: {{ $.Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
           - path: "/authorize"
             pathType: "Prefix"
             backend:
               service:
                 name: "memex-portal-service"
                 port:
-                  number: {{ .Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+                  number: {{ $.Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
           - path: "/token"
             pathType: "Prefix"
             backend:
               service:
                 name: "memex-portal-service"
                 port:
-                  number: {{ .Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+                  number: {{ $.Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+{{- end }}
 {{- end }}
 {{- end }}
