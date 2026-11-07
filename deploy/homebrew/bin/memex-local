@@ -3878,6 +3878,21 @@ cmd_port_forward() {
   ok "port-forward (re)started via launchd"
 }
 
+# ONE-TIME migration of an emptyDir Loki (an earlier `memex-local observability`, which had no values
+# file) to the persistent one: enabling persistence adds a volumeClaimTemplate, and a StatefulSet's
+# volumeClaimTemplates are IMMUTABLE, so `helm upgrade` would fail on every retry. The StatefulSet is
+# deleted first and helm recreates it; what the emptyDir held is lost anyway on any restart, and the
+# deletion is announced. A Loki that already has its claim template is left alone.
+observability_migrate_loki() {
+  local templates
+  local_kubectl -n "$MONITORING_NS" get statefulset loki >/dev/null 2>&1 || return 0
+  templates="$(local_kubectl -n "$MONITORING_NS" get statefulset loki -o jsonpath='{.spec.volumeClaimTemplates[*].metadata.name}' 2>/dev/null || true)"
+  [ -z "$templates" ] || return 0
+  warn "one-time migration: the existing Loki keeps its logs in an emptyDir; recreating it with a persistent volume — the logs it holds now are discarded"
+  local_kubectl -n "$MONITORING_NS" delete statefulset loki --wait=true >/dev/null 2>&1 \
+    || die "observability: could not delete the emptyDir Loki StatefulSet (kubectl -n $MONITORING_NS delete statefulset loki)"
+}
+
 cmd_observability() {                            # §11
   preflight
   step "Installing Grafana/Loki/Promtail/Prometheus into '$MONITORING_NS' (§11)"
@@ -3891,6 +3906,7 @@ cmd_observability() {                            # §11
   fi
   helm repo add grafana https://grafana.github.io/helm-charts >/dev/null 2>&1 || true
   helm repo update grafana >/dev/null 2>&1 || helm repo update >/dev/null 2>&1 || true
+  observability_migrate_loki
   # Sized for the shared VM (share/values.observability.yaml: requests, memory limits, 7 days).
   helm upgrade --install loki grafana/loki-stack \
     -n "$MONITORING_NS" --create-namespace \

@@ -1119,6 +1119,30 @@ case "$OUT" in *"rebinding it to 127.0.0.1"*"NOT run by memex-local"*SETUP_DONE*
 rm -rf "$OV"
 FJ0="$(awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI")"
 grep -q '( cmd_observability ) || warn' <<<"$FJ0" && ok "a failing observability install fails its own step loudly, never the whole join" || bad "observability subshell" ""
+# The emptyDir Loki of an earlier install is migrated ONCE (immutable volumeClaimTemplates); a
+# persistent one, or none, is left alone. kubectl is pinned to the local cluster.
+OM="$(mktemp -d)"; mkdir -p "$OM/stubs"
+cat > "$OM/stubs/kubectl" <<STUB
+#!/bin/bash
+echo "\$@" >> "$OM/k.log"
+case "\$*" in
+  *"get statefulset loki -o jsonpath"*) printf '%s' "\${FAKE_TEMPLATES:-}" ;;
+  *"get statefulset loki"*) exit "\${FAKE_STS_RC:-0}" ;;
+esac
+exit 0
+STUB
+chmod +x "$OM/stubs/kubectl"
+om() { env PATH="$OM/stubs:$STUBS:$PATH" HOME="$OM" MEMEX_LOCAL_HOME="$OM/.memex-local" MEMEX_LOCAL_LIB=1 "$@"; }
+OUT="$(om bash -c 'set -euo pipefail; . "$0"; observability_migrate_loki; echo DONE' "$CLI" 2>&1)"
+grep -q -- '--context colima -n monitoring delete statefulset loki' "$OM/k.log" && case "$OUT" in *"discarded"*DONE*) true ;; *) false ;; esac \
+  && ok "an emptyDir Loki is recreated once, announced (its logs are discarded), on the LOCAL cluster" || bad "loki migration" "$OUT / $(cat "$OM/k.log")"
+: > "$OM/k.log"; om env FAKE_TEMPLATES=storage bash -c 'set -euo pipefail; . "$0"; observability_migrate_loki' "$CLI" >/dev/null 2>&1
+! grep -q 'delete' "$OM/k.log" && ok "a Loki that already has its claim template is left alone" || bad "persistent loki deleted" "$(cat "$OM/k.log")"
+: > "$OM/k.log"; om env FAKE_STS_RC=1 bash -c 'set -euo pipefail; . "$0"; observability_migrate_loki' "$CLI" >/dev/null 2>&1
+! grep -q 'delete' "$OM/k.log" && ok "no Loki yet: nothing to migrate" || bad "no loki deleted" "$(cat "$OM/k.log")"
+rm -rf "$OM"
+grep -q 'storage.tsdb.retention.size: 6GB' "$HERE/../share/values.observability.yaml" && grep -q 'persistentVolume: { size: 8Gi }' "$HERE/../share/values.observability.yaml" \
+  && ok "Prometheus is capped by SIZE too (6 GB on the chart's 8Gi volume — an existing PVC is never asked to grow)" || bad "prometheus size cap" ""
 # Observability: sized values, layered by the command; fleet join installs it by default.
 OBS="$HERE/../share/values.observability.yaml"
 grep -q 'retention: 7d' "$OBS" && grep -q 'retention_period: 168h' "$OBS" && grep -q 'alertmanager: { enabled: false }' "$OBS" && [ "$(grep -c 'limits: { memory:' "$OBS")" = 4 ] \

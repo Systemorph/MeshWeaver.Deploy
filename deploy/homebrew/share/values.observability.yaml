@@ -1,7 +1,7 @@
 # memex-local observability — Grafana + Loki + Promtail + Prometheus (grafana/loki-stack), SIZED for
 # the Colima VM a Mac shares with its portal, its private instances and the build runners: requests
 # small enough to schedule beside them, memory limits so a query storm cannot starve the portal,
-# 7 days of logs and metrics on 10 GiB volumes each. Layered by `memex-local observability`, which
+# 7 days of logs and metrics (Loki on 10 GiB; Prometheus on 8 GiB, capped at 6 GB). Layered by `memex-local observability`, which
 # `fleet join` runs by default. Read-only views for the person: kubectl port-forward to Grafana.
 grafana:
   enabled: true
@@ -24,5 +24,11 @@ prometheus:
   prometheus-pushgateway: { enabled: false }
   server:
     retention: 7d
-    persistentVolume: { size: 10Gi }
+    # The chart's default 8Gi volume: an existing install's PVC is never asked to grow (local-path
+    # cannot expand one, and helm would refuse the upgrade). Time retention alone can fill it at a
+    # high scrape rate before samples age out, so the size cap bounds it too, keeping ~25% free for
+    # the WAL, the head block and compaction (the AKS overlay's rule).
+    persistentVolume: { size: 8Gi }
+    extraArgs:
+      storage.tsdb.retention.size: 6GB
     resources: { requests: { cpu: 100m, memory: 512Mi }, limits: { memory: 2Gi } }
