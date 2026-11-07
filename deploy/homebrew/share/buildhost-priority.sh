@@ -45,6 +45,14 @@
 # MEMEX_BUILD_PRIO_LIB=1 . buildhost-priority.sh defines the functions without running anything.
 set -u
 
+# The configuration --install recorded (profile, COLIMA_HOME, every MEMEX_BUILD_PRIO_* override), kept apart from
+# the runtime state. Each line only fills a variable the environment left unset, so a shell's override still wins
+# at the next install, and the agent, the headless process and the unattended daemon's restart all see what the
+# install saw.
+CONFIG_FILE="${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/buildhost-priority.env"
+# shellcheck source=/dev/null
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
 LABEL="com.memex.local.buildhost-priority"
 PROFILE="${MEMEX_BUILD_PROFILE:-build}"
 LOCAL_HOME="${MEMEX_LOCAL_HOME:-$HOME/.memex-local}"
@@ -176,15 +184,19 @@ run() {
   done
 }
 
-# The settings the installing shell overrode travel into the agent: a COLIMA_HOME outside ~/.colima (or the agent
-# would look for the VM where it is not and never act) and every MEMEX_BUILD_PRIO_* threshold, interval or path.
-persisted_env() {
+# Record the effective configuration for every later start (see CONFIG_FILE above).
+write_config() {
   local v
-  for v in COLIMA_HOME MEMEX_BUILD_PRIO_INTERVAL MEMEX_BUILD_PRIO_YIELD_AT MEMEX_BUILD_PRIO_RESUME_BELOW \
-           MEMEX_BUILD_PRIO_RESUME_AFTER MEMEX_BUILD_PRIO_OLLAMA_BUSY MEMEX_BUILD_PRIO_STATE MEMEX_BUILD_PRIO_LOG; do
-    [ -n "${!v:-}" ] && printf '        <key>%s</key><string>%s</string>\n' "$v" "${!v}"
-  done
-  return 0
+  mkdir -p "$LOCAL_HOME"
+  {
+    printf '# written by buildhost-priority.sh --install; removed by --uninstall\n'
+    printf '[ -n "${MEMEX_BUILD_PROFILE:-}" ] || MEMEX_BUILD_PROFILE=%q\n' "$PROFILE"
+    for v in COLIMA_HOME MEMEX_BUILD_PRIO_INTERVAL MEMEX_BUILD_PRIO_YIELD_AT MEMEX_BUILD_PRIO_RESUME_BELOW \
+             MEMEX_BUILD_PRIO_RESUME_AFTER MEMEX_BUILD_PRIO_OLLAMA_BUSY MEMEX_BUILD_PRIO_STATE MEMEX_BUILD_PRIO_LOG; do
+      [ -n "${!v:-}" ] && printf '[ -n "${%s:-}" ] || %s=%q; export %s\n' "$v" "$v" "${!v}" "$v"
+    done
+    printf 'export MEMEX_BUILD_PROFILE\n'
+  } > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
 }
 
 plist() {
@@ -204,7 +216,6 @@ plist() {
         <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>MEMEX_BUILD_PROFILE</key><string>${PROFILE}</string>
         <key>MEMEX_LOCAL_HOME</key><string>${LOCAL_HOME}</string>
-$(persisted_env)
     </dict>
     <!-- Interactive: the governor itself must run promptly when the machine is contended — a launchd agent's
          default policy ranks it BELOW the build VM it has to demote. It sleeps between ticks. -->
@@ -225,7 +236,15 @@ PID_FILE="$LOCAL_HOME/buildhost-priority.pid"
 # recorded in $PID_FILE, and the unattended daemon (memex-daemon.sh) starts it again after every boot.
 gui_session() { [ "${MEMEX_HEADLESS:-}" != 1 ] && launchctl print "gui/$(id -u)" >/dev/null 2>&1; }
 
-headless_pid() { local p; p="$(cat "$PID_FILE" 2>/dev/null || true)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null && printf '%s' "$p"; return 0; }
+# The pid file records "<pid> <start time>"; a pid counts only while the same process (same start time, running
+# this script) holds it — a record that outlived a reboot or a crash names nothing, and nothing is signalled.
+proc_start() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' '_' | sed 's/^_//; s/_$//'; }
+headless_pid() {
+  local p t
+  read -r p t < "$PID_FILE" 2>/dev/null || return 0
+  [ -n "$p" ] && [ -n "$t" ] && [ "$(proc_start "$p")" = "$t" ] && ps -o command= -p "$p" 2>/dev/null | grep -q 'buildhost-priority.sh' && printf '%s' "$p"
+  return 0
+}
 
 stop_headless() {
   local p; p="$(headless_pid)"
@@ -239,13 +258,18 @@ install_agent() {
   plist_dst="$HOME/Library/LaunchAgents/${LABEL}.plist"
   mkdir -p "$LOCAL_HOME"
   [ "$self" -ef "$dst" ] 2>/dev/null || install -m 0755 "$self" "$dst"
+  write_config
   if ! gui_session; then
+    # One governor per Mac: a LaunchAgent from an earlier GUI install is unloaded and removed, so a later login
+    # cannot start a second one beside this process.
+    stop_launchd_agent
     stop_headless
     MEMEX_BUILD_PROFILE="$PROFILE" MEMEX_LOCAL_HOME="$LOCAL_HOME" nohup /bin/bash "$dst" run >> "$LOG_FILE" 2>&1 < /dev/null &
-    echo $! > "$PID_FILE"
+    echo "$! $(proc_start $!)" > "$PID_FILE"
     echo "started the governor headless (no GUI session; pid $!, profile $PROFILE; state $STATE_FILE, log $LOG_FILE)"
     return 0
   fi
+  stop_headless   # one governor per Mac: a headless process from an earlier install ends before the agent loads
   mkdir -p "$HOME/Library/LaunchAgents"
   plist "$dst" > "$plist_dst"
   launchctl bootout "gui/$(id -u)" "$plist_dst" >/dev/null 2>&1 || true
@@ -253,16 +277,20 @@ install_agent() {
   echo "loaded launchd agent $LABEL (profile $PROFILE; state $STATE_FILE, log $LOG_FILE)"
 }
 
-uninstall_agent() {
+stop_launchd_agent() {
   local plist_dst="$HOME/Library/LaunchAgents/${LABEL}.plist"
   if [ -f "$plist_dst" ]; then
     launchctl bootout "gui/$(id -u)" "$plist_dst" >/dev/null 2>&1 || true
     rm -f "$plist_dst"
   fi
+}
+
+uninstall_agent() {
+  stop_launchd_agent
   stop_headless
   # bootout and kill send TERM, whose trap restores the default policy; do it here too in case nothing was running.
   apply_mode full "$(vm_pids)" || true
-  rm -f "$LOCAL_HOME/buildhost-priority.sh"
+  rm -f "$LOCAL_HOME/buildhost-priority.sh" "$CONFIG_FILE"
   echo "removed the governor $LABEL; the build VM runs at its default policy"
 }
 

@@ -35,8 +35,10 @@ memex-local buildhost priority off       # remove it; the VM runs at its default
 ```
 
 State: `~/.memex-local/buildhost-priority.state`. Log, transitions only: `~/.memex-local/buildhost-priority.log`.
-Overrides set in the installing shell (`COLIMA_HOME`, `MEMEX_BUILD_PRIO_*`) are written into the agent's
-environment.
+The install records its configuration (profile, `COLIMA_HOME`, any `MEMEX_BUILD_PRIO_*` override) in
+`~/.memex-local/buildhost-priority.env`, kept apart from the state. Every start reloads it, and an override
+set in a shell still wins at the next install. There is one governor per Mac: installing in one mode stops
+the other mode's governor first.
 
 **Headless Macs.** On a Mac without a GUI login session (the `.pkg`'s *Unattended host*, see
 `deploy/macos/README.md`), no LaunchAgent can load. There the governor runs as a background process of the

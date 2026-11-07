@@ -1722,18 +1722,33 @@ printf '#!/bin/bash\n[ "$1" = -t ] && case "$2" in */colima-build/disk) echo 424
   && ok "profile default maps to Lima instance colima, any other to colima-<profile>" || bad "instance_dir" ""
 rm -rf "$GT"
 OUT="$(bash "$GOV" --install --profile 'Bad Name' 2>&1)" && bad "a bad profile was accepted" "$OUT" || ok "the governor refuses a profile that is not a Colima profile name"
-PE="$(env COLIMA_HOME=/srv/colima MEMEX_BUILD_PRIO_YIELD_AT=300 MEMEX_BUILD_PRIO_LIB=1 bash -c '. "$0"; plist /x/gov.sh' "$GOV")"
-grep -q '<key>COLIMA_HOME</key><string>/srv/colima</string>' <<<"$PE" && grep -q '<key>MEMEX_BUILD_PRIO_YIELD_AT</key><string>300</string>' <<<"$PE" \
-  && ! grep -q 'MEMEX_BUILD_PRIO_INTERVAL' <<<"$PE" \
-  && ok "the installing shell's COLIMA_HOME and MEMEX_BUILD_PRIO_* overrides travel into the agent (and only those set)" || bad "persisted env" "$PE"
 GH="$(mktemp -d)"; mkdir -p "$GH/stubs"
 for t in launchctl taskpolicy lsof; do printf '#!/bin/bash\necho "%s $*" >> "%s/log"\nexit 0\n' "$t" "$GH" > "$GH/stubs/$t"; done; chmod +x "$GH/stubs/"*
-OUT="$(env PATH="$GH/stubs:$PATH" HOME="$GH" MEMEX_LOCAL_HOME="$GH/.ml" MEMEX_HEADLESS=1 bash "$GOV" --install --profile build 2>&1)"
-GP="$(cat "$GH/.ml/buildhost-priority.pid" 2>/dev/null)"
+gh_env() { env PATH="$GH/stubs:$PATH" HOME="$GH" MEMEX_LOCAL_HOME="$GH/.ml" "$@"; }
+OUT="$(gh_env COLIMA_HOME="/srv/my colima" MEMEX_BUILD_PRIO_YIELD_AT=300 MEMEX_HEADLESS=1 bash "$GOV" --install --profile build 2>&1)"
+GP="$(cut -d' ' -f1 "$GH/.ml/buildhost-priority.pid" 2>/dev/null)"
 [ -n "$GP" ] && kill -0 "$GP" 2>/dev/null && ! grep -q 'bootstrap' "$GH/log" 2>/dev/null && [ ! -e "$GH/Library/LaunchAgents/com.memex.local.buildhost-priority.plist" ] \
   && ok "headless (no GUI session) the governor runs as a background process recorded in a pid file, no LaunchAgent" || bad "headless install" "$OUT / $(cat "$GH/log" 2>/dev/null)"
-env PATH="$GH/stubs:$PATH" HOME="$GH" MEMEX_LOCAL_HOME="$GH/.ml" bash "$GOV" --uninstall >/dev/null 2>&1
-[ -n "$GP" ] && ! kill -0 "$GP" 2>/dev/null && [ ! -e "$GH/.ml/buildhost-priority.pid" ] && ok "--uninstall stops the headless process too" || { bad "headless uninstall" ""; [ -n "$GP" ] && kill "$GP" 2>/dev/null; }
+CF="$(gh_env MEMEX_BUILD_PRIO_LIB=1 env -u COLIMA_HOME -u MEMEX_BUILD_PRIO_YIELD_AT bash -c '. "$0"; echo "$COLIMA_HOME|$YIELD_AT|$PROFILE"' "$GOV")"
+[ "$CF" = "/srv/my colima|300|build" ] && [ "$(gh_env MEMEX_BUILD_PRIO_YIELD_AT=500 MEMEX_BUILD_PRIO_LIB=1 bash -c '. "$0"; echo "$YIELD_AT"' "$GOV")" = 500 ] \
+  && ok "the install's COLIMA_HOME, profile and overrides are recorded apart from the state and reload at every start; a shell's override still wins" || bad "recorded config" "$CF"
+gh_env bash "$GOV" --install --profile build >/dev/null 2>&1
+[ -n "$GP" ] && ! kill -0 "$GP" 2>/dev/null && [ -e "$GH/Library/LaunchAgents/com.memex.local.buildhost-priority.plist" ] \
+  && ok "switching to a GUI session stops the headless governor before the agent loads (one governor per Mac)" || bad "headless → gui" "$(cat "$GH/log")"
+gh_env MEMEX_HEADLESS=1 bash "$GOV" --install --profile build >/dev/null 2>&1
+GP="$(cut -d' ' -f1 "$GH/.ml/buildhost-priority.pid" 2>/dev/null)"
+[ ! -e "$GH/Library/LaunchAgents/com.memex.local.buildhost-priority.plist" ] && grep -q 'bootout' "$GH/log" \
+  && ok "switching to headless unloads and removes the LaunchAgent, so a later login cannot start a second governor" || bad "gui → headless" "$(cat "$GH/log")"
+gh_env bash "$GOV" --uninstall >/dev/null 2>&1
+[ -n "$GP" ] && ! kill -0 "$GP" 2>/dev/null && [ ! -e "$GH/.ml/buildhost-priority.pid" ] && [ ! -e "$GH/.ml/buildhost-priority.env" ] \
+  && ok "--uninstall stops the headless process and removes the recorded configuration" || { bad "headless uninstall" ""; [ -n "$GP" ] && kill "$GP" 2>/dev/null; }
+sleep 300 & SP=$!
+echo "$SP Mon_Jan_1_00:00:00_2001" > "$GH/.ml/buildhost-priority.pid"
+gh_env bash "$GOV" --uninstall >/dev/null 2>&1
+echo "$SP $(ps -o lstart= -p "$SP" | tr -s ' ' '_' | sed 's/^_//; s/_$//')" > "$GH/.ml/buildhost-priority.pid"
+gh_env bash "$GOV" --uninstall >/dev/null 2>&1
+kill -0 "$SP" 2>/dev/null && ok "a pid record that names another process (a reused pid after a reboot) is never signalled" || bad "stale pid signalled" ""
+kill "$SP" 2>/dev/null
 rm -rf "$GH"
 grep -q 'MEMEX_HEADLESS=1 .*buildhost-priority.sh" --install' "$HERE/../../macos/libexec/memex-daemon.sh" \
   && ok "the unattended daemon starts the governor headless after every boot, once installed" || bad "daemon starts governor" ""
