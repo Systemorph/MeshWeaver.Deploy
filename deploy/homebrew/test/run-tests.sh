@@ -1060,7 +1060,7 @@ grep -q 'image_pull_ghcr() {' "$CLI" && ! awk '/^image_pull_ghcr\(\) \{/,/^}$/' 
 awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI" | grep -q 'install_ollama_agent' && ! awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI" | grep -q 'nohup ollama' \
   && ok "setup_ollama starts Ollama under launchd, not as a nohup'd process" || bad "setup_ollama under launchd" "still nohup or no agent"
 grep -q '<key>OLLAMA_HOST</key><string>${1:-127.0.0.1}:11434</string>' "$CLI" && grep -q '<key>KeepAlive</key><true/>' "$CLI" \
-  && awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI" | grep -q 'install_ollama_agent 127.0.0.1' \
+  && grep -q 'install_ollama_agent 127.0.0.1' <<<"$(awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI")" \
   && ok "the Ollama agent binds the Mac's LOOPBACK by default (unauthenticated: never LAN-wide by default) and is kept alive" || bad "ollama agent plist" "bind or KeepAlive"
 # ollama_vm_reach: proven from inside the VM; LAN-wide only as a loud fallback, refusable.
 OV="$(mktemp -d)"; mkdir -p "$OV/stubs" "$OV/home/Library/LaunchAgents" "$OV/home/.memex-local"
@@ -1093,8 +1093,9 @@ rm -rf "$OV"
 OBS="$HERE/../share/values.observability.yaml"
 grep -q 'retention: 7d' "$OBS" && grep -q 'retention_period: 168h' "$OBS" && grep -q 'alertmanager: { enabled: false }' "$OBS" && [ "$(grep -c 'limits: { memory:' "$OBS")" = 4 ] \
   && ok "observability is sized for the VM: memory limits on all four, 7 days of logs and metrics, no alertmanager" || bad "observability sizing" "$(cat "$OBS")"
-awk '/^cmd_observability\(\) \{/,/^}$/' "$CLI" | grep -q 'values.observability.yaml' && ok "memex-local observability layers the sized values" || bad "observability values layer" "missing"
-awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI" | grep -q 'with_obs="yes"' && awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI" | grep -q 'cmd_observability' && awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI" | grep -q -- '--no-observability) with_obs="no"' \
+OB="$(awk '/^cmd_observability\(\) \{/,/^}$/' "$CLI")"; grep -q 'values.observability.yaml' <<<"$OB" && ok "memex-local observability layers the sized values" || bad "observability values layer" "missing"
+FJ="$(awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI")"
+grep -q 'with_obs="yes"' <<<"$FJ" && grep -q 'cmd_observability' <<<"$FJ" && grep -q -- '--no-observability) with_obs="no"' <<<"$FJ" \
   && ok "fleet join installs observability by default (--no-observability skips it)" || bad "fleet join observability" "missing"
 
 echo "── headless host: install_launchd holds the forward as a process, no LaunchAgent ──"
