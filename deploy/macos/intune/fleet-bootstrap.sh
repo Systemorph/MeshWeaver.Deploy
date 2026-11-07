@@ -31,7 +31,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.2.0"
+readonly FLEET_BOOTSTRAP_VERSION="1.3.0"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -49,8 +49,12 @@ readonly MEMEX_FORMULA="systemorph/memex/memex-local"
 
 log() {
   local line; line="$(date -u +%Y-%m-%dT%H:%M:%SZ) fleet-bootstrap ${FLEET_BOOTSTRAP_VERSION}: $*"
+  # 🚨 a token-bearing URL (the setup wizard's ?token=) never reaches the output or the log
+  case "$line" in *token=*) line="$(printf '%s' "$line" | sed -E 's/token=[^[:space:]&"]+/token=<withheld>/g')" ;; esac
   printf '%s\n' "$line"
-  if mkdir -p "$LOG_DIR" 2>/dev/null; then printf '%s\n' "$line" >> "$LOG_DIR/fleet-bootstrap.log" 2>/dev/null || true; fi
+  if mkdir -p "$LOG_DIR" 2>/dev/null; then
+    ( umask 077; printf '%s\n' "$line" >> "$LOG_DIR/fleet-bootstrap.log" ) 2>/dev/null || true
+  fi
 }
 
 # Runs a command that CHANGES the machine — or prints it under FLEET_BOOTSTRAP_DRY_RUN=1.
@@ -93,6 +97,13 @@ machine_id() {
   printf '%s' "$id"
 }
 
+# A READ-ONLY probe as the console user: it RUNS even in a dry run (it changes nothing), so a dry run plans
+# from what is really there instead of from a simulated success. A failed probe means "not yet".
+probe_as_user() {
+  local user="$1" home; shift; home="$(user_home "$user")"
+  sudo -n -u "$user" -H env HOME="$home" PATH="$BREW_PREFIX/bin:$TS_DIR/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$@" >/dev/null 2>&1
+}
+
 # Runs as the console user with that user's HOME and Homebrew on PATH.
 as_user() {
   local user="$1" home; shift; home="$(user_home "$user")"
@@ -129,7 +140,7 @@ step_homebrew() {
   if [ -x "$BREW_PREFIX/bin/brew" ]; then log "homebrew: present ($BREW_PREFIX)"; return 0; fi
   log "homebrew: installing under $BREW_PREFIX for $user (untar install, no prompt)"
   run mkdir -p "$BREW_PREFIX" && run chown -R "$user:admin" "$BREW_PREFIX" \
-    && as_user "$user" /bin/bash -c "curl -fsSL https://github.com/Homebrew/brew/tarball/master | tar xz --strip-components 1 -C '$BREW_PREFIX'" \
+    && as_user "$user" /bin/bash -c "curl -fsSL https://github.com/Homebrew/brew/tarball/main | tar xz --strip-components 1 -C '$BREW_PREFIX'" \
     || { log "homebrew: FAILED to install"; return 1; }
 }
 
@@ -180,9 +191,11 @@ step_tailscale_binaries() {
     || { rm -rf "$tmp"; log "tailscale: FAILED (download, checksum or install)"; return 1; }
   rm -rf "$tmp"
   TS_CHANGED=1
-  # the user-facing CLI on every PATH, as a root-owned link to the root-owned binary
-  install -d -o root -g wheel -m 0755 /usr/local/bin 2>/dev/null || true
-  [ "$(stat -f%Su /usr/local/bin 2>/dev/null)" = "root" ] && ln -sf "$TS_DIR/bin/tailscale" /usr/local/bin/tailscale
+  # the user-facing CLI on every PATH, as a root-owned link to the root-owned binary — only in a root-owned
+  # /usr/local/bin (created when absent; an existing user-owned one, e.g. a Rosetta Homebrew's, is left alone)
+  [ -d /usr/local/bin ] || install -d -o root -g wheel -m 0755 /usr/local/bin 2>/dev/null || true
+  if [ "$(stat -f%Su /usr/local/bin 2>/dev/null)" = "root" ]; then ln -sf "$TS_DIR/bin/tailscale" /usr/local/bin/tailscale || true; fi
+  return 0
 }
 
 step_tailscaled() {
@@ -244,9 +257,16 @@ step_memex() {
     return 0
   fi
   # the stack is provisioned when it VERIFIES usable, not when the VM merely runs — `up` is retried until it does
-  if ! as_user "$user" "$mlocal" verify >/dev/null 2>&1; then
+  if ! probe_as_user "$user" "$mlocal" verify; then
     log "memex: provisioning the local stack (memex-local up)"
     as_user "$user" "$mlocal" up >/dev/null 2>&1 || { log "memex: 'memex-local up' FAILED — retried next run"; return 1; }
+    [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] && { log "memex: (dry run) the join follows once the stack verifies"; return 0; }
+  fi
+  # A portal still serving its FIRST-RUN SETUP passes `verify` but has no database: nothing is joined or
+  # finalised until the console user has configured it.
+  if probe_as_user "$user" env MEMEX_LOCAL_LIB=1 /bin/bash -c '. "$0"; awaiting_setup' "$mlocal"; then
+    log "memex: WAITING for the first-run setup — $user runs 'memex-local setup' (it prints the wizard's link) and completes it"
+    return 0
   fi
   if [ -f "$home/.memex-local/fleet.yaml" ]; then
     # joined: resume a finalisation an earlier run did not finish, from the stored credentials (no new code).
@@ -261,8 +281,10 @@ step_memex() {
   fi
   code_file="$home/.memex-local/enrol/$machine.code"
   log "memex: fleet join as $machine (control $control); the code is read from $code_file once present"
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then log "memex: (dry run) would run 'memex-local fleet join' and wait for the code at $code_file"; return 0; fi
   out="$(as_user "$user" "$mlocal" fleet join --control "$control" --id "$machine" --no-open --code-file "$code_file" 2>&1)"; rc=$?
-  printf '%s\n' "$out" | grep -E 'https://|fingerprint|joined as|WAITING|waiting' | while IFS= read -r l; do log "memex: $l"; done
+  # the approval link and the fingerprints only — never a token-bearing setup URL
+  printf '%s\n' "$out" | grep -E 'Hosting/Heartbeats/Enrol/|fingerprint|joined as|WAITING|waiting' | grep -v 'token=' | while IFS= read -r l; do log "memex: $l"; done
   case "$rc" in
     0) as_user "$user" /usr/bin/touch "$home/.memex-local/fleet.finalized" || true; log "memex: joined as $machine" ;;
     3) log "memex: WAITING for the approval on control and the enrolment code at $code_file" ;;

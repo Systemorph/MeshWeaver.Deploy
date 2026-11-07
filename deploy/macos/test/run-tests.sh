@@ -354,6 +354,11 @@ TSJ="$(cat "$T/tailscale.json")"
 grep -q '<string>/Library/MeshWeaver/tailscale/bin/tailscaled</string>' "$T/ts.plist" && ! grep -q 'homebrew' "$T/ts.plist" \
   && ok "the root daemon runs tailscaled from the root-owned directory, never the user's Homebrew tree" || bad "daemon binary path" "$(grep tailscaled "$T/ts.plist")"
 grep -q 'brew" tap systemorph/memex' "$FB" && grep -q 'brew" trust systemorph/memex' "$FB" && ok "the third-party tap is tapped AND trusted before memex-local is installed" || bad "tap trust" "missing"
+grep -q 'tarball/main' "$FB" && ! grep -q 'tarball/master' "$FB" && ok "Homebrew comes from its supported main tree" || bad "homebrew branch" "master"
+env FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$T/tlog" bash -c '. "$0"; log "open https://memex.localhost:8443/setup?token=abc123 now"' "$FB" > "$T/tok.out" 2>&1
+! grep -q 'abc123' "$T/tok.out" "$T/tlog/fleet-bootstrap.log" && grep -q 'token=<withheld>' "$T/tok.out" && ok "a token-bearing URL never reaches the output or the log" || bad "token withheld" "$(cat "$T/tok.out")"
+[ "$(ls -l "$T/tlog/fleet-bootstrap.log" | cut -c1-10)" = "-rw-------" ] && ok "the run log is readable by root only" || bad "log mode" "$(ls -l "$T/tlog/fleet-bootstrap.log")"
+grep -q "WAITING for the first-run setup" "$FB" && ok "a portal still in first-run setup is reported WAITING; nothing is joined or finalised" || bad "setup wait" "missing"
 grep -q 'TS_CHANGED:-0' "$FB" && grep -q 'TS_CHANGED=1' "$FB" && ok "an upgraded tailscaled is reloaded, not left running the old binary" || bad "reload after upgrade" "missing"
 grep -q 'fleet.finalized' "$FB" && ok "a join's finalisation is recorded by a marker written only after it completed" || bad "finalisation marker" "missing"
 grep -q 'TRUST_STORES=nss' "$FB" && grep -q 'WAITING for the local CA to be trusted' "$FB" && ok "the local CA is created without the keychain prompt, and up waits until it is trusted" || bad "CA trust wait" "missing"
@@ -367,6 +372,11 @@ case "$RC:$OUT" in 0:*"homebrew: installing"*"tools: installing"*"tailscale: ins
 case "$OUT" in *"DRY-RUN: mkdir -p $T/brew"*"DRY-RUN: write $T/ld/com.meshweaver.fleet.tailscaled.plist"*) ok "the dry run prints the changing commands instead of running them" ;; *) bad "dry-run commands" "$OUT" ;; esac
 [ ! -e "$T/brew" ] && [ ! -e "$T/ld/com.meshweaver.fleet.tailscaled.plist" ] && ok "the dry run changed nothing" || bad "dry run changed the machine" "$(ls "$T")"
 grep -q 'network: WAITING' "$T/logs/fleet-bootstrap.log" && ok "the run is logged to /Library/Logs/MeshWeaver/fleet-bootstrap.log" || bad "bootstrap log" "$(cat "$T/logs/fleet-bootstrap.log" 2>/dev/null)"
+OUT="$(env FLEET_TS_FORMULA_API="file://$T/tailscale.json" FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_CONSOLE_USER=jroe FLEET_USER_HOME="$T/home" FLEET_BREW_PREFIX="$T/brew" FLEET_LOG_DIR="$T/logs" \
+  FLEET_TS_DIR="$T/tsbin" FLEET_LAUNCHDAEMONS_DIR="$T/ld" FLEET_TAILSCALED_SOCKET="$T/no.sock" FLEET_TAILSCALED_STATE_DIR="$T/ts" FLEET_MANAGED_PREFS="$T/none" FLEET_MACHINE_ID=studio-2 \
+  FLEET_CONTROL_URL=https://control.example.test bash "$FB" 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*"memex: provisioning the local stack"*"the join follows once the stack verifies"*) ok "a dry run with a control URL plans the provisioning from real probes" ;; *) bad "dry run with ControlUrl" "rc=$RC: $OUT" ;; esac
+case "$OUT" in *"joined as"*) bad "a dry run never claims a join" "$OUT" ;; *) ok "a dry run never claims a join" ;; esac
 OUT="$(env FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_CONSOLE_USER=root FLEET_LOG_DIR="$T/logs" bash "$FB" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*"no one is logged in"*) ok "no one at the console: nothing to do, exit 0" ;; *) bad "no console user" "rc=$RC: $OUT" ;; esac
 
