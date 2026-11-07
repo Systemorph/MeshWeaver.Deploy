@@ -79,14 +79,14 @@ open_setup_if_waiting &
 # WILDCARD binds only — the default loopback bind gets "permission denied" on 80/443.
 # The portal enforces its own sign-in, and the mesh was already reachable on the LAN
 # through the 8443 forward's wildcard sibling risks; keep the machine firewalled as usual.
-# A Mac published at a public name (`memex-local publish on`, <state dir>/publish.yaml) binds its front
+# A published Mac (`memex-local publish on` — its tailnet name and/or a public name, <state dir>/publish.yaml) binds its front
 # door to LOOPBACK only, on the unprivileged port alone (the low-port allowance above is for wildcard binds,
 # so a loopback 80/443 would be refused): https://memex.localhost:<port> locally, and the private network
 # reaches the same port through `tailscale serve` (TCP 443 → 127.0.0.1:<port>), so nothing on the LAN can
 # reach the portal directly. Every other install keeps all three mappings on every interface.
 # MEMEX_LOCAL_HOME comes from the LaunchAgent (__LOCAL_HOME__), so a non-default state dir is honoured.
 if [ -f "${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/publish.yaml" ]; then
-  echo "$(date -u +%FT%TZ) published at a public name — the front door binds loopback only, port ${HOST_PORT}"
+  echo "$(date -u +%FT%TZ) published on the private network — the front door binds loopback only, port ${HOST_PORT}"
   # The network's OWN entry point (memex-local publish → share/network-entry.yaml), loopback only too:
   # tailscale serve forwards the network's TCP 443 here, and the proxy behind it marks every request.
   # Held in a restart loop beside the front door; the front door is the process launchd watches.
