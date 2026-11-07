@@ -419,24 +419,68 @@ Cannot be run in this environment — verify on a real Apple-Silicon Mac:
   ACR pull (`az acr login`).
 - The end-to-end `curl https://memex.localhost:8443/` returning `http=200`.
 
-## Publishing a Mac at a public name
+## Publishing a Mac on the private network
 
-`memex-local publish on --host <name> --sign-in microsoft --tenant <directory id> --client-id <id> < secret-file`
-makes the portal also answer at `<name>` through the private network's ingress bridge
-(`deploy/tailnet-bridge/`). It writes `~/.memex-local/publish.yaml` (0600): the name as an additional
-ingress host (the portal's links keep `memex.localhost`), the Microsoft sign-in for it (a NAMED directory
-only), and invitation-only admission — the first person to sign in becomes the administrator, everyone
-after needs an invitation. The client secret is read from STDIN, never an argument, and never printed.
+`memex-local publish on --sign-in microsoft --tenant <directory id> --client-id <id> < secret-file`
+makes the portal also answer at the Mac's **own name on the private network** — the MagicDNS name
+`tailscale status --json` reports as `.Self.DNSName` (e.g. `mac-1.<tailnet suffix>`), read by the
+command and never typed. A member device on the network opens `https://<that name>` and reaches the Mac
+directly: nothing public is involved and no bridge is needed. This is the default; `--tailnet-only` says
+it explicitly. Without tailscale, or with tailscale not connected, there is no such name and a tailnet-only
+publish refuses, saying why.
+
+It writes `~/.memex-local/publish.yaml` (0600): the name as an additional ingress host (the portal's
+links keep `memex.localhost`), the Microsoft sign-in (a NAMED directory only), and invitation-only
+admission — the first person to sign in becomes the administrator, everyone after needs an invitation.
+The client secret is read from STDIN, never an argument, and never printed. The portal treats the tailnet
+name like any non-local host, so the real provider signs people in there; the development sign-in answers
+on localhost names only, and never for a request the entry point marked (Google, Apple and LinkedIn are a
+follow-up: the chart carries no client secret for them yet). `publish status` reads it back;
+`publish off` removes it; `memex-local update` applies either.
+
 While the layer exists the front door (`share/port-forward.sh`) binds **loopback only, on the
 unprivileged port alone** (macOS allows an unprivileged low-port bind on wildcard addresses only), so
 locally the portal is `https://memex.localhost:<port>` (default 8443). The private network gets its
-OWN entry point (`share/network-entry.yaml`, a small in-cluster proxy behind its own loopback forward on
-8446): `tailscale serve --tcp 443 tcp://127.0.0.1:8446` is the one way in, and the proxy marks EVERY request
-`X-MeshWeaver-Provenance: tailnet` (overwriting whatever the sender claimed) and serves the public name
-only, so the portal refuses the open sign-in for network traffic whatever its `Host` says. The network
-policy must let only the bridge (`tag:bridge`) reach TCP 443 and no member reach 8443, 8444 (the e2e portal) or 8446 (a
-userspace network client delivers to loopback-bound ports too). The
-development sign-in answers on localhost names only, so a public name always needs a real provider
-(Google, Apple and LinkedIn for a public name are a follow-up: the chart carries no client secret for
-them yet). `publish status` reads it back; `publish off` removes it; `memex-local update` applies either.
+OWN entry point (`share/network-entry.yaml`, a small in-cluster Caddy behind its own loopback forward on
+8446): `tailscale serve --tcp 443 tcp://127.0.0.1:8446` is the one way in, and the proxy has one site per
+published name, each marking EVERY request `X-MeshWeaver-Provenance: tailnet` (overwriting whatever the
+sender claimed) — there is no unmarked site, and a name the Mac does not publish gets no answer. The
+network policy must let no member reach 8443, 8444 (the e2e portal) or 8446 (a user-space network client
+delivers to loopback-bound ports too): TCP 443 is the one way in.
+
+### What a member device needs
+
+1. **Join the private network** (MeshWeaver.Deploy `deploy/headscale/README.md`) with MagicDNS on, so the
+   Mac's name resolves.
+2. **Trust the entry point's CA.** The entry point serves `tls internal`: a certificate from its own
+   local CA, which no browser and no WKWebView trusts until the device does. On the published Mac, after
+   `memex-local update`:
+
+   ```bash
+   memex-local publish ca > memex-entry-ca.crt
+   ```
+
+   prints the root certificate (PEM). It lives on the entry point's data volume, so a pod restart or a
+   re-publish keeps the same root and a device trusts it once; `publish off` keeps it too
+   (`kubectl -n memex delete pvc memex-network-entry-data` forgets it). Install it on the device:
+   - **macOS**: `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain memex-entry-ca.crt`
+     (or open it in Keychain Access and set *When using this certificate: Always Trust*).
+   - **iOS / iPadOS**: AirDrop or mail the file, install the profile (Settings → *Profile Downloaded*),
+     then turn it on under Settings → General → About → *Certificate Trust Settings*. Safari and the apps'
+     WKWebView use that trust store.
+   - **Windows / Linux**: import it as a trusted root (`certutil -addstore Root`, or
+     `/usr/local/share/ca-certificates/` + `update-ca-certificates`), and in Firefox under its own
+     certificate settings.
+3. **Register the sign-in redirect URI for the tailnet name** on the provider's app registration —
+   for Microsoft `https://<tailnet name>/signin-microsoft` (`publish on` prints the exact URI for every
+   name). Without it the provider refuses the sign-in with a redirect-URI mismatch. The command changes
+   no app registration itself.
+
+### Also at a public name (optional)
+
+`memex-local publish on --host <name> --sign-in microsoft …` ADDS a public name the private network's
+ingress bridge (`deploy/tailnet-bridge/`) forwards to the same port 443 with `Host` = the public name. The
+tailnet name is still published beside it when tailscale reports one (without one the public name is
+published alone, and the command says so); each name gets its own marked site and needs its own redirect
+URI. A public name is never the default.
 
