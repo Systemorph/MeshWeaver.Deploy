@@ -31,7 +31,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.3.0"
+readonly FLEET_BOOTSTRAP_VERSION="1.3.1"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -227,6 +227,10 @@ step_network() {
   run rm -f "$key_file"
 }
 
+# The INSTALLED CLI behind Homebrew's bin/ wrapper (a write_env_script that execs libexec/memex-local — sourcing
+# the wrapper would exec instead of defining the functions). Sourced only from here.
+memex_libexec() { printf '%s' "${FLEET_MEMEX_LIBEXEC:-$BREW_PREFIX/opt/memex-local/libexec}"; }
+
 # Whether a CA certificate is trusted for SSL by the system (the System keychain's trust settings). Pure read.
 ca_trusted() {
   security verify-cert -c "$1" -p ssl >/dev/null 2>&1
@@ -264,7 +268,8 @@ step_memex() {
   fi
   # A portal still serving its FIRST-RUN SETUP passes `verify` but has no database: nothing is joined or
   # finalised until the console user has configured it.
-  if probe_as_user "$user" env MEMEX_LOCAL_LIB=1 /bin/bash -c '. "$0"; awaiting_setup' "$mlocal"; then
+  if probe_as_user "$user" env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(memex_libexec)/share" MEMEX_CHART_DIR="$(memex_libexec)/share/helm" \
+       /bin/bash -c '. "$0"; awaiting_setup' "$(memex_libexec)/memex-local"; then
     log "memex: WAITING for the first-run setup — $user runs 'memex-local setup' (it prints the wizard's link) and completes it"
     return 0
   fi

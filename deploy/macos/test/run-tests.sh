@@ -359,6 +359,16 @@ env FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$T/tlog" bash -c '. "$0"; log "open htt
 ! grep -q 'abc123' "$T/tok.out" "$T/tlog/fleet-bootstrap.log" && grep -q 'token=<withheld>' "$T/tok.out" && ok "a token-bearing URL never reaches the output or the log" || bad "token withheld" "$(cat "$T/tok.out")"
 [ "$(ls -l "$T/tlog/fleet-bootstrap.log" | cut -c1-10)" = "-rw-------" ] && ok "the run log is readable by root only" || bad "log mode" "$(ls -l "$T/tlog/fleet-bootstrap.log")"
 grep -q "WAITING for the first-run setup" "$FB" && ok "a portal still in first-run setup is reported WAITING; nothing is joined or finalised" || bad "setup wait" "missing"
+# Regression: the setup probe sources the INSTALLED libexec CLI, never Homebrew's exec-ing bin/ wrapper.
+mkdir -p "$T/brewfake/bin" "$T/brewfake/opt/memex-local/libexec/share"
+printf '#!/bin/bash\nexec "%s/brewfake/opt/memex-local/libexec/memex-local" "$@"\n' "$T" > "$T/brewfake/bin/memex-local"
+printf '#!/bin/bash\nawaiting_setup() { [ "${FAKE_AWAITING:-}" = 1 ]; }\n[ "${MEMEX_LOCAL_LIB:-}" = 1 ] || echo dispatched\n' > "$T/brewfake/opt/memex-local/libexec/memex-local"
+chmod +x "$T/brewfake/bin/memex-local" "$T/brewfake/opt/memex-local/libexec/memex-local"
+lib="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BREW_PREFIX="$T/brewfake" bash -c '. "$0"; memex_libexec' "$FB")"
+[ "$lib" = "$T/brewfake/opt/memex-local/libexec" ] && ok "the setup probe resolves the installed libexec CLI behind the wrapper" || bad "memex_libexec" "$lib"
+if env MEMEX_LOCAL_LIB=1 FAKE_AWAITING=0 /bin/bash -c '. "$0"; awaiting_setup' "$lib/memex-local"; then bad "a configured portal is not 'awaiting setup'" "true"; else ok "sourcing the libexec CLI: a configured portal is not 'awaiting setup'"; fi
+env MEMEX_LOCAL_LIB=1 FAKE_AWAITING=1 /bin/bash -c '. "$0"; awaiting_setup' "$lib/memex-local" && ok "sourcing the libexec CLI: a portal in first-run setup is" || bad "awaiting setup detected" "false"
+grep -q '"$(memex_libexec)/memex-local"' "$FB" && ok "the bootstrap sources the libexec CLI, not bin/memex-local" || bad "bootstrap sources libexec" "missing"
 grep -q 'TS_CHANGED:-0' "$FB" && grep -q 'TS_CHANGED=1' "$FB" && ok "an upgraded tailscaled is reloaded, not left running the old binary" || bad "reload after upgrade" "missing"
 grep -q 'fleet.finalized' "$FB" && ok "a join's finalisation is recorded by a marker written only after it completed" || bad "finalisation marker" "missing"
 grep -q 'TRUST_STORES=nss' "$FB" && grep -q 'WAITING for the local CA to be trusted' "$FB" && ok "the local CA is created without the keychain prompt, and up waits until it is trusted" || bad "CA trust wait" "missing"
