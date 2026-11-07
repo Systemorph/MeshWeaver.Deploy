@@ -883,6 +883,14 @@ fleet_open_code() {
   rm -f "$ct"
 }
 
+# Whether this Mac is a FLEET HOST: in registry mode and joined (fleet.yaml) or offered back
+# (backlease.yaml), unless MEMEX_FLEET_HOST=0. Its first instance then installs Hosting by template.
+fleet_host() {
+  [ "${MEMEX_FLEET_HOST:-}" = "0" ] && return 1
+  registry_mode || return 1
+  [ -f "$FLEET_FILE" ] || [ -f "$BACKLEASE_FILE" ]
+}
+
 # One member of the opened payload — the control instance's compact {"v":1,"d":…,"m":…,"c":…}, whose values are
 # a deployment id and hex keys (no quote or backslash can occur), so a plain match reads it on macOS and Linux alike.
 fleet_payload() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" "$2" 2>/dev/null | head -1; }
@@ -1533,6 +1541,13 @@ helm_deploy() {
   if [ -f "$FLEET_FILE" ]; then
     mode_args+=(-f "$FLEET_FILE")
     info "FLEET: joined as '$(fleet_value Hosting__Deployment)' — keys from the enrolment code (never printed)"
+  fi
+  # FLEET HOST template (MacStudioFleet §3a): a joined or back-leased Mac in registry mode carries the
+  # Hosting app on its first instance — the heartbeat and the self-update patcher ship in it. Named in
+  # InstallByDefault with the baseline kept; nobody installs anything by hand. MEMEX_FLEET_HOST=0 opts out.
+  if fleet_host; then
+    mode_args+=(-f "$share_dir/values.local.fleet-host.yaml")
+    info "FLEET HOST: the Hosting app is part of this Mac's first instance (InstallByDefault Plugins/Hosting + the baseline)"
   fi
   # PUBLIC NAME layer (`memex-local publish on`): the additional host, its sign-in, invitation-only.
   if [ -f "$PUBLISH_FILE" ]; then
@@ -3180,6 +3195,19 @@ cmd_logs() {
   exec kubectl logs $follow --tail="$tail" "$target" -n "$NAMESPACE"
 }
 
+# The image source `update` really uses: what its flags chose, except that INSIDE the autoupdate agent a
+# registry-mode `--skip-image` re-apply follows the public GHCR image (MacStudioFleet §2b) — unless the
+# install follows a release channel (that is ACR's, behind a sign-in), or MEMEX_AUTOUPDATE_IMAGE=0.
+autoupdate_image_source() {
+  local source="$1" channel="${2:-}"
+  if [ "$source" = "skip" ] && [ -n "${MEMEX_IN_AUTOUPDATE:-}" ] && [ "${MEMEX_AUTOUPDATE_IMAGE:-1}" != "0" ] \
+     && [ -z "$channel" ] && registry_mode; then
+    printf 'ghcr'
+  else
+    printf '%s' "$source"
+  fi
+}
+
 cmd_update() {
   local image_source="build" acr_tag="$ACR_DEFAULT_TAG" rebuild_base="" channel="$CHANNEL" verdict
   registry_mode && image_source="ghcr"             # §17 — same default as `up`: the public GHCR, anonymously
@@ -3205,6 +3233,17 @@ cmd_update() {
     esac
     shift
   done
+  # 🚨 A fleet Mac must roll with no hand on it (MacStudioFleet §2b): the autoupdate agent re-applies a
+  # changed chart with `update --skip-image`, and an agent that is ALREADY running executes the OLD
+  # release's code — so the new release cannot change that call, only how `update` answers it. In
+  # registry mode the image is the public GHCR one (anonymous, no Azure sign-in), so inside the agent the
+  # re-apply follows it too: a template that needs a newer platform (a package's minMeshVersion) then
+  # lands in the same pass instead of waiting for a person to run `update`. MEMEX_AUTOUPDATE_IMAGE=0 opts out.
+  local chosen; chosen="$(autoupdate_image_source "$image_source" "$channel")"
+  if [ "$chosen" != "$image_source" ]; then
+    image_source="$chosen"
+    info "autoupdate in registry mode: following the public GHCR image as well as the chart"
+  fi
   preflight
   colima_running || die "Colima is not running — run 'memex-local up' first"
   ensure_overlay                                 # reuse the existing overlay/secrets (idempotent)
@@ -3278,11 +3317,13 @@ own remedy." ;;
     return 0
   fi
   echo
-  info "Self-update note: this same chart carries the in-pod self-updater. With"
-  info "Admin/UpdatePolicy = Continuous (default), a Continuous/RELEASE install"
-  info "auto-rolls to newer ACR tags on its own (see Doc/Architecture/ReleaseStrategy)."
-  info "A pure local-build loop has nothing to poll — treat it as 'None' and use"
-  info "'memex-local update' as the manual path."
+  if registry_mode; then
+    info "Self-update: this install follows the public GHCR image (ghcr.io/systemorph/memex-portal-ai) —"
+    info "the autoupdate agent pulls it with every new memex-local release, and the in-pod self-updater"
+    info "follows Admin/UpdatePolicy. No Azure sign-in is involved (see Doc/Architecture/ReleaseStrategy)."
+  else
+    info "Self-update: a local-build install has nothing to poll — 'memex-local update' rebuilds it."
+  fi
 }
 
 cmd_port_forward() {
@@ -3964,7 +4005,7 @@ PLIST
       elif ! colima_running; then
         printf '%s autoupdate: chart changed but Colima is not running — the next up/update applies it\n' "$(date -u +%FT%TZ)"
       else
-        printf '%s autoupdate: chart changed — re-applying it (update --skip-image)\n' "$(date -u +%FT%TZ)"
+        printf '%s autoupdate: chart changed — re-applying it (update; registry mode also follows the public GHCR image)\n' "$(date -u +%FT%TZ)"
         if MEMEX_IN_AUTOUPDATE=1 "$(brew --prefix)/bin/memex-local" update --skip-image; then
           printf '%s autoupdate: chart re-applied on %s\n' "$(date -u +%FT%TZ)" "$after"
         else
