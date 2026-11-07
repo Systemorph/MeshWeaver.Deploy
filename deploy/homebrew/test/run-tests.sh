@@ -1653,6 +1653,9 @@ M="$(env MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c '. "$0"; ollama() { print
 [ "$M" = 24 ] && ok "the largest model's size is read from 'ollama list' and rounded UP (23.4 GB → 24)" || bad "largest model" "$M"
 # apply against recording stubs: a missing VM is created at the plan; an installed release is sized; never the portal's context.
 BH="$(mktemp -d)"; mkdir -p "$BH/stubs"
+# launchctl, taskpolicy and lsof are stubbed too: apply loads the priority governor, and a test on a developer's
+# Mac must never load a real launchd agent or touch a real VM's policy.
+for t in launchctl taskpolicy lsof; do printf '#!/bin/bash\necho "%s $*" >> "%s/log"\nexit 0\n' "$t" "$BH" > "$BH/stubs/$t"; done
 for t in colima helm kubectl; do cat > "$BH/stubs/$t" <<STUB
 #!/bin/bash
 # Version probes (the toolchain resolver's floor check) are answered at the manifest's version; nothing reaches a real binary.
@@ -1690,8 +1693,36 @@ grep -q 'colima stop -p build' "$BH/log" && grep -q 'colima start -p build --cpu
 bh FAKE_COLIMA_LIST='{"name":"build","status":"Stopped","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply >/dev/null 2>&1
 grep -q '^colima start -p build$' "$BH/log" && grep -q 'upgrade build-host-mac' "$BH/log" && ok "a STOPPED build VM is started before its release is sized (never a helm call against a stopped cluster)" || bad "stopped vm" "$(cat "$BH/log")"
 grep -q 'kubectl --context colima-build -n keda wait --for=condition=Available deployment --all' "$BH/log" && ok "KEDA is checked for Available deployments, not only its CRD" || bad "keda health" "$(cat "$BH/log")"
+grep -q '^launchctl bootstrap gui/[0-9]* .*/Library/LaunchAgents/com.memex.local.buildhost-priority.plist' "$BH/log" \
+  && grep -q '<key>MEMEX_BUILD_PROFILE</key><string>build</string>' "$BH/Library/LaunchAgents/com.memex.local.buildhost-priority.plist" \
+  && [ -x "$BH/.memex-local/buildhost-priority.sh" ] \
+  && ok "apply loads the priority governor (launchd agent for profile build, script copied to ~/.memex-local)" || bad "apply priority governor" "$(cat "$BH/log")"
 OUT="$(bh MEMEX_HOST_MEM_GIB=abc "$CLI" buildhost plan 2>&1)" && bad "a non-numeric probe was used" "$OUT" || { case "$OUT" in *"instead of a whole number"*) ok "a host probe that is not a whole number stops the plan (never sized from 0)" ;; *) bad "probe validation" "$OUT" ;; esac; }
 rm -rf "$BH"
+
+echo "── buildhost priority: fleet jobs at the lowest priority, every idle core otherwise ──"
+GOV="$HERE/../share/buildhost-priority.sh"
+gov() { env MEMEX_BUILD_PRIO_LIB=1 bash -c 'set -u; . "$0"; shift; "$@"' "$GOV" _ "$@"; }
+[ "$(gov decide full 250 0 0 2)" = "yield 0" ] && ok "others above two cores → the build VM yields at once" || bad "yield on others" "$(gov decide full 250 0 0 2)"
+[ "$(gov decide full 100 12 0 2)" = "yield 0" ] && ok "Ollama computing → the build VM yields, however idle the rest" || bad "yield on ollama" "$(gov decide full 100 12 0 2)"
+[ "$(gov decide full 199 9 0 2)" = "full 0" ] && ok "below both thresholds the build VM keeps every idle core" || bad "full when idle" "$(gov decide full 199 9 0 2)"
+[ "$(gov decide yield 100 0 10 2)" = "yield 12" ] && [ "$(gov decide yield 100 0 14 2)" = "full 0" ] \
+  && ok "back to full only after the rest stayed calm for 15 s (hysteresis, no flapping)" || bad "resume hysteresis" "$(gov decide yield 100 0 14 2)"
+[ "$(gov decide yield 160 0 14 2)" = "yield 0" ] && ok "between the resume and yield thresholds the calm clock restarts" || bad "calm reset" "$(gov decide yield 160 0 14 2)"
+GT="$(mktemp -d)"
+printf '  0 10:00.00 kernel_task\n  10 0:01.00 /usr/bin/foo\n  20 1:00:00.00 VZ\n  30 0:00.50 /opt/homebrew/bin/ollama runner\n' | gov sample_cpu /dev/null "$GT/a" "20" > "$GT/r1"
+printf '  0 20:00.00 kernel_task\n  10 0:03.50 /usr/bin/foo\n  20 2:00:00.00 VZ\n  30 0:01.50 /opt/homebrew/bin/ollama runner\n  40 0:00.20 /opt/homebrew/Cellar/ollama/0.40.14/libexec/lib/ollama/llama-server --model x\n' | gov sample_cpu "$GT/a" "$GT/b" "20" > "$GT/r2"
+[ "$(cat "$GT/r1")" = "0 0" ] && [ "$(cat "$GT/r2")" = "370 120" ] \
+  && ok "CPU is the delta since the last sample (h:mm:ss parsed), excluding the build VM and kernel_task; Ollama (serve, runner, llama-server) counted apart" || bad "sample_cpu" "$(cat "$GT/r1") / $(cat "$GT/r2")"
+mkdir -p "$GT/home/.colima/_lima/colima-build" "$GT/stubs"; : > "$GT/home/.colima/_lima/colima-build/disk"
+printf '#!/bin/bash\n[ "$1" = -t ] && case "$2" in */colima-build/disk) echo 4242 ;; esac\n' > "$GT/stubs/lsof"; chmod +x "$GT/stubs/lsof"
+[ "$(env PATH="$GT/stubs:$PATH" HOME="$GT/home" COLIMA_HOME= MEMEX_BUILD_PRIO_LIB=1 bash -c '. "$0"; vm_pids' "$GOV")" = 4242 ] \
+  && ok "the build VM process is the one holding the build profile's disk open — never found by name" || bad "vm_pids" ""
+[ "$(env HOME="$GT/home" MEMEX_BUILD_PRIO_LIB=1 MEMEX_BUILD_PROFILE=default bash -c '. "$0"; instance_dir default' "$GOV")" = "$GT/home/.colima/_lima/colima" ] \
+  && ok "profile default maps to Lima instance colima, any other to colima-<profile>" || bad "instance_dir" ""
+rm -rf "$GT"
+OUT="$(bash "$GOV" --install --profile 'Bad Name' 2>&1)" && bad "a bad profile was accepted" "$OUT" || ok "the governor refuses a profile that is not a Colima profile name"
+
 FJB="$(awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI")"
 grep -q '( cmd_buildhost apply ) || warn' <<<"$FJB" && grep -q -- '--no-buildhost) with_build="no"' <<<"$FJB" \
   && ok "fleet join runs buildhost apply by default (--no-buildhost skips it), and a failure there never ends the join" || bad "fleet join buildhost" ""

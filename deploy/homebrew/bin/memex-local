@@ -4094,6 +4094,7 @@ cmd_buildhost() {
         fi
       fi
       buildhost_keda
+      buildhost_priority_install
       if helm --kube-context "$(build_ctx)" -n "$BUILD_NS" status "$BUILD_RELEASE" >/dev/null 2>&1; then
         step "Sizing the runners: $(plan_value runners_min "$plan")…$(plan_value runners_max "$plan") × ${BUILD_CPU_PER_RUNNER} CPU, $(plan_value stage_slots "$plan") stage slots"
         helm --kube-context "$(build_ctx)" -n "$BUILD_NS" upgrade "$BUILD_RELEASE" "$(resolve_chart)" --reuse-values \
@@ -4121,9 +4122,29 @@ m, r = v.get("mac", {}), v.get("resources", {})
 print("  runners %s…%s, %s stage slots, requests %s, limits %s" % (m.get("minReplicas", "?"), m.get("maxReplicas", "?"), v.get("stageSlots", "?"), r.get("requests"), r.get("limits")))' 2>/dev/null \
         || warn "no build-host release $BUILD_RELEASE in $(build_ctx)"
       build_kubectl -n "$BUILD_NS" get pods --no-headers 2>/dev/null | awk '{ print "  " $1 "  " $3 }' || true
+      MEMEX_BUILD_PROFILE="$BUILD_PROFILE" MEMEX_LOCAL_HOME="$LOCAL_HOME" bash "$(resolve_share)/buildhost-priority.sh" --status 2>/dev/null | sed 's/^/  priority: /' || true
       ;;
-    *) die "usage: memex-local buildhost {plan | apply [--resize] | status}" ;;
+    priority)
+      case "${1:-status}" in
+        install) buildhost_priority_install ;;
+        off) MEMEX_BUILD_PROFILE="$BUILD_PROFILE" MEMEX_LOCAL_HOME="$LOCAL_HOME" bash "$(resolve_share)/buildhost-priority.sh" --uninstall ;;
+        status) MEMEX_BUILD_PROFILE="$BUILD_PROFILE" MEMEX_LOCAL_HOME="$LOCAL_HOME" bash "$(resolve_share)/buildhost-priority.sh" --status ;;
+        *) die "usage: memex-local buildhost priority {install | off | status}" ;;
+      esac
+      ;;
+    *) die "usage: memex-local buildhost {plan | apply [--resize] | status | priority [install|off|status]}" ;;
   esac
+}
+
+# Fleet jobs run at the LOWEST priority on a leased Mac: the launchd governor (share/buildhost-priority.sh) puts the
+# build VM's process in the background band while anything else wants the cores (the owner, the portal VM, Ollama)
+# and gives it every idle core otherwise. nice/renice do nothing on macOS (measured) — see the script's header and
+# MeshWeaver.Plugins Hosting/MacStudioAttachRunbook §5. Idempotent; part of every `buildhost apply`.
+buildhost_priority_install() {
+  step "Fleet jobs at the lowest priority: the build VM yields to everything else on this Mac"
+  MEMEX_BUILD_PROFILE="$BUILD_PROFILE" MEMEX_LOCAL_HOME="$LOCAL_HOME" bash "$(resolve_share)/buildhost-priority.sh" --install --profile "$BUILD_PROFILE" >/dev/null \
+    && ok "launchd agent com.memex.local.buildhost-priority loaded ('memex-local buildhost priority status')" \
+    || warn "the build-host priority governor did not load — the build VM competes with the owner at the default band; 'memex-local buildhost priority install'"
 }
 
 # KEDA in the build VM: the runners' scaler. Idempotent.
@@ -4248,12 +4269,15 @@ COMMANDS:
                   the observability stack sized for the VM (--no-observability skips it) and
                   the build VM sized from this host (buildhost apply; --no-buildhost skips it).
                   'status' shows the fingerprints.
-  buildhost plan | apply [--resize] | status
+  buildhost plan | apply [--resize] | status | priority [install|off|status]
                   BUILD RUNNERS sized from this host: a build VM (Colima profile build, containerd)
                   of cores − 2 CPU and host − portal VM − largest model − headroom GiB; runners of
                   4 CPU with 4 stage slots each, 1 warm … VM CPU / 4 under KEDA, so the stage
                   containers together fill the VM. 'apply' creates the VM and KEDA and sizes an
                   installed release; --resize restarts a smaller VM at the planned size.
+                  Fleet jobs run at the LOWEST priority: 'apply' also loads a launchd governor that
+                  puts the build VM in the background band while the owner, the portal VM or Ollama
+                  want the cores, and gives it every idle core otherwise ('priority off' removes it).
   backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>] | status | off
   internal on --tenant <id> --client-id <id> < secret | status | off
                   INTERNAL ONLY — the fleet default: the portal answers at this Mac's private-network
