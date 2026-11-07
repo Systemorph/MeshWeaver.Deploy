@@ -1032,7 +1032,9 @@ printf 'pluginCatalog:\n  registryUrl: "https://memex.example.test"\n' > "$FH/ho
 [ "$(fh_lib MEMEX_FLEET_HOST=0)" = "no" ] && ok "MEMEX_FLEET_HOST=0 opts out" || bad "opt-out" "$(fh_lib MEMEX_FLEET_HOST=0)"
 rm "$FH/home/.memex-local/backlease.yaml"; : > "$FH/home/.memex-local/fleet.yaml"
 [ "$(fh_lib)" = "yes" ] && ok "a joined Mac (fleet join) is a fleet host" || bad "fleet join → fleet host" "$(fh_lib)"
-awk '/^cmd_update\(\) \{/,/^}$/' "$CLI" | grep -q 'image_source="ghcr"' && awk '/^cmd_update\(\) \{/,/^}$/' "$CLI" | grep -q 'MEMEX_IN_AUTOUPDATE' \
+# (sed, not awk: mawk on the Linux runner reads `\{` differently)
+upd_body="$(sed -n '/^cmd_update() {/,/^}$/p' "$CLI")"
+grep -q 'image_source="ghcr"' <<<"$upd_body" && grep -q 'MEMEX_IN_AUTOUPDATE' <<<"$upd_body" \
   && ok "inside the autoupdate agent, a registry-mode update --skip-image still follows the public GHCR image" || bad "autoupdate follows GHCR" "missing in cmd_update"
 grep -q 'mode_args+=(-f "$share_dir/values.local.fleet-host.yaml")' "$CLI" && ok "helm_deploy layers the fleet-host template" || bad "helm_deploy layers fleet-host" "missing"
 rm -rf "$FH"
