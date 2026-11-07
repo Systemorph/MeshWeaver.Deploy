@@ -3976,6 +3976,7 @@ largest_model_gib() {
 #   runners (max)  = VM CPU / CPU per runner, each with stage slots = CPU per runner, so the stage containers
 #                    of all runners together ≈ the VM's CPUs; KEDA keeps BUILD_MIN_WARM warm and scales to max
 #   runner memory  = (VM GiB − the VM's own system share) / max runners, capped; request = limit − 4 GiB
+#   (host − portal VM: every OTHER Colima profile's memory is subtracted, see other_vms_gib)
 buildhost_plan() {
   # $3 (the portal VM's CPU) is not subtracted: the two VMs share the host's cores, and macOS schedules
   # whichever is busy; memory is not shared, so the portal VM's memory is.
@@ -3987,8 +3988,10 @@ buildhost_plan() {
   [ "$lim" -ge 8 ] || { echo "error=only ${vmem} GiB left for the build VM (host ${mem} − portal VM ${pmem} − model ${model} − headroom ${BUILD_HEADROOM_GIB}); a runner needs at least 8 GiB"; return 1; }
   req=$(( lim - 4 ))
   local minw="$BUILD_MIN_WARM"; [ "$minw" -le "$runners" ] || minw="$runners"
-  printf 'vm_cpu=%s\nvm_mem=%s\nrunners_min=%s\nrunners_max=%s\nrunner_cpu=%s\nrunner_mem_request=%s\nrunner_mem_limit=%s\nstage_slots=%s\nstage_total=%s\n' \
-    "$cpu" "$vmem" "$minw" "$runners" "$per" "$req" "$lim" "$per" "$(( runners * per ))"
+  # The CPU REQUEST sits half a core under the limit: k3s, KEDA and the kubelet request CPU too, and N runners
+  # requesting the VM's every core would leave the last one Pending. The limit still lets each use its 4.
+  printf 'vm_cpu=%s\nvm_mem=%s\nrunners_min=%s\nrunners_max=%s\nrunner_cpu=%s\nrunner_cpu_request=%sm\nrunner_mem_request=%s\nrunner_mem_limit=%s\nstage_slots=%s\nstage_total=%s\n' \
+    "$cpu" "$vmem" "$minw" "$runners" "$per" "$(( per * 1000 - 500 ))" "$req" "$lim" "$per" "$(( runners * per ))"
 }
 plan_value() { awk -F= -v k="$1" '$1 == k { print $2; exit }' <<<"$2"; }
 
@@ -4005,17 +4008,49 @@ for line in sys.stdin:
         break' "$BUILD_PROFILE" 2>/dev/null || true
 }
 
+# The memory every OTHER Colima profile claims (GiB) — the portal's and any other VM on this Mac, running
+# or not (a stopped VM starts again at its size) — or the portal VM's configured size, whichever is larger.
+other_vms_gib() {
+  local sum
+  sum="$(colima list --json 2>/dev/null | python3 -c 'import json,sys
+t = 0
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    d = json.loads(line)
+    if d.get("name") != sys.argv[1]: t += int(d.get("memory", 0))
+print(t // 1073741824)' "$BUILD_PROFILE" 2>/dev/null)" || sum=0
+  [ "${sum:-0}" -ge "$COLIMA_MEM" ] 2>/dev/null || sum="$COLIMA_MEM"
+  printf '%s' "$sum"
+}
+
+# The tools the build host needs, resolved like every other command (an existing install meeting the floor,
+# else the installer's vendored copy) — never whatever `colima`/`helm` happens to be first on PATH.
+buildhost_tools() { tools_activate; need colima colima; need kubectl kubernetes-cli; need helm helm; }
+
+# `colima start -p <profile>` makes that profile's context the CURRENT kubectl context, which every unpinned
+# portal command would then follow into the build cluster. Run it, then put the previous context back.
+colima_keep_context() {
+  local prev rc=0
+  prev="$(kubectl config current-context 2>/dev/null || true)"
+  "$@" || rc=$?
+  if [ -n "$prev" ]; then kubectl config use-context "$prev" >/dev/null 2>&1 || warn "could not restore the kubectl context '$prev' — run 'kubectl config use-context $prev'"; fi
+  return "$rc"
+}
+
 cmd_buildhost() {
   local sub="${1:-status}"; shift || true
-  local plan
-  plan="$(buildhost_plan "$(host_cores)" "$(host_mem_gib)" "$COLIMA_CPU" "$COLIMA_MEM" "$(largest_model_gib)")" \
+  buildhost_tools
+  local plan others
+  others="$(other_vms_gib)"
+  plan="$(buildhost_plan "$(host_cores)" "$(host_mem_gib)" "$COLIMA_CPU" "$others" "$(largest_model_gib)")" \
     || die "buildhost: $(plan_value error "$plan")"
   local cpu vmem
   cpu="$(plan_value vm_cpu "$plan")"; vmem="$(plan_value vm_mem "$plan")"
   case "$sub" in
     plan)
       [ $# -eq 0 ] || die "buildhost plan: takes no arguments"
-      info "host: $(host_cores) cores, $(host_mem_gib) GiB; portal VM ${COLIMA_CPU} CPU / ${COLIMA_MEM} GiB; largest model $(largest_model_gib) GiB"
+      info "host: $(host_cores) cores, $(host_mem_gib) GiB; other VMs ${others} GiB (the portal's included); largest model $(largest_model_gib) GiB"
       info "build VM (profile $BUILD_PROFILE): ${cpu} CPU / ${vmem} GiB"
       info "runners: $(plan_value runners_min "$plan") warm … $(plan_value runners_max "$plan") (KEDA), each ${BUILD_CPU_PER_RUNNER} CPU / $(plan_value runner_mem_request "$plan")–$(plan_value runner_mem_limit "$plan") GiB, $(plan_value stage_slots "$plan") stage slots → up to $(plan_value stage_total "$plan") stage containers at once"
       ;;
@@ -4026,7 +4061,7 @@ cmd_buildhost() {
       size="$(build_vm_size)"
       if [ -z "$size" ]; then
         step "Creating the build VM (Colima profile $BUILD_PROFILE: ${cpu} CPU / ${vmem} GiB, containerd, k3s)"
-        colima start -p "$BUILD_PROFILE" --cpu "$cpu" --memory "$vmem" --disk 100 --runtime containerd --kubernetes \
+        colima_keep_context colima start -p "$BUILD_PROFILE" --cpu "$cpu" --memory "$vmem" --disk 100 --runtime containerd --kubernetes \
           --k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet \
           || die "buildhost: could not start the build VM (colima start -p $BUILD_PROFILE)"
       else
@@ -4034,12 +4069,13 @@ cmd_buildhost() {
         if [ "${have_cpu:-0}" -lt "$cpu" ] || [ "${have_mem:-0}" -lt "$vmem" ]; then
           if [ "$resize" = "yes" ]; then
             step "Resizing the build VM ${have_cpu} CPU / ${have_mem} GiB → ${cpu} / ${vmem} (a restart: running builds are re-queued by the build API; the disk is kept)"
-            colima stop -p "$BUILD_PROFILE" && colima start -p "$BUILD_PROFILE" --cpu "$cpu" --memory "$vmem" \
-              || die "buildhost: could not resize the build VM"
+            colima stop -p "$BUILD_PROFILE" || die "buildhost: could not stop the build VM for the resize"
+            colima_keep_context colima start -p "$BUILD_PROFILE" --cpu "$cpu" --memory "$vmem" \
+              || die "buildhost: the build VM stopped but did not start at ${cpu} CPU / ${vmem} GiB — 'colima start -p $BUILD_PROFILE' starts it again"
           else
             warn "the build VM is ${have_cpu} CPU / ${have_mem} GiB, the plan is ${cpu} / ${vmem} — 'memex-local buildhost apply --resize' restarts it at that size"
             cpu="$have_cpu"; vmem="$have_mem"
-            plan="$(buildhost_plan $(( cpu + 2 )) $(( vmem + COLIMA_MEM + $(largest_model_gib) + BUILD_HEADROOM_GIB )) "$COLIMA_CPU" "$COLIMA_MEM" "$(largest_model_gib)")" \
+            plan="$(buildhost_plan $(( cpu + 2 )) $(( vmem + others + $(largest_model_gib) + BUILD_HEADROOM_GIB )) "$COLIMA_CPU" "$others" "$(largest_model_gib)")" \
               || die "buildhost: the current build VM is too small for one runner — 'memex-local buildhost apply --resize'"
           fi
         else
@@ -4052,7 +4088,7 @@ cmd_buildhost() {
         helm --kube-context "$(build_ctx)" -n "$BUILD_NS" upgrade "$BUILD_RELEASE" "$(resolve_chart)" --reuse-values \
           --set "buildHosts.mac.minReplicas=$(plan_value runners_min "$plan")" \
           --set "buildHosts.mac.maxReplicas=$(plan_value runners_max "$plan")" \
-          --set-string "buildHosts.resources.requests.cpu=${BUILD_CPU_PER_RUNNER}" \
+          --set-string "buildHosts.resources.requests.cpu=$(plan_value runner_cpu_request "$plan")" \
           --set-string "buildHosts.resources.requests.memory=$(plan_value runner_mem_request "$plan")Gi" \
           --set-string "buildHosts.resources.limits.cpu=${BUILD_CPU_PER_RUNNER}" \
           --set-string "buildHosts.resources.limits.memory=$(plan_value runner_mem_limit "$plan")Gi" \

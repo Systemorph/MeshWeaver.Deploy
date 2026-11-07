@@ -1638,8 +1638,8 @@ rm -rf "$IN"
 echo "── buildhost: build runners sized from the host, KEDA, no helm by hand ──"
 lib() { env MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c 'set -euo pipefail; . "$0"; shift; "$@"' "$CLI" _ "$@"; }
 P="$(lib buildhost_plan 18 128 8 16 0)"
-[ "$P" = "$(printf 'vm_cpu=16\nvm_mem=104\nrunners_min=1\nrunners_max=4\nrunner_cpu=4\nrunner_mem_request=20\nrunner_mem_limit=24\nstage_slots=4\nstage_total=16')" ] \
-  && ok "an 18-core / 128 GiB Mac: build VM 16 CPU / 104 GiB, runners 1…4 × 4 CPU, 20–24 GiB, 4 stage slots = 16 stage containers" || bad "plan 18/128" "$P"
+[ "$P" = "$(printf 'vm_cpu=16\nvm_mem=104\nrunners_min=1\nrunners_max=4\nrunner_cpu=4\nrunner_cpu_request=3500m\nrunner_mem_request=20\nrunner_mem_limit=24\nstage_slots=4\nstage_total=16')" ] \
+  && ok "an 18-core / 128 GiB Mac: build VM 16 CPU / 104 GiB, runners 1…4 × 4 CPU (request 3.5: system pods fit), 20–24 GiB, 4 stage slots = 16 stage containers" || bad "plan 18/128" "$P"
 P="$(lib buildhost_plan 18 128 8 16 23)"
 grep -q '^vm_mem=81$' <<<"$P" && grep -q '^runner_mem_limit=19$' <<<"$P" && grep -q '^runner_mem_request=15$' <<<"$P" \
   && ok "the largest local model's memory is kept out of the build VM (23 GiB model → 81 GiB VM, 19 GiB runners)" || bad "plan with model" "$P"
@@ -1655,6 +1655,8 @@ M="$(env MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c '. "$0"; ollama() { print
 BH="$(mktemp -d)"; mkdir -p "$BH/stubs"
 for t in colima helm kubectl; do cat > "$BH/stubs/$t" <<STUB
 #!/bin/bash
+# Version probes (the toolchain resolver's floor check) are answered at the manifest's version; nothing reaches a real binary.
+case "\$*" in *version*) case "$t" in colima) echo "colima version 0.10.3" ;; kubectl) echo "Client Version: v1.37.1" ;; helm) echo "v4.3.1+gabc" ;; esac; exit 0 ;; esac
 echo "$t \$*" >> "$BH/log"
 case "$t \$*" in
   "colima list"*) printf '%s' "\${FAKE_COLIMA_LIST:-}" ;;
@@ -1663,14 +1665,17 @@ esac
 exit 0
 STUB
 done; chmod +x "$BH/stubs/"*
-bh() { env PATH="$BH/stubs:$STUBS:$PATH" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
+# PATH holds the stubs and the system directories ONLY (no Homebrew), and MEMEX_PREFIX names an empty
+# prefix: the resolver can find no real colima, helm or kubectl — a test must never start a VM.
+mkdir -p "$BH/prefix"
+bh() { env PATH="$BH/stubs:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" MEMEX_PREFIX="$BH/prefix" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
 OUT="$(bh "$CLI" buildhost apply 2>&1)"
 grep -q 'colima start -p build --cpu 16 --memory 104 --disk 100 --runtime containerd --kubernetes' "$BH/log" && grep -q 'kubectl --context colima-build get crd scaledobjects.keda.sh' "$BH/log" \
   && case "$OUT" in *"first attach installs it"*) true ;; *) false ;; esac \
   && ok "apply creates the build VM at the plan (containerd, k3s), checks KEDA in colima-build, and names the first attach for a missing release" || bad "apply create" "$OUT / $(cat "$BH/log")"
 : > "$BH/log"
 OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
-grep -q 'helm --kube-context colima-build -n build-mac upgrade build-host-mac .* --reuse-values --set buildHosts.mac.minReplicas=1 --set buildHosts.mac.maxReplicas=4 --set-string buildHosts.resources.requests.cpu=4 --set-string buildHosts.resources.requests.memory=20Gi --set-string buildHosts.resources.limits.cpu=4 --set-string buildHosts.resources.limits.memory=24Gi --set buildHosts.stageSlots=4' "$BH/log" \
+grep -q 'helm --kube-context colima-build -n build-mac upgrade build-host-mac .* --reuse-values --set buildHosts.mac.minReplicas=1 --set buildHosts.mac.maxReplicas=4 --set-string buildHosts.resources.requests.cpu=3500m --set-string buildHosts.resources.requests.memory=20Gi --set-string buildHosts.resources.limits.cpu=4 --set-string buildHosts.resources.limits.memory=24Gi --set buildHosts.stageSlots=4' "$BH/log" \
   && ! grep -q 'colima start\|colima stop' "$BH/log" \
   && ok "an installed release is sized in place (--reuse-values, its own context); a VM that covers the plan is not restarted" || bad "apply size" "$OUT / $(cat "$BH/log")"
 : > "$BH/log"
