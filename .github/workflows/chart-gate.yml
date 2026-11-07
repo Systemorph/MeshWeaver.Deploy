@@ -187,6 +187,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: deploy/aks/scripts/test-chart-drift-render.sh
 
+      # The drift checker's LIVE reads on a cluster that does not serve a kind (MeshWeaver.Deploy#155):
+      # scaledobjects.keda.sh without KEDA used to stop the Audit's chart step before it compared
+      # anything. The real check-chart-drift.sh, real render and real comparator run with kubectl and
+      # `helm get manifest` answered from fixtures; two negative controls swap the shared rule
+      # (kind-not-served.sh) for a wrong one and require the matching case to go red.
+      - name: Assert the chart-drift check skips an unserved kind only when the chart renders none of it
+        if: ${{ !cancelled() }}
+        run: deploy/aks/scripts/test-check-chart-drift-unserved-kinds.sh
+
       # The portal's postStart hook (deploy/helm/files/crash-dump-retention.sh) is the only thing
       # between a crash loop and a full /data volume, and it deletes files. Rendering it proves
       # nothing about WHAT it deletes, so it is EXECUTED here against scratch directories: keep the

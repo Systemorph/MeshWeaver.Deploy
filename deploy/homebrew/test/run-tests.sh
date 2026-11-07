@@ -1126,7 +1126,7 @@ cat > "$OM/stubs/kubectl" <<STUB
 #!/bin/bash
 echo "\$@" >> "$OM/k.log"
 case "\$*" in
-  *"get statefulset loki -o jsonpath"*) printf '%s' "\${FAKE_TEMPLATES:-}" ;;
+  *"get statefulset loki -o jsonpath"*) printf '%s' "\${FAKE_TEMPLATES:-}"; exit "\${FAKE_READ_RC:-0}" ;;
   *"get statefulset loki"*) exit "\${FAKE_STS_RC:-0}" ;;
 esac
 exit 0
@@ -1140,7 +1140,10 @@ grep -q -- '--context colima -n monitoring delete statefulset loki' "$OM/k.log" 
 ! grep -q 'delete' "$OM/k.log" && ok "a Loki that already has its claim template is left alone" || bad "persistent loki deleted" "$(cat "$OM/k.log")"
 : > "$OM/k.log"; om env FAKE_STS_RC=1 bash -c 'set -euo pipefail; . "$0"; observability_migrate_loki' "$CLI" >/dev/null 2>&1
 ! grep -q 'delete' "$OM/k.log" && ok "no Loki yet: nothing to migrate" || bad "no loki deleted" "$(cat "$OM/k.log")"
+: > "$OM/k.log"; om env FAKE_READ_RC=1 bash -c 'set -euo pipefail; . "$0"; observability_migrate_loki' "$CLI" >/dev/null 2>&1
+! grep -q 'delete' "$OM/k.log" && ok "a FAILED read of the claim templates deletes nothing (it is not 'no template')" || bad "failed read deleted" "$(cat "$OM/k.log")"
 rm -rf "$OM"
+grep -q 'helm --kube-context "${MEMEX_KUBE_CONTEXT:-colima}" upgrade --install loki grafana/loki-stack' "$CLI" && ok "the observability release is pinned to the local cluster's context, like the migration" || bad "observability helm context" ""
 grep -q 'storage.tsdb.retention.size: 6GB' "$HERE/../share/values.observability.yaml" && grep -q 'persistentVolume: { size: 8Gi }' "$HERE/../share/values.observability.yaml" \
   && ok "Prometheus is capped by SIZE too (6 GB on the chart's 8Gi volume — an existing PVC is never asked to grow)" || bad "prometheus size cap" ""
 # Observability: sized values, layered by the command; fleet join installs it by default.

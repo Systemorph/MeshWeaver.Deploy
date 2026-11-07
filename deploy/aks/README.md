@@ -86,6 +86,7 @@ deploy/aks/
 │   ├── import-dashboards.sh   ← generic Grafana dashboard importer
 │   ├── check-chart-invariants.sh ← PR gate: does the CHART describe a workable shape?
 │   ├── check-chart-drift.sh   ← does the CLUSTER run what the chart describes?
+│   ├── kind-not-served.sh     ← the one rule for a kind the cluster does not serve (drift + audit)
 │   ├── aks-extras.yaml        ← StorageClass + RWX PVCs, applied by deploy.sh
 │   └── values.deploy.example.yaml ← template for your secrets file (never commit the real one)
 └── manifests/                 ← applied alongside the Helm release
@@ -310,6 +311,14 @@ makes the split explicit — it takes `--via kubectl|aks-invoke`. Its scheduled 
 governed `Audit` InstanceAction (`hosting-chart-drift`, in the VNet as hosting-operator), which
 passes `kubectl`; the former GitHub-side caller `chart-drift.yml` and its `aks-invoke` read were
 retired with Systemorph/Memex#647.
+
+A kind the cluster does not serve — `scaledobjects.keda.sh` on a cluster without KEDA — is decided by
+ONE rule, `scripts/kind-not-served.sh`, which both steps of an Audit source (`hosting-audit` and
+`check-chart-drift.sh`): the read is answered as an empty list and the kind is named as skipped.
+`check-chart-drift.sh` adds the question only it can ask, because only it holds the render: if the
+rendered chart DOES contain an object of that kind, the run fails (a deploy of that render cannot
+succeed), it never skips. Every other failed read — Forbidden above all — stays fatal
+(MeshWeaver.Deploy#155; `scripts/test-check-chart-drift-unserved-kinds.sh`).
 
 > **Jumpbox + Azure Bastion** is the third option: the `AzureBastionSubnet` is
 > already carved out by `network.bicep`; deploy Bastion + a small VM in the VNet

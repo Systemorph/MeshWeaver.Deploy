@@ -3903,7 +3903,9 @@ cmd_port_forward() {
 observability_migrate_loki() {
   local templates
   local_kubectl -n "$MONITORING_NS" get statefulset loki >/dev/null 2>&1 || return 0
-  templates="$(local_kubectl -n "$MONITORING_NS" get statefulset loki -o jsonpath='{.spec.volumeClaimTemplates[*].metadata.name}' 2>/dev/null || true)"
+  # A failed read is NOT "no claim template": only a successful read that shows none deletes anything.
+  templates="$(local_kubectl -n "$MONITORING_NS" get statefulset loki -o jsonpath='{.spec.volumeClaimTemplates[*].metadata.name}' 2>/dev/null)" \
+    || die "observability: could not read the Loki StatefulSet's volume claims — nothing was changed; re-run when the cluster answers"
   [ -z "$templates" ] || return 0
   warn "one-time migration: the existing Loki keeps its logs in an emptyDir; recreating it with a persistent volume — the logs it holds now are discarded"
   local_kubectl -n "$MONITORING_NS" delete statefulset loki --wait=true >/dev/null 2>&1 \
@@ -3925,13 +3927,13 @@ cmd_observability() {                            # §11
   helm repo update grafana >/dev/null 2>&1 || helm repo update >/dev/null 2>&1 || true
   observability_migrate_loki
   # Sized for the shared VM (share/values.observability.yaml: requests, memory limits, 7 days).
-  helm upgrade --install loki grafana/loki-stack \
+  helm --kube-context "${MEMEX_KUBE_CONTEXT:-colima}" upgrade --install loki grafana/loki-stack \
     -n "$MONITORING_NS" --create-namespace \
     -f "$(resolve_share)/values.observability.yaml" \
     --set grafana.adminPassword="$gpw" \
     || die "observability: helm could not install grafana/loki-stack into '$MONITORING_NS'"
   ok "Observability installed. Grafana admin password: $gpw_file"
-  info "View dashboards:  kubectl -n $MONITORING_NS port-forward svc/loki-grafana 3000:80"
+  info "View dashboards:  kubectl --context ${MEMEX_KUBE_CONTEXT:-colima} -n $MONITORING_NS port-forward svc/loki-grafana 3000:80"
   info "Then open http://localhost:3000  (user: admin)  — query {namespace=\"memex\"}"
 }
 
