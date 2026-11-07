@@ -119,8 +119,14 @@ names) and applies it with the governed `ApplyChart` InstanceAction from a `Host
 
 ## Keys for servers — minted by a governed action, never by hand
 
-A person's machine joins with their own sign-in. A SERVER (a pod, a headless Mac) joins with a one-time
-PRE-AUTH KEY, and that key is minted by the operator verb `deploy/hosting-operator/bin/hosting-tailnet-key`
+A person's machine joins with their own sign-in. A SERVER (a pod, a headless Mac) joins with a PRE-AUTH
+KEY. Two paths exist, for two shapes of consumer:
+
+- **Declared pre-auth keys** (above): a long-lived, renewed, often reusable key in a Kubernetes Secret in
+  the headscale namespace — for a consumer that re-joins as a fresh node on every restart (the ingress bridge).
+- **A minted one-time key** (this section): a SINGLE-USE, tagged key stored in Key Vault and mounted by the
+  consumer through the Secrets Store CSI driver as a FILE — for a consumer that keeps its node identity on its
+  own volume and must never see a Kubernetes Secret (the estate's Grafana node). It is minted by the operator verb `deploy/hosting-operator/bin/hosting-tailnet-key`
 — run by the approved secret-write action on the control instance (MeshWeaver.Plugins
 `Hosting/AksOperationsViaActions.md` → "A tailnet key"), never by a person with `kubectl exec`:
 
