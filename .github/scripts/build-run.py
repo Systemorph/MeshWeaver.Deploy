@@ -780,8 +780,11 @@ class ModuleHubBroker:
 
     def __init__(self, api: "Api", repo: str, sha: str, host: str, root: str, fingerprints: dict, trunk: bool,
                  order: int, pull_request: Optional[int], log: Callable[[str], None],
-                 sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic) -> None:
+                 sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+                 slice_cache: Optional[str] = None) -> None:
         self.api, self.repo, self.sha, self.host, self.root = api, repo, sha, host, root
+        # the host's content-addressed slice cache (`<cache>/module-slices/<repo>/<module>/<sha256>/`): verified bytes only
+        self.slice_cache = slice_cache
         self.fps, self.trunk, self.order, self.pr, self.log = fingerprints, trunk, order, pull_request, log
         self.sleep, self.clock = sleep, clock
         self.granted: dict = {}       # module → the step seq the hub granted THIS host
@@ -825,20 +828,61 @@ class ModuleHubBroker:
             self.sleep(MODULE_HUB_RETRY)
 
     def _fetch(self, module: str, output_hash: str, seq: int) -> dict:
+        """A Hit's output into `outputs/<module>/`: from this host's SLICE CACHE when it already holds that hash, else
+        downloaded from the hub's store, verified against the hash and cached (atomically) for the next run."""
         hexd = output_hash.split(":", 1)[-1]
         if not re.fullmatch(r"[0-9a-f]{64}", hexd):
             return {"verdict": "Failed", "why": f"the hub names an output that is no sha256 ({output_hash!r})"}
-        tmp = os.path.join(self.root, ".tmp", f"{module}.tar")
-        status, why = self.api.download(self._path(module, f"/outputs/{hexd}"), tmp, timeout=600)
-        if status != 200:
-            return {"verdict": "Failed", "why": f"the output {hexd[:12]} could not be fetched ({status}: {why})"}
-        if _sha256_file(tmp) != hexd:
-            return {"verdict": "Failed", "why": f"the fetched output does not hash to {hexd[:12]} — refused"}
         dest = os.path.join(self.root, "outputs", module)
         shutil.rmtree(dest, ignore_errors=True)
-        safe_extract(tmp, dest)
-        os.remove(tmp)
-        return {"verdict": "Hit", "seq": seq, "outputHash": hexd, "outputDir": dest}
+        cached = self._cached(module, hexd)
+        if cached is None:
+            tmp = os.path.join(self.root, ".tmp", f"{module}.tar")
+            status, why = self.api.download(self._path(module, f"/outputs/{hexd}"), tmp, timeout=600)
+            if status != 200:
+                return {"verdict": "Failed", "why": f"the output {hexd[:12]} could not be fetched ({status}: {why})"}
+            if _sha256_file(tmp) != hexd:
+                return {"verdict": "Failed", "why": f"the fetched output does not hash to {hexd[:12]} — refused"}
+            cached = self._cache_put(module, hexd, tmp)
+            os.remove(tmp)
+            source = "fetched from the hub's store"
+        else:
+            source = "from this host's slice cache"
+        if cached is None:
+            return {"verdict": "Failed", "why": "the output could not be extracted"}
+        shutil.copytree(cached, dest, symlinks=False)
+        return {"verdict": "Hit", "seq": seq, "outputHash": hexd, "outputDir": dest, "source": source}
+
+    def _cache_dir(self, module: str, hexd: str) -> Optional[str]:
+        return os.path.join(self.slice_cache, self.repo, module, hexd) if self.slice_cache else None
+
+    def _cached(self, module: str, hexd: str) -> Optional[str]:
+        d = self._cache_dir(module, hexd)
+        return d if d and os.path.isfile(os.path.join(d, ".complete")) else None
+
+    def _cache_put(self, module: str, hexd: str, tar: str) -> Optional[str]:
+        """Extract a VERIFIED output (its bytes hash to `hexd`) into the slice cache, atomically: a staging directory renamed
+        into place, `.complete` written first inside it — a reader sees a whole slice or none. Without a cache, a run-local
+        directory."""
+        final = self._cache_dir(module, hexd)
+        if final is None:
+            local = os.path.join(self.root, ".tmp", f"x-{module}")
+            shutil.rmtree(local, ignore_errors=True)
+            safe_extract(tar, local)
+            return local
+        if os.path.isfile(os.path.join(final, ".complete")):
+            return final
+        staging = f"{final}.staging-{os.getpid()}-{threading.get_ident()}"
+        shutil.rmtree(staging, ignore_errors=True)
+        safe_extract(tar, staging)
+        with open(os.path.join(staging, ".complete"), "w") as fh:
+            fh.write(hexd)
+        os.makedirs(os.path.dirname(final), exist_ok=True)
+        try:
+            os.rename(staging, final)
+        except OSError:            # another run put the same content first — it is the same bytes
+            shutil.rmtree(staging, ignore_errors=True)
+        return final if os.path.isfile(os.path.join(final, ".complete")) else None
 
     def complete(self, module: str, done: dict) -> dict:
         seq = self.granted.get(module)
@@ -859,6 +903,8 @@ class ModuleHubBroker:
                     body["error"] = str(e)
                 else:
                     status, answer = self.api.upload(self._path(module, f"/outputs/{hexd}"), {}, tar, os.path.getsize(tar), timeout=1800)
+                    if status in (200, 201):
+                        self._cache_put(module, hexd, tar)      # the next run on this host reads it locally
                     os.remove(tar)
                     if status not in (200, 201):
                         body["error"] = f"the output upload was refused ({status}: {_answer_text(answer)})"
@@ -3360,7 +3406,8 @@ class Host:
                 self.log("module hub: a non-trunk run without a pull request ref — no broker for this run")
                 return
             root = os.path.join(workdir, "module-hub")
-            self.module_broker = ModuleHubBroker(self.api, repo, sha, self.host, root, fps, trunk, order, pr, self.log)
+            self.module_broker = ModuleHubBroker(self.api, repo, sha, self.host, root, fps, trunk, order, pr, self.log,
+                                                 slice_cache=os.path.join(self.cache, "module-slices"))
             self.module_broker_stop = threading.Event()
             threading.Thread(target=self.module_broker.serve, args=(self.module_broker_stop,), daemon=True).start()
             self.log(f"module hub: {len(fps)} module(s) fingerprinted from the pristine tree; lane "
@@ -5469,6 +5516,22 @@ def self_test() -> int:
         resp2 = json.load(open(os.path.join(br2.root, "resp", "B.json")))
         check("modhub/a Hit is fetched, verified and extracted where the stage reads it",
               resp2["verdict"] == "Hit" and open(os.path.join(resp2["outputDir"], "B.dll"), "rb").read() == b"built B", resp2)
+        sc = os.path.join(tmp, "mh-slices")
+        brc, api_c = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Hit", "step": {"seq": 4, "outputHash": "sha256:" + out_hex}})],
+                                  ("GET-BYTES", "/modules/MeshWeaver.Plugins/B/outputs/" + out_hex): [(200, out_bytes)]})
+        brc.slice_cache = sc
+        for round_ in (1, 2):
+            shutil.rmtree(os.path.join(brc.root, "resp"), ignore_errors=True); os.makedirs(os.path.join(brc.root, "resp"))
+            brc.answered.discard("req:B")
+            with open(os.path.join(brc.root, "req", "B.json"), "w") as fh:
+                json.dump({"module": "B"}, fh)
+            brc.poll_once()
+        downloads = [c for c in api_c.calls if c[0] == "GET-BYTES"]
+        resp_c = json.load(open(os.path.join(brc.root, "resp", "B.json")))
+        check("modhub/a slice already in this host's cache is used with NO download (the second Hit)",
+              len(downloads) == 1 and resp_c.get("source") == "from this host's slice cache"
+              and open(os.path.join(resp_c["outputDir"], "B.dll"), "rb").read() == b"built B"
+              and os.path.isfile(os.path.join(sc, "MeshWeaver.Plugins", "B", out_hex, ".complete")), (downloads, resp_c))
         check("modhub/a TRUNK run asks on main with its merge order",
               [c[2] for c in api_h.calls if c[1].endswith("/request")][0].get("order") == 77
               and [c[2] for c in api_h.calls if c[1].endswith("/request")][0].get("lane") == "Main")
