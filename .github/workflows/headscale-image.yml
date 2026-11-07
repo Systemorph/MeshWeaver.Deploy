@@ -188,8 +188,12 @@ jobs:
           sec = next(d for d in docs if d["kind"] == "Secret")
           assert sec["metadata"]["annotations"].get("helm.sh/resource-policy") == "keep", "the key Secret is not kept"
           assert not sec.get("data"), "the chart rendered key material"
+          assert set(sec["metadata"].get("annotations", {})) == {"helm.sh/resource-policy"}, f"the chart renders sidecar-owned annotations: {sec['metadata'].get('annotations')}"
           print("preauthKeys: one Role over exactly the declared Secret (get/update/patch), token in the sidecar only, Secret kept and empty")
           PY
+          # The chart never READS the cluster for the key Secret (a lookup made off-cluster previews show the
+          # key as removed, and stored the key in the release manifest).
+          ! grep -q 'lookup' deploy/headscale/helm/templates/preauthkeys.yaml || { echo "::error::preauthkeys.yaml uses lookup"; exit 1; }
           # A long release name keeps every key's Secret distinct (names are never truncated).
           long=$(printf 'r%.0s' $(seq 1 45))
           names=$(helm template "$long" deploy/headscale/helm -f ci-values.yaml "${keys[@]}" --set 'preauthKeys.keys[1].name=mac' --set 'preauthKeys.keys[1].user=fleet' \
