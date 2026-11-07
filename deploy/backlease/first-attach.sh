@@ -55,7 +55,7 @@ for d in "$tester" "$portal" "$runner"; do [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] |
 
 # The build host runs in its OWN Colima profile (default `build`), never in the profile memex-local's portal uses: that one
 # runs the docker runtime, which cannot start a pod with hostUsers: false, and bwrap needs that pod's Unmasked /proc.
-# Create it once:  colima start -p build --cpu 8 --memory 24 --disk 100 --runtime containerd --kubernetes \
+# Create it once:  colima start -p build --cpu 16 --memory 100 --disk 300 --runtime containerd --kubernetes \
 #                    --k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet
 # (the kubelet root on the data disk: the tester and portal images are copied into emptyDirs, which the 20 GiB root
 # disk cannot hold). Then install KEDA into it. EVERY Kubernetes call below names that context explicitly — never the
