@@ -3231,6 +3231,7 @@ class Host:
         self.warm_repos: set = set()
         self.warm_thread: Optional[threading.Thread] = None
         self.warm_cancel = threading.Event()
+        self.warm_stop_seconds = 120.0
 
     def preflight(self) -> None:
         missing = []
@@ -3474,7 +3475,10 @@ class Host:
         """One loop turn: 'stopping', 'no-inputs', 'idle', 'drained', 'ran' or 'lost'. Raises Fatal."""
         if self.stopping:
             return "stopping"
-        self.assert_clean()
+        # the host's OWN warm sandbox is not a leftover: the survivor check runs while no warm build is in flight, and again
+        # (below) after a claim has stopped one and before its run starts
+        if not (self.warm_thread and self.warm_thread.is_alive()):
+            self.assert_clean()
         if not self.refresh_inputs():
             return "no-inputs"
         self.mark_ready()
@@ -3489,14 +3493,20 @@ class Host:
                 self.warm_thread.start()
             return "drained" if self.drained else "idle"
         self.stop_warming()
+        self.assert_clean()      # the full survivor check, now that no warm sandbox is in flight
         return self.run(claim)
 
     def stop_warming(self) -> None:
         """A claim (or SIGTERM) needs the host: stop the warm build in flight and wait for its sandbox to be gone, so no
-        run ever copies a half-built warm workspace."""
+        run ever copies a half-built warm workspace. FAIL-CLOSED: a warm worker still alive after the bound (a git step or the
+        platform-source copy that does not observe the cancel) keeps the cancel SET and ends this host — never a run that
+        copies a workspace the worker can still change or wipe."""
         if self.warm_thread and self.warm_thread.is_alive():
             self.warm_cancel.set()
-            self.warm_thread.join(timeout=120)
+            self.warm_thread.join(timeout=self.warm_stop_seconds)
+            if self.warm_thread.is_alive():
+                raise Fatal(f"the warm build did not stop within {self.warm_stop_seconds:g} s of a claim — this host claims nothing more (the claim is "
+                            "released by the lease), and Kubernetes replaces the container")
         self.warm_cancel.clear()
 
     def warm_main_when_idle(self) -> None:
@@ -3530,10 +3540,12 @@ class Host:
                 if decl is None:
                     write_warm_state(warm, {"key": key, "tip": tip, "built": "none"})
                     continue
-                extra = {**self.platform_env(), "MW_BUILD_REPO": repo}
+                # the image's PREPARED inputs, resolved for THIS build: `run_env` is the run's, and it is empty while idle
+                prepared = prepared_env()
+                extra = {**self.platform_env(), **prepared, "MW_BUILD_REPO": repo}
                 extra.pop("MW_PLATFORM_SOURCE", None)
                 writable = []
-                platform_src = self.env.get("MW_PLATFORM_SOURCE", "")
+                platform_src = self.env.get("MW_PLATFORM_SOURCE", "") or prepared.get("MW_PLATFORM_SOURCE", "")
                 if platform_src and os.path.isdir(platform_src):
                     psrc = os.path.join(scratch, "platform")
                     extra["MW_PLATFORM_SOURCE"] = writable_platform_source(platform_src, psrc)
@@ -5638,6 +5650,19 @@ def self_test() -> int:
             _git_run(["-C", hook_repo, "checkout", "-q", "--detach", c1], {"PATH": genv_g["PATH"], "HOME": wroot})
             check("warm/no hook in a run tree's .git runs on ANY host git step (the merge included)",
                   not os.path.exists(os.path.join(wroot, "merge-hook-ran")))
+            stuck_release = threading.Event()
+            hs = host(_FakeApi({}), env=dict(env, MW_BUILD_WARM_WORKSPACE="true"))
+            hs.warm_stop_seconds = 0.2
+            hs.warm_thread = threading.Thread(target=lambda: stuck_release.wait(30), daemon=True)
+            hs.warm_thread.start()
+            try:
+                hs.stop_warming()
+                check("warm-idle/a warm worker that does not stop is FATAL (fail-closed), never handed to a run", False, "returned")
+            except Fatal as e:
+                check("warm-idle/a warm worker that does not stop is FATAL and keeps the cancel set",
+                      "did not stop" in str(e) and hs.warm_cancel.is_set(), str(e))
+            finally:
+                stuck_release.set()
             check("warm-idle/the next run starts from that built state",
                   line5.startswith(f"workspace: incremental copy of main@{c3[:12]} (built by the tip's warmBuild)")
                   and os.path.isfile(os.path.join(run5, "src", "obj", "warm.txt")), line5)
