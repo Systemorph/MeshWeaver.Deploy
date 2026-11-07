@@ -1674,18 +1674,23 @@ grep -q 'colima start -p build --cpu 16 --memory 104 --disk 100 --runtime contai
   && case "$OUT" in *"first attach installs it"*) true ;; *) false ;; esac \
   && ok "apply creates the build VM at the plan (containerd, k3s), checks KEDA in colima-build, and names the first attach for a missing release" || bad "apply create" "$OUT / $(cat "$BH/log")"
 : > "$BH/log"
-OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
+OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
 grep -q 'helm --kube-context colima-build -n build-mac upgrade build-host-mac .* --reuse-values --set buildHosts.mac.minReplicas=1 --set buildHosts.mac.maxReplicas=4 --set-string buildHosts.resources.requests.cpu=3500m --set-string buildHosts.resources.requests.memory=20Gi --set-string buildHosts.resources.limits.cpu=4 --set-string buildHosts.resources.limits.memory=24Gi --set buildHosts.stageSlots=4' "$BH/log" \
   && ! grep -q 'colima start\|colima stop' "$BH/log" \
   && ok "an installed release is sized in place (--reuse-values, its own context); a VM that covers the plan is not restarted" || bad "apply size" "$OUT / $(cat "$BH/log")"
 : > "$BH/log"
-OUT="$(bh FAKE_COLIMA_LIST=$'{"name":"default","cpus":8,"memory":17179869184}\n{"name":"build","cpus":8,"memory":25769803776}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
+OUT="$(bh FAKE_COLIMA_LIST=$'{"name":"default","cpus":8,"memory":17179869184}\n{"name":"build","status":"Running","cpus":8,"memory":25769803776}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
 ! grep -q 'colima stop' "$BH/log" && grep -q 'maxReplicas=2 ' "$BH/log" && case "$OUT" in *"apply --resize"*) true ;; *) false ;; esac \
   && ok "a smaller VM is NOT restarted without --resize: the runners are sized to what it has, and the resize is named" || bad "apply no resize" "$OUT / $(cat "$BH/log")"
 : > "$BH/log"
-bh FAKE_COLIMA_LIST='{"name":"build","cpus":8,"memory":25769803776}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize >/dev/null 2>&1
+bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":8,"memory":25769803776}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize >/dev/null 2>&1
 grep -q 'colima stop -p build' "$BH/log" && grep -q 'colima start -p build --cpu 16 --memory 104' "$BH/log" && grep -q 'maxReplicas=4 ' "$BH/log" \
   && ok "--resize restarts the build VM at the plan and sizes the runners to it" || bad "apply resize" "$(cat "$BH/log")"
+: > "$BH/log"
+bh FAKE_COLIMA_LIST='{"name":"build","status":"Stopped","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply >/dev/null 2>&1
+grep -q '^colima start -p build$' "$BH/log" && grep -q 'upgrade build-host-mac' "$BH/log" && ok "a STOPPED build VM is started before its release is sized (never a helm call against a stopped cluster)" || bad "stopped vm" "$(cat "$BH/log")"
+grep -q 'kubectl --context colima-build -n keda wait --for=condition=Available deployment --all' "$BH/log" && ok "KEDA is checked for Available deployments, not only its CRD" || bad "keda health" "$(cat "$BH/log")"
+OUT="$(bh MEMEX_HOST_MEM_GIB=abc "$CLI" buildhost plan 2>&1)" && bad "a non-numeric probe was used" "$OUT" || { case "$OUT" in *"instead of a whole number"*) ok "a host probe that is not a whole number stops the plan (never sized from 0)" ;; *) bad "probe validation" "$OUT" ;; esac; }
 rm -rf "$BH"
 FJB="$(awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI")"
 grep -q '( cmd_buildhost apply ) || warn' <<<"$FJB" && grep -q -- '--no-buildhost) with_build="no"' <<<"$FJB" \

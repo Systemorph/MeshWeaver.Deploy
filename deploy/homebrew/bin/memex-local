@@ -4004,7 +4004,7 @@ for line in sys.stdin:
     if not line: continue
     d = json.loads(line)
     if d.get("name") == sys.argv[1]:
-        print(d.get("cpus", 0), int(int(d.get("memory", 0)) / 1073741824))
+        print(d.get("cpus", 0), int(int(d.get("memory", 0)) / 1073741824), d.get("status", "Unknown"))
         break' "$BUILD_PROFILE" 2>/dev/null || true
 }
 
@@ -4041,8 +4041,14 @@ colima_keep_context() {
 cmd_buildhost() {
   local sub="${1:-status}"; shift || true
   buildhost_tools
-  local plan others
+  local plan others probe
   others="$(other_vms_gib)"
+  # Every probe is a whole number, or nothing is computed from it (an empty sysctl would read as 0 and
+  # hand the build VM the whole machine).
+  for probe in "$(host_cores)" "$(host_mem_gib)" "$others" "$(largest_model_gib)"; do
+    case "$probe" in ''|*[!0-9]*) die "buildhost: a host probe returned '$probe' instead of a whole number (cores, memory, other VMs, largest model) — set MEMEX_HOST_CORES / MEMEX_HOST_MEM_GIB / MEMEX_MODEL_GIB to override" ;; esac
+  done
+  [ "$(host_mem_gib)" -gt 0 ] && [ "$(host_cores)" -gt 0 ] || die "buildhost: the host reported 0 cores or 0 GiB — refusing to size from it"
   plan="$(buildhost_plan "$(host_cores)" "$(host_mem_gib)" "$COLIMA_CPU" "$others" "$(largest_model_gib)")" \
     || die "buildhost: $(plan_value error "$plan")"
   local cpu vmem
@@ -4065,7 +4071,12 @@ cmd_buildhost() {
           --k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet \
           || die "buildhost: could not start the build VM (colima start -p $BUILD_PROFILE)"
       else
-        read -r have_cpu have_mem <<<"$size"
+        local have_status
+        read -r have_cpu have_mem have_status <<<"$size"
+        if [ "$have_status" != "Running" ] && { [ "$resize" != "yes" ] || { [ "${have_cpu:-0}" -ge "$cpu" ] && [ "${have_mem:-0}" -ge "$vmem" ]; }; }; then
+          step "Starting the build VM (profile $BUILD_PROFILE is ${have_status:-not running})"
+          colima_keep_context colima start -p "$BUILD_PROFILE" || die "buildhost: could not start the build VM (colima start -p $BUILD_PROFILE)"
+        fi
         if [ "${have_cpu:-0}" -lt "$cpu" ] || [ "${have_mem:-0}" -lt "$vmem" ]; then
           if [ "$resize" = "yes" ]; then
             step "Resizing the build VM ${have_cpu} CPU / ${have_mem} GiB → ${cpu} / ${vmem} (a restart: running builds are re-queued by the build API; the disk is kept)"
@@ -4117,12 +4128,17 @@ print("  runners %s…%s, %s stage slots, requests %s, limits %s" % (m.get("minR
 
 # KEDA in the build VM: the runners' scaler. Idempotent.
 buildhost_keda() {
-  if build_kubectl get crd scaledobjects.keda.sh >/dev/null 2>&1; then ok "KEDA present in $(build_ctx)"; return 0; fi
+  if build_kubectl get crd scaledobjects.keda.sh >/dev/null 2>&1; then
+    build_kubectl -n keda wait --for=condition=Available deployment --all --timeout=120s >/dev/null 2>&1 \
+      || die "buildhost: KEDA is installed in $(build_ctx) but its deployments are not Available — the runners could not scale ('kubectl --context $(build_ctx) -n keda get pods')"
+    ok "KEDA ready in $(build_ctx)"; return 0
+  fi
   step "Installing KEDA into $(build_ctx)"
   helm repo add kedacore https://kedacore.github.io/charts >/dev/null 2>&1 || true
   helm repo update kedacore >/dev/null 2>&1 || true
   helm --kube-context "$(build_ctx)" upgrade --install keda kedacore/keda -n keda --create-namespace --wait >/dev/null \
     || die "buildhost: could not install KEDA into $(build_ctx)"
+  build_kubectl get crd scaledobjects.keda.sh >/dev/null 2>&1 || die "buildhost: KEDA installed but scaledobjects.keda.sh is missing in $(build_ctx)"
 }
 
 # The effective host profile — what `up` would size the VM and pull for. Refuses an unknown profile.
