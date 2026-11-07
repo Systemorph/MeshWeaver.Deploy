@@ -1,6 +1,8 @@
 // The smoke's policy: the chart's default (helm/values.yaml → policy), every member reaches every
-// member. The smoke checks that headscale ACCEPTS it, not what it allows.
+// member, plus a tag owner so test/keys.sh can mint a TAGGED key. The smoke checks that headscale ACCEPTS
+// it, not what it allows.
 {
+  "tagOwners": { "tag:bridge": ["tailnet-bridge@", "tailnet-bridge-2@"] },
   "acls": [
     { "action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:member:*"] }
   ]

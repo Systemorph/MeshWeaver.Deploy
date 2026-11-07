@@ -93,6 +93,13 @@ else
   grep -q 'answered HTTP 401' "$root/run.log" && pass "a refused API call fails the pass" || bad "a refused API call failed without naming the answer"
 fi
 
+# 7b. A declared tag makes the key a tagged key (the policy's tagOwners grants it).
+jq '.[0].tags = ["tag:bridge"]' "$root/keys.json" > "$root/kt.json" && mv "$root/kt.json" "$root/keys.json"
+run || { cat "$root/run.log"; bad "pass after adding a tag exited non-zero"; }
+grep -q "the declaration changed" "$root/run.log" && pass "adding a tag is a changed declaration" || bad "adding a tag kept the old key"
+[ "$(h preauthkeys list -o json | jq -r --argjson id "$(id_of hs-preauth-bridge)" '[.[] | select(.id == $id)][0].acl_tags | join(",")')" = "tag:bridge" ] \
+  && pass "the new key carries the declared tag" || bad "the new key does not carry tag:bridge"
+
 # 8. A changed declaration replaces a still-valid key (here: a different user), and expires the old one.
 bridge_before=$(id_of hs-preauth-bridge)
 jq '.[0].user = "tailnet-bridge-2"' "$root/keys.json" > "$root/k4.json" && mv "$root/k4.json" "$root/keys.json"

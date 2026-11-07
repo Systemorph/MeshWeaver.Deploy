@@ -138,6 +138,7 @@ preauthKeys:
   #   ephemeral: true        # its machine is removed when it goes away
   #   validHours: 720
   #   renewHours: 168
+  #   tags: ["tag:bridge"]   # a TAGGED machine: the policy addresses it by tag (needs tagOwners in `policy`)
   resources:
     requests:
       cpu: 10m

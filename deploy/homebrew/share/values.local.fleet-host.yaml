@@ -1,0 +1,19 @@
+# memex-local FLEET HOST — the install TEMPLATE of a Mac that is part of the fleet.
+# Layered by helm_deploy in REGISTRY MODE whenever this Mac is joined (`memex-local fleet join`) or offered
+# back (`memex-local backlease enroll`), before the user's overlay (an overlay still wins). It makes the
+# Hosting app part of the Mac's FIRST instance — its local control instance (MeshWeaver.Plugins
+# Hosting/MacStudioFleet §3a) — with nobody clicking anything:
+#   * the back-lease heartbeat is armed by Hosting (Hosting/PlatformBuildInbox, kept activated by the
+#     Hosting module), so a joined Mac reports to control;
+#   * the in-pod self-updater's Kubernetes patcher (MeshWeaver.SelfUpdate.Aks) ships in Hosting.
+# The package is NAMED EXACTLY in InstallByDefault (installed on the deployment configuration's
+# authority, seeded once per package by the default-install ledger), and the platform baseline is kept
+# beside that explicit set — without InstallPreInstalledPackages=true an exact set would suppress it
+# (Doc/Architecture/PluginRegistry, policy declared-package-set-is-exact). Measured on the first fleet
+# Mac (2026-11-07): these two keys reach the pod and the pass selects Hosting once the portal runs a
+# platform at or above Hosting's minMeshVersion — which the registry-mode `update` now pulls from the
+# public GHCR with no Azure sign-in.
+config:
+  memex_portal:
+    PluginCatalog__InstallByDefault__0: "Plugins/Hosting"
+    PluginCatalog__InstallPreInstalledPackages: "true"
