@@ -6,8 +6,9 @@
 
 A Mac is ONE node, so every replica the chart can run has to fit on it beside what the node already runs.
 Two checks, against the node's allocatable MINUS the requests of the pods already scheduled there (k3s, KEDA,
-the kubelet's own: `kubectl get pods -A -o json`, given with --pods-json; the host's own namespace `build-mac`
-is left out, so a re-run does not count the replicas it is about to replace):
+the kubelet's own: `kubectl get pods -A -o json`, given with --pods-json; only pods BOUND to a node count, each
+with the scheduler's effective request (sidecars included); the host's own namespace `build-mac` is left out, so a
+re-run does not count the replicas it is about to replace):
 
   * the FLOOR — the replicas the chart keeps standing: the sum of `buildHosts.<channel>.minReplicas` (default 0,
     counted as at least one) — checking one replica alone passed a 24 GiB VM for a floor of two 20 GiB replicas,
@@ -62,9 +63,27 @@ def peak_of(b):
     return sum(int((b.get(n) or {}).get("maxReplicas") or 1) for n in channels(b))
 
 
+def pod_request(spec, key, conv):
+    """One pod's effective request for `key`, as the scheduler computes it: the larger of (a) the app containers
+    plus every restartable init container (a sidecar, `restartPolicy: Always`, which keeps running beside them)
+    and (b) the peak of the init sequence — each ordinary init container's request plus the sidecars started
+    before it, and each sidecar's start (itself plus the sidecars before it)."""
+    def req(c):
+        return conv(((c.get("resources") or {}).get("requests") or {}).get(key, "0"))
+    sidecars = 0.0
+    init_peak = 0.0
+    for c in spec.get("initContainers") or []:
+        if c.get("restartPolicy") == "Always":
+            sidecars += req(c)
+            init_peak = max(init_peak, sidecars)
+        else:
+            init_peak = max(init_peak, req(c) + sidecars)
+    return max(init_peak, sum(req(c) for c in spec.get("containers") or []) + sidecars)
+
+
 def used_by_others(pods, own_namespace="build-mac"):
-    """(cpu, GiB) requested by the pods already on the node: every container of a pod that is not finished,
-    outside the host's own namespace. An init container's request is the larger of it and the containers'."""
+    """(cpu, GiB) requested on the node by the pods already BOUND to it (`spec.nodeName` set — an unscheduled
+    Pending pod reserves nothing, a bound Pending one does), not finished, outside the host's own namespace."""
     cpu = mem = 0.0
     for p in (pods or {}).get("items", []):
         if p.get("metadata", {}).get("namespace") == own_namespace:
@@ -72,10 +91,10 @@ def used_by_others(pods, own_namespace="build-mac"):
         if p.get("status", {}).get("phase") in ("Succeeded", "Failed"):
             continue
         spec = p.get("spec", {})
-        def req(cs, key, conv):
-            return [conv(((c.get("resources") or {}).get("requests") or {}).get(key, "0")) for c in cs or []]
-        cpu += max([sum(req(spec.get("containers"), "cpu", cores))] + req(spec.get("initContainers"), "cpu", cores))
-        mem += max([sum(req(spec.get("containers"), "memory", gib))] + req(spec.get("initContainers"), "memory", gib))
+        if not spec.get("nodeName"):
+            continue
+        cpu += pod_request(spec, "cpu", cores)
+        mem += pod_request(spec, "memory", gib)
     return cpu, mem
 
 
@@ -106,20 +125,30 @@ def self_test():
     shipped = yaml.safe_load(open(os.path.join(here, "build-host-mac.values.yaml")))["buildHosts"]
     one = lambda req, **ch: {"resources": {"requests": req}, "extraChannels": ["mac"], "mac": {"enabled": True, **ch}}
     # what a fresh k3s + KEDA node requests (measured shape: coredns, local-path, metrics-server, KEDA's three)
+    def pod(ns, phase, containers, init=None, node="colima-build"):
+        spec = {"containers": [{"resources": {"requests": r}} for r in containers]}
+        if init is not None:
+            spec["initContainers"] = init
+        if node:
+            spec["nodeName"] = node
+        return {"metadata": {"namespace": ns}, "status": {"phase": phase}, "spec": spec}
     system = {"items": [
-        {"metadata": {"namespace": "kube-system"}, "status": {"phase": "Running"},
-         "spec": {"containers": [{"resources": {"requests": {"cpu": "100m", "memory": "70Mi"}}}]}},
-        {"metadata": {"namespace": "kube-system"}, "status": {"phase": "Running"},
-         "spec": {"containers": [{"resources": {"requests": {"cpu": "100m", "memory": "70Mi"}}}]}},
-        {"metadata": {"namespace": "keda"}, "status": {"phase": "Running"},
-         "spec": {"containers": [{"resources": {"requests": {"cpu": "100m", "memory": "100Mi"}}}],
-                  "initContainers": [{"resources": {"requests": {"cpu": "500m"}}}]}},
-        # a finished pod and the host's own replica are not counted
-        {"metadata": {"namespace": "kube-system"}, "status": {"phase": "Succeeded"},
-         "spec": {"containers": [{"resources": {"requests": {"cpu": "8", "memory": "64Gi"}}}]}},
-        {"metadata": {"namespace": "build-mac"}, "status": {"phase": "Running"},
-         "spec": {"containers": [{"resources": {"requests": {"cpu": "4", "memory": "20Gi"}}}]}},
+        pod("kube-system", "Running", [{"cpu": "100m", "memory": "70Mi"}]),
+        pod("kube-system", "Running", [{"cpu": "100m", "memory": "70Mi"}]),
+        # an ordinary init container counts as the larger of it and the containers
+        pod("keda", "Running", [{"cpu": "100m", "memory": "100Mi"}], init=[{"resources": {"requests": {"cpu": "500m"}}}]),
+        # a bound Pending pod reserves its request
+        pod("kube-system", "Pending", [{"cpu": "200m", "memory": "10Mi"}]),
+        # NOT counted: a finished pod, the host's own replica, an UNSCHEDULED Pending pod (no nodeName)
+        pod("kube-system", "Succeeded", [{"cpu": "8", "memory": "64Gi"}]),
+        pod("build-mac", "Running", [{"cpu": "4", "memory": "20Gi"}]),
+        pod("default", "Pending", [{"cpu": "4", "memory": "20Gi"}], node=None),
     ]}
+    # a 1.5-CPU app with a 1-CPU restartable sidecar requests 2.5 CPU; an ordinary init after the sidecar adds to it
+    sidecar = {"items": [pod("kube-system", "Running", [{"cpu": "1500m"}],
+                             init=[{"restartPolicy": "Always", "resources": {"requests": {"cpu": "1"}}},
+                                   {"resources": {"requests": {"cpu": "2"}}}])]}
+    unbound_only = {"items": [pod("default", "Pending", [{"cpu": "4", "memory": "20Gi"}], node=None)]}
     sys_used = used_by_others(system)
     cases = [
         # The shipped values on the documented 16 CPU / 100 GiB VM, beside the system pods: floor and peak fit.
@@ -133,6 +162,12 @@ def self_test():
          one({"cpu": "4", "memory": "20Gi"}, minReplicas=2, maxReplicas=4), sys_used, False),
         ("the same peak fits a node with nothing else requested", "16 98Gi",
          one({"cpu": "4", "memory": "20Gi"}, minReplicas=2, maxReplicas=4), (0, 0), True),
+        # Review 4504126537: an unscheduled Pending pod reserves nothing on the node.
+        ("an unbound Pending pod does not block an empty node", "16 98Gi", shipped, used_by_others(unbound_only), True),
+        # Review 4504126561: a restartable sidecar runs beside the app containers — 1.5 + 1 = 2.5 CPU, and the ordinary
+        # init container after it peaks at 2 + 1 = 3 CPU; the shipped 14-CPU peak then does not fit 16 CPU.
+        ("a pod with a sidecar is counted with it, so the shipped peak does not fit beside it", "16 98Gi", shipped,
+         used_by_others(sidecar), False),
         # The dedup regression (review 4503894482): extraChannels [mac, mac] renders ONE Deployment.
         ("a duplicated extra channel counts its floor once", "12 60Gi",
          {**one({"cpu": "4", "memory": "20Gi"}, minReplicas=2, maxReplicas=2), "extraChannels": ["mac", "mac"]}, (0, 0), True),
@@ -144,10 +179,15 @@ def self_test():
          {**one({"cpu": "4", "memory": "20Gi"}, minReplicas=2, maxReplicas=2), "latest": {"enabled": True, "minReplicas": 1}}, (0, 0), False),
     ]
     bad = 0
-    if abs(sys_used[0] - 0.7) > 1e-9 or abs(sys_used[1] - 240 / 1024) > 1e-9:
+    if abs(sys_used[0] - 0.9) > 1e-9 or abs(sys_used[1] - 250 / 1024) > 1e-9:
         bad += 1
-        print(f"FAIL: the system pods' requests read {sys_used}, expected 0.7 CPU / 240 MiB "
-              "(finished pods and the host's own namespace left out; an init container counted as the larger)", file=sys.stderr)
+        print(f"FAIL: the system pods' requests read {sys_used}, expected 0.9 CPU / 250 MiB (finished pods, the host's "
+              "own namespace and an unscheduled pod left out; a bound Pending pod counted; an init container counted as the larger)",
+              file=sys.stderr)
+    sc = used_by_others(sidecar)[0]
+    if abs(sc - 3.0) > 1e-9:
+        bad += 1
+        print(f"FAIL: the sidecar pod reads {sc} CPU, expected 3 (the init after the sidecar: 2 + 1, above 1.5 + 1)", file=sys.stderr)
     for name, alloc, b, used, want in cases:
         got, msg = verdict(alloc, b, used)
         if got != want:
@@ -157,7 +197,7 @@ def self_test():
             print(f"ok: {name}")
     if bad:
         sys.exit(1)
-    print(f"host-fits-node self-test: {len(cases) + 1} of {len(cases) + 1} checks hold")
+    print(f"host-fits-node self-test: {len(cases) + 2} of {len(cases) + 2} checks hold")
 
 
 def main(argv):
