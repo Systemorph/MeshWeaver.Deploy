@@ -44,3 +44,7 @@ buildHosts:
   mac:
     enabled: true
     maxReplicas: 1
+    # A STANDING replica (the declared floor): the Mac is offered always-on, and its one replica must not depend on the
+    # anonymous queue count answering — while `GET /api/builds/queue` answers 503 KEDA keeps the CURRENT replica count, so
+    # a floor of 0 left the host at zero and a routed `mac` run waited forever (first attach of eiger, 2026-11-07).
+    minReplicas: 1
