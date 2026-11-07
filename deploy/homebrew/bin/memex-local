@@ -156,7 +156,9 @@ readonly FLEET_FILE="$LOCAL_HOME/fleet.yaml"
 readonly PUBLISH_FILE="$LOCAL_HOME/publish.yaml"
 # The network's OWN entry point (share/network-entry.yaml): tailscale serve 443 → 127.0.0.1:<this port> →
 # the in-cluster proxy that marks every request X-MeshWeaver-Provenance: tailnet → the local ingress.
-readonly ENTRY_PORT="${MEMEX_ENTRY_PORT:-8444}"
+# 8446: distinct from the front door (8443) and the e2e portal's forward (8444) — a collision would let
+# tailscale serve hand network traffic to a forward WITHOUT the mark; publish refuses one (below).
+readonly ENTRY_PORT="${MEMEX_ENTRY_PORT:-8446}"
 readonly FLEET_DIR="$LOCAL_HOME/enrol"
 readonly FLEET_CODE_PREFIX="mwenrol1."
 # The host's Ollama under launchd (survives a reboot), bound to every interface so the Colima VM reaches
@@ -779,6 +781,17 @@ cmd_publish() {
       secret="$(cat)"; secret="${secret%$'\n'}"
       [ -n "$secret" ] || die "publish on: no client secret on STDIN"
       case "$secret" in *'"'*|*'\\'*|*$'\n'*) die "publish on: the client secret contains a quote, backslash or newline — store it with your provider's secret format" ;; esac
+      # The entry port must be its own: never the front door's or the e2e portal's, and free right now —
+      # otherwise tailscale serve would hand network traffic to a forward that adds no mark.
+      case "$ENTRY_PORT" in ''|*[!0-9]*) die "publish on: MEMEX_ENTRY_PORT must be a port number (got '$ENTRY_PORT')" ;; esac
+      for taken in "$HOST_PORT" "${MEMEX_E2E_PORT:-8444}" 80 443; do
+        [ "$ENTRY_PORT" != "$taken" ] || die "publish on: the entry port $ENTRY_PORT collides with port $taken (the front door, the e2e portal or the ingress) — set MEMEX_ENTRY_PORT to a free port"
+      done
+      if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$ENTRY_PORT" -sTCP:LISTEN 2>/dev/null | grep -qv 'memex-network-entry'; then
+        if ! lsof -nP -iTCP:"$ENTRY_PORT" -sTCP:LISTEN 2>/dev/null | grep -q 'kubectl'; then
+          die "publish on: something already listens on port $ENTRY_PORT — set MEMEX_ENTRY_PORT to a free port (the network must reach ONLY the entry point)"
+        fi
+      fi
       mkdir -p "$LOCAL_HOME"
       local tenant_line=""
       [ -n "$tenant" ] && tenant_line="    Authentication__Microsoft__TenantId: \"${tenant}\"
@@ -818,7 +831,7 @@ YAML
         warn "could not set up 'tailscale serve --tcp 443 tcp://127.0.0.1:${ENTRY_PORT}' — the bridge cannot reach this Mac until it is"
       fi
       info "While published the front door is loopback-only on port ${HOST_PORT}: open https://${HOSTNAME_LOCAL}:${HOST_PORT} locally"
-      info "The network policy must let ONLY the bridge (tag:bridge) reach TCP 443, and no member reach ${HOST_PORT} or ${ENTRY_PORT}"
+      info "The network policy must let ONLY the bridge (tag:bridge) reach TCP 443, and no member reach ${HOST_PORT}, ${MEMEX_E2E_PORT:-8444} or ${ENTRY_PORT}"
       info "Register the redirect URI on the app: https://${host}/signin-${provider}"
       info "Apply it: memex-local update   (the front door rebinds to loopback; the first person to sign in at https://${host} becomes this instance's administrator — make it yours)"
       ;;

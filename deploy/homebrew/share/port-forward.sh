@@ -90,7 +90,7 @@ if [ -f "${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/publish.yaml" ]; then
   # The network's OWN entry point (memex-local publish → share/network-entry.yaml), loopback only too:
   # tailscale serve forwards the network's TCP 443 here, and the proxy behind it marks every request.
   # Held in a restart loop beside the front door; the front door is the process launchd watches.
-  entry_port="${MEMEX_ENTRY_PORT:-8444}"
+  entry_port="${MEMEX_ENTRY_PORT:-8446}"   # memex-local ENTRY_PORT: never 8443 (front door) or 8444 (e2e)
   # This script stays the SUPERVISOR (no exec): launchd's KeepAlive and the headless PF_PID both track
   # this process, and stopping it must stop BOTH forwards — the entry loop, its active kubectl, and the
   # front door — so a restart never leaves an old process holding a port or a second retry loop.
