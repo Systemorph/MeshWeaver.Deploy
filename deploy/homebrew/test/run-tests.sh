@@ -962,7 +962,7 @@ FJ="$(mktemp -d)"; mkdir -p "$FJ/home/.memex-local/enrol"
 fj_lib() { env HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c ". \"$CLI\"; $1"; }
 # The pure helpers: request encoding, the key fingerprint, the value fingerprint format.
 req="$(fj_lib 'fleet_request studio-2 host-a jroe C02X AAAA')"
-dec="$(printf '%s' "$req" | tr '_-' '/+' | awk '{ n = length($0) % 4; if (n) $0 = $0 substr("===", 1, 4 - n); print }' | base64 -D 2>/dev/null)"
+dec="$(printf '%s' "$req" | tr '_-' '/+' | awk '{ n = length($0) % 4; if (n) $0 = $0 substr("===", 1, 4 - n); print }' | base64 -d 2>/dev/null)"
 [ "$dec" = '{"v":1,"deployment":"studio-2","host":"host-a","user":"jroe","machine":"C02X","key":"AAAA"}' ] \
   && ok "fleet_request is base64url of the v1 JSON the control page parses" || bad "fleet_request" "$dec"
 case "$req" in *[+/=]*) bad "fleet_request is URL-safe" "$req" ;; *) ok "fleet_request is URL-safe (no + / =)" ;; esac
@@ -992,7 +992,8 @@ F="$FJ/home/.memex-local/fleet.yaml"
 grep -q "Hosting__ModuleReportSecret: \"$M\"" "$F" 2>/dev/null && grep -q "Hosting__ControlInbox__Secret: \"$C\"" "$F" \
   && grep -q 'Hosting__ControlInbox__Url: "https://control.example.test/api/hooks/Hosting/PlatformBuilds"' "$F" \
   && ok "the fleet layer carries both keys and the control inbox URL" || bad "fleet layer content" "$(sed 's/"[ab]\{64\}"/<value>/' "$F" 2>/dev/null)"
-[ "$(stat -f '%Lp' "$F" 2>/dev/null)" = "600" ] && ok "the fleet layer is 0600" || bad "fleet layer mode" "$(stat -f '%Lp' "$F" 2>/dev/null)"
+fmode="$(stat -f '%Lp' "$F" 2>/dev/null || stat -c '%a' "$F" 2>/dev/null)"
+[ "$fmode" = "600" ] && ok "the fleet layer is 0600" || bad "fleet layer mode" "$fmode"
 [ ! -e "$KEY" ] && ok "the throw-away key is deleted once the code is opened" || bad "throw-away key removed" "still at $KEY"
 # A code sealed to ANOTHER key is refused by name; one issued for another id is refused by name.
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$KEY" 2>/dev/null ); OTHER="$FJ/other.pem"

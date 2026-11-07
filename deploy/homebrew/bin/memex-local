@@ -752,7 +752,7 @@ fleet_open_code() {
   local code="$1" key="$2" out="$3" ct
   case "$code" in "$FLEET_CODE_PREFIX"*) ;; *) die "that is not an enrolment code (it starts with '$FLEET_CODE_PREFIX') — copy it from the control instance's page" ;; esac
   ct="$(mktemp "$FLEET_DIR/code.XXXXXX")"
-  printf '%s' "${code#"$FLEET_CODE_PREFIX"}" | base64 -D > "$ct" 2>/dev/null || { rm -f "$ct"; die "the enrolment code is not base64 — copy all of it"; }
+  printf '%s' "${code#"$FLEET_CODE_PREFIX"}" | base64 -d > "$ct" 2>/dev/null || { rm -f "$ct"; die "the enrolment code is not base64 — copy all of it"; }
   ( umask 077
     openssl pkeyutl -decrypt -inkey "$key" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
       -pkeyopt rsa_mgf1_md:sha256 -in "$ct" -out "$out" 2>/dev/null ) \
@@ -760,8 +760,9 @@ fleet_open_code() {
   rm -f "$ct"
 }
 
-# One member of the opened payload ({"v":1,"d":…,"m":…,"c":…}), via macOS's plutil (no jq/python needed).
-fleet_payload() { plutil -extract "$1" raw -o - "$2" 2>/dev/null; }
+# One member of the opened payload — the control instance's compact {"v":1,"d":…,"m":…,"c":…}, whose values are
+# a deployment id and hex keys (no quote or backslash can occur), so a plain match reads it on macOS and Linux alike.
+fleet_payload() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" "$2" 2>/dev/null | head -1; }
 
 write_fleet_file() {
   local control="$1" id="$2" report="$3" announce="$4"
@@ -805,7 +806,7 @@ cmd_fleet() {
       case "$control" in https://*) ;; *) die "fleet join: --control must be the control instance's https URL (got '${control:-<none>}')" ;; esac
       printf '%s' "$id" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$' \
         || die "fleet join: --id must be lower-case letters, digits and dashes (at most 63), starting and ending with a letter or digit — it becomes Deployments/<id> on control"
-      need openssl openssl; need plutil plutil; need shasum shasum
+      need openssl openssl; need shasum shasum
 
       step "Preflight (MacStudioFleet §2b step 1)"
       local user host machine t missing=""
