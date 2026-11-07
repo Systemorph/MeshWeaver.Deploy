@@ -119,5 +119,14 @@ if [ -f "${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/publish.yaml" ]; then
   wait "$front_door"
   exit 1
 fi
+# An INTERNAL-ONLY Mac (`memex-local internal on`, <state dir>/internal.yaml — the fleet default): the front
+# door binds LOOPBACK only, on the unprivileged port, and the private network reaches it through
+# `tailscale serve --tcp 443` (TLS passed through to the ingress, which serves the machine's own name with its
+# trusted certificate). Nothing on the LAN reaches the portal directly; no entry proxy is involved.
+if [ -f "${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/internal.yaml" ]; then
+  echo "$(date -u +%FT%TZ) internal only — the front door binds loopback only, port ${HOST_PORT}; the private network reaches it through tailscale serve"
+  exec kubectl --context "$KUBE_CONTEXT" port-forward -n ingress-nginx svc/ingress-nginx-controller \
+      --address 127.0.0.1,::1 "${HOST_PORT}:443"
+fi
 exec kubectl --context "$KUBE_CONTEXT" port-forward -n ingress-nginx svc/ingress-nginx-controller \
     --address 0.0.0.0,:: 80:80 443:443 "${HOST_PORT}:443"
