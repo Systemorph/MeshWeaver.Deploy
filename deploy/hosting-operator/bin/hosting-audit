@@ -82,6 +82,10 @@ hosting::safe_name container "$container"
 
 command -v jq >/dev/null 2>&1 || hosting::die "jq is not installed in this image — the audit's detection is a jq program, and without it nothing can be compared"
 [ -f "$AUDIT_JQ" ] || hosting::die "the detection program ${AUDIT_JQ} is missing beside this script — the image was built without it"
+# The one rule for "a kind this cluster does not serve" (step 3), shared with check-chart-drift.sh.
+hosting::find_drift_dir
+# shellcheck source=../../aks/scripts/kind-not-served.sh
+source "${HOSTING_DRIFT_DIR}/kind-not-served.sh"
 
 hosting::dry && hosting::log "dry run requested — the audit is read-only, so it runs for real"
 
@@ -122,7 +126,10 @@ hosting::log "manifest  ${managed} chart-managed object(s)"
 # ── 3. the live namespace ───────────────────────────────────────────────────────────────────────
 # One `kubectl get <kind>` per kind. A kind this cluster does not serve is SKIPPED and recorded in
 # the report (nothing of that kind can exist); anything else — Forbidden above all — is fatal,
-# because a kind the audit could not read is a kind it must not report as clean.
+# because a kind the audit could not read is a kind it must not report as clean. What counts as "not
+# served" is ONE rule, kind-not-served.sh beside the drift scripts, which check-chart-drift.sh — this
+# Audit's second step — sources too (MeshWeaver.Deploy#155: the two steps disagreed, and the second
+# one stopped on every cluster without KEDA). It is found and sourced before anything is read.
 KINDS="deployment statefulset daemonset cronjob job configmap secret secretproviderclass ingress service serviceaccount role rolebinding poddisruptionbudget scaledobject horizontalpodautoscaler persistentvolumeclaim networkpolicy"
 skipped=""
 : > "$work/live.jsonl"
@@ -132,13 +139,14 @@ for kind in $KINDS; do
       || hosting::die "kubectl's listing of ${kind} in ${namespace} is not JSON"
   else
     err="$(tr -d '\n' < "$work/err")"
-    case "$err" in
-      *"doesn't have a resource type"*|*"the server could not find the requested resource"*|*"no matches for kind"*)
-        skipped="${skipped} ${kind}"
-        hosting::log "kind      ${kind} is not served by this cluster — skipped" ;;
-      *)
-        hosting::die "could not list ${kind} in ${namespace}: ${err}. An audit that cannot read a kind must not report it as clean — grant the hosting-operator ClusterRole get/list on it (deploy/aks/manifests/hosting-operator/operator-rbac.yaml) and re-run." ;;
-    esac
+    # The rule reads the output line by line (a discovery warning must not hide a Forbidden), so it
+    # gets the raw text; $err, flattened, is only for the message.
+    if kind_not_served "$(cat "$work/err")"; then
+      skipped="${skipped} ${kind}"
+      hosting::log "kind      ${kind} is not served by this cluster — skipped"
+    else
+      hosting::die "could not list ${kind} in ${namespace}: ${err}. An audit that cannot read a kind must not report it as clean — grant the hosting-operator ClusterRole get/list on it (deploy/aks/manifests/hosting-operator/operator-rbac.yaml) and re-run."
+    fi
   fi
 done
 jq -s 'add // []' "$work/live.jsonl" > "$work/live.json" \

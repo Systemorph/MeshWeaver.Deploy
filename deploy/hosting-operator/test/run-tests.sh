@@ -5493,6 +5493,9 @@ if os.environ.get("CD_STUB_RECORD") == "none":
     sys.exit(1)
 open(out, "w").write("{}")
 PYEOF
+# The shared kind rule must be present for the directory to count as the drift scripts (the stub
+# check-chart-drift.sh below never sources it; the real one does).
+printf 'kind_not_served() { return 1; }\n' > "$_cd/scripts/kind-not-served.sh"
 cat > "$_cd/scripts/check-chart-drift.sh" <<'SHEOF'
 printf '%s\n' "$*" > "$CD_STUB_ARGS"
 case "$CD_STUB_MODE" in
