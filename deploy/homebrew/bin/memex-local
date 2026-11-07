@@ -1475,7 +1475,8 @@ cmd_fleet() {
         cmd_update
         if [ "$with_obs" = "yes" ]; then
           step "Observability (Grafana, Loki, Promtail, Prometheus — sized for the VM)"
-          cmd_observability || warn "observability did not install — re-run 'memex-local observability'"
+          # A subshell: a die inside (preflight, helm) fails THIS step, loudly, and the join carries on.
+          ( cmd_observability ) || warn "observability did not install — re-run 'memex-local observability'"
         fi
       else
         info "Apply it: memex-local update"
@@ -2198,6 +2199,22 @@ ollama_vm_reach() {
   fi
   warn "the VM cannot reach Ollama on the Mac's loopback: binding it to EVERY interface (LAN-reachable, unauthenticated) — restrict with the macOS firewall, or MEMEX_OLLAMA_ALLOW_LAN=0"
   install_ollama_agent 0.0.0.0
+  ollama_wait_ready || { warn "ollama did not become ready on :11434 after the every-interface bind"; return 1; }
+}
+
+ollama_wait_ready() {
+  local i=0
+  until curl -fsS "http://127.0.0.1:11434/api/version" >/dev/null 2>&1; do
+    i=$((i+1)); [ "$i" -gt 60 ] && return 1
+    sleep 1
+  done
+}
+
+# 0 when something listens on :11434 at an address that is NOT the Mac's loopback (lsof's NAME column).
+ollama_listens_lan() {
+  local names; names="$(lsof -nP -iTCP:11434 -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 { print $9 }')" || names=""
+  [ -n "$names" ] || return 1
+  grep -Eqv '^(127\.0\.0\.1|\[::1\]|localhost):11434$' <<<"$names"
 }
 
 setup_ollama() {
@@ -2205,16 +2222,23 @@ setup_ollama() {
   if ! curl -fsS "http://127.0.0.1:11434/api/version" >/dev/null 2>&1; then
     info "Starting 'ollama serve' under launchd ($OLLAMA_PLIST_LABEL), bound to the Mac's loopback (127.0.0.1:11434)"
     install_ollama_agent 127.0.0.1
-    # Wait on readiness rather than a fixed sleep.
-    local i=0
-    until curl -fsS "http://127.0.0.1:11434/api/version" >/dev/null 2>&1; do
-      i=$((i+1)); [ "$i" -gt 60 ] && die "ollama did not become ready on :11434"
-      sleep 1
-    done
+    ollama_wait_ready || die "ollama did not become ready on :11434"
   else
     info "ollama already serving on :11434"
+    # An Ollama that is ALREADY running is not trusted to be on loopback: an earlier memex-local bound
+    # every interface, and a hand-started or brew-services Ollama may carry OLLAMA_HOST=0.0.0.0.
+    if ollama_listens_lan; then
+      if [ -f "$OLLAMA_PLIST_DST" ]; then
+        warn "Ollama listens beyond the Mac's loopback (an earlier memex-local bound every interface) — rebinding it to 127.0.0.1"
+        install_ollama_agent 127.0.0.1
+        ollama_wait_ready || die "ollama did not become ready on :11434 after rebinding to loopback"
+      else
+        warn "an Ollama NOT started by memex-local listens beyond the Mac's loopback — unauthenticated on the LAN. Stop it ('brew services stop ollama', or end the process) and re-run: memex-local then runs it on loopback"
+        [ "${MEMEX_OLLAMA_ALLOW_LAN:-1}" = "0" ] && die "MEMEX_OLLAMA_ALLOW_LAN=0 refuses to continue with an Ollama listening beyond loopback"
+      fi
+    fi
   fi
-  ollama_vm_reach
+  ollama_vm_reach || true
   if [ "$OLLAMA_MODEL" = "none" ]; then
     info "MEMEX_OLLAMA_MODEL=none — not pulling a chat model; the portal's qwen3.6-code will not answer until you alias one"
   else
@@ -3869,7 +3893,8 @@ cmd_observability() {                            # §11
   helm upgrade --install loki grafana/loki-stack \
     -n "$MONITORING_NS" --create-namespace \
     -f "$(resolve_share)/values.observability.yaml" \
-    --set grafana.adminPassword="$gpw"
+    --set grafana.adminPassword="$gpw" \
+    || die "observability: helm could not install grafana/loki-stack into '$MONITORING_NS'"
   ok "Observability installed. Grafana admin password: $gpw_file"
   info "View dashboards:  kubectl -n $MONITORING_NS port-forward svc/loki-grafana 3000:80"
   info "Then open http://localhost:3000  (user: admin)  — query {namespace=\"memex\"}"

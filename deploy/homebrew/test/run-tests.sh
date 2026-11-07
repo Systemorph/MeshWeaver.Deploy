@@ -1088,7 +1088,21 @@ case "$OUT" in *"EVERY interface"*) grep -q '<string>0.0.0.0:11434</string>' "$P
 rm -f "$P"; touch "$P"
 OUT="$(ovr env FAKE_VM_REACH_RC=7 MEMEX_OLLAMA_ALLOW_LAN=0 bash -c '. "$0"; ollama_vm_reach' "$CLI" 2>&1)"
 case "$OUT" in *"refuses a LAN-wide bind"*) [ ! -s "$P" ] && ok "MEMEX_OLLAMA_ALLOW_LAN=0 refuses the LAN-wide bind (and says the portal has no model)" || bad "allow lan 0 wrote" "$(cat "$P")" ;; *) bad "allow lan 0" "$OUT" ;; esac
+lsof_says() { printf '%s\n' "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME" "ollama 1 u 3u IPv4 0 0t0 TCP $1 (LISTEN)" > "$OV/lsof.out"; }
+cat > "$OV/stubs/lsof" <<STUB
+#!/bin/bash
+cat "$OV/lsof.out" 2>/dev/null
+STUB
+chmod +x "$OV/stubs/lsof"
+lsof_says '127.0.0.1:11434'; ovr bash -c '. "$0"; ollama_listens_lan' "$CLI" && bad "loopback listener read as LAN" "" || ok "an Ollama on 127.0.0.1 is read as loopback-only"
+lsof_says '*:11434'; ovr bash -c '. "$0"; ollama_listens_lan' "$CLI" && ok "an Ollama on every interface (*:11434) is read as LAN-reachable" || bad "*:11434 not LAN" ""
+: > "$OV/lsof.out"; ovr bash -c '. "$0"; ollama_listens_lan' "$CLI" && bad "no listener read as LAN" "" || ok "no listener is not LAN-reachable"
+SO="$(awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI")"
+grep -q 'if ollama_listens_lan; then' <<<"$SO" && grep -q 'rebinding it to 127.0.0.1' <<<"$SO" && grep -q 'NOT started by memex-local' <<<"$SO" && grep -q 'ollama_vm_reach || true' <<<"$SO" \
+  && ok "an ALREADY running Ollama is checked: memex-local's own is rebound to loopback, a foreign one is named (refused under ALLOW_LAN=0); a failed VM reach never aborts the join" || bad "existing ollama migration" "$SO"
 rm -rf "$OV"
+FJ0="$(awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI")"
+grep -q '( cmd_observability ) || warn' <<<"$FJ0" && ok "a failing observability install fails its own step loudly, never the whole join" || bad "observability subshell" ""
 # Observability: sized values, layered by the command; fleet join installs it by default.
 OBS="$HERE/../share/values.observability.yaml"
 grep -q 'retention: 7d' "$OBS" && grep -q 'retention_period: 168h' "$OBS" && grep -q 'alertmanager: { enabled: false }' "$OBS" && [ "$(grep -c 'limits: { memory:' "$OBS")" = 4 ] \
