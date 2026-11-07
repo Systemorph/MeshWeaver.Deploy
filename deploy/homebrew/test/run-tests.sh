@@ -1258,16 +1258,29 @@ if [ -n "$cli_path" ] && grep -q "path: $cli_path\$" "$HERE/../../helm/templates
   ok "PORTAL_DATA_DIR ($cli_path) is the hostPath the chart mounts"
 else bad "PORTAL_DATA_DIR is the chart's hostPath" "cli='$cli_path' chart='$chart_path'"; fi
 
-echo "── publish: a public name needs a real sign-in, and binds the front door to loopback (MacStudioFleet §6) ──"
+echo "── publish: a real sign-in, the tailnet name (and an optional public name), the front door on loopback (MacStudioFleet §6) ──"
 PB="$(mktemp -d)"; mkdir -p "$PB/stubs" "$PB/home"
-printf '#!/bin/bash\necho "$@" >> "%s/ts.log"; exit 0\n' "$PB" > "$PB/stubs/tailscale"; chmod +x "$PB/stubs/tailscale"
+# The tailscale stub logs its arguments and answers `status --json` with FAKE_TS_JSON (nothing when unset:
+# not connected, so no tailnet name).
+cat > "$PB/stubs/tailscale" <<STUB
+#!/bin/bash
+echo "\$@" >> "$PB/ts.log"
+case "\$*" in *"status --json"*) [ -n "\${FAKE_TS_JSON:-}" ] && printf '%s' "\$FAKE_TS_JSON" ;; esac
+exit 0
+STUB
+chmod +x "$PB/stubs/tailscale"
+# Self is the MagicDNS name of THIS Mac (mixed case, trailing dot as tailscale prints it); the peer's name
+# must never be picked up.
+TS_JSON='{"BackendState":"Running","Peer":{"nodekey:aa":{"DNSName":"other-mac.tailnet.example."}},"Self":{"HostName":"Mac-1","DNSName":"Mac-1.Tailnet.Example."}}'
 pb() { env PATH="$PB/stubs:$STUBS:$PATH" HOME="$PB/home" MEMEX_LOCAL_HOME="$PB/home/.memex-local" "$@"; }
 LAYER="$PB/home/.memex-local/publish.yaml"
 refuse_pub() { local why="$1" want="$2"; shift 2
   OUT="$(printf 's3cret' | pb "$CLI" publish on "$@" 2>&1)"; RC=$?
   case "$RC:$OUT" in 0:*) bad "publish refuses $why" "exited 0" ;; *"$want"*) ok "publish refuses $why" ;; *) bad "publish refuses $why" "$OUT" ;; esac
   [ ! -f "$LAYER" ] || { bad "a refused publish writes no layer ($why)" "$(cat "$LAYER")"; rm -f "$LAYER"; }; }
-refuse_pub "a missing host"            "--host must be"            --sign-in microsoft --tenant t-1 --client-id c-1
+refuse_pub "a tailnet-only publish without a tailnet name" "no tailnet name to publish" --sign-in microsoft --tenant t-1 --client-id c-1
+case "$OUT" in *"reports no MagicDNS name"*) ok "a missing tailnet name is SAID (why there is none)" ;; *) bad "missing tailnet name is said" "$OUT" ;; esac
+refuse_pub "--tailnet-only with --host" "exclude each other"       --tailnet-only --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1
 refuse_pub "a localhost name"          "--host must be"            --host memex.localhost --sign-in microsoft --tenant t-1 --client-id c-1
 refuse_pub "no sign-in provider"       "needs a real sign-in"      --host mac-1.example.com --client-id c-1
 refuse_pub "an unknown provider"       "--sign-in must be microsoft" --host mac-1.example.com --sign-in dev --client-id c-1
@@ -1278,6 +1291,7 @@ OUT="$(printf '' | pb "$CLI" publish on --host mac-1.example.com --sign-in micro
 case "$RC:$OUT" in 0:*) bad "publish refuses an empty secret" "exited 0" ;; *"no client secret on STDIN"*) ok "publish refuses an empty secret" ;; *) bad "publish refuses an empty secret" "$OUT" ;; esac
 OUT="$(printf 's3cret-value\n' | pb "$CLI" publish on --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
 [ "$RC" = 0 ] && ok "publish on writes the layer" || bad "publish on writes the layer" "rc=$RC: $OUT"
+case "$OUT" in *"no tailnet name: publishing the public name mac-1.example.com only"*) ok "a public name without a tailnet name is published alone, and that is said" ;; *) bad "public-only is said" "$OUT" ;; esac
 case "$OUT" in *s3cret-value*) bad "publish never prints the secret" "$OUT" ;; *) ok "publish never prints the secret" ;; esac
 [ "$(stat -c %a "$LAYER" 2>/dev/null || stat -f %Lp "$LAYER")" = 600 ] && ok "the layer is 0600" || bad "the layer is 0600" "$(ls -l "$LAYER")"
 grep -q '^    - "mac-1.example.com"$' "$LAYER" && grep -q 'Authentication__Microsoft__ClientId: "c-1"' "$LAYER" \
@@ -1293,7 +1307,7 @@ pfaddr() { env PATH="$PB/stubs:$STUBS:$PATH" MEMEX_LOCAL_HOME="$PB/home/.memex-l
   sed "s#^\( *\)exec kubectl#\1kubectl#; s#^exec kubectl#kubectl#" "$1" | bash 2>/dev/null | grep port-forward | grep -v memex-network-entry | head -n 1' _ "$PF" 2>/dev/null | grep -o -- '--address .*'; }
 [ "$(pfaddr)" = "--address 127.0.0.1,::1 8443:443" ] && ok "published: the front door binds loopback only, on the unprivileged port alone" || bad "published front door" "$(pfaddr)"
 E="$PB/home/.memex-local/network-entry.yaml"
-grep -q 'header_up X-MeshWeaver-Provenance tailnet' "$E" && grep -q 'https://mac-1.example.com:8443 {' "$E" && ! grep -q '__HOST__' "$E" \
+grep -q 'header_up X-MeshWeaver-Provenance tailnet' "$E" && grep -q '^    https://mac-1.example.com:8443 {$' "$E" && ! grep -q '__[A-Z]*__' "$E" \
   && ok "the entry point marks every request and serves the public name only" || bad "network entry manifest" "$(head -40 "$E" 2>/dev/null)"
 grep -q 'svc/memex-network-entry' "$PF" && grep -q -- '"${entry_port}:8443"' "$PF" && ok "published: the entry point has its own loopback forward" || bad "entry forward" "missing in port-forward.sh"
 # The entry port may not collide with the front door or the e2e portal (traffic there carries no mark).
@@ -1361,7 +1375,59 @@ grep -q 'capabilities: { drop: \["ALL"\], add: \["NET_BIND_SERVICE"\] }' "$HERE/
   && ok "the network entry point adds NET_BIND_SERVICE back (caddy's file capability)" || bad "network-entry capabilities" "$(grep -n capabilities "$HERE/../share/network-entry.yaml")"
 grep -q 'setcap -r /usr/bin/caddy' "$HERE/../../tailnet-bridge/Dockerfile" && grep -q 'test -z "$(getcap /usr/local/bin/caddy)"' "$HERE/../../tailnet-bridge/Dockerfile" \
   && ok "the bridge image strips caddy's file capability and its test stage proves it" || bad "bridge caddy file cap" "missing in deploy/tailnet-bridge/Dockerfile"
-pb "$CLI" publish off >/dev/null 2>&1
+# The tailnet name: read from `tailscale status --json` (.Self.DNSName, dot stripped, lower-cased), never typed.
+tsname() { pb env FAKE_TS_JSON="$1" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; tailnet_name' "$CLI" 2>&1; }
+[ "$(tsname "$TS_JSON" 2>/dev/null)" = "mac-1.tailnet.example" ] && ok "the tailnet name is .Self.DNSName, trailing dot stripped, lower-cased (not a peer's)" || bad "tailnet name read" "$(tsname "$TS_JSON")"
+case "$(tsname '{"Self":{"DNSName":"mac-1."}}')" in *"without a domain"*) ok "a DNSName without a domain is no tailnet name, and that is said" ;; *) bad "domainless DNSName" "$(tsname '{"Self":{"DNSName":"mac-1."}}')" ;; esac
+# tailscale ABSENT: no tailnet name, and the output says so (a PATH without the stub and without any real tailscale).
+NOTS="$(mktemp -d)"; for t in bash env awk sed tr grep cat head paste mktemp dirname; do p="$(command -v "$t")" && ln -s "$p" "$NOTS/$t"; done
+OUT="$(env PATH="$NOTS" HOME="$PB/home" MEMEX_LOCAL_HOME="$PB/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; n="$(tailnet_name)"; printf "name=[%s]\n" "$n"' "$CLI" 2>&1)"
+case "$OUT" in *"tailscale is not installed — no tailnet name"*"name=[]"*) ok "tailscale absent: no tailnet name, and the output says so" ;; *) bad "tailscale absent" "$OUT" ;; esac
+rm -rf "$NOTS"
+# Tailnet-only (the default): the machine's own name is the ONLY published name, no public host anywhere.
+: > "$PB/ts.log"
+OUT="$(printf 's3cret-value\n' | pb env FAKE_TS_JSON="$TS_JSON" "$CLI" publish on --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "publish on without --host publishes on the private network only" || bad "tailnet-only publish" "rc=$RC: $OUT"
+[ "$(awk '/^  additionalHosts:/{on=1;next} on&&/^    - /{print;next} on{exit}' "$LAYER")" = '    - "mac-1.tailnet.example"' ] \
+  && ok "tailnet-only: the ingress gets the tailnet name and nothing else" || bad "tailnet-only hosts" "$(grep -A3 additionalHosts "$LAYER")"
+grep -q '^    https://mac-1.tailnet.example:8443 {$' "$E" && grep -q 'header_up X-MeshWeaver-Provenance tailnet' "$E" && grep -q 'caddyfile-hosts: "mac-1.tailnet.example"' "$E" \
+  && ok "tailnet-only: the entry point serves the tailnet name, marked" || bad "tailnet-only entry" "$(sed -n '/Caddyfile/,/^---/p' "$E")"
+grep -q -- 'serve --bg --tcp 443 tcp://127.0.0.1:8446' "$PB/ts.log" && ok "tailnet-only: tailscale serve still hands TCP 443 to the entry point" || bad "tailnet-only serve" "$(cat "$PB/ts.log")"
+case "$OUT" in *"redirect URI on the app: https://mac-1.tailnet.example/signin-microsoft"*"publish ca"*) ok "tailnet-only: says the redirect URI for the tailnet name and how a member trusts the CA" ;; *) bad "tailnet-only guidance" "$OUT" ;; esac
+case "$(pb "$CLI" publish status 2>&1)" in *"PUBLISHED — https://mac-1.tailnet.example, sign-in: Microsoft (tenant t-1)"*) ok "publish status names the tailnet name" ;; *) bad "tailnet-only status" "$(pb "$CLI" publish status 2>&1)" ;; esac
+OUT="$(printf 's3cret-value\n' | pb env FAKE_TS_JSON="$TS_JSON" "$CLI" publish on --tailnet-only --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+[ "$RC" = 0 ] && grep -q '^    - "mac-1.tailnet.example"$' "$LAYER" && ok "--tailnet-only says the default explicitly" || bad "--tailnet-only" "rc=$RC: $OUT"
+# Both names: --host ADDS the public name beside the tailnet name — one Caddy site for both, one ingress list.
+OUT="$(printf 's3cret-value\n' | pb env FAKE_TS_JSON="$TS_JSON" "$CLI" publish on --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+[ "$RC" = 0 ] && [ "$(awk '/^  additionalHosts:/{on=1;next} on&&/^    - /{print;next} on{exit}' "$LAYER" | sed 's/^ *- *//; s/"//g' | paste -sd, -)" = "mac-1.tailnet.example,mac-1.example.com" ] \
+  && ok "public + tailnet: the ingress lists both names" || bad "both names: hosts" "rc=$RC $(grep -A4 additionalHosts "$LAYER")"
+CF="$(sed -n '/Caddyfile: |/,/^---/p' "$E")"
+[ "$(printf '%s\n' "$CF" | grep -c '^    https://.*:8443 {$')" = 2 ] && [ "$(printf '%s\n' "$CF" | grep -c 'header_up X-MeshWeaver-Provenance tailnet')" = 2 ] \
+  && printf '%s\n' "$CF" | grep -A6 '^    https://mac-1.tailnet.example:8443 {$' | grep -q 'tls_server_name mac-1.tailnet.example$' \
+  && printf '%s\n' "$CF" | grep -A6 '^    https://mac-1.example.com:8443 {$' | grep -q 'tls_server_name mac-1.example.com$' \
+  && ! printf '%s\n' "$CF" | grep -q '__HOST\|site:' && grep -q 'caddyfile-hosts: "mac-1.tailnet.example mac-1.example.com"' "$E" \
+  && ok "public + tailnet: one marked Caddy site per name (no unmarked site), each with its own upstream SNI" || bad "two-name Caddyfile" "$CF"
+case "$OUT" in *"https://mac-1.tailnet.example/signin-microsoft"*"https://mac-1.example.com/signin-microsoft"*) ok "public + tailnet: a redirect URI for each name" ;; *) bad "both redirect URIs" "$OUT" ;; esac
+# The CA lives on a volume (a restart keeps the root a member trusted) and `publish off` keeps it.
+grep -q 'name: XDG_DATA_HOME, value: /data' "$HERE/../share/network-entry.yaml" && grep -q 'claimName: memex-network-entry-data' "$HERE/../share/network-entry.yaml" \
+  && ok "the entry point's CA lives on its data volume, not in /tmp" || bad "CA volume" "$(grep -n 'XDG_DATA_HOME\|claimName' "$HERE/../share/network-entry.yaml")"
+# publish ca: the root certificate out of the entry point, PEM only on stdout; refuses anything else.
+cat > "$PB/stubs/kubectl" <<'STUB'
+#!/bin/bash
+echo "$@" >> "${KLOG:-/dev/null}"
+case "$*" in *"exec deploy/memex-network-entry -- cat /data/caddy/pki/authorities/local/root.crt"*) printf '%s' "${FAKE_CA:-}" ;; esac
+exit 0
+STUB
+chmod +x "$PB/stubs/kubectl"
+PEM=$'-----BEGIN CERTIFICATE-----\nMIIBfake\n-----END CERTIFICATE-----'
+[ "$(pb env FAKE_CA="$PEM" "$CLI" publish ca 2>/dev/null)" = "$PEM" ] && ok "publish ca prints the entry point's root certificate (PEM only, on stdout)" || bad "publish ca" "$(pb env FAKE_CA="$PEM" "$CLI" publish ca 2>&1)"
+OUT="$(pb env FAKE_CA="" "$CLI" publish ca 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "publish ca refuses a missing CA" "exited 0" ;; *"no root certificate"*) ok "publish ca refuses when the entry point has no CA (and says where it looked)" ;; *) bad "publish ca missing" "$OUT" ;; esac
+: > "$PB/klog"
+pb env KLOG="$PB/klog" "$CLI" publish off >/dev/null 2>&1
+grep -q 'delete deployment/memex-network-entry service/memex-network-entry configmap/memex-network-entry' "$PB/klog" && ! grep -q 'pvc\|-f ' "$PB/klog" \
+  && ok "publish off deletes the entry point by name and keeps its CA volume" || bad "publish off keeps the CA" "$(cat "$PB/klog")"
+rm -f "$PB/stubs/kubectl"
 [ ! -f "$LAYER" ] && ok "publish off removes the layer" || bad "publish off" "layer still there"
 grep -q -- 'serve --tcp 443 off' "$PB/ts.log" && ok "publish off stops the tailscale serve" || bad "publish off serve" "$(cat "$PB/ts.log")"
 [ "$(pfaddr)" = "--address 0.0.0.0,:: 80:80 443:443 8443:443" ] && ok "not published: the front door binds every interface, all three mappings (unchanged)" || bad "unpublished front door" "$(pfaddr)"

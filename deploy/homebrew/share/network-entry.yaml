@@ -1,10 +1,17 @@
 # memex-local NETWORK ENTRY POINT — applied by `memex-local publish on`, deleted by `publish off`.
 # The private network's OWN way into this Mac's portal (MeshWeaver core Doc/Architecture/PrivateNetwork §5):
-#   network (only tag:bridge may reach TCP 443) → tailscale serve 443 → 127.0.0.1:<entry port>
+#   network (a member device at this Mac's tailnet name, or the ingress bridge for a public name) → TCP 443
+#   → tailscale serve 443 → 127.0.0.1:<entry port>
 #   → this proxy → the local ingress, with X-MeshWeaver-Provenance: tailnet set on EVERY request
 #   (overwriting whatever the sender claimed). The portal refuses the open development sign-in for a
 #   request that carries the mark, whatever its Host says. The person at the Mac uses the loopback-only
-#   front door, which never adds the mark. __HOST__ is the public name; nothing else is substituted.
+#   front door, which never adds the mark.
+# Rendered by `publish on` (render_network_entry): the site between `site:begin` and `site:end` once per
+# published name (the host placeholder — the machine's own MagicDNS name, read from `tailscale status
+# --json`, and/or a public name the bridge forwards), and the hosts placeholder = the names, space-separated.
+# Every site gets the SAME mark — there is no unmarked site.
+# The CA behind `tls internal` lives on the data volume, so it survives a pod restart and a device that
+# trusted it (`memex-local publish ca`) keeps trusting it; `publish off` keeps the volume for the same reason.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -19,6 +26,10 @@ data:
     	skip_install_trust
     	auto_https disable_redirects
     }
+    # The site below is rendered once per published name, each with its OWN upstream transport, so the
+    # SNI the ingress sees is always the name asked for (one shared transport reuses a pooled connection
+    # across names — measured with Caddy 2.10.2). Every copy carries the same mark.
+    # site:begin
     https://__HOST__:8443 {
     	tls internal
     	reverse_proxy https://ingress-nginx-controller.ingress-nginx.svc.cluster.local:443 {
@@ -29,6 +40,18 @@ data:
     		}
     	}
     }
+    # site:end
+---
+# The local CA's home. Kept by `publish off` (it deletes the ConfigMap, Deployment and Service by name), so
+# re-publishing presents the same root and no member device has to trust a new one.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: memex-network-entry-data
+  labels: { app.kubernetes.io/name: memex-network-entry, app.kubernetes.io/managed-by: memex-local }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 64Mi } }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -37,21 +60,24 @@ metadata:
   labels: { app.kubernetes.io/name: memex-network-entry, app.kubernetes.io/managed-by: memex-local }
 spec:
   replicas: 1
+  # Recreate: the data volume (the local CA) is ReadWriteOnce — a rolling update would wait on it forever.
+  strategy: { type: Recreate }
   selector: { matchLabels: { app.kubernetes.io/name: memex-network-entry } }
   template:
     metadata:
       labels: { app.kubernetes.io/name: memex-network-entry }
-      annotations: { memex-local/caddyfile-host: "__HOST__" }
+      annotations: { memex-local/caddyfile-hosts: "__HOSTS__" }
     spec:
       automountServiceAccountToken: false
-      securityContext: { runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: { type: RuntimeDefault } }
+      securityContext: { runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: entry
           # Caddy 2.10.2, pinned by digest (the same pin as MeshWeaver.Deploy deploy/tailnet-bridge).
           image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
           args: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
           env:
-            - { name: XDG_DATA_HOME, value: /tmp/caddy }
+            # the data dir holds the local CA (pki/authorities/local/root.crt) — on the volume, never in /tmp
+            - { name: XDG_DATA_HOME, value: /data }
             - { name: XDG_CONFIG_HOME, value: /tmp/caddy }
           ports: [{ name: https, containerPort: 8443 }]
           # 🚨 NET_BIND_SERVICE back, nothing else: the caddy binary of the image carries the FILE capability
@@ -64,8 +90,10 @@ spec:
           volumeMounts:
             - { name: config, mountPath: /etc/caddy, readOnly: true }
             - { name: tmp, mountPath: /tmp }
+            - { name: data, mountPath: /data }
       volumes:
         - { name: config, configMap: { name: memex-network-entry } }
+        - { name: data, persistentVolumeClaim: { claimName: memex-network-entry-data } }
         - { name: tmp, emptyDir: { sizeLimit: 32Mi } }
 ---
 apiVersion: v1

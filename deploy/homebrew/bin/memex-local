@@ -145,9 +145,9 @@ readonly LLM_FILE="$LOCAL_HOME/llm.yaml"
 # One values layer after back-lease and before the overlay (an overlay value still wins). The throw-away
 # RSA key the code is sealed to lives under $FLEET_DIR only until the code is opened.
 readonly FLEET_FILE="$LOCAL_HOME/fleet.yaml"
-# ── PUBLIC NAME — this Mac answers at a public name through the network's ingress bridge ─────────────────
+# ── PUBLISHED — this Mac answers at its tailnet name (and optionally a public name) on the private network ──
 # Written by `memex-local publish on`, read by helm_deploy as one more values layer after the fleet layer
-# and before the overlay (an overlay value still wins): the public name as an ADDITIONAL ingress host (the
+# and before the overlay (an overlay value still wins): the published names as ADDITIONAL ingress hosts (the
 # portal's own links keep https://memex.localhost), the sign-in provider declared for it, and
 # invitation-only admission. While it exists the front door binds LOOPBACK only, on the unprivileged port
 # (share/port-forward.sh), and the network has its OWN entry point (share/network-entry.yaml, reached by
@@ -723,18 +723,29 @@ cmd_backlease() {
 
 
 # ---------------------------------------------------------------------------
-# §18b — PUBLIC NAME through the network's ingress bridge (MeshWeaver.Plugins Hosting/MacStudioFleet §6)
+# §18b — PUBLISH this Mac on the private network (MeshWeaver.Plugins Hosting/MacStudioFleet §6)
 # ---------------------------------------------------------------------------
-# `publish on --host <public name> --sign-in microsoft --tenant <id> --client-id <id>` makes this Mac's
-# portal answer at <public name> as well as at memex.localhost: the bridge (MeshWeaver.Deploy
-# deploy/tailnet-bridge) forwards that name over the private network to this Mac's port 443 with
-# Host = the public name. What protects it is the portal's own sign-in, so the command REQUIRES a real
-# provider for the public name (the development sign-in answers on localhost names only) and turns on
-# invitation-only admission: the first person to sign in becomes the instance's administrator, everyone
-# after needs an invitation. The client secret is read from STDIN (`< file` or a pipe), never an argument,
-# and stored in this 0600 layer only. `publish status` reads it back; `publish off` removes it.
+# `publish on --sign-in microsoft --tenant <id> --client-id <id>` makes this Mac's portal answer at its OWN
+# name on the private network — the MagicDNS name `tailscale status --json` reports as .Self.DNSName
+# (e.g. mac-1.<tailnet suffix>), read here and never typed — as well as at memex.localhost. A member device
+# on the network reaches https://<that name> DIRECTLY (tailscale serve TCP 443 → the entry point); nothing
+# public is involved. That is the default (`--tailnet-only` says it explicitly).
+# `--host <public name>` ADDS a public name the network's ingress bridge (MeshWeaver.Deploy
+# deploy/tailnet-bridge) forwards to the same port with Host = the public name; the machine's own name is
+# still served beside it when tailscale reports one.
+# What protects every name is the portal's own sign-in, so the command REQUIRES a real provider (the
+# development sign-in answers on localhost names only, and never for a request the entry point marked) and
+# turns on invitation-only admission: the first person to sign in becomes the instance's administrator,
+# everyone after needs an invitation. The client secret is read from STDIN (`< file` or a pipe), never an
+# argument, and stored in this 0600 layer only. `publish status` reads it back; `publish off` removes it;
+# `publish ca` prints the entry point's root certificate for a member device to trust.
 publish_value() { awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$PUBLISH_FILE" 2>/dev/null; }
-publish_host() { awk '/^  additionalHosts:/ { getline; sub(/^ *- */, ""); gsub(/"/, ""); print; exit }' "$PUBLISH_FILE" 2>/dev/null; }
+# Every published name, one per line (the layer's ingress.additionalHosts list).
+publish_hosts() {
+  awk '/^  additionalHosts:/ { on = 1; next } on && /^    - / { sub(/^ *- */, ""); gsub(/"/, ""); print; next } on { exit }' "$PUBLISH_FILE" 2>/dev/null
+}
+# "https://a, https://b" for the messages.
+publish_urls() { publish_hosts | sed 's|^|https://|' | paste -sd, - | sed 's/,/, /g'; }
 publish_signin_summary() {
   local p; for p in Microsoft Google Apple LinkedIn; do
     [ -n "$(publish_value "Authentication__${p}__ClientId")" ] && printf '%s' "$p"
@@ -757,6 +768,57 @@ publish_tailscale() {
   local ts=(tailscale) sock; sock="$(tailscale_socket)"; [ -n "$sock" ] && ts+=(--socket="$sock")
   command -v tailscale >/dev/null 2>&1 || { warn "tailscale is not installed — join the private network first (MeshWeaver.Deploy deploy/headscale/README.md)"; return 1; }
   ${ts[@]+"${ts[@]}"} "$@"
+}
+
+# This Mac's OWN name on the private network: .Self.DNSName of `tailscale status --json` (the MagicDNS
+# name, e.g. mac-1.<tailnet suffix>.), trailing dot stripped, lower-cased. Prints nothing — and says why on
+# stderr — when tailscale is absent, not connected, or reports no name: the caller then publishes no
+# tailnet name. Read with jq, else python3, else plutil (macOS reads JSON too); never typed by hand.
+tailnet_name() {
+  command -v tailscale >/dev/null 2>&1 || { warn "tailscale is not installed — no tailnet name to publish (join the private network: MeshWeaver.Deploy deploy/headscale/README.md)"; return 0; }
+  local json name=""
+  json="$(publish_tailscale status --json 2>/dev/null)" || json=""
+  if [ -n "$json" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      name="$(printf '%s' "$json" | jq -r '.Self.DNSName // empty' 2>/dev/null)"
+    elif command -v python3 >/dev/null 2>&1; then
+      name="$(printf '%s' "$json" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("Self") or {}).get("DNSName") or "")' 2>/dev/null)"
+    elif command -v plutil >/dev/null 2>&1; then
+      name="$(printf '%s' "$json" | plutil -extract Self.DNSName raw -o - - 2>/dev/null)"
+    fi
+  fi
+  name="$(printf '%s' "$name" | tr 'A-Z' 'a-z')"; name="${name%.}"
+  case "$name" in
+    '') warn "tailscale reports no MagicDNS name for this Mac (not connected, or MagicDNS is off) — no tailnet name to publish"; return 0 ;;
+    *[!a-z0-9.-]*|*.localhost|localhost) warn "tailscale reports '$name', which is not a DNS name — no tailnet name to publish"; return 0 ;;
+    *.*) printf '%s' "$name" ;;
+    *) warn "tailscale reports '$name' without a domain (MagicDNS is off?) — no tailnet name to publish"; return 0 ;;
+  esac
+}
+
+# Renders share/network-entry.yaml for the given names: the Caddy site between `site:begin` and `site:end`
+# once per name (__HOST__), __HOSTS__ = the names space-separated. Names are validated DNS names by now.
+render_network_entry() {
+  local template="$1"; shift
+  awk -v names="$*" '
+    BEGIN { n = split(names, h, " ") }
+    /# site:begin/ { inblock = 1; block = ""; next }
+    inblock && /# site:end/ { inblock = 0; for (i = 1; i <= n; i++) { b = block; gsub(/__HOST__/, h[i], b); printf "%s", b }; next }
+    inblock { block = block $0 "\n"; next }
+    { gsub(/__HOSTS__/, names); print }
+  ' "$template"
+}
+
+# The entry point's root certificate (Caddy's `tls internal` CA, on the entry point's data volume): what a
+# member device must trust before a browser or a WKWebView accepts https://<tailnet name>. PEM on stdout.
+readonly ENTRY_CA_PATH="/data/caddy/pki/authorities/local/root.crt"
+publish_ca() {
+  local pem
+  pem="$(kubectl -n "$NAMESPACE" exec deploy/memex-network-entry -- cat "$ENTRY_CA_PATH" 2>/dev/null)" || pem=""
+  case "$pem" in
+    "-----BEGIN CERTIFICATE-----"*"-----END CERTIFICATE-----"*) printf '%s\n' "$pem" ;;
+    *) die "publish ca: no root certificate at memex-network-entry:$ENTRY_CA_PATH — is this Mac published ('memex-local publish status') and the entry point running ('kubectl -n $NAMESPACE get pods -l app.kubernetes.io/name=memex-network-entry')?" ;;
+  esac
 }
 
 # Removes EMPTY placeholder lines (`    <key>: ""`) for the given keys from the person's overlay. The overlay is
@@ -782,10 +844,11 @@ cmd_publish() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
     on)
-      local host="" provider="" tenant="" client_id="" secret=""
+      local host="" provider="" tenant="" client_id="" secret="" tailnet_only=""
       while [ $# -gt 0 ]; do
         case "$1" in
           --host)      shift; host="${1:?--host needs the public name}" ;;
+          --tailnet-only) tailnet_only=1 ;;
           --sign-in)   shift; provider="${1:?--sign-in needs a provider: microsoft, google, apple or linkedin}" ;;
           --tenant)    shift; tenant="${1:?--tenant needs the directory id}" ;;
           --client-id) shift; client_id="${1:?--client-id needs the app registration client id}" ;;
@@ -793,7 +856,10 @@ cmd_publish() {
         esac
         shift
       done
-      case "$host" in ''|*[!a-z0-9.-]*|*.localhost|localhost) die "publish on: --host must be a lower-case public DNS name (got '${host:-<none>}')" ;; *.*) ;; *) die "publish on: --host '$host' is not a DNS name" ;; esac
+      [ -n "$tailnet_only" ] && [ -n "$host" ] && die "publish on: --tailnet-only and --host exclude each other — --host ADDS a public name; leave it out to publish on the private network only"
+      if [ -n "$host" ]; then
+        case "$host" in *[!a-z0-9.-]*|*.localhost|localhost) die "publish on: --host must be a lower-case public DNS name (got '$host')" ;; *.*) ;; *) die "publish on: --host '$host' is not a DNS name" ;; esac
+      fi
       local key
       case "$provider" in
         microsoft) key=Microsoft
@@ -803,7 +869,7 @@ cmd_publish() {
         '')        die "publish on: --sign-in <provider> is required — a public name needs a real sign-in (the development sign-in answers on localhost names only)" ;;
         *)         die "publish on: --sign-in must be microsoft (google, apple, linkedin: a follow-up) — got '$provider'" ;;
       esac
-      [ -n "$client_id" ] || die "publish on: --client-id <id> is required (the app registration whose redirect URI is https://${host}/signin-${provider})"
+      [ -n "$client_id" ] || die "publish on: --client-id <id> is required (the app registration whose redirect URI is https://<each published name>/signin-${provider})"
       case "$client_id" in *[!A-Za-z0-9._-]*) die "publish on: --client-id contains characters a client id never has" ;; esac
       [ -t 0 ] && die "publish on: pipe the client secret on STDIN (e.g. '< secret-file' or from your secret store) — it is never an argument and never printed"
       secret="$(cat)"; secret="${secret%$'\n'}"
@@ -820,18 +886,32 @@ cmd_publish() {
           die "publish on: something already listens on port $ENTRY_PORT — set MEMEX_ENTRY_PORT to a free port (the network must reach ONLY the entry point)"
         fi
       fi
+      # The machine's OWN name on the network, read from tailscale — never typed. Without one, a
+      # tailnet-only publish has nothing to publish; a public name is published alone, and that is said.
+      local ts_name; ts_name="$(tailnet_name)"
+      if [ -z "$ts_name" ]; then
+        [ -n "$host" ] || die "publish on: no tailnet name to publish (see above) — join the private network ('tailscale up --login-server <the network's login server>'), or add a public name with --host <name>"
+        info "no tailnet name: publishing the public name ${host} only"
+      fi
+      local names=() n host_lines=""
+      [ -n "$ts_name" ] && names+=("$ts_name")
+      [ -n "$host" ] && [ "$host" != "$ts_name" ] && names+=("$host")
+      for n in ${names[@]+"${names[@]}"}; do
+        host_lines="${host_lines}    - \"${n}\"
+"
+      done
       mkdir -p "$LOCAL_HOME"
       local tenant_line=""
       [ -n "$tenant" ] && tenant_line="    Authentication__Microsoft__TenantId: \"${tenant}\"
 "
       ( umask 077; cat > "$PUBLISH_FILE" ) <<YAML
-# memex-local PUBLIC NAME — managed by \`memex-local publish\`; re-run \`on\` to change, \`off\` to delete.
-# This Mac's portal also answers at https://${host} through the network's ingress bridge. The front door
-# binds loopback only (port ${HOST_PORT}) while this file exists; the network reaches it through tailscale serve.
+# memex-local PUBLISHED — managed by \`memex-local publish\`; re-run \`on\` to change, \`off\` to delete.
+# This Mac's portal also answers at the names below: its own name on the private network (read from
+# tailscale) and/or a public name the network's ingress bridge forwards. The front door binds loopback only
+# (port ${HOST_PORT}) while this file exists; the network reaches the entry point through tailscale serve.
 ingress:
   additionalHosts:
-    - "${host}"
-config:
+${host_lines}config:
   memex_portal:
     Authentication__${key}__ClientId: "${client_id}"
 ${tenant_line}    Features__Onboarding__InvitationOnly: "true"
@@ -843,32 +923,35 @@ YAML
       unset secret
       local dropped; dropped="$(overlay_drop_empty ${PUBLISH_OWNED_KEYS[@]+"${PUBLISH_OWNED_KEYS[@]}"})"
       [ -n "$dropped" ] && ok "removed empty overlay placeholder(s) that would erase the sign-in: $(printf '%s' "$dropped" | tr '\n' ' ')"
-      ok "public-name layer written: $PUBLISH_FILE (https://${host}, sign-in ${key}${tenant:+ tenant ${tenant}}, invitation-only; the secret is in the file, never printed)"
+      ok "publish layer written: $PUBLISH_FILE ($(publish_urls), sign-in ${key}${tenant:+ tenant ${tenant}}, invitation-only; the secret is in the file, never printed)"
       # The network's OWN entry point: an in-cluster proxy that marks every request it carries as
       # arriving through the network (X-MeshWeaver-Provenance: tailnet, overwriting any sender claim) —
       # the portal refuses the open sign-in on that mark whatever the Host says. Only it is served to
       # the network; the person at the Mac keeps the loopback-only front door, which adds no mark.
       local share; share="$(resolve_share)"
-      if sed -e "s|__HOST__|${host}|g" "$share/network-entry.yaml" > "$LOCAL_HOME/network-entry.yaml" \
+      if render_network_entry "$share/network-entry.yaml" ${names[@]+"${names[@]}"} > "$LOCAL_HOME/network-entry.yaml" \
          && kubectl -n "$NAMESPACE" apply -f "$LOCAL_HOME/network-entry.yaml" >/dev/null 2>&1; then
-        ok "network entry point applied (memex-network-entry: marks every network request, serves ${host} only)"
+        ok "network entry point applied (memex-network-entry: marks every network request, serves ${names[*]} only)"
       else
         warn "could not apply the network entry point ($LOCAL_HOME/network-entry.yaml) — is Colima up? Re-run 'memex-local publish on …'"
       fi
       if publish_tailscale serve --bg --tcp 443 "tcp://127.0.0.1:${ENTRY_PORT}" >/dev/null 2>&1; then
         ok "the network reaches this Mac on TCP 443 through the entry point only (tailscale serve → 127.0.0.1:${ENTRY_PORT})"
       else
-        warn "could not set up 'tailscale serve --tcp 443 tcp://127.0.0.1:${ENTRY_PORT}' — the bridge cannot reach this Mac until it is"
+        warn "could not set up 'tailscale serve --tcp 443 tcp://127.0.0.1:${ENTRY_PORT}' — the network cannot reach this Mac until it is"
       fi
       info "While published the front door is loopback-only on port ${HOST_PORT}: open https://${HOSTNAME_LOCAL}:${HOST_PORT} locally"
-      info "The network policy must let ONLY the bridge (tag:bridge) reach TCP 443, and no member reach ${HOST_PORT}, ${MEMEX_E2E_PORT:-8444} or ${ENTRY_PORT}"
-      info "Register the redirect URI on the app: https://${host}/signin-${provider}"
-      info "Apply it: memex-local update   (the front door rebinds to loopback; the first person to sign in at https://${host} becomes this instance's administrator — make it yours)"
+      info "The network policy must let no member reach ${HOST_PORT}, ${MEMEX_E2E_PORT:-8444} or ${ENTRY_PORT} (a user-space network client delivers to loopback ports too) — TCP 443 is the one way in"
+      for n in ${names[@]+"${names[@]}"}; do info "Register the redirect URI on the app: https://${n}/signin-${provider}"; done
+      if [ -n "$ts_name" ]; then
+        info "A member device: join the network, then trust the entry point's CA once — 'memex-local publish ca > memex-entry-ca.crt' here (after the update), install it there (README: Publishing a Mac on the private network)"
+      fi
+      info "Apply it: memex-local update   (the front door rebinds to loopback; the first person to sign in at https://${names[0]} becomes this instance's administrator — make it yours)"
       ;;
     status)
       [ $# -eq 0 ] || die "publish status: unknown flag '$1'"
       if [ -f "$PUBLISH_FILE" ]; then
-        ok "PUBLIC NAME ON — https://$(publish_host), sign-in: $(publish_signin_summary), admission: invitation-only"
+        ok "PUBLISHED — $(publish_urls), sign-in: $(publish_signin_summary), admission: invitation-only"
         info "values file: $PUBLISH_FILE (layered after the fleet layer by helm_deploy)"
         # What the portal ACTUALLY got — the rendered config, not the layer: an overlay value wins over this file.
         local want_id want_tenant got_id got_tenant
@@ -882,22 +965,28 @@ YAML
         fi
         publish_tailscale serve status 2>/dev/null | sed 's/^/  /' || true
       else
-        info "no public name — publish this Mac with:"
-        info "  memex-local publish on --host <name> --sign-in microsoft --tenant <id> --client-id <id> < secret-file"
+        info "not published — publish this Mac on the private network (its tailnet name) with:"
+        info "  memex-local publish on --sign-in microsoft --tenant <id> --client-id <id> < secret-file"
+        info "  (add --host <public name> to also answer at a public name through the network's ingress bridge)"
       fi
       ;;
     off)
       [ $# -eq 0 ] || die "publish off: unknown flag '$1'"
       publish_tailscale serve --tcp 443 off >/dev/null 2>&1 || true
-      kubectl -n "$NAMESPACE" delete -f "$LOCAL_HOME/network-entry.yaml" --ignore-not-found >/dev/null 2>&1 || true
+      # By name, not -f: the data volume (the entry point's CA) stays, so a re-publish presents the same root.
+      kubectl -n "$NAMESPACE" delete deployment/memex-network-entry service/memex-network-entry configmap/memex-network-entry --ignore-not-found >/dev/null 2>&1 || true
       if [ -f "$PUBLISH_FILE" ]; then
         rm -f "$PUBLISH_FILE"
-        ok "public name OFF — the next 'memex-local update' drops the host and its sign-in (the bridge then answers 502)"
+        ok "publish OFF — the next 'memex-local update' drops the names and their sign-in (the entry point's CA volume is kept: 'kubectl -n $NAMESPACE delete pvc memex-network-entry-data' forgets it)"
       else
-        info "no public name was set"
+        info "this Mac was not published"
       fi
       ;;
-    *) die "usage: memex-local publish {on --host <name> --sign-in microsoft --tenant <id> --client-id <id> < secret | status | off}" ;;
+    ca)
+      [ $# -eq 0 ] || die "publish ca: unknown flag '$1'"
+      publish_ca
+      ;;
+    *) die "usage: memex-local publish {on [--tailnet-only | --host <public name>] --sign-in microsoft --tenant <id> --client-id <id> < secret | status | ca | off}" ;;
   esac
 }
 
@@ -1624,7 +1713,7 @@ helm_deploy() {
     # an empty overlay placeholder for a key this layer owns would erase it (the overlay is layered last)
     overlay_drop_empty ${PUBLISH_OWNED_KEYS[@]+"${PUBLISH_OWNED_KEYS[@]}"} >/dev/null
     mode_args+=(-f "$PUBLISH_FILE")
-    info "PUBLIC NAME: also answers at https://$(publish_host) — sign-in: $(publish_signin_summary); admission: invitation-only"
+    info "PUBLISHED: also answers at $(publish_urls) — sign-in: $(publish_signin_summary); admission: invitation-only"
   fi
   # LOCAL MODEL layer (`memex-local llm use`): the host's Ollama is the portal's utility-tier model.
   if [ -f "$LLM_FILE" ]; then
@@ -3531,14 +3620,17 @@ COMMANDS:
                   printed, only their sha256 fingerprints), runs backlease enroll, starts Ollama
                   under launchd, and updates from the public GHCR. 'status' shows the fingerprints.
   backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] | status | off
-  publish on --host <name> --sign-in microsoft --tenant <id> --client-id <id> < secret | status | off
-                  PUBLIC NAME (Hosting/MacStudioFleet §6): this Mac's portal also answers at <name>
-                  through the private network's ingress bridge. Writes the values layer (the
-                  additional ingress host, the sign-in provider for it, invitation-only admission;
-                  the client secret is read from STDIN into the 0600 layer, never printed), binds the
-                  front door to loopback and sets up 'tailscale serve --tcp 443' so only the network
-                  reaches it. The development sign-in answers on localhost names only, so a public
-                  name always needs a real provider. 'memex-local update' applies it.
+  publish on [--tailnet-only | --host <name>] --sign-in microsoft --tenant <id> --client-id <id> < secret | status | ca | off
+                  PUBLISH (Hosting/MacStudioFleet §6): this Mac's portal also answers at its OWN name
+                  on the private network (tailscale's MagicDNS name, read from 'tailscale status
+                  --json', never typed) — member devices reach it directly, nothing public involved.
+                  --host <name> ADDS a public name the network's ingress bridge forwards. Writes the
+                  values layer (the additional ingress hosts, the sign-in provider, invitation-only
+                  admission; the client secret is read from STDIN into the 0600 layer, never
+                  printed), binds the front door to loopback and sets up 'tailscale serve --tcp 443'
+                  to the marking entry point. The development sign-in answers on localhost names
+                  only, so publishing always needs a real provider. 'memex-local update' applies it.
+                  'publish ca > root.crt' prints the entry point's root CA for member devices to trust.
   relay pair --instance <https url> --owner <user id> --binary <dir|file> | status | off [--forget]
                   DEVICE RELAY (Hosting/DeviceRelay): let a cloud instance's inbox read the
                   chats that exist only on this Mac (iMessage, WhatsApp Desktop) LIVE —
