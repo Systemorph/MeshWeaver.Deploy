@@ -14,7 +14,7 @@ sed -e 's#/tmp/hs/#/tmp/hk/#g' "$cfg" > "$root/config.yaml"
 headscale serve -c "$root/config.yaml" > "$root/serve.log" 2>&1 &
 hs_pid=$!
 echo stub-token > "$root/sa/token"; echo control > "$root/sa/namespace"
-python3 /test/kube-stub.py 18080 "$root/sa/token" "$root/state" hs-preauth-bridge hs-preauth-mac > "$root/stub.log" 2>&1 &
+python3 /test/kube-stub.py 18080 "$root/sa/token" "$root/state" hs-preauth-bridge hs-preauth-mac hs-preauth-readonly > "$root/stub.log" 2>&1 &
 stub_pid=$!
 trap 'kill "$hs_pid" "$stub_pid" 2>/dev/null || true' EXIT
 for _ in $(seq 1 60); do headscale -c "$root/config.yaml" health >/dev/null 2>&1 && break; sleep 0.5; done
@@ -92,6 +92,33 @@ if KEYS_CONFIG="$root/keys.json" HEADSCALE_CONFIG="$root/config.yaml" KUBE_API=h
 else
   grep -q 'answered HTTP 401' "$root/run.log" && pass "a refused API call fails the pass" || bad "a refused API call failed without naming the answer"
 fi
+
+# 8. A changed declaration replaces a still-valid key (here: a different user), and expires the old one.
+bridge_before=$(id_of hs-preauth-bridge)
+jq '.[0].user = "tailnet-bridge-2"' "$root/keys.json" > "$root/k4.json" && mv "$root/k4.json" "$root/keys.json"
+run || { cat "$root/run.log"; bad "pass after a declaration change exited non-zero"; }
+bridge_after=$(id_of hs-preauth-bridge)
+[ -n "$bridge_after" ] && [ "$bridge_after" != "$bridge_before" ] && grep -q "the declaration changed" "$root/run.log" \
+  && pass "a changed declaration replaces a still-valid key, and says why" || bad "a changed declaration kept the old key"
+[ "$(h preauthkeys list -o json | jq -r --argjson id "${bridge_after:-0}" '[.[] | select(.id == $id)][0].user.name')" = tailnet-bridge-2 ] \
+  && pass "the new key belongs to the newly declared user" || bad "the new key's user is not the declared one"
+now=$(date +%s)
+[ "$(h preauthkeys list -o json | jq -r --argjson id "${bridge_before:-0}" --argjson now "$now" '[.[] | select(.id == $id)][0].expiration.seconds <= $now')" = true ] \
+  && pass "the key minted for the old declaration was expired" || bad "the old declaration's key is still valid"
+[ -z "$(jq -r '.metadata.annotations["headscale.meshweaver.net/pending-expire"] // empty' "$root/state/hs-preauth-bridge.json")" ] \
+  && pass "nothing is left pending once the replaced key is expired" || bad "a revocation is still pending"
+
+# 9. A minted key the Secret write refused is expired at once — no valid credential is left behind.
+jq '[{"name": "ro", "user": "ro-user", "secret": "hs-preauth-readonly"}]' "$root/keys.json" > "$root/k5.json"
+if KEYS_CONFIG="$root/k5.json" HEADSCALE_CONFIG="$root/config.yaml" KUBE_API=http://127.0.0.1:18080 \
+     KUBE_SA_DIR="$root/sa" headscale-keys --once > "$root/run.log" 2>&1; then
+  bad "a pass whose Secret write was refused exited 0"
+else
+  grep -q 'answered HTTP 403; expiring the unstored key' "$root/run.log" && pass "a refused write fails the pass, naming it" || { cat "$root/run.log"; bad "a refused write failed without saying so"; }
+fi
+now=$(date +%s)
+[ "$(h preauthkeys list -o json | jq -r --argjson now "$now" '[.[] | select(.user.name == "ro-user") | select((.expiration.seconds // 0) > $now)] | length')" = 0 ] \
+  && pass "the unstored key is no longer valid" || bad "a minted key nobody stored is still valid"
 
 echo "$fail failure(s)"
 exit "$fail"

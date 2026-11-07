@@ -60,6 +60,9 @@ class Handler(BaseHTTPRequestHandler):
         name = self.secret()
         if not name:
             return
+        if name.endswith("-readonly"):  # a Secret the Role cannot write: the API server refuses the PATCH
+            self.answer(403, {"reason": "Forbidden"})
+            return
         if self.headers.get("Content-Type") != "application/merge-patch+json":
             self.answer(415, {"reason": "UnsupportedMediaType"})
             return

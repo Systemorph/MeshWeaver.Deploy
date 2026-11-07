@@ -49,7 +49,8 @@ blockedPaths: ["/dev", "/dev/*"]
 
 networkPolicy:
   enabled: true
-  # Namespaces whose pods may reach the proxy port: the ingress controller's. Empty = any namespace.
+  # REQUIRED while enabled: the namespaces whose pods may reach the proxy port — the ingress controller's.
+  # (Any other pod reaching it would be trusted as a forwarding proxy, so there is no "any namespace".)
   ingressNamespaces: []
 
 resources:

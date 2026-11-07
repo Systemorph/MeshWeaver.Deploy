@@ -67,6 +67,9 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- if and .Values.target.upstreamHost (not (regexMatch $dns (toString .Values.target.upstreamHost))) }}
 {{- fail (printf "target.upstreamHost %q is not a lower-case DNS name" (toString .Values.target.upstreamHost)) }}
 {{- end }}
+{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.ingressNamespaces) }}
+{{- fail "networkPolicy.ingressNamespaces is required — name the ingress controller's namespace(s); without it any pod in the cluster could reach the proxy and be trusted as a forwarding proxy" }}
+{{- end }}
 {{- range $p := .Values.blockedPaths }}
 {{- if not (regexMatch "^/[A-Za-z0-9/_.*-]*$" (toString $p)) }}
 {{- fail (printf "blockedPaths entry %q is not a path matcher" (toString $p)) }}

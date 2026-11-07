@@ -190,6 +190,16 @@ jobs:
           assert not sec.get("data"), "the chart rendered key material"
           print("preauthKeys: one Role over exactly the declared Secret (get/update/patch), token in the sidecar only, Secret kept and empty")
           PY
+          # A long release name keeps every key's Secret distinct (names are never truncated).
+          long=$(printf 'r%.0s' $(seq 1 45))
+          names=$(helm template "$long" deploy/headscale/helm -f ci-values.yaml "${keys[@]}" --set 'preauthKeys.keys[1].name=mac' --set 'preauthKeys.keys[1].user=fleet' \
+                  | awk '/^kind: Secret/{s=1} s && /^  name:/{print $2; s=0}' | sort -u | wc -l | tr -d ' ')
+          [ "$names" = 2 ] || { echo "::error::two declared keys rendered $names distinct Secret name(s) under a long release name"; exit 1; }
+          # The pod template hashes the DECLARATION only (a key renewal must not restart the server).
+          grep -q 'checksum/preauth-keys:' <<<"$pk" || { echo "::error::no declaration checksum on the pod template"; exit 1; }
+          a=$(helm template hs deploy/headscale/helm -f ci-values.yaml "${keys[@]}" | grep 'checksum/preauth-keys')
+          b=$(helm template hs deploy/headscale/helm -f ci-values.yaml "${keys[@]}" --set 'preauthKeys.keys[0].user=other' | grep 'checksum/preauth-keys')
+          [ "$a" != "$b" ] || { echo "::error::changing a declared key does not change the pod template"; exit 1; }
           refuse "preauthKeys has no image"             -f ci-values.yaml "${keys[@]}" --set preauthKeys.image.repository=
           refuse "preauthKeys declares no key"          -f ci-values.yaml --set preauthKeys.enabled=true --set preauthKeys.image.repository=r/k
           refuse "a key name is not a DNS label"        -f ci-values.yaml "${keys[@]}" --set 'preauthKeys.keys[0].name=Bad_Name'

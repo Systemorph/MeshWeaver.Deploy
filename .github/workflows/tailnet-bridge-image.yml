@@ -88,6 +88,7 @@ jobs:
           ingress: { className: nginx, clusterIssuer: letsencrypt }
           network: { loginServer: https://hs.example.com, authKeySecret: hs-preauth-tailnet-bridge }
           target: { name: mac-1.tailnet.internal }
+          networkPolicy: { ingressNamespaces: [ingress-nginx] }
           YAML
           off=$(helm template tb "$c")
           [ -z "$(printf '%s' "$off" | grep -E '^kind:' || true)" ] || { echo "::error::the chart rendered objects with enabled: false"; exit 1; }
@@ -99,6 +100,13 @@ jobs:
           grep -q 'name: BRIDGE_BLOCKED, value: "/dev /dev/\*"' <<<"$out" || { echo "::error::the development sign-in is not blocked by default"; exit 1; }
           grep -q 'automountServiceAccountToken: false' <<<"$out" || { echo "::error::the bridge mounts a service-account token"; exit 1; }
           grep -q 'secretName: hs-preauth-tailnet-bridge' <<<"$out" || { echo "::error::the key Secret is not mounted"; exit 1; }
+          python3 - "$out" <<'PY'
+          import sys, yaml
+          np = next(d for d in yaml.safe_load_all(sys.argv[1]) if d and d["kind"] == "NetworkPolicy")
+          rule = np["spec"]["ingress"]
+          assert len(rule) == 1 and rule[0].get("from") == [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "ingress-nginx"}}}], f"ingress sources {rule}"
+          print("network policy: only the ingress namespace reaches the proxy")
+          PY
           refuse() { local why="$1"; shift
             if helm template tb "$c" "$@" >/dev/null 2>&1; then echo "::error::rendered although $why"; exit 1; fi; }
           refuse "image.tag is missing"            -f ci-values.yaml --set image.tag=
@@ -111,6 +119,7 @@ jobs:
           refuse "the target is the public host"   -f ci-values.yaml --set target.name=mac-1.example.com
           refuse "the port is not a port"          -f ci-values.yaml --set target.port=70000
           refuse "a blocked path is not a matcher" -f ci-values.yaml --set 'blockedPaths[0]=dev}'
+          refuse "the policy admits any namespace" -f ci-values.yaml --set 'networkPolicy.ingressNamespaces=null'
           echo "chart: nothing by default; enabled → $kinds; every refusal holds"
 
   publish:

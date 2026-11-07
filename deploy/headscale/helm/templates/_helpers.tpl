@@ -122,8 +122,9 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 {{- end -}}
 
-{{/* The Secret one declared key is kept in. */}}
+{{/* The Secret one declared key is kept in. NEVER truncated: a Secret name may be 253 characters, and
+     cutting it could map two declared keys onto one Secret (the key name is the distinguishing suffix). */}}
 {{- define "headscale.preauthSecret" -}}
-{{- printf "%s-preauth-%s" (include "headscale.fullname" .root) .name | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-preauth-%s" (include "headscale.fullname" .root) .name -}}
 {{- end -}}
 

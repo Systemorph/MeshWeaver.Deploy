@@ -27,8 +27,9 @@ spec:
         # upgrade would succeed while logins kept using the old credential.
         checksum/oidc-secret-source: {{ include (print $.Template.BasePath "/secretproviderclass.yaml") . | cat | printf "%s|%s" .Values.oidc.clientSecret.existingSecret | sha256sum }}
         {{- if .Values.preauthKeys.enabled }}
-        # The keys sidecar reads its declaration once per pass, but a changed declaration is a changed pod.
-        checksum/preauth-keys: {{ include (print $.Template.BasePath "/preauthkeys.yaml") . | sha256sum }}
+        # A changed DECLARATION is a changed pod — the declaration only: the rendered Secrets carry the
+        # live key (lookup), and hashing them would restart the control server after every key renewal.
+        checksum/preauth-keys: {{ toJson (pick .Values.preauthKeys "keys" "interval" "image" "resources") | sha256sum }}
         {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}

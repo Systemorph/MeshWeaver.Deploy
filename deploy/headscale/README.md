@@ -71,14 +71,21 @@ sequenceDiagram
 
 - The chart creates each Secret EMPTY with `helm.sh/resource-policy: keep` and carries an existing key
   across upgrades (`lookup`); the sidecar cannot create, list or read any other Secret.
-- A key is replaced when it is missing, within `renewHours` of its expiry, expired or unknown in
-  headscale, or (single-use) already used; the replaced key is expired at once, so nothing new joins with
-  it while machines that already joined keep their registration.
+- A key is replaced when it is missing, its DECLARATION changed (user, flags or lifetime — a fingerprint
+  is stored with the key), within `renewHours` of its expiry, expired or unknown in headscale, or
+  (single-use) already used. The replaced key is expired at once, so nothing new joins with it while
+  machines that already joined keep their registration. Its id is recorded in the Secret in the SAME
+  write as the new key (`pending-expire`) and retried every pass until headscale confirms it no longer
+  accepts it; a key whose Secret write was refused is expired immediately (retried for the life of the
+  process if that fails). Every such failure fails the pass and is logged.
+- The pod template hashes the declaration only, never the Secrets, so a key renewal does not restart the
+  control server.
 - The key never appears in a log, an argv or the environment: headscale writes it to a mode-600 file, the
   patch goes from a file (`curl --data-binary @file`), and the consumer mounts the Secret as a file.
 - The image `headscale-keys:<line>-<sha>` is the SAME headscale binary with a shell, curl and jq (the
   server image stays the upstream distroless bytes); both are published from one commit. `test/keys.sh`
-  runs the loop in the build against a real server and a stand-in API server (`test/kube-stub.py`).
+  runs the loop in the build against a real server and a stand-in API server (`test/kube-stub.py`): 20
+  assertions, including a changed declaration, a refused Secret write, and no key in the log.
 
 ## Relays (DERP)
 

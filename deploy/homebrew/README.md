@@ -408,3 +408,18 @@ Cannot be run in this environment — verify on a real Apple-Silicon Mac:
 - The local-build image path (`dotnet publish -t:PublishContainer`) and/or the
   ACR pull (`az acr login`).
 - The end-to-end `curl https://memex.localhost:8443/` returning `http=200`.
+
+## Publishing a Mac at a public name
+
+`memex-local publish on --host <name> --sign-in microsoft --tenant <directory id> --client-id <id> < secret-file`
+makes the portal also answer at `<name>` through the private network's ingress bridge
+(`deploy/tailnet-bridge/`). It writes `~/.memex-local/publish.yaml` (0600): the name as an additional
+ingress host (the portal's links keep `memex.localhost`), the Microsoft sign-in for it (a NAMED directory
+only), and invitation-only admission — the first person to sign in becomes the administrator, everyone
+after needs an invitation. The client secret is read from STDIN, never an argument, and never printed.
+While the layer exists the front door (`share/port-forward.sh`) binds **loopback only**, and
+`tailscale serve --tcp 443 tcp://127.0.0.1:443` is the one way in, from the private network. The
+development sign-in answers on localhost names only, so a public name always needs a real provider
+(Google, Apple and LinkedIn for a public name are a follow-up: the chart carries no client secret for
+them yet). `publish status` reads it back; `publish off` removes it; `memex-local update` applies either.
+

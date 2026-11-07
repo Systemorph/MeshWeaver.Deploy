@@ -79,5 +79,13 @@ open_setup_if_waiting &
 # WILDCARD binds only — the default loopback bind gets "permission denied" on 80/443.
 # The portal enforces its own sign-in, and the mesh was already reachable on the LAN
 # through the 8443 forward's wildcard sibling risks; keep the machine firewalled as usual.
+# A Mac published at a public name (`memex-local publish on`, $MEMEX_LOCAL_HOME/publish.yaml) binds its front
+# door to LOOPBACK only: the private network reaches it through `tailscale serve` (TCP 443 → 127.0.0.1:443)
+# and nothing on the LAN can reach the portal directly. Every other install keeps binding every interface.
+address="0.0.0.0,::"
+if [ -f "${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/publish.yaml" ]; then
+  address="127.0.0.1,::1"
+  echo "$(date -u +%FT%TZ) published at a public name — the front door binds loopback only ($address)"
+fi
 exec kubectl --context "$KUBE_CONTEXT" port-forward -n ingress-nginx svc/ingress-nginx-controller \
-    --address 0.0.0.0,:: 80:80 443:443 "${HOST_PORT}:443"
+    --address "$address" 80:80 443:443 "${HOST_PORT}:443"

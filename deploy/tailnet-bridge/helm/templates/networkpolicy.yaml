@@ -14,14 +14,12 @@ spec:
   ingress:
     - ports:
         - { port: http, protocol: TCP }
-      {{- with .Values.networkPolicy.ingressNamespaces }}
       from:
-        {{- range . }}
+        {{- range .Values.networkPolicy.ingressNamespaces }}
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: {{ . }}
         {{- end }}
-      {{- end }}
   egress:
     # DNS for the control server, the relays and the STUN servers.
     - ports:
