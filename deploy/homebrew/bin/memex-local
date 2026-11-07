@@ -2233,7 +2233,7 @@ setup_ollama() {
         install_ollama_agent 127.0.0.1
         ollama_wait_ready || die "ollama did not become ready on :11434 after rebinding to loopback"
       else
-        warn "an Ollama NOT started by memex-local listens beyond the Mac's loopback — unauthenticated on the LAN. Stop it ('brew services stop ollama', or end the process) and re-run: memex-local then runs it on loopback"
+        warn "an Ollama NOT started by memex-local listens beyond the Mac's loopback — unauthenticated on the LAN. Stop it ('brew services stop ollama', or end the process) and run 'memex-local up --skip-image': memex-local then runs it on loopback"
         [ "${MEMEX_OLLAMA_ALLOW_LAN:-1}" = "0" ] && die "MEMEX_OLLAMA_ALLOW_LAN=0 refuses to continue with an Ollama listening beyond loopback"
       fi
     fi
