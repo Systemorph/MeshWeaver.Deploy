@@ -300,6 +300,7 @@ The refusals, and why each one exists:
       "nodeSelector" $nodeSelector "tolerations" $tolerations
       "resources" ($b.resources | default dict) "workSizeLimit" ($b.workSizeLimit | default "60Gi")
       "runDeadline" $runDeadline "stageSlots" $stageSlots
+      "moduleHub" (eq (toString ($b.moduleHub | default false)) "true")
       "scaleDownStabilizationSeconds" (int ($b.scaleDownStabilizationSeconds | default 300))
       "sandbox" $sandbox
       "pollingInterval" (int ($b.pollingInterval | default 15)) "cooldownPeriod" (int ($b.cooldownPeriod | default 600))
