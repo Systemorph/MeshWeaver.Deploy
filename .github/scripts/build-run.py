@@ -695,7 +695,10 @@ def validate_module_hub(doc: object) -> Optional[dict]:
             raise Refusal(f"`moduleHub.modules.{mid}.paths` must be relative paths")
         if not isinstance(deps, list) or not all(isinstance(d, str) for d in deps):
             raise Refusal(f"`moduleHub.modules.{mid}.deps` must list module ids")
-        out[mid] = {"paths": sorted(set(paths)), "deps": sorted(set(deps))}
+        options = m.get("options", []) if isinstance(m, dict) else []
+        if not isinstance(options, list) or not all(isinstance(o, str) for o in options):
+            raise Refusal(f"`moduleHub.modules.{mid}.options` must list strings (the build options that shape the compile)")
+        out[mid] = {"paths": sorted(set(paths)), "deps": sorted(set(deps)), "options": sorted(set(options))}
     for mid, m in out.items():
         for d in m["deps"]:
             if d not in out:
@@ -705,6 +708,21 @@ def validate_module_hub(doc: object) -> Optional[dict]:
         raise Refusal("`moduleHub.recipe` must list relative paths")
     module_order(out)       # refuses a cycle
     return {"modules": out, "recipe": sorted(set(recipe))}
+
+
+def widen_module_hub(trusted: dict, candidate: Optional[dict]) -> dict:
+    """The TRUSTED declaration widened by the run's own: per trusted module, its paths, recipe and options UNIONED with what
+    the candidate tree declares for it (a pull request that adds a dependency lists its directory — CI's
+    gen-module-hub --check holds the candidate to its projects). A union can only ADD inputs to a key — a candidate can
+    never remove a trusted path, rename a module or add one — so a lying candidate makes keys stricter, never looser. Pure."""
+    if not candidate:
+        return trusted
+    mods = {}
+    for mid, spec in trusted["modules"].items():
+        c = candidate["modules"].get(mid) or {}
+        mods[mid] = {"paths": sorted(set(spec["paths"]) | set(c.get("paths", []))), "deps": spec["deps"],
+                     "options": sorted(set(spec.get("options", [])) | set(c.get("options", [])))}
+    return {"modules": mods, "recipe": sorted(set(trusted["recipe"]) | set(candidate.get("recipe", [])))}
 
 
 def module_order(mods: dict) -> list:
@@ -734,7 +752,8 @@ def module_fingerprints(decl: dict, ls_tree: Callable[[list], str], toolchain: s
     fps: dict = {}
     for m in module_order(decl["modules"]):
         spec = decl["modules"][m]
-        rows = [f"module={m}", f"toolchain={toolchain}", "sources:", ls_tree(spec["paths"]).strip(), "recipe:", recipe.strip()]
+        rows = [f"module={m}", f"toolchain={toolchain}", *[f"option:{o}" for o in spec.get("options", [])],
+                "sources:", ls_tree(spec["paths"]).strip(), "recipe:", recipe.strip()]
         rows += [f"dep:{d}={fps[d]}" for d in spec["deps"]]          # SEAM(ref-asm): the dependency's API hash, once published
         fps[m] = "sha256:" + hashlib.sha256("\n".join(rows).encode()).hexdigest()
     return fps
@@ -929,6 +948,19 @@ class ModuleHubBroker:
         accepted = status == 200 and isinstance(answer, dict) and answer.get("accepted") is True
         return {"accepted": accepted, "succeeded": accepted and body["succeeded"],
                 "why": (answer or {}).get("why") if isinstance(answer, dict) else f"{status}", "outputHash": body.get("outputHash")}
+
+    def release_open_grants(self, why: str) -> None:
+        """Complete every grant this run still holds as FAILED (the run is ending), so no other run waits for those
+        leases to lapse. Never raises."""
+        for module, seq in list(self.granted.items()):
+            if f"done:{module}" in self.answered:
+                continue
+            try:
+                self.api.call("POST", self._path(module, "/complete"),
+                              {"holder": self.host, "seq": seq, "fingerprint": self.fps[module], "succeeded": False, "error": why})
+                self.log(f"module hub: {module} released ({why})")
+            except Exception as e:   # teardown never fails the run's verdict
+                self.log(f"module hub: {module} could not be released: {type(e).__name__}")
 
     def poll_once(self) -> int:
         """Answer every new request and every new completion once. Returns how many it answered."""
@@ -3399,6 +3431,13 @@ class Host:
             if decl is None:
                 self.log("module hub: the default branch declares no moduleHub — the stages build as before")
                 return
+            # the run's own declaration WIDENS the trusted one (a new dependency's directory), never narrows it
+            try:
+                with open(os.path.join(checkout, ".github", "build-stages.json")) as fh:
+                    candidate = validate_module_hub(json.load(fh))
+            except (OSError, ValueError, Refusal):
+                candidate = None
+            decl = widen_module_hub(decl, candidate)
 
             def ls_tree(paths: list) -> str:
                 rc_, out_ = self.git_runner(["-C", checkout, "ls-tree", "-r", "HEAD", "--", *paths], genv)
@@ -3433,6 +3472,8 @@ class Host:
     def stop_module_broker(self) -> None:
         if self.module_broker_stop is not None:
             self.module_broker_stop.set()
+        if self.module_broker is not None:
+            self.module_broker.release_open_grants("the run ended before this module was handed over")
         self.module_broker, self.module_broker_stop = None, None
 
     def preflight(self) -> None:
@@ -5441,6 +5482,11 @@ def self_test() -> int:
             except Refusal as e:
                 check(f"modhub/{why_mh} is refused, naming it", why_mh in str(e), str(e))
         check("modhub/no declaration is no broker", validate_module_hub({"stages": []}) is None)
+        wid = widen_module_hub(mh, validate_module_hub({"moduleHub": {"modules": {"A": {"paths": ["src/NewDep"]}, "Evil": {"paths": ["x"]}},
+                                                                     "recipe": ["src/Directory.PlatformRefs.targets"]}}))
+        check("modhub/the run's declaration WIDENS the trusted one (a new dependency's paths, a recipe file) and never narrows it",
+              wid["modules"]["A"]["paths"] == ["src/A", "src/NewDep"] and wid["modules"]["B"]["paths"] == ["src/B"]
+              and "Evil" not in wid["modules"] and set(wid["recipe"]) == {"src/Directory.Build.props", "src/Directory.PlatformRefs.targets"}, wid)
         trees = {"src/A": "100644 blob a1 src/A/a.cs", "src/B": "100644 blob b1 src/B/b.cs", "src/Directory.Build.props": "100644 blob r1 src/Directory.Build.props"}
         fp1 = module_fingerprints(mh, lambda ps: "\n".join(trees[p] for p in ps), "tc")
         trees["src/A"] = "100644 blob a2 src/A/a.cs"
@@ -5454,6 +5500,11 @@ def self_test() -> int:
         fp4 = module_fingerprints(mh, lambda ps: "\n".join(trees[p] for p in ps), "tc")
         check("modhub/a recipe change moves every module", fp4["A"] != fp3["A"] and fp4["B"] != fp3["B"])
         check("modhub/the toolchain moves every module", module_fingerprints(mh, lambda ps: "\n".join(trees[p] for p in ps), "tc2")["A"] != fp4["A"])
+        mh_opt = validate_module_hub({"moduleHub": {"modules": {"A": {"paths": ["src/A"], "options": ["accept=targets lib"]},
+                                                              "B": {"paths": ["src/B"], "deps": ["A"]}}, "recipe": ["src/Directory.Build.props"]}})
+        check("modhub/a build option (the catalog's accept) moves the module and its dependents",
+              module_fingerprints(mh_opt, lambda ps: "\n".join(trees[p] for p in ps), "tc")["A"] != fp4["A"]
+              and module_fingerprints(mh_opt, lambda ps: "\n".join(trees[p] for p in ps), "tc")["B"] != fp4["B"])
         # the output tar: equal content → equal bytes, whatever the mtimes; a link is refused; extraction stays inside
         o1, o2 = os.path.join(tmp, "mh-o1"), os.path.join(tmp, "mh-o2")
         for d_, t_ in ((o1, 1000), (o2, 2000)):
@@ -5582,6 +5633,15 @@ def self_test() -> int:
             json.dump({"succeeded": True}, fh)
         br3.poll_once()
         check("modhub/a completion without this host's grant is refused locally", json.load(open(os.path.join(br3.root, "ack", "B.json")))["accepted"] is False)
+        brr, api_r = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Grant", "step": {"seq": 11}})],
+                                  ("POST", "/modules/MeshWeaver.Plugins/B/complete"): lambda p_, b_: (200, {"accepted": True})})
+        with open(os.path.join(brr.root, "req", "B.json"), "w") as fh:
+            json.dump({"module": "B"}, fh)
+        brr.poll_once()
+        brr.release_open_grants("the run ended")
+        rel = [c[2] for c in api_r.calls if c[1].endswith("/complete")]
+        check("modhub/at the run's end every open grant is completed as FAILED (no lease waits to lapse)",
+              rel and rel[0]["seq"] == 11 and rel[0]["succeeded"] is False and rel[0]["holder"] == brr.host, rel)
 
         # ── 5c. the ONE credential: AcrPull by workload identity, host-only ──────────────
         fed = os.path.join(tmp, "azure-identity-token")
