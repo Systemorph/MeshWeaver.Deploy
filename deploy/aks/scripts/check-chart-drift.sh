@@ -373,8 +373,9 @@ done
 while read -r res group kind; do
   out="$WORK/live-$(echo "$res" | tr '/' '-' | tr '.' '-').json"
   fetch "$res" > "$out" && is_json "$out" && continue
-  # The transport's own words — stderr, and for aks-invoke the logs it returned on stdout.
-  answer="$(cat "$WORK/kubectl.err" "$out" 2>/dev/null | tr -d '\n')"
+  # The transport's own words — stderr, and for aks-invoke the logs it returned on stdout — WITH their
+  # newlines: the rule judges line by line, so a discovery warning cannot hide a Forbidden.
+  answer="$(cat "$WORK/kubectl.err" "$out" 2>/dev/null)"
   kind_not_served "$answer" || read_failed "$res"
   if ! rendered="$(rendered_count "$group" "$kind")"; then
     echo "::error::could not count the ${kind} objects in the render — whether $res may be skipped cannot be decided"

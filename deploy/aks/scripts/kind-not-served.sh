@@ -25,10 +25,29 @@
 # requested resource` (the API path is absent — a list GET, so not an object NotFound, which reads
 # `Error from server (NotFound): <kind> "<name>" not found`), and `no matches for kind` (a kind/version
 # pair discovery does not know).
+#
+# 🚨 "Not served" must be the ONLY failure signal. kubectl prints discovery WARNINGS for other API
+# groups on stderr — `couldn't get resource list for external.metrics.k8s.io/v1beta1: the server could
+# not find the requested resource` — before the read's real error. A whole-text match would then call
+# `Error from server (Forbidden)` "not served", and the drift check would compare an empty list and
+# could report clean over a failed authorization (review of MeshWeaver.Deploy#178). So the text is
+# judged LINE BY LINE: a line naming Forbidden or Unauthorized is fatal whatever else it says, and
+# every other non-blank line must be a not-served line. Anything else — a timeout, a TLS error, a
+# warning this rule does not know — makes the answer "not established", i.e. fatal. That fails
+# closed: an unknown line beside a genuine "not served" stops the run rather than skipping a kind.
+# Callers pass the output WITH its newlines.
 kind_not_served() {
-  case "${1:-}" in
-    *"doesn't have a resource type"*|*"the server could not find the requested resource"*|*"no matches for kind"*)
-      return 0 ;;
-  esac
-  return 1
+  local line seen=1
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "${line//[[:space:]]/}" ] || continue
+    case "$line" in
+      *Forbidden*|*forbidden*|*Unauthorized*|*unauthorized*)
+        return 1 ;;
+      *"doesn't have a resource type"*|*"the server could not find the requested resource"*|*"no matches for kind"*)
+        seen=0 ;;
+      *)
+        return 1 ;;
+    esac
+  done <<< "${1:-}"
+  return "$seen"
 }

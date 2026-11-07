@@ -139,7 +139,9 @@ for kind in $KINDS; do
       || hosting::die "kubectl's listing of ${kind} in ${namespace} is not JSON"
   else
     err="$(tr -d '\n' < "$work/err")"
-    if kind_not_served "$err"; then
+    # The rule reads the output line by line (a discovery warning must not hide a Forbidden), so it
+    # gets the raw text; $err, flattened, is only for the message.
+    if kind_not_served "$(cat "$work/err")"; then
       skipped="${skipped} ${kind}"
       hosting::log "kind      ${kind} is not served by this cluster — skipped"
     else

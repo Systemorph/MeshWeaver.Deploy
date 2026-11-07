@@ -18,10 +18,14 @@
 #                                                    is never reported as clean)
 #   4. served (an empty list)                      → compared, nothing skipped — the control for 1
 #   5. the rule file absent                        → the preflight refuses, naming it
+#   6. a discovery warning + Forbidden/Unauthorized → red: the authorization failure wins
+#   7. a discovery warning + "not served"          → skipped (the control for 6)
+#   8. the rule on the exact texts, line by line
 # NEGATIVE CONTROLS — the rule is replaced, in a copy of this directory, by a wrong one, and the case
 # that should catch it must go red:
 #   N1. "nothing is ever not served" (the pre-#155 behaviour) → case 1 must fail
 #   N2. "everything is not served"                            → case 3 must fail
+#   N3. the first, whole-text version of the rule            → case 6 must fail (mixed output skipped)
 # Without them, a test whose assertions could not tell the fix from the defect would still pass.
 set -uo pipefail
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -70,6 +74,11 @@ case "$res" in
       served)    echo '{"apiVersion":"v1","kind":"List","items":[]}' ;;
       unserved)  echo 'error: the server doesn'"'"'t have a resource type "scaledobjects"' >&2; exit 1 ;;
       forbidden) echo 'Error from server (Forbidden): scaledobjects.keda.sh is forbidden: User "system:serviceaccount:x:y" cannot list resource "scaledobjects" in API group "keda.sh" in the namespace "check"' >&2; exit 1 ;;
+      # Mixed diagnostics: a discovery WARNING for another API group (which carries a not-served
+      # phrase) printed before the read's real answer.
+      warn-forbidden)   echo "$STUB_WARN" >&2; echo 'Error from server (Forbidden): scaledobjects.keda.sh is forbidden: User "system:serviceaccount:x:y" cannot list resource "scaledobjects" in API group "keda.sh" in the namespace "check"' >&2; exit 1 ;;
+      warn-unauthorized) echo "$STUB_WARN" >&2; echo 'error: You must be logged in to the server (Unauthorized)' >&2; exit 1 ;;
+      warn-unserved)    echo "$STUB_WARN" >&2; echo 'error: the server doesn'"'"'t have a resource type "scaledobjects"' >&2; exit 1 ;;
     esac ;;
   *) echo "stub kubectl: unexpected read '$res'" >&2; exit 1 ;;
 esac
@@ -81,10 +90,13 @@ if [ "\${1:-}" = get ] && [ "\${2:-}" = manifest ]; then cat "\$STUB_DATA/releas
 exec "$REAL_HELM" "\$@"
 SHEOF
 chmod +x "$WORK/bin/kubectl" "$WORK/bin/helm"
+# kubectl's discovery warning for an API group whose service is gone — it carries a not-served phrase
+# about ANOTHER group, and it precedes the read's own answer on stderr.
+DISCOVERY_WARNING='E1107 10:00:00.000000   1 memcache.go:287] couldn'"'"'t get resource list for external.metrics.k8s.io/v1beta1: the server could not find the requested resource'
 
 run_check() {  # run_check <scripts-dir> <scaledobject answer> [extra args...] — sets OUT and RC
   local dir="$1" so="$2"; shift 2
-  OUT="$(env PATH="$WORK/bin:$PATH" STUB_DATA="$DATA" STUB_SO="$so" GITHUB_STEP_SUMMARY="" \
+  OUT="$(env PATH="$WORK/bin:$PATH" STUB_DATA="$DATA" STUB_SO="$so" STUB_WARN="$DISCOVERY_WARNING" GITHUB_STEP_SUMMARY="" \
     bash "$dir/check-chart-drift.sh" -n check -r rel --via kubectl -c "$CHART" \
       -f "$CHART/values.yaml" -f "$VALUES" --record "$DATA/record.json" "$@" 2>&1)"; RC=$?
 }
@@ -131,6 +143,40 @@ else
   bad "case 4: a served kind must be compared with nothing skipped (exit $RC)"
 fi
 
+# 6. Mixed diagnostics (review of #178): a discovery warning carrying a not-served phrase, then an
+#    authorization failure. The authorization failure wins: fatal, nothing skipped, nothing compared.
+for so in warn-forbidden warn-unauthorized; do
+  run_check "$SELF_DIR" "$so"
+  if [ "$RC" -ne 0 ] && ! compared && has "could not read scaledobjects.keda.sh" && ! has "skipped"; then
+    pass "a discovery warning does not turn an authorization failure into 'not served' ($so)"
+  else
+    bad "case 6 ($so): warning + authorization failure must stay fatal (exit $RC)"
+  fi
+done
+# 7. …while a warning beside a genuine "not served" answer still skips (the control for case 6).
+run_check "$SELF_DIR" warn-unserved
+if compared && has "kind scaledobjects.keda.sh is not served by this cluster"; then
+  pass "a discovery warning beside a genuine 'not served' answer still skips (the control for case 6)"
+else
+  bad "case 7: warning + not served must still skip and compare (exit $RC)"
+fi
+
+# 8. The rule itself, on the exact texts — one line per verdict.
+# shellcheck source=kind-not-served.sh
+source "$SELF_DIR/kind-not-served.sh"
+rule_case() {  # rule_case <expected 0|1> <description> <text>
+  local got=0
+  kind_not_served "$3" || got=1
+  if [ "$got" = "$1" ]; then pass "rule: $2"; else OUT="$3"; bad "rule: $2 — expected $1, got $got"; fi
+}
+SO_FORBIDDEN='Error from server (Forbidden): scaledobjects.keda.sh is forbidden: User "u" cannot list resource "scaledobjects"'
+rule_case 0 "a lone not-served answer is not served" 'error: the server doesn'"'"'t have a resource type "scaledobjects"'
+rule_case 1 "warning + Forbidden is NOT not-served" "$DISCOVERY_WARNING"$'\n'"$SO_FORBIDDEN"
+rule_case 1 "warning + Unauthorized is NOT not-served" "$DISCOVERY_WARNING"$'\n''error: You must be logged in to the server (Unauthorized)'
+rule_case 1 "a line naming Forbidden fails even if it also carries a not-served phrase" "$SO_FORBIDDEN: the server could not find the requested resource"
+rule_case 1 "an unknown error beside a not-served line fails closed" "$DISCOVERY_WARNING"$'\n''Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout'
+rule_case 1 "empty output is not an answer" ""
+
 # A copy of this directory with the rule replaced (or removed) — never a committed second copy.
 scripts_copy() {  # scripts_copy <name> <rule body | "absent">
   local d="$WORK/$1"
@@ -163,6 +209,18 @@ if compared && has "kind scaledobjects.keda.sh is not served"; then
 else
   bad "N2: an over-wide rule should have skipped the Forbidden read (exit $RC)"
 fi
+
+# N3. The first version of the shared rule — a whole-text match — measured against the mixed cases:
+#     each authorization failure must then read as skipped, which is the defect case 6 exists to catch.
+OLD_RULE='case "${1:-}" in *"doesn'"'"'t have a resource type"*|*"the server could not find the requested resource"*|*"no matches for kind"*) return 0 ;; esac; return 1'
+for so in warn-forbidden warn-unauthorized; do
+  run_check "$(scripts_copy "whole-text-$so" "$OLD_RULE")" "$so"
+  if compared && has "kind scaledobjects.keda.sh is not served"; then
+    pass "N3: with the whole-text rule, $so is skipped and compared — case 6 tells the fix from it"
+  else
+    bad "N3 ($so): the whole-text rule should have skipped the authorization failure (exit $RC)"
+  fi
+done
 
 if [ "$fail" -ne 0 ]; then
   echo "::error::check-chart-drift.sh does not handle a kind this cluster does not serve as specified (#155)"
