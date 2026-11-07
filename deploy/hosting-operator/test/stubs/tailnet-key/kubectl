@@ -7,6 +7,7 @@
 #   HOSTING_TK_ANSWER    what `headscale preauthkeys create … -o json` prints: normal (default) | reusable |
 #                        ephemeral | wrongtags | nokey | refuse
 #   HOSTING_TK_EXPIRE    ok (default) | fail — the `preauthkeys expire` answer
+#   HOSTING_TK_EXPIRES_IN seconds from now the minted key expires at (default 7200); "none" omits the expiration
 set -uo pipefail
 state="${HOSTING_TK_STATE:?the kubectl stub needs HOSTING_TK_STATE}"
 printf 'kubectl %s\n' "$*" >> "$state/kubectl.log"
@@ -27,14 +28,16 @@ case "$*" in
     jq -n --arg p "${HOSTING_TK_POLICY-$policy_default}" '{data: {"config.yaml": "server_url: x", "policy.hujson": $p}}'; exit 0 ;;
   *" exec "*"preauthkeys create"*)
     tags="$(printf '%s' "$*" | sed -E 's/.*--tags ([^ ]+).*/\1/')"
+    if [ "${HOSTING_TK_EXPIRES_IN:-7200}" = none ]; then exp_json='"created_at": {"seconds": 1}'
+    else exp_json="\"expiration\": {\"seconds\": $(( $(date -u +%s) + ${HOSTING_TK_EXPIRES_IN:-7200} ))}"; fi
     tag_json="$(printf '%s' "$tags" | tr ',' '\n' | jq -R . | jq -cs .)"
     case "${HOSTING_TK_ANSWER:-normal}" in
       refuse)    echo 'Error: creating preauthkey: rpc error: database is locked' >&2; exit 1 ;;
       nokey)     echo '{"id": 7, "acl_tags": '"$tag_json"'}'; exit 0 ;;
-      reusable)  echo '{"id": 7, "key": "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef", "reusable": true, "expiration": {"seconds": 1794073226}, "acl_tags": '"$tag_json"'}'; exit 0 ;;
-      ephemeral) echo '{"id": 7, "key": "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef", "ephemeral": true, "expiration": {"seconds": 1794073226}, "acl_tags": '"$tag_json"'}'; exit 0 ;;
-      wrongtags) echo '{"id": 7, "key": "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef", "expiration": {"seconds": 1794073226}, "acl_tags": ["tag:other"]}'; exit 0 ;;
-      *)         echo '{"id": 7, "key": "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef", "expiration": {"seconds": 1794073226}, "created_at": {"seconds": 1794066026}, "acl_tags": '"$tag_json"'}'; exit 0 ;;
+      reusable)  echo '{"id": 7, "key": "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef", "reusable": true, '"$exp_json"', "acl_tags": '"$tag_json"'}'; exit 0 ;;
+      ephemeral) echo '{"id": 7, "key": "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef", "ephemeral": true, '"$exp_json"', "acl_tags": '"$tag_json"'}'; exit 0 ;;
+      wrongtags) echo '{"id": 7, "key": "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef", '"$exp_json"', "acl_tags": ["tag:other"]}'; exit 0 ;;
+      *)         echo '{"id": 7, "key": "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef", '"$exp_json"', "acl_tags": '"$tag_json"'}'; exit 0 ;;
     esac ;;
   *" exec "*"preauthkeys expire --id "*)
     [ "${HOSTING_TK_EXPIRE:-ok}" = "ok" ] && exit 0

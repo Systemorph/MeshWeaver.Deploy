@@ -5761,9 +5761,29 @@ if command -v jq >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
   done
 
   tk HOSTING_KVS_SET_FAIL=control-Tailnet-ObservabilityAuthKey -- "${TK_ARGS[@]}"
-  [ "$_tk_rc" -ne 0 ] && case "$_tk_out" in *"The key was expired"*) true ;; *) false ;; esac \
-    && ok "tailnet key: a vault that refuses the write fails the step" || bad "vault refusal" "rc ${_tk_rc}: ${_tk_out}"
+  [ "$_tk_rc" -ne 0 ] && case "$_tk_out" in *"Key 7 was expired in headscale"*) true ;; *) false ;; esac \
+    && ok "tailnet key: a vault that refuses the write fails the step, saying the key was expired" || bad "vault refusal" "rc ${_tk_rc}: ${_tk_out}"
   case "$_tk_kube" in *"preauthkeys expire --id 7"*) ok "…and expires the key nobody holds" ;; *) bad "vault refusal expires key" "kubectl saw: ${_tk_kube}" ;; esac
+  tk_done
+
+  # 🚨 A failed revocation is SAID, never reported as cleaned up (review of #166).
+  tk HOSTING_KVS_SET_FAIL=control-Tailnet-ObservabilityAuthKey HOSTING_TK_EXPIRE=fail -- "${TK_ARGS[@]}"
+  [ "$_tk_rc" -ne 0 ] && case "$_tk_out" in *"could NOT be expired in headscale"*) true ;; *) false ;; esac \
+    && case "$_tk_out" in *"was expired in headscale"*|*"nothing holds a live key"*) false ;; *) true ;; esac \
+    && ok "tailnet key: a revocation that fails is reported as failed, never as cleaned up" || bad "failed revocation reported" "rc ${_tk_rc}: ${_tk_out}"
+  tk_done
+  # 🚨 Headscale's own expiration is validated against the request (review of #166).
+  tk HOSTING_TK_EXPIRES_IN=90000 -- "${TK_ARGS[@]}"
+  [ "$_tk_rc" -ne 0 ] && case "$_tk_out" in *"does not expire within the requested 2h"*) true ;; *) false ;; esac \
+    && ok "tailnet key: a key expiring later than requested is refused" || bad "over-long key refused" "rc ${_tk_rc}: ${_tk_out}"
+  [ ! -f "$_tk_st/set.control-Tailnet-ObservabilityAuthKey" ] && case "$_tk_kube" in *"expire --id 7"*) true ;; *) false ;; esac \
+    && ok "…nothing is stored and the key is expired" || bad "over-long key not stored" "kubectl saw: ${_tk_kube}"
+  tk_done
+  tk HOSTING_TK_EXPIRES_IN=none -- "${TK_ARGS[@]}"
+  [ "$_tk_rc" -ne 0 ] && ok "tailnet key: a key with no expiration is refused" || bad "no-expiry key refused" "exited 0: ${_tk_out}"
+  tk_done
+  tk HOSTING_TK_EXPIRES_IN=7300 -- "${TK_ARGS[@]}"
+  [ "$_tk_rc" -eq 0 ] && ok "tailnet key: negative control — inside the skew allowance it is stored" || bad "skew control" "rc ${_tk_rc}: ${_tk_out}"
   tk_done
 
   tk HOSTING_TK_PODS="headscale-abc headscale-def" -- "${TK_ARGS[@]}"

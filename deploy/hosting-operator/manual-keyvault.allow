@@ -22,6 +22,7 @@ bin/hosting-kv-values-set  — TRANSITIONAL: the governed key-level writer of he
 bin/hosting-kv-copy  — TRANSITIONAL: copyFrom reads the source value to write the per-prefix copy
 bin/hosting-kv-rotate  — TRANSITIONAL: reads the vaulted registry key to compare before rotating
 bin/hosting-registry-register  — TRANSITIONAL: reads the held instance key and the bootstrap key to call the registry
+bin/hosting-tailnet-key  — governed verb (SetSecrets tailnetKey): mints a single-use Headscale key in the pod and writes it through --file, confirms by list-versions; never reads a value. TRANSITIONAL (policy secret-actions-interim-actions-lane): runs as hosting-operator on the aks-ops lane
 bin/hosting-registry-coupon  — TRANSITIONAL: reads the registry's coupon-mint credential to call the registry; writes the minted coupon through --file, existence checked with `list`
 bin/hosting-signin-app  — writes the minted Entra client secret through --file; existence is checked with `list`, no value read
 bin/hosting-image-mirror  — TRANSITIONAL: reads the registry publisher password to push the mirror
