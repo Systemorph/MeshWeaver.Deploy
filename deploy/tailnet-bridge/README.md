@@ -81,3 +81,12 @@ Never `helm install` by hand. An estate vendors this chart byte-identical into i
 repository, writes one overlay per published machine (`host`, `target.name`, ingress class and issuer,
 the key Secret) and applies it with the governed `ApplyChart` InstanceAction from a `Hosting/ChartRelease`
 record whose `host` and `dnsZone` also write the public name's DNS record.
+
+## Capabilities (2026-11-07)
+
+The container drops every capability but keeps `NET_BIND_SERVICE`. The pinned caddy binary carries the
+file capability `cap_net_bind_service`, and with all capabilities dropped and `allowPrivilegeEscalation:
+false` the kernel refuses to exec it — `/usr/local/bin/tailnet-bridge: line 89: caddy: Operation not
+permitted`, CrashLoopBackOff — even though it listens on 8080. Measured on control with the first
+deployment of the bridge (`tailnet-bridge-eiger`, since removed: the owner decided not to publish eiger
+for now). Keep the capability in any chart that runs this image.

@@ -6,6 +6,6 @@ description: >-
   WireGuard to the machine. The machine opens no port; its own sign-in protects it. Renders NOTHING
   unless `enabled: true`. See deploy/tailnet-bridge/README.md.
 type: application
-version: 0.1.0
+version: 0.1.1
 # The Tailscale client release the image carries (deploy/tailnet-bridge/Dockerfile).
 appVersion: "1.104.4"
