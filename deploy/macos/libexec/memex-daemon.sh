@@ -47,6 +47,14 @@ while :; do
   sleep "$pause"
 done
 log "'$CLI up' completed after $((attempt + 1)) attempt(s)"
+# A leased build host keeps its fleet jobs at the lowest priority across reboots: no session loads the
+# governor's LaunchAgent here, so it runs headless (deploy/homebrew/share/buildhost-priority.sh), once installed.
+if [ -x "$local_home/buildhost-priority.sh" ]; then
+  # --install with no arguments: the profile, COLIMA_HOME and threshold overrides come from the configuration
+  # the original install recorded (~/.memex-local/buildhost-priority.env), never from the runtime state.
+  MEMEX_HEADLESS=1 MEMEX_LOCAL_HOME="$local_home" /bin/bash "$local_home/buildhost-priority.sh" --install \
+    && log "build-host priority governor started (headless)" || log "the build-host priority governor did not start — the build VM competes at the default band"
+fi
 
 pidfile="$local_home/port-forward.pid"
 pid="$(cat "$pidfile" 2>/dev/null || true)"

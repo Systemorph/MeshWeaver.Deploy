@@ -22,7 +22,10 @@
 #   3. creates two Secrets there from the values read in step 0, on stdin only — never a process argument, never printed:
 #      `build-worker-mac` (key `token`) and `build-pull` (kubernetes.io/dockerconfigjson: kubelet image pulls ONLY) and `build-registry-key-mac` (the READ-ONLY
 #      instance key the runner reads the plugin registry's bundle index with — a build host holds no registry credential);
-#   4. `helm upgrade --install build-host-mac` of THIS checkout's chart with build-host-mac.values.yaml and the set given.
+#   4. `helm upgrade --install build-host-mac` of THIS checkout's chart with build-host-mac.values.yaml and the set given;
+#   5. fleet jobs at the LOWEST priority on this Mac: loads the launchd governor (deploy/homebrew/share/buildhost-priority.sh
+#      --install) that puts the build VM's process in the background band while the owner, the portal VM or Ollama want
+#      the cores, and gives it every idle core otherwise (nice/renice do nothing on macOS — see the script's header).
 # The set (version + tester/portal/runner digests) is the one the operations record names for `latest`; it is passed,
 # never committed. The runner digest must be a multi-arch index carrying linux/arm64.
 set -euo pipefail
@@ -73,7 +76,7 @@ runtime="$(k get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeV
   || { echo "ERROR: profile $profile runs '$runtime' — the build host needs containerd 2 or newer (a user-namespaced pod). Nothing was changed." >&2; exit 1; }
 
 # ── preconditions: everything is CHECKED before anything is changed ──────────────────────────────────────────
-echo "== 0/4 preconditions"
+echo "== 0/5 preconditions"
 k get crd scaledobjects.keda.sh -o name >/dev/null 2>&1 \
   || { echo "ERROR: KEDA is not installed in this cluster (no scaledobjects.keda.sh) — the host's scaler needs it; install KEDA first. Nothing was changed." >&2; exit 1; }
 k -n keda wait --for=condition=Available deployment --all --timeout=20s >/dev/null 2>&1 \
@@ -117,7 +120,7 @@ if [ -z "$pluginsreg" ]; then
   echo "   /hosts/inputs names no sealed publication for mac — the host claims with the cluster hosts' plugins contract"
 fi
 
-echo "== 1/4 AppArmor profile mw-build-host in the Colima VM"
+echo "== 1/5 AppArmor profile mw-build-host in the Colima VM"
 printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' '' 'profile mw-build-host flags=(unconfined) {' '  userns,' '}' \
   | vm sudo sh -c 'cat > /etc/apparmor.d/mw-build-host && apparmor_parser --replace /etc/apparmor.d/mw-build-host'
 # The probe runs as the VM's ordinary, UNPRIVILEGED user — as the build container does (uid 1654, no capabilities).
@@ -127,10 +130,10 @@ vm unshare -U -r true 2>/dev/null \
   && echo "   note: unprivileged user namespaces start even WITHOUT the profile in this VM" \
   || echo "   loaded: an unprivileged user namespace starts under mw-build-host, and not without it"
 
-echo "== 2/4 namespace build-mac"
+echo "== 2/5 namespace build-mac"
 k create namespace build-mac --dry-run=client -o yaml | k apply -f - >/dev/null
 
-echo "== 3/4 secrets (values on stdin only — never in a process argument, never printed)"
+echo "== 3/5 secrets (values on stdin only — never in a process argument, never printed)"
 printf '%s' "$worker_value" \
   | k -n build-mac create secret generic build-worker-mac --from-file=token=/dev/stdin --dry-run=client -o yaml \
   | k apply -f - >/dev/null
@@ -153,7 +156,7 @@ fi
 unset worker_value pull_value key_value
 echo "   build-worker-mac and build-pull (image pulls only) applied${instkey:+, and build-registry-key-mac}"
 
-echo "== 4/4 helm upgrade --install build-host-mac ($version)"
+echo "== 4/5 helm upgrade --install build-host-mac ($version)"
 helm upgrade --install build-host-mac "$chart" --kube-context "$ctx" -n build-mac \
   -f "$chart/values.yaml" -f "$here/build-host-mac.values.yaml" \
   --set-string buildHosts.apiUrl="$api" \
@@ -170,3 +173,8 @@ helm upgrade --install build-host-mac "$chart" --kube-context "$ctx" -n build-ma
   --set-string buildHosts.mac.runnerDigest="$runner" \
   --wait=false
 k -n build-mac get deploy,scaledobject,pvc
+
+echo "== 5/5 fleet jobs at the lowest priority (launchd governor for profile $profile)"
+# The runners are deployed by now: a governor that cannot load is reported, never a failed attach.
+bash "$here/../homebrew/share/buildhost-priority.sh" --install --profile "$profile" \
+  || echo "WARN: the priority governor did not load — the build VM competes at the default band; re-run: bash deploy/homebrew/share/buildhost-priority.sh --install --profile $profile" >&2
