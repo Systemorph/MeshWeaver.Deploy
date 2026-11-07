@@ -1018,6 +1018,12 @@ case "$RC:$OUT" in 0:*) bad "a bad id is refused" "exited 0" ;; *"--id must be l
 OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet status 2>&1)"
 case "$OUT" in *"JOINED as 'studio-2'"*"sha256:"*) ok "fleet status shows the join and the key fingerprints" ;; *) bad "fleet status" "$OUT" ;; esac
 case "$OUT" in *"$M"*|*"$C"*) bad "fleet status never prints a key value" "a value is in the output" ;; *) ok "fleet status prints no key value" ;; esac
+# Unattended (a device-management run): no code yet → the link is printed and kept, exit 3, nothing joined.
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$FJ/home/.memex-local/enrol/studio-3.key.pem" 2>/dev/null )
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --code-file "$FJ/none.code" 2>&1)"; RC=$?
+case "$RC:$OUT" in 3:*"WAITING for the approval on control and the enrolment code at $FJ/none.code"*) ok "unattended: no code yet → says what it waits for, exit 3" ;; *) bad "unattended join waits" "rc=$RC: $OUT" ;; esac
+grep -q '/Hosting/Heartbeats/Enrol/' "$FJ/home/.memex-local/enrol/studio-3.link" 2>/dev/null && ok "unattended: the approval link is kept in enrol/<id>.link" || bad "link kept" "$(cat "$FJ/home/.memex-local/enrol/studio-3.link" 2>/dev/null)"
+[ -f "$FJ/home/.memex-local/enrol/studio-3.key.pem" ] && ok "unattended: the throw-away key is kept for the run that brings the code" || bad "key kept while waiting" "gone"
 grep -q 'mode_args+=(-f "$FLEET_FILE")' "$CLI" && ok "helm_deploy layers the fleet file" || bad "helm_deploy layers the fleet file" "no -f \$FLEET_FILE"
 rm -rf "$FJ"
 
@@ -1348,6 +1354,9 @@ python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[
 if [ -S "$PB/home/.tailscale/tailscaled.sock" ]; then
   : > "$PB/ts.log"; pb env -u MEMEX_TAILSCALE_SOCKET MEMEX_LOCAL_LIB=1 bash -c '. "$0"; publish_tailscale status' "$CLI" >/dev/null 2>&1
   grep -q -- "--socket=$PB/home/.tailscale/tailscaled.sock status" "$PB/ts.log" && ok "a user-space tailscaled's socket under the home is used automatically" || bad "tailscale socket auto-detect" "$(cat "$PB/ts.log")"
+  python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$TSOCK/root.sock" 2>/dev/null
+  : > "$PB/ts.log"; pb env -u MEMEX_TAILSCALE_SOCKET MEMEX_TAILSCALED_ROOT_SOCKET="$TSOCK/root.sock" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; publish_tailscale status' "$CLI" >/dev/null 2>&1
+  grep -q -- "--socket=$TSOCK/root.sock status" "$PB/ts.log" && ok "the fleet's ROOT tailscaled daemon socket is preferred over a user-space one" || bad "root socket preferred" "$(cat "$PB/ts.log")"
   : > "$PB/ts.log"; pb env MEMEX_TAILSCALE_SOCKET=/custom.sock MEMEX_LOCAL_LIB=1 bash -c '. "$0"; publish_tailscale status' "$CLI" >/dev/null 2>&1
   grep -q -- "--socket=/custom.sock status" "$PB/ts.log" && ok "MEMEX_TAILSCALE_SOCKET still wins" || bad "explicit socket wins" "$(cat "$PB/ts.log")"
   rm -f "$PB/home/.tailscale/tailscaled.sock"

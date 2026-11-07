@@ -64,7 +64,7 @@ jobs:
           set -euo pipefail
           files="deploy/macos/build-pkg.sh deploy/macos/scripts/postinstall deploy/macos/daemon/postinstall \
                  deploy/macos/libexec/memex-daemon.sh deploy/macos/libexec/uninstall.sh deploy/macos/test/run-tests.sh \
-                 deploy/homebrew/share/tools.sh deploy/homebrew/bin/memex-local"
+                 deploy/homebrew/share/tools.sh deploy/homebrew/bin/memex-local deploy/macos/intune/fleet-bootstrap.sh"
           for f in $files; do bash -n "$f"; done
           # shellcheck disable=SC2086
           shellcheck -S warning $files
