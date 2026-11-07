@@ -37,10 +37,13 @@ buildHosts:
   workerTokenSecret: {name: "build-worker-mac", key: "token"}
   latest: {enabled: false}
   stable: {enabled: false}
-  # NO artifact store: the first attach takes only jobs routed to `mac` on purpose, and a stage that PRODUCES a module
-  # bundle or gate artifact fails its hand-over by design (build-run.py: "no artifact store is configured") — module
-  # builds stay off macos targets until arch-qualified bundle keys exist (Hosting/BackLease, core G10). The store the
-  # publishing side reads is the operations instance's shared CI artifact store; reaching it from a Mac is BackLease phase 2.
+  # The artifact store is the BUILD API, as on the cluster hosts (`upload: true` → `api:`): a stage's files are PUT to
+  # `<apiUrl>/<repo>/<sha>/artifacts/<sha256>` with the Mac's own channel token, which the operations instance accepts only
+  # from a `build-host-mac-*` host on channel `mac` (StandingBuildHosts §7a). This stores receipts on the RUN only — a
+  # `mac` run is never published (only `latest` publishes), so no arm64 bundle reaches the registry (core G10). Without a
+  # store the `modules` stage could not hand its bundles to `compile-check`, and a probe of either failed (measured on the
+  # first Mac, 2026-11-07: "no artifact store is configured").
+  artifactStore: {upload: true}
   extraChannels: ["mac"]
   mac:
     enabled: true
