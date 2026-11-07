@@ -14,7 +14,7 @@
 #   0. pins EVERY kubectl and helm call to the build profile's context (`colima-<profile>`, never the mutable current one) —
 #      and never runs `memex-local up`; CHECKS the profile runs containerd (the docker runtime cannot run a user-namespaced
 #      pod, and without one bwrap cannot mount a fresh /proc — measured on the first Mac, 2026-11-07);
-#      CHECKS before changing anything: KEDA installed and ready, the node's allocatable covers the host's requests,
+#      CHECKS before changing anything: KEDA installed and ready, the node's allocatable, less what its pods already request, covers the host's floor and peak (replicas × requests),
 #      both vault objects readable;
 #   1. loads the `mw-build-host` AppArmor profile (`userns` only) into the Colima VM, persisted under /etc/apparmor.d,
 #      and proves an UNPRIVILEGED user namespace starts under it;
@@ -58,7 +58,7 @@ for d in "$tester" "$portal" "$runner"; do [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] |
 
 # The build host runs in its OWN Colima profile (default `build`), never in the profile memex-local's portal uses: that one
 # runs the docker runtime, which cannot start a pod with hostUsers: false, and bwrap needs that pod's Unmasked /proc.
-# Create it once:  colima start -p build --cpu 8 --memory 24 --disk 100 --runtime containerd --kubernetes \
+# Create it once:  colima start -p build --cpu 16 --memory 100 --disk 300 --runtime containerd --kubernetes \
 #                    --k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet
 # (the kubelet root on the data disk: the tester and portal images are copied into emptyDirs, which the 20 GiB root
 # disk cannot hold). Then install KEDA into it. EVERY Kubernetes call below names that context explicitly — never the
@@ -82,21 +82,11 @@ k get crd scaledobjects.keda.sh -o name >/dev/null 2>&1 \
 k -n keda wait --for=condition=Available deployment --all --timeout=20s >/dev/null 2>&1 \
   || { echo "ERROR: KEDA's deployments in namespace keda are not Available. Nothing was changed." >&2; exit 1; }
 alloc="$(k get nodes -o jsonpath='{.items[0].status.allocatable.cpu} {.items[0].status.allocatable.memory}')"
-python3 - "$alloc" "$here/build-host-mac.values.yaml" <<'PY2' || { echo "Nothing was changed." >&2; exit 1; }
-import re, sys, yaml
-cpu, mem = sys.argv[1].split()
-def cores(v): return float(v[:-1]) / 1000 if v.endswith("m") else float(v)
-def gib(v):
-    units = {"Ki": 1 / 1048576, "Mi": 1 / 1024, "Gi": 1, "Ti": 1024}
-    m = re.fullmatch(r"([0-9.]+)([KMGT]i)?", v)
-    return float(m.group(1)) * (units[m.group(2)] if m.group(2) else 1 / 1073741824)
-req = yaml.safe_load(open(sys.argv[2]))["buildHosts"]["resources"]["requests"]
-if cores(str(req["cpu"])) > cores(cpu) or gib(str(req["memory"])) > gib(mem):
-    print(f"ERROR: the host requests {req['cpu']} CPU / {req['memory']}, the node allocates {cpu} / {mem} — it would stay Pending; "
-          "give the Colima VM more (colima stop; colima start --cpu N --memory M) or lower the values file", file=sys.stderr)
-    sys.exit(1)
-print(f"   node allocates {cpu} CPU / {mem}; the host requests {req['cpu']} / {req['memory']}")
-PY2
+# The declared FLOOR (every enabled channel's minReplicas) and the PEAK (their maxReplicas), each times one replica's
+# requests, must fit what the one node has left after the pods already on it (k3s, KEDA) — checking a single replica
+# passed a VM that left the second standing replica Pending for good.
+k get pods -A -o json | python3 "$here/host-fits-node.py" "$alloc" "$here/build-host-mac.values.yaml" --pods-json - \
+  || { echo "Nothing was changed." >&2; exit 1; }
 # The vault reads happen BEFORE any apply, so a failed read never replaces a working Secret with an empty one.
 worker_value="$(az keyvault secret show --vault-name "$vault" --name "$worker" --query value -o tsv)" \
   && [ -n "$worker_value" ] || { echo "ERROR: could not read the worker token $worker from $vault. Nothing was changed." >&2; exit 1; }
