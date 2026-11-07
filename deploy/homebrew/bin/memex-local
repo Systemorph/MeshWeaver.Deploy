@@ -1053,12 +1053,18 @@ restart_front_door() {
 # the running portal carries this layer's sign-in with the development sign-in off — never in the
 # window between writing the layer and the update that applies it.
 internal_serve_when_signed_in() {
-  local want got dev
+  local want got dev inv
   want="$(internal_value Authentication__Microsoft__ClientId)"
   got="$(local_kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__Microsoft__ClientId}' 2>/dev/null || true)"
   dev="$(local_kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__EnableDevLogin}' 2>/dev/null || true)"
-  if [ -z "$want" ] || [ "$got" != "$want" ] || [ "$dev" = "true" ]; then
+  inv="$(local_kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Features__Onboarding__InvitationOnly}' 2>/dev/null || true)"
+  if [ -z "$want" ] || [ "$got" != "$want" ] || [ "$dev" = "true" ] || [ "$inv" != "true" ]; then
     info "the private network is NOT opened yet: the running portal does not carry this sign-in (dev sign-in: ${dev:-unset}) — 'memex-local update' applies it and opens it"
+    return 1
+  fi
+  # The configmap changes before the pods do: only a COMPLETED rollout serves the new sign-in.
+  if ! local_kubectl -n "$NAMESPACE" rollout status deployment/memex-portal-deployment --timeout=300s >/dev/null 2>&1; then
+    info "the private network is NOT opened yet: the portal's rollout has not completed — 'memex-local update' opens it once it has"
     return 1
   fi
   if publish_tailscale serve --bg --tcp 443 "tcp://127.0.0.1:${HOST_PORT}" >/dev/null 2>&1; then
@@ -2029,7 +2035,8 @@ helm_deploy() {
     mode_args+=(-f "$INTERNAL_FILE")
     # After the overlay (a --set beats every -f): the overlay must not re-open the passwordless
     # development sign-in on a portal the private network reaches.
-    internal_args=(--set-string "config.memex_portal.Authentication__EnableDevLogin=false")
+    internal_args=(--set-string "config.memex_portal.Authentication__EnableDevLogin=false"
+                   --set-string "config.memex_portal.Features__Onboarding__InvitationOnly=true")
     info "INTERNAL ONLY: answers at https://$(internal_value Host) over the private network (sign-in Microsoft, invitation-only)"
   fi
   # PUBLIC NAME layer (`memex-local publish on`): the additional host, its sign-in, invitation-only.
