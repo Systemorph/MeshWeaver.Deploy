@@ -66,8 +66,11 @@ RUN chmod +x /opt/hosting/bin/* && ln -s /opt/hosting/bin/hosting-* /usr/local/b
 # core's drift scripts, at the same commit as the chart they render. They stay in deploy/aks/scripts,
 # where chart-gate.yml tests them on every pull request; this is where the command finds them in the
 # image (the aks-ops lane finds them in its MeshWeaver.Deploy checkout instead, deploy/aks/scripts).
+# kind-not-served.sh is the one rule for a kind the cluster does not serve, which hosting-audit sources
+# from here too (MeshWeaver.Deploy#155).
 COPY aks/scripts/check-chart-drift.sh aks/scripts/chart-drift-compare.py \
-     aks/scripts/chart-drift-record.py aks/scripts/chart-drift-render.py /opt/hosting/drift/
+     aks/scripts/chart-drift-record.py aks/scripts/chart-drift-render.py \
+     aks/scripts/kind-not-served.sh /opt/hosting/drift/
 
 # 🚨 THE CHART IS BAKED IN, and the build context is `deploy/` for exactly this reason.
 #

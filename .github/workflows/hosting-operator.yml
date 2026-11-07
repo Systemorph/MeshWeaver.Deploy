@@ -163,7 +163,7 @@ jobs:
             test -f /opt/hosting/chart/Chart.yaml    || { echo "chart missing"; exit 1; }
             test -f /opt/hosting/chart-db/Chart.yaml || { echo "db chart missing"; exit 1; }
             command -v helm kubectl az pg_dump jq crane >/dev/null || { echo "a required tool is missing"; exit 1; }
-            test -f /opt/hosting/drift/check-chart-drift.sh || { echo "drift scripts missing"; exit 1; }
+            test -f /opt/hosting/drift/check-chart-drift.sh && test -f /opt/hosting/drift/kind-not-served.sh || { echo "drift scripts missing"; exit 1; }
             python3 -c "import yaml" || { echo "python3/PyYAML missing"; exit 1; }
           '
 

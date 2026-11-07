@@ -117,16 +117,9 @@ if [ -z "$expect_patch" ] && [ -f "${estate}/deployments/aks/${namespace}/portal
 fi
 
 # ── the drift scripts, at the operator pin ──────────────────────────────────────────────────────
-drift_dir=""
-for candidate in "${HOSTING_DRIFT_SCRIPTS:-}" "${SELF_BIN}/../../scripts" "/opt/hosting/drift"; do
-  [ -n "$candidate" ] || continue
-  if [ -f "${candidate}/check-chart-drift.sh" ] && [ -f "${candidate}/chart-drift-record.py" ]; then
-    drift_dir="$(cd -- "$candidate" && pwd)"
-    break
-  fi
-done
-[ -n "$drift_dir" ] \
-  || hosting::die "core's drift scripts (check-chart-drift.sh, chart-drift-record.py) are not beside this command — looked in \$HOSTING_DRIFT_SCRIPTS, ${SELF_BIN}/../../scripts and /opt/hosting/drift. The lane's MeshWeaver checkout must include deploy/aks/scripts (the image carries them at /opt/hosting/drift). Without them nothing can be compared, and an audit that compared nothing must not report a verdict."
+# Without them nothing can be compared, and an audit that compared nothing must not report a verdict.
+hosting::find_drift_dir
+drift_dir="$HOSTING_DRIFT_DIR"
 
 # ── every input, or a refusal naming it ─────────────────────────────────────────────────────────
 [ -d "$chart" ] \
