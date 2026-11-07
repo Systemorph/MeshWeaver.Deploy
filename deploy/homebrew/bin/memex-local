@@ -1049,6 +1049,25 @@ restart_front_door() {
   if install_launchd >/dev/null 2>&1; then ok "front door restarted ($1)"; else warn "could not restart the front door — run 'memex-local port-forward'"; fi
 }
 
+# Open the private network to this Mac (tailscale serve TCP 443 -> the loopback front door) ONLY once
+# the running portal carries this layer's sign-in with the development sign-in off — never in the
+# window between writing the layer and the update that applies it.
+internal_serve_when_signed_in() {
+  local want got dev
+  want="$(internal_value Authentication__Microsoft__ClientId)"
+  got="$(local_kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__Microsoft__ClientId}' 2>/dev/null || true)"
+  dev="$(local_kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__EnableDevLogin}' 2>/dev/null || true)"
+  if [ -z "$want" ] || [ "$got" != "$want" ] || [ "$dev" = "true" ]; then
+    info "the private network is NOT opened yet: the running portal does not carry this sign-in (dev sign-in: ${dev:-unset}) — 'memex-local update' applies it and opens it"
+    return 1
+  fi
+  if publish_tailscale serve --bg --tcp 443 "tcp://127.0.0.1:${HOST_PORT}" >/dev/null 2>&1; then
+    ok "the private network reaches this Mac on TCP 443 (tailscale serve → the loopback front door, TLS passed through)"
+  else
+    warn "could not set up 'tailscale serve --tcp 443 tcp://127.0.0.1:${HOST_PORT}'"; return 1
+  fi
+}
+
 cmd_internal() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
@@ -1100,13 +1119,9 @@ YAML
           || warn "could not apply the Ingress $INTERNAL_INGRESS ($LOCAL_HOME/internal-ingress.yaml)"
       fi
       restart_front_door "loopback only — the private network is the only way in"
-      if publish_tailscale serve --bg --tcp 443 "tcp://127.0.0.1:${HOST_PORT}" >/dev/null 2>&1; then
-        ok "the private network reaches this Mac on TCP 443 (tailscale serve → the loopback front door, TLS passed through)"
-      else
-        warn "could not set up 'tailscale serve --tcp 443 tcp://127.0.0.1:${HOST_PORT}'"
-      fi
+      internal_serve_when_signed_in || true
       info "Register on the sign-in app exactly: https://${host}/signin-microsoft, https://${host}/auth/callback/Microsoft, https://${host}/auth/ea/callback"
-      info "Apply it: memex-local update   (the portal takes the sign-in; the first person to sign in becomes the administrator — the owner)"
+      info "Apply it: memex-local update   (the portal takes the sign-in, then the private network is opened; the first person to sign in becomes the administrator — the owner)"
       ;;
     status)
       if [ ! -f "$INTERNAL_FILE" ]; then info "not internal-only — memex-local internal on --tenant <id> --client-id <id> < secret"; return 0; fi
@@ -1979,7 +1994,7 @@ helm_deploy() {
   #    Cleared, the instance manifest the first-run wizard writes decides what installs (it
   #    projects the ticked packages as PluginCatalog:InstallByDefault:N and names the registry).
   #    Self-registry mode keeps today's per-source "<name>/*" entries, assembled below.
-  local mode_args=()
+  local mode_args=() internal_args=()
   if registry_mode; then
     # The tracked registry-mode layer first (self-update from the public GHCR, MeshWeaver.Deploy#65),
     # then the per-install registry file. Both are -f layers, so the user's overlay still wins.
@@ -2012,6 +2027,9 @@ helm_deploy() {
   if [ -f "$INTERNAL_FILE" ]; then
     overlay_drop_empty ${PUBLISH_OWNED_KEYS[@]+"${PUBLISH_OWNED_KEYS[@]}"} >/dev/null
     mode_args+=(-f "$INTERNAL_FILE")
+    # After the overlay (a --set beats every -f): the overlay must not re-open the passwordless
+    # development sign-in on a portal the private network reaches.
+    internal_args=(--set-string "config.memex_portal.Authentication__EnableDevLogin=false")
     info "INTERNAL ONLY: answers at https://$(internal_value Host) over the private network (sign-in Microsoft, invitation-only)"
   fi
   # PUBLIC NAME layer (`memex-local publish on`): the additional host, its sign-in, invitation-only.
@@ -2074,6 +2092,7 @@ helm_deploy() {
     -f "$share_dir/values.local.defaults.yaml" \
     ${mode_args[@]+"${mode_args[@]}"} \
     -f "$OVERLAY" \
+    ${internal_args[@]+"${internal_args[@]}"} \
     --set persistDataVolume=true \
     --set "config.memex_portal.Bootstrap__Secret=$LOCAL_BOOTSTRAP_SECRET" \
     ${plugin_args[@]+"${plugin_args[@]}"} \
@@ -2095,6 +2114,7 @@ helm_deploy() {
   if ! perms_err="$(colima ssh -- sh -c "sudo mkdir -p $PORTAL_DATA_DIR && sudo chmod 0777 $PORTAL_DATA_DIR" 2>&1)"; then
     warn "could not make $PORTAL_DATA_DIR writable on the node — portal may crashloop on DataProtection keys${perms_err:+: $perms_err}"
   fi
+  if [ -f "$INTERNAL_FILE" ]; then internal_serve_when_signed_in || true; fi
 }
 
 # ---------------------------------------------------------------------------

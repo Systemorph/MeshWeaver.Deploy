@@ -1486,6 +1486,10 @@ chmod +x "$IN/stubs/tailscale"
 cat > "$IN/stubs/kubectl" <<STUB
 #!/bin/bash
 echo "\$@" >> "$IN/k.log"
+case "\$*" in
+  *"configmap memex-portal-config"*"Microsoft__ClientId"*) printf '%s' "\${FAKE_CM_ID:-}" ;;
+  *"configmap memex-portal-config"*"EnableDevLogin"*) printf '%s' "\${FAKE_CM_DEV:-}" ;;
+esac
 exit 0
 STUB
 chmod +x "$IN/stubs/kubectl"
@@ -1507,7 +1511,15 @@ grep -q '^#Host: studio-2.net.example.test$' "$IL" && grep -q 'Authentication__M
 grep -q 'Authentication__EnableDevLogin: "false"' "$IL" && ok "internal only turns the passwordless development sign-in OFF explicitly" || bad "dev login off" "$(grep -c DevLogin "$IL")"
 [ -s "$IN/k.log" ] && ! grep -v -- '^--context colima ' "$IN/k.log" | grep -q . \
   && ok "every kubectl call of internal on is pinned to the LOCAL cluster (--context colima): a private key never lands in another context" || bad "kubectl context" "$(cat "$IN/k.log")"
-grep -q -- 'serve --bg --tcp 443 tcp://127.0.0.1:8443' "$IN/ts.log" && ok "tailscale serve forwards TCP 443 to the loopback front door (TLS passthrough)" || bad "tailscale serve" "$(cat "$IN/ts.log")"
+! grep -q -- 'serve --bg' "$IN/ts.log" && case "$OUT" in *"NOT opened yet"*) true ;; *) false ;; esac \
+  && ok "the private network is NOT opened while the running portal lacks the sign-in (no exposure before update)" || bad "serve before sign-in" "$(cat "$IN/ts.log")"
+printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn env FAKE_CM_ID=c-1 FAKE_CM_DEV=true "$CLI" internal on --tenant t-1 --client-id c-1 >/dev/null 2>&1
+! grep -q -- 'serve --bg' "$IN/ts.log" && ok "nor while the running portal still has the development sign-in on" || bad "serve with dev login" "$(cat "$IN/ts.log")"
+printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn env FAKE_CM_ID=c-1 FAKE_CM_DEV=false "$CLI" internal on --tenant t-1 --client-id c-1 >/dev/null 2>&1
+grep -q -- 'serve --bg --tcp 443 tcp://127.0.0.1:8443' "$IN/ts.log" && ok "once the portal carries the sign-in, tailscale serve forwards TCP 443 to the loopback front door (TLS passthrough)" || bad "tailscale serve" "$(cat "$IN/ts.log")"
+grep -q 'internal_args=(--set-string "config.memex_portal.Authentication__EnableDevLogin=false")' "$CLI" && grep -q '    -f "$OVERLAY" \\$' "$CLI" \
+  && awk '/-f "\$OVERLAY" \\$/{o=NR} /internal_args\[@\]\+/{i=NR} END{exit !(o && i==o+1)}' "$CLI" \
+  && ok "helm: the development sign-in is forced off AFTER the overlay (an overlay cannot re-open it)" || bad "dev login after overlay" "order"
 case "$OUT" in *"https://studio-2.net.example.test/signin-microsoft"*"/auth/callback/Microsoft"*"/auth/ea/callback"*) ok "internal on names the three redirect URIs to register" ;; *) bad "redirect URIs" "$OUT" ;; esac
 grep -q 'mode_args+=(-f "$INTERNAL_FILE")' "$CLI" && ok "helm_deploy layers the internal-only file" || bad "helm layer" "missing"
 M="$(inn env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; internal_ingress_manifest studio-2.net.example.test "nginx.ingress.kubernetes.io/proxy-body-size: \"50m\""' "$CLI")"
