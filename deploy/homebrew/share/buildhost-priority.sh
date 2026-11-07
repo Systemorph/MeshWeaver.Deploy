@@ -241,7 +241,8 @@ gui_session() { [ "${MEMEX_HEADLESS:-}" != 1 ] && launchctl print "gui/$(id -u)"
 proc_start() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' '_' | sed 's/^_//; s/_$//'; }
 headless_pid() {
   local p t
-  read -r p t < "$PID_FILE" 2>/dev/null || return 0
+  [ -f "$PID_FILE" ] || return 0
+  read -r p t < "$PID_FILE" || return 0
   [ -n "$p" ] && [ -n "$t" ] && [ "$(proc_start "$p")" = "$t" ] && ps -o command= -p "$p" 2>/dev/null | grep -q 'buildhost-priority.sh' && printf '%s' "$p"
   return 0
 }
