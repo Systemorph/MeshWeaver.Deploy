@@ -185,6 +185,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import concurrent.futures
 import gzip
 import json
@@ -667,6 +668,7 @@ def validate_restore(doc: object) -> Optional[dict]:
 MODULE_HUB_POLL = 0.25
 MODULE_HUB_RETRY = 2.0
 MODULE_HUB_WAIT = 45 * 60
+MODULE_HUB_LEASE_MARGIN = 30      # seconds: hand nothing over this close to the lease's end (clock skew, the upload's own time)
 
 
 def module_hub_enabled(env: dict) -> bool:
@@ -787,7 +789,9 @@ class ModuleHubBroker:
         self.slice_cache = slice_cache
         self.fps, self.trunk, self.order, self.pr, self.log = fingerprints, trunk, order, pull_request, log
         self.sleep, self.clock = sleep, clock
+        self.utcnow = lambda: datetime.datetime.now(datetime.timezone.utc)
         self.granted: dict = {}       # module → the step seq the hub granted THIS host
+        self.lease_until: dict = {}   # module → the lease's end on the SERVER's clock (the hub may grant a replacement past it)
         self.answered: set = set()
         for d in ("req", "resp", "done", "ack", "outputs", "build", ".tmp"):
             os.makedirs(os.path.join(root, d), exist_ok=True)
@@ -817,6 +821,11 @@ class ModuleHubBroker:
             step = answer.get("step") if isinstance(answer, dict) else None
             if status == 200 and verdict == "Grant" and isinstance(step, dict):
                 self.granted[module] = int(step.get("seq") or 0)
+                until = answer.get("leaseUntil") if isinstance(answer, dict) else None
+                try:
+                    self.lease_until[module] = datetime.datetime.fromisoformat(str(until).replace("Z", "+00:00")) if until else None
+                except ValueError:
+                    self.lease_until[module] = None
                 return {"verdict": "Grant", "seq": self.granted[module], "fingerprint": fp,
                         "outputDir": os.path.join(self.root, "build", module)}
             if status == 200 and verdict == "Hit" and isinstance(step, dict) and step.get("outputHash"):
@@ -889,6 +898,11 @@ class ModuleHubBroker:
         if seq is None:
             return {"accepted": False, "why": f"this host holds no grant for {module!r}"}
         fp = self.fps[module]
+        until = self.lease_until.get(module)
+        if until is not None and self.utcnow() >= until - datetime.timedelta(seconds=MODULE_HUB_LEASE_MARGIN):
+            # past (or about to pass) the lease on the server's clock: the hub may already have granted a replacement, so
+            # this host hands NOTHING over — its build stays in this run's own workspace
+            return {"accepted": False, "succeeded": False, "why": f"the lease ended at {until.isoformat()} — nothing was handed over"}
         ok = done.get("succeeded") is True
         body = {"holder": self.host, "seq": seq, "fingerprint": fp, "succeeded": False, "error": str(done.get("error") or "the stage reported a failure")[:2000]}
         if ok:
@@ -5532,6 +5546,22 @@ def self_test() -> int:
               len(downloads) == 1 and resp_c.get("source") == "from this host's slice cache"
               and open(os.path.join(resp_c["outputDir"], "B.dll"), "rb").read() == b"built B"
               and os.path.isfile(os.path.join(sc, "MeshWeaver.Plugins", "B", out_hex, ".complete")), (downloads, resp_c))
+        brl, api_l = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Grant", "step": {"seq": 9}, "leaseUntil": "2026-11-08T10:00:00Z"})],
+                                  ("PUT", "/modules/MeshWeaver.Plugins/B/outputs/"): put_,
+                                  ("POST", "/modules/MeshWeaver.Plugins/B/complete"): lambda p_, b_: (200, {"accepted": True})})
+        brl.utcnow = lambda: datetime.datetime(2026, 11, 8, 9, 59, 50, tzinfo=datetime.timezone.utc)   # 10 s before the end
+        with open(os.path.join(brl.root, "req", "B.json"), "w") as fh:
+            json.dump({"module": "B"}, fh)
+        brl.poll_once()
+        os.makedirs(os.path.join(brl.root, "build", "B"), exist_ok=True)
+        open(os.path.join(brl.root, "build", "B", "B.dll"), "wb").write(b"late")
+        with open(os.path.join(brl.root, "done", "B.json"), "w") as fh:
+            json.dump({"succeeded": True}, fh)
+        brl.poll_once()
+        ack_l = json.load(open(os.path.join(brl.root, "ack", "B.json")))
+        check("modhub/too close to the server's lease end, NOTHING is handed over (no upload, no completion)",
+              ack_l["accepted"] is False and "lease ended" in ack_l["why"]
+              and not any(c[1].endswith("/complete") or c[0] == "PUT" for c in api_l.calls), (ack_l, api_l.calls))
         check("modhub/a TRUNK run asks on main with its merge order",
               [c[2] for c in api_h.calls if c[1].endswith("/request")][0].get("order") == 77
               and [c[2] for c in api_h.calls if c[1].endswith("/request")][0].get("lane") == "Main")
