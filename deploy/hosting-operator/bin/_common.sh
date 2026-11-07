@@ -475,3 +475,26 @@ hosting::values_half() {
     || hosting::die "python3 is not on PATH — the values-half key check needs it (operator image: tdnf python3 PyYAML)"
   python3 "$helper" "$@"
 }
+
+# hosting::find_drift_dir — set HOSTING_DRIFT_DIR to the drift scripts (deploy/aks/scripts: the chart
+# comparison and the shared kind-not-served.sh rule), or die naming where it looked. Call it directly,
+# never inside $(…): a die in a command substitution prints and lets the caller carry on.
+# Looked for, in order: $HOSTING_DRIFT_SCRIPTS (the aks-ops lane's MeshWeaver.Deploy checkout), the
+# image build context's layout (aks/operator/bin → aks/scripts), this repository's checkout layout
+# (deploy/hosting-operator/bin → deploy/aks/scripts), and the image's /opt/hosting/drift. Every file
+# the commands read from it must be there — a directory with only some of them is another commit's.
+# shellcheck disable=SC2034  # HOSTING_DRIFT_DIR is the function's result, read by the sourcing command
+hosting::find_drift_dir() {
+  local self candidate
+  self="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+  HOSTING_DRIFT_DIR=""
+  for candidate in "${HOSTING_DRIFT_SCRIPTS:-}" "${self}/../../scripts" "${self}/../../aks/scripts" "/opt/hosting/drift"; do
+    [ -n "$candidate" ] || continue
+    if [ -f "${candidate}/check-chart-drift.sh" ] && [ -f "${candidate}/chart-drift-record.py" ] \
+       && [ -f "${candidate}/kind-not-served.sh" ]; then
+      HOSTING_DRIFT_DIR="$(cd -- "$candidate" && pwd)"
+      return 0
+    fi
+  done
+  hosting::die "the drift scripts (check-chart-drift.sh, chart-drift-record.py, kind-not-served.sh) are not beside this command — looked in \$HOSTING_DRIFT_SCRIPTS, ${self}/../../scripts, ${self}/../../aks/scripts and /opt/hosting/drift. The lane's MeshWeaver.Deploy checkout must include deploy/aks/scripts (the image carries them at /opt/hosting/drift): they hold the chart comparison and the one rule for a kind this cluster does not serve."
+}

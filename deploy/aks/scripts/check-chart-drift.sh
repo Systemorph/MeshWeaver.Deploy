@@ -224,6 +224,15 @@ elif ! python3 -c "import yaml" >/dev/null 2>&1; then
   missing+=("PyYAML                    python3 has no 'yaml' module — pip install pyyaml (or apt-get install python3-yaml)")
 fi
 [ -d "$CHART" ]   || missing+=("-c <chart-dir>            chart not found at '$CHART'")
+# The ONE rule for "this cluster does not serve that kind", shared with hosting-audit (#155). It ships
+# beside this script everywhere this script ships (the checkout, the lane's sparse checkout of this
+# directory, the image's /opt/hosting/drift) — absent means a partial copy, and that is red.
+if [ -f "$SELF_DIR/kind-not-served.sh" ]; then
+  # shellcheck source=kind-not-served.sh
+  source "$SELF_DIR/kind-not-served.sh"
+else
+  missing+=("kind-not-served.sh        not beside this script in '$SELF_DIR' — the shared rule for a kind the cluster does not serve")
+fi
 for v in ${VALUES[@]+"${VALUES[@]}"}; do
   [ -f "$v" ] || missing+=("-f '$v'                   values file does not exist")
 done
@@ -327,15 +336,63 @@ fetch_manifest() {
   esac
 }
 
-for res in "configmap/memex-portal-config" "deployment/memex-portal-deployment" \
-           "poddisruptionbudgets" "scaledobjects.keda.sh"; do
+# 🚨 A KIND THIS CLUSTER DOES NOT SERVE (MeshWeaver.Deploy#155). The two LIST reads below name kinds a
+# cluster may legitimately not have — scaledobjects.keda.sh on a cluster without KEDA (keda.enabled:
+# false). The answer "the server doesn't have a resource type" then means nothing of that kind can
+# exist, and hosting-audit, the first step of the same Audit, already records it as a skipped kind.
+# This step uses the SAME rule (kind-not-served.sh, sourced in the preflight), plus the one question
+# only this step can ask, because only it holds the render:
+#   * the render contains NO object of the kind → the read is answered: an empty list, and the kind is
+#     named as skipped. Nothing is hidden by it — no live object of the kind can exist.
+#   * the render DOES contain one → a FAILURE, never a skip: the chart describes an object this
+#     cluster cannot hold, so a deploy of this render fails, and "clean" would be a lie.
+# Every other failed read stays fatal, Forbidden above all. The two named reads are never subject to
+# the rule: the chart always renders them, so "not served" could only ever be the second case.
+read_failed() { # $1 = resource
+  echo "::error::could not read $1 from namespace '$NS' via --via $VIA. This is a FAILURE, not an absence of drift."
+  [ -s "$WORK/kubectl.err" ] && sed 's/^/    /' "$WORK/kubectl.err"
+  exit 1
+}
+is_json() { python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$1" 2>/dev/null; }
+# rendered_count <apiGroup> <Kind> — how many objects of that kind the render contains.
+rendered_count() {
+  python3 -c '
+import sys, yaml
+desired, group, kind = sys.argv[1], sys.argv[2], sys.argv[3]
+print(sum(1 for d in yaml.safe_load_all(open(desired))
+          if isinstance(d, dict) and d.get("kind") == kind
+          and str(d.get("apiVersion", "")).split("/")[0] == group))
+' "$WORK/desired.yaml" "$1" "$2"
+}
+SKIPPED_KINDS=""
+for res in "configmap/memex-portal-config" "deployment/memex-portal-deployment"; do
   out="$WORK/live-$(echo "$res" | tr '/' '-' | tr '.' '-').json"
-  if ! fetch "$res" > "$out" || ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$out" 2>/dev/null; then
-    echo "::error::could not read $res from namespace '$NS' via --via $VIA. This is a FAILURE, not an absence of drift."
+  if ! fetch "$res" > "$out" || ! is_json "$out"; then read_failed "$res"; fi
+done
+# <resource> <apiGroup> <Kind>, one per line.
+while read -r res group kind; do
+  out="$WORK/live-$(echo "$res" | tr '/' '-' | tr '.' '-').json"
+  fetch "$res" > "$out" && is_json "$out" && continue
+  # The transport's own words — stderr, and for aks-invoke the logs it returned on stdout.
+  answer="$(cat "$WORK/kubectl.err" "$out" 2>/dev/null | tr -d '\n')"
+  kind_not_served "$answer" || read_failed "$res"
+  if ! rendered="$(rendered_count "$group" "$kind")"; then
+    echo "::error::could not count the ${kind} objects in the render — whether $res may be skipped cannot be decided"
+    exit 1
+  fi
+  if [ "$rendered" != "0" ]; then
+    echo "::error::this cluster does not serve $res, but the rendered chart contains ${rendered} ${kind} object(s). A deploy of this render fails on a kind the cluster cannot hold — a FAILURE, never a skip. Turn the kind off in the values (keda.enabled: false for a ScaledObject), or make the cluster serve it."
     [ -s "$WORK/kubectl.err" ] && sed 's/^/    /' "$WORK/kubectl.err"
     exit 1
   fi
-done
+  printf '{"apiVersion":"v1","kind":"List","items":[]}\n' > "$out"
+  SKIPPED_KINDS="${SKIPPED_KINDS:+$SKIPPED_KINDS }$res"
+  echo "kind $res is not served by this cluster and the rendered chart contains no ${kind} — skipped (nothing of that kind can exist here)"
+  summary "- ⏭️ kind \`$res\` is not served by this cluster and the chart renders no ${kind} — skipped"
+done <<'KINDS'
+poddisruptionbudgets policy PodDisruptionBudget
+scaledobjects.keda.sh keda.sh ScaledObject
+KINDS
 
 # ---------------------------------------------------------------------------
 # OWNED — what the LAST deploy rendered. Same rule as every fetch above: an unreadable input is a
@@ -421,6 +478,7 @@ python3 "$SELF_DIR/chart-drift-compare.py" \
   "$RECORD_FACTS"
 rc=$?
 
+[ -z "$SKIPPED_KINDS" ] || echo "kinds skipped (not served by this cluster, rendered by nothing): $SKIPPED_KINDS"
 if [ "$rc" -ne 0 ]; then
   report "namespace '$NS' has drifted from the chart (or the comparison could not be made)"
 else
