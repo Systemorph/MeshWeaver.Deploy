@@ -193,7 +193,9 @@ jobs:
           PY
           # The chart never READS the cluster for the key Secret (a lookup made off-cluster previews show the
           # key as removed, and stored the key in the release manifest).
-          ! grep -q 'lookup' deploy/headscale/helm/templates/preauthkeys.yaml || { echo "::error::preauthkeys.yaml uses lookup"; exit 1; }
+          # The CALL (`lookup "v1" …`, also inside an assignment), not the word in the template's comment.
+          ! grep -qE 'lookup[[:space:]]+"' deploy/headscale/helm/templates/preauthkeys.yaml || { echo "::error::preauthkeys.yaml calls lookup"; exit 1; }
+          printf '{{- $live := lookup "v1" "Secret" "ns" "n" }}\n' | grep -qE 'lookup[[:space:]]+"' || { echo "::error::the lookup guard cannot see a call"; exit 1; }
           # A long release name keeps every key's Secret distinct (names are never truncated).
           long=$(printf 'r%.0s' $(seq 1 45))
           names=$(helm template "$long" deploy/headscale/helm -f ci-values.yaml "${keys[@]}" --set 'preauthKeys.keys[1].name=mac' --set 'preauthKeys.keys[1].user=fleet' \
