@@ -145,6 +145,14 @@ readonly LLM_FILE="$LOCAL_HOME/llm.yaml"
 # One values layer after back-lease and before the overlay (an overlay value still wins). The throw-away
 # RSA key the code is sealed to lives under $FLEET_DIR only until the code is opened.
 readonly FLEET_FILE="$LOCAL_HOME/fleet.yaml"
+# ── PUBLIC NAME — this Mac answers at a public name through the network's ingress bridge ─────────────────
+# Written by `memex-local publish on`, read by helm_deploy as one more values layer after the fleet layer
+# and before the overlay (an overlay value still wins): the public name as an ADDITIONAL ingress host (the
+# portal's own links keep https://memex.localhost), the sign-in provider declared for it, and
+# invitation-only admission. While it exists the front door binds LOOPBACK only, on the unprivileged port
+# (share/port-forward.sh), and the network reaches it through `tailscale serve` (TCP 443 → 127.0.0.1:<port>),
+# so nothing on the LAN can reach the portal. Design: MeshWeaver.Plugins Hosting/MacStudioFleet §6.
+readonly PUBLISH_FILE="$LOCAL_HOME/publish.yaml"
 readonly FLEET_DIR="$LOCAL_HOME/enrol"
 readonly FLEET_CODE_PREFIX="mwenrol1."
 # The host's Ollama under launchd (survives a reboot), bound to every interface so the Colima VM reaches
@@ -707,6 +715,121 @@ cmd_backlease() {
   esac
 }
 
+
+# ---------------------------------------------------------------------------
+# §18b — PUBLIC NAME through the network's ingress bridge (MeshWeaver.Plugins Hosting/MacStudioFleet §6)
+# ---------------------------------------------------------------------------
+# `publish on --host <public name> --sign-in microsoft --tenant <id> --client-id <id>` makes this Mac's
+# portal answer at <public name> as well as at memex.localhost: the bridge (MeshWeaver.Deploy
+# deploy/tailnet-bridge) forwards that name over the private network to this Mac's port 443 with
+# Host = the public name. What protects it is the portal's own sign-in, so the command REQUIRES a real
+# provider for the public name (the development sign-in answers on localhost names only) and turns on
+# invitation-only admission: the first person to sign in becomes the instance's administrator, everyone
+# after needs an invitation. The client secret is read from STDIN (`< file` or a pipe), never an argument,
+# and stored in this 0600 layer only. `publish status` reads it back; `publish off` removes it.
+publish_value() { awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$PUBLISH_FILE" 2>/dev/null; }
+publish_host() { awk '/^  additionalHosts:/ { getline; sub(/^ *- */, ""); gsub(/"/, ""); print; exit }' "$PUBLISH_FILE" 2>/dev/null; }
+publish_signin_summary() {
+  local p; for p in Microsoft Google Apple LinkedIn; do
+    [ -n "$(publish_value "Authentication__${p}__ClientId")" ] && printf '%s' "$p"
+  done
+  local t; t="$(publish_value Authentication__Microsoft__TenantId)"; [ -n "$t" ] && printf ' (tenant %s)' "$t"
+}
+
+# The network path to the front door: tailscale serve forwards TCP 443 on this Mac's network address to
+# the loopback-only front door. A custom socket (a user-space tailscaled) via MEMEX_TAILSCALE_SOCKET.
+publish_tailscale() {
+  local ts=(tailscale); [ -n "${MEMEX_TAILSCALE_SOCKET:-}" ] && ts+=(--socket="$MEMEX_TAILSCALE_SOCKET")
+  command -v tailscale >/dev/null 2>&1 || { warn "tailscale is not installed — join the private network first (MeshWeaver.Deploy deploy/headscale/README.md)"; return 1; }
+  ${ts[@]+"${ts[@]}"} "$@"
+}
+
+cmd_publish() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    on)
+      local host="" provider="" tenant="" client_id="" secret=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --host)      shift; host="${1:?--host needs the public name}" ;;
+          --sign-in)   shift; provider="${1:?--sign-in needs a provider: microsoft, google, apple or linkedin}" ;;
+          --tenant)    shift; tenant="${1:?--tenant needs the directory id}" ;;
+          --client-id) shift; client_id="${1:?--client-id needs the app registration client id}" ;;
+          *) die "publish on: unknown flag '$1'" ;;
+        esac
+        shift
+      done
+      case "$host" in ''|*[!a-z0-9.-]*|*.localhost|localhost) die "publish on: --host must be a lower-case public DNS name (got '${host:-<none>}')" ;; *.*) ;; *) die "publish on: --host '$host' is not a DNS name" ;; esac
+      local key
+      case "$provider" in
+        microsoft) key=Microsoft
+                   case "$tenant" in ''|common|organizations|consumers) die "publish on: --sign-in microsoft needs --tenant <directory id> — a named directory, never common/organizations/consumers (who may sign in is that directory's members, then the invitation list)" ;; esac ;;
+        google|apple|linkedin)
+                   die "publish on: --sign-in $provider is not wired yet — the chart carries a client secret for Microsoft only (Google, Apple and LinkedIn sign-in for a public name are a follow-up, MeshWeaver.Plugins Hosting/MacStudioFleet §6)" ;;
+        '')        die "publish on: --sign-in <provider> is required — a public name needs a real sign-in (the development sign-in answers on localhost names only)" ;;
+        *)         die "publish on: --sign-in must be microsoft (google, apple, linkedin: a follow-up) — got '$provider'" ;;
+      esac
+      [ -n "$client_id" ] || die "publish on: --client-id <id> is required (the app registration whose redirect URI is https://${host}/signin-${provider})"
+      case "$client_id" in *[!A-Za-z0-9._-]*) die "publish on: --client-id contains characters a client id never has" ;; esac
+      [ -t 0 ] && die "publish on: pipe the client secret on STDIN (e.g. '< secret-file' or from your secret store) — it is never an argument and never printed"
+      secret="$(cat)"; secret="${secret%$'\n'}"
+      [ -n "$secret" ] || die "publish on: no client secret on STDIN"
+      case "$secret" in *'"'*|*'\\'*|*$'\n'*) die "publish on: the client secret contains a quote, backslash or newline — store it with your provider's secret format" ;; esac
+      mkdir -p "$LOCAL_HOME"
+      local tenant_line=""
+      [ -n "$tenant" ] && tenant_line="    Authentication__Microsoft__TenantId: \"${tenant}\"
+"
+      ( umask 077; cat > "$PUBLISH_FILE" ) <<YAML
+# memex-local PUBLIC NAME — managed by \`memex-local publish\`; re-run \`on\` to change, \`off\` to delete.
+# This Mac's portal also answers at https://${host} through the network's ingress bridge. The front door
+# binds loopback only (port ${HOST_PORT}) while this file exists; the network reaches it through tailscale serve.
+ingress:
+  additionalHosts:
+    - "${host}"
+config:
+  memex_portal:
+    Authentication__${key}__ClientId: "${client_id}"
+${tenant_line}    Features__Onboarding__InvitationOnly: "true"
+secrets:
+  memex_portal:
+    Authentication__${key}__ClientSecret: "${secret}"
+YAML
+      chmod 600 "$PUBLISH_FILE"
+      unset secret
+      ok "public-name layer written: $PUBLISH_FILE (https://${host}, sign-in ${key}${tenant:+ tenant ${tenant}}, invitation-only; the secret is in the file, never printed)"
+      if publish_tailscale serve --bg --tcp 443 "tcp://127.0.0.1:${HOST_PORT}" >/dev/null 2>&1; then
+        ok "the network reaches this Mac's front door on TCP 443 (tailscale serve → 127.0.0.1:${HOST_PORT})"
+      else
+        warn "could not set up 'tailscale serve --tcp 443 tcp://127.0.0.1:${HOST_PORT}' — the bridge cannot reach this Mac until it is"
+      fi
+      info "While published the front door is loopback-only on port ${HOST_PORT}: open https://${HOSTNAME_LOCAL}:${HOST_PORT} locally"
+      info "Register the redirect URI on the app: https://${host}/signin-${provider}"
+      info "Apply it: memex-local update   (the front door rebinds to loopback; the first person to sign in at https://${host} becomes this instance's administrator — make it yours)"
+      ;;
+    status)
+      [ $# -eq 0 ] || die "publish status: unknown flag '$1'"
+      if [ -f "$PUBLISH_FILE" ]; then
+        ok "PUBLIC NAME ON — https://$(publish_host), sign-in: $(publish_signin_summary), admission: invitation-only"
+        info "values file: $PUBLISH_FILE (layered after the fleet layer by helm_deploy)"
+        publish_tailscale serve status 2>/dev/null | sed 's/^/  /' || true
+      else
+        info "no public name — publish this Mac with:"
+        info "  memex-local publish on --host <name> --sign-in microsoft --tenant <id> --client-id <id> < secret-file"
+      fi
+      ;;
+    off)
+      [ $# -eq 0 ] || die "publish off: unknown flag '$1'"
+      publish_tailscale serve --tcp 443 off >/dev/null 2>&1 || true
+      if [ -f "$PUBLISH_FILE" ]; then
+        rm -f "$PUBLISH_FILE"
+        ok "public name OFF — the next 'memex-local update' drops the host and its sign-in (the bridge then answers 502)"
+      else
+        info "no public name was set"
+      fi
+      ;;
+    *) die "usage: memex-local publish {on --host <name> --sign-in microsoft --tenant <id> --client-id <id> < secret | status | off}" ;;
+  esac
+}
 
 # ---------------------------------------------------------------------------
 # §19 — FLEET JOIN: one command, the control instance does the rest (MeshWeaver.Plugins Hosting/MacStudioFleet §2b)
@@ -1411,6 +1534,11 @@ helm_deploy() {
     mode_args+=(-f "$FLEET_FILE")
     info "FLEET: joined as '$(fleet_value Hosting__Deployment)' — keys from the enrolment code (never printed)"
   fi
+  # PUBLIC NAME layer (`memex-local publish on`): the additional host, its sign-in, invitation-only.
+  if [ -f "$PUBLISH_FILE" ]; then
+    mode_args+=(-f "$PUBLISH_FILE")
+    info "PUBLIC NAME: also answers at https://$(publish_host) — sign-in: $(publish_signin_summary); admission: invitation-only"
+  fi
   # LOCAL MODEL layer (`memex-local llm use`): the host's Ollama is the portal's utility-tier model.
   if [ -f "$LLM_FILE" ]; then
     mode_args+=(-f "$LLM_FILE")
@@ -1581,7 +1709,7 @@ install_launchd() {
     if [ -f "$PF_PID" ] && kill -0 "$(cat "$PF_PID")" 2>/dev/null; then
       ok "port-forward already running (pid $(cat "$PF_PID"))"
     else
-      MEMEX_PORT="$HOST_PORT" MEMEX_LOCAL_SHARE="$share" nohup /bin/bash "$PF_SCRIPT" >> "$PF_LOG" 2>&1 &
+      MEMEX_PORT="$HOST_PORT" MEMEX_LOCAL_SHARE="$share" MEMEX_LOCAL_HOME="$LOCAL_HOME" nohup /bin/bash "$PF_SCRIPT" >> "$PF_LOG" 2>&1 &
       echo $! > "$PF_PID"
       ok "port-forward started (pid $(cat "$PF_PID"), log: $PF_LOG)"
     fi
@@ -1595,6 +1723,7 @@ install_launchd() {
       -e "s|__LOG__|${PF_LOG}|g" \
       -e "s|__PORT__|${HOST_PORT}|g" \
       -e "s|__SHARE__|${share}|g" \
+      -e "s|__LOCAL_HOME__|${LOCAL_HOME}|g" \
       "$share/com.memex.local.plist" > "$PLIST_DST"
   # Reload idempotently.
   launchctl bootout "gui/$(id -u)" "$PLIST_DST" >/dev/null 2>&1 || true
@@ -3289,6 +3418,14 @@ COMMANDS:
                   printed, only their sha256 fingerprints), runs backlease enroll, starts Ollama
                   under launchd, and updates from the public GHCR. 'status' shows the fingerprints.
   backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] | status | off
+  publish on --host <name> --sign-in microsoft --tenant <id> --client-id <id> < secret | status | off
+                  PUBLIC NAME (Hosting/MacStudioFleet §6): this Mac's portal also answers at <name>
+                  through the private network's ingress bridge. Writes the values layer (the
+                  additional ingress host, the sign-in provider for it, invitation-only admission;
+                  the client secret is read from STDIN into the 0600 layer, never printed), binds the
+                  front door to loopback and sets up 'tailscale serve --tcp 443' so only the network
+                  reaches it. The development sign-in answers on localhost names only, so a public
+                  name always needs a real provider. 'memex-local update' applies it.
   relay pair --instance <https url> --owner <user id> --binary <dir|file> | status | off [--forget]
                   DEVICE RELAY (Hosting/DeviceRelay): let a cloud instance's inbox read the
                   chats that exist only on this Mac (iMessage, WhatsApp Desktop) LIVE —
@@ -3854,6 +3991,7 @@ main() {
     backlease)     cmd_backlease "$@" ;;
     fleet)         cmd_fleet "$@" ;;
     llm)           cmd_llm "$@" ;;
+    publish)       cmd_publish "$@" ;;
     relay)         cmd_relay "$@" ;;
     verify)        cmd_verify "$@" ;;
     autoroll)      cmd_autoroll "$@" ;;

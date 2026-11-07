@@ -920,6 +920,10 @@ ingress:
   enabled: false
   className: "nginx"
   host: ""          # e.g. memex.localtest.me (resolves to 127.0.0.1)
+  # Further names the SAME portal answers at, with the same paths on every Ingress — e.g. a public name
+  # reached through the private network's ingress bridge (MeshWeaver.Deploy deploy/tailnet-bridge). The
+  # portal's links keep using `host`; the TLS block lists every name with the one `tlsSecret`.
+  additionalHosts: []
   tlsSecret: ""     # name of a kubernetes.io/tls secret in this namespace
   # Which cert-manager ClusterIssuer issues that Secret. Blank here (neutral chart: a self-host
   # install may pre-create the Secret); the fleet's records render `letsencrypt-prod` into it, and

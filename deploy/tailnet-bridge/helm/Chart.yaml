@@ -1,0 +1,11 @@
+apiVersion: v2
+name: tailnet-bridge
+description: >-
+  Publishes ONE machine of the private network at a public name: the cluster's HTTPS ingress routes the
+  name to a small proxy that is itself a member of the network (Tailscale, userspace) and forwards over
+  WireGuard to the machine. The machine opens no port; its own sign-in protects it. Renders NOTHING
+  unless `enabled: true`. See deploy/tailnet-bridge/README.md.
+type: application
+version: 0.1.0
+# The Tailscale client release the image carries (deploy/tailnet-bridge/Dockerfile).
+appVersion: "1.104.4"

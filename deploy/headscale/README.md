@@ -26,9 +26,66 @@ kept apart from the phone app: SSH, screen sharing, a local mesh on another Mac,
 | `Service` + `Ingress` | plain HTTP inside the cluster, TLS at the ingress (cert-manager or a pre-created Secret) |
 | `SecretProviderClass` (OIDC via Key Vault) | the client secret is mounted as a FILE and never synced into a Kubernetes Secret |
 | `NetworkPolicy` | in: the HTTP port, from the ingress namespace; out: DNS and HTTPS only (issuer, DERP map) |
+| `keys` sidecar + `ConfigMap`, a `Secret` per key, `ServiceAccount`, `Role`, `RoleBinding` (only with `preauthKeys.enabled`) | the declared pre-auth keys — below |
 
-The pod runs as uid 65532 on a read-only root with no capabilities and no service-account token.
+The pod runs as uid 65532 on a read-only root with no capabilities and no service-account token (the
+keys sidecar alone mounts one, through its own projected volume).
 Metrics and gRPC listen on loopback only; the admin CLI talks to the unix socket inside the pod.
+
+## Declared pre-auth keys — joining a machine unattended
+
+A machine that joins with nobody at a browser (the ingress bridge, `deploy/tailnet-bridge/`; a build
+host) needs a **pre-auth key**. Minting one by hand means `kubectl exec` into the control server and
+pasting the key somewhere. Instead the overlay DECLARES the keys, the governed `ApplyChart` applies the
+declaration under its approval, and a sidecar keeps the cluster matching it:
+
+```yaml
+preauthKeys:
+  enabled: true
+  image: { repository: <registry>/headscale-keys }   # tag defaults to image.tag (same commit)
+  keys:
+    - { name: tailnet-bridge, user: tailnet-bridge, reusable: true, ephemeral: true, validHours: 720, renewHours: 168 }
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant O as Overlay + ApplyChart (approved)
+    participant K8s as Kubernetes API
+    participant S as keys sidecar
+    participant H as headscale (same pod)
+    participant B as consumer pod (bridge)
+    O->>K8s: Secret <fullname>-preauth-<name> (empty, kept), Role over exactly it
+    loop every interval
+        S->>K8s: GET the Secret (projected token, Role: get/update/patch on the declared names only)
+        alt no key / expiring / expired / unknown / single-use and used
+            S->>H: users create (when absent), preauthkeys create (unix socket)
+            H-->>S: key (to a mode-600 file, never printed)
+            S->>K8s: PATCH Secret data.authkey + key-id, expires-at, reason
+            S->>H: preauthkeys expire <replaced key>
+        end
+    end
+    B->>K8s: mounts the Secret as a FILE (same namespace)
+    B->>H: tailscale up --auth-key file:…
+```
+
+- The chart creates each Secret EMPTY with `helm.sh/resource-policy: keep` and carries an existing key
+  across upgrades (`lookup`); the sidecar cannot create, list or read any other Secret.
+- A key is replaced when it is missing, its DECLARATION changed (user, flags or lifetime — a fingerprint
+  is stored with the key), within `renewHours` of its expiry, expired or unknown in headscale, or
+  (single-use) already used. The replaced key is expired at once, so nothing new joins with it while
+  machines that already joined keep their registration. Its id is recorded in the Secret in the SAME
+  write as the new key (`pending-expire`) and retried every pass until headscale confirms it no longer
+  accepts it; a key whose Secret write was refused is expired immediately (retried for the life of the
+  process if that fails). Every such failure fails the pass and is logged.
+- The pod template hashes the declaration only, never the Secrets, so a key renewal does not restart the
+  control server.
+- The key never appears in a log, an argv or the environment: headscale writes it to a mode-600 file, the
+  patch goes from a file (`curl --data-binary @file`), and the consumer mounts the Secret as a file.
+- The image `headscale-keys:<line>-<sha>` is the SAME headscale binary with a shell, curl and jq (the
+  server image stays the upstream distroless bytes); both are published from one commit. `test/keys.sh`
+  runs the loop in the build against a real server and a stand-in API server (`test/kube-stub.py`): 20
+  assertions, including a changed declaration, a refused Secret write, and no key in the log.
 
 ## Relays (DERP)
 
@@ -43,7 +100,8 @@ HTTP ingress cannot carry, so it is a separate change (a `LoadBalancer` Service 
 `Dockerfile`, into the fleet registry as `headscale:<version>-<short sha>` (immutable; the chart refuses
 any other tag shape). The build runs `test/smoke.sh` on the shipped binary; the pull-request job then
 proves the smoke can go red, serves the CHART's own rendered config as the pod does, joins a stock
-Tailscale client to it, and checks every render refusal.
+Tailscale client to it, and checks every render refusal. The same run publishes `headscale-keys:<version>-<short
+sha>` (target `keys-release`), the declared-keys sidecar, whose `test/keys.sh` also runs in the build.
 
 A version bump: change the `HEADSCALE_IMAGE` digest and `LINE` together, read the release notes for the
 minimum Tailscale client, and declare the new line in the platform repository's

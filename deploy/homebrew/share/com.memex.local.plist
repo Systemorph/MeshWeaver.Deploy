@@ -37,6 +37,10 @@
              resolution the CLI made (existing copy meeting its floor first, vendored fallback second). -->
         <key>MEMEX_LOCAL_SHARE</key>
         <string>__SHARE__</string>
+        <!-- The CLI's state directory: the forward reads publish.yaml from it (a published Mac binds
+             loopback only), so a non-default MEMEX_LOCAL_HOME must reach the agent too. -->
+        <key>MEMEX_LOCAL_HOME</key>
+        <string>__LOCAL_HOME__</string>
     </dict>
 
     <key>RunAtLoad</key>

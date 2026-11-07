@@ -90,4 +90,41 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 {{- end }}
 {{- end }}
+{{- if .Values.preauthKeys.enabled }}
+{{- if not .Values.preauthKeys.image.repository }}
+{{- fail "preauthKeys.image.repository is required when preauthKeys.enabled (<registry>/headscale-keys)" }}
+{{- end }}
+{{- $kt := toString (default .Values.image.tag .Values.preauthKeys.image.tag) }}
+{{- if not (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+-[0-9a-f]{7,40}$" $kt) }}
+{{- fail (printf "preauthKeys.image.tag %q is not an immutable <headscale version>-<short sha> tag" $kt) }}
+{{- end }}
+{{- if not .Values.preauthKeys.keys }}
+{{- fail "preauthKeys.keys is empty — declare at least one key, or leave preauthKeys.enabled false" }}
+{{- end }}
+{{- $seen := dict }}
+{{- range $k := .Values.preauthKeys.keys }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$" (toString $k.name)) }}
+{{- fail (printf "preauthKeys.keys: name %q is not a short lower-case DNS label" (toString $k.name)) }}
+{{- end }}
+{{- if hasKey $seen (toString $k.name) }}
+{{- fail (printf "preauthKeys.keys: %q is declared twice" (toString $k.name)) }}
+{{- end }}
+{{- $_ := set $seen (toString $k.name) true }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9._]*[a-z0-9])?$" (toString $k.user)) }}
+{{- fail (printf "preauthKeys.keys[%s]: user %q is required and must be a plain lower-case name" $k.name (toString $k.user)) }}
+{{- end }}
+{{- $valid := int (default 720 $k.validHours) }}
+{{- $renew := int (default 168 $k.renewHours) }}
+{{- if or (lt $valid 1) (lt $renew 1) (ge $renew $valid) }}
+{{- fail (printf "preauthKeys.keys[%s]: renewHours (%d) must be at least 1 and below validHours (%d)" $k.name $renew $valid) }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- end -}}
+
+{{/* The Secret one declared key is kept in. NEVER truncated: a Secret name may be 253 characters, and
+     cutting it could map two declared keys onto one Secret (the key name is the distinguishing suffix). */}}
+{{- define "headscale.preauthSecret" -}}
+{{- printf "%s-preauth-%s" (include "headscale.fullname" .root) .name -}}
+{{- end -}}
+

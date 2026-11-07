@@ -14,18 +14,36 @@ ARG HEADSCALE_IMAGE=headscale/headscale:0.29.7@sha256:11f81665e842809db9fe3006a3
 
 FROM ${HEADSCALE_IMAGE} AS upstream
 
-# ── The test stage: the SHIPPED binary, exercised before anything is published ─────────────────────────────
-# The upstream image is distroless (no shell), so the binary is copied into a throwaway Debian stage that
-# runs test/smoke.sh against it: `headscale configtest` on the chart's own config shape, then a real
-# `headscale serve` answering /health and the Noise key endpoint, then the CLI over the unix socket.
-# A red smoke fails the build, so nothing untested reaches the registry.
-FROM debian:12-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS test
+# ── The keys sidecar (keys/headscale-keys.sh): the SAME headscale binary with a shell, curl and jq ──────
+# The upstream image is distroless, so the declared pre-auth keys loop (helm values `preauthKeys`) runs
+# from this second image, in the headscale pod, over the shared unix socket. Published beside the server
+# image as `headscale-keys:<line>-<sha>` from the same commit (headscale-image.yml).
+FROM debian:12-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS keys
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl jq \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=upstream /ko-app/headscale /usr/local/bin/headscale
+COPY keys/headscale-keys.sh /usr/local/bin/headscale-keys
+RUN chmod 0755 /usr/local/bin/headscale-keys
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/headscale-keys"]
+
+# ── The test stage: the SHIPPED binary and the SHIPPED keys script, exercised before anything is published ──
+# test/smoke.sh: `headscale configtest` on the chart's own config shape, then a real `headscale serve`
+# answering /health and the Noise key endpoint, then the CLI over the unix socket. test/keys.sh: the keys
+# loop against that server and a stand-in API server (test/kube-stub.py). A red test fails the build, so
+# nothing untested reaches the registry.
+FROM keys AS test
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
 COPY test /test
-RUN chmod 0755 /test/*.sh && /test/smoke.sh && touch /smoke-passed
+RUN chmod 0755 /test/*.sh && /test/smoke.sh && /test/keys.sh && touch /smoke-passed
+
+# ── The keys image that ships: the keys stage, plus a proof the tests ran ──────────────────────────────────
+FROM keys AS keys-release
+COPY --from=test /smoke-passed /etc/headscale-smoke-passed
 
 # ── The image that ships: the upstream bytes, unchanged, plus a proof the smoke ran ────────────────────────
 FROM upstream

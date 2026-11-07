@@ -1,0 +1,93 @@
+{{- if and .Values.enabled .Values.preauthKeys.enabled }}
+{{- include "headscale.validate" . }}
+{{- $fullname := include "headscale.fullname" . }}
+# The declaration the keys sidecar reads (keys/headscale-keys.sh): one entry per declared key.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-keys
+  labels:
+    {{- include "headscale.labels" . | nindent 4 }}
+data:
+  keys.json: |
+    {{- $keys := list }}
+    {{- range $k := .Values.preauthKeys.keys }}
+    {{- $keys = append $keys (dict
+          "name" $k.name
+          "user" $k.user
+          "secret" (include "headscale.preauthSecret" (dict "root" $ "name" $k.name))
+          "reusable" (default false $k.reusable)
+          "ephemeral" (default false $k.ephemeral)
+          "validHours" (int (default 720 $k.validHours))
+          "renewHours" (int (default 168 $k.renewHours))) }}
+    {{- end }}
+    {{- toJson $keys | nindent 4 }}
+{{- range $k := .Values.preauthKeys.keys }}
+{{- $name := include "headscale.preauthSecret" (dict "root" $ "name" $k.name) }}
+{{- /* Created EMPTY; the sidecar fills it. An upgrade must not wipe a minted key, so the live data and
+       annotations are carried over (lookup answers nothing under `helm template`, which only renders). */}}
+{{- $live := lookup "v1" "Secret" $.Release.Namespace $name }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "headscale.labels" $ | nindent 4 }}
+    headscale.meshweaver.net/preauth-key: {{ $k.name | quote }}
+  annotations:
+    helm.sh/resource-policy: keep
+    {{- if $live }}
+    {{- range $ak, $av := ($live.metadata.annotations | default dict) }}
+    {{- if hasPrefix "headscale.meshweaver.net/" $ak }}
+    {{ $ak }}: {{ $av | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+type: Opaque
+{{- if and $live $live.data }}
+data:
+  {{- toYaml $live.data | nindent 2 }}
+{{- end }}
+{{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}-keys
+  labels:
+    {{- include "headscale.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+# Exactly the declared Secrets: get to read the current key, update/patch to store a new one. No create,
+# no list, no other Secret — the namespace's other credentials stay out of reach.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-keys
+  labels:
+    {{- include "headscale.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "update", "patch"]
+    resourceNames:
+      {{- range $k := .Values.preauthKeys.keys }}
+      - {{ include "headscale.preauthSecret" (dict "root" $ "name" $k.name) }}
+      {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-keys
+  labels:
+    {{- include "headscale.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-keys
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fullname }}-keys
+    namespace: {{ .Release.Namespace }}
+{{- end }}
