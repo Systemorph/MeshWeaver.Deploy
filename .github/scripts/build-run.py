@@ -1758,8 +1758,12 @@ def artifact_path(repo: str, sha: str, digest: str) -> str:
 # length and sha256 while it stores it under the instance's own root and records the receipt. A transport failure or a
 # 5xx is retried at most API_UPLOAD_ATTEMPTS times in all, with a doubling pause, inside the run budget; anything else —
 # and the last failed attempt — fails the stage, naming the answer. Never a silent pass.
+# 10 attempts with the pause doubling from 2 s and capped at 60 s wait ~5 min in all (2+4+…+32+60·4 ≈ 302 s): a stage's
+# whole verdict is lost when its hand-over fails, and the 503 that cost one (Plugins fee21cf7, 2026-11-07, "artifact
+# hand-over 503 after 4 attempts" — then ~14 s of patience) fell inside a control-database throttling window that lasted
+# minutes, not seconds (Plugins Hosting/CiProfile.md §7). Still bounded by the run budget, which every pause respects.
 API_STORE_SPEC = "api:"
-API_UPLOAD_ATTEMPTS = 4
+API_UPLOAD_ATTEMPTS = 10
 
 
 def events_path(repo: str, sha: str, stage: str) -> str:
@@ -2999,6 +3003,16 @@ class Host:
         # The optional fifth part of a set: sent exactly when the chart renders it, so the claim proves the whole token.
         if self.version and env.get("MW_BUILD_CORE_TESTS_DIGEST", "").strip():
             self.set_identity["coreTestsDigest"] = env["MW_BUILD_CORE_TESTS_DIGEST"].strip()
+        # A CHANNEL host presents its set too, so a channel declared to SERVE another (a leased Mac's `mac` → `latest`,
+        # Plugins#5104) can prove it runs exactly the served channel's set — the server serves a host nothing unless every
+        # digest matches (BuildHostQueue.ServesTheSet). Only well-shaped digests are sent: the server refuses a whole claim
+        # that carries a malformed one, and a channel host's own claim does not depend on them.
+        if not self.version:
+            for key, name in (("testerDigest", "MW_BUILD_TESTER_DIGEST"), ("portalDigest", "MW_BUILD_PORTAL_DIGEST"),
+                              ("runnerDigest", "MW_BUILD_RUNNER_DIGEST"), ("coreTestsDigest", "MW_BUILD_CORE_TESTS_DIGEST")):
+                value = env.get(name, "").strip()
+                if DIGEST.match(value):
+                    self.set_identity[key] = value
         self.lane = self.version or self.channel
         self.identity = env.get("MW_BUILD_FRAMEWORK_IDENTITY", "").strip()
         if not self.identity and env.get("MW_BUILD_IDENTITY_FILE"):
@@ -7927,7 +7941,18 @@ def self_test() -> int:
         hc = host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})],
                             ("POST", "/claim"): lambda p_, b: (claims_c.append(b), (204, None))[1]}))
         hc.cycle()
-        check("version/a CHANNEL host's claim carries no set digests", claims_c and "testerDigest" not in claims_c[0], claims_c)
+        check("version/a CHANNEL host without set digests in its env sends none", claims_c and "testerDigest" not in claims_c[0], claims_c)
+        claims_cs: list[dict] = []
+        env_cs = {k: v for k, v in env_v.items() if k != "MW_BUILD_VERSION"}
+        env_cs.update({"MW_BUILD_CHANNEL": "mac", "MW_BUILD_CORE_TESTS_DIGEST": "not-a-digest"})
+        host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})],
+                       ("POST", "/claim"): lambda p_, b: (claims_cs.append(b), (204, None))[1]}), env=env_cs).cycle()
+        check("version/a CHANNEL host presents its tester, portal and runner digests (a serving channel proves the served set)",
+              claims_cs and claims_cs[0].get("channel") == "mac" and "version" not in claims_cs[0]
+              and claims_cs[0].get("testerDigest") == "sha256:" + "a" * 64 and claims_cs[0].get("portalDigest") == "sha256:" + "b" * 64
+              and claims_cs[0].get("runnerDigest") == "sha256:" + "c" * 64, claims_cs)
+        check("version/a channel host drops a malformed digest instead of sending it (the server would refuse the claim)",
+              claims_cs and "coreTestsDigest" not in claims_cs[0], claims_cs)
         ic = [c[3] for c in hc.api.calls if c[1] == "/hosts/inputs"]
         check("version/a channel host's inputs request names its channel", ic and set(ic[0]) == {"channel"}, ic)
         check("version/no core-tests image in the env → none in the claim", claims_v and "coreTestsDigest" not in claims_v[0], claims_v)
