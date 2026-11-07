@@ -1378,7 +1378,9 @@ grep -q 'setcap -r /usr/bin/caddy' "$HERE/../../tailnet-bridge/Dockerfile" && gr
 # The tailnet name: read from `tailscale status --json` (.Self.DNSName, dot stripped, lower-cased), never typed.
 tsname() { pb env FAKE_TS_JSON="$1" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; tailnet_name' "$CLI" 2>&1; }
 [ "$(tsname "$TS_JSON" 2>/dev/null)" = "mac-1.tailnet.example" ] && ok "the tailnet name is .Self.DNSName, trailing dot stripped, lower-cased (not a peer's)" || bad "tailnet name read" "$(tsname "$TS_JSON")"
-case "$(tsname '{"Self":{"DNSName":"mac-1."}}')" in *"without a domain"*) ok "a DNSName without a domain is no tailnet name, and that is said" ;; *) bad "domainless DNSName" "$(tsname '{"Self":{"DNSName":"mac-1."}}')" ;; esac
+case "$(tsname '{"BackendState":"Running","Self":{"DNSName":"mac-1."}}')" in *"without a domain"*) ok "a DNSName without a domain is no tailnet name, and that is said" ;; *) bad "domainless DNSName" "$(tsname '{"BackendState":"Running","Self":{"DNSName":"mac-1."}}')" ;; esac
+OUT="$(tsname '{"BackendState":"Stopped","Self":{"DNSName":"mac-1.tailnet.example."}}')"
+case "$OUT" in *"not running on this Mac (BackendState: Stopped)"*) case "$OUT" in *"mac-1.tailnet.example"*) bad "a stopped backend's name is not published" "$OUT" ;; *) ok "a stopped backend's last DNSName is no tailnet name, and that is said" ;; esac ;; *) bad "stopped backend" "$OUT" ;; esac
 # tailscale ABSENT: no tailnet name, and the output says so (a PATH without the stub and without any real tailscale).
 NOTS="$(mktemp -d)"; for t in bash env awk sed tr grep cat head paste mktemp dirname; do p="$(command -v "$t")" && ln -s "$p" "$NOTS/$t"; done
 OUT="$(env PATH="$NOTS" HOME="$PB/home" MEMEX_LOCAL_HOME="$PB/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; n="$(tailnet_name)"; printf "name=[%s]\n" "$n"' "$CLI" 2>&1)"
@@ -1409,18 +1411,19 @@ CF="$(sed -n '/Caddyfile: |/,/^---/p' "$E")"
   && ok "public + tailnet: one marked Caddy site per name (no unmarked site), each with its own upstream SNI" || bad "two-name Caddyfile" "$CF"
 case "$OUT" in *"https://mac-1.tailnet.example/signin-microsoft"*"https://mac-1.example.com/signin-microsoft"*) ok "public + tailnet: a redirect URI for each name" ;; *) bad "both redirect URIs" "$OUT" ;; esac
 # The CA lives on a volume (a restart keeps the root a member trusted) and `publish off` keeps it.
+grep -q 'strategy: { type: Recreate, rollingUpdate: null }' "$HERE/../share/network-entry.yaml" && ok "Recreate clears the server-defaulted rollingUpdate (an earlier entry point upgrades)" || bad "Recreate strategy" "$(grep -n strategy "$HERE/../share/network-entry.yaml")"
 grep -q 'name: XDG_DATA_HOME, value: /data' "$HERE/../share/network-entry.yaml" && grep -q 'claimName: memex-network-entry-data' "$HERE/../share/network-entry.yaml" \
   && ok "the entry point's CA lives on its data volume, not in /tmp" || bad "CA volume" "$(grep -n 'XDG_DATA_HOME\|claimName' "$HERE/../share/network-entry.yaml")"
 # publish ca: the root certificate out of the entry point, PEM only on stdout; refuses anything else.
 cat > "$PB/stubs/kubectl" <<'STUB'
 #!/bin/bash
 echo "$@" >> "${KLOG:-/dev/null}"
-case "$*" in *"exec deploy/memex-network-entry -- cat /data/caddy/pki/authorities/local/root.crt"*) printf '%s' "${FAKE_CA:-}" ;; esac
+case "$*" in *"--context colima -n memex exec deploy/memex-network-entry -- cat /data/caddy/pki/authorities/local/root.crt"*) printf '%s' "${FAKE_CA:-}" ;; esac
 exit 0
 STUB
 chmod +x "$PB/stubs/kubectl"
 PEM=$'-----BEGIN CERTIFICATE-----\nMIIBfake\n-----END CERTIFICATE-----'
-[ "$(pb env FAKE_CA="$PEM" "$CLI" publish ca 2>/dev/null)" = "$PEM" ] && ok "publish ca prints the entry point's root certificate (PEM only, on stdout)" || bad "publish ca" "$(pb env FAKE_CA="$PEM" "$CLI" publish ca 2>&1)"
+[ "$(pb env FAKE_CA="$PEM" "$CLI" publish ca 2>/dev/null)" = "$PEM" ] && ok "publish ca prints the LOCAL cluster's (context colima) entry-point root certificate (PEM only, on stdout)" || bad "publish ca" "$(pb env FAKE_CA="$PEM" "$CLI" publish ca 2>&1)"
 OUT="$(pb env FAKE_CA="" "$CLI" publish ca 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "publish ca refuses a missing CA" "exited 0" ;; *"no root certificate"*) ok "publish ca refuses when the entry point has no CA (and says where it looked)" ;; *) bad "publish ca missing" "$OUT" ;; esac
 : > "$PB/klog"

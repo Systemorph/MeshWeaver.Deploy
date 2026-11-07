@@ -776,16 +776,24 @@ publish_tailscale() {
 # tailnet name. Read with jq, else python3, else plutil (macOS reads JSON too); never typed by hand.
 tailnet_name() {
   command -v tailscale >/dev/null 2>&1 || { warn "tailscale is not installed — no tailnet name to publish (join the private network: MeshWeaver.Deploy deploy/headscale/README.md)"; return 0; }
-  local json name=""
+  local json name="" state=""
   json="$(publish_tailscale status --json 2>/dev/null)" || json=""
   if [ -n "$json" ]; then
     if command -v jq >/dev/null 2>&1; then
+      state="$(printf '%s' "$json" | jq -r '.BackendState // empty' 2>/dev/null)"
       name="$(printf '%s' "$json" | jq -r '.Self.DNSName // empty' 2>/dev/null)"
     elif command -v python3 >/dev/null 2>&1; then
+      state="$(printf '%s' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState") or "")' 2>/dev/null)"
       name="$(printf '%s' "$json" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("Self") or {}).get("DNSName") or "")' 2>/dev/null)"
     elif command -v plutil >/dev/null 2>&1; then
+      state="$(printf '%s' "$json" | plutil -extract BackendState raw -o - - 2>/dev/null)"
       name="$(printf '%s' "$json" | plutil -extract Self.DNSName raw -o - - 2>/dev/null)"
     fi
+  fi
+  # A stopped or logged-out backend still reports the last DNSName — publishing it would advertise a name
+  # nobody can reach. Only a Running backend's name counts.
+  if [ -n "$json" ] && [ "$state" != "Running" ]; then
+    warn "tailscale is not running on this Mac (BackendState: ${state:-unknown}) — no tailnet name to publish ('tailscale up' first)"; return 0
   fi
   name="$(printf '%s' "$name" | tr 'A-Z' 'a-z')"; name="${name%.}"
   case "$name" in
@@ -812,12 +820,15 @@ render_network_entry() {
 # The entry point's root certificate (Caddy's `tls internal` CA, on the entry point's data volume): what a
 # member device must trust before a browser or a WKWebView accepts https://<tailnet name>. PEM on stdout.
 readonly ENTRY_CA_PATH="/data/caddy/pki/authorities/local/root.crt"
+# Pinned to the LOCAL cluster's context (MEMEX_KUBE_CONTEXT, default colima — the same as share/port-forward.sh):
+# this hands out a trust anchor, so it must never read another cluster's entry point because the person's
+# current context points elsewhere.
 publish_ca() {
-  local pem
-  pem="$(kubectl -n "$NAMESPACE" exec deploy/memex-network-entry -- cat "$ENTRY_CA_PATH" 2>/dev/null)" || pem=""
+  local pem ctx="${MEMEX_KUBE_CONTEXT:-colima}"
+  pem="$(kubectl --context "$ctx" -n "$NAMESPACE" exec deploy/memex-network-entry -- cat "$ENTRY_CA_PATH" 2>/dev/null)" || pem=""
   case "$pem" in
     "-----BEGIN CERTIFICATE-----"*"-----END CERTIFICATE-----"*) printf '%s\n' "$pem" ;;
-    *) die "publish ca: no root certificate at memex-network-entry:$ENTRY_CA_PATH — is this Mac published ('memex-local publish status') and the entry point running ('kubectl -n $NAMESPACE get pods -l app.kubernetes.io/name=memex-network-entry')?" ;;
+    *) die "publish ca: no root certificate at memex-network-entry:$ENTRY_CA_PATH (context $ctx) — is this Mac published ('memex-local publish status') and the entry point running ('kubectl -n $NAMESPACE get pods -l app.kubernetes.io/name=memex-network-entry')?" ;;
   esac
 }
 
