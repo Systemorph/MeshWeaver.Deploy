@@ -180,6 +180,10 @@ jobs:
           dep = next(d for d in docs if d["kind"] == "Deployment")
           pod = dep["spec"]["template"]["spec"]
           assert pod["automountServiceAccountToken"] is False, "the pod automounts a token"
+          # Both service-account fields, explicitly: omitting serviceAccountName lets the API server default it
+          # back from the deprecated serviceAccount copy of the live template.
+          assert pod.get("serviceAccountName") == "hs-headscale-keys" and pod.get("serviceAccount") == "hs-headscale-keys", \
+              f"keys enabled: service account {pod.get('serviceAccountName')}/{pod.get('serviceAccount')}"
           by = {c["name"]: c for c in pod["containers"]}
           assert set(by) == {"headscale", "keys"}, f"containers {set(by)}"
           assert not any(m["name"] == "keys-token" for m in by["headscale"].get("volumeMounts", [])), "the server container mounts the keys token"
@@ -190,6 +194,17 @@ jobs:
           assert not sec.get("data"), "the chart rendered key material"
           assert set(sec["metadata"].get("annotations", {})) == {"helm.sh/resource-policy"}, f"the chart renders sidecar-owned annotations: {sec['metadata'].get('annotations')}"
           print("preauthKeys: one Role over exactly the declared Secret (get/update/patch), token in the sidecar only, Secret kept and empty")
+          PY
+          # Keys DISABLED: the pod still names its account explicitly — `default`, in both fields — so an upgrade that
+          # turns the keys off cannot leave new pods pointing at the deleted keys account.
+          nokeys=$(helm template hs deploy/headscale/helm -f ci-values.yaml)
+          python3 - "$nokeys" <<'PY'
+          import sys, yaml
+          dep = next(d for d in yaml.safe_load_all(sys.argv[1]) if d and d["kind"] == "Deployment")
+          pod = dep["spec"]["template"]["spec"]
+          assert pod.get("serviceAccountName") == "default" and pod.get("serviceAccount") == "default", \
+              f"keys disabled: service account {pod.get('serviceAccountName')}/{pod.get('serviceAccount')}"
+          print("preauthKeys disabled: serviceAccountName and serviceAccount are both default")
           PY
           # The chart never READS the cluster for the key Secret (a lookup made off-cluster previews show the
           # key as removed, and stored the key in the release manifest).
