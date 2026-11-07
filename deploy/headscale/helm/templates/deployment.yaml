@@ -26,12 +26,20 @@ spec:
         # existing Secret's name): headscale reads client_secret_path once at start, so without this an
         # upgrade would succeed while logins kept using the old credential.
         checksum/oidc-secret-source: {{ include (print $.Template.BasePath "/secretproviderclass.yaml") . | cat | printf "%s|%s" .Values.oidc.clientSecret.existingSecret | sha256sum }}
+        {{- if .Values.preauthKeys.enabled }}
+        # The keys sidecar reads its declaration once per pass, but a changed declaration is a changed pod.
+        checksum/preauth-keys: {{ include (print $.Template.BasePath "/preauthkeys.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
-      # headscale calls nothing in the cluster, not even the API server.
+      # headscale calls nothing in the cluster, not even the API server. The keys sidecar alone mounts a
+      # token (its own projected volume below), bound to a Role over the declared Secrets only.
       automountServiceAccountToken: false
+      {{- if .Values.preauthKeys.enabled }}
+      serviceAccountName: {{ include "headscale.fullname" . }}-keys
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -77,6 +85,27 @@ spec:
             {{- if .Values.oidc.enabled }}
             - { name: oidc-secret, mountPath: {{ include "headscale.oidcSecretDir" . }}, readOnly: true }
             {{- end }}
+        {{- if .Values.preauthKeys.enabled }}
+        # The declared pre-auth keys (values `preauthKeys`): the same headscale binary with a shell, over the
+        # shared socket; it writes each key into its own Secret and never prints it.
+        - name: keys
+          image: "{{ .Values.preauthKeys.image.repository }}:{{ default .Values.image.tag .Values.preauthKeys.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - { name: KEYS_INTERVAL, value: {{ .Values.preauthKeys.interval | quote }} }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            {{- toYaml .Values.preauthKeys.resources | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /etc/headscale, readOnly: true }
+            - { name: run, mountPath: /var/run/headscale }
+            - { name: keys-config, mountPath: /etc/headscale-keys, readOnly: true }
+            - { name: keys-token, mountPath: /var/run/secrets/headscale-keys, readOnly: true }
+            - { name: keys-tmp, mountPath: /tmp }
+        {{- end }}
       volumes:
         - name: config
           configMap:
@@ -86,6 +115,23 @@ spec:
             claimName: {{ include "headscale.fullname" . }}-data
         - name: run
           emptyDir: {}
+        {{- if .Values.preauthKeys.enabled }}
+        - name: keys-config
+          configMap:
+            name: {{ include "headscale.fullname" . }}-keys
+        - name: keys-tmp
+          emptyDir: { medium: Memory, sizeLimit: 1Mi }
+        - name: keys-token
+          projected:
+            sources:
+              - serviceAccountToken: { path: token, expirationSeconds: 3600 }
+              - configMap:
+                  name: kube-root-ca.crt
+                  items: [{ key: ca.crt, path: ca.crt }]
+              - downwardAPI:
+                  items:
+                    - { path: namespace, fieldRef: { fieldPath: metadata.namespace } }
+        {{- end }}
         {{- if .Values.oidc.enabled }}
         - name: oidc-secret
           {{- if .Values.oidc.clientSecret.existingSecret }}

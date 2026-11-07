@@ -117,6 +117,34 @@ resources:
   limits:
     memory: 512Mi
 
+# DECLARED pre-auth keys — how a machine joins the network UNATTENDED (the ingress bridge, a build host):
+# each key below is kept valid in its own Kubernetes Secret, `<fullname>-preauth-<name>` (key `authkey`),
+# by a sidecar in this pod (keys/headscale-keys.sh) that talks to headscale over the shared socket. The
+# chart creates each Secret empty (kept on uninstall and across upgrades); the sidecar may get, update and
+# patch exactly those Secrets and nothing else. A key is replaced when it is missing, within `renewHours`
+# of its expiry, expired or unknown in headscale, or — single-use — already used; the replaced key is
+# expired so nothing new can join with it. The key is never printed. A consumer in the SAME namespace
+# mounts the Secret; nothing outside the cluster can read it.
+preauthKeys:
+  enabled: false
+  image:
+    repository: ""      # required when enabled: <registry>/headscale-keys
+    tag: ""             # defaults to image.tag — the keys image is published from the same commit
+  interval: 600         # seconds between passes
+  keys: []
+  # - name: tailnet-bridge   # → Secret <fullname>-preauth-tailnet-bridge
+  #   user: tailnet-bridge   # the headscale user the machines belong to (created when absent)
+  #   reusable: true         # a restarting pod joins again with the same key
+  #   ephemeral: true        # its machine is removed when it goes away
+  #   validHours: 720
+  #   renewHours: 168
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      memory: 64Mi
+
 nodeSelector: {}
 tolerations: []
 affinity: {}

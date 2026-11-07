@@ -1,0 +1,31 @@
+{{- if .Values.enabled }}
+{{- include "tailnet-bridge.validate" . }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "tailnet-bridge.fullname" . }}
+  labels:
+    {{- include "tailnet-bridge.labels" . | nindent 4 }}
+  annotations:
+    {{- with .Values.ingress.clusterIssuer }}
+    cert-manager.io/cluster-issuer: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - hosts: [{{ .Values.host | quote }}]
+      secretName: {{ default (printf "%s-tls" (include "tailnet-bridge.fullname" .)) .Values.ingress.tlsSecret }}
+  rules:
+    - host: {{ .Values.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "tailnet-bridge.fullname" . }}
+                port: { name: http }
+{{- end }}

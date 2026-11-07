@@ -1,0 +1,105 @@
+{{- if .Values.enabled }}
+{{- include "tailnet-bridge.validate" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tailnet-bridge.fullname" . }}
+  labels:
+    {{- include "tailnet-bridge.labels" . | nindent 4 }}
+spec:
+  # ONE replica: the bridge is one machine on the network (its key is ephemeral + reusable, so a
+  # replacement pod joins as a fresh node and the old one is removed when it goes away).
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "tailnet-bridge.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tailnet-bridge.selectorLabels" . | nindent 8 }}
+      annotations:
+        # The key Secret is read at start; a different Secret is a different pod.
+        checksum/auth-key-secret: {{ .Values.network.authKeySecret | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      # The bridge calls nothing in the cluster.
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: bridge
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - { name: TS_LOGIN_SERVER, value: {{ .Values.network.loginServer | quote }} }
+            - { name: TS_AUTHKEY_FILE, value: /var/run/secrets/tailnet-bridge/authkey }
+            - { name: TS_STATE_DIR, value: /tmp/tailscale }
+            - { name: TS_HOSTNAME, value: {{ default (include "tailnet-bridge.fullname" .) .Values.network.hostname | quote }} }
+            - { name: BRIDGE_TARGET, value: {{ printf "https://%s:%d" .Values.target.name (int .Values.target.port) | quote }} }
+            - { name: BRIDGE_UPSTREAM_HOST, value: {{ default .Values.host .Values.target.upstreamHost | quote }} }
+            - { name: BRIDGE_TLS_SERVER_NAME, value: {{ default .Values.host .Values.target.upstreamHost | quote }} }
+            - { name: BRIDGE_TLS_INSECURE, value: {{ .Values.target.insecureSkipVerify | toString | quote }} }
+            - { name: BRIDGE_BLOCKED, value: {{ join " " .Values.blockedPaths | quote }} }
+            - { name: BRIDGE_CONFIG_DIR, value: /tmp/tailnet-bridge }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          # Ready only once joined: the machine name resolves and the proxy answers.
+          startupProbe:
+            httpGet: { path: /__bridge/healthz, port: http }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["tailscale", "--socket=/tmp/tailscale/tailscaled.sock", "ip", "-4"]
+            periodSeconds: 15
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /__bridge/healthz, port: http }
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: authkey, mountPath: /var/run/secrets/tailnet-bridge, readOnly: true }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+        - name: authkey
+          secret:
+            secretName: {{ .Values.network.authKeySecret }}
+            items:
+              - { key: authkey, path: authkey }
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
