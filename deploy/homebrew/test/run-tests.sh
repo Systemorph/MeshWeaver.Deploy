@@ -675,8 +675,8 @@ fi
 for c in cmd_up cmd_update; do
   body="$(awk -v f="^${c}\\\\(\\\\)" '$0 ~ f { on=1 } on { print } on && /^}$/ { exit }' "$CLI")"
   case "$body" in
-    *'registry_mode && image_source="acr"'*) ok "${c} defaults to the ACR image in registry mode" ;;
-    *) bad "${c} defaults to the ACR image in registry mode" "no registry-mode default in ${c}()" ;;
+    *'registry_mode && image_source="ghcr"'*) ok "${c} defaults to the public GHCR image in registry mode (no Azure sign-in)" ;;
+    *) bad "${c} defaults to the public GHCR image in registry mode" "no registry-mode GHCR default in ${c}()" ;;
   esac
 done
 
@@ -957,6 +957,70 @@ OUT="$(env PATH="$STUBS:$PATH" HOME="$MP/home" MEMEX_LOCAL_HOME="$MP/home/.memex
 case "$RC:$OUT" in 0:*) bad "no flag and no preference → refused" "exited 0" ;; *"--control must be the control instance's https URL"*"managed preference com.memex.local ControlUrl"*) ok "no flag and no preference → refused, naming the flag AND the preference key" ;; *) bad "refusal names flag + preference" "$OUT" ;; esac
 rm -rf "$MP"
 
+echo "── fleet join: the enrolment code opens only with this Mac's key (MacStudioFleet §2b) ──"
+FJ="$(mktemp -d)"; mkdir -p "$FJ/home/.memex-local/enrol"
+fj_lib() { env HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c ". \"$CLI\"; $1"; }
+# The pure helpers: request encoding, the key fingerprint, the value fingerprint format.
+req="$(fj_lib 'fleet_request studio-2 host-a jroe C02X AAAA')"
+dec="$(printf '%s' "$req" | tr '_-' '/+' | awk '{ n = length($0) % 4; if (n) $0 = $0 substr("===", 1, 4 - n); print }' | base64 -d 2>/dev/null)"
+[ "$dec" = '{"v":1,"deployment":"studio-2","host":"host-a","user":"jroe","machine":"C02X","key":"AAAA"}' ] \
+  && ok "fleet_request is base64url of the v1 JSON the control page parses" || bad "fleet_request" "$dec"
+case "$req" in *[+/=]*) bad "fleet_request is URL-safe" "$req" ;; *) ok "fleet_request is URL-safe (no + / =)" ;; esac
+[ "$(fj_lib 'fleet_fact "a<b>c;d"')" = "abcd" ] && ok "fleet_fact keeps only the characters the control page admits" || bad "fleet_fact" "$(fj_lib 'fleet_fact "a<b>c;d"')"
+[ "$(fj_lib 'fleet_value_fingerprint abc')" = "sha256:$(printf abc | shasum -a 256 | cut -c1-12)" ] \
+  && ok "fleet_value_fingerprint is the control instance's sha256:<12 hex>" || bad "fleet_value_fingerprint" "$(fj_lib 'fleet_value_fingerprint abc')"
+KEY="$FJ/home/.memex-local/enrol/studio-2.key.pem"
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$KEY" 2>/dev/null )
+fp="$(fj_lib "fleet_key_fingerprint '$KEY'")"
+want="$(openssl pkey -in "$KEY" -pubout -outform DER 2>/dev/null | shasum -a 256 | cut -c1-32)"
+[ "$(printf '%s' "$fp" | tr -d ' ')" = "$want" ] && [ "$(printf '%s' "$fp" | awk '{print NF}')" = "8" ] \
+  && ok "the key fingerprint is the shasum of the DER key in eight groups of four (what the control page shows)" || bad "key fingerprint" "$fp vs $want"
+# Seal a payload exactly as the control instance does (RSA-OAEP, SHA-256 + MGF1-SHA-256) to the Mac's key.
+# (the public key goes through a file: bash 3.2's process substitution inside $(…) is not reliable)
+seal() { openssl pkey -in "$2" -pubout -out "$FJ/seal-pub.pem" 2>/dev/null
+  printf '%s' "$1" | openssl pkeyutl -encrypt -pubin -inkey "$FJ/seal-pub.pem" \
+  -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 2>/dev/null | base64 | tr -d '\n'; }
+M="$(printf 'a%.0s' $(seq 64))"; C="$(printf 'b%.0s' $(seq 64))"
+# (payload built first: bash 3.2 splits escaped quotes nested inside "$(…)")
+P2='{"v":1,"d":"studio-2","m":"'"$M"'","c":"'"$C"'"}'; P9='{"v":1,"d":"studio-9","m":"'"$M"'","c":"'"$C"'"}'
+sealed="$(seal "$P2" "$KEY")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/code.txt"
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/code.txt" 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*"joined as 'studio-2'"*) ok "fleet join opens a code sealed to its key and joins" ;; *) bad "fleet join with a good code" "rc=$RC: $OUT" ;; esac
+case "$OUT" in *"$M"*|*"$C"*) bad "fleet join never prints a key value" "a value is in the output" ;; *) ok "fleet join prints no key value (fingerprints only)" ;; esac
+case "$OUT" in *"Hosting/Heartbeats/Enrol/"*) ok "fleet join prints the control instance's approval link" ;; *) bad "approval link" "$OUT" ;; esac
+F="$FJ/home/.memex-local/fleet.yaml"
+grep -q "Hosting__ModuleReportSecret: \"$M\"" "$F" 2>/dev/null && grep -q "Hosting__ControlInbox__Secret: \"$C\"" "$F" \
+  && grep -q 'Hosting__ControlInbox__Url: "https://control.example.test/api/hooks/Hosting/PlatformBuilds"' "$F" \
+  && ok "the fleet layer carries both keys and the control inbox URL" || bad "fleet layer content" "$(sed 's/"[ab]\{64\}"/<value>/' "$F" 2>/dev/null)"
+# (ls, not stat: GNU `stat -f` is the FILESYSTEM report and prints to stdout, so a BSD-then-GNU fallback mis-reads)
+fmode="$(ls -l "$F" 2>/dev/null | cut -c1-10)"
+[ "$fmode" = "-rw-------" ] && ok "the fleet layer is 0600" || bad "fleet layer mode" "$fmode"
+[ ! -e "$KEY" ] && ok "the throw-away key is deleted once the code is opened" || bad "throw-away key removed" "still at $KEY"
+# A code sealed to ANOTHER key is refused by name; one issued for another id is refused by name.
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$KEY" 2>/dev/null ); OTHER="$FJ/other.pem"
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$OTHER" 2>/dev/null )
+sealed="$(seal "$P2" "$OTHER")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/wrong.txt"
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/wrong.txt" 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "a code for another key is refused" "exited 0" ;; *"does not open with this Mac's key"*) ok "a code sealed to another key is refused by name" ;; *) bad "wrong-key refusal" "$OUT" ;; esac
+sealed="$(seal "$P9" "$KEY")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/other-id.txt"
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/other-id.txt" 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "a code for another id is refused" "exited 0" ;; *"issued for 'studio-9'"*) ok "a code issued for another id is refused by name" ;; *) bad "other-id refusal" "$OUT" ;; esac
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id Bad_Id --no-open 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "a bad id is refused" "exited 0" ;; *"--id must be lower-case"*) ok "an id that cannot be a record id is refused" ;; *) bad "bad id refusal" "$OUT" ;; esac
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet status 2>&1)"
+case "$OUT" in *"JOINED as 'studio-2'"*"sha256:"*) ok "fleet status shows the join and the key fingerprints" ;; *) bad "fleet status" "$OUT" ;; esac
+case "$OUT" in *"$M"*|*"$C"*) bad "fleet status never prints a key value" "a value is in the output" ;; *) ok "fleet status prints no key value" ;; esac
+grep -q 'mode_args+=(-f "$FLEET_FILE")' "$CLI" && ok "helm_deploy layers the fleet file" || bad "helm_deploy layers the fleet file" "no -f \$FLEET_FILE"
+rm -rf "$FJ"
+
+echo "── registry mode pulls the public GHCR anonymously; Ollama runs under launchd ──"
+grep -q 'image_pull_ghcr() {' "$CLI" && ! awk '/^image_pull_ghcr\(\) \{/,/^}$/' "$CLI" | grep -q 'az ' \
+  && ok "image_pull_ghcr exists and calls no az" || bad "image_pull_ghcr without az" "$(awk '/^image_pull_ghcr\(\) \{/,/^}$/' "$CLI")"
+awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI" | grep -q 'install_ollama_agent' && ! awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI" | grep -q 'nohup ollama' \
+  && ok "setup_ollama starts Ollama under launchd, not as a nohup'd process" || bad "setup_ollama under launchd" "still nohup or no agent"
+grep -q '<key>OLLAMA_HOST</key><string>0.0.0.0:11434</string>' "$CLI" && grep -q '<key>KeepAlive</key><true/>' "$CLI" \
+  && ok "the Ollama agent binds every interface (the VM reaches it) and is kept alive" || bad "ollama agent plist" "missing OLLAMA_HOST or KeepAlive"
+
 echo "── headless host: install_launchd holds the forward as a process, no LaunchAgent ──"
 HL="$(mktemp -d)"; mkdir -p "$HL/stubs" "$HL/home"
 printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "$FAKE_LAUNCHCTL_LOG"\nexit 0\n' > "$HL/stubs/launchctl"; chmod +x "$HL/stubs/launchctl"
@@ -1162,7 +1226,7 @@ else bad "PORTAL_DATA_DIR is the chart's hostPath" "cli='$cli_path' chart='$char
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
-for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel backlease llm relay autoupdate; do
+for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel backlease fleet llm relay autoupdate; do
   case "$help_out" in
     *"$cmd"*) ;;
     *) bad "help documents '$cmd'" "not in the usage text"; continue ;;

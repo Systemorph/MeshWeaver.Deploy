@@ -209,6 +209,33 @@ This covers gaps G1 and G4 of the Mac host gap analysis. A headless host still n
 remaining gaps closed: a pull credential that is not a person's `az login`, Colima at boot, and a
 reachable hostname.
 
+## Join the fleet — one command (`memex-local fleet join`)
+
+A new Mac Studio joins the fleet with ONE command and ONE browser sign-in. The control instance does
+the rest (design: MeshWeaver.Plugins `Hosting/MacStudioFleet.md` §2b):
+
+```bash
+memex-local fleet join --control https://<control-instance> --id studio-2
+```
+
+1. The command runs preflight and reads the macOS account (it never assumes one).
+2. It makes a throw-away RSA-3072 key under `~/.memex-local/enrol/` (0600), prints the key's
+   **fingerprint**, and opens the control instance's approval page `Hosting/Heartbeats/Enrol/<request>`.
+3. A global administrator of the control instance checks that the page shows the same fingerprint and
+   presses **Approve**. The page shows an **enrolment code**: the machine's heartbeat key and
+   announcement key, sealed to this Mac's throw-away key (RSA-OAEP-SHA256). The code is ciphertext,
+   so it is safe to copy.
+4. Paste the code into the terminal. The command opens it with macOS's own `openssl`, deletes the
+   throw-away key and writes `~/.memex-local/fleet.yaml` (0600). It never prints a key value, only the
+   `sha256:` fingerprints, which the control instance's enrolment record shows too.
+5. It runs `backlease enroll`, starts Ollama under launchd (`com.memex.local.ollama`, bound to every
+   interface so the VM reaches it, restarted after a reboot), and runs `update`. In registry mode,
+   `update` pulls the **public GHCR** images anonymously, so no `az login` is needed (`--from-acr`
+   still works).
+
+`memex-local fleet status` shows the join and both fingerprints. On the control instance,
+`Hosting/Heartbeats/Enrolments` lists every join with the first step not yet measured done.
+
 ## Auto-update of the CLI and its chart — on by default
 
 A Homebrew install keeps **itself** current: `memex-local up` and `memex-local update` arm a
