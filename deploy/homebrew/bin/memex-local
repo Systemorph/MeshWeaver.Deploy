@@ -742,13 +742,41 @@ publish_signin_summary() {
   local t; t="$(publish_value Authentication__Microsoft__TenantId)"; [ -n "$t" ] && printf ' (tenant %s)' "$t"
 }
 
+# The tailscaled socket to talk to: MEMEX_TAILSCALE_SOCKET, else a USER-SPACE tailscaled's socket under the
+# person's home ($HOME/.tailscale/tailscaled.sock — the shape a fleet Mac runs), else the system default.
+# Without it `tailscale serve` talks to a daemon that is not running and fails.
+tailscale_socket() {
+  if [ -n "${MEMEX_TAILSCALE_SOCKET:-}" ]; then printf '%s' "$MEMEX_TAILSCALE_SOCKET"
+  elif [ -S "$HOME/.tailscale/tailscaled.sock" ]; then printf '%s' "$HOME/.tailscale/tailscaled.sock"
+  fi
+}
+
 # The network path to the front door: tailscale serve forwards TCP 443 on this Mac's network address to
-# the loopback-only front door. A custom socket (a user-space tailscaled) via MEMEX_TAILSCALE_SOCKET.
+# the loopback-only front door, through tailscale_socket.
 publish_tailscale() {
-  local ts=(tailscale); [ -n "${MEMEX_TAILSCALE_SOCKET:-}" ] && ts+=(--socket="$MEMEX_TAILSCALE_SOCKET")
+  local ts=(tailscale) sock; sock="$(tailscale_socket)"; [ -n "$sock" ] && ts+=(--socket="$sock")
   command -v tailscale >/dev/null 2>&1 || { warn "tailscale is not installed — join the private network first (MeshWeaver.Deploy deploy/headscale/README.md)"; return 1; }
   ${ts[@]+"${ts[@]}"} "$@"
 }
+
+# Removes EMPTY placeholder lines (`    <key>: ""`) for the given keys from the person's overlay. The overlay is
+# layered LAST, and an empty string there OVERRIDES a lower layer's value — the chart then drops the key, so a
+# portal published with a Microsoft client id came up with none (measured 2026-11-07: the overlay template's
+# own `Authentication__Microsoft__ClientId: ""`). Only empty placeholders go; a real value the person set stays
+# and still wins. The file keeps its mode. Prints the keys it removed.
+overlay_drop_empty() {
+  [ -f "$OVERLAY" ] || return 0
+  local key pattern="" tmp
+  for key in "$@"; do pattern="${pattern:+$pattern|}$key"; done
+  grep -Eq "^[[:space:]]+($pattern):[[:space:]]*\"\"[[:space:]]*\$" "$OVERLAY" || return 0
+  grep -Eo "^[[:space:]]+($pattern):[[:space:]]*\"\"" "$OVERLAY" | sed -e 's/^[[:space:]]*//' -e 's/:.*//'
+  tmp="$(mktemp "$LOCAL_HOME/overlay.XXXXXX")"
+  grep -Ev "^[[:space:]]+($pattern):[[:space:]]*\"\"[[:space:]]*\$" "$OVERLAY" > "$tmp" || true
+  chmod 600 "$tmp" && mv "$tmp" "$OVERLAY"
+}
+
+# The keys the public-name layer owns, which an empty overlay placeholder must not erase.
+readonly PUBLISH_OWNED_KEYS=(Authentication__Microsoft__ClientId Authentication__Microsoft__TenantId Authentication__Microsoft__ClientSecret)
 
 cmd_publish() {
   local sub="${1:-status}"; shift || true
@@ -813,6 +841,8 @@ secrets:
 YAML
       chmod 600 "$PUBLISH_FILE"
       unset secret
+      local dropped; dropped="$(overlay_drop_empty ${PUBLISH_OWNED_KEYS[@]+"${PUBLISH_OWNED_KEYS[@]}"})"
+      [ -n "$dropped" ] && ok "removed empty overlay placeholder(s) that would erase the sign-in: $(printf '%s' "$dropped" | tr '\n' ' ')"
       ok "public-name layer written: $PUBLISH_FILE (https://${host}, sign-in ${key}${tenant:+ tenant ${tenant}}, invitation-only; the secret is in the file, never printed)"
       # The network's OWN entry point: an in-cluster proxy that marks every request it carries as
       # arriving through the network (X-MeshWeaver-Provenance: tailnet, overwriting any sender claim) —
@@ -840,6 +870,16 @@ YAML
       if [ -f "$PUBLISH_FILE" ]; then
         ok "PUBLIC NAME ON — https://$(publish_host), sign-in: $(publish_signin_summary), admission: invitation-only"
         info "values file: $PUBLISH_FILE (layered after the fleet layer by helm_deploy)"
+        # What the portal ACTUALLY got — the rendered config, not the layer: an overlay value wins over this file.
+        local want_id want_tenant got_id got_tenant
+        want_id="$(publish_value Authentication__Microsoft__ClientId)"; want_tenant="$(publish_value Authentication__Microsoft__TenantId)"
+        got_id="$(kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__Microsoft__ClientId}' 2>/dev/null || true)"
+        got_tenant="$(kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__Microsoft__TenantId}' 2>/dev/null || true)"
+        if [ -n "$want_id" ] && [ "$got_id" = "$want_id" ] && [ "$got_tenant" = "$want_tenant" ]; then
+          ok "the running portal's config carries the Microsoft client id and tenant of this layer"
+        else
+          warn "the running portal's config does NOT carry this layer's Microsoft sign-in (client id: ${got_id:-<none>}, tenant: ${got_tenant:-<none>}) — an overlay value may override it; run 'memex-local publish on …' again (it removes empty overlay placeholders), then 'memex-local update'"
+        fi
         publish_tailscale serve status 2>/dev/null | sed 's/^/  /' || true
       else
         info "no public name — publish this Mac with:"
@@ -1016,7 +1056,7 @@ cmd_fleet() {
       else
         warn "not in REGISTRY MODE — run 'memex-local registry <url>' and then 'memex-local backlease enroll --control $control --deployment $id'"
       fi
-      if command -v tailscale >/dev/null 2>&1 && ! tailscale status >/dev/null 2>&1; then
+      if command -v tailscale >/dev/null 2>&1 && ! publish_tailscale status >/dev/null 2>&1; then
         info "Private network: 'tailscale up --login-server <the network's login server>' (one browser sign-in until control mints pre-auth keys — MacStudioFleet §2b gap 2)"
       fi
       if [ "$do_update" = "yes" ] && colima_running; then
@@ -1581,6 +1621,8 @@ helm_deploy() {
   fi
   # PUBLIC NAME layer (`memex-local publish on`): the additional host, its sign-in, invitation-only.
   if [ -f "$PUBLISH_FILE" ]; then
+    # an empty overlay placeholder for a key this layer owns would erase it (the overlay is layered last)
+    overlay_drop_empty ${PUBLISH_OWNED_KEYS[@]+"${PUBLISH_OWNED_KEYS[@]}"} >/dev/null
     mode_args+=(-f "$PUBLISH_FILE")
     info "PUBLIC NAME: also answers at https://$(publish_host) — sign-in: $(publish_signin_summary); admission: invitation-only"
   fi

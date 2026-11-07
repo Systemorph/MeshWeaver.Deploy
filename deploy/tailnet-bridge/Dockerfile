@@ -11,6 +11,11 @@ ARG TAILSCALE_IMAGE=tailscale/tailscale:v1.104.4@sha256:ed6480b33c6eb67c9cbd203e
 ARG CADDY_IMAGE=caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
 
 FROM ${CADDY_IMAGE} AS caddy
+# 🚨 The stock caddy binary carries the FILE capability cap_net_bind_service. The bridge runs with every
+# capability dropped and no privilege escalation (helm/templates/deployment.yaml), and the kernel then refuses
+# to exec such a binary at all ("operation not permitted"). It listens on 8080 and needs no capability, so the
+# file capability is removed here, once, instead of granting one back to the pod.
+RUN apk add --no-cache libcap && setcap -r /usr/bin/caddy && test -z "$(getcap /usr/bin/caddy)"
 
 FROM ${TAILSCALE_IMAGE} AS bridge
 COPY --from=caddy /usr/bin/caddy /usr/local/bin/caddy
@@ -23,7 +28,9 @@ ENTRYPOINT ["/usr/local/bin/tailnet-bridge"]
 # ── The test stage: the SHIPPED entrypoint and binaries, before anything is published ──────────────────────
 FROM bridge AS test
 USER root
-RUN apk add --no-cache curl
+RUN apk add --no-cache curl libcap
+# the shipped caddy must carry no file capability — with every capability dropped it would not even start
+RUN test -z "$(getcap /usr/local/bin/caddy)"
 COPY test /test
 RUN chmod 0755 /test/*.sh && su -s /bin/sh -c /test/smoke.sh nobody && touch /smoke-passed
 
