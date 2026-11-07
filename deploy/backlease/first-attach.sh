@@ -7,11 +7,13 @@
 #     --api https://<operations instance>/api/builds --registry <name>.azurecr.io --vault <key vault> \
 #     --worker-secret <vault object of the Mac's worker token> --pull-secret <vault object of the pull token password> \
 #     --pull-user <registry token name> \
-#     --plugins-registry <https URL of the plugin registry> --instance-key-secret <vault object of the Mac's READ-ONLY mwi_ key> \
+#     [--profile build] [--plugins-registry <https URL> --instance-key-secret <vault object of a READ-ONLY mwi_ key>] \
 #     --version <x.y.z> --tester sha256:… --portal sha256:… --runner sha256:…
 #
 # What it does, in order, and nothing else:
-#   0. pins EVERY kubectl and helm call to the `colima` context (never the mutable current one) — and never runs `memex-local up`;
+#   0. pins EVERY kubectl and helm call to the build profile's context (`colima-<profile>`, never the mutable current one) —
+#      and never runs `memex-local up`; CHECKS the profile runs containerd (the docker runtime cannot run a user-namespaced
+#      pod, and without one bwrap cannot mount a fresh /proc — measured on the first Mac, 2026-11-07);
 #      CHECKS before changing anything: KEDA installed and ready, the node's allocatable covers the host's requests,
 #      both vault objects readable;
 #   1. loads the `mw-build-host` AppArmor profile (`userns` only) into the Colima VM, persisted under /etc/apparmor.d,
@@ -26,28 +28,46 @@
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 chart="$here/../helm"
-api= registry= vault= worker= pull= pulluser= version= tester= portal= runner= pluginsreg= instkey=
+profile=build api= registry= vault= worker= pull= pulluser= version= tester= portal= runner= pluginsreg= instkey=
 while [ $# -gt 0 ]; do
   case "$1" in
-    --api) api="$2";; --registry) registry="$2";; --vault) vault="$2";;
+    --profile) profile="$2";; --api) api="$2";; --registry) registry="$2";; --vault) vault="$2";;
     --worker-secret) worker="$2";; --pull-secret) pull="$2";; --pull-user) pulluser="$2";;
     --plugins-registry) pluginsreg="$2";; --instance-key-secret) instkey="$2";;
     --version) version="$2";; --tester) tester="$2";; --portal) portal="$2";; --runner) runner="$2";;
     *) echo "unknown argument $1" >&2; exit 2;;
   esac; shift 2
 done
-for v in api registry vault worker pull pulluser version tester portal runner pluginsreg instkey; do
+for v in api registry vault worker pull pulluser version tester portal runner; do
   [ -n "${!v}" ] || { echo "ERROR: --${v//_/-} is required (see the header)" >&2; exit 2; }
 done
 [[ "$api" == https://* ]] || { echo "ERROR: --api must be https (the worker token rides on it)" >&2; exit 2; }
-[[ "$pluginsreg" == https://* ]] || { echo "ERROR: --plugins-registry must be https (the instance key rides on it)" >&2; exit 2; }
+# The registry bundle index (H8) is OPT-IN: pass BOTH --plugins-registry and --instance-key-secret, or neither. Without them
+# the host takes its plugins layer exactly as the cluster hosts do — the sealed publication /hosts/inputs names, or none.
+# Measured 2026-11-07: the registry serves a mixed package (AI) as an assemblies-only bundle, which module-fetch refuses,
+# so an H8 host never claimed.
+if [ -n "$pluginsreg$instkey" ]; then
+  { [ -n "$pluginsreg" ] && [ -n "$instkey" ]; } || { echo "ERROR: --plugins-registry and --instance-key-secret go together" >&2; exit 2; }
+  [[ "$pluginsreg" == https://* ]] || { echo "ERROR: --plugins-registry must be https (the instance key rides on it)" >&2; exit 2; }
+fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: --version must be x.y.z" >&2; exit 2; }
 for d in "$tester" "$portal" "$runner"; do [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "ERROR: $d is not sha256:<64 hex>" >&2; exit 2; }; done
 
-# EVERY Kubernetes call below names the colima context explicitly — never the mutable current context, so another
+# The build host runs in its OWN Colima profile (default `build`), never in the profile memex-local's portal uses: that one
+# runs the docker runtime, which cannot start a pod with hostUsers: false, and bwrap needs that pod's Unmasked /proc.
+# Create it once:  colima start -p build --cpu 8 --memory 24 --disk 100 --runtime containerd --kubernetes \
+#                    --k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet
+# (the kubelet root on the data disk: the tester and portal images are copied into emptyDirs, which the 20 GiB root
+# disk cannot hold). Then install KEDA into it. EVERY Kubernetes call below names that context explicitly — never the
+# mutable current context, so another
 # terminal switching contexts mid-run cannot redirect a Secret or the release into another cluster.
-kubectl config get-contexts colima >/dev/null 2>&1 || { echo "ERROR: no kubectl context named colima" >&2; exit 1; }
-k() { kubectl --context colima "$@"; }
+[[ "$profile" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "ERROR: --profile must be a Colima profile name" >&2; exit 2; }
+if [ "$profile" = default ]; then ctx=colima; else ctx="colima-$profile"; fi
+kubectl config get-contexts "$ctx" >/dev/null 2>&1 || { echo "ERROR: no kubectl context named $ctx (colima start -p $profile … --kubernetes, see above)" >&2; exit 1; }
+k() { kubectl --context "$ctx" "$@"; }
+vm() { colima ssh -p "$profile" -- "$@"; }
+runtime="$(k get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}')"
+[[ "$runtime" == containerd://* ]] || { echo "ERROR: profile $profile runs '$runtime' — the build host needs containerd (a user-namespaced pod). Nothing was changed." >&2; exit 1; }
 
 # ── preconditions: everything is CHECKED before anything is changed ──────────────────────────────────────────
 echo "== 0/4 preconditions"
@@ -76,17 +96,20 @@ worker_value="$(az keyvault secret show --vault-name "$vault" --name "$worker" -
   && [ -n "$worker_value" ] || { echo "ERROR: could not read the worker token $worker from $vault. Nothing was changed." >&2; exit 1; }
 pull_value="$(az keyvault secret show --vault-name "$vault" --name "$pull" --query value -o tsv)" \
   && [ -n "$pull_value" ] || { echo "ERROR: could not read the pull token $pull from $vault. Nothing was changed." >&2; exit 1; }
-key_value="$(az keyvault secret show --vault-name "$vault" --name "$instkey" --query value -o tsv)" \
-  && [[ "$key_value" == mwi_* ]] || { echo "ERROR: could not read a mwi_ instance key from $instkey in $vault. Nothing was changed." >&2; exit 1; }
-echo "   KEDA ready; the three vault objects read"
+key_value=
+if [ -n "$instkey" ]; then
+  key_value="$(az keyvault secret show --vault-name "$vault" --name "$instkey" --query value -o tsv)" \
+    && [[ "$key_value" == mwi_* ]] || { echo "ERROR: could not read a mwi_ instance key from $instkey in $vault. Nothing was changed." >&2; exit 1; }
+fi
+echo "   KEDA ready; the vault objects read"
 
 echo "== 1/4 AppArmor profile mw-build-host in the Colima VM"
 printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' '' 'profile mw-build-host flags=(unconfined) {' '  userns,' '}' \
-  | colima ssh -- sudo sh -c 'cat > /etc/apparmor.d/mw-build-host && apparmor_parser --replace /etc/apparmor.d/mw-build-host'
+  | vm sudo sh -c 'cat > /etc/apparmor.d/mw-build-host && apparmor_parser --replace /etc/apparmor.d/mw-build-host'
 # The probe runs as the VM's ordinary, UNPRIVILEGED user — as the build container does (uid 1654, no capabilities).
-colima ssh -- aa-exec -p mw-build-host -- unshare -U -r true \
+vm aa-exec -p mw-build-host -- unshare -U -r true \
   || { echo "ERROR: an unprivileged user namespace does not start under mw-build-host — bwrap would fail" >&2; exit 1; }
-colima ssh -- unshare -U -r true 2>/dev/null \
+vm unshare -U -r true 2>/dev/null \
   && echo "   note: unprivileged user namespaces start even WITHOUT the profile in this VM" \
   || echo "   loaded: an unprivileged user namespace starts under mw-build-host, and not without it"
 
@@ -108,21 +131,25 @@ sys.stdout.write(json.dumps({"auths": {registry: {"username": user, "password": 
   | k apply -f - >/dev/null
 # The plugins layer: a host holds NO registry credential for it (StandingBuildHosts §2); it reads the registry's bundle
 # index (H8) with the Mac's READ-ONLY instance key.
-printf '%s' "$key_value" \
-  | k -n build-mac create secret generic build-registry-key-mac --from-file=key=/dev/stdin --dry-run=client -o yaml \
-  | k apply -f - >/dev/null
+if [ -n "$key_value" ]; then
+  printf '%s' "$key_value" \
+    | k -n build-mac create secret generic build-registry-key-mac --from-file=key=/dev/stdin --dry-run=client -o yaml \
+    | k apply -f - >/dev/null
+fi
 unset worker_value pull_value key_value
-echo "   build-worker-mac, build-pull (image pulls only) and build-registry-key-mac applied"
+echo "   build-worker-mac and build-pull (image pulls only) applied${instkey:+, and build-registry-key-mac}"
 
 echo "== 4/4 helm upgrade --install build-host-mac ($version)"
-helm upgrade --install build-host-mac "$chart" --kube-context colima -n build-mac \
+helm upgrade --install build-host-mac "$chart" --kube-context "$ctx" -n build-mac \
   -f "$chart/values.yaml" -f "$here/build-host-mac.values.yaml" \
   --set-string buildHosts.apiUrl="$api" \
   --set-string buildHosts.testerRepository="$registry/mw-plugin-test" \
   --set-string buildHosts.portalRepository="$registry/memex-portal-ai" \
   --set-string buildHosts.runnerRepository="$registry/mw-build-host" \
   --set-string buildHosts.pluginsRegistry="$registry" \
-  --set-string buildHosts.registry.url="$pluginsreg" \
+  ${pluginsreg:+--set-string buildHosts.registry.url="$pluginsreg"} \
+  ${pluginsreg:+--set-string buildHosts.registry.instanceKeySecret.name=build-registry-key-mac} \
+  ${pluginsreg:+--set-string buildHosts.registry.instanceKeySecret.key=key} \
   --set-string buildHosts.mac.platformVersion="$version" \
   --set-string buildHosts.mac.testerDigest="$tester" \
   --set-string buildHosts.mac.portalDigest="$portal" \
