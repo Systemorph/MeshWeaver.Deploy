@@ -9,7 +9,7 @@
 # 🚨 WHY ONE FILE (MeshWeaver#5844). The drift audit used to render the committed overlay, while the
 # deploy renders the record's values PLUS these flags — most visibly `selfUpdate.azureClientId`,
 # which the chart turns into the portal's inline AZURE_CLIENT_ID. So the audit called values every
-# deploy installs "pending deletions", and "drift" stopped meaning "a Reconcile would change this".
+# deploy installs "pending deletions" — findings about an input no deploy reads, not about the cluster.
 # A second copy of these lines in the audit would drift from this one the same way, so there is no
 # second copy: change a flag HERE and both readers move together.
 #
