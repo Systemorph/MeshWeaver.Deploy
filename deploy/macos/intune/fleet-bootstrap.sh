@@ -7,8 +7,10 @@
 #   1. Find the console user — the person the Mac's memex runs as. No one logged in yet: exit 0 (the next run
 #      continues; the Mac's own memex runs as a person, never as root).
 #   2. Homebrew under /opt/homebrew, owned by that user (the documented untar install — no installer prompt),
-#      then the tools as that user: colima docker kubectl helm ollama tailscale, and memex-local from the tap.
-#   3. tailscaled as a ROOT LaunchDaemon (com.meshweaver.fleet.tailscaled, socket /var/run/tailscaled.socket):
+#      then the tools as that user: colima docker kubectl helm ollama, and memex-local from the trusted tap.
+#   3. tailscale/tailscaled fetched BY ROOT from Homebrew's verified bottle into the root-owned
+#      /Library/MeshWeaver/tailscale (never run as root from the user-owned Homebrew tree), and tailscaled as a
+#      ROOT LaunchDaemon (com.meshweaver.fleet.tailscaled, socket /var/run/tailscaled.socket):
 #      the network must be up before anyone logs in, which the Tailscale app does not do. memex-local finds
 #      this socket by itself.
 #   4. The private network: joined with a single-use pre-auth key when one is provided (FLEET_PREAUTH_KEY_FILE,
@@ -29,7 +31,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.0.0"
+readonly FLEET_BOOTSTRAP_VERSION="1.1.0"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -37,7 +39,12 @@ readonly TAILSCALED_SOCKET="${FLEET_TAILSCALED_SOCKET:-/var/run/tailscaled.socke
 readonly TAILSCALED_STATE_DIR="${FLEET_TAILSCALED_STATE_DIR:-/var/lib/tailscale}"
 readonly LOG_DIR="${FLEET_LOG_DIR:-/Library/Logs/MeshWeaver}"
 readonly MANAGED_PREFS="${FLEET_MANAGED_PREFS:-/Library/Managed Preferences/com.memex.local}"
-readonly BREW_TOOLS=(colima docker kubectl helm ollama tailscale)
+readonly BREW_TOOLS=(colima docker kubectl helm ollama)
+# 🚨 What runs AS ROOT never comes from the Homebrew tree, which the console user owns (they could replace the
+# binary and run code as root at the next boot). tailscale/tailscaled are fetched BY ROOT from Homebrew's bottle
+# (the formula API names the URL and its sha256, verified here), into a root-owned directory under /Library.
+readonly TS_DIR="${FLEET_TS_DIR:-/Library/MeshWeaver/tailscale}"
+readonly TS_FORMULA_API="${FLEET_TS_FORMULA_API:-https://formulae.brew.sh/api/formula/tailscale.json}"
 readonly MEMEX_FORMULA="systemorph/memex/memex-local"
 
 log() {
@@ -102,7 +109,7 @@ tailscaled_plist() {
   <key>Label</key><string>${TAILSCALED_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${BREW_PREFIX}/bin/tailscaled</string>
+    <string>${TS_DIR}/bin/tailscaled</string>
     <string>--state=${TAILSCALED_STATE_DIR}/tailscaled.state</string>
     <string>--socket=${TAILSCALED_SOCKET}</string>
   </array>
@@ -130,7 +137,46 @@ step_tools() {
   [ -x "$BREW_PREFIX/bin/memex-local" ] || missing+=("$MEMEX_FORMULA")
   if [ "${#missing[@]}" -eq 0 ]; then log "tools: all present"; return 0; fi
   log "tools: installing ${missing[*]}"
+  # a third-party tap's formulae are refused until the tap is tapped AND trusted (deploy/homebrew/README.md)
+  as_user "$user" "$BREW_PREFIX/bin/brew" tap systemorph/memex >/dev/null 2>&1 \
+    && as_user "$user" "$BREW_PREFIX/bin/brew" trust systemorph/memex >/dev/null 2>&1 \
+    || { log "tools: FAILED to tap and trust systemorph/memex"; return 1; }
   as_user "$user" "$BREW_PREFIX/bin/brew" install "${missing[@]}" || { log "tools: FAILED to install ${missing[*]}"; return 1; }
+}
+
+# The bottle file key for this Mac in the formula JSON: the macOS release's codename when the formula has it,
+# else the newest arm64 macOS bottle. Pure over its arguments (JSON text, macOS major version).
+bottle_key() {
+  osascript -l JavaScript -e 'function run(a){var f=JSON.parse(a[0]).bottle.stable.files;var names={"15":"sequoia","26":"tahoe","27":"golden_gate"};var want="arm64_"+(names[a[1]]||"");if(f[want])return want;var k=Object.keys(f).filter(function(x){return x.indexOf("arm64_")===0&&x!=="arm64_linux";});return k.length?k[0]:"";}' "$1" "$2" 2>/dev/null
+}
+
+# One field of the formula JSON: version | url <key> | sha256 <key>. Pure.
+formula_field() {
+  osascript -l JavaScript -e 'function run(a){var d=JSON.parse(a[0]);if(a[1]==="version")return d.versions.stable;var f=d.bottle.stable.files[a[2]];return f?f[a[1]]:"";}' "$1" "$2" "${3:-}" 2>/dev/null
+}
+
+# tailscale + tailscaled, fetched by root from the verified bottle into the root-owned $TS_DIR.
+step_tailscale_binaries() {
+  local json version key url sha tmp have
+  json="$(curl -fsSL "$TS_FORMULA_API")" || { log "tailscale: FAILED to read the formula API"; return 1; }
+  version="$(formula_field "$json" version)"; key="$(bottle_key "$json" "$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)")"
+  url="$(formula_field "$json" url "$key")"; sha="$(formula_field "$json" sha256 "$key")"
+  [ -n "$version" ] && [ -n "$url" ] && [ -n "$sha" ] || { log "tailscale: FAILED — no arm64 macOS bottle in the formula API"; return 1; }
+  have="$(cat "$TS_DIR/VERSION" 2>/dev/null || true)"
+  if [ "$have" = "$version" ] && [ -x "$TS_DIR/bin/tailscaled" ] && [ "$(stat -f%Su "$TS_DIR/bin/tailscaled" 2>/dev/null)" = "root" ]; then
+    log "tailscale: $version present, root-owned ($TS_DIR)"; return 0
+  fi
+  log "tailscale: installing $version from the verified bottle ($key) into $TS_DIR"
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then printf 'DRY-RUN: fetch %s (sha256 %s) → %s\n' "$url" "$sha" "$TS_DIR"; return 0; fi
+  tmp="$(mktemp -d)"
+  curl -fsSL -H "Authorization: Bearer QQ==" -o "$tmp/bottle.tar.gz" "$url" \
+    && [ "$(shasum -a 256 "$tmp/bottle.tar.gz" | cut -d' ' -f1)" = "$sha" ] \
+    && tar xzf "$tmp/bottle.tar.gz" -C "$tmp" \
+    && install -d -o root -g wheel -m 0755 "$(dirname "$TS_DIR")" "$TS_DIR" "$TS_DIR/bin" \
+    && install -o root -g wheel -m 0755 "$tmp"/tailscale/*/bin/tailscale "$tmp"/tailscale/*/bin/tailscaled "$TS_DIR/bin/" \
+    && printf '%s\n' "$version" > "$TS_DIR/VERSION" \
+    || { rm -rf "$tmp"; log "tailscale: FAILED (download, checksum or install)"; return 1; }
+  rm -rf "$tmp"
 }
 
 step_tailscaled() {
@@ -147,34 +193,48 @@ step_tailscaled() {
 }
 
 step_network() {
-  local machine="$1" ts=("$BREW_PREFIX/bin/tailscale" --socket="$TAILSCALED_SOCKET")
+  local machine="$1" ts=("$TS_DIR/bin/tailscale" --socket="$TAILSCALED_SOCKET")
   if "${ts[@]}" status >/dev/null 2>&1; then log "network: joined"; return 0; fi
   local key_file="${FLEET_PREAUTH_KEY_FILE:-}" login; login="$(setting FLEET_LOGIN_SERVER LoginServer)"
   if [ -z "$key_file" ] || [ ! -f "$key_file" ] || [ -z "$login" ]; then
     log "network: WAITING for a single-use pre-auth key and the login server (control mints the key at enrolment — Hosting/MacStudioFleet §2b.1 target 2)"
     return 0
   fi
-  log "network: joining $login as $machine with the provided pre-auth key (never printed)"
-  local key; key="$(cat "$key_file")"; rm -f "$key_file"
-  run "${ts[@]}" up --login-server "$login" --hostname "$machine" --auth-key "$key" --reset || { log "network: FAILED to join"; return 1; }
+  log "network: joining $login as $machine with the provided pre-auth key (read from its file, never printed)"
+  # by FILE reference: the key never appears in an argument, a process listing or a dry-run line
+  run "${ts[@]}" up --login-server "$login" --hostname "$machine" --auth-key="file:$key_file" --reset \
+    || { log "network: FAILED to join — the key file is kept for the next run"; return 1; }
+  run rm -f "$key_file"
 }
 
 step_memex() {
-  local user="$1" machine="$2" control registry home code_file out rc
+  local user="$1" machine="$2" control registry home code_file out rc mlocal
   control="$(setting FLEET_CONTROL_URL ControlUrl)"; registry="$(setting FLEET_REGISTRY_URL RegistryUrl)"
-  home="$(user_home "$user")"
+  home="$(user_home "$user")"; mlocal="$BREW_PREFIX/bin/memex-local"
   [ -n "$control" ] || { log "memex: WAITING for ControlUrl (the com.memex.local configuration profile)"; return 0; }
-  if [ -n "$registry" ]; then
-    as_user "$user" "$BREW_PREFIX/bin/memex-local" registry "$registry" >/dev/null 2>&1 || log "memex: registry mode not set (re-tried next run)"
+  # registry mode is initialised ONCE: re-running `registry <url>` would rewrite registry.yaml without the
+  # bootstrap key or pinned id an existing registration was made with
+  if [ -n "$registry" ] && [ ! -f "$home/.memex-local/registry.yaml" ]; then
+    log "memex: registry mode ($registry)"
+    as_user "$user" "$mlocal" registry "$registry" >/dev/null 2>&1 || { log "memex: FAILED to set registry mode"; return 1; }
   fi
-  if ! as_user "$user" "$BREW_PREFIX/bin/colima" status >/dev/null 2>&1; then
-    log "memex: starting the local stack (memex-local up)"
-    as_user "$user" "$BREW_PREFIX/bin/memex-local" up >/dev/null 2>&1 || log "memex: 'memex-local up' did not finish — re-tried next run"
+  # the stack is provisioned when it VERIFIES usable, not when the VM merely runs — `up` is retried until it does
+  if ! as_user "$user" "$mlocal" verify >/dev/null 2>&1; then
+    log "memex: provisioning the local stack (memex-local up)"
+    as_user "$user" "$mlocal" up >/dev/null 2>&1 || { log "memex: 'memex-local up' FAILED — retried next run"; return 1; }
   fi
-  if [ -f "$home/.memex-local/fleet.yaml" ]; then log "memex: already joined as $machine"; return 0; fi
+  if [ -f "$home/.memex-local/fleet.yaml" ]; then
+    # joined: resume a finalisation an earlier run did not finish, from the stored credentials (no new code)
+    if [ ! -f "$home/.memex-local/backlease.yaml" ]; then
+      log "memex: joined as $machine — finishing: back-lease enrolment"
+      as_user "$user" "$mlocal" backlease enroll --control "$control" --deployment "$machine" >/dev/null 2>&1 || { log "memex: back-lease enrolment FAILED — retried next run"; return 1; }
+      as_user "$user" "$mlocal" update >/dev/null 2>&1 || { log "memex: 'memex-local update' FAILED — retried next run"; return 1; }
+    fi
+    log "memex: joined as $machine, finished"; return 0
+  fi
   code_file="$home/.memex-local/enrol/$machine.code"
   log "memex: fleet join as $machine (control $control); the code is read from $code_file once present"
-  out="$(as_user "$user" "$BREW_PREFIX/bin/memex-local" fleet join --control "$control" --id "$machine" --no-open --code-file "$code_file" 2>&1)"; rc=$?
+  out="$(as_user "$user" "$mlocal" fleet join --control "$control" --id "$machine" --no-open --code-file "$code_file" 2>&1)"; rc=$?
   printf '%s\n' "$out" | grep -E 'https://|fingerprint|joined as|WAITING|waiting' | while IFS= read -r l; do log "memex: $l"; done
   case "$rc" in
     0) log "memex: joined as $machine" ;;
@@ -191,6 +251,7 @@ main() {
   log "run for console user $user, machine $machine"
   step_homebrew "$user" || failed=1
   [ "$failed" = 0 ] && { step_tools "$user" || failed=1; }
+  [ "$failed" = 0 ] && { step_tailscale_binaries || failed=1; }
   [ "$failed" = 0 ] && { step_tailscaled || failed=1; }
   [ "$failed" = 0 ] && { step_network "$machine" || failed=1; }
   [ "$failed" = 0 ] && { step_memex "$user" "$machine" || failed=1; }

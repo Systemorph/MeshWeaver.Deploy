@@ -10,10 +10,11 @@ MeshWeaver.Plugins `Hosting/MacStudioFleet.md` §2b and §2b.2.
 |---|---|---|
 | console user | the person the Mac's memex runs as (`stat -f%Su /dev/console`) | no one is logged in |
 | Homebrew | `/opt/homebrew`, owned by that person (the documented untar install, no prompt) | — |
-| tools | `colima docker kubectl helm ollama tailscale` and `systemorph/memex/memex-local`, as that person | — |
+| tools | `colima docker kubectl helm ollama` and `systemorph/memex/memex-local` (the tap tapped AND trusted first), as that person | — |
+| tailscale binaries | `tailscale` + `tailscaled` fetched BY ROOT from Homebrew's bottle (URL and sha256 from the formula API, verified) into the root-owned `/Library/MeshWeaver/tailscale` — what runs as root never comes from the user-owned Homebrew tree | — |
 | tailscaled | a ROOT LaunchDaemon `com.meshweaver.fleet.tailscaled` on `/var/run/tailscaled.socket` (the Tailscale app does not run before login; this does). memex-local uses this socket by itself | — |
-| network | `tailscale up` with a single-use pre-auth key from `FLEET_PREAUTH_KEY_FILE` (read, deleted, never printed) | no key yet (control mints it at enrolment) |
-| memex | registry mode, `memex-local up`, then `memex-local fleet join --code-file ~/.memex-local/enrol/<id>.code` | no `ControlUrl` yet, or the approval and the enrolment code are pending (the link is in the log and in `~/.memex-local/enrol/<id>.link`) |
+| network | `tailscale up --auth-key=file:<FLEET_PREAUTH_KEY_FILE>` (by file reference, never an argument; deleted only after the join succeeded) | no key yet (control mints it at enrolment) |
+| memex | registry mode (once — never re-written), `memex-local up` until `memex-local verify` passes, `memex-local fleet join --code-file ~/.memex-local/enrol/<id>.code`, and a joined Mac's unfinished back-lease enrolment resumed from its stored credentials | no `ControlUrl` yet, or the approval and the enrolment code are pending (the link is in the log and in `~/.memex-local/enrol/<id>.link`) |
 
 **Configuration** comes from the managed-preference domain `com.memex.local`, deployed as a configuration
 profile. Its keys are `ControlUrl`, `DeploymentId`, `RegistryUrl` and `LoginServer`. The environment

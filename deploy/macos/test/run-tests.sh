@@ -339,11 +339,28 @@ done
 [ "$(FB_EVAL='machine_id' fb FLEET_MACHINE_ID=studio-2)" = "studio-2" ] && ok "a configured machine id wins" || bad "machine id configured" "$(FB_EVAL='machine_id' fb FLEET_MACHINE_ID=studio-2)"
 mkdir -p "$T/fbstub"; printf '#!/bin/bash\necho "Studio_2 Pro"\n' > "$T/fbstub/scutil"; chmod +x "$T/fbstub/scutil"
 [ "$(FB_EVAL='machine_id' fb PATH="$T/fbstub:$PATH" FLEET_MANAGED_PREFS="$T/none")" = "studio-2-pro" ] && ok "the host name becomes a deployment-id-shaped machine id" || bad "machine id derived" "$(FB_EVAL='machine_id' fb PATH="$T/fbstub:$PATH" FLEET_MANAGED_PREFS="$T/none")"
+# The privileged binaries come from Homebrew's verified bottle, chosen for this macOS — never from the user's tree.
+cat > "$T/tailscale.json" <<'JSON'
+{"versions":{"stable":"1.104.5"},"bottle":{"stable":{"files":{
+ "arm64_golden_gate":{"url":"https://ghcr.io/v2/homebrew/core/tailscale/blobs/sha256:aaa","sha256":"aaa"},
+ "arm64_tahoe":{"url":"https://ghcr.io/v2/homebrew/core/tailscale/blobs/sha256:bbb","sha256":"bbb"},
+ "arm64_linux":{"url":"x","sha256":"x"}}}}}
+JSON
+TSJ="$(cat "$T/tailscale.json")"
+[ "$(env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; bottle_key "$1" 26' "$FB" "$TSJ")" = "arm64_tahoe" ] && ok "the bottle for this macOS release is chosen (26 → tahoe)" || bad "bottle key 26" "$(env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; bottle_key "$1" 26' "$FB" "$TSJ")"
+[ "$(env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; bottle_key "$1" 99' "$FB" "$TSJ")" = "arm64_golden_gate" ] && ok "an unknown release takes the newest arm64 macOS bottle, never linux" || bad "bottle key fallback" "$(env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; bottle_key "$1" 99' "$FB" "$TSJ")"
+[ "$(env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; formula_field "$1" sha256 arm64_tahoe' "$FB" "$TSJ")" = "bbb" ] && [ "$(env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; formula_field "$1" version' "$FB" "$TSJ")" = "1.104.5" ] \
+  && ok "the formula's version and the bottle's sha256 are read for verification" || bad "formula fields" "wrong"
+grep -q '<string>/Library/MeshWeaver/tailscale/bin/tailscaled</string>' "$T/ts.plist" && ! grep -q 'homebrew' "$T/ts.plist" \
+  && ok "the root daemon runs tailscaled from the root-owned directory, never the user's Homebrew tree" || bad "daemon binary path" "$(grep tailscaled "$T/ts.plist")"
+grep -q 'brew" tap systemorph/memex' "$FB" && grep -q 'brew" trust systemorph/memex' "$FB" && ok "the third-party tap is tapped AND trusted before memex-local is installed" || bad "tap trust" "missing"
+grep -q -- '--auth-key="file:$key_file"' "$FB" && ! grep -q -- '--auth-key "\$key"' "$FB" \
+  && ok "the pre-auth key is passed by FILE reference (never an argument)" || bad "auth key by file" "missing"
 # A dry run on a bare Mac: every changing command is printed, nothing runs, and it waits (exit 0) for the key and the control URL.
-OUT="$(env FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_CONSOLE_USER=jroe FLEET_USER_HOME="$T/home" FLEET_BREW_PREFIX="$T/brew" FLEET_LOG_DIR="$T/logs" \
-  FLEET_LAUNCHDAEMONS_DIR="$T/ld" FLEET_TAILSCALED_SOCKET="$T/no.sock" FLEET_TAILSCALED_STATE_DIR="$T/ts" FLEET_MANAGED_PREFS="$T/none" FLEET_MACHINE_ID=studio-2 \
+OUT="$(env FLEET_TS_FORMULA_API="file://$T/tailscale.json" FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_CONSOLE_USER=jroe FLEET_USER_HOME="$T/home" FLEET_BREW_PREFIX="$T/brew" FLEET_LOG_DIR="$T/logs" \
+  FLEET_TS_DIR="$T/tsbin" FLEET_LAUNCHDAEMONS_DIR="$T/ld" FLEET_TAILSCALED_SOCKET="$T/no.sock" FLEET_TAILSCALED_STATE_DIR="$T/ts" FLEET_MANAGED_PREFS="$T/none" FLEET_MACHINE_ID=studio-2 \
   bash "$FB" 2>&1)"; RC=$?
-case "$RC:$OUT" in 0:*"homebrew: installing"*"tools: installing"*"tailscaled: installing the root LaunchDaemon"*"network: WAITING"*"memex: WAITING for ControlUrl"*"done"*) ok "a dry run on a bare Mac plans every step and waits, exit 0" ;; *) bad "bootstrap dry run" "rc=$RC: $OUT" ;; esac
+case "$RC:$OUT" in 0:*"homebrew: installing"*"tools: installing"*"tailscale: installing 1.104.5 from the verified bottle"*"tailscaled: installing the root LaunchDaemon"*"network: WAITING"*"memex: WAITING for ControlUrl"*"done"*) ok "a dry run on a bare Mac plans every step (tap trusted, binaries from the verified bottle) and waits, exit 0" ;; *) bad "bootstrap dry run" "rc=$RC: $OUT" ;; esac
 case "$OUT" in *"DRY-RUN: mkdir -p $T/brew"*"DRY-RUN: write $T/ld/com.meshweaver.fleet.tailscaled.plist"*) ok "the dry run prints the changing commands instead of running them" ;; *) bad "dry-run commands" "$OUT" ;; esac
 [ ! -e "$T/brew" ] && [ ! -e "$T/ld/com.meshweaver.fleet.tailscaled.plist" ] && ok "the dry run changed nothing" || bad "dry run changed the machine" "$(ls "$T")"
 grep -q 'network: WAITING' "$T/logs/fleet-bootstrap.log" && ok "the run is logged to /Library/Logs/MeshWeaver/fleet-bootstrap.log" || bad "bootstrap log" "$(cat "$T/logs/fleet-bootstrap.log" 2>/dev/null)"
