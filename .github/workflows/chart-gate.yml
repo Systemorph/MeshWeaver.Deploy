@@ -223,6 +223,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: deploy/aks/scripts/test-build-hosts.sh
 
+      # The leased-back Mac's preflight (deploy/backlease/first-attach.sh step 0): the declared floor
+      # (every enabled channel's minReplicas) times one replica's requests must fit the one node, and
+      # the documented VM fits the shipped values. No cluster, no network.
+      - name: Assert the Mac build host's standing replicas fit its documented VM
+        if: ${{ !cancelled() }}
+        run: python3 deploy/backlease/host-fits-node.py --self-test
+
       # The node-pool headroom (templates/node-headroom/, Memex#863): the defaults render nothing (the
       # negative control), a declared pool renders one negative, non-preempting PriorityClass and one
       # pinned requests==limits placeholder, and the refusals hold. No cluster, no network.
