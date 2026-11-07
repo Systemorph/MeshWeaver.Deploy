@@ -1436,10 +1436,39 @@ grep -q -- 'serve --tcp 443 off' "$PB/ts.log" && ok "publish off stops the tails
 [ "$(pfaddr)" = "--address 0.0.0.0,:: 80:80 443:443 8443:443" ] && ok "not published: the front door binds every interface, all three mappings (unchanged)" || bad "unpublished front door" "$(pfaddr)"
 rm -rf "$PB"
 
+echo "── cert: a trusted certificate for the private-network name, per name in the entry point ──"
+CT="$(mktemp -d)"; mkdir -p "$CT/home"
+ct() { env PATH="$STUBS:$PATH" HOME="$CT/home" MEMEX_LOCAL_HOME="$CT/home/.memex-local" "$@"; }
+CFG=(--domain studio-2.net.example.test --email ops@example.test --client-id cid-1 --tenant ten-1 --subscription sub-1 --resource-group dns --zone net.example.test)
+OUT="$(printf 'dns-s3cret\n' | ct "$CLI" cert config "${CFG[@]}" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "cert config writes the configuration" || bad "cert config" "rc=$RC: $OUT"
+case "$OUT" in *dns-s3cret*) bad "cert config never prints the secret" "$OUT" ;; *) ok "cert config never prints the secret" ;; esac
+[ "$(ls -l "$CT/home/.memex-local/certs/dns01.secret" | cut -c1-10)" = "-rw-------" ] && [ "$(cat "$CT/home/.memex-local/certs/dns01.secret")" = "dns-s3cret" ] \
+  && ok "the DNS identity's secret is kept 0600 apart from the configuration" || bad "secret file" "$(ls -l "$CT/home/.memex-local/certs/")"
+! grep -q dns-s3cret "$CT/home/.memex-local/certs/dns01.env" && grep -q '^AZURE_ZONE_NAME=net.example.test$' "$CT/home/.memex-local/certs/dns01.env" \
+  && ok "the configuration names the zone and identity, nothing secret" || bad "dns01.env" "$(cat "$CT/home/.memex-local/certs/dns01.env")"
+OUT="$(printf 'x\n' | ct "$CLI" cert config --domain studio-2.example.test --email e --client-id c --tenant t --subscription s --resource-group r --zone net.example.test 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "a domain outside the zone is refused" "exited 0" ;; *"is not inside the zone"*) ok "a domain outside the zone the identity may write is refused" ;; *) bad "zone refusal" "$OUT" ;; esac
+LA="$(ct env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; cert_lego_args' "$CLI" | tr '\n' ' ')"
+case "$LA" in "run --accept-tos --email ops@example.test --dns azuredns --domains studio-2.net.example.test --key-type EC256 --renew-days 30 --path $CT/home/.memex-local/certs/lego ") ok "lego v5: one 'run' obtains or renews (within 30 days), DNS-01 in Azure DNS, EC256" ;; *) bad "lego args" "$LA" ;; esac
+# The entry point serves the trusted certificate for a name that has one, and its local CA for the others.
+mkdir -p "$CT/home/.memex-local/certs/lego/certificates"
+printf 'CERT\n' > "$CT/home/.memex-local/certs/lego/certificates/studio-2.net.example.test.crt"; printf 'KEY\n' > "$CT/home/.memex-local/certs/lego/certificates/studio-2.net.example.test.key"
+R="$(ct env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; render_network_entry "$1" studio-2.net.example.test mac-1.example.com' "$CLI" "$HERE/../share/network-entry.yaml")"
+grep -q 'tls /certs/studio-2.net.example.test.crt /certs/studio-2.net.example.test.key' <<<"$R" && ok "a name with a trusted certificate is served with it" || bad "trusted cert site" "$(grep -n 'tls ' <<<"$R")"
+[ "$(grep -c '^[[:space:]]*tls internal$' <<<"$R")" = 1 ] && ok "a name without one keeps the entry point's local CA" || bad "local CA site" "$(grep -n 'tls ' <<<"$R")"
+grep -q 'secretName: memex-network-entry-certs, optional: true' <<<"$R" && grep -q 'memex-local/certs-digest: "[0-9a-f]\{16\}"' <<<"$R" \
+  && ok "the certificates mount optionally, and a renewal changes the pod's digest (restart onto it)" || bad "certs mount/digest" "$(grep -n 'certs' <<<"$R")"
+! grep -q '__TLS__\|__CERTS_DIGEST__' <<<"$R" && ok "no placeholder is left in the rendered entry point" || bad "placeholders left" "$(grep -n '__' <<<"$R")"
+R0="$(ct env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; render_network_entry "$1" other.example.com' "$CLI" "$HERE/../share/network-entry.yaml")"
+grep -q 'memex-local/certs-digest: "none"' <<<"$R0" && grep -q 'tls internal' <<<"$R0" && ok "with no certificate at all, the entry point is unchanged (local CA)" || bad "no-cert render" "$(grep -n 'tls \|digest' <<<"$R0")"
+case "$(ct "$CLI" cert status 2>&1)" in *"studio-2.net.example.test"*) ok "cert status names the configured domain" ;; *) bad "cert status" "$(ct "$CLI" cert status 2>&1)" ;; esac
+rm -rf "$CT"
+
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
-for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel backlease fleet llm relay publish autoupdate; do
+for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert backlease fleet llm relay publish autoupdate; do
   case "$help_out" in
     *"$cmd"*) ;;
     *) bad "help documents '$cmd'" "not in the usage text"; continue ;;
