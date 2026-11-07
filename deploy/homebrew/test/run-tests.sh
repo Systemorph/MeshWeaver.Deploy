@@ -1098,8 +1098,24 @@ lsof_says '127.0.0.1:11434'; ovr bash -c '. "$0"; ollama_listens_lan' "$CLI" && 
 lsof_says '*:11434'; ovr bash -c '. "$0"; ollama_listens_lan' "$CLI" && ok "an Ollama on every interface (*:11434) is read as LAN-reachable" || bad "*:11434 not LAN" ""
 : > "$OV/lsof.out"; ovr bash -c '. "$0"; ollama_listens_lan' "$CLI" && bad "no listener read as LAN" "" || ok "no listener is not LAN-reachable"
 SO="$(awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI")"
-grep -q 'if ollama_listens_lan; then' <<<"$SO" && grep -q 'rebinding it to 127.0.0.1' <<<"$SO" && grep -q 'NOT started by memex-local' <<<"$SO" && grep -q 'ollama_vm_reach || true' <<<"$SO" \
+grep -q 'if ollama_listens_lan; then' <<<"$SO" && grep -q 'rebinding it to 127.0.0.1' <<<"$SO" && grep -q 'NOT run by memex-local' <<<"$SO" && grep -q 'ollama_vm_reach || true' <<<"$SO" \
   && ok "an ALREADY running Ollama is checked: memex-local's own is rebound to loopback, a foreign one is named (refused under ALLOW_LAN=0); a failed VM reach never aborts the join" || bad "existing ollama migration" "$SO"
+# setup_ollama end to end against an ALREADY running Ollama (curl answers) with a foreign LAN listener:
+# warned and carried on by default (never an errexit abort), refused under MEMEX_OLLAMA_ALLOW_LAN=0;
+# and memex-local's own agent is rebound, then RE-CHECKED (a foreign process may still hold the port).
+cat > "$OV/stubs/curl" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+chmod +x "$OV/stubs/curl"
+lsof_says '*:11434'; rm -f "$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist"
+OUT="$(ovr env MEMEX_OLLAMA_MODEL=none bash -c 'set -euo pipefail; . "$0"; setup_ollama; echo SETUP_DONE' "$CLI" 2>&1)"
+case "$OUT" in *"NOT run by memex-local"*SETUP_DONE*) ok "a foreign LAN Ollama is named and the setup carries on (no errexit abort)" ;; *) bad "foreign ollama default" "$OUT" ;; esac
+OUT="$(ovr env MEMEX_OLLAMA_MODEL=none MEMEX_OLLAMA_ALLOW_LAN=0 bash -c 'set -euo pipefail; . "$0"; setup_ollama; echo SETUP_DONE' "$CLI" 2>&1)"
+case "$OUT" in *SETUP_DONE*) bad "ALLOW_LAN=0 continued past a foreign LAN Ollama" "$OUT" ;; *"refuses to continue"*) ok "MEMEX_OLLAMA_ALLOW_LAN=0 refuses to continue with a foreign LAN Ollama" ;; *) bad "allow lan 0 foreign" "$OUT" ;; esac
+touch "$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist"
+OUT="$(ovr env MEMEX_OLLAMA_MODEL=none bash -c 'set -euo pipefail; . "$0"; setup_ollama; echo SETUP_DONE' "$CLI" 2>&1)"
+case "$OUT" in *"rebinding it to 127.0.0.1"*"NOT run by memex-local"*SETUP_DONE*) grep -q '<string>127.0.0.1:11434</string>' "$OV/home/Library/LaunchAgents/com.memex.local.ollama.plist" && ok "memex-local's own agent is rebound to loopback, then the port is RE-CHECKED (a listener still beyond loopback is named)" || bad "rebind plist" "" ;; *) bad "rebind then recheck" "$OUT" ;; esac
 rm -rf "$OV"
 FJ0="$(awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI")"
 grep -q '( cmd_observability ) || warn' <<<"$FJ0" && ok "a failing observability install fails its own step loudly, never the whole join" || bad "observability subshell" ""
