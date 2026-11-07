@@ -992,8 +992,9 @@ F="$FJ/home/.memex-local/fleet.yaml"
 grep -q "Hosting__ModuleReportSecret: \"$M\"" "$F" 2>/dev/null && grep -q "Hosting__ControlInbox__Secret: \"$C\"" "$F" \
   && grep -q 'Hosting__ControlInbox__Url: "https://control.example.test/api/hooks/Hosting/PlatformBuilds"' "$F" \
   && ok "the fleet layer carries both keys and the control inbox URL" || bad "fleet layer content" "$(sed 's/"[ab]\{64\}"/<value>/' "$F" 2>/dev/null)"
-fmode="$(stat -f '%Lp' "$F" 2>/dev/null || stat -c '%a' "$F" 2>/dev/null)"
-[ "$fmode" = "600" ] && ok "the fleet layer is 0600" || bad "fleet layer mode" "$fmode"
+# (ls, not stat: GNU `stat -f` is the FILESYSTEM report and prints to stdout, so a BSD-then-GNU fallback mis-reads)
+fmode="$(ls -l "$F" 2>/dev/null | cut -c1-10)"
+[ "$fmode" = "-rw-------" ] && ok "the fleet layer is 0600" || bad "fleet layer mode" "$fmode"
 [ ! -e "$KEY" ] && ok "the throw-away key is deleted once the code is opened" || bad "throw-away key removed" "still at $KEY"
 # A code sealed to ANOTHER key is refused by name; one issued for another id is refused by name.
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$KEY" 2>/dev/null ); OTHER="$FJ/other.pem"
