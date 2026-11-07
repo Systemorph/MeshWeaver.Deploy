@@ -24,9 +24,11 @@ data:
     {{- toJson $keys | nindent 4 }}
 {{- range $k := .Values.preauthKeys.keys }}
 {{- $name := include "headscale.preauthSecret" (dict "root" $ "name" $k.name) }}
-{{- /* Created EMPTY; the sidecar fills it. An upgrade must not wipe a minted key, so the live data and
-       annotations are carried over (lookup answers nothing under `helm template`, which only renders). */}}
-{{- $live := lookup "v1" "Secret" $.Release.Namespace $name }}
+{{- /* Created EMPTY, and the chart NEVER renders its key: the sidecar fills `data.authkey` and its
+       headscale.meshweaver.net/* annotations, and helm's three-way merge leaves fields that are in
+       neither the old nor the new manifest alone, so an upgrade keeps the minted key. (A `lookup` that
+       copied the live data into the manifest made `helm template` previews show the key as REMOVED,
+       because lookup is empty off-cluster, and stored the key material in the release manifest.) */}}
 ---
 apiVersion: v1
 kind: Secret
@@ -37,18 +39,7 @@ metadata:
     headscale.meshweaver.net/preauth-key: {{ $k.name | quote }}
   annotations:
     helm.sh/resource-policy: keep
-    {{- if $live }}
-    {{- range $ak, $av := ($live.metadata.annotations | default dict) }}
-    {{- if hasPrefix "headscale.meshweaver.net/" $ak }}
-    {{ $ak }}: {{ $av | quote }}
-    {{- end }}
-    {{- end }}
-    {{- end }}
 type: Opaque
-{{- if and $live $live.data }}
-data:
-  {{- toYaml $live.data | nindent 2 }}
-{{- end }}
 {{- end }}
 ---
 apiVersion: v1

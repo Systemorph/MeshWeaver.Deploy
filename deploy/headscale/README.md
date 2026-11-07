@@ -69,8 +69,10 @@ sequenceDiagram
     B->>H: tailscale up --auth-key file:…
 ```
 
-- The chart creates each Secret EMPTY with `helm.sh/resource-policy: keep` and carries an existing key
-  across upgrades (`lookup`); the sidecar cannot create, list or read any other Secret.
+- The chart creates each Secret EMPTY with `helm.sh/resource-policy: keep` and never renders its key:
+  helm's three-way merge leaves the sidecar's `data` and annotations alone on upgrade (they are in
+  neither manifest), so `helm template` previews and the stored release manifest never carry key
+  material. The sidecar cannot create, list or read any other Secret.
 - A key is replaced when it is missing, its DECLARATION changed (user, flags or lifetime — a fingerprint
   is stored with the key), within `renewHours` of its expiry, expired or unknown in headscale, or
   (single-use) already used. The replaced key is expired at once, so nothing new joins with it while
