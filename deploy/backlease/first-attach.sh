@@ -110,8 +110,8 @@ echo "   KEDA ready; the vault objects read"
 # refuse every claim). Read the answer now, with the Mac's own token on stdin, and refuse before changing anything.
 if [ -z "$pluginsreg" ]; then
   inputs="$(printf 'header = "Authorization: Bearer %s"\n' "$worker_value" \
-    | curl -fsS -m 30 -K - "$api/hosts/inputs?channel=mac")" \
-    || { echo "ERROR: could not read $api/hosts/inputs?channel=mac. Nothing was changed." >&2; exit 1; }
+    | curl -fsS -m 30 -K - "${api%/}/hosts/inputs?channel=mac")" \
+    || { echo "ERROR: could not read ${api%/}/hosts/inputs?channel=mac. Nothing was changed." >&2; exit 1; }
   python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d.get("plugins") is None else 3)' "$inputs" \
     || { echo "ERROR: /hosts/inputs names a sealed plugins publication for channel mac, which this Mac cannot pull (no workload identity). Pass --plugins-registry and --instance-key-secret for the registry index, or attach once the publication is readable. Nothing was changed." >&2; exit 1; }
   echo "   /hosts/inputs names no sealed publication for mac — the host claims with the cluster hosts' plugins contract"
