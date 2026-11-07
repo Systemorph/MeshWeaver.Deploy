@@ -607,7 +607,7 @@ percent_arg() {
 }
 
 write_backlease_file() {
-  local control="$1" deployment="$2" interval="$3" repo="$4" load_max="${5:-70}" mem_max="${6:-70}"
+  local control="$1" deployment="$2" interval="$3" repo="$4" load_max="${5:-70}" mem_max="${6:-70}" vm_cpu_max="${7:-70}" vm_mem_max="${8:-70}"
   mkdir -p "$LOCAL_HOME" "$BACKLEASE_DIR"
   ( umask 077; cat > "$BACKLEASE_FILE" ) <<YAML
 # memex-local BACK-LEASE — managed by \`memex-local backlease\`; re-run \`enroll\` to change, \`off\` to
@@ -627,6 +627,8 @@ config:
     Hosting__BackLease__ReadingsPath: "/host-readings/readings.json"
     Hosting__BackLease__HostLoadMax: "${load_max}%"
     Hosting__BackLease__HostMemoryMax: "${mem_max}%"
+    Hosting__BackLease__VmCpuMax: "${vm_cpu_max}%"
+    Hosting__BackLease__VmMemoryMax: "${vm_mem_max}%"
 ${repo:+    Hosting__BackLease__Repository: "${repo}"
 }extraVolumes:
   - name: backlease-readings
@@ -684,11 +686,13 @@ cmd_backlease() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
     enroll)
-      local control="" deployment="" interval="30" repo="" load_max="70" mem_max="70"
+      local control="" deployment="" interval="30" repo="" load_max="70" mem_max="70" vm_cpu_max="70" vm_mem_max="70"
       while [ $# -gt 0 ]; do
         case "$1" in
           --host-load-max)   shift; load_max="$(percent_arg "${1:?--host-load-max needs a percentage}" --host-load-max)" || exit 1 ;;
           --host-memory-max) shift; mem_max="$(percent_arg "${1:?--host-memory-max needs a percentage}" --host-memory-max)" || exit 1 ;;
+          --vm-cpu-max)      shift; vm_cpu_max="$(percent_arg "${1:?--vm-cpu-max needs a percentage}" --vm-cpu-max)" || exit 1 ;;
+          --vm-memory-max)   shift; vm_mem_max="$(percent_arg "${1:?--vm-memory-max needs a percentage}" --vm-memory-max)" || exit 1 ;;
           --control)    shift; control="${1:?--control needs a URL}" ;;
           --deployment) shift; deployment="${1:?--deployment needs an id}" ;;
           --interval)   shift; interval="${1:?--interval needs seconds}" ;;
@@ -709,8 +713,8 @@ cmd_backlease() {
       # Preconditions the design names (Hosting/BackLease §2): registry mode, Colima up, the portal reachable.
       registry_mode || die "backlease enroll: this install is not in REGISTRY MODE — run 'memex-local registry <url>' first (a leased machine consumes the registry's bundles, it cannot be its own registry)"
       colima_running || die "backlease enroll: Colima is not running — 'memex-local up' first"
-      write_backlease_file "${control%/}" "$deployment" "$interval" "$repo" "$load_max" "$mem_max"
-      ok "back-lease layer written: $BACKLEASE_FILE (reports to ${control%/} as '$deployment', heartbeat every ${interval}s; leased work only while host load < ${load_max}% and memory < ${mem_max}%)"
+      write_backlease_file "${control%/}" "$deployment" "$interval" "$repo" "$load_max" "$mem_max" "$vm_cpu_max" "$vm_mem_max"
+      ok "back-lease layer written: $BACKLEASE_FILE (reports to ${control%/} as '$deployment', heartbeat every ${interval}s; leased work only while host load < ${load_max}%, host memory < ${mem_max}%, VM CPU < ${vm_cpu_max}%, VM memory < ${vm_mem_max}%)"
       install_backlease_sampler "$interval"
       backlease_declarations "${control%/}" "$deployment"
       info "Apply it: memex-local update   (re-renders the chart with the back-lease layer; the portal's heartbeat arms on its next activation)"
@@ -745,7 +749,7 @@ cmd_backlease() {
         info "back-lease was not on"
       fi
       ;;
-    *) die "usage: memex-local backlease {enroll --control <url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] | status | off}" ;;
+    *) die "usage: memex-local backlease {enroll --control <url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>] | status | off}" ;;
   esac
 }
 
@@ -4198,7 +4202,7 @@ COMMANDS:
                   4 CPU with 4 stage slots each, 1 warm … VM CPU / 4 under KEDA, so the stage
                   containers together fill the VM. 'apply' creates the VM and KEDA and sizes an
                   installed release; --resize restarts a smaller VM at the planned size.
-  backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] | status | off
+  backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>] | status | off
   internal on --tenant <id> --client-id <id> < secret | status | off
                   INTERNAL ONLY — the fleet default: the portal answers at this Mac's private-network
                   name (https://<machine>.net.<domain>) over the private network only, with its

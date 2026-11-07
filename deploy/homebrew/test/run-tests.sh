@@ -1691,9 +1691,9 @@ lib percent_arg 5 --x >/dev/null 2>&1 && bad "5% accepted" "" || ok "a threshold
 lib percent_arg 99 --x >/dev/null 2>&1 && bad "99% accepted" "" || ok "a threshold above 95% is refused"
 lib percent_arg 0.7 --x >/dev/null 2>&1 && bad "0.7 accepted" "" || ok "a fraction is refused (whole percentages only)"
 BL="$(mktemp -d)"
-env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$BL" HOME="$BL" bash -c '. "$0"; write_backlease_file https://control.example.test mac-1 30 "" 85 60' "$CLI" >/dev/null 2>&1
-grep -q 'Hosting__BackLease__HostLoadMax: "85%"' "$BL/backlease.yaml" && grep -q 'Hosting__BackLease__HostMemoryMax: "60%"' "$BL/backlease.yaml" \
-  && ok "the back-lease layer declares the host load and memory ceilings for the heartbeat" || bad "backlease thresholds" "$(ls "$BL"; cat "$BL"/backlease.yaml 2>/dev/null)"
+env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$BL" HOME="$BL" bash -c '. "$0"; write_backlease_file https://control.example.test mac-1 30 "" 85 60 90 80' "$CLI" >/dev/null 2>&1
+grep -q 'Hosting__BackLease__HostLoadMax: "85%"' "$BL/backlease.yaml" && grep -q 'Hosting__BackLease__HostMemoryMax: "60%"' "$BL/backlease.yaml" && grep -q 'Hosting__BackLease__VmCpuMax: "90%"' "$BL/backlease.yaml" && grep -q 'Hosting__BackLease__VmMemoryMax: "80%"' "$BL/backlease.yaml" \
+  && ok "the back-lease layer declares the host load/memory and VM CPU/memory ceilings for the heartbeat" || bad "backlease thresholds" "$(ls "$BL"; cat "$BL"/backlease.yaml 2>/dev/null)"
 rm -rf "$BL"
 
 echo "── the CLI still knows every command it documents ────────────────"
