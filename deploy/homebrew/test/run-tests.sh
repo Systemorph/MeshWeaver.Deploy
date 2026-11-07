@@ -1244,23 +1244,25 @@ case "$RC:$OUT" in 0:*) bad "publish refuses an empty secret" "exited 0" ;; *"no
 OUT="$(printf 's3cret-value\n' | pb "$CLI" publish on --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
 [ "$RC" = 0 ] && ok "publish on writes the layer" || bad "publish on writes the layer" "rc=$RC: $OUT"
 case "$OUT" in *s3cret-value*) bad "publish never prints the secret" "$OUT" ;; *) ok "publish never prints the secret" ;; esac
-[ "$(stat -f %Lp "$LAYER" 2>/dev/null || stat -c %a "$LAYER")" = 600 ] && ok "the layer is 0600" || bad "the layer is 0600" "$(ls -l "$LAYER")"
+[ "$(stat -c %a "$LAYER" 2>/dev/null || stat -f %Lp "$LAYER")" = 600 ] && ok "the layer is 0600" || bad "the layer is 0600" "$(ls -l "$LAYER")"
 grep -q '^    - "mac-1.example.com"$' "$LAYER" && grep -q 'Authentication__Microsoft__ClientId: "c-1"' "$LAYER" \
   && grep -q 'Authentication__Microsoft__TenantId: "t-1"' "$LAYER" && grep -q 'Features__Onboarding__InvitationOnly: "true"' "$LAYER" \
   && grep -q 'Authentication__Microsoft__ClientSecret: "s3cret-value"' "$LAYER" \
   && ok "the layer: additional host, provider + tenant, invitation-only, the secret" || bad "the layer's content" "$(sed 's/ClientSecret: .*/ClientSecret: <redacted>/' "$LAYER")"
-grep -q -- 'serve --bg --tcp 443 tcp://127.0.0.1:443' "$PB/ts.log" && ok "publish on points tailscale serve at the loopback front door" || bad "tailscale serve" "$(cat "$PB/ts.log" 2>/dev/null)"
+grep -q -- 'serve --bg --tcp 443 tcp://127.0.0.1:8443' "$PB/ts.log" && ok "publish on points tailscale serve at the loopback front door's port" || bad "tailscale serve" "$(cat "$PB/ts.log" 2>/dev/null)"
 case "$(pb "$CLI" publish status 2>&1)" in *"https://mac-1.example.com, sign-in: Microsoft (tenant t-1), admission: invitation-only"*) ok "publish status reads the layer back" ;; *) bad "publish status" "$(pb "$CLI" publish status 2>&1)" ;; esac
 # The front door: loopback only while published, every interface otherwise (kubectl is the suite's stub).
 PF="$HERE/../share/port-forward.sh"
-pfaddr() { env PATH="$PB/stubs:$STUBS:$PATH" MEMEX_LOCAL_HOME="$PB/home/.memex-local" MEMEX_HEADLESS=1 bash -c '
+pfaddr() { env PATH="$PB/stubs:$STUBS:$PATH" MEMEX_LOCAL_HOME="$PB/home/.memex-local" MEMEX_HEADLESS=1 MEMEX_PORT=8443 bash -c '
   colima() { return 0; }; kubectl() { case "$*" in *port-forward*) printf "%s\n" "$*" ;; *) return 0 ;; esac; }; export -f colima kubectl
-  sed "s#^exec kubectl#kubectl#" "$1" | bash' _ "$PF" 2>/dev/null | grep -o -- '--address [^ ]*'; }
-[ "$(pfaddr)" = "--address 127.0.0.1,::1" ] && ok "published: the front door binds loopback only" || bad "published front door" "$(pfaddr)"
+  sed "s#^\( *\)exec kubectl#\1kubectl#; s#^exec kubectl#kubectl#" "$1" | bash | grep -m1 port-forward' _ "$PF" 2>/dev/null | grep -o -- '--address .*'; }
+[ "$(pfaddr)" = "--address 127.0.0.1,::1 8443:443" ] && ok "published: the front door binds loopback only, on the unprivileged port alone" || bad "published front door" "$(pfaddr)"
+grep -q '<key>MEMEX_LOCAL_HOME</key>' "$HERE/../share/com.memex.local.plist" && grep -q -- '-e "s|__LOCAL_HOME__|${LOCAL_HOME}|g"' "$CLI" \
+  && ok "the LaunchAgent carries the state directory the forward reads publish.yaml from" || bad "MEMEX_LOCAL_HOME reaches the LaunchAgent" "plist or sed missing"
 pb "$CLI" publish off >/dev/null 2>&1
 [ ! -f "$LAYER" ] && ok "publish off removes the layer" || bad "publish off" "layer still there"
 grep -q -- 'serve --tcp 443 off' "$PB/ts.log" && ok "publish off stops the tailscale serve" || bad "publish off serve" "$(cat "$PB/ts.log")"
-[ "$(pfaddr)" = "--address 0.0.0.0,::" ] && ok "not published: the front door binds every interface (unchanged)" || bad "unpublished front door" "$(pfaddr)"
+[ "$(pfaddr)" = "--address 0.0.0.0,:: 80:80 443:443 8443:443" ] && ok "not published: the front door binds every interface, all three mappings (unchanged)" || bad "unpublished front door" "$(pfaddr)"
 rm -rf "$PB"
 
 echo "── the CLI still knows every command it documents ────────────────"

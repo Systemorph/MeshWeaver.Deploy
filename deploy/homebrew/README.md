@@ -417,8 +417,10 @@ makes the portal also answer at `<name>` through the private network's ingress b
 ingress host (the portal's links keep `memex.localhost`), the Microsoft sign-in for it (a NAMED directory
 only), and invitation-only admission — the first person to sign in becomes the administrator, everyone
 after needs an invitation. The client secret is read from STDIN, never an argument, and never printed.
-While the layer exists the front door (`share/port-forward.sh`) binds **loopback only**, and
-`tailscale serve --tcp 443 tcp://127.0.0.1:443` is the one way in, from the private network. The
+While the layer exists the front door (`share/port-forward.sh`) binds **loopback only, on the
+unprivileged port alone** (macOS allows an unprivileged low-port bind on wildcard addresses only), so
+locally the portal is `https://memex.localhost:<port>` (default 8443), and
+`tailscale serve --tcp 443 tcp://127.0.0.1:<port>` is the one way in, from the private network. The
 development sign-in answers on localhost names only, so a public name always needs a real provider
 (Google, Apple and LinkedIn for a public name are a follow-up: the chart carries no client secret for
 them yet). `publish status` reads it back; `publish off` removes it; `memex-local update` applies either.

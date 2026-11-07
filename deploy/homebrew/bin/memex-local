@@ -149,9 +149,9 @@ readonly FLEET_FILE="$LOCAL_HOME/fleet.yaml"
 # Written by `memex-local publish on`, read by helm_deploy as one more values layer after the fleet layer
 # and before the overlay (an overlay value still wins): the public name as an ADDITIONAL ingress host (the
 # portal's own links keep https://memex.localhost), the sign-in provider declared for it, and
-# invitation-only admission. While it exists the front door binds LOOPBACK only (share/port-forward.sh)
-# and the network reaches it through `tailscale serve` (TCP 443 → 127.0.0.1:443), so nothing on the LAN
-# can reach the portal. Design: MeshWeaver.Plugins Hosting/MacStudioFleet §6.
+# invitation-only admission. While it exists the front door binds LOOPBACK only, on the unprivileged port
+# (share/port-forward.sh), and the network reaches it through `tailscale serve` (TCP 443 → 127.0.0.1:<port>),
+# so nothing on the LAN can reach the portal. Design: MeshWeaver.Plugins Hosting/MacStudioFleet §6.
 readonly PUBLISH_FILE="$LOCAL_HOME/publish.yaml"
 readonly FLEET_DIR="$LOCAL_HOME/enrol"
 readonly FLEET_CODE_PREFIX="mwenrol1."
@@ -782,7 +782,7 @@ cmd_publish() {
       ( umask 077; cat > "$PUBLISH_FILE" ) <<YAML
 # memex-local PUBLIC NAME — managed by \`memex-local publish\`; re-run \`on\` to change, \`off\` to delete.
 # This Mac's portal also answers at https://${host} through the network's ingress bridge. The front door
-# binds loopback only while this file exists; the network reaches it through tailscale serve (TCP 443).
+# binds loopback only (port ${HOST_PORT}) while this file exists; the network reaches it through tailscale serve.
 ingress:
   additionalHosts:
     - "${host}"
@@ -797,11 +797,12 @@ YAML
       chmod 600 "$PUBLISH_FILE"
       unset secret
       ok "public-name layer written: $PUBLISH_FILE (https://${host}, sign-in ${key}${tenant:+ tenant ${tenant}}, invitation-only; the secret is in the file, never printed)"
-      if publish_tailscale serve --bg --tcp 443 tcp://127.0.0.1:443 >/dev/null 2>&1; then
-        ok "the network reaches this Mac's front door on TCP 443 (tailscale serve → 127.0.0.1:443)"
+      if publish_tailscale serve --bg --tcp 443 "tcp://127.0.0.1:${HOST_PORT}" >/dev/null 2>&1; then
+        ok "the network reaches this Mac's front door on TCP 443 (tailscale serve → 127.0.0.1:${HOST_PORT})"
       else
-        warn "could not set up 'tailscale serve --tcp 443 tcp://127.0.0.1:443' — the bridge cannot reach this Mac until it is"
+        warn "could not set up 'tailscale serve --tcp 443 tcp://127.0.0.1:${HOST_PORT}' — the bridge cannot reach this Mac until it is"
       fi
+      info "While published the front door is loopback-only on port ${HOST_PORT}: open https://${HOSTNAME_LOCAL}:${HOST_PORT} locally"
       info "Register the redirect URI on the app: https://${host}/signin-${provider}"
       info "Apply it: memex-local update   (the front door rebinds to loopback; the first person to sign in at https://${host} becomes this instance's administrator — make it yours)"
       ;;
@@ -1708,7 +1709,7 @@ install_launchd() {
     if [ -f "$PF_PID" ] && kill -0 "$(cat "$PF_PID")" 2>/dev/null; then
       ok "port-forward already running (pid $(cat "$PF_PID"))"
     else
-      MEMEX_PORT="$HOST_PORT" MEMEX_LOCAL_SHARE="$share" nohup /bin/bash "$PF_SCRIPT" >> "$PF_LOG" 2>&1 &
+      MEMEX_PORT="$HOST_PORT" MEMEX_LOCAL_SHARE="$share" MEMEX_LOCAL_HOME="$LOCAL_HOME" nohup /bin/bash "$PF_SCRIPT" >> "$PF_LOG" 2>&1 &
       echo $! > "$PF_PID"
       ok "port-forward started (pid $(cat "$PF_PID"), log: $PF_LOG)"
     fi
@@ -1722,6 +1723,7 @@ install_launchd() {
       -e "s|__LOG__|${PF_LOG}|g" \
       -e "s|__PORT__|${HOST_PORT}|g" \
       -e "s|__SHARE__|${share}|g" \
+      -e "s|__LOCAL_HOME__|${LOCAL_HOME}|g" \
       "$share/com.memex.local.plist" > "$PLIST_DST"
   # Reload idempotently.
   launchctl bootout "gui/$(id -u)" "$PLIST_DST" >/dev/null 2>&1 || true
