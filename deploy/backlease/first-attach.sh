@@ -14,7 +14,7 @@
 #   0. pins EVERY kubectl and helm call to the build profile's context (`colima-<profile>`, never the mutable current one) —
 #      and never runs `memex-local up`; CHECKS the profile runs containerd (the docker runtime cannot run a user-namespaced
 #      pod, and without one bwrap cannot mount a fresh /proc — measured on the first Mac, 2026-11-07);
-#      CHECKS before changing anything: KEDA installed and ready, the node's allocatable covers the host's standing replicas (floor × requests),
+#      CHECKS before changing anything: KEDA installed and ready, the node's allocatable, less what its pods already request, covers the host's floor and peak (replicas × requests),
 #      both vault objects readable;
 #   1. loads the `mw-build-host` AppArmor profile (`userns` only) into the Colima VM, persisted under /etc/apparmor.d,
 #      and proves an UNPRIVILEGED user namespace starts under it;
@@ -82,9 +82,11 @@ k get crd scaledobjects.keda.sh -o name >/dev/null 2>&1 \
 k -n keda wait --for=condition=Available deployment --all --timeout=20s >/dev/null 2>&1 \
   || { echo "ERROR: KEDA's deployments in namespace keda are not Available. Nothing was changed." >&2; exit 1; }
 alloc="$(k get nodes -o jsonpath='{.items[0].status.allocatable.cpu} {.items[0].status.allocatable.memory}')"
-# The declared FLOOR (every enabled channel's minReplicas) times one replica's requests must fit the one node — checking a
-# single replica passed a VM that left the second standing replica Pending for good.
-python3 "$here/host-fits-node.py" "$alloc" "$here/build-host-mac.values.yaml" || { echo "Nothing was changed." >&2; exit 1; }
+# The declared FLOOR (every enabled channel's minReplicas) and the PEAK (their maxReplicas), each times one replica's
+# requests, must fit what the one node has left after the pods already on it (k3s, KEDA) — checking a single replica
+# passed a VM that left the second standing replica Pending for good.
+k get pods -A -o json | python3 "$here/host-fits-node.py" "$alloc" "$here/build-host-mac.values.yaml" --pods-json - \
+  || { echo "Nothing was changed." >&2; exit 1; }
 # The vault reads happen BEFORE any apply, so a failed read never replaces a working Secret with an empty one.
 worker_value="$(az keyvault secret show --vault-name "$vault" --name "$worker" --query value -o tsv)" \
   && [ -n "$worker_value" ] || { echo "ERROR: could not read the worker token $worker from $vault. Nothing was changed." >&2; exit 1; }
