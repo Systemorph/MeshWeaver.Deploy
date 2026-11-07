@@ -31,7 +31,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.1.0"
+readonly FLEET_BOOTSTRAP_VERSION="1.2.0"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -96,7 +96,9 @@ machine_id() {
 # Runs as the console user with that user's HOME and Homebrew on PATH.
 as_user() {
   local user="$1" home; shift; home="$(user_home "$user")"
-  run sudo -u "$user" -H env HOME="$home" PATH="$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$@"
+  # the root-owned tailscale client is on the user's PATH too (execute-only for them): memex-local's network
+  # check and `publish on` need it, and it talks to the root daemon's socket
+  run sudo -u "$user" -H env HOME="$home" PATH="$BREW_PREFIX/bin:$TS_DIR/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$@"
 }
 
 # The LaunchDaemon that runs tailscaled as root at boot. Pure: prints the plist.
@@ -177,14 +179,19 @@ step_tailscale_binaries() {
     && printf '%s\n' "$version" > "$TS_DIR/VERSION" \
     || { rm -rf "$tmp"; log "tailscale: FAILED (download, checksum or install)"; return 1; }
   rm -rf "$tmp"
+  TS_CHANGED=1
+  # the user-facing CLI on every PATH, as a root-owned link to the root-owned binary
+  install -d -o root -g wheel -m 0755 /usr/local/bin 2>/dev/null || true
+  [ "$(stat -f%Su /usr/local/bin 2>/dev/null)" = "root" ] && ln -sf "$TS_DIR/bin/tailscale" /usr/local/bin/tailscale
 }
 
 step_tailscaled() {
   local want; want="$(tailscaled_plist)"
-  if [ -f "$TAILSCALED_PLIST" ] && [ "$(cat "$TAILSCALED_PLIST")" = "$want" ] && [ -S "$TAILSCALED_SOCKET" ]; then
+  # an upgraded binary (this run) must be RELOADED: the running daemon would otherwise keep the old one
+  if [ "${TS_CHANGED:-0}" != "1" ] && [ -f "$TAILSCALED_PLIST" ] && [ "$(cat "$TAILSCALED_PLIST")" = "$want" ] && [ -S "$TAILSCALED_SOCKET" ]; then
     log "tailscaled: running as a root daemon ($TAILSCALED_LABEL, $TAILSCALED_SOCKET)"; return 0
   fi
-  log "tailscaled: installing the root LaunchDaemon $TAILSCALED_LABEL (socket $TAILSCALED_SOCKET)"
+  log "tailscaled: (re)loading the root LaunchDaemon $TAILSCALED_LABEL (socket $TAILSCALED_SOCKET)"
   run mkdir -p "$TAILSCALED_STATE_DIR" "$(dirname "$TAILSCALED_PLIST")" || return 1
   if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then printf 'DRY-RUN: write %s\n' "$TAILSCALED_PLIST"
   else printf '%s\n' "$want" > "$TAILSCALED_PLIST" && chmod 644 "$TAILSCALED_PLIST" && chown root:wheel "$TAILSCALED_PLIST" || return 1; fi
@@ -207,6 +214,11 @@ step_network() {
   run rm -f "$key_file"
 }
 
+# Whether a CA certificate is trusted for SSL by the system (the System keychain's trust settings). Pure read.
+ca_trusted() {
+  security verify-cert -c "$1" -p ssl >/dev/null 2>&1
+}
+
 step_memex() {
   local user="$1" machine="$2" control registry home code_file out rc mlocal
   control="$(setting FLEET_CONTROL_URL ControlUrl)"; registry="$(setting FLEET_REGISTRY_URL RegistryUrl)"
@@ -218,17 +230,32 @@ step_memex() {
     log "memex: registry mode ($registry)"
     as_user "$user" "$mlocal" registry "$registry" >/dev/null 2>&1 || { log "memex: FAILED to set registry mode"; return 1; }
   fi
+  # The local CA: `memex-local up` runs `mkcert -install`, whose System-keychain step needs an interactive
+  # authorisation an unattended run cannot give. So the CA is CREATED here without touching the keychain
+  # (TRUST_STORES=nss), and `up` waits until it is trusted — by the device-management layer (a certificate
+  # payload of the com.memex.local profile carrying this public CA certificate) or by a person running
+  # `mkcert -install` once. Nothing here runs the user-owned mkcert as root.
+  local caroot; caroot="$(as_user "$user" env TRUST_STORES=nss "$BREW_PREFIX/bin/mkcert" -CAROOT 2>/dev/null || true)"
+  if [ -n "$caroot" ] && [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" != "1" ] && [ ! -f "$caroot/rootCA.pem" ]; then
+    as_user "$user" env TRUST_STORES=nss "$BREW_PREFIX/bin/mkcert" -install >/dev/null 2>&1 || true
+  fi
+  if [ -n "$caroot" ] && [ -f "$caroot/rootCA.pem" ] && ! ca_trusted "$caroot/rootCA.pem"; then
+    log "memex: WAITING for the local CA to be trusted ($caroot/rootCA.pem, public) — deploy it as a certificate payload, or run 'mkcert -install' once as $user"
+    return 0
+  fi
   # the stack is provisioned when it VERIFIES usable, not when the VM merely runs — `up` is retried until it does
   if ! as_user "$user" "$mlocal" verify >/dev/null 2>&1; then
     log "memex: provisioning the local stack (memex-local up)"
     as_user "$user" "$mlocal" up >/dev/null 2>&1 || { log "memex: 'memex-local up' FAILED — retried next run"; return 1; }
   fi
   if [ -f "$home/.memex-local/fleet.yaml" ]; then
-    # joined: resume a finalisation an earlier run did not finish, from the stored credentials (no new code)
-    if [ ! -f "$home/.memex-local/backlease.yaml" ]; then
-      log "memex: joined as $machine — finishing: back-lease enrolment"
+    # joined: resume a finalisation an earlier run did not finish, from the stored credentials (no new code).
+    # Completion is a MARKER written only after BOTH steps succeeded — backlease.yaml alone proves nothing.
+    if [ ! -f "$home/.memex-local/fleet.finalized" ]; then
+      log "memex: joined as $machine — finishing: back-lease enrolment and the update"
       as_user "$user" "$mlocal" backlease enroll --control "$control" --deployment "$machine" >/dev/null 2>&1 || { log "memex: back-lease enrolment FAILED — retried next run"; return 1; }
       as_user "$user" "$mlocal" update >/dev/null 2>&1 || { log "memex: 'memex-local update' FAILED — retried next run"; return 1; }
+      as_user "$user" /usr/bin/touch "$home/.memex-local/fleet.finalized" || return 1
     fi
     log "memex: joined as $machine, finished"; return 0
   fi
@@ -237,7 +264,7 @@ step_memex() {
   out="$(as_user "$user" "$mlocal" fleet join --control "$control" --id "$machine" --no-open --code-file "$code_file" 2>&1)"; rc=$?
   printf '%s\n' "$out" | grep -E 'https://|fingerprint|joined as|WAITING|waiting' | while IFS= read -r l; do log "memex: $l"; done
   case "$rc" in
-    0) log "memex: joined as $machine" ;;
+    0) as_user "$user" /usr/bin/touch "$home/.memex-local/fleet.finalized" || true; log "memex: joined as $machine" ;;
     3) log "memex: WAITING for the approval on control and the enrolment code at $code_file" ;;
     *) log "memex: fleet join FAILED (exit $rc)"; return 1 ;;
   esac
