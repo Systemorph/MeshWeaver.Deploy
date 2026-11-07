@@ -1,9 +1,28 @@
 {{- if eq (include "memex.portal.enabled" .) "true" -}}
 {{- if .Values.ingress.enabled }}
 {{- $tls := .Values.ingress.tlsSecret | default "" }}
+{{- /* ingress.additionalHosts: further names the SAME portal answers at (e.g. a public name reached
+       through the private network's ingress bridge, deploy/tailnet-bridge). Every Ingress below
+       carries every host with the same paths; the TLS block lists them all with the one Secret. */}}
+{{- $hosts := prepend (.Values.ingress.additionalHosts | default list) .Values.ingress.host | uniq }}
+{{- range $h := (.Values.ingress.additionalHosts | default list) }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" (toString $h)) }}
+{{- fail (printf "ingress host %q is not a lower-case DNS name (ingress.additionalHosts)" (toString $h)) }}
+{{- end }}
+{{- end }}
 {{- $issuer := .Values.ingress.clusterIssuer | default "" }}
 {{- $handWritten := hasKey (.Values.ingress.annotations | default dict) "cert-manager.io/cluster-issuer" }}
-{{- if and $tls (not $issuer) (not $handWritten) }}
+{{- /* ingress.tlsFromKeyVault (MeshWeaver.Deploy#130): the CSI driver creates the Secret from a vault
+       certificate. That IS an issuer reaching the ingress — and it must be the ONLY one: cert-manager
+       writing the same Secret would race the driver, each overwriting the other's certificate. */}}
+{{- $fromVault := (include "memex.ingressTlsFromKeyVault" . | fromYaml).certificate }}
+{{- /* The namespaced `cert-manager.io/issuer` annotation is a writer too: ingress.annotations is copied
+       onto the Ingress, so cert-manager would issue into the CSI-managed Secret just the same. */}}
+{{- $handWrittenNamespaced := hasKey (.Values.ingress.annotations | default dict) "cert-manager.io/issuer" }}
+{{- if and $fromVault (or (and $issuer (ne $issuer "none")) $handWritten $handWrittenNamespaced) }}
+{{- fail (printf "ingress.tlsFromKeyVault.certificate is %q AND a cert-manager issuer is set for the same Secret %q. Pick ONE writer: the CSI driver (from the vault) or cert-manager — two writers overwrite each other's certificate. Leave ingress.clusterIssuer empty (or none), and set neither cert-manager.io/cluster-issuer nor cert-manager.io/issuer in ingress.annotations, when the certificate comes from Key Vault." $fromVault $tls) }}
+{{- end }}
+{{- if and $tls (not $issuer) (not $handWritten) (not $fromVault) }}
 {{- fail (printf "ingress.tlsSecret is %q but NO issuer reaches the ingress. Set ingress.clusterIssuer (the fleet's is letsencrypt-prod), or ingress.clusterIssuer=none when that Secret is created by other means. An ingress naming a TLS secret nobody issues serves ANOTHER host's certificate: fabrikam.example.com served CN=memex.meshweaver.cloud for nine hours on 2026-09-15." $tls) }}
 {{- end }}
 # ---- Portal Ingress (TLS termination at the ingress controller) ------------
@@ -60,7 +79,11 @@ metadata:
     {{- if and $issuer (ne $issuer "none") (not $handWritten) }}
     cert-manager.io/cluster-issuer: {{ $issuer | quote }}
     {{- end }}
-    {{- if eq $issuer "none" }}
+    {{- if $fromVault }}
+    # This Secret is created and rotated by the Key Vault CSI driver from a vault certificate
+    # (ingress.tlsFromKeyVault; the SecretProviderClass is in ingress-tls-secretproviderclass.yaml).
+    meshweaver.io/tls-secret: "key-vault"
+    {{- else if eq $issuer "none" }}
     # Deliberate: this Secret is created by other means. Written down so a reader of the live
     # object can tell an opt-out from a forgotten issuer.
     meshweaver.io/tls-secret: "pre-provisioned"
@@ -72,13 +95,16 @@ spec:
   ingressClassName: {{ .Values.ingress.className | quote }}
   tls:
     - hosts:
-        - {{ .Values.ingress.host | quote }}
+        {{- range $h := $hosts }}
+        - {{ $h | quote }}
+        {{- end }}
       secretName: {{ .Values.ingress.tlsSecret | quote }}
   rules:
-    - host: {{ .Values.ingress.host | quote }}
+{{- range $h := $hosts }}
+    - host: {{ $h | quote }}
       http:
         paths:
-{{- $nextMode := include "memex.portalNext.mode" . }}
+{{- $nextMode := include "memex.portalNext.mode" $ }}
 {{- if ne $nextMode "off" }}
           # ---- Next.js React GUI (FEATURE-FLAGGED — see .Values.portalNext) ---
           # nginx matches the LONGEST prefix first regardless of order, so /next/*
@@ -108,7 +134,8 @@ spec:
               service:
                 name: "memex-portal-service"
                 port:
-                  number: {{ .Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+                  number: {{ $.Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+{{- end }}
 {{- if (.Values.grpc).enabled }}
 # ---- Native gRPC on the SAME host (backend-protocol is per-Ingress-resource) ----
 # ONLY the bidi participant connection (meshweaver.v1.Mesh/Open) is native gRPC — a second Ingress
@@ -136,10 +163,13 @@ spec:
   ingressClassName: {{ .Values.ingress.className | quote }}
   tls:
     - hosts:
-        - {{ .Values.ingress.host | quote }}
+        {{- range $h := $hosts }}
+        - {{ $h | quote }}
+        {{- end }}
       secretName: {{ .Values.ingress.tlsSecret | quote }}
   rules:
-    - host: {{ .Values.ingress.host | quote }}
+{{- range $h := $hosts }}
+    - host: {{ $h | quote }}
       http:
         paths:
           - path: "/meshweaver.v1.Mesh/Open"
@@ -148,7 +178,8 @@ spec:
               service:
                 name: "memex-portal-service"
                 port:
-                  number: {{ .Values.grpc.port }}
+                  number: {{ $.Values.grpc.port }}
+{{- end }}
 {{- end }}
 # ---- MCP + its OAuth flow pinned to ONE pod (stateful per-pod sessions) ------
 # /mcp (Streamable HTTP) and its OAuth endpoints (/register /authorize /token) keep session +
@@ -176,10 +207,13 @@ spec:
   ingressClassName: {{ .Values.ingress.className | quote }}
   tls:
     - hosts:
-        - {{ .Values.ingress.host | quote }}
+        {{- range $h := $hosts }}
+        - {{ $h | quote }}
+        {{- end }}
       secretName: {{ .Values.ingress.tlsSecret | quote }}
   rules:
-    - host: {{ .Values.ingress.host | quote }}
+{{- range $h := $hosts }}
+    - host: {{ $h | quote }}
       http:
         paths:
           - path: "/mcp"
@@ -188,27 +222,28 @@ spec:
               service:
                 name: "memex-portal-service"
                 port:
-                  number: {{ .Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+                  number: {{ $.Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
           - path: "/register"
             pathType: "Prefix"
             backend:
               service:
                 name: "memex-portal-service"
                 port:
-                  number: {{ .Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+                  number: {{ $.Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
           - path: "/authorize"
             pathType: "Prefix"
             backend:
               service:
                 name: "memex-portal-service"
                 port:
-                  number: {{ .Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+                  number: {{ $.Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
           - path: "/token"
             pathType: "Prefix"
             backend:
               service:
                 name: "memex-portal-service"
                 port:
-                  number: {{ .Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+                  number: {{ $.Values.config.memex_portal.ASPNETCORE_HTTP_PORTS | default 8080 }}
+{{- end }}
 {{- end }}
 {{- end }}

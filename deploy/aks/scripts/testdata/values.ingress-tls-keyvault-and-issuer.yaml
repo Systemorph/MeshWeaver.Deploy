@@ -1,0 +1,14 @@
+# REFUSAL: a vault-synced TLS Secret AND a cert-manager issuer for the same Secret. Two writers
+# overwrite each other's certificate, so the chart must refuse the render (MeshWeaver.Deploy#130).
+ingress:
+  enabled: true
+  className: "nginx-internal"
+  host: "portal.example.com"
+  tlsSecret: "portal-tls"
+  clusterIssuer: "letsencrypt-prod"
+  tlsFromKeyVault:
+    certificate: "portal-example-com"
+keyVaultSecrets:
+  vaultName: "kv-example"
+  tenantId: "00000000-0000-0000-0000-000000000000"
+  identityClientId: "11111111-1111-1111-1111-111111111111"

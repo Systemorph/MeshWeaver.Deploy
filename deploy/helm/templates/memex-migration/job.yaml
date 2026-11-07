@@ -61,6 +61,7 @@ spec:
         - name: "{{ .Values.portal.imagePullSecret }}"
 {{- end }}
       initContainers:
+        {{- with (include "memex.trustedCa.initContainer" (dict "root" $ "image" .Values.portal.image)) }}{{- . | nindent 8 }}{{- end }}
         # Postgres and the migration can start concurrently on a fresh install; gate on Postgres
         # TCP readiness so the migration doesn't fail-fast before the DB accepts connections.
         #
@@ -97,6 +98,7 @@ spec:
               value: "rehearse"
             - name: "MIGRATION_BUDGET_MINUTES"
               value: {{ .Values.migration.budgetMinutes | int | quote }}
+            {{- with (include "memex.trustedCa.env" $) }}{{- . | nindent 12 }}{{- end }}
           envFrom:
             - configMapRef:
                 name: "memex-migration-config"
@@ -108,13 +110,15 @@ spec:
                 optional: true
             {{- end }}
           {{- $rehearsalClasses := (include "memex.keyVaultClasses" . | fromYamlArray) }}
-          {{- if $rehearsalClasses }}
+          {{- $rehearsalTrustedCa := (include "memex.trustedCa" . | fromYaml) }}
+          {{- if or $rehearsalClasses $rehearsalTrustedCa.enabled }}
           volumeMounts:
             {{- range $class := $rehearsalClasses }}
             - name: "{{ $class.volumeName }}"
               mountPath: "{{ $class.mountPath }}"
               readOnly: true
             {{- end }}
+            {{- with (include "memex.trustedCa.mount" $) }}{{- . | nindent 12 }}{{- end }}
           {{- end }}
         {{- end }}
       containers:
@@ -124,6 +128,7 @@ spec:
             {{- include "memex.dbReleaseEnv" (dict "root" $ "half" "memex_migration") | nindent 12 }}
             - name: "MIGRATION_BUDGET_MINUTES"
               value: {{ .Values.migration.budgetMinutes | int | quote }}
+            {{- with (include "memex.trustedCa.env" $) }}{{- . | nindent 12 }}{{- end }}
           envFrom:
             - configMapRef:
                 name: "memex-migration-config"
@@ -213,7 +218,8 @@ spec:
                  name. Rendered only when a class is declared — a namespace with no Key Vault gets
                  the pod spec it had before. */}}
           {{- $keyVaultClasses := (include "memex.keyVaultClasses" . | fromYamlArray) }}
-          {{- if or $keyVaultClasses .Values.extraVolumeMounts }}
+          {{- $trustedCa := (include "memex.trustedCa" . | fromYaml) }}
+          {{- if or $keyVaultClasses .Values.extraVolumeMounts $trustedCa.enabled }}
           volumeMounts:
             {{- range $class := $keyVaultClasses }}
             - name: "{{ $class.volumeName }}"
@@ -229,8 +235,9 @@ spec:
             {{- range .Values.extraVolumeMounts }}
             - {{ toYaml . | nindent 14 | trim }}
             {{- end }}
+            {{- with (include "memex.trustedCa.mount" $) }}{{- . | nindent 12 }}{{- end }}
           {{- end }}
-      {{- if or $keyVaultClasses .Values.extraVolumes }}
+      {{- if or $keyVaultClasses .Values.extraVolumes $trustedCa.enabled }}
       volumes:
         {{- range $class := $keyVaultClasses }}
         - name: "{{ $class.volumeName }}"
@@ -246,5 +253,6 @@ spec:
         {{- range .Values.extraVolumes }}
         - {{ toYaml . | nindent 10 | trim }}
         {{- end }}
+        {{- with (include "memex.trustedCa.volumes" $) }}{{- . | nindent 8 }}{{- end }}
       {{- end }}
 {{- end }}

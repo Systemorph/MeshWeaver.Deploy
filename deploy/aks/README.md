@@ -554,6 +554,59 @@ curl -sS -o /dev/null -w "%{http_code} verify=%{ssl_verify_result}\n" \
   --resolve <host>:443:$IP https://<host>/
 ```
 
+### TLS from a Key Vault certificate (an estate on its own ingress-nginx)
+
+The `kubernetes.azure.com/tls-cert-keyvault-uri` annotation is read only by the AKS app routing
+add-on. An estate whose Ingress objects are served by its own ingress-nginx controllers has nothing
+that turns that annotation into a Secret. For that estate, name the vault certificate in the
+overlay and the chart has the Key Vault CSI driver create the Secret:
+
+```yaml
+ingress:
+  tlsSecret: "portal-tls"
+  clusterIssuer: ""                       # or "none"; never an issuer: one writer per Secret
+  tlsFromKeyVault:
+    certificate: "portal-example-com"     # the vault CERTIFICATE object's name
+# vault, tenant and reader identity fall back to keyVaultSecrets.*
+```
+
+The chart renders a SecretProviderClass with a `kubernetes.io/tls` secret object named
+`ingress.tlsSecret`. Its `tls.key` and `tls.crt` both come from the certificate read as a secret,
+which is its PEM bundle with the full chain, so the served chain includes the intermediate. The
+portal pod mounts that class, because the driver creates and refreshes the Secret only while a pod
+mounts it. A fresh or reset namespace gets the Secret from the chart alone. A new version of the
+vault certificate reaches the Secret on the driver's rotation poll with no deploy, provided the
+cluster's Key Vault Secrets Provider runs with secret rotation enabled. The reader identity needs
+secret GET on the vault. The chart refuses the render when a cert-manager issuer is also set.
+
+### Trusting the estate's own certificate authority (MeshWeaver.Deploy#138)
+
+The certificate above is what the instance PRESENTS. When it is issued by the estate's internal CA,
+the pods must also TRUST that CA, or every TLS call they make to such a host fails with *"The SSL
+connection could not be established"*: the self-updater's hand-over to a private control host, the
+control instance's probe of a working instance's public `/health`, and a database behind a
+certificate from the same CA (otherwise reachable only with `TrustServerCertificate=True`).
+
+```yaml
+trustedCertificateAuthorities:
+  secret: "internal-ca"    # a Secret the estate creates, e.g. synced by a keyVaultSecrets class
+  # configMap: "internal-ca"   # or a ConfigMap
+  # pem: |                     # or inline: a CA certificate is public material
+  #   -----BEGIN CERTIFICATE-----
+```
+
+How it works, and why the system roots stay: .NET on Linux reads OpenSSL's default certificate FILE
+and DIRECTORY, and `SSL_CERT_FILE` / `SSL_CERT_DIR` each REPLACE one of them, so pointing either at
+the estate's bundle alone would drop the public roots. Instead a `trusted-ca-bundle` init container
+(the portal image) writes one file, the image's system bundle (`systemBundle`, default
+`/etc/ssl/certs/ca-certificates.crt`) followed by every declared PEM, into a pod-local emptyDir. The
+portal, the migration Job and its rehearsal read that file through `SSL_CERT_FILE`. `SSL_CERT_DIR`
+stays unset, so the default directory is read as well. The init container refuses to start the pod
+when the system bundle is missing or a declared source holds no certificate. Declaring nothing
+renders nothing. `check-chart-invariants.sh` (invariant 22 and the evidence check after it) holds the
+shape. A changed ConfigMap or Secret reaches a pod when it next starts. An inline `pem` edit rolls
+the pods by itself.
+
 ### Default SSL certificate (cluster-wide, one-time)
 
 Without it, any client that connects **without SNI** gets the self-signed
@@ -811,6 +864,29 @@ az aks command invoke -g <rg> -n <cluster> --command \
 #    published tags before step 4 and pick one; a tag you did not see in the registry is not a
 #    tag you can deploy:
 az acr repository show-tags -n <acrName> --repository memex-log-watcher -o tsv
+#    Pin a <major>.<minor>.<patch> tag. The lane derives it as the highest published version
+#    plus one, so it only moves forward. :latest moves on every publish (it is the declared
+#    moving label in core's .github/release-channels.json), and :<sha7> names a Plugins commit
+#    rather than a release.
+#
+#    🌐 An estate that pulls ONLY from the fleet registry (<fleet-registry>, with its
+#    `<prefix>PluginCatalog-RegistryToken` instance key) reads the SAME image there: the lane
+#    copies every tag to the fleet registry by digest (same manifest, read back). The fleet
+#    registry has its own storage and is not a read-through cache of the ACR, so this push is the
+#    only way the image reaches it. List the tags with a registry-aware client, which performs
+#    the bearer-token exchange the registry requires (any account name, the instance key as the
+#    password):
+#      crane auth login <fleet-registry> -u instance -p "$INSTANCE_KEY"
+#      crane ls <fleet-registry>/memex-log-watcher
+#    A raw `GET /v2/memex-log-watcher/tags/list` with the key as a Basic-auth password answers
+#    401: the registry accepts only a bearer token. Over plain HTTP, first exchange the key at
+#    the realm the 401's `WWW-Authenticate` header names (realm `https://<fleet-registry>/auth`, service `<fleet-registry>`):
+#      curl -u "instance:$INSTANCE_KEY" \
+#        "https://<fleet-registry>/auth?service=<fleet-registry>&scope=repository:memex-log-watcher:pull"
+#    and send the returned `token` as `Authorization: Bearer <token>` on the tags/list GET.
+#    Then pin a version tag in the estate's mirror lane and manifest. No per-key grant is needed: the registry ACL lets any
+#    authenticated instance key pull any image repository outside `plugins/` (the last rule in
+#    deploy/helm/templates/registry/configmap.yaml).
 
 # 4. Apply the Deployment + PVC (edit the image tag + watched namespaces in the manifest first).
 az aks command invoke -g <rg> -n <cluster> \

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# A stand-in `kubectl` for hosting-tailnet-key. It plays ONE headscale release in one namespace:
+#
+#   HOSTING_TK_STATE     directory: kubectl.log (every argv)
+#   HOSTING_TK_PODS      the running pods `get pods -o name` lists (space-separated; default: headscale-abc)
+#   HOSTING_TK_POLICY    the policy.hujson the ConfigMap holds (default: one declaring tag:observability)
+#   HOSTING_TK_ANSWER    what `headscale preauthkeys create … -o json` prints: normal (default) | reusable |
+#                        ephemeral | wrongtags | nokey | refuse
+#   HOSTING_TK_EXPIRE    ok (default) | fail — the `preauthkeys expire` answer
+set -uo pipefail
+state="${HOSTING_TK_STATE:?the kubectl stub needs HOSTING_TK_STATE}"
+printf 'kubectl %s\n' "$*" >> "$state/kubectl.log"
+policy_default='{
+  // reviewed policy
+  "groups": { "group:admins": ["admin@example.com"] },
+  "tagOwners": {
+    "tag:observability": ["group:admins"], // the dashboard node
+  },
+  "acls": [ { "action": "accept", "src": ["group:admins"], "dst": ["tag:observability:80,443"] }, ],
+}'
+case "$*" in
+  *"get pods "*"-o name"*)
+    for p in ${HOSTING_TK_PODS-headscale-abc}; do echo "pod/$p"; done; exit 0 ;;
+  *"get pod "*"-o json"*)
+    echo '{"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"headscale-data"}},{"name":"config","configMap":{"name":"headscale"}}]}}'; exit 0 ;;
+  *"get configmap headscale -o json"*)
+    jq -n --arg p "${HOSTING_TK_POLICY-$policy_default}" '{data: {"config.yaml": "server_url: x", "policy.hujson": $p}}'; exit 0 ;;
+  *" exec "*"preauthkeys create"*)
+    tags="$(printf '%s' "$*" | sed -E 's/.*--tags ([^ ]+).*/\1/')"
+    tag_json="$(printf '%s' "$tags" | tr ',' '\n' | jq -R . | jq -cs .)"
+    case "${HOSTING_TK_ANSWER:-normal}" in
+      refuse)    echo 'Error: creating preauthkey: rpc error: database is locked' >&2; exit 1 ;;
+      nokey)     echo '{"id": 7, "acl_tags": '"$tag_json"'}'; exit 0 ;;
+      reusable)  echo '{"id": 7, "key": "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef", "reusable": true, "expiration": {"seconds": 1794073226}, "acl_tags": '"$tag_json"'}'; exit 0 ;;
+      ephemeral) echo '{"id": 7, "key": "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef", "ephemeral": true, "expiration": {"seconds": 1794073226}, "acl_tags": '"$tag_json"'}'; exit 0 ;;
+      wrongtags) echo '{"id": 7, "key": "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef", "expiration": {"seconds": 1794073226}, "acl_tags": ["tag:other"]}'; exit 0 ;;
+      *)         echo '{"id": 7, "key": "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef", "expiration": {"seconds": 1794073226}, "created_at": {"seconds": 1794066026}, "acl_tags": '"$tag_json"'}'; exit 0 ;;
+    esac ;;
+  *" exec "*"preauthkeys expire --id "*)
+    [ "${HOSTING_TK_EXPIRE:-ok}" = "ok" ] && exit 0
+    echo 'Error: expiring preauthkey: not found' >&2; exit 1 ;;
+esac
+echo "kubectl stub: unexpected invocation: $*" >&2
+exit 1

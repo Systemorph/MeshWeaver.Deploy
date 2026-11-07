@@ -46,10 +46,15 @@
 #  18. the operator EXECUTOR renders whatever `enabled` says  or Actions never reaches the pod that
 #                                                             switched the operator Job off
 #  19. an ingress naming a tlsSecret names an ISSUER for it   or the host is served another
-#                                                             instance's certificate (chart refusal)
+#      (cert-manager, `none`, or a Key Vault certificate      instance's certificate (chart refusal)
+#      synced by the CSI driver — never two of them)
 #  20. a crash dump lands in <root>/$(MEMEX_POD_NAME)/ on a    or every roll deletes the dump (the
 #      dedicated claim or /data, root normalised, and the     09-26 and 10-07 dumps were lost so)
 #      retention script runs as init container AND postStart
+#  22. additional trusted CAs: SSL_CERT_FILE only ever names  or a pod trusts only the estate's CA
+#      the bundle trusted-ca-bundle wrote FIRST from the       (every public call fails) or nothing;
+#      system CAs + the estate's, mounted; no SSL_CERT_DIR;    the migration's DB TLS diverges
+#      the portal and the migration Job agree
 #  21. /next renders ONE whole shape: bundled (portal config, or /next 503s, or a second
 #      container + Service `next` ports, ingress to them, no     server is left behind by a roll
 #      portal-next Deployment) or the override (its own         (policy portal-next-in-platform-image)
@@ -158,6 +163,13 @@ COMBOS=(
   # opt-out shape is here too, because "no issuer" must be a statement, never an omission.
   "a public host issued by cert-manager (fixture)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.ingress-issuer.yaml"
   "a host whose TLS Secret is pre-provisioned (fixture)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.ingress-preprovisioned.yaml"
+  # MeshWeaver.Deploy#130: an estate on its own ingress-nginx, no app routing add-on. The TLS Secret
+  # comes from a Key Vault certificate through the CSI driver — the only combination that renders
+  # the ingress-tls SecretProviderClass; the evidence check below reads it by name.
+  "a host whose TLS Secret is synced from Key Vault (fixture)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.ingress-tls-keyvault.yaml"
+  # The same, with a certificate whose valid vault name reads as a YAML number. The evidence check
+  # below asserts every objectName stays the string "2026" — unquoted it is an integer the API rejects.
+  "a host whose TLS Secret is synced from a numeric-named Key Vault certificate (fixture)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.ingress-tls-keyvault-numeric-name.yaml"
   # 🚨 Cookie session affinity as the RECORD renders it (MeshWeaver#6825): HelmValues writes the typed
   # block under ingress.sessionAffinity.*, which the chart did not read, so a record-only render
   # dropped affinity from every multi-replica Blazor portal. The evidence check below the loop reads
@@ -213,6 +225,10 @@ COMBOS=(
   # the hosts — a build host must not perturb the portal's shape. Its own shape and refusals are
   # asserted by test-build-hosts.sh.
   "the standing build hosts, both channels (fixture)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.build-hosts.yaml"
+  # MeshWeaver.Deploy#138: an estate with private hosts and an internal CA. The only combination that
+  # renders the trusted-ca-bundle init container, so without it invariant 22 has no subject; the
+  # evidence check below asserts which containers read the bundle.
+  "AKS overlay + an internal CA trusted from all three sources (fixture)|deploy/helm/values.yaml:deploy/aks/values.aks.yaml:deploy/aks/scripts/testdata/values.trusted-ca.yaml"
 )
 
 WORK="$(mktemp -d)"
@@ -365,6 +381,50 @@ else
   report "plugin source credentials: the fixture must render exactly Sources__1__TokenKey=\"PluginCatalog:SourceTokens:Extensions\" and Sources__2__InstallationOwner=\"fabrikam\" (trimmed), Sources__3__TokenKey=\"\" (a blank tokenKey is a DECLARATION the portal refuses — dropping it reads the repository with the instance's App or anonymously), NO credential key for the undeclared source 0 and the null tokenKey of source 4, and the chart defaults must render none"
 fi
 
+# The trusted-CA evidence (MeshWeaver.Deploy#138). Read by NAME: invariant 22 holds just as well when
+# NO render carries the bundle, so the fixture must render it on the portal, the migration and its
+# rehearsal, from all three sources, with the inline ConfigMap; and the chart defaults must render
+# none of it, so an estate that declares nothing is unchanged.
+ca_render="$(render_of "AKS overlay + an internal CA trusted from all three sources (fixture)")"
+if [ -f "$ca_render" ] && [ -f "$defaults_render" ] && python3 - "$ca_render" "$defaults_render" <<'PY'
+import sys, yaml
+def docs(p):
+    return [d for d in yaml.safe_load_all(open(p)) if d]
+def pods(ds):
+    out = {}
+    for d in ds:
+        comp = ((d.get("metadata") or {}).get("labels") or {}).get("app.kubernetes.io/component")
+        if d.get("kind") in ("Deployment", "Job") and comp in ("memex-portal", "memex-migration") \
+                and d["metadata"]["name"] != "portal-next-deployment":
+            out[comp] = d["spec"]["template"]["spec"]
+    return out
+def readers(spec):
+    return sorted(c["name"] for c in (spec.get("initContainers") or []) + spec["containers"]
+                  if any(e.get("name") == "SSL_CERT_FILE" for e in (c.get("env") or [])))
+on, off = docs(sys.argv[1]), docs(sys.argv[2])
+p_on, p_off = pods(on), pods(off)
+assert readers(p_on["memex-portal"]) == ["memex-portal"], readers(p_on["memex-portal"])
+assert readers(p_on["memex-migration"]) == ["memex-migration", "memex-migration-rehearsal"], readers(p_on["memex-migration"])
+for spec in p_on.values():
+    vols = {v["name"]: v for v in spec["volumes"]}
+    assert vols["trusted-ca-inline"]["configMap"]["name"] == "memex-trusted-ca", vols
+    assert vols["trusted-ca-configmap"]["configMap"]["name"] == "estate-internal-ca", vols
+    assert vols["trusted-ca-secret"]["secret"]["secretName"] == "estate-internal-ca-kv", vols
+    assert "trusted-ca-bundle" in [c["name"] for c in spec["initContainers"]], spec["initContainers"]
+cm = [d for d in on if d.get("kind") == "ConfigMap" and d["metadata"]["name"] == "memex-trusted-ca"]
+assert cm and "BEGIN CERTIFICATE" in cm[0]["data"]["ca.crt"], cm
+for spec in p_off.values():
+    names = [c["name"] for c in (spec.get("initContainers") or []) + spec["containers"]]
+    assert "trusted-ca-bundle" not in names and not readers(spec), names
+    assert not any(v["name"].startswith("trusted-ca") for v in (spec.get("volumes") or [])), spec.get("volumes")
+assert not any(d.get("kind") == "ConfigMap" and d["metadata"]["name"] == "memex-trusted-ca" for d in off)
+PY
+then
+  ok "an internal CA reaches the portal, the migration and its rehearsal through ONE bundle built from the system CAs plus all three sources; the defaults render none of it"
+else
+  report "trustedCertificateAuthorities: the fixture must render the trusted-ca-bundle init container on the portal and the migration Job, SSL_CERT_FILE on memex-portal, memex-migration and memex-migration-rehearsal, a volume per source and the memex-trusted-ca ConfigMap — and the chart defaults none of it (MeshWeaver.Deploy#138)"
+fi
+
 # The session-affinity evidence (MeshWeaver#6825). Read by NAME: the record's typed block must reach
 # the portal Ingress — `affinity: cookie` and the cookie name derived from the typed fields,
 # nginxAnnotations over both, ingress.annotations over everything, the AGIC map NOT rendered — and a
@@ -411,6 +471,69 @@ else
   report "ingress.sessionAffinity: the portal Ingress must carry affinity=cookie and the cookie name when the block is enabled, nginxAnnotations over them, ingress.annotations over all, no AGIC annotation, and NONE of it when disabled — a record-only render otherwise drops cookie affinity (MeshWeaver#6825)"
 fi
 
+# The Key Vault TLS evidence (MeshWeaver.Deploy#130). Read by NAME: the fixture must render a
+# SecretProviderClass whose kubernetes.io/tls secretObject is the Secret the Ingress names, with
+# tls.key and tls.crt both from the vault certificate, and the portal pod must MOUNT that class —
+# the driver creates and rotates the Secret only while a pod mounts it, so an unmounted class syncs
+# nothing, silently. The AKS overlay (no tlsFromKeyVault) must render no such class.
+kv_tls_render="$(render_of "a host whose TLS Secret is synced from Key Vault (fixture)")"
+kv_tls_aks="$(render_of "AKS overlay (the layer every AKS install shares)")"
+if [ -f "$kv_tls_render" ] && [ -f "$kv_tls_aks" ] && python3 - "$kv_tls_render" "$kv_tls_aks" <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+ing = next(d for d in docs if d["kind"] == "Ingress" and d["metadata"]["name"] == "memex-portal")
+secret = ing["spec"]["tls"][0]["secretName"]
+assert secret == "portal-tls", secret
+ann = ing["metadata"].get("annotations") or {}
+assert ann.get("meshweaver.io/tls-secret") == "key-vault", ann
+assert "cert-manager.io/cluster-issuer" not in ann, ann
+def tls_objects(d):
+    return [o for o in d["spec"].get("secretObjects") or [] if o.get("type") == "kubernetes.io/tls"]
+spcs = [d for d in docs if d["kind"] == "SecretProviderClass" and tls_objects(d)]
+assert len(spcs) == 1, [d["metadata"]["name"] for d in spcs]
+spc = spcs[0]
+tls = tls_objects(spc)[0]
+assert tls["secretName"] == secret, tls
+assert sorted(x["key"] for x in tls["data"]) == ["tls.crt", "tls.key"], tls
+assert {x["objectName"] for x in tls["data"]} == {"portal-example-com"}, tls
+objs = yaml.safe_load(spc["spec"]["parameters"]["objects"])["array"]
+assert [yaml.safe_load(o) for o in objs] == [{"objectName": "portal-example-com", "objectType": "secret"}], objs
+dep = next(d for d in docs if d["kind"] == "Deployment" and any(c["name"] == "memex-portal" for c in d["spec"]["template"]["spec"]["containers"]))
+pod = dep["spec"]["template"]["spec"]
+vol = [v for v in pod.get("volumes") or [] if ((v.get("csi") or {}).get("volumeAttributes") or {}).get("secretProviderClass") == spc["metadata"]["name"]]
+assert len(vol) == 1, pod.get("volumes")
+portal = next(c for c in pod["containers"] if c["name"] == "memex-portal")
+assert sum(1 for m in portal.get("volumeMounts") or [] if m["name"] == vol[0]["name"]) == 1, "the ingress TLS class is not mounted by the portal container"
+aks = [d for d in yaml.safe_load_all(open(sys.argv[2])) if d]
+assert not any(d["kind"] == "SecretProviderClass" and tls_objects(d) for d in aks), "the AKS overlay rendered a TLS class it never asked for"
+PY
+then
+  ok "ingress.tlsFromKeyVault renders a kubernetes.io/tls SecretProviderClass syncing the Ingress's own Secret (tls.key + tls.crt from the vault certificate), mounted by the portal container; the AKS overlay renders none"
+else
+  report "ingress.tlsFromKeyVault: the fixture must render a SecretProviderClass with a kubernetes.io/tls secretObject named after ingress.tlsSecret (tls.key and tls.crt from the vault certificate), a CSI volume for it MOUNTED by the portal container, the meshweaver.io/tls-secret=key-vault marker and no cert-manager issuer, and the AKS overlay must render no such class (MeshWeaver.Deploy#130)"
+fi
+
+# A vault certificate name that reads as a YAML number ("2026") must render as the STRING in every
+# objectName — the provider's objects array and both tls secretObject keys. Unquoted, the API server
+# rejects the SecretProviderClass and TLS provisioning never starts (MeshWeaver.Deploy#130).
+kv_tls_numeric="$(render_of "a host whose TLS Secret is synced from a numeric-named Key Vault certificate (fixture)")"
+if [ -f "$kv_tls_numeric" ] && python3 - "$kv_tls_numeric" <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+spcs = [d for d in docs if d["kind"] == "SecretProviderClass" and any(o.get("type") == "kubernetes.io/tls" for o in d["spec"].get("secretObjects") or [])]
+assert len(spcs) == 1, len(spcs)
+spc = spcs[0]
+names = [x["objectName"] for o in spc["spec"]["secretObjects"] if o.get("type") == "kubernetes.io/tls" for x in o["data"]]
+objs = [yaml.safe_load(o) for o in yaml.safe_load(spc["spec"]["parameters"]["objects"])["array"]]
+names += [o["objectName"] for o in objs]
+assert len(names) == 3 and all(n == "2026" and isinstance(n, str) for n in names), [(n, type(n).__name__) for n in names]
+PY
+then
+  ok "ingress.tlsFromKeyVault: a numeric-looking vault certificate name renders as the string \"2026\" in all three objectNames"
+else
+  report "ingress.tlsFromKeyVault: a vault certificate named \"2026\" must render as a STRING objectName in the objects array and in both tls secretObject keys — an unquoted scalar becomes an integer the API server rejects (MeshWeaver.Deploy#130)"
+fi
+
 # The bake-gate evidence (MeshWeaver#4588, #5544). Invariant 10b — an armed PreWarm__GateReadiness
 # is read by the readinessProbe on /ready, and the rollout deadline covers a cold bake — is
 # CONDITIONAL, so it is satisfied just as well by a set of renders where nothing ever arms the gate.
@@ -450,6 +573,8 @@ REFUSALS=(
   "an external database with neither a values connection string nor a MEMEX_HOST (the fabrikam refusal)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.external-db-no-host.yaml|names no external database host"
   "an external database whose values string names the in-cluster Service (the explicit-placeholder refusal)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.external-db-explicit-in-cluster-host.yaml|names the in-cluster Service memex-postgres-service"
   "a TLS secret with no issuer reaching the ingress (the fabrikam certificate refusal)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.ingress-no-issuer.yaml|NO issuer reaches the ingress"
+  "a Key Vault TLS Secret AND a cert-manager issuer for it (two writers, MeshWeaver.Deploy#130)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.ingress-tls-keyvault-and-issuer.yaml|Pick ONE writer"
+  "a Key Vault TLS Secret AND a hand-written namespaced cert-manager.io/issuer annotation (two writers, MeshWeaver.Deploy#130)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.ingress-tls-keyvault-and-namespaced-issuer.yaml|Pick ONE writer"
   "a database release AND the bundled Postgres (two answers to which database)|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.db-release-with-bundled-postgres.yaml|exclusive with postgres.enabled"
   # Plugins#1738: an executor the portal would silently read as Job must fail the render.
   "a misspelled operator executor|deploy/helm/values.yaml:deploy/aks/scripts/testdata/values.operator-executor-misspelled.yaml|must be Job or Actions"

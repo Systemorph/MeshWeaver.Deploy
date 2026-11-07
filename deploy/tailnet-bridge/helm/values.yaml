@@ -1,0 +1,66 @@
+# tailnet-bridge — one machine of the private network at a public name. Reference values: NEUTRAL
+# placeholders only (this repository is public). An installation's names live in its estate's overlay.
+# Renders NOTHING unless enabled.
+enabled: false
+nameOverride: ""
+
+image:
+  repository: ""        # required: <registry>/tailnet-bridge
+  tag: ""               # required: the immutable <version>-<short sha> tag (the chart refuses any other shape)
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# The public name (TLS at the ingress). Required.
+host: ""                # e.g. mac-1.example.com
+
+ingress:
+  className: ""         # required: the cluster's HTTPS ingress class
+  clusterIssuer: ""     # cert-manager ClusterIssuer that issues tlsSecret (or name a pre-created tlsSecret)
+  tlsSecret: ""         # defaults to <fullname>-tls
+  # A portal holds long-lived streams (SignalR, MCP): no buffering, long timeouts, large bodies.
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: 100m
+
+# The network.
+network:
+  loginServer: ""       # required: https://<the control server>
+  hostname: ""          # this bridge's machine name; defaults to <fullname>
+  # The pre-auth key: a Secret in THIS namespace with key `authkey` — the control server's declared key
+  # (headscale chart, `preauthKeys`, Secret <headscale fullname>-preauth-<name>). Mounted as a file.
+  authKeySecret: ""     # required
+
+# The machine on the network.
+target:
+  name: ""              # required: its MagicDNS name, e.g. mac-1.tailnet.internal
+  port: 443
+  # The Host header and TLS server name the machine is asked for. Default: `host` (the public name), so
+  # the machine's own redirects and sign-in callbacks point back at the public name.
+  upstreamHost: ""
+  # The hop runs inside WireGuard, which already authenticates the machine by its node key; a local
+  # machine's ingress rarely holds a certificate for its public name. Set false when it does.
+  insecureSkipVerify: true
+
+# Paths the PUBLIC name must never reach, answered 404 by the bridge itself (caddy path matchers). The
+# default is a local portal's development sign-in, which admits anyone who can reach it.
+blockedPaths: ["/dev", "/dev/*"]
+
+networkPolicy:
+  enabled: true
+  # REQUIRED while enabled: the namespaces whose pods may reach the proxy port — the ingress controller's.
+  # (Any other pod reaching it would be trusted as a forwarding proxy, so there is no "any namespace".)
+  ingressNamespaces: []
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

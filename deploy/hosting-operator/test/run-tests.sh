@@ -5487,6 +5487,7 @@ printf 'config: {}\n' > "$_cd/estate/deployments/aks/memex/values.memex.public.y
 cat > "$_cd/scripts/chart-drift-record.py" <<'PYEOF'
 import os, sys
 out = sys.argv[sys.argv.index("--out") + 1]
+open(os.environ["CD_STUB_RECORD_ARGS"], "w").write(" ".join(sys.argv[1:]))
 if os.environ.get("CD_STUB_RECORD") == "none":
     print("::error::no Deployment record owns memex/memex")
     sys.exit(1)
@@ -5506,7 +5507,7 @@ _cd_run() { # _cd_run <mode> [extra env...] -- [extra args...]
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
   _cd_out="$(cd "$_cd/estate" && env ${envs[@]+"${envs[@]}"} HOSTING_DRIFT_SCRIPTS="$_cd/scripts" HOSTING_CHART="$_cd/chart" \
-    CD_STUB_MODE="$mode" CD_STUB_ARGS="$_cd/args" hosting-chart-drift --namespace memex --release memex "$@" 2>&1)"; _cd_rc=$?
+    CD_STUB_MODE="$mode" CD_STUB_ARGS="$_cd/args" CD_STUB_RECORD_ARGS="$_cd/record-args" hosting-chart-drift --cluster aks-example --namespace memex --release memex "$@" 2>&1)"; _cd_rc=$?
 }
 : > "$_cd/args"
 _cd_run clean
@@ -5586,6 +5587,10 @@ _cd_run unreadable
 _cd_run clean CD_STUB_RECORD=none
 [ "$_cd_rc" -ne 0 ] && case "$_cd_out" in *"chart_drift_verdict"*) false ;; *"no single Deployment record owns"*) true ;; *) false ;; esac \
   && ok "no owning record is RED, never compared" || bad "no owning record" "rc ${_cd_rc}; out: ${_cd_out}"
+# MeshWeaver.Deploy#144: the record that owns the release is the one RUNNING on the audited cluster, so
+# the audited cluster reaches the record script — and without it nothing is decided.
+case "$(cat "$_cd/record-args" 2>/dev/null)" in *"--cluster aks-example"*"--namespace memex --release memex"*) ok "the audited cluster reaches the record script (only records running on it can own the release)" ;;
+  *) bad "the audited cluster reaches the record script" "record args: $(cat "$_cd/record-args" 2>/dev/null)" ;; esac
 _cd_run clean HOSTING_DRY_RUN=true
 [ "$_cd_rc" -eq 0 ] && case "$_cd_out" in *"::hosting:: chart_drift_verdict=clean"*) true ;; *) false ;; esac \
   && ok "a dry run compares for real (read-only)" || bad "dry run" "rc ${_cd_rc}; out: ${_cd_out}"
@@ -5595,11 +5600,15 @@ _cd_run clean -- --overlay "$_cd/estate/nope.yaml"
 _cd_run clean -- --records "$_cd/estate/nope"
 [ "$_cd_rc" -ne 0 ] && case "$_cd_out" in *"Deployment records folder"*) true ;; *) false ;; esac \
   && ok "a missing records folder is refused by name" || bad "missing records" "rc ${_cd_rc}; out: ${_cd_out}"
-refuses "chart drift needs --namespace" "missing required flag --namespace" hosting-chart-drift --release r
-refuses "chart drift needs --release"   "missing required flag --release"   hosting-chart-drift --namespace n
-refuses "chart drift rejects unknown flags" "unknown argument" hosting-chart-drift --namespace n --release r --via aks-invoke
+refuses_hard "chart drift needs --cluster (no input naming the audited cluster is RED)" "missing required flag --cluster" \
+  hosting-chart-drift --namespace n --release r
+refuses "chart drift needs --namespace" "missing required flag --namespace" hosting-chart-drift --cluster c --release r
+refuses "chart drift needs --release"   "missing required flag --release"   hosting-chart-drift --cluster c --namespace n
+refuses "chart drift rejects unknown flags" "unknown argument" hosting-chart-drift --cluster c --namespace n --release r --via aks-invoke
 refuses_hard "chart drift namespace with a metacharacter" "is not a plain name" \
-  hosting-chart-drift --namespace 'n; kubectl delete ns --all' --release r
+  hosting-chart-drift --cluster c --namespace 'n; kubectl delete ns --all' --release r
+refuses_hard "chart drift cluster with a metacharacter" "is not a plain name" \
+  hosting-chart-drift --cluster 'c; kubectl delete ns --all' --namespace n --release r
 rm -rf "$_cd"; unset _cd _cd_out _cd_rc
 
 echo
@@ -5693,6 +5702,98 @@ refuses_hard "runner reap: --runner rides --execute only" "rides --execute only"
 refuses_hard "runner reap: a namespace with a metacharacter" "is not a Kubernetes name" hosting-runner-reap --namespace 'arc; kubectl delete ns --all'
 refuses_hard "runner reap: a runner name with a metacharacter" "is not a Kubernetes name" hosting-runner-reap --namespace arc-runners --execute --runner 'x;y'
 unset _rr_out _rr_rc _rr_calls _rr_st _st_fix
+
+echo "── hosting-tailnet-key: a single-use, tagged Headscale key straight into the vault, never shown ──"
+# deploy/headscale/README.md → "Keys for servers". Headscale mints a key for ANY tag (measured, 0.29.7),
+# so the policy check here is the only guard; the key must never be printed or put on an argv.
+TK_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/tailnet-key" && pwd)"
+TK_KVS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/kv-set" && pwd)"
+TK_ARGS=(--namespace control --release headscale --vault kv-example --object control-Tailnet-ObservabilityAuthKey --tags tag:observability --expiration 2h)
+tk() {  # tk [env…] -- <args…>
+  local envs=()
+  while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  _tk_st="$(mktemp -d)"
+  _tk_out="$(env "${envs[@]}" PATH="$TK_STUBS:$TK_KVS:$PATH" HOSTING_TK_STATE="$_tk_st" HOSTING_KVS_STATE="$_tk_st" \
+    hosting-tailnet-key "$@" 2>&1)"; _tk_rc=$?
+  _tk_kube="$(cat "$_tk_st/kubectl.log" 2>/dev/null || true)"; _tk_az="$(cat "$_tk_st/az.log" 2>/dev/null || true)"
+}
+tk_done() { rm -rf "$_tk_st"; }
+if command -v jq >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  tk -- "${TK_ARGS[@]}"
+  [ "$_tk_rc" -eq 0 ] && ok "tailnet key: a declared tag is minted and stored" || bad "tailnet key minted" "exited ${_tk_rc}: ${_tk_out}"
+  case "$_tk_kube" in *"exec headscale-abc -c headscale -- headscale preauthkeys create --tags tag:observability --expiration 2h -o json"*) ok "…inside the ONE headscale pod, with exactly the requested tags and expiry" ;; *) bad "mint command" "kubectl saw: ${_tk_kube}" ;; esac
+  case "$_tk_kube" in *reusable*|*ephemeral*) bad "…never --reusable / --ephemeral" "kubectl saw: ${_tk_kube}" ;; *) ok "…never --reusable / --ephemeral" ;; esac
+  [ "$(cat "$_tk_st/set.control-Tailnet-ObservabilityAuthKey" 2>/dev/null)" = "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef" ] \
+    && ok "…the key is stored byte-for-byte (no trailing newline)" || bad "stored key" "vault got: $(cat "$_tk_st/set.control-Tailnet-ObservabilityAuthKey" 2>/dev/null)"
+  case "$_tk_az" in *"--file "*"mw-source=tailnet-key"*"mw-tags=tag:observability"*"mw-key-id=7"*) ok "…through --file, tagged with metadata only (source, tags, key id)" ;; *) bad "stored through --file with tags" "az saw: ${_tk_az}" ;; esac
+  case "${_tk_out}${_tk_az}" in *NEVERPRINTED*|*hskey-auth-*) bad "tailnet key: the key is never printed and never on an argv" "seen: ${_tk_out} ${_tk_az}" ;; *) ok "tailnet key: the key is never printed and never on an argv" ;; esac
+  case "$_tk_out" in *"::hosting:: tailnet_key=minted"*"::hosting:: tailnet_key_id=7"*"::hosting:: tailnet_key_tags=tag:observability"*) ok "…reported by id, tags and expiry" ;; *) bad "minted facts" "said: ${_tk_out}" ;; esac
+  tk_done
+
+  # 🚨 THE GUARD: a tag the running policy does not declare is refused before anything is minted.
+  tk -- "${TK_ARGS[@]/tag:observability/tag:undeclared}"
+  [ "$_tk_rc" -ne 0 ] && case "$_tk_out" in *"is not declared in the tagOwners"*"Nothing was minted"*) true ;; *) false ;; esac \
+    && ok "tailnet key: a tag absent from tagOwners is REFUSED, naming the policy" || bad "undeclared tag refused" "rc ${_tk_rc}: ${_tk_out}"
+  case "$_tk_kube" in *"preauthkeys create"*) bad "…and nothing is minted" "kubectl saw: ${_tk_kube}" ;; *) ok "…and nothing is minted" ;; esac
+  [ ! -f "$_tk_st/set.control-Tailnet-ObservabilityAuthKey" ] && ok "…and nothing is written" || bad "undeclared tag writes nothing" "it wrote"
+  tk_done
+  # Negative control on that guard: the SAME tag, once the policy declares it, is minted — so the refusal above is the policy check.
+  tk HOSTING_TK_POLICY='{"tagOwners": {"tag:undeclared": ["group:admins"]}, "acls": []}' -- "${TK_ARGS[@]/tag:observability/tag:undeclared}"
+  [ "$_tk_rc" -eq 0 ] && ok "tailnet key: negative control — the same tag, declared, is minted" || bad "declared tag control" "rc ${_tk_rc}: ${_tk_out}"
+  tk_done
+  # A tag that appears only in a COMMENT or an ACL is not declared.
+  tk HOSTING_TK_POLICY='{ // "tag:undeclared": in a comment
+    "tagOwners": {"tag:observability": ["group:admins"]}, "acls": [{"action": "accept", "src": ["tag:undeclared"], "dst": ["*:*"]}] }' -- "${TK_ARGS[@]/tag:observability/tag:undeclared}"
+  [ "$_tk_rc" -ne 0 ] && ok "tailnet key: a tag named only in a comment or an ACL is still undeclared" || bad "comment/ACL tag" "exited 0: ${_tk_out}"
+  tk_done
+  tk HOSTING_TK_POLICY='' -- "${TK_ARGS[@]}"
+  [ "$_tk_rc" -ne 0 ] && case "$_tk_out" in *"could not read tagOwners"*) true ;; *) false ;; esac \
+    && ok "tailnet key: an unreadable policy is a refusal, never 'no tags to check'" || bad "empty policy" "rc ${_tk_rc}: ${_tk_out}"
+  tk_done
+
+  for answer in reusable ephemeral wrongtags nokey; do
+    tk HOSTING_TK_ANSWER="$answer" -- "${TK_ARGS[@]}"
+    [ "$_tk_rc" -ne 0 ] && ok "tailnet key: a ${answer} answer is refused" || bad "${answer} answer refused" "exited 0: ${_tk_out}"
+    [ ! -f "$_tk_st/set.control-Tailnet-ObservabilityAuthKey" ] && ok "…and nothing is stored" || bad "${answer} answer stores nothing" "it wrote"
+    case "$_tk_kube" in *"preauthkeys expire --id 7"*) ok "…and the minted key is EXPIRED in headscale" ;; *) bad "${answer}: key expired" "kubectl saw: ${_tk_kube}" ;; esac
+    case "$_tk_out" in *NEVERPRINTED*|*hskey-auth-*) bad "…without printing the key" "said: ${_tk_out}" ;; *) ok "…without printing the key" ;; esac
+    tk_done
+  done
+
+  tk HOSTING_KVS_SET_FAIL=control-Tailnet-ObservabilityAuthKey -- "${TK_ARGS[@]}"
+  [ "$_tk_rc" -ne 0 ] && case "$_tk_out" in *"The key was expired"*) true ;; *) false ;; esac \
+    && ok "tailnet key: a vault that refuses the write fails the step" || bad "vault refusal" "rc ${_tk_rc}: ${_tk_out}"
+  case "$_tk_kube" in *"preauthkeys expire --id 7"*) ok "…and expires the key nobody holds" ;; *) bad "vault refusal expires key" "kubectl saw: ${_tk_kube}" ;; esac
+  tk_done
+
+  tk HOSTING_TK_PODS="headscale-abc headscale-def" -- "${TK_ARGS[@]}"
+  [ "$_tk_rc" -ne 0 ] && case "$_tk_out" in *"2 running headscale pod(s)"*) true ;; *) false ;; esac \
+    && ok "tailnet key: two running pods is a refusal (which database?)" || bad "two pods" "rc ${_tk_rc}: ${_tk_out}"
+  tk_done
+  tk HOSTING_TK_PODS="" -- "${TK_ARGS[@]}"
+  [ "$_tk_rc" -ne 0 ] && ok "tailnet key: no running pod is a refusal" || bad "no pod" "exited 0"
+  tk_done
+
+  tk HOSTING_DRY_RUN=true -- "${TK_ARGS[@]}"
+  [ "$_tk_rc" -eq 0 ] && case "$_tk_out" in *"::hosting:: tailnet_key=dry-run"*) true ;; *) false ;; esac \
+    && ok "tailnet key: a dry run checks the tags and reports, minting nothing" || bad "dry run" "rc ${_tk_rc}: ${_tk_out}"
+  case "$_tk_kube" in *"preauthkeys create"*) bad "…dry run mints nothing" "kubectl saw: ${_tk_kube}" ;; *) ok "…dry run mints nothing" ;; esac
+  tk_done
+else
+  bad "hosting-tailnet-key tests need jq and python3" "missing"
+fi
+refuses_hard "tailnet key: --reusable is refused" "SINGLE-USE" hosting-tailnet-key "${TK_ARGS[@]}" --reusable
+refuses_hard "tailnet key: --ephemeral is refused" "SINGLE-USE" hosting-tailnet-key "${TK_ARGS[@]}" --ephemeral
+refuses_hard "tailnet key: an untagged key is refused" "missing required flag --tags" hosting-tailnet-key --namespace control --release headscale --vault kv-example --object o --expiration 2h
+refuses_hard "tailnet key: an expiry over 24h is refused" "must be 10m–24h" hosting-tailnet-key "${TK_ARGS[@]/2h/25h}"
+refuses_hard "tailnet key: an expiry of 7d is refused" "must be <minutes>m or <hours>h" hosting-tailnet-key "${TK_ARGS[@]/2h/7d}"
+refuses_hard "tailnet key: an expiry under 10m is refused" "must be 10m–24h" hosting-tailnet-key "${TK_ARGS[@]/2h/5m}"
+refuses_hard "tailnet key: a tag that is not tag:<label> is refused" "is not tag:" hosting-tailnet-key "${TK_ARGS[@]/tag:observability/observability}"
+refuses_hard "tailnet key: a tag with a metacharacter is refused" "is not tag:" hosting-tailnet-key "${TK_ARGS[@]/tag:observability/tag:x;id}"
+refuses_hard "tailnet key: five tags are refused" "1–4 tags" hosting-tailnet-key "${TK_ARGS[@]/tag:observability/tag:a,tag:b,tag:c,tag:d,tag:e}"
+refuses_hard "tailnet key: a duplicate tag is refused" "named twice" hosting-tailnet-key "${TK_ARGS[@]/tag:observability/tag:a,tag:a}"
+refuses_hard "tailnet key: a namespace with a metacharacter is refused" "not a plain name" hosting-tailnet-key "${TK_ARGS[@]/control/con;trol}"
+unset _tk_out _tk_rc _tk_kube _tk_az _tk_st
 
 echo
 echo "─────────────────────────────────────────────────────────────────"

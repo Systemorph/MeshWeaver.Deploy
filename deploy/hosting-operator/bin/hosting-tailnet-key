@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# hosting-tailnet-key --namespace <ns> --release <headscale release> --vault <vault> --object <vault object>
+#                     --tags <tag:a[,tag:b]> --expiration <N>m|<N>h [--set-by <principal>]
+#
+# MINT a one-time Headscale PRE-AUTH KEY for a server that joins the private network, and store it
+# straight into Key Vault without anyone seeing it (deploy/headscale/README.md → "Keys for servers").
+# The server's chart mounts the object as a FILE (Secrets Store CSI) and registers once with it.
+#
+#   1. find the ONE running pod of the headscale release in --namespace
+#   2. read the policy the pod RUNS (the ConfigMap its `config` volume mounts) and refuse every tag
+#      its `tagOwners` does not declare — Headscale itself mints a key for ANY tag (measured on
+#      0.29.7: `preauthkeys create --tags tag:undeclared` answers 0 with a key), so this check is the
+#      only thing that keeps an approval from minting a tag the network policy never reviewed
+#   3. `headscale preauthkeys create --tags … --expiration …` inside that pod (kubectl exec; the
+#      binary is called directly — the image is distroless). Never --reusable, never --ephemeral:
+#      the answer is refused unless it reads back single-use, non-ephemeral and carrying exactly the
+#      requested tags
+#   4. write the key into the vault through a mode-600 --file, tagged with metadata only
+#      (mw-fp, mw-set-by, mw-set-at, mw-source=tailnet-key, mw-tags, mw-expires, mw-key-id), and
+#      confirm the version by a METADATA read
+#   5. a key the vault did not take is EXPIRED in Headscale before the step fails, so no live key
+#      exists that nobody holds
+#
+# 🚨 NEVER PRINTS THE KEY (policy `secrets-write-only-entry`). It crosses from the pod's stdout into a
+# mode-600 file, from there into another mode-600 file holding only the key, and into `az … --file`.
+# It is never in a variable that is echoed, never on an argv, never in a `::hosting::` fact; what
+# crosses back is the key's Headscale id, its expiry, its tags and a sha256 fingerprint.
+#
+# 🚨 THE EXPIRATION IS BOUNDED, 10m–24h. The key's one consumer is the server's next start (an approved
+# ApplyChart), and a single-use key that outlives that window is a standing credential in the vault
+# for nothing; 24h covers an approval that waits overnight. The server keeps its identity on its own
+# volume afterwards, so an expired key costs nothing once it registered.
+#
+# It OVERWRITES the object: a fresh key replaces a spent one (Key Vault keeps the previous version).
+# shellcheck source=_common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
+# shellcheck disable=SC2034  # read by hosting::die in _common.sh, which shellcheck does not follow here
+HOSTING_CMD="hosting-tailnet-key"
+
+namespace="" release="" vault="" object="" tags="" expiration="" set_by="hosting-operator"
+# A flag given LAST with no value must not spin (see hosting-registry-coupon).
+shift_value() { if [ $# -ge 2 ]; then shift_n=2; else shift_n=1; fi; }
+while [ $# -gt 0 ]; do
+  shift_n=1
+  case "$1" in
+    --namespace)  namespace="${2:-}";  shift_value "$@" ;;
+    --release)    release="${2:-}";    shift_value "$@" ;;
+    --vault)      vault="${2:-}";      shift_value "$@" ;;
+    --object)     object="${2:-}";     shift_value "$@" ;;
+    --tags)       tags="${2:-}";       shift_value "$@" ;;
+    --expiration) expiration="${2:-}"; shift_value "$@" ;;
+    --set-by)     set_by="${2:-}";     shift_value "$@" ;;
+    --reusable|--ephemeral)
+      hosting::die "$1 is refused — a server joins with a SINGLE-USE, non-ephemeral key; a reusable key in the vault would let anything that reads it join the network again and again" ;;
+    *) hosting::die "unknown argument '$1'" ;;
+  esac
+  shift "$shift_n"
+done
+hosting::need_flag namespace "$namespace"
+hosting::need_flag release "$release"
+hosting::need_flag vault "$vault"
+hosting::need_flag object "$object"
+hosting::need_flag tags "$tags"
+hosting::need_flag expiration "$expiration"
+hosting::safe_name namespace "$namespace"
+hosting::safe_name release "$release"
+hosting::safe_name vault "$vault"
+hosting::safe_name object "$object"
+hosting::safe_actor set-by "$set_by"
+
+# ── the tags: 1–4 of `tag:<dns label>`, no duplicates ───────────────────────────────────────────
+IFS=',' read -r -a tag_list <<< "$tags"
+[ "${#tag_list[@]}" -ge 1 ] && [ "${#tag_list[@]}" -le 4 ] \
+  || hosting::die "tags '${tags}' must name 1–4 tags — an UNTAGGED key would register the server as a person's machine, inside every member-to-member rule"
+seen_tags=","
+for t in "${tag_list[@]}"; do
+  [[ "$t" =~ ^tag:[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
+    || hosting::die "tag '${t}' is not tag:<lower-case dns label> — refusing to pass it to headscale"
+  case "$seen_tags" in *",$t,"*) hosting::die "tag '${t}' is named twice" ;; esac
+  seen_tags="${seen_tags}${t},"
+done
+
+# ── the expiration: 10m–24h ──────────────────────────────────────────────────────────────────────
+[[ "$expiration" =~ ^([0-9]{1,4})([mh])$ ]] \
+  || hosting::die "expiration '${expiration}' must be <minutes>m or <hours>h (e.g. 2h)"
+amount="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[2]}"
+minutes=$(( 10#$amount ))
+[ "$unit" = "h" ] && minutes=$(( minutes * 60 ))
+[ "$minutes" -ge 10 ] && [ "$minutes" -le 1440 ] \
+  || hosting::die "expiration '${expiration}' must be 10m–24h — the key is read once, at the server's next start; a longer-lived key is a standing credential in the vault"
+
+command -v jq >/dev/null 2>&1 || hosting::die "jq is not installed in this image — headscale answers JSON"
+command -v python3 >/dev/null 2>&1 || hosting::die "python3 is not installed in this image — the policy is HuJSON"
+
+# ── 1. the headscale pod ──────────────────────────────────────────────────────────────────────────
+hosting::step "Find the headscale pod"
+pods="$(hosting::read kubectl -n "$namespace" get pods \
+  -l "app.kubernetes.io/name=headscale,app.kubernetes.io/instance=${release}" \
+  --field-selector=status.phase=Running -o name)" \
+  || hosting::die "could not list the pods of release ${release} in ${namespace}. Nothing was minted."
+count="$(printf '%s\n' "$pods" | grep -c '^pod/' || true)"
+[ "$count" = "1" ] \
+  || hosting::die "release ${release} in ${namespace} has ${count} running headscale pod(s), not exactly one — the key must be minted by the server whose database the network uses. Nothing was minted."
+pod="${pods#pod/}"
+hosting::safe_name pod "$pod"
+hosting::log "headscale pod/${pod} in ${namespace}"
+
+# ── 2. the policy it RUNS, and its tagOwners ─────────────────────────────────────────────────────
+hosting::step "Check the tags against the policy headscale runs"
+config_map="$(hosting::read kubectl -n "$namespace" get pod "$pod" -o json \
+  | jq -r '[.spec.volumes[]? | select(.name == "config") | .configMap.name // empty] | first // empty')" || config_map=""
+[ -n "$config_map" ] \
+  || hosting::die "pod/${pod} mounts no ConfigMap as its 'config' volume — cannot read the policy it runs, so the tags cannot be checked. Nothing was minted."
+hosting::safe_name configmap "$config_map"
+owned="$(hosting::read kubectl -n "$namespace" get configmap "$config_map" -o json \
+  | jq -r '.data["policy.hujson"] // empty' \
+  | python3 -c '
+import json, sys
+src = sys.stdin.read()
+if not src.strip():
+    sys.exit(3)
+# HuJSON -> JSON in two passes, never touching a string: drop // and /* */ comments, then trailing commas.
+def scan(text, drop_comments):
+    out, i, n, in_str = [], 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1]); i += 2; continue
+            if c == "\"":
+                in_str = False
+            i += 1; continue
+        if c == "\"":
+            in_str = True; out.append(c); i += 1; continue
+        if drop_comments and text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if drop_comments and text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        if not drop_comments and c == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "]}":
+                i += 1; continue
+        out.append(c); i += 1
+    return "".join(out)
+policy = json.loads(scan(scan(src, True), False))
+for tag in sorted((policy.get("tagOwners") or {}).keys()):
+    print(tag)
+')" || hosting::die "could not read tagOwners from the policy in configmap/${config_map} (absent, or not valid HuJSON). Nothing was minted."
+for t in "${tag_list[@]}"; do
+  printf '%s\n' "$owned" | grep -qxF -- "$t" \
+    || hosting::die "tag '${t}' is not declared in the tagOwners of the policy headscale runs (configmap/${config_map}: ${owned//$'\n'/, }) — headscale would mint it anyway, so this is refused here. Declare the tag in the policy (the headscale chart's values) and apply it first. Nothing was minted."
+done
+hosting::log "tags      ${tags} — every one declared in tagOwners"
+
+if hosting::dry; then
+  hosting::log "(dry run) would mint a single-use key tagged ${tags}, expiring in ${expiration}, inside pod/${pod}, and store it under ${object} in vault ${vault} (never shown), tagged mw-set-by=${set_by}"
+  hosting::say tailnet_key dry-run
+  hosting::say tailnet_key_tags "$tags"
+  exit 0
+fi
+
+# Everything below touches the key. umask first: every temporary this step creates is 0600.
+umask 077
+work="$(mktemp -d)" || hosting::die "could not create a private working directory. Nothing was minted."
+cleanup() { rm -rf "$work"; }
+trap 'hosting::on_exit; cleanup' EXIT
+
+# ── 3. mint, inside the pod ──────────────────────────────────────────────────────────────────────
+hosting::step "Mint the key inside headscale"
+if ! kubectl -n "$namespace" exec "$pod" -c headscale -- \
+      headscale preauthkeys create --tags "$tags" --expiration "$expiration" -o json \
+      > "$work/answer.json" 2> "$work/exec.err"; then
+  hosting::die "headscale refused to mint the key: $(head -n1 "$work/exec.err" | cut -c1-300). Nothing was stored."
+fi
+key_id="$(jq -r '.id // empty' "$work/answer.json" 2>/dev/null)"
+expire_key() {  # best effort: a key that is not in the vault must not stay live
+  [[ "$key_id" =~ ^[0-9]+$ ]] || return 0
+  if kubectl -n "$namespace" exec "$pod" -c headscale -- headscale preauthkeys expire --id "$key_id" >/dev/null 2>&1; then
+    hosting::log "expired   key ${key_id} in headscale — nobody holds it"
+  else
+    hosting::log "could NOT expire key ${key_id} in headscale — expire it by hand (headscale preauthkeys expire --id ${key_id}); it lapses on its own at its expiry"
+  fi
+}
+[[ "$key_id" =~ ^[0-9]+$ ]] || hosting::die "headscale answered without a key id — refusing to store an answer that is not a key. Nothing was stored."
+# Single-use, non-ephemeral, exactly the requested tags — read back from headscale's own answer.
+want_tags="$(printf '%s\n' "${tag_list[@]}" | sort | jq -R . | jq -cs .)"
+if ! jq -e --argjson want "$want_tags" \
+      '(.reusable // false) == false and (.ephemeral // false) == false and ((.acl_tags // []) | sort) == $want' \
+      "$work/answer.json" >/dev/null 2>&1; then
+  expire_key
+  hosting::die "headscale's answer is not a single-use, non-ephemeral key carrying exactly ${tags} — refusing to store it. Nothing was stored."
+fi
+jq -rj '.key // empty' "$work/answer.json" > "$work/key" 2>/dev/null
+case "$(head -c 11 "$work/key")" in
+  hskey-auth-) ;;
+  *) expire_key; hosting::die "headscale answered without a pre-auth key (no hskey-auth prefix) — refusing to store it. Nothing was stored." ;;
+esac
+expires_at="$(jq -r '.expiration.seconds // empty' "$work/answer.json" 2>/dev/null)"
+rm -f "$work/answer.json"
+expires_iso="unknown"
+if [[ "$expires_at" =~ ^[0-9]+$ ]]; then
+  expires_iso="$(date -u -d "@${expires_at}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$expires_at" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+fi
+fp="$(hosting::fingerprint "$work/key")"
+
+# ── 4. store it ───────────────────────────────────────────────────────────────────────────────────
+hosting::step "Store the key in Key Vault"
+# Key Vault tag values: the tags travel with ';' (a ',' is fine too, but ';' reads as a list in the portal).
+if ! version_id="$(az keyvault secret set --vault-name "$vault" --name "$object" --file "$work/key" \
+      --tags "mw-fp=${fp}" "mw-set-by=${set_by}" "mw-set-at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+             "mw-source=tailnet-key" "mw-tags=${tags//,/;}" "mw-expires=${expires_iso}" "mw-key-id=${key_id}" \
+      --query id -o tsv 2>"$work/az.err")"; then
+  rm -f "$work/key"
+  expire_key
+  hosting::die "headscale minted key ${key_id} but vault ${vault} refused ${object}: $(tr -d '\n' < "$work/az.err" | cut -c1-300). The key was expired; nothing holds a live key."
+fi
+rm -f "$work/key"
+if [ -z "$version_id" ] \
+   || ! az keyvault secret list-versions --vault-name "$vault" --name "$object" --query "[?id=='${version_id}'].id" -o tsv 2>/dev/null | grep -qxF -- "$version_id"; then
+  expire_key
+  hosting::die "set ${object} in vault ${vault}, but the vault does not list the version it returned — refusing to report a key the server will not find. The key was expired."
+fi
+hosting::log "minted    key ${key_id} (${tags}; single use; expires ${expires_iso}) → ${object} in vault ${vault} (${version_id##*/}; ${fp})"
+hosting::say tailnet_key minted
+hosting::say tailnet_key_id "$key_id"
+hosting::say tailnet_key_tags "$tags"
+hosting::say tailnet_key_expires "$expires_iso"
+hosting::say kv_set "${object}:${fp}"

@@ -14,9 +14,9 @@ buildHosts:
   imagePullSecret: "build-pull"
   # A Mac is ONE node with no CI pool: no pool selector or taint toleration (null clears the chart default; an empty
   # map would merge with it), and a budget that fits the Colima VM — first-attach.sh checks the node's allocatable.
-  # The plugins layer: a Mac has no workload identity and holds NO registry credential (StandingBuildHosts §2), so it
-  # reads the registry's bundle index (H8) with a READ-ONLY instance key — first-attach.sh sets registry.url and the Secret.
-  registry: {instanceKeySecret: {name: "build-registry-key-mac", key: "key"}}
+  # The plugins layer: as the cluster hosts take it — the sealed publication /hosts/inputs names, or none. The registry's
+  # bundle index (H8, a READ-ONLY instance key) is opt-in through first-attach.sh's --plugins-registry/--instance-key-secret:
+  # measured 2026-11-07 the registry served AI as an assemblies-only bundle, module-fetch refused it, and the host never claimed.
   rolloutStrategy: "Recreate"
   nodeSelector: null
   tolerations: null
@@ -30,17 +30,25 @@ buildHosts:
   cacheClaimName: "build-cache-mac"
   # The Mac's only class is node-local; one replica owns the cache.
   cache: {create: true, storageClass: "local-path", size: "20Gi", accessMode: "ReadWriteOnce"}
-  # bwrap needs `userns`; first-attach.sh loads this profile into the Colima VM before the release.
-  sandbox: {appArmorProfile: "Localhost", appArmorLocalhostProfile: "mw-build-host"}
+  # bwrap needs a fresh /proc per stage, which only an Unmasked /proc allows, and Kubernetes grants that only to a pod in
+  # its own user namespace (hostUsers: false) — hence the dedicated containerd profile first-attach.sh checks for.
+  sandbox: {appArmorProfile: "Localhost", appArmorLocalhostProfile: "mw-build-host", seccompProfile: "Unconfined", userNamespace: true}
   # The Mac's OWN worker token (the operations instance accepts it for channel `mac` only).
   workerTokenSecret: {name: "build-worker-mac", key: "token"}
   latest: {enabled: false}
   stable: {enabled: false}
-  # NO artifact store: the first attach takes only jobs routed to `mac` on purpose, and a stage that PRODUCES a module
-  # bundle or gate artifact fails its hand-over by design (build-run.py: "no artifact store is configured") — module
-  # builds stay off macos targets until arch-qualified bundle keys exist (Hosting/BackLease, core G10). The store the
-  # publishing side reads is the operations instance's shared CI artifact store; reaching it from a Mac is BackLease phase 2.
+  # The artifact store is the BUILD API, as on the cluster hosts (`upload: true` → `api:`): a stage's files are PUT to
+  # `<apiUrl>/<repo>/<sha>/artifacts/<sha256>` with the Mac's own channel token, which the operations instance accepts only
+  # from a `build-host-mac-*` host on channel `mac` (StandingBuildHosts §7a). This stores receipts on the RUN only — a
+  # `mac` run is never published (only `latest` publishes), so no arm64 bundle reaches the registry (core G10). Without a
+  # store the `modules` stage could not hand its bundles to `compile-check`, and a probe of either failed (measured on the
+  # first Mac, 2026-11-07: "no artifact store is configured").
+  artifactStore: {upload: true}
   extraChannels: ["mac"]
   mac:
     enabled: true
     maxReplicas: 1
+    # A STANDING replica (the declared floor): the Mac is offered always-on, and its one replica must not depend on the
+    # anonymous queue count answering — while `GET /api/builds/queue` answers 503 KEDA keeps the CURRENT replica count, so
+    # a floor of 0 left the host at zero and a routed `mac` run waited forever (the first Mac's attach, 2026-11-07).
+    minReplicas: 1

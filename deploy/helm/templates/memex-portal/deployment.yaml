@@ -47,6 +47,12 @@ spec:
         checksum/secrets: {{ include (print $.Template.BasePath "/memex-portal/secrets.yaml") . | sha256sum }}
 {{- $bundles := include "memex.bundles" . | fromYaml }}
 {{- $dumps := include "memex.crashDumps" . | fromYaml }}
+{{- $trustedCa := include "memex.trustedCa" . | fromYaml }}
+{{- if $trustedCa.pem }}
+        # The inline CA bundle (trustedCertificateAuthorities.pem): the init container that folds it
+        # into the trust store runs once per pod, so an edit must roll the pods.
+        checksum/trusted-ca: {{ include (print $.Template.BasePath "/memex-portal/trusted-ca.yaml") . | sha256sum }}
+{{- end }}
 {{- if $bundles.enabled }}
         # The bundle-fetch init container's script (bundle-fetch.yaml): an edit to it must roll the
         # pods for the same reason a config edit must — nothing re-runs an init container in place.
@@ -127,6 +133,7 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
+{{- with (include "memex.trustedCa.initContainer" (dict "root" $ "image" .Values.portal.image)) }}{{- . | nindent 8 }}{{- end }}
         # Postgres and the portal start concurrently on a fresh install; the portal's hub
         # init FAILS (and the host aborts) if Postgres isn't yet accepting connections.
         # Gate startup on Postgres TCP readiness so the ordering is deterministic.
@@ -410,6 +417,7 @@ spec:
             # their own threads for the same reason (LimitedConcurrencyLevelTaskScheduler).
             - name: "DOTNET_ThreadPool_ThreadsToKeepAlive"
               value: "-1"
+            {{- with (include "memex.trustedCa.env" $) }}{{- . | nindent 12 }}{{- end }}
           {{- with .Values.selfUpdate }}
           {{- if .azureClientId }}
             # Explicit AZURE_CLIENT_ID for the self-updater's ACR credential (the workload-identity
@@ -476,10 +484,21 @@ spec:
               mountPath: "{{ $class.mountPath }}"
               readOnly: true
 {{- end }}
+{{- /* The Ingress TLS certificate class (ingress.tlsFromKeyVault). Nothing reads the files: the
+       mount exists because the CSI driver creates and rotates the synced kubernetes.io/tls Secret
+       only while a pod mounts the volume. Portal only — the migration Job has no use for it. */}}
+{{- with (include "memex.ingressTlsFromKeyVault" . | fromYaml) }}
+{{- if .certificate }}
+            - name: "{{ .volumeName }}"
+              mountPath: "{{ .mountPath }}"
+              readOnly: true
+{{- end }}
+{{- end }}
 {{- /* ⚠️ LEGACY: extra mounts the chart does not own — the mount half of .Values.extraVolumes
        (typically a HAND-MADE secrets-store CSI volume, whose mount is what makes the driver sync
        its k8s Secret and keep rotating it). Prefer .Values.keyVaultSecrets, which renders the
        mount above. Verbatim VolumeMount objects. */}}
+{{- with (include "memex.trustedCa.mount" $) }}{{- . | nindent 12 }}{{- end }}
 {{- range .Values.extraVolumeMounts }}
             - {{ toYaml . | nindent 14 | trim }}
 {{- end }}
@@ -755,6 +774,16 @@ spec:
             volumeAttributes:
               secretProviderClass: "{{ $class.name }}"
 {{- end }}
+{{- with (include "memex.ingressTlsFromKeyVault" . | fromYaml) }}
+{{- if .certificate }}
+        - name: "{{ .volumeName }}"
+          csi:
+            driver: "secrets-store.csi.k8s.io"
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: "{{ .name }}"
+{{- end }}
+{{- end }}
 {{- /* ⚠️ LEGACY: extra volumes the chart does not own — typically the secrets-store CSI volume
        behind a HAND-MADE SecretProviderClass. Prefer .Values.keyVaultSecrets, which renders the
        SecretProviderClass itself and this volume from one declaration. Kept because without the
@@ -762,6 +791,7 @@ spec:
        `helm upgrade` drops it, the CSI driver stops syncing/rotating its k8s Secret, and every
        key it feeds goes stale (the memex-cloud AI-keys shape, paired with .Values.extraEnvFrom).
        Verbatim Volume objects; mount them via .Values.extraVolumeMounts. */}}
+{{- with (include "memex.trustedCa.volumes" $) }}{{- . | nindent 8 }}{{- end }}
 {{- range .Values.extraVolumes }}
         - {{ toYaml . | nindent 10 | trim }}
 {{- end }}

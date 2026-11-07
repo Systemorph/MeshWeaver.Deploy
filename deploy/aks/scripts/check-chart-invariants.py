@@ -1239,6 +1239,64 @@ else:
     if "next" in _svc_ports or "next" in _c_ports or "PortalNext__Bundled" in cfg_data:
         finding("/next is OFF but part of the bundled shape renders", _next_fix)
 
+# ---- 22. Additional trusted CAs: one combined bundle, written before it is read, on BOTH pods ----
+# MeshWeaver.Deploy#138 (templates/memex-portal/_trusted-ca.tpl). SSL_CERT_FILE REPLACES OpenSSL's
+# default file, so it may only ever point at the bundle the `trusted-ca-bundle` init container
+# wrote from the image's system CAs PLUS the estate's: every container that reads it must mount
+# that emptyDir at the file's directory, the init container must run FIRST and start from the
+# system bundle, SSL_CERT_DIR must stay unset (it would replace the default directory), and the
+# portal and the migration Job — which open the same databases — must agree.
+checks += 1
+_ca_fix = "See templates/memex-portal/_trusted-ca.tpl."
+
+
+def _ca_shape(label, pod_spec):
+    """Returns the SSL_CERT_FILE the pod's containers read (None when none), reporting contradictions."""
+    inits = pod_spec.get("initContainers") or []
+    all_c = inits + (pod_spec.get("containers") or [])
+    vols = {v.get("name"): v for v in (pod_spec.get("volumes") or [])}
+    files = set()
+    for idx, c in enumerate(all_c):
+        env = {e.get("name"): e for e in (c.get("env") or [])}
+        if "SSL_CERT_DIR" in env:
+            finding(f"{label}: container {c.get('name')!r} sets SSL_CERT_DIR",
+                    "it REPLACES OpenSSL's default certificate directory, dropping system roots. " + _ca_fix)
+        if "SSL_CERT_FILE" not in env:
+            continue
+        f = str(env["SSL_CERT_FILE"].get("value") or "")
+        files.add(f)
+        d = f.rsplit("/", 1)[0]
+        m = next((m for m in (c.get("volumeMounts") or []) if m.get("name") == "trusted-ca-bundle"), None)
+        if m is None or (m.get("mountPath") or "").rstrip("/") != d:
+            finding(f"{label}: container {c.get('name')!r} reads SSL_CERT_FILE={f!r} without mounting trusted-ca-bundle at {d!r}",
+                    "the file would not exist and the runtime would trust NOTHING. " + _ca_fix)
+        w = next((i for i, x in enumerate(inits) if x.get("name") == "trusted-ca-bundle"), None)
+        if w is None or w >= idx:
+            finding(f"{label}: container {c.get('name')!r} reads SSL_CERT_FILE but no trusted-ca-bundle init container runs before it",
+                    "nothing would have written the bundle. " + _ca_fix)
+    if len(files) > 1:
+        finding(f"{label}: containers read different SSL_CERT_FILE paths {sorted(files)!r}", _ca_fix)
+    writer = next((x for x in inits if x.get("name") == "trusted-ca-bundle"), None)
+    if writer is not None:
+        text = "\n".join(str(x) for x in (writer.get("command") or []))
+        if 'cat "$sys" >' not in text:
+            finding(f"{label}: the trusted-ca-bundle init container does not start the bundle from the system CAs",
+                    "a bundle of ONLY the estate's CAs breaks every public TLS call. " + _ca_fix)
+        if not isinstance((vols.get("trusted-ca-bundle") or {}).get("emptyDir"), dict):
+            finding(f"{label}: the trusted-ca-bundle volume is not a pod-local emptyDir", _ca_fix)
+        if not files:
+            finding(f"{label}: the trusted-ca-bundle init container renders but no container reads SSL_CERT_FILE",
+                    "the bundle is written and nothing trusts it. " + _ca_fix)
+    return next(iter(files), None)
+
+
+_portal_ca = _ca_shape("portal", pod)
+if migration is not None:
+    _mig_ca = _ca_shape("migration", (((migration.get("spec") or {}).get("template") or {}).get("spec")) or {})
+    if _portal_ca != _mig_ca:
+        finding(f"the portal trusts the bundle {_portal_ca!r} and the migration Job {_mig_ca!r}",
+                "both open the same databases; one without the estate's CA fails its TLS handshake. " + _ca_fix)
+
 MIN_CHECKS = 5
 if checks < MIN_CHECKS:
     print(

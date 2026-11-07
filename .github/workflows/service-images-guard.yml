@@ -1,5 +1,6 @@
-# `Service images reach the registry as the publishing identity can` — the guard over the four
-# service-image lanes (ocr-image.yml, ollama-image.yml, whisper-image.yml, s1-extract-image.yml).
+# `Service images reach the registry as the publishing identity can` — the guard over the six
+# service-image lanes (ocr-image.yml, ollama-image.yml, whisper-image.yml, s1-extract-image.yml,
+# headscale-image.yml, tailnet-bridge-image.yml).
 #
 # Those lanes moved here from the platform repository (core slimming). There they signed in with a
 # subscription and reached the registry through `az acr` (an ARM lookup) and the platform's
@@ -40,7 +41,7 @@ jobs:
       - name: Every service-image lane signs in tenant-level and never asks ARM
         run: |
           set -euo pipefail
-          lanes=(ocr-image.yml ollama-image.yml whisper-image.yml s1-extract-image.yml)
+          lanes=(ocr-image.yml ollama-image.yml whisper-image.yml s1-extract-image.yml headscale-image.yml tailnet-bridge-image.yml)
           for lane in "${lanes[@]}"; do
             [ -f ".github/workflows/$lane" ] || { echo "::error::.github/workflows/$lane is missing — the guard's subject moved; repoint it"; exit 1; }
             python3 .github/scripts/acr-data-plane.py check-workflow ".github/workflows/$lane"

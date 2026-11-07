@@ -139,6 +139,52 @@ readonly BACKLEASE_FILE="$LOCAL_HOME/backlease.yaml"
 # residency declared (a model whose residency is Unknown is never used for mail triage), and the
 # utility tier mapped to it (the tier the inbox triage, reply drafting and calendar suggestions ask).
 readonly LLM_FILE="$LOCAL_HOME/llm.yaml"
+# ── CERTIFICATES for the machine's private-network name (Let's Encrypt over DNS-01; `memex-local cert`) ──
+# dns01.env names the DNS zone and the identity allowed to write its challenge records (nothing secret);
+# dns01.secret is that identity's client secret (0600) — delivered by the enrolment channel, never typed into
+# a chat or printed. lego keeps the account and the certificates under $CERT_DIR/lego; a launchd agent
+# re-runs `cert issue` daily, which renews only within 30 days of expiry.
+readonly CERT_DIR="$LOCAL_HOME/certs"
+# ── INTERNAL ONLY (`memex-local internal on`) — the fleet default: the portal answers at this Mac's private-network
+# name with its trusted certificate, over the private network only. One values layer (the sign-in and
+# invitation-only admission, 0600), a separate Ingress for that name, and tailscale serve TCP 443 → the front door.
+readonly INTERNAL_FILE="$LOCAL_HOME/internal.yaml"
+readonly INTERNAL_INGRESS="memex-portal-net"
+readonly INTERNAL_TLS_SECRET="memex-portal-net-tls"
+readonly CERT_ENV="$CERT_DIR/dns01.env"
+readonly CERT_SECRET="$CERT_DIR/dns01.secret"
+readonly CERT_PLIST_LABEL="com.memex.local.cert"
+readonly CERT_PLIST_DST="$HOME/Library/LaunchAgents/${CERT_PLIST_LABEL}.plist"
+# ── FLEET JOIN — this Mac joins the fleet in one command (MeshWeaver.Plugins Hosting/MacStudioFleet §2b) ──
+# Written by `memex-local fleet join` from the enrolment code a control-instance global admin issued: the
+# machine's heartbeat key and its announcement key (secrets.memex_portal, 0600) and the control inbox URL.
+# One values layer after back-lease and before the overlay (an overlay value still wins). The throw-away
+# RSA key the code is sealed to lives under $FLEET_DIR only until the code is opened.
+readonly FLEET_FILE="$LOCAL_HOME/fleet.yaml"
+# ── PUBLISHED — this Mac answers at its tailnet name (and optionally a public name) on the private network ──
+# Written by `memex-local publish on`, read by helm_deploy as one more values layer after the fleet layer
+# and before the overlay (an overlay value still wins): the published names as ADDITIONAL ingress hosts (the
+# portal's own links keep https://memex.localhost), the sign-in provider declared for it, and
+# invitation-only admission. While it exists the front door binds LOOPBACK only, on the unprivileged port
+# (share/port-forward.sh), and the network has its OWN entry point (share/network-entry.yaml, reached by
+# `tailscale serve` TCP 443 → 127.0.0.1:<entry port>), which marks every request it carries so the portal
+# refuses the open sign-in for it whatever the Host says. Design: core Doc/Architecture/PrivateNetwork §5.
+readonly PUBLISH_FILE="$LOCAL_HOME/publish.yaml"
+# The network's OWN entry point (share/network-entry.yaml): tailscale serve 443 → 127.0.0.1:<this port> →
+# the in-cluster proxy that marks every request X-MeshWeaver-Provenance: tailnet → the local ingress.
+# 8446: distinct from the front door (8443) and the e2e portal's forward (8444) — a collision would let
+# tailscale serve hand network traffic to a forward WITHOUT the mark; publish refuses one (below).
+readonly ENTRY_PORT="${MEMEX_ENTRY_PORT:-8446}"
+readonly FLEET_DIR="$LOCAL_HOME/enrol"
+readonly FLEET_CODE_PREFIX="mwenrol1."
+# The host's Ollama under launchd (survives a reboot), bound to every interface so the Colima VM reaches
+# it by the gateway IP — the nohup'd `ollama serve` did not survive a reboot (MacStudioFleet §2b gap 9).
+readonly OLLAMA_PLIST_LABEL="com.memex.local.ollama"
+readonly OLLAMA_PLIST_DST="$HOME/Library/LaunchAgents/${OLLAMA_PLIST_LABEL}.plist"
+# The public, multi-arch GHCR images registry mode pulls ANONYMOUSLY — the registry the in-pod
+# self-updater follows (values.local.registry-mode.yaml). No `az login` (gap 5).
+readonly GHCR="ghcr.io/systemorph"
+readonly GHCR_DEFAULT_TAG="latest"
 readonly BACKLEASE_DIR="$LOCAL_HOME/backlease"
 readonly BACKLEASE_SAMPLER="$LOCAL_HOME/backlease-sampler.sh"
 readonly BACKLEASE_PLIST_LABEL="com.memex.local.backlease"
@@ -692,6 +738,763 @@ cmd_backlease() {
 }
 
 
+# ---------------------------------------------------------------------------
+# §18b — PUBLISH this Mac on the private network (MeshWeaver.Plugins Hosting/MacStudioFleet §6)
+# ---------------------------------------------------------------------------
+# `publish on --sign-in microsoft --tenant <id> --client-id <id>` makes this Mac's portal answer at its OWN
+# name on the private network — the MagicDNS name `tailscale status --json` reports as .Self.DNSName
+# (e.g. mac-1.<tailnet suffix>), read here and never typed — as well as at memex.localhost. A member device
+# on the network reaches https://<that name> DIRECTLY (tailscale serve TCP 443 → the entry point); nothing
+# public is involved. That is the default (`--tailnet-only` says it explicitly).
+# `--host <public name>` ADDS a public name the network's ingress bridge (MeshWeaver.Deploy
+# deploy/tailnet-bridge) forwards to the same port with Host = the public name; the machine's own name is
+# still served beside it when tailscale reports one.
+# What protects every name is the portal's own sign-in, so the command REQUIRES a real provider (the
+# development sign-in answers on localhost names only, and never for a request the entry point marked) and
+# turns on invitation-only admission: the first person to sign in becomes the instance's administrator,
+# everyone after needs an invitation. The client secret is read from STDIN (`< file` or a pipe), never an
+# argument, and stored in this 0600 layer only. `publish status` reads it back; `publish off` removes it;
+# `publish ca` prints the entry point's root certificate for a member device to trust.
+publish_value() { awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$PUBLISH_FILE" 2>/dev/null; }
+# Every published name, one per line (the layer's ingress.additionalHosts list).
+publish_hosts() {
+  awk '/^  additionalHosts:/ { on = 1; next } on && /^    - / { sub(/^ *- */, ""); gsub(/"/, ""); print; next } on { exit }' "$PUBLISH_FILE" 2>/dev/null
+}
+# "https://a, https://b" for the messages.
+publish_urls() { publish_hosts | sed 's|^|https://|' | paste -sd, - | sed 's/,/, /g'; }
+publish_signin_summary() {
+  local p; for p in Microsoft Google Apple LinkedIn; do
+    [ -n "$(publish_value "Authentication__${p}__ClientId")" ] && printf '%s' "$p"
+  done
+  local t; t="$(publish_value Authentication__Microsoft__TenantId)"; [ -n "$t" ] && printf ' (tenant %s)' "$t"
+}
+
+# The tailscaled socket to talk to: MEMEX_TAILSCALE_SOCKET, else a USER-SPACE tailscaled's socket under the
+# person's home ($HOME/.tailscale/tailscaled.sock — the shape a fleet Mac runs), else the system default.
+# Without it `tailscale serve` talks to a daemon that is not running and fails.
+# The fleet's own shape is a ROOT LaunchDaemon (com.meshweaver.fleet.tailscaled, socket /var/run/tailscaled.socket
+# — deploy/macos/intune/fleet-bootstrap.sh): it is up before anyone logs in, which the Tailscale app is not.
+# Order: MEMEX_TAILSCALE_SOCKET, that root daemon's socket, a user-space daemon's under the home, the default.
+tailscale_socket() {
+  local root_sock="${MEMEX_TAILSCALED_ROOT_SOCKET:-/var/run/tailscaled.socket}"
+  if [ -n "${MEMEX_TAILSCALE_SOCKET:-}" ]; then printf '%s' "$MEMEX_TAILSCALE_SOCKET"
+  elif [ -S "$root_sock" ]; then printf '%s' "$root_sock"
+  elif [ -S "$HOME/.tailscale/tailscaled.sock" ]; then printf '%s' "$HOME/.tailscale/tailscaled.sock"
+  fi
+}
+
+# The network path to the front door: tailscale serve forwards TCP 443 on this Mac's network address to
+# the loopback-only front door, through tailscale_socket.
+publish_tailscale() {
+  local ts=(tailscale) sock; sock="$(tailscale_socket)"; [ -n "$sock" ] && ts+=(--socket="$sock")
+  command -v tailscale >/dev/null 2>&1 || { warn "tailscale is not installed — join the private network first (MeshWeaver.Deploy deploy/headscale/README.md)"; return 1; }
+  ${ts[@]+"${ts[@]}"} "$@"
+}
+
+# This Mac's OWN name on the private network: .Self.DNSName of `tailscale status --json` (the MagicDNS
+# name, e.g. mac-1.<tailnet suffix>.), trailing dot stripped, lower-cased. Prints nothing — and says why on
+# stderr — when tailscale is absent, not connected, or reports no name: the caller then publishes no
+# tailnet name. Read with jq, else python3, else plutil (macOS reads JSON too); never typed by hand.
+tailnet_name() {
+  command -v tailscale >/dev/null 2>&1 || { warn "tailscale is not installed — no tailnet name to publish (join the private network: MeshWeaver.Deploy deploy/headscale/README.md)"; return 0; }
+  local json name="" state=""
+  json="$(publish_tailscale status --json 2>/dev/null)" || json=""
+  if [ -n "$json" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      state="$(printf '%s' "$json" | jq -r '.BackendState // empty' 2>/dev/null)"
+      name="$(printf '%s' "$json" | jq -r '.Self.DNSName // empty' 2>/dev/null)"
+    elif command -v python3 >/dev/null 2>&1; then
+      state="$(printf '%s' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState") or "")' 2>/dev/null)"
+      name="$(printf '%s' "$json" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("Self") or {}).get("DNSName") or "")' 2>/dev/null)"
+    elif command -v plutil >/dev/null 2>&1; then
+      state="$(printf '%s' "$json" | plutil -extract BackendState raw -o - - 2>/dev/null)"
+      name="$(printf '%s' "$json" | plutil -extract Self.DNSName raw -o - - 2>/dev/null)"
+    fi
+  fi
+  # A stopped or logged-out backend still reports the last DNSName — publishing it would advertise a name
+  # nobody can reach. Only a Running backend's name counts.
+  if [ -n "$json" ] && [ "$state" != "Running" ]; then
+    warn "tailscale is not running on this Mac (BackendState: ${state:-unknown}) — no tailnet name to publish ('tailscale up' first)"; return 0
+  fi
+  name="$(printf '%s' "$name" | tr 'A-Z' 'a-z')"; name="${name%.}"
+  case "$name" in
+    '') warn "tailscale reports no MagicDNS name for this Mac (not connected, or MagicDNS is off) — no tailnet name to publish"; return 0 ;;
+    *[!a-z0-9.-]*|*.localhost|localhost) warn "tailscale reports '$name', which is not a DNS name — no tailnet name to publish"; return 0 ;;
+    *.*) printf '%s' "$name" ;;
+    *) warn "tailscale reports '$name' without a domain (MagicDNS is off?) — no tailnet name to publish"; return 0 ;;
+  esac
+}
+
+# Renders share/network-entry.yaml for the given names: the Caddy site between `site:begin` and `site:end`
+# once per name (__HOST__), __HOSTS__ = the names space-separated. Names are validated DNS names by now.
+render_network_entry() {
+  local template="$1"; shift
+  # per name: a publicly trusted certificate when `memex-local cert` holds one for it, else the local CA
+  local withcert="" h digest=""
+  for h in "$@"; do [ -f "$(cert_file "$h" crt)" ] && [ -f "$(cert_file "$h" key)" ] && withcert="$withcert $h"; done
+  [ -n "$withcert" ] && digest="$(for h in $withcert; do cat "$(cert_file "$h" crt)"; done | shasum -a 256 | cut -c1-16)"
+  awk -v names="$*" -v withcert="$withcert" -v digest="${digest:-none}" '
+    BEGIN { n = split(names, h, " "); m = split(withcert, w, " "); for (j = 1; j <= m; j++) has[w[j]] = 1 }
+    /# site:begin/ { inblock = 1; block = ""; next }
+    inblock && /# site:end/ { inblock = 0; for (i = 1; i <= n; i++) { b = block; gsub(/__HOST__/, h[i], b); t = (h[i] in has) ? "tls /certs/" h[i] ".crt /certs/" h[i] ".key" : "tls internal"; gsub(/__TLS__/, t, b); printf "%s", b }; next }
+    inblock { block = block $0 "\n"; next }
+    { gsub(/__HOSTS__/, names); gsub(/__CERTS_DIGEST__/, digest); print }
+  ' "$template"
+}
+
+# ---------------------------------------------------------------------------
+# §18c — CERTIFICATES for the machine's private-network name (`memex-local cert`)
+# ---------------------------------------------------------------------------
+# `cert config --domain <machine>.net.<domain> --email <contact> --client-id <id> --tenant <id> --subscription <id>
+#   --resource-group <rg> --zone <zone>` with the client secret on STDIN; `cert issue` obtains (or renews, within
+# 30 days) a Let's Encrypt certificate over DNS-01 with lego, hands it to the network entry point as the Secret
+# memex-network-entry-certs, and arms a daily launchd re-run; `cert status` reads it back.
+cert_value() { awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); gsub(/"/, ""); print; exit }' "$CERT_ENV" 2>/dev/null; }
+
+# A certificate file of lego's layout for <name>: crt | key.
+cert_file() { printf '%s/lego/certificates/%s.%s' "$CERT_DIR" "$1" "$2"; }
+
+# The certificate's expiry (notAfter) or empty.
+cert_expiry() { [ -f "$(cert_file "$1" crt)" ] && openssl x509 -in "$(cert_file "$1" crt)" -noout -enddate 2>/dev/null | sed 's/^notAfter=//'; }
+
+# The lego invocation for issue-or-renew. Pure: prints the argument list one per line (tests read it).
+cert_lego_args() {
+  printf '%s\n' run --accept-tos --email "$(cert_value LEGO_EMAIL)" --dns azuredns --domains "$(cert_value CERT_DOMAIN)" \
+    --key-type EC256 --renew-days 30 --path "$CERT_DIR/lego"
+}
+
+# Puts every certificate lego holds into the entry point's Secret, then re-renders the entry point so its pod
+# restarts onto them (the digest annotation changes). Skipped quietly when the stack is not up.
+cert_install() {
+  local args=() f n
+  for f in "$CERT_DIR"/lego/certificates/*.crt; do
+    [ -f "$f" ] || continue
+    n="$(basename "$f" .crt)"
+    case "$n" in *.issuer) continue ;; esac
+    [ -f "$CERT_DIR/lego/certificates/$n.key" ] || continue
+    args+=(--from-file="$n.crt=$f" --from-file="$n.key=$CERT_DIR/lego/certificates/$n.key")
+  done
+  [ "${#args[@]}" -gt 0 ] || return 0
+  colima_running || { info "the stack is not running — the certificate reaches the entry point at the next 'publish on'"; return 0; }
+  # the internal-only Ingress serves the configured name with its own TLS Secret
+  local d; d="$(cert_value CERT_DOMAIN)"
+  if [ -n "$d" ] && [ -f "$(cert_file "$d" crt)" ] && [ -f "$(cert_file "$d" key)" ]; then
+    local_kubectl -n "$NAMESPACE" create secret tls "$INTERNAL_TLS_SECRET" --cert="$(cert_file "$d" crt)" --key="$(cert_file "$d" key)" --dry-run=client -o yaml \
+      | local_kubectl -n "$NAMESPACE" apply -f - >/dev/null 2>&1 && ok "certificate for $d handed to the internal Ingress (Secret $INTERNAL_TLS_SECRET)" \
+      || warn "could not write the Secret $INTERNAL_TLS_SECRET"
+  fi
+  local_kubectl -n "$NAMESPACE" create secret generic memex-network-entry-certs ${args[@]+"${args[@]}"} --dry-run=client -o yaml \
+    | local_kubectl -n "$NAMESPACE" apply -f - >/dev/null 2>&1 || { warn "could not write the Secret memex-network-entry-certs"; return 1; }
+  ok "certificate(s) handed to the network entry point (Secret memex-network-entry-certs)"
+  if [ -f "$LOCAL_HOME/network-entry.yaml" ] && [ -f "$PUBLISH_FILE" ]; then
+    info "re-rendering the entry point onto the certificate: memex-local publish on is re-run by the next 'memex-local update'; applying now"
+    local share names; share="$(resolve_share)"
+    names="$(awk -F'"' '/memex-local\/caddyfile-hosts:/ { print $2; exit }' "$LOCAL_HOME/network-entry.yaml")"
+    # shellcheck disable=SC2086
+    render_network_entry "$share/network-entry.yaml" $names > "$LOCAL_HOME/network-entry.yaml" \
+      && local_kubectl -n "$NAMESPACE" apply -f "$LOCAL_HOME/network-entry.yaml" >/dev/null 2>&1 \
+      && ok "network entry point re-rendered (serves the trusted certificate for $(cert_value CERT_DOMAIN))"
+  fi
+}
+
+install_cert_agent() {
+  local self; self="$(command -v memex-local 2>/dev/null || printf '%s' "$0")"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$CERT_PLIST_DST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${CERT_PLIST_LABEL}</string>
+  <key>ProgramArguments</key><array><string>${self}</string><string>cert</string><string>issue</string><string>--no-agent</string></array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>MEMEX_LOCAL_HOME</key><string>${LOCAL_HOME}</string></dict>
+  <key>StartInterval</key><integer>86400</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>${CERT_DIR}/renew.log</string>
+  <key>StandardErrorPath</key><string>${CERT_DIR}/renew.log</string>
+</dict>
+</plist>
+PLIST
+  launchctl bootout "gui/$(id -u)" "$CERT_PLIST_DST" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$CERT_PLIST_DST" >/dev/null 2>&1 && ok "daily renewal armed (launchd $CERT_PLIST_LABEL; lego renews within 30 days of expiry)" \
+    || warn "could not load the renewal agent $CERT_PLIST_LABEL"
+}
+
+cmd_cert() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    config)
+      local domain="" email="" cid="" tenant="" sub_id="" rg="" zone="" secret
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --domain) shift; domain="${1:?}" ;; --email) shift; email="${1:?}" ;; --client-id) shift; cid="${1:?}" ;;
+          --tenant) shift; tenant="${1:?}" ;; --subscription) shift; sub_id="${1:?}" ;; --resource-group) shift; rg="${1:?}" ;;
+          --zone) shift; zone="${1:?}" ;; *) die "cert config: unknown flag '$1'" ;;
+        esac; shift
+      done
+      for v in domain email cid tenant sub_id rg zone; do [ -n "${!v}" ] || die "cert config: --${v//_/-} is required (cid = --client-id, sub_id = --subscription, rg = --resource-group)"; done
+      case "$domain" in *.*) ;; *) die "cert config: --domain must be a full name (e.g. <machine>.net.<domain>)" ;; esac
+      case "$domain" in *".$zone") ;; *) die "cert config: --domain '$domain' is not inside the zone '$zone' the identity may write" ;; esac
+      [ -t 0 ] && die "cert config: pipe the DNS-01 identity's client secret on STDIN — it is never an argument and never printed"
+      secret="$(cat)"; secret="${secret%$'\n'}"; [ -n "$secret" ] || die "cert config: no client secret on STDIN"
+      mkdir -p "$CERT_DIR"; chmod 700 "$CERT_DIR"
+      ( umask 077; printf '%s' "$secret" > "$CERT_SECRET" ); unset secret
+      ( umask 077; cat > "$CERT_ENV" ) <<ENV
+# memex-local CERTIFICATES — managed by \`memex-local cert config\`. Nothing secret here; the client secret is in dns01.secret.
+CERT_DOMAIN=${domain}
+LEGO_EMAIL=${email}
+AZURE_CLIENT_ID=${cid}
+AZURE_TENANT_ID=${tenant}
+AZURE_SUBSCRIPTION_ID=${sub_id}
+AZURE_RESOURCE_GROUP=${rg}
+AZURE_ZONE_NAME=${zone}
+ENV
+      ok "certificate configuration written ($CERT_ENV; the secret in $CERT_SECRET, 0600, never printed) — next: memex-local cert issue"
+      ;;
+    issue)
+      local agent="yes"; [ "${1:-}" = "--no-agent" ] && agent="no"
+      [ -f "$CERT_ENV" ] && [ -s "$CERT_SECRET" ] || die "cert issue: not configured — memex-local cert config … < secret"
+      need lego lego
+      local domain; domain="$(cert_value CERT_DOMAIN)"
+      local args=(); while IFS= read -r a; do args+=("$a"); done < <(cert_lego_args)
+      step "Certificate for $domain (Let's Encrypt, DNS-01 in $(cert_value AZURE_ZONE_NAME); renews within 30 days of expiry)"
+      env AZURE_AUTH_METHOD=env AZURE_CLIENT_ID="$(cert_value AZURE_CLIENT_ID)" AZURE_CLIENT_SECRET_FILE="$CERT_SECRET" \
+          AZURE_TENANT_ID="$(cert_value AZURE_TENANT_ID)" AZURE_SUBSCRIPTION_ID="$(cert_value AZURE_SUBSCRIPTION_ID)" \
+          AZURE_RESOURCE_GROUP="$(cert_value AZURE_RESOURCE_GROUP)" AZURE_ZONE_NAME="$(cert_value AZURE_ZONE_NAME)" \
+          lego ${args[@]+"${args[@]}"} || die "cert issue: lego could not obtain or renew the certificate for $domain (its output is above)"
+      ok "certificate for $domain valid until $(cert_expiry "$domain")"
+      cert_install
+      [ "$agent" = "yes" ] && install_cert_agent
+      ;;
+    status)
+      if [ ! -f "$CERT_ENV" ]; then info "no certificate configured — memex-local cert config … < secret, then memex-local cert issue"; return 0; fi
+      local domain; domain="$(cert_value CERT_DOMAIN)"
+      if [ -n "$(cert_expiry "$domain")" ]; then ok "certificate for $domain valid until $(cert_expiry "$domain")"; else warn "no certificate for $domain yet — memex-local cert issue"; fi
+      if launchctl print "gui/$(id -u)/${CERT_PLIST_LABEL}" >/dev/null 2>&1; then ok "daily renewal agent loaded ($CERT_PLIST_LABEL)"; else warn "renewal agent $CERT_PLIST_LABEL NOT loaded — memex-local cert issue arms it"; fi
+      ;;
+    *) die "usage: memex-local cert {config --domain <name> --email <e> --client-id <id> --tenant <id> --subscription <id> --resource-group <rg> --zone <zone> < secret | issue | status}" ;;
+  esac
+}
+
+# The entry point's root certificate (Caddy's `tls internal` CA, on the entry point's data volume): what a
+# member device must trust before a browser or a WKWebView accepts https://<tailnet name>. PEM on stdout.
+readonly ENTRY_CA_PATH="/data/caddy/pki/authorities/local/root.crt"
+# Pinned to the LOCAL cluster's context (MEMEX_KUBE_CONTEXT, default colima — the same as share/port-forward.sh):
+# this hands out a trust anchor, so it must never read another cluster's entry point because the person's
+# current context points elsewhere.
+publish_ca() {
+  local pem ctx="${MEMEX_KUBE_CONTEXT:-colima}"
+  pem="$(kubectl --context "$ctx" -n "$NAMESPACE" exec deploy/memex-network-entry -- cat "$ENTRY_CA_PATH" 2>/dev/null)" || pem=""
+  case "$pem" in
+    "-----BEGIN CERTIFICATE-----"*"-----END CERTIFICATE-----"*) printf '%s\n' "$pem" ;;
+    *) die "publish ca: no root certificate at memex-network-entry:$ENTRY_CA_PATH (context $ctx) — is this Mac published ('memex-local publish status') and the entry point running ('kubectl -n $NAMESPACE get pods -l app.kubernetes.io/name=memex-network-entry')?" ;;
+  esac
+}
+
+# Removes EMPTY placeholder lines (`    <key>: ""`) for the given keys from the person's overlay. The overlay is
+# layered LAST, and an empty string there OVERRIDES a lower layer's value — the chart then drops the key, so a
+# portal published with a Microsoft client id came up with none (measured 2026-11-07: the overlay template's
+# own `Authentication__Microsoft__ClientId: ""`). Only empty placeholders go; a real value the person set stays
+# and still wins. The file keeps its mode. Prints the keys it removed.
+overlay_drop_empty() {
+  [ -f "$OVERLAY" ] || return 0
+  local key pattern="" tmp
+  for key in "$@"; do pattern="${pattern:+$pattern|}$key"; done
+  grep -Eq "^[[:space:]]+($pattern):[[:space:]]*\"\"[[:space:]]*\$" "$OVERLAY" || return 0
+  grep -Eo "^[[:space:]]+($pattern):[[:space:]]*\"\"" "$OVERLAY" | sed -e 's/^[[:space:]]*//' -e 's/:.*//'
+  tmp="$(mktemp "$LOCAL_HOME/overlay.XXXXXX")"
+  grep -Ev "^[[:space:]]+($pattern):[[:space:]]*\"\"[[:space:]]*\$" "$OVERLAY" > "$tmp" || true
+  chmod 600 "$tmp" && mv "$tmp" "$OVERLAY"
+}
+
+# The keys the public-name layer owns, which an empty overlay placeholder must not erase.
+readonly PUBLISH_OWNED_KEYS=(Authentication__Microsoft__ClientId Authentication__Microsoft__TenantId Authentication__Microsoft__ClientSecret)
+
+# ---------------------------------------------------------------------------
+# §18d — INTERNAL ONLY (`memex-local internal on|status|off`) — the fleet default (Hosting/MacStudioFleet §2b.3)
+# ---------------------------------------------------------------------------
+internal_value() { awk -v k="$1" '$1 == "#"k":" { print $2; exit } $1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$INTERNAL_FILE" 2>/dev/null; }
+
+# The separate Ingress for the private-network name. Separate because the chart's ONE tlsSecret covers every
+# host, and pointing it at this name's certificate would break memex.localhost. Its annotations are the
+# portal Ingress's own (read live), minus the bookkeeping ones. Pure over its arguments: prints the manifest.
+internal_ingress_manifest() {
+  local host="$1" annotations="$2" class="${3:-nginx}"
+  printf 'apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: %s\n  labels: { app.kubernetes.io/managed-by: memex-local, app.kubernetes.io/component: memex-portal-net }\n' "$INTERNAL_INGRESS"
+  if [ -n "$annotations" ]; then printf '  annotations:\n'; printf '%s\n' "$annotations" | sed 's/^/    /'; fi
+  printf 'spec:\n  ingressClassName: %s\n  tls:\n    - hosts: ["%s"]\n      secretName: %s\n' "$class" "$host" "$INTERNAL_TLS_SECRET"
+  printf '  rules:\n    - host: "%s"\n      http:\n        paths:\n          - path: /\n            pathType: Prefix\n            backend: { service: { name: memex-portal-service, port: { number: 8080 } } }\n' "$host"
+}
+
+# The portal Ingress's annotations, one `key: "value"` line each, without kubectl/helm/cert-manager bookkeeping.
+portal_ingress_annotations() {
+  local_kubectl -n "$NAMESPACE" get ingress memex-portal -o go-template='{{range $k, $v := .metadata.annotations}}{{$k}}: {{printf "%q" $v}}{{"\n"}}{{end}}' 2>/dev/null \
+    | grep -Ev '^(kubectl\.kubernetes\.io/|meta\.helm\.sh/|cert-manager\.io/)' || true
+}
+
+# The local cluster's kubectl — pinned to MEMEX_KUBE_CONTEXT (default colima, as publish ca and
+# share/port-forward.sh), so a private key or an Ingress never lands in whatever cluster the
+# current context happens to name (an operator's Mac also holds cloud contexts).
+local_kubectl() { kubectl --context "${MEMEX_KUBE_CONTEXT:-colima}" "$@"; }
+
+# Restart the front door only where one is already installed, so it re-reads internal.yaml now
+# (loopback-only while internal, all interfaces again after off) instead of at the next update.
+restart_front_door() {
+  if [ "$HEADLESS" = "1" ]; then
+    [ -f "$PF_PID" ] || return 0
+    kill "$(cat "$PF_PID")" 2>/dev/null || true; rm -f "$PF_PID"
+  else
+    [ -f "$PLIST_DST" ] || return 0
+  fi
+  if install_launchd >/dev/null 2>&1; then ok "front door restarted ($1)"; else warn "could not restart the front door — run 'memex-local port-forward'"; fi
+}
+
+# Open the private network to this Mac (tailscale serve TCP 443 -> the loopback front door) ONLY once
+# the running portal carries this layer's sign-in with the development sign-in off — never in the
+# window between writing the layer and the update that applies it.
+internal_serve_when_signed_in() {
+  local want got dev inv
+  want="$(internal_value Authentication__Microsoft__ClientId)"
+  got="$(local_kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__Microsoft__ClientId}' 2>/dev/null || true)"
+  dev="$(local_kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__EnableDevLogin}' 2>/dev/null || true)"
+  inv="$(local_kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Features__Onboarding__InvitationOnly}' 2>/dev/null || true)"
+  if [ -z "$want" ] || [ "$got" != "$want" ] || [ "$dev" = "true" ] || [ "$inv" != "true" ]; then
+    info "the private network is NOT opened yet: the running portal does not carry this sign-in (dev sign-in: ${dev:-unset}) — 'memex-local update' applies it and opens it"
+    return 1
+  fi
+  # The configmap changes before the pods do: only a COMPLETED rollout serves the new sign-in.
+  if ! local_kubectl -n "$NAMESPACE" rollout status deployment/memex-portal-deployment --timeout=300s >/dev/null 2>&1; then
+    info "the private network is NOT opened yet: the portal's rollout has not completed — 'memex-local update' opens it once it has"
+    return 1
+  fi
+  if publish_tailscale serve --bg --tcp 443 "tcp://127.0.0.1:${HOST_PORT}" >/dev/null 2>&1; then
+    ok "the private network reaches this Mac on TCP 443 (tailscale serve → the loopback front door, TLS passed through)"
+  else
+    warn "could not set up 'tailscale serve --tcp 443 tcp://127.0.0.1:${HOST_PORT}'"; return 1
+  fi
+}
+
+cmd_internal() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    on)
+      local tenant="" client_id="" secret="" host
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --tenant) shift; tenant="${1:?--tenant needs the directory id}" ;;
+          --client-id) shift; client_id="${1:?--client-id needs the app registration client id}" ;;
+          *) die "internal on: unknown flag '$1'" ;;
+        esac; shift
+      done
+      case "$tenant" in ''|common|organizations|consumers) die "internal on: --tenant <directory id> is required — a named directory, never common/organizations/consumers" ;; esac
+      [ -n "$client_id" ] || die "internal on: --client-id <id> is required (the sign-in app with this Mac's redirect URIs on its private-network name)"
+      case "$client_id" in *[!A-Za-z0-9._-]*) die "internal on: --client-id contains characters a client id never has" ;; esac
+      [ -t 0 ] && die "internal on: pipe the client secret on STDIN — it is never an argument and never printed"
+      secret="$(cat)"; secret="${secret%$'\n'}"
+      # 🚨 an EMPTY secret is refused, never written: \`az ad app credential reset … |\` pipes nothing when az fails
+      # (e.g. the app's password-credential limit), and an empty secret silently breaks the sign-in
+      [ "${#secret}" -ge 16 ] || die "internal on: the client secret on STDIN is empty or too short (${#secret} characters) — did the command producing it fail? Nothing was written"
+      case "$secret" in *'"'*|*'\\'*|*$'\n'*) die "internal on: the client secret contains a quote, backslash or newline" ;; esac
+      host="$(tailnet_name)"
+      [ -n "$host" ] || die "internal on: this Mac has no private-network name yet — join the network first (MeshWeaver.Plugins Hosting/MacStudioOnboarding step 4)"
+      [ -f "$(cert_file "$host" crt)" ] || warn "no trusted certificate for $host yet — run 'memex-local cert config … < secret' and 'memex-local cert issue'; until then the name has no certificate"
+      mkdir -p "$LOCAL_HOME"
+      ( umask 077; cat > "$INTERNAL_FILE" ) <<YAML
+# memex-local INTERNAL ONLY — managed by \`memex-local internal\`; re-run \`on\` to change, \`off\` to delete.
+# This Mac's portal answers at https://${host} over the private network only (Hosting/MacStudioFleet §2b.3).
+#Host: ${host}
+config:
+  memex_portal:
+    Authentication__Microsoft__ClientId: "${client_id}"
+    Authentication__Microsoft__TenantId: "${tenant}"
+    Features__Onboarding__InvitationOnly: "true"
+    Authentication__EnableDevLogin: "false"
+secrets:
+  memex_portal:
+    Authentication__Microsoft__ClientSecret: "${secret}"
+YAML
+      chmod 600 "$INTERNAL_FILE"; unset secret
+      local dropped; dropped="$(overlay_drop_empty ${PUBLISH_OWNED_KEYS[@]+"${PUBLISH_OWNED_KEYS[@]}"})"
+      [ -n "$dropped" ] && ok "removed empty overlay placeholder(s) that would erase the sign-in: $(printf '%s' "$dropped" | tr '\n' ' ')"
+      ok "internal-only layer written: $INTERNAL_FILE (https://${host}, sign-in Microsoft, invitation-only; the secret never printed)"
+      cert_install >/dev/null 2>&1 || true
+      if colima_running; then
+        internal_ingress_manifest "$host" "$(portal_ingress_annotations)" > "$LOCAL_HOME/internal-ingress.yaml" \
+          && local_kubectl -n "$NAMESPACE" apply -f "$LOCAL_HOME/internal-ingress.yaml" >/dev/null 2>&1 \
+          && ok "Ingress $INTERNAL_INGRESS applied (host $host, TLS Secret $INTERNAL_TLS_SECRET)" \
+          || warn "could not apply the Ingress $INTERNAL_INGRESS ($LOCAL_HOME/internal-ingress.yaml)"
+      fi
+      restart_front_door "loopback only — the private network is the only way in"
+      internal_serve_when_signed_in || true
+      info "Register on the sign-in app exactly: https://${host}/signin-microsoft, https://${host}/auth/callback/Microsoft, https://${host}/auth/ea/callback"
+      info "Apply it: memex-local update   (the portal takes the sign-in, then the private network is opened; the first person to sign in becomes the administrator — the owner)"
+      ;;
+    status)
+      if [ ! -f "$INTERNAL_FILE" ]; then info "not internal-only — memex-local internal on --tenant <id> --client-id <id> < secret"; return 0; fi
+      local host got_id; host="$(internal_value Host)"
+      ok "INTERNAL ONLY — https://${host} over the private network (sign-in Microsoft, invitation-only)"
+      got_id="$(local_kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__Microsoft__ClientId}' 2>/dev/null || true)"
+      if [ -n "$got_id" ] && [ "$got_id" = "$(internal_value Authentication__Microsoft__ClientId)" ]; then ok "the running portal's config carries the client id of this layer"; else warn "the running portal's config does NOT carry this layer's client id (${got_id:-<none>}) — run 'memex-local update'"; fi
+      local_kubectl -n "$NAMESPACE" get ingress "$INTERNAL_INGRESS" >/dev/null 2>&1 && ok "Ingress $INTERNAL_INGRESS present" || warn "Ingress $INTERNAL_INGRESS missing — re-run 'memex-local internal on'"
+      [ -n "$(cert_expiry "$host")" ] && ok "certificate for $host valid until $(cert_expiry "$host")" || warn "no trusted certificate for $host — memex-local cert issue"
+      publish_tailscale serve status 2>/dev/null | sed 's/^/  /' || true
+      ;;
+    off)
+      publish_tailscale serve --tcp 443 off >/dev/null 2>&1 || true
+      local_kubectl -n "$NAMESPACE" delete ingress "$INTERNAL_INGRESS" --ignore-not-found >/dev/null 2>&1 || true
+      if [ -f "$INTERNAL_FILE" ]; then rm -f "$INTERNAL_FILE"; ok "internal-only OFF — the next 'memex-local update' drops its sign-in"; else info "internal-only was not on"; fi
+      restart_front_door "all interfaces again"
+      ;;
+    *) die "usage: memex-local internal {on --tenant <id> --client-id <id> < secret | status | off}" ;;
+  esac
+}
+
+cmd_publish() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    on)
+      local host="" provider="" tenant="" client_id="" secret="" tailnet_only=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --host)      shift; host="${1:?--host needs the public name}" ;;
+          --tailnet-only) tailnet_only=1 ;;
+          --sign-in)   shift; provider="${1:?--sign-in needs a provider: microsoft, google, apple or linkedin}" ;;
+          --tenant)    shift; tenant="${1:?--tenant needs the directory id}" ;;
+          --client-id) shift; client_id="${1:?--client-id needs the app registration client id}" ;;
+          *) die "publish on: unknown flag '$1'" ;;
+        esac
+        shift
+      done
+      [ -n "$tailnet_only" ] && [ -n "$host" ] && die "publish on: --tailnet-only and --host exclude each other — --host ADDS a public name; leave it out to publish on the private network only"
+      if [ -n "$host" ]; then
+        case "$host" in *[!a-z0-9.-]*|*.localhost|localhost) die "publish on: --host must be a lower-case public DNS name (got '$host')" ;; *.*) ;; *) die "publish on: --host '$host' is not a DNS name" ;; esac
+      fi
+      local key
+      case "$provider" in
+        microsoft) key=Microsoft
+                   case "$tenant" in ''|common|organizations|consumers) die "publish on: --sign-in microsoft needs --tenant <directory id> — a named directory, never common/organizations/consumers (who may sign in is that directory's members, then the invitation list)" ;; esac ;;
+        google|apple|linkedin)
+                   die "publish on: --sign-in $provider is not wired yet — the chart carries a client secret for Microsoft only (Google, Apple and LinkedIn sign-in for a public name are a follow-up, MeshWeaver.Plugins Hosting/MacStudioFleet §6)" ;;
+        '')        die "publish on: --sign-in <provider> is required — a public name needs a real sign-in (the development sign-in answers on localhost names only)" ;;
+        *)         die "publish on: --sign-in must be microsoft (google, apple, linkedin: a follow-up) — got '$provider'" ;;
+      esac
+      [ -n "$client_id" ] || die "publish on: --client-id <id> is required (the app registration whose redirect URI is https://<each published name>/signin-${provider})"
+      case "$client_id" in *[!A-Za-z0-9._-]*) die "publish on: --client-id contains characters a client id never has" ;; esac
+      [ -t 0 ] && die "publish on: pipe the client secret on STDIN (e.g. '< secret-file' or from your secret store) — it is never an argument and never printed"
+      secret="$(cat)"; secret="${secret%$'\n'}"
+      [ -n "$secret" ] || die "publish on: no client secret on STDIN"
+      case "$secret" in *'"'*|*'\\'*|*$'\n'*) die "publish on: the client secret contains a quote, backslash or newline — store it with your provider's secret format" ;; esac
+      # The entry port must be its own: never the front door's or the e2e portal's, and free right now —
+      # otherwise tailscale serve would hand network traffic to a forward that adds no mark.
+      case "$ENTRY_PORT" in ''|*[!0-9]*) die "publish on: MEMEX_ENTRY_PORT must be a port number (got '$ENTRY_PORT')" ;; esac
+      for taken in "$HOST_PORT" "${MEMEX_E2E_PORT:-8444}" 80 443; do
+        [ "$ENTRY_PORT" != "$taken" ] || die "publish on: the entry port $ENTRY_PORT collides with port $taken (the front door, the e2e portal or the ingress) — set MEMEX_ENTRY_PORT to a free port"
+      done
+      if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$ENTRY_PORT" -sTCP:LISTEN 2>/dev/null | grep -qv 'memex-network-entry'; then
+        if ! lsof -nP -iTCP:"$ENTRY_PORT" -sTCP:LISTEN 2>/dev/null | grep -q 'kubectl'; then
+          die "publish on: something already listens on port $ENTRY_PORT — set MEMEX_ENTRY_PORT to a free port (the network must reach ONLY the entry point)"
+        fi
+      fi
+      # The machine's OWN name on the network, read from tailscale — never typed. Without one, a
+      # tailnet-only publish has nothing to publish; a public name is published alone, and that is said.
+      local ts_name; ts_name="$(tailnet_name)"
+      if [ -z "$ts_name" ]; then
+        [ -n "$host" ] || die "publish on: no tailnet name to publish (see above) — join the private network ('tailscale up --login-server <the network's login server>'), or add a public name with --host <name>"
+        info "no tailnet name: publishing the public name ${host} only"
+      fi
+      # The DEFAULT for a fleet Mac is internal only: the portal answers at its private-network name, over the
+      # private network, with a publicly trusted certificate (`memex-local cert`). A public name (--host, through
+      # the ingress bridge) is an explicit option on request, never part of onboarding.
+      if [ -n "$ts_name" ] && [ ! -f "$(cert_file "$ts_name" crt)" ]; then
+        warn "no trusted certificate for ${ts_name} yet — the entry point serves its local CA until 'memex-local cert issue' (MeshWeaver.Plugins Hosting/MacStudioOnboarding)"
+      fi
+      local names=() n host_lines=""
+      [ -n "$ts_name" ] && names+=("$ts_name")
+      [ -n "$host" ] && [ "$host" != "$ts_name" ] && names+=("$host")
+      for n in ${names[@]+"${names[@]}"}; do
+        host_lines="${host_lines}    - \"${n}\"
+"
+      done
+      mkdir -p "$LOCAL_HOME"
+      local tenant_line=""
+      [ -n "$tenant" ] && tenant_line="    Authentication__Microsoft__TenantId: \"${tenant}\"
+"
+      ( umask 077; cat > "$PUBLISH_FILE" ) <<YAML
+# memex-local PUBLISHED — managed by \`memex-local publish\`; re-run \`on\` to change, \`off\` to delete.
+# This Mac's portal also answers at the names below: its own name on the private network (read from
+# tailscale) and/or a public name the network's ingress bridge forwards. The front door binds loopback only
+# (port ${HOST_PORT}) while this file exists; the network reaches the entry point through tailscale serve.
+ingress:
+  additionalHosts:
+${host_lines}config:
+  memex_portal:
+    Authentication__${key}__ClientId: "${client_id}"
+${tenant_line}    Features__Onboarding__InvitationOnly: "true"
+secrets:
+  memex_portal:
+    Authentication__${key}__ClientSecret: "${secret}"
+YAML
+      chmod 600 "$PUBLISH_FILE"
+      unset secret
+      local dropped; dropped="$(overlay_drop_empty ${PUBLISH_OWNED_KEYS[@]+"${PUBLISH_OWNED_KEYS[@]}"})"
+      [ -n "$dropped" ] && ok "removed empty overlay placeholder(s) that would erase the sign-in: $(printf '%s' "$dropped" | tr '\n' ' ')"
+      ok "publish layer written: $PUBLISH_FILE ($(publish_urls), sign-in ${key}${tenant:+ tenant ${tenant}}, invitation-only; the secret is in the file, never printed)"
+      # The network's OWN entry point: an in-cluster proxy that marks every request it carries as
+      # arriving through the network (X-MeshWeaver-Provenance: tailnet, overwriting any sender claim) —
+      # the portal refuses the open sign-in on that mark whatever the Host says. Only it is served to
+      # the network; the person at the Mac keeps the loopback-only front door, which adds no mark.
+      local share; share="$(resolve_share)"
+      if render_network_entry "$share/network-entry.yaml" ${names[@]+"${names[@]}"} > "$LOCAL_HOME/network-entry.yaml" \
+         && kubectl -n "$NAMESPACE" apply -f "$LOCAL_HOME/network-entry.yaml" >/dev/null 2>&1; then
+        ok "network entry point applied (memex-network-entry: marks every network request, serves ${names[*]} only)"
+      else
+        warn "could not apply the network entry point ($LOCAL_HOME/network-entry.yaml) — is Colima up? Re-run 'memex-local publish on …'"
+      fi
+      if publish_tailscale serve --bg --tcp 443 "tcp://127.0.0.1:${ENTRY_PORT}" >/dev/null 2>&1; then
+        ok "the network reaches this Mac on TCP 443 through the entry point only (tailscale serve → 127.0.0.1:${ENTRY_PORT})"
+      else
+        warn "could not set up 'tailscale serve --tcp 443 tcp://127.0.0.1:${ENTRY_PORT}' — the network cannot reach this Mac until it is"
+      fi
+      info "While published the front door is loopback-only on port ${HOST_PORT}: open https://${HOSTNAME_LOCAL}:${HOST_PORT} locally"
+      info "The network policy must let no member reach ${HOST_PORT}, ${MEMEX_E2E_PORT:-8444} or ${ENTRY_PORT} (a user-space network client delivers to loopback ports too) — TCP 443 is the one way in"
+      for n in ${names[@]+"${names[@]}"}; do info "Register the redirect URI on the app: https://${n}/signin-${provider}"; done
+      if [ -n "$ts_name" ]; then
+        info "A member device: join the network, then trust the entry point's CA once — 'memex-local publish ca > memex-entry-ca.crt' here (after the update), install it there (README: Publishing a Mac on the private network)"
+      fi
+      info "Apply it: memex-local update   (the front door rebinds to loopback; the first person to sign in at https://${names[0]} becomes this instance's administrator — make it yours)"
+      ;;
+    status)
+      [ $# -eq 0 ] || die "publish status: unknown flag '$1'"
+      if [ -f "$PUBLISH_FILE" ]; then
+        ok "PUBLISHED — $(publish_urls), sign-in: $(publish_signin_summary), admission: invitation-only"
+        info "values file: $PUBLISH_FILE (layered after the fleet layer by helm_deploy)"
+        # What the portal ACTUALLY got — the rendered config, not the layer: an overlay value wins over this file.
+        local want_id want_tenant got_id got_tenant
+        want_id="$(publish_value Authentication__Microsoft__ClientId)"; want_tenant="$(publish_value Authentication__Microsoft__TenantId)"
+        got_id="$(kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__Microsoft__ClientId}' 2>/dev/null || true)"
+        got_tenant="$(kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__Microsoft__TenantId}' 2>/dev/null || true)"
+        if [ -n "$want_id" ] && [ "$got_id" = "$want_id" ] && [ "$got_tenant" = "$want_tenant" ]; then
+          ok "the running portal's config carries the Microsoft client id and tenant of this layer"
+        else
+          warn "the running portal's config does NOT carry this layer's Microsoft sign-in (client id: ${got_id:-<none>}, tenant: ${got_tenant:-<none>}) — an overlay value may override it; run 'memex-local publish on …' again (it removes empty overlay placeholders), then 'memex-local update'"
+        fi
+        publish_tailscale serve status 2>/dev/null | sed 's/^/  /' || true
+      else
+        info "not published — publish this Mac on the private network (its tailnet name) with:"
+        info "  memex-local publish on --sign-in microsoft --tenant <id> --client-id <id> < secret-file"
+        info "  (add --host <public name> to also answer at a public name through the network's ingress bridge)"
+      fi
+      ;;
+    off)
+      [ $# -eq 0 ] || die "publish off: unknown flag '$1'"
+      publish_tailscale serve --tcp 443 off >/dev/null 2>&1 || true
+      # By name, not -f: the data volume (the entry point's CA) stays, so a re-publish presents the same root.
+      kubectl -n "$NAMESPACE" delete deployment/memex-network-entry service/memex-network-entry configmap/memex-network-entry --ignore-not-found >/dev/null 2>&1 || true
+      if [ -f "$PUBLISH_FILE" ]; then
+        rm -f "$PUBLISH_FILE"
+        ok "publish OFF — the next 'memex-local update' drops the names and their sign-in (the entry point's CA volume is kept: 'kubectl -n $NAMESPACE delete pvc memex-network-entry-data' forgets it)"
+      else
+        info "this Mac was not published"
+      fi
+      ;;
+    ca)
+      [ $# -eq 0 ] || die "publish ca: unknown flag '$1'"
+      publish_ca
+      ;;
+    *) die "usage: memex-local publish {on [--tailnet-only | --host <public name>] --sign-in microsoft --tenant <id> --client-id <id> < secret | status | ca | off}" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# §19 — FLEET JOIN: one command, the control instance does the rest (MeshWeaver.Plugins Hosting/MacStudioFleet §2b)
+# ---------------------------------------------------------------------------
+# `fleet join --control <url> --id <id>`: preflight; a throw-away RSA-3072 key; the link to the control
+# instance's approval page (Hosting/Heartbeats/Enrol/<request>) with the key's fingerprint to compare;
+# the enrolment code a global admin's Approve shows, opened with the key (RSA-OAEP-SHA256 — macOS's own
+# LibreSSL does it); the fleet layer with the two keys; back-lease, Ollama, and `update`. No secret value
+# is ever printed: the CLI prints FINGERPRINTS (sha256:<12 hex>, the control instance's own format).
+fleet_value() { awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$FLEET_FILE" 2>/dev/null; }
+
+# A fact for the request: printable, at most 96 characters, of the shape the control instance admits.
+fleet_fact() { printf '%s' "$1" | LC_ALL=C tr -cd 'A-Za-z0-9 ._@()+-' | cut -c1-96; }
+
+# The hardware id: the serial number, else the platform UUID.
+fleet_machine_id() {
+  local id
+  id="$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformSerialNumber/ { print $4; exit }')"
+  [ -n "$id" ] || id="$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformUUID/ { print $4; exit }')"
+  fleet_fact "${id:-unknown}"
+}
+
+# The key fingerprint as the control instance shows it: first 32 hex digits of SHA-256 over the DER key, in fours.
+fleet_key_fingerprint() {
+  openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | shasum -a 256 | cut -c1-32 | sed -e 's/..../& /g' -e 's/ $//'
+}
+
+# A value's fingerprint in the control instance's format (SecretFingerprint.Of): sha256:<first 12 hex>.
+fleet_value_fingerprint() { printf 'sha256:%s' "$(printf '%s' "$1" | shasum -a 256 | cut -c1-12)"; }
+
+# base64url without padding, of stdin.
+fleet_b64url() { base64 | tr -d '\n=' | tr '+/' '-_'; }
+
+# The request the control instance's Enrol page parses (MachineEnrolment.Parse): v1 JSON, base64url.
+fleet_request() {
+  local id="$1" host="$2" user="$3" machine="$4" spki="$5"
+  printf '{"v":1,"deployment":"%s","host":"%s","user":"%s","machine":"%s","key":"%s"}' \
+    "$id" "$host" "$user" "$machine" "$spki" | fleet_b64url
+}
+
+# Opens an enrolment code with the throw-away key into a 0600 JSON file. Fails closed, naming why.
+fleet_open_code() {
+  local code="$1" key="$2" out="$3" ct
+  case "$code" in "$FLEET_CODE_PREFIX"*) ;; *) die "that is not an enrolment code (it starts with '$FLEET_CODE_PREFIX') — copy it from the control instance's page" ;; esac
+  ct="$(mktemp "$FLEET_DIR/code.XXXXXX")"
+  printf '%s' "${code#"$FLEET_CODE_PREFIX"}" | base64 -d > "$ct" 2>/dev/null || { rm -f "$ct"; die "the enrolment code is not base64 — copy all of it"; }
+  ( umask 077
+    openssl pkeyutl -decrypt -inkey "$key" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+      -pkeyopt rsa_mgf1_md:sha256 -in "$ct" -out "$out" 2>/dev/null ) \
+    || { rm -f "$ct" "$out"; die "the enrolment code does not open with this Mac's key — it was issued for another join; approve THIS link again"; }
+  rm -f "$ct"
+}
+
+# Whether this Mac is a FLEET HOST: in registry mode and joined (fleet.yaml) or offered back
+# (backlease.yaml), unless MEMEX_FLEET_HOST=0. Its first instance then installs Hosting by template.
+fleet_host() {
+  [ "${MEMEX_FLEET_HOST:-}" = "0" ] && return 1
+  registry_mode || return 1
+  [ -f "$FLEET_FILE" ] || [ -f "$BACKLEASE_FILE" ]
+}
+
+# One member of the opened payload — the control instance's compact {"v":1,"d":…,"m":…,"c":…}, whose values are
+# a deployment id and hex keys (no quote or backslash can occur), so a plain match reads it on macOS and Linux alike.
+fleet_payload() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" "$2" 2>/dev/null | head -1; }
+
+write_fleet_file() {
+  local control="$1" id="$2" report="$3" announce="$4"
+  mkdir -p "$LOCAL_HOME"
+  ( umask 077; cat > "$FLEET_FILE" ) <<YAML
+# memex-local FLEET — managed by \`memex-local fleet join\` (MeshWeaver.Plugins Hosting/MacStudioFleet §2b).
+# The two keys below were issued by the control instance (${control}) when a global administrator approved
+# this Mac, and reached it only sealed to a key this Mac held. Never copy them anywhere; re-run
+# \`fleet join\` to rotate. Layered by helm_deploy after back-lease and before the overlay.
+config:
+  memex_portal:
+    Hosting__Deployment: "${id}"
+    Hosting__ControlInbox__Url: "${control}/api/hooks/Hosting/PlatformBuilds"
+secrets:
+  memex_portal:
+    Hosting__ModuleReportSecret: "${report}"
+    Hosting__ControlInbox__Secret: "${announce}"
+YAML
+  chmod 600 "$FLEET_FILE"
+}
+
+cmd_fleet() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    join)
+      local control="" id="" open_link="yes" code_file="" do_update="yes"
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --control)   shift; control="${1:?--control needs the control instance URL}" ;;
+          --id)        shift; id="${1:?--id needs the deployment id}" ;;
+          --no-open)   open_link="no" ;;
+          --code-file) shift; code_file="${1:?--code-file needs a path}" ;;   # absent → print the link, exit 3 (unattended)
+          --no-update) do_update="no" ;;
+          *) die "fleet join: unknown flag '$1'" ;;
+        esac
+        shift
+      done
+      [ -n "$control" ] || control="$(managed_pref ControlUrl)"
+      [ -n "$id" ]      || id="$(managed_pref DeploymentId)"
+      control="${control%/}"
+      case "$control" in https://*) ;; *) die "fleet join: --control must be the control instance's https URL (got '${control:-<none>}')" ;; esac
+      printf '%s' "$id" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$' \
+        || die "fleet join: --id must be lower-case letters, digits and dashes (at most 63), starting and ending with a letter or digit — it becomes Deployments/<id> on control"
+      need openssl openssl; need shasum shasum
+
+      step "Preflight (MacStudioFleet §2b step 1)"
+      local user host machine t missing=""
+      user="$(id -un)"; host="$(fleet_fact "$(scutil --get LocalHostName 2>/dev/null || hostname -s)")"; machine="$(fleet_machine_id)"
+      info "macOS account: $user · host: $host · hardware id: $machine"
+      for t in colima docker kubectl helm ollama tailscale; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+      [ -z "$missing" ] || warn "missing:$missing — 'brew install$missing' (tailscale joins the private network; the rest run the stack)"
+
+      step "A throw-away key for this join (step 2)"
+      mkdir -p "$FLEET_DIR"; chmod 700 "$FLEET_DIR"
+      local key="$FLEET_DIR/$id.key.pem"
+      [ -f "$key" ] || ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$key" 2>/dev/null ) \
+        || die "could not generate the throw-away key"
+      local spki fp url
+      spki="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | base64 | tr -d '\n')"
+      fp="$(fleet_key_fingerprint "$key")"
+      url="$control/Hosting/Heartbeats/Enrol/$(fleet_request "$id" "$host" "$(fleet_fact "$user")" "$machine" "$spki")"
+      ok "key fingerprint: $fp"
+      info "Open this link, sign in as a global administrator of the control instance, CHECK that the page"
+      info "shows the fingerprint above, and press 'Approve and issue the keys':"
+      printf '\n%s\n\n' "$url"
+      [ "$open_link" = "yes" ] && command -v open >/dev/null 2>&1 && open "$url" >/dev/null 2>&1 || true
+
+      local code=""
+      printf '%s\n' "$url" > "$FLEET_DIR/$id.link"
+      if [ -n "$code_file" ] && [ ! -f "$code_file" ]; then
+        # unattended (a device-management run): nothing to paste into — say what is awaited and come back
+        info "WAITING for the approval on control and the enrolment code at $code_file (the link is also in $FLEET_DIR/$id.link)"
+        exit 3
+      fi
+      if [ -n "$code_file" ]; then
+        code="$(tr -d ' \n\r' < "$code_file")"
+      else
+        printf 'Paste the enrolment code the page shows, then press Enter:\n> '
+        IFS= read -r code
+        code="$(printf '%s' "$code" | tr -d ' \r')"
+      fi
+      local payload="$FLEET_DIR/$id.payload.json"
+      fleet_open_code "$code" "$key" "$payload"
+      local d m c
+      d="$(fleet_payload d "$payload")"; m="$(fleet_payload m "$payload")"; c="$(fleet_payload c "$payload")"
+      rm -f "$payload"
+      [ "$d" = "$id" ] || die "the code was issued for '$d', not '$id' — approve the link this run printed"
+      [ -n "$m" ] && [ -n "$c" ] || die "the code opened but carries no keys — approve the link again"
+      write_fleet_file "$control" "$id" "$m" "$c"
+      rm -f "$key"
+      ok "joined as '$id' — heartbeat key $(fleet_value_fingerprint "$m"), announcement key $(fleet_value_fingerprint "$c") (the control instance's enrolment record shows the same fingerprints)"
+
+      step "Back-lease, local models and the image (steps 5)"
+      if registry_mode; then
+        cmd_backlease enroll --control "$control" --deployment "$id"
+      else
+        warn "not in REGISTRY MODE — run 'memex-local registry <url>' and then 'memex-local backlease enroll --control $control --deployment $id'"
+      fi
+      if command -v tailscale >/dev/null 2>&1 && ! publish_tailscale status >/dev/null 2>&1; then
+        info "Private network: 'tailscale up --login-server <the network's login server>' (one browser sign-in until control mints pre-auth keys — MacStudioFleet §2b gap 2)"
+      fi
+      if [ "$do_update" = "yes" ] && colima_running; then
+        setup_ollama
+        cmd_update
+      else
+        info "Apply it: memex-local update"
+      fi
+      info "Progress: the control instance's Hosting/Heartbeats/Enrolments lists this join and its first heartbeat"
+      ;;
+    status)
+      [ $# -eq 0 ] || die "fleet status: unknown flag '$1'"
+      if [ -f "$FLEET_FILE" ]; then
+        local m c
+        m="$(awk '$1 == "Hosting__ModuleReportSecret:" { gsub(/"/, "", $2); print $2; exit }' "$FLEET_FILE")"
+        c="$(awk '$1 == "Hosting__ControlInbox__Secret:" { gsub(/"/, "", $2); print $2; exit }' "$FLEET_FILE")"
+        ok "JOINED as '$(fleet_value Hosting__Deployment)' — control inbox $(fleet_value Hosting__ControlInbox__Url)"
+        info "heartbeat key:    $(fleet_value_fingerprint "$m")"
+        info "announcement key: $(fleet_value_fingerprint "$c")"
+        cmd_backlease status
+      else
+        info "not joined — memex-local fleet join --control https://<control-instance> --id <id>"
+      fi
+      ;;
+    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] | status}" ;;
+  esac
+}
+
 llm_value() { awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$LLM_FILE" 2>/dev/null; }
 
 # The Colima VM's gateway to the host: where the Mac's own services answer (Ollama on :11434).
@@ -1046,6 +1849,24 @@ so the tag was lost between then and now (a prune, a competing build, or a tag o
 another flow). Re-run the image step; do NOT roll."
 }
 
+# The PUBLIC GHCR images, pulled anonymously (MacStudioFleet §2b gap 5) — what registry mode runs and what
+# the in-pod self-updater follows. No credential is sent; a pull that fails names the tag, never `az login`.
+image_pull_ghcr() {
+  local tag="${1:-$GHCR_DEFAULT_TAG}"
+  need docker docker
+  step "Pulling multi-arch images from the public $GHCR (tag=$tag, anonymous — no Azure sign-in needed)"
+  local img
+  for img in memex-portal-ai memex-migration; do
+    docker pull --platform linux/arm64 "$GHCR/$img:$tag" \
+      || die "cannot pull $GHCR/$img:$tag — the tag may not exist (public tags: latest, 3.0.0-ci.<n>); no credential is involved"
+  done
+  docker tag "$GHCR/memex-portal-ai:$tag" "$PORTAL_IMAGE"
+  docker tag "$GHCR/memex-migration:$tag" "$MIGRATION_IMAGE"
+  ok "Pulled $GHCR images onto $PORTAL_IMAGE / $MIGRATION_IMAGE"
+  verify_image_resolvable "$PORTAL_IMAGE"
+  verify_image_resolvable "$MIGRATION_IMAGE"
+}
+
 image_pull_acr() {                                     # §3 Option A
   local tag="${1:-$ACR_DEFAULT_TAG}" channel="${2:-}"
   need docker docker
@@ -1179,7 +2000,7 @@ helm_deploy() {
   #    Cleared, the instance manifest the first-run wizard writes decides what installs (it
   #    projects the ticked packages as PluginCatalog:InstallByDefault:N and names the registry).
   #    Self-registry mode keeps today's per-source "<name>/*" entries, assembled below.
-  local mode_args=()
+  local mode_args=() internal_args=()
   if registry_mode; then
     # The tracked registry-mode layer first (self-update from the public GHCR, MeshWeaver.Deploy#65),
     # then the per-install registry file. Both are -f layers, so the user's overlay still wins.
@@ -1194,6 +2015,36 @@ helm_deploy() {
   if [ -f "$BACKLEASE_FILE" ]; then
     mode_args+=(-f "$BACKLEASE_FILE")
     info "BACK-LEASE: this Mac reports to $(backlease_control) as '$(backlease_deployment)' and heartbeats every $(backlease_interval)s"
+  fi
+  # FLEET layer (`memex-local fleet join`): the machine's own heartbeat + announcement keys and the
+  # control inbox URL — after back-lease, before the user's overlay, so an overlay value still wins.
+  if [ -f "$FLEET_FILE" ]; then
+    mode_args+=(-f "$FLEET_FILE")
+    info "FLEET: joined as '$(fleet_value Hosting__Deployment)' — keys from the enrolment code (never printed)"
+  fi
+  # FLEET HOST template (MacStudioFleet §3a): a joined or back-leased Mac in registry mode carries the
+  # Hosting app on its first instance — the heartbeat and the self-update patcher ship in it. Named in
+  # InstallByDefault with the baseline kept; nobody installs anything by hand. MEMEX_FLEET_HOST=0 opts out.
+  if fleet_host; then
+    mode_args+=(-f "$share_dir/values.local.fleet-host.yaml")
+    info "FLEET HOST: the Hosting app is part of this Mac's first instance (InstallByDefault Plugins/Hosting + the baseline)"
+  fi
+  # INTERNAL-ONLY layer (`memex-local internal on`): the sign-in for this Mac's private-network name, invitation-only.
+  if [ -f "$INTERNAL_FILE" ]; then
+    overlay_drop_empty ${PUBLISH_OWNED_KEYS[@]+"${PUBLISH_OWNED_KEYS[@]}"} >/dev/null
+    mode_args+=(-f "$INTERNAL_FILE")
+    # After the overlay (a --set beats every -f): the overlay must not re-open the passwordless
+    # development sign-in on a portal the private network reaches.
+    internal_args=(--set-string "config.memex_portal.Authentication__EnableDevLogin=false"
+                   --set-string "config.memex_portal.Features__Onboarding__InvitationOnly=true")
+    info "INTERNAL ONLY: answers at https://$(internal_value Host) over the private network (sign-in Microsoft, invitation-only)"
+  fi
+  # PUBLIC NAME layer (`memex-local publish on`): the additional host, its sign-in, invitation-only.
+  if [ -f "$PUBLISH_FILE" ]; then
+    # an empty overlay placeholder for a key this layer owns would erase it (the overlay is layered last)
+    overlay_drop_empty ${PUBLISH_OWNED_KEYS[@]+"${PUBLISH_OWNED_KEYS[@]}"} >/dev/null
+    mode_args+=(-f "$PUBLISH_FILE")
+    info "PUBLISHED: also answers at $(publish_urls) — sign-in: $(publish_signin_summary); admission: invitation-only"
   fi
   # LOCAL MODEL layer (`memex-local llm use`): the host's Ollama is the portal's utility-tier model.
   if [ -f "$LLM_FILE" ]; then
@@ -1248,6 +2099,7 @@ helm_deploy() {
     -f "$share_dir/values.local.defaults.yaml" \
     ${mode_args[@]+"${mode_args[@]}"} \
     -f "$OVERLAY" \
+    ${internal_args[@]+"${internal_args[@]}"} \
     --set persistDataVolume=true \
     --set "config.memex_portal.Bootstrap__Secret=$LOCAL_BOOTSTRAP_SECRET" \
     ${plugin_args[@]+"${plugin_args[@]}"} \
@@ -1269,6 +2121,7 @@ helm_deploy() {
   if ! perms_err="$(colima ssh -- sh -c "sudo mkdir -p $PORTAL_DATA_DIR && sudo chmod 0777 $PORTAL_DATA_DIR" 2>&1)"; then
     warn "could not make $PORTAL_DATA_DIR writable on the node — portal may crashloop on DataProtection keys${perms_err:+: $perms_err}"
   fi
+  if [ -f "$INTERNAL_FILE" ]; then internal_serve_when_signed_in || true; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1298,11 +2151,35 @@ apply_logging() {
 # ---------------------------------------------------------------------------
 # §10 — host-native Ollama wired into the cluster by name (ollama:11434)
 # ---------------------------------------------------------------------------
+# A launchd login agent running `ollama serve` with OLLAMA_HOST=0.0.0.0:11434: it starts at login and
+# restarts on exit, which the nohup'd process it replaces never did (a rebooted Mac had no model).
+install_ollama_agent() {
+  local bin; bin="$(command -v ollama)" || die "ollama is not on PATH — brew install ollama"
+  mkdir -p "$HOME/Library/LaunchAgents" "$LOCAL_HOME"
+  cat > "$OLLAMA_PLIST_DST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${OLLAMA_PLIST_LABEL}</string>
+  <key>ProgramArguments</key><array><string>${bin}</string><string>serve</string></array>
+  <key>EnvironmentVariables</key><dict><key>OLLAMA_HOST</key><string>0.0.0.0:11434</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${LOCAL_HOME}/ollama.log</string>
+  <key>StandardErrorPath</key><string>${LOCAL_HOME}/ollama.log</string>
+</dict>
+</plist>
+PLIST
+  launchctl bootout "gui/$(id -u)" "$OLLAMA_PLIST_DST" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$OLLAMA_PLIST_DST"
+}
+
 setup_ollama() {
   step "Wiring host-native Ollama (Metal GPU) — model ${OLLAMA_MODEL} as qwen3.6-code (§10)"
   if ! curl -fsS "http://127.0.0.1:11434/api/version" >/dev/null 2>&1; then
-    info "Starting 'ollama serve' bound to 0.0.0.0:11434 (so the VM can reach it)"
-    OLLAMA_HOST=0.0.0.0:11434 nohup ollama serve >"$LOCAL_HOME/ollama.log" 2>&1 &
+    info "Starting 'ollama serve' under launchd ($OLLAMA_PLIST_LABEL), bound to 0.0.0.0:11434 so the VM can reach it"
+    install_ollama_agent
     # Wait on readiness rather than a fixed sleep.
     local i=0
     until curl -fsS "http://127.0.0.1:11434/api/version" >/dev/null 2>&1; do
@@ -1341,7 +2218,7 @@ install_launchd() {
     if [ -f "$PF_PID" ] && kill -0 "$(cat "$PF_PID")" 2>/dev/null; then
       ok "port-forward already running (pid $(cat "$PF_PID"))"
     else
-      MEMEX_PORT="$HOST_PORT" MEMEX_LOCAL_SHARE="$share" nohup /bin/bash "$PF_SCRIPT" >> "$PF_LOG" 2>&1 &
+      MEMEX_PORT="$HOST_PORT" MEMEX_LOCAL_SHARE="$share" MEMEX_LOCAL_HOME="$LOCAL_HOME" nohup /bin/bash "$PF_SCRIPT" >> "$PF_LOG" 2>&1 &
       echo $! > "$PF_PID"
       ok "port-forward started (pid $(cat "$PF_PID"), log: $PF_LOG)"
     fi
@@ -1355,6 +2232,7 @@ install_launchd() {
       -e "s|__LOG__|${PF_LOG}|g" \
       -e "s|__PORT__|${HOST_PORT}|g" \
       -e "s|__SHARE__|${share}|g" \
+      -e "s|__LOCAL_HOME__|${LOCAL_HOME}|g" \
       "$share/com.memex.local.plist" > "$PLIST_DST"
   # Reload idempotently.
   launchctl bootout "gui/$(id -u)" "$PLIST_DST" >/dev/null 2>&1 || true
@@ -2533,12 +3411,15 @@ cmd_up() {
   # Registry mode runs the CI-built image — the whole point is consuming what the registry bakes
   # against — so ACR is the default there; a source build stays one flag away (--build).
   local image_source="build" acr_tag="$ACR_DEFAULT_TAG" with_obs="no" rebuild_base="" channel="$CHANNEL" verdict
-  registry_mode && image_source="acr"
+  # Registry mode runs the CI-built image from the PUBLIC GHCR, anonymously (MacStudioFleet §2b gap 5):
+  # a fleet Mac updates without Azure credentials. ACR stays one flag away (--from-acr, --channel).
+  registry_mode && image_source="ghcr"
   [ -n "$channel" ] && image_source="acr"
   while [ $# -gt 0 ]; do
     case "$1" in
       --channel) shift; channel="${1:?--channel needs a label, e.g. 3-latest}"; image_source="acr" ;;
       --from-acr) image_source="acr" ;;
+      --from-ghcr) image_source="ghcr" ;;
       --build)    image_source="build" ;;
       --skip-image) image_source="skip" ;;
       --tag) shift; acr_tag="${1:?--tag needs a value}"; channel="" ;;
@@ -2556,6 +3437,7 @@ cmd_up() {
   case "$image_source" in                        # §3
     build) image_build_local "$rebuild_base"; portal_next_build_local ;;   # portal + migration, then the /next React GUI
     acr)   image_pull_acr "$acr_tag" "$channel" ;;
+    ghcr)  image_pull_ghcr "$( [ "$acr_tag" = "$ACR_DEFAULT_TAG" ] && echo "$GHCR_DEFAULT_TAG" || echo "$acr_tag")" ;;
     skip)  info "Skipping image step (--skip-image); relying on IfNotPresent/cache" ;;
   esac
 
@@ -2807,14 +3689,28 @@ cmd_logs() {
   exec kubectl logs $follow --tail="$tail" "$target" -n "$NAMESPACE"
 }
 
+# The image source `update` really uses: what its flags chose, except that INSIDE the autoupdate agent a
+# registry-mode `--skip-image` re-apply follows the public GHCR image (MacStudioFleet §2b) — unless the
+# install follows a release channel (that is ACR's, behind a sign-in), or MEMEX_AUTOUPDATE_IMAGE=0.
+autoupdate_image_source() {
+  local source="$1" channel="${2:-}"
+  if [ "$source" = "skip" ] && [ -n "${MEMEX_IN_AUTOUPDATE:-}" ] && [ "${MEMEX_AUTOUPDATE_IMAGE:-1}" != "0" ] \
+     && [ -z "$channel" ] && registry_mode; then
+    printf 'ghcr'
+  else
+    printf '%s' "$source"
+  fi
+}
+
 cmd_update() {
   local image_source="build" acr_tag="$ACR_DEFAULT_TAG" rebuild_base="" channel="$CHANNEL" verdict
-  registry_mode && image_source="acr"              # §17 — same default as `up`
+  registry_mode && image_source="ghcr"             # §17 — same default as `up`: the public GHCR, anonymously
   [ -n "$channel" ] && image_source="acr"
   while [ $# -gt 0 ]; do
     case "$1" in
       --channel) shift; channel="${1:?--channel needs a label, e.g. 3-latest}"; image_source="acr" ;;
       --from-acr|--acr) image_source="acr" ;;
+      --from-ghcr) image_source="ghcr" ;;
       --build) image_source="build" ;;
       # Force a rebuild of the portal-ai BASE (the Node + Claude Code + Copilot layer). It is cached
       # by image presence, so a changed deploy/base-images/portal-ai/Dockerfile is otherwise never
@@ -2831,6 +3727,17 @@ cmd_update() {
     esac
     shift
   done
+  # 🚨 A fleet Mac must roll with no hand on it (MacStudioFleet §2b): the autoupdate agent re-applies a
+  # changed chart with `update --skip-image`, and an agent that is ALREADY running executes the OLD
+  # release's code — so the new release cannot change that call, only how `update` answers it. In
+  # registry mode the image is the public GHCR one (anonymous, no Azure sign-in), so inside the agent the
+  # re-apply follows it too: a template that needs a newer platform (a package's minMeshVersion) then
+  # lands in the same pass instead of waiting for a person to run `update`. MEMEX_AUTOUPDATE_IMAGE=0 opts out.
+  local chosen; chosen="$(autoupdate_image_source "$image_source" "$channel")"
+  if [ "$chosen" != "$image_source" ]; then
+    image_source="$chosen"
+    info "autoupdate in registry mode: following the public GHCR image as well as the chart"
+  fi
   preflight
   colima_running || die "Colima is not running — run 'memex-local up' first"
   ensure_overlay                                 # reuse the existing overlay/secrets (idempotent)
@@ -2839,6 +3746,7 @@ cmd_update() {
   case "$image_source" in
     build) image_build_local "$rebuild_base"; portal_next_build_local ;;   # §3 Option B — portal + migration, then the /next React GUI
     acr)   image_pull_acr "$acr_tag" "$channel" ;;   # §3 Option A — retags onto the chart's image names
+    ghcr)  image_pull_ghcr "$( [ "$acr_tag" = "$ACR_DEFAULT_TAG" ] && echo "$GHCR_DEFAULT_TAG" || echo "$acr_tag")" ;;
     skip)  info "reusing the images already in Colima's store — config re-apply only" ;;
   esac
 
@@ -2903,11 +3811,13 @@ own remedy." ;;
     return 0
   fi
   echo
-  info "Self-update note: this same chart carries the in-pod self-updater. With"
-  info "Admin/UpdatePolicy = Continuous (default), a Continuous/RELEASE install"
-  info "auto-rolls to newer ACR tags on its own (see Doc/Architecture/ReleaseStrategy)."
-  info "A pure local-build loop has nothing to poll — treat it as 'None' and use"
-  info "'memex-local update' as the manual path."
+  if registry_mode; then
+    info "Self-update: this install follows the public GHCR image (ghcr.io/systemorph/memex-portal-ai) —"
+    info "the autoupdate agent pulls it with every new memex-local release, and the in-pod self-updater"
+    info "follows Admin/UpdatePolicy. No Azure sign-in is involved (see Doc/Architecture/ReleaseStrategy)."
+  else
+    info "Self-update: a local-build install has nothing to poll — 'memex-local update' rebuilds it."
+  fi
 }
 
 cmd_port_forward() {
@@ -3016,8 +3926,8 @@ USAGE:
 COMMANDS:
   up [--build|--from-acr|--skip-image] [--tag T] [--with-observability] [--rebuild-base]
                   Bring the whole stack up (idempotent). Default image source:
-                  --from-acr in registry mode (the CI-built multi-arch image, native
-                  arm64 member), --build otherwise (Option B, source → Colima's
+                  --from-ghcr in registry mode (the public CI-built multi-arch image,
+                  pulled anonymously — no Azure sign-in; --from-acr still works), --build otherwise (Option B, source → Colima's
                   Docker store — the no-cloud-creds path).
   registry <url> [--key mwr_…] [--id ID] | status | off
                   REGISTRY MODE (§17): make this install a CONSUMER of a remote plugin
@@ -3034,7 +3944,38 @@ COMMANDS:
   llm use [--model qwen3.6] [--residency Eu|Global] | status | off
                   LOCAL MODEL: the Mac own Ollama serves the portal utility tier (inbox
                   triage, reply drafts, calendar suggestions). Addressed by IP; apply with update.
+  fleet join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] | status
+                  JOIN THIS MAC TO THE FLEET in one command (MeshWeaver.Plugins Hosting/MacStudioFleet
+                  §2b): prints a link to the control instance's approval page with this Mac's key
+                  fingerprint; a global administrator approves it there and the page shows an
+                  enrolment code sealed to this Mac's throw-away key; paste it here. Then writes
+                  ~/.memex-local/fleet.yaml (the heartbeat and announcement keys, 0600 — never
+                  printed, only their sha256 fingerprints), runs backlease enroll, starts Ollama
+                  under launchd, and updates from the public GHCR. 'status' shows the fingerprints.
   backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] | status | off
+  internal on --tenant <id> --client-id <id> < secret | status | off
+                  INTERNAL ONLY — the fleet default: the portal answers at this Mac's private-network
+                  name (https://<machine>.net.<domain>) over the private network only, with its
+                  trusted certificate ('cert'), Microsoft sign-in and invitation-only admission. A
+                  separate Ingress for that name, tailscale serve TCP 443 → the loopback front door.
+                  The client secret is read from STDIN (an empty one is refused), never printed.
+  cert config --domain <machine>.net.<domain> --email <e> --client-id <id> --tenant <id> --subscription <id>
+       --resource-group <rg> --zone <zone> < secret | issue | status
+                  A PUBLICLY TRUSTED certificate for this Mac's private-network name (Let's Encrypt over
+                  DNS-01, lego): 'issue' obtains or renews it (within 30 days of expiry), hands it to
+                  the network entry point (Secret memex-network-entry-certs) and arms a daily launchd
+                  renewal. The DNS identity's secret is read from STDIN, kept 0600, never printed.
+  publish on [--tailnet-only | --host <name>] --sign-in microsoft --tenant <id> --client-id <id> < secret | status | ca | off
+                  PUBLISH (Hosting/MacStudioFleet §6): this Mac's portal also answers at its OWN name
+                  on the private network (tailscale's MagicDNS name, read from 'tailscale status
+                  --json', never typed) — member devices reach it directly, nothing public involved.
+                  --host <name> ADDS a public name the network's ingress bridge forwards. Writes the
+                  values layer (the additional ingress hosts, the sign-in provider, invitation-only
+                  admission; the client secret is read from STDIN into the 0600 layer, never
+                  printed), binds the front door to loopback and sets up 'tailscale serve --tcp 443'
+                  to the marking entry point. The development sign-in answers on localhost names
+                  only, so publishing always needs a real provider. 'memex-local update' applies it.
+                  'publish ca > root.crt' prints the entry point's root CA for member devices to trust.
   relay pair --instance <https url> --owner <user id> --binary <dir|file> | status | off [--forget]
                   DEVICE RELAY (Hosting/DeviceRelay): let a cloud instance's inbox read the
                   chats that exist only on this Mac (iMessage, WhatsApp Desktop) LIVE —
@@ -3573,7 +4514,7 @@ PLIST
       elif ! colima_running; then
         printf '%s autoupdate: chart changed but Colima is not running — the next up/update applies it\n' "$(date -u +%FT%TZ)"
       else
-        printf '%s autoupdate: chart changed — re-applying it (update --skip-image)\n' "$(date -u +%FT%TZ)"
+        printf '%s autoupdate: chart changed — re-applying it (update; registry mode also follows the public GHCR image)\n' "$(date -u +%FT%TZ)"
         if MEMEX_IN_AUTOUPDATE=1 "$(brew --prefix)/bin/memex-local" update --skip-image; then
           printf '%s autoupdate: chart re-applied on %s\n' "$(date -u +%FT%TZ)" "$after"
         else
@@ -3598,7 +4539,11 @@ main() {
     update)        cmd_update "$@" ;;
     registry)      cmd_registry "$@" ;;
     backlease)     cmd_backlease "$@" ;;
+    fleet)         cmd_fleet "$@" ;;
     llm)           cmd_llm "$@" ;;
+    publish)       cmd_publish "$@" ;;
+    cert)          cmd_cert "$@" ;;
+    internal)      cmd_internal "$@" ;;
     relay)         cmd_relay "$@" ;;
     verify)        cmd_verify "$@" ;;
     autoroll)      cmd_autoroll "$@" ;;

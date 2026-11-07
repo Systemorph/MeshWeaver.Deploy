@@ -1,0 +1,16 @@
+# REFUSAL: a vault-synced TLS Secret AND a hand-written NAMESPACED cert-manager issuer annotation.
+# ingress.annotations is copied onto the Ingress, so cert-manager would issue into the Secret the CSI
+# driver manages — two writers, the same race as clusterIssuer (MeshWeaver.Deploy#130).
+ingress:
+  enabled: true
+  className: "nginx-internal"
+  host: "portal.example.com"
+  tlsSecret: "portal-tls"
+  annotations:
+    cert-manager.io/issuer: "letsencrypt-namespaced"
+  tlsFromKeyVault:
+    certificate: "portal-example-com"
+keyVaultSecrets:
+  vaultName: "kv-example"
+  tenantId: "00000000-0000-0000-0000-000000000000"
+  identityClientId: "11111111-1111-1111-1111-111111111111"

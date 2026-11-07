@@ -669,14 +669,22 @@ if command -v helm >/dev/null 2>&1; then
   else
     bad "rendered: registry mode with the clear emits no InstallByDefault key" "with clear: $with_clear key(s); without: $without_clear"
   fi
+  fh="$(render -f "$HERE/../share/values.local.fleet-host.yaml" --set-json 'pluginCatalog.installByDefault=[]')"
+  # (here-strings, not printf | grep -q: under pipefail an early-exiting grep SIGPIPEs the printf)
+  if grep -q 'PluginCatalog__InstallByDefault__0: "Plugins/Hosting"' <<<"$fh" \
+     && grep -q 'PluginCatalog__InstallPreInstalledPackages: "true"' <<<"$fh"; then
+    ok "rendered: the fleet-host template names Plugins/Hosting exactly and keeps the platform baseline"
+  else
+    bad "rendered: fleet-host template" "$(printf '%s\n' "$fh" | grep -E 'InstallByDefault|InstallPreInstalled' | head -5)"
+  fi
 else
   printf '  skip  rendered registry-mode InstallByDefault check — helm is not on PATH here (the static check above still ran)\n'
 fi
 for c in cmd_up cmd_update; do
   body="$(awk -v f="^${c}\\\\(\\\\)" '$0 ~ f { on=1 } on { print } on && /^}$/ { exit }' "$CLI")"
   case "$body" in
-    *'registry_mode && image_source="acr"'*) ok "${c} defaults to the ACR image in registry mode" ;;
-    *) bad "${c} defaults to the ACR image in registry mode" "no registry-mode default in ${c}()" ;;
+    *'registry_mode && image_source="ghcr"'*) ok "${c} defaults to the public GHCR image in registry mode (no Azure sign-in)" ;;
+    *) bad "${c} defaults to the public GHCR image in registry mode" "no registry-mode GHCR default in ${c}()" ;;
   esac
 done
 
@@ -957,6 +965,103 @@ OUT="$(env PATH="$STUBS:$PATH" HOME="$MP/home" MEMEX_LOCAL_HOME="$MP/home/.memex
 case "$RC:$OUT" in 0:*) bad "no flag and no preference → refused" "exited 0" ;; *"--control must be the control instance's https URL"*"managed preference com.memex.local ControlUrl"*) ok "no flag and no preference → refused, naming the flag AND the preference key" ;; *) bad "refusal names flag + preference" "$OUT" ;; esac
 rm -rf "$MP"
 
+echo "── fleet join: the enrolment code opens only with this Mac's key (MacStudioFleet §2b) ──"
+FJ="$(mktemp -d)"; mkdir -p "$FJ/home/.memex-local/enrol"
+fj_lib() { env HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c ". \"$CLI\"; $1"; }
+# The pure helpers: request encoding, the key fingerprint, the value fingerprint format.
+req="$(fj_lib 'fleet_request studio-2 host-a jroe C02X AAAA')"
+dec="$(printf '%s' "$req" | tr '_-' '/+' | awk '{ n = length($0) % 4; if (n) $0 = $0 substr("===", 1, 4 - n); print }' | base64 -d 2>/dev/null)"
+[ "$dec" = '{"v":1,"deployment":"studio-2","host":"host-a","user":"jroe","machine":"C02X","key":"AAAA"}' ] \
+  && ok "fleet_request is base64url of the v1 JSON the control page parses" || bad "fleet_request" "$dec"
+case "$req" in *[+/=]*) bad "fleet_request is URL-safe" "$req" ;; *) ok "fleet_request is URL-safe (no + / =)" ;; esac
+[ "$(fj_lib 'fleet_fact "a<b>c;d"')" = "abcd" ] && ok "fleet_fact keeps only the characters the control page admits" || bad "fleet_fact" "$(fj_lib 'fleet_fact "a<b>c;d"')"
+[ "$(fj_lib 'fleet_value_fingerprint abc')" = "sha256:$(printf abc | shasum -a 256 | cut -c1-12)" ] \
+  && ok "fleet_value_fingerprint is the control instance's sha256:<12 hex>" || bad "fleet_value_fingerprint" "$(fj_lib 'fleet_value_fingerprint abc')"
+KEY="$FJ/home/.memex-local/enrol/studio-2.key.pem"
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$KEY" 2>/dev/null )
+fp="$(fj_lib "fleet_key_fingerprint '$KEY'")"
+want="$(openssl pkey -in "$KEY" -pubout -outform DER 2>/dev/null | shasum -a 256 | cut -c1-32)"
+[ "$(printf '%s' "$fp" | tr -d ' ')" = "$want" ] && [ "$(printf '%s' "$fp" | awk '{print NF}')" = "8" ] \
+  && ok "the key fingerprint is the shasum of the DER key in eight groups of four (what the control page shows)" || bad "key fingerprint" "$fp vs $want"
+# Seal a payload exactly as the control instance does (RSA-OAEP, SHA-256 + MGF1-SHA-256) to the Mac's key.
+# (the public key goes through a file: bash 3.2's process substitution inside $(…) is not reliable)
+seal() { openssl pkey -in "$2" -pubout -out "$FJ/seal-pub.pem" 2>/dev/null
+  printf '%s' "$1" | openssl pkeyutl -encrypt -pubin -inkey "$FJ/seal-pub.pem" \
+  -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 2>/dev/null | base64 | tr -d '\n'; }
+M="$(printf 'a%.0s' $(seq 64))"; C="$(printf 'b%.0s' $(seq 64))"
+# (payload built first: bash 3.2 splits escaped quotes nested inside "$(…)")
+P2='{"v":1,"d":"studio-2","m":"'"$M"'","c":"'"$C"'"}'; P9='{"v":1,"d":"studio-9","m":"'"$M"'","c":"'"$C"'"}'
+sealed="$(seal "$P2" "$KEY")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/code.txt"
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/code.txt" 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*"joined as 'studio-2'"*) ok "fleet join opens a code sealed to its key and joins" ;; *) bad "fleet join with a good code" "rc=$RC: $OUT" ;; esac
+case "$OUT" in *"$M"*|*"$C"*) bad "fleet join never prints a key value" "a value is in the output" ;; *) ok "fleet join prints no key value (fingerprints only)" ;; esac
+case "$OUT" in *"Hosting/Heartbeats/Enrol/"*) ok "fleet join prints the control instance's approval link" ;; *) bad "approval link" "$OUT" ;; esac
+F="$FJ/home/.memex-local/fleet.yaml"
+grep -q "Hosting__ModuleReportSecret: \"$M\"" "$F" 2>/dev/null && grep -q "Hosting__ControlInbox__Secret: \"$C\"" "$F" \
+  && grep -q 'Hosting__ControlInbox__Url: "https://control.example.test/api/hooks/Hosting/PlatformBuilds"' "$F" \
+  && ok "the fleet layer carries both keys and the control inbox URL" || bad "fleet layer content" "$(sed 's/"[ab]\{64\}"/<value>/' "$F" 2>/dev/null)"
+# (ls, not stat: GNU `stat -f` is the FILESYSTEM report and prints to stdout, so a BSD-then-GNU fallback mis-reads)
+fmode="$(ls -l "$F" 2>/dev/null | cut -c1-10)"
+[ "$fmode" = "-rw-------" ] && ok "the fleet layer is 0600" || bad "fleet layer mode" "$fmode"
+[ ! -e "$KEY" ] && ok "the throw-away key is deleted once the code is opened" || bad "throw-away key removed" "still at $KEY"
+# A code sealed to ANOTHER key is refused by name; one issued for another id is refused by name.
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$KEY" 2>/dev/null ); OTHER="$FJ/other.pem"
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$OTHER" 2>/dev/null )
+sealed="$(seal "$P2" "$OTHER")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/wrong.txt"
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/wrong.txt" 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "a code for another key is refused" "exited 0" ;; *"does not open with this Mac's key"*) ok "a code sealed to another key is refused by name" ;; *) bad "wrong-key refusal" "$OUT" ;; esac
+sealed="$(seal "$P9" "$KEY")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/other-id.txt"
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/other-id.txt" 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "a code for another id is refused" "exited 0" ;; *"issued for 'studio-9'"*) ok "a code issued for another id is refused by name" ;; *) bad "other-id refusal" "$OUT" ;; esac
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id Bad_Id --no-open 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "a bad id is refused" "exited 0" ;; *"--id must be lower-case"*) ok "an id that cannot be a record id is refused" ;; *) bad "bad id refusal" "$OUT" ;; esac
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet status 2>&1)"
+case "$OUT" in *"JOINED as 'studio-2'"*"sha256:"*) ok "fleet status shows the join and the key fingerprints" ;; *) bad "fleet status" "$OUT" ;; esac
+case "$OUT" in *"$M"*|*"$C"*) bad "fleet status never prints a key value" "a value is in the output" ;; *) ok "fleet status prints no key value" ;; esac
+# Unattended (a device-management run): no code yet → the link is printed and kept, exit 3, nothing joined.
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$FJ/home/.memex-local/enrol/studio-3.key.pem" 2>/dev/null )
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --code-file "$FJ/none.code" 2>&1)"; RC=$?
+case "$RC:$OUT" in 3:*"WAITING for the approval on control and the enrolment code at $FJ/none.code"*) ok "unattended: no code yet → says what it waits for, exit 3" ;; *) bad "unattended join waits" "rc=$RC: $OUT" ;; esac
+grep -q '/Hosting/Heartbeats/Enrol/' "$FJ/home/.memex-local/enrol/studio-3.link" 2>/dev/null && ok "unattended: the approval link is kept in enrol/<id>.link" || bad "link kept" "$(cat "$FJ/home/.memex-local/enrol/studio-3.link" 2>/dev/null)"
+[ -f "$FJ/home/.memex-local/enrol/studio-3.key.pem" ] && ok "unattended: the throw-away key is kept for the run that brings the code" || bad "key kept while waiting" "gone"
+grep -q 'mode_args+=(-f "$FLEET_FILE")' "$CLI" && ok "helm_deploy layers the fleet file" || bad "helm_deploy layers the fleet file" "no -f \$FLEET_FILE"
+rm -rf "$FJ"
+
+echo "── a fleet Mac's template carries Hosting (fleet join / backlease, registry mode) ──"
+FH="$(mktemp -d)"; mkdir -p "$FH/home/.memex-local"
+fh_lib() { env HOME="$FH/home" MEMEX_LOCAL_HOME="$FH/home/.memex-local" MEMEX_LOCAL_LIB=1 "$@" bash -c ". \"$CLI\"; fleet_host && echo yes || echo no"; }
+[ "$(fh_lib)" = "no" ] && ok "not registered, not joined: no fleet-host template" || bad "fleet_host off by default" "$(fh_lib)"
+printf 'pluginCatalog:\n  registryUrl: "https://memex.example.test"\n' > "$FH/home/.memex-local/registry.yaml"
+[ "$(fh_lib)" = "no" ] && ok "registry mode alone (a personal Mac) is not a fleet host" || bad "registry alone" "$(fh_lib)"
+: > "$FH/home/.memex-local/backlease.yaml"
+[ "$(fh_lib)" = "yes" ] && ok "a back-leased Mac in registry mode is a fleet host (Hosting by template)" || bad "backlease → fleet host" "$(fh_lib)"
+[ "$(fh_lib MEMEX_FLEET_HOST=0)" = "no" ] && ok "MEMEX_FLEET_HOST=0 opts out" || bad "opt-out" "$(fh_lib MEMEX_FLEET_HOST=0)"
+rm "$FH/home/.memex-local/backlease.yaml"; : > "$FH/home/.memex-local/fleet.yaml"
+[ "$(fh_lib)" = "yes" ] && ok "a joined Mac (fleet join) is a fleet host" || bad "fleet join → fleet host" "$(fh_lib)"
+# The real decision, exercised (MEMEX_LOCAL_LIB=1 sources the functions): registry mode inside the agent
+# follows GHCR; outside the agent, outside registry mode, with a channel, or opted out, --skip-image stays.
+ais() { env HOME="$FH/home" MEMEX_LOCAL_HOME="$FH/home/.memex-local" MEMEX_LOCAL_LIB=1 "$@" bash -c ". \"$CLI\"; autoupdate_image_source \"\$0\" \"\$1\"" "$AIS_SRC" "$AIS_CH"; }
+AIS_SRC=skip AIS_CH=""
+[ "$(ais MEMEX_IN_AUTOUPDATE=1)" = "ghcr" ] && ok "inside the agent, a registry-mode --skip-image re-apply follows the public GHCR image" || bad "agent + registry → ghcr" "$(ais MEMEX_IN_AUTOUPDATE=1)"
+[ "$(ais)" = "skip" ] && ok "a person's --skip-image is honoured (outside the agent)" || bad "outside agent stays skip" "$(ais)"
+[ "$(ais MEMEX_IN_AUTOUPDATE=1 MEMEX_AUTOUPDATE_IMAGE=0)" = "skip" ] && ok "MEMEX_AUTOUPDATE_IMAGE=0 opts out" || bad "opt-out" "$(ais MEMEX_IN_AUTOUPDATE=1 MEMEX_AUTOUPDATE_IMAGE=0)"
+AIS_CH="3-latest"; [ "$(ais MEMEX_IN_AUTOUPDATE=1)" = "skip" ] && ok "an install following a release channel is not moved to GHCR" || bad "channel stays" "$(ais MEMEX_IN_AUTOUPDATE=1)"; AIS_CH=""
+AIS_SRC=build; [ "$(ais MEMEX_IN_AUTOUPDATE=1)" = "build" ] && ok "only --skip-image is affected (an explicit source is kept)" || bad "explicit source kept" "$(ais MEMEX_IN_AUTOUPDATE=1)"; AIS_SRC=skip
+rm -f "$FH/home/.memex-local/registry.yaml"
+[ "$(ais MEMEX_IN_AUTOUPDATE=1)" = "skip" ] && ok "not in registry mode: the agent's re-apply stays chart-only" || bad "self-registry stays skip" "$(ais MEMEX_IN_AUTOUPDATE=1)"
+printf 'pluginCatalog:\n  registryUrl: "https://memex.example.test"\n' > "$FH/home/.memex-local/registry.yaml"
+grep -q 'chosen="$(autoupdate_image_source "$image_source" "$channel")"' "$CLI" && ok "cmd_update applies the decision" || bad "cmd_update uses autoupdate_image_source" "missing"
+grep -q 'mode_args+=(-f "$share_dir/values.local.fleet-host.yaml")' "$CLI" && ok "helm_deploy layers the fleet-host template" || bad "helm_deploy layers fleet-host" "missing"
+rm -rf "$FH"
+
+echo "── registry mode pulls the public GHCR anonymously; Ollama runs under launchd ──"
+grep -q 'image_pull_ghcr() {' "$CLI" && ! awk '/^image_pull_ghcr\(\) \{/,/^}$/' "$CLI" | grep -q 'az ' \
+  && ok "image_pull_ghcr exists and calls no az" || bad "image_pull_ghcr without az" "$(awk '/^image_pull_ghcr\(\) \{/,/^}$/' "$CLI")"
+awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI" | grep -q 'install_ollama_agent' && ! awk '/^setup_ollama\(\) \{/,/^}$/' "$CLI" | grep -q 'nohup ollama' \
+  && ok "setup_ollama starts Ollama under launchd, not as a nohup'd process" || bad "setup_ollama under launchd" "still nohup or no agent"
+grep -q '<key>OLLAMA_HOST</key><string>0.0.0.0:11434</string>' "$CLI" && grep -q '<key>KeepAlive</key><true/>' "$CLI" \
+  && ok "the Ollama agent binds every interface (the VM reaches it) and is kept alive" || bad "ollama agent plist" "missing OLLAMA_HOST or KeepAlive"
+
 echo "── headless host: install_launchd holds the forward as a process, no LaunchAgent ──"
 HL="$(mktemp -d)"; mkdir -p "$HL/stubs" "$HL/home"
 printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "$FAKE_LAUNCHCTL_LOG"\nexit 0\n' > "$HL/stubs/launchctl"; chmod +x "$HL/stubs/launchctl"
@@ -1159,10 +1264,288 @@ if [ -n "$cli_path" ] && grep -q "path: $cli_path\$" "$HERE/../../helm/templates
   ok "PORTAL_DATA_DIR ($cli_path) is the hostPath the chart mounts"
 else bad "PORTAL_DATA_DIR is the chart's hostPath" "cli='$cli_path' chart='$chart_path'"; fi
 
+echo "── publish: a real sign-in, the tailnet name (and an optional public name), the front door on loopback (MacStudioFleet §6) ──"
+PB="$(mktemp -d)"; mkdir -p "$PB/stubs" "$PB/home"
+# The tailscale stub logs its arguments and answers `status --json` with FAKE_TS_JSON (nothing when unset:
+# not connected, so no tailnet name).
+cat > "$PB/stubs/tailscale" <<STUB
+#!/bin/bash
+echo "\$@" >> "$PB/ts.log"
+case "\$*" in *"status --json"*) [ -n "\${FAKE_TS_JSON:-}" ] && printf '%s' "\$FAKE_TS_JSON" ;; esac
+exit 0
+STUB
+chmod +x "$PB/stubs/tailscale"
+# Self is the MagicDNS name of THIS Mac (mixed case, trailing dot as tailscale prints it); the peer's name
+# must never be picked up.
+TS_JSON='{"BackendState":"Running","Peer":{"nodekey:aa":{"DNSName":"other-mac.tailnet.example."}},"Self":{"HostName":"Mac-1","DNSName":"Mac-1.Tailnet.Example."}}'
+pb() { env PATH="$PB/stubs:$STUBS:$PATH" HOME="$PB/home" MEMEX_LOCAL_HOME="$PB/home/.memex-local" "$@"; }
+LAYER="$PB/home/.memex-local/publish.yaml"
+refuse_pub() { local why="$1" want="$2"; shift 2
+  OUT="$(printf 's3cret' | pb "$CLI" publish on "$@" 2>&1)"; RC=$?
+  case "$RC:$OUT" in 0:*) bad "publish refuses $why" "exited 0" ;; *"$want"*) ok "publish refuses $why" ;; *) bad "publish refuses $why" "$OUT" ;; esac
+  [ ! -f "$LAYER" ] || { bad "a refused publish writes no layer ($why)" "$(cat "$LAYER")"; rm -f "$LAYER"; }; }
+refuse_pub "a tailnet-only publish without a tailnet name" "no tailnet name to publish" --sign-in microsoft --tenant t-1 --client-id c-1
+case "$OUT" in *"reports no MagicDNS name"*) ok "a missing tailnet name is SAID (why there is none)" ;; *) bad "missing tailnet name is said" "$OUT" ;; esac
+refuse_pub "--tailnet-only with --host" "exclude each other"       --tailnet-only --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1
+refuse_pub "a localhost name"          "--host must be"            --host memex.localhost --sign-in microsoft --tenant t-1 --client-id c-1
+refuse_pub "no sign-in provider"       "needs a real sign-in"      --host mac-1.example.com --client-id c-1
+refuse_pub "an unknown provider"       "--sign-in must be microsoft" --host mac-1.example.com --sign-in dev --client-id c-1
+refuse_pub "a provider the chart does not wire yet" "is not wired yet" --host mac-1.example.com --sign-in google --client-id c-1
+refuse_pub "a multi-directory tenant"  "a named directory"         --host mac-1.example.com --sign-in microsoft --tenant common --client-id c-1
+refuse_pub "a missing client id"       "--client-id <id> is required" --host mac-1.example.com --sign-in microsoft --tenant t-1
+OUT="$(printf '' | pb "$CLI" publish on --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "publish refuses an empty secret" "exited 0" ;; *"no client secret on STDIN"*) ok "publish refuses an empty secret" ;; *) bad "publish refuses an empty secret" "$OUT" ;; esac
+OUT="$(printf 's3cret-value\n' | pb "$CLI" publish on --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "publish on writes the layer" || bad "publish on writes the layer" "rc=$RC: $OUT"
+case "$OUT" in *"no tailnet name: publishing the public name mac-1.example.com only"*) ok "a public name without a tailnet name is published alone, and that is said" ;; *) bad "public-only is said" "$OUT" ;; esac
+case "$OUT" in *s3cret-value*) bad "publish never prints the secret" "$OUT" ;; *) ok "publish never prints the secret" ;; esac
+[ "$(stat -c %a "$LAYER" 2>/dev/null || stat -f %Lp "$LAYER")" = 600 ] && ok "the layer is 0600" || bad "the layer is 0600" "$(ls -l "$LAYER")"
+grep -q '^    - "mac-1.example.com"$' "$LAYER" && grep -q 'Authentication__Microsoft__ClientId: "c-1"' "$LAYER" \
+  && grep -q 'Authentication__Microsoft__TenantId: "t-1"' "$LAYER" && grep -q 'Features__Onboarding__InvitationOnly: "true"' "$LAYER" \
+  && grep -q 'Authentication__Microsoft__ClientSecret: "s3cret-value"' "$LAYER" \
+  && ok "the layer: additional host, provider + tenant, invitation-only, the secret" || bad "the layer's content" "$(sed 's/ClientSecret: .*/ClientSecret: <redacted>/' "$LAYER")"
+grep -q -- 'serve --bg --tcp 443 tcp://127.0.0.1:8446' "$PB/ts.log" && ok "publish on serves the network the ENTRY POINT's port only (not the front door)" || bad "tailscale serve" "$(cat "$PB/ts.log" 2>/dev/null)"
+case "$(pb "$CLI" publish status 2>&1)" in *"https://mac-1.example.com, sign-in: Microsoft (tenant t-1), admission: invitation-only"*) ok "publish status reads the layer back" ;; *) bad "publish status" "$(pb "$CLI" publish status 2>&1)" ;; esac
+# The front door: loopback only while published, every interface otherwise (kubectl is the suite's stub).
+PF="$HERE/../share/port-forward.sh"
+pfaddr() { env PATH="$PB/stubs:$STUBS:$PATH" MEMEX_LOCAL_HOME="$PB/home/.memex-local" MEMEX_HEADLESS=1 MEMEX_PORT=8443 bash -c '
+  colima() { return 0; }; kubectl() { case "$*" in *port-forward*) printf "%s\n" "$*" ;; *) return 0 ;; esac; }; export -f colima kubectl
+  sed "s#^\( *\)exec kubectl#\1kubectl#; s#^exec kubectl#kubectl#" "$1" | bash 2>/dev/null | grep port-forward | grep -v memex-network-entry | head -n 1' _ "$PF" 2>/dev/null | grep -o -- '--address .*'; }
+[ "$(pfaddr)" = "--address 127.0.0.1,::1 8443:443" ] && ok "published: the front door binds loopback only, on the unprivileged port alone" || bad "published front door" "$(pfaddr)"
+E="$PB/home/.memex-local/network-entry.yaml"
+grep -q 'header_up X-MeshWeaver-Provenance tailnet' "$E" && grep -q '^    https://mac-1.example.com:8443 {$' "$E" && ! grep -q '__[A-Z]*__' "$E" \
+  && ok "the entry point marks every request and serves the public name only" || bad "network entry manifest" "$(head -40 "$E" 2>/dev/null)"
+grep -q 'svc/memex-network-entry' "$PF" && grep -q -- '"${entry_port}:8443"' "$PF" && ok "published: the entry point has its own loopback forward" || bad "entry forward" "missing in port-forward.sh"
+# The entry port may not collide with the front door or the e2e portal (traffic there carries no mark).
+OUT="$(printf 's3cret' | env MEMEX_ENTRY_PORT=8444 PATH="$PB/stubs:$STUBS:$PATH" HOME="$PB/home" MEMEX_LOCAL_HOME="$PB/home/.memex-local" "$CLI" publish on --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "publish refuses an entry port on the e2e port" "exited 0" ;; *"collides with port 8444"*) ok "publish refuses an entry port that collides with the e2e portal's" ;; *) bad "entry port collision" "$OUT" ;; esac
+OUT="$(printf 's3cret' | env MEMEX_ENTRY_PORT=8443 PATH="$PB/stubs:$STUBS:$PATH" HOME="$PB/home" MEMEX_LOCAL_HOME="$PB/home/.memex-local" "$CLI" publish on --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "publish refuses the front door's port" "exited 0" ;; *"collides with port 8443"*) ok "publish refuses an entry port that collides with the front door's" ;; *) bad "front-door collision" "$OUT" ;; esac
+grep -q 'collides' /dev/null; [ -f "$LAYER" ] && grep -q 'mac-1.example.com' "$LAYER" && ok "(the layer from the earlier publish is untouched by the refusals)" || true
+# Stopping the published forward stops BOTH forwards and the entry retry loop (no orphan holds a port).
+# kubectl/colima are exported FUNCTIONS: the script prepends /opt/homebrew/bin to PATH, so a PATH stub
+# would lose to a real kubectl.
+SUP="$(mktemp -d "${TMPDIR:-/tmp}/pfsup.XXXXXX")"; mkdir -p "$SUP/home/.memex-local"; : > "$SUP/home/.memex-local/publish.yaml"
+env MEMEX_LOCAL_HOME="$SUP/home/.memex-local" MEMEX_HEADLESS=1 MEMEX_PORT=8443 bash -c '
+  colima() { return 0; }; kubectl() { case "$*" in *port-forward*) exec sleep 307 ;; *) return 0 ;; esac; }; export -f colima kubectl
+  exec bash "$1"' _ "$PF" >/dev/null 2>&1 &
+SPID=$!; sleep 2
+kids_before=$(pgrep -f "sleep 307" | wc -l | tr -d ' ')
+kill -TERM "$SPID"; wait "$SPID" 2>/dev/null; sleep 1
+kids_after=$(pgrep -f "sleep 307" | wc -l | tr -d ' ')
+[ "$kids_before" -ge 2 ] && [ "$kids_after" = 0 ] && ok "stopping the published forward stops both forwards (${kids_before} → 0)" || bad "supervisor stops both forwards" "before=$kids_before after=$kids_after"
+grep -q '<key>MEMEX_LOCAL_HOME</key>' "$HERE/../share/com.memex.local.plist" && grep -q -- '-e "s|__LOCAL_HOME__|${LOCAL_HOME}|g"' "$CLI" \
+  && ok "the LaunchAgent carries the state directory the forward reads publish.yaml from" || bad "MEMEX_LOCAL_HOME reaches the LaunchAgent" "plist or sed missing"
+# An empty overlay placeholder for a key the layer owns would ERASE the sign-in (the overlay is layered last).
+OV="$PB/home/.memex-local/values.local.yaml"
+printf 'config:\n  memex_portal:\n    Authentication__Provider: ""\n    Authentication__Microsoft__ClientId: ""\n    Authentication__Microsoft__TenantId: ""\n    KeepMe: "x"\n' > "$OV"; chmod 600 "$OV"
+OUT="$(printf 's3cret-value\n' | pb "$CLI" publish on --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+! grep -q 'Authentication__Microsoft__ClientId: ""' "$OV" && ! grep -q 'Authentication__Microsoft__TenantId: ""' "$OV" \
+  && grep -q 'Authentication__Provider: ""' "$OV" && grep -q 'KeepMe: "x"' "$OV" \
+  && ok "publish on removes ONLY the empty overlay placeholders of the keys it owns" || bad "overlay placeholders" "$(cat "$OV")"
+case "$OUT" in *"removed empty overlay placeholder"*"Authentication__Microsoft__ClientId"*) ok "publish on says which placeholders it removed" ;; *) bad "placeholder report" "$OUT" ;; esac
+[ "$(ls -l "$OV" | cut -c1-10)" = "-rw-------" ] && ok "the overlay keeps its 0600 mode" || bad "overlay mode" "$(ls -l "$OV")"
+printf 'config:\n  memex_portal:\n    Authentication__Microsoft__ClientId: "mine"\n' > "$OV"
+printf 's3cret-value\n' | pb "$CLI" publish on --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1 >/dev/null 2>&1
+grep -q 'Authentication__Microsoft__ClientId: "mine"' "$OV" && ok "a REAL overlay value is kept (and still wins)" || bad "real overlay value kept" "$(cat "$OV")"
+rm -f "$OV"
+# publish status checks what the portal ACTUALLY got (the rendered config), not the layer.
+cat > "$PB/stubs/kubectl" <<'STUB'
+#!/bin/bash
+case "$*" in
+  *"get configmap memex-portal-config"*ClientId*) printf '%s' "${FAKE_CLIENT_ID:-}" ;;
+  *"get configmap memex-portal-config"*TenantId*) printf '%s' "${FAKE_TENANT_ID:-}" ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "$PB/stubs/kubectl"
+case "$(pb env FAKE_CLIENT_ID=c-1 FAKE_TENANT_ID=t-1 "$CLI" publish status 2>&1)" in *"running portal's config carries the Microsoft client id and tenant"*) ok "publish status confirms the rendered config carries the sign-in" ;; *) bad "status: rendered config ok" "$(pb env FAKE_CLIENT_ID=c-1 FAKE_TENANT_ID=t-1 "$CLI" publish status 2>&1)" ;; esac
+case "$(pb env FAKE_CLIENT_ID= FAKE_TENANT_ID= "$CLI" publish status 2>&1)" in *"does NOT carry this layer's Microsoft sign-in"*) ok "publish status warns when the rendered config lost the client id" ;; *) bad "status: rendered config missing" "$(pb "$CLI" publish status 2>&1)" ;; esac
+rm -f "$PB/stubs/kubectl"
+# A user-space tailscaled under the person's home: its socket is used without being told.
+TSOCK="$(mktemp -d "${TMPDIR:-/tmp}/tss.XXXXXX")"; mkdir -p "$PB/home/.tailscale"
+python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$PB/home/.tailscale/tailscaled.sock" 2>/dev/null
+if [ -S "$PB/home/.tailscale/tailscaled.sock" ]; then
+  : > "$PB/ts.log"; pb env -u MEMEX_TAILSCALE_SOCKET MEMEX_LOCAL_LIB=1 bash -c '. "$0"; publish_tailscale status' "$CLI" >/dev/null 2>&1
+  grep -q -- "--socket=$PB/home/.tailscale/tailscaled.sock status" "$PB/ts.log" && ok "a user-space tailscaled's socket under the home is used automatically" || bad "tailscale socket auto-detect" "$(cat "$PB/ts.log")"
+  python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$TSOCK/root.sock" 2>/dev/null
+  : > "$PB/ts.log"; pb env -u MEMEX_TAILSCALE_SOCKET MEMEX_TAILSCALED_ROOT_SOCKET="$TSOCK/root.sock" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; publish_tailscale status' "$CLI" >/dev/null 2>&1
+  grep -q -- "--socket=$TSOCK/root.sock status" "$PB/ts.log" && ok "the fleet's ROOT tailscaled daemon socket is preferred over a user-space one" || bad "root socket preferred" "$(cat "$PB/ts.log")"
+  : > "$PB/ts.log"; pb env MEMEX_TAILSCALE_SOCKET=/custom.sock MEMEX_LOCAL_LIB=1 bash -c '. "$0"; publish_tailscale status' "$CLI" >/dev/null 2>&1
+  grep -q -- "--socket=/custom.sock status" "$PB/ts.log" && ok "MEMEX_TAILSCALE_SOCKET still wins" || bad "explicit socket wins" "$(cat "$PB/ts.log")"
+  rm -f "$PB/home/.tailscale/tailscaled.sock"
+else
+  printf '  skip  tailscale socket auto-detect — this host cannot create a unix socket here\n'
+fi
+rm -rf "$TSOCK"
+# The network entry point: the caddy binary carries a FILE capability, so a pod with every capability dropped
+# must add NET_BIND_SERVICE back or the exec is refused (CrashLoopBackOff); the bridge strips the file cap instead.
+grep -q 'capabilities: { drop: \["ALL"\], add: \["NET_BIND_SERVICE"\] }' "$HERE/../share/network-entry.yaml" \
+  && ok "the network entry point adds NET_BIND_SERVICE back (caddy's file capability)" || bad "network-entry capabilities" "$(grep -n capabilities "$HERE/../share/network-entry.yaml")"
+grep -q 'setcap -r /usr/bin/caddy' "$HERE/../../tailnet-bridge/Dockerfile" && grep -q 'test -z "$(getcap /usr/local/bin/caddy)"' "$HERE/../../tailnet-bridge/Dockerfile" \
+  && ok "the bridge image strips caddy's file capability and its test stage proves it" || bad "bridge caddy file cap" "missing in deploy/tailnet-bridge/Dockerfile"
+# The tailnet name: read from `tailscale status --json` (.Self.DNSName, dot stripped, lower-cased), never typed.
+tsname() { pb env FAKE_TS_JSON="$1" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; tailnet_name' "$CLI" 2>&1; }
+[ "$(tsname "$TS_JSON" 2>/dev/null)" = "mac-1.tailnet.example" ] && ok "the tailnet name is .Self.DNSName, trailing dot stripped, lower-cased (not a peer's)" || bad "tailnet name read" "$(tsname "$TS_JSON")"
+case "$(tsname '{"BackendState":"Running","Self":{"DNSName":"mac-1."}}')" in *"without a domain"*) ok "a DNSName without a domain is no tailnet name, and that is said" ;; *) bad "domainless DNSName" "$(tsname '{"BackendState":"Running","Self":{"DNSName":"mac-1."}}')" ;; esac
+OUT="$(tsname '{"BackendState":"Stopped","Self":{"DNSName":"mac-1.tailnet.example."}}')"
+case "$OUT" in *"not running on this Mac (BackendState: Stopped)"*) case "$OUT" in *"mac-1.tailnet.example"*) bad "a stopped backend's name is not published" "$OUT" ;; *) ok "a stopped backend's last DNSName is no tailnet name, and that is said" ;; esac ;; *) bad "stopped backend" "$OUT" ;; esac
+# tailscale ABSENT: no tailnet name, and the output says so (a PATH without the stub and without any real tailscale).
+NOTS="$(mktemp -d)"; for t in bash env awk sed tr grep cat head paste mktemp dirname; do p="$(command -v "$t")" && ln -s "$p" "$NOTS/$t"; done
+OUT="$(env PATH="$NOTS" HOME="$PB/home" MEMEX_LOCAL_HOME="$PB/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; n="$(tailnet_name)"; printf "name=[%s]\n" "$n"' "$CLI" 2>&1)"
+case "$OUT" in *"tailscale is not installed — no tailnet name"*"name=[]"*) ok "tailscale absent: no tailnet name, and the output says so" ;; *) bad "tailscale absent" "$OUT" ;; esac
+rm -rf "$NOTS"
+# Tailnet-only (the default): the machine's own name is the ONLY published name, no public host anywhere.
+: > "$PB/ts.log"
+OUT="$(printf 's3cret-value\n' | pb env FAKE_TS_JSON="$TS_JSON" "$CLI" publish on --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "publish on without --host publishes on the private network only" || bad "tailnet-only publish" "rc=$RC: $OUT"
+[ "$(awk '/^  additionalHosts:/{on=1;next} on&&/^    - /{print;next} on{exit}' "$LAYER")" = '    - "mac-1.tailnet.example"' ] \
+  && ok "tailnet-only: the ingress gets the tailnet name and nothing else" || bad "tailnet-only hosts" "$(grep -A3 additionalHosts "$LAYER")"
+grep -q '^    https://mac-1.tailnet.example:8443 {$' "$E" && grep -q 'header_up X-MeshWeaver-Provenance tailnet' "$E" && grep -q 'caddyfile-hosts: "mac-1.tailnet.example"' "$E" \
+  && ok "tailnet-only: the entry point serves the tailnet name, marked" || bad "tailnet-only entry" "$(sed -n '/Caddyfile/,/^---/p' "$E")"
+grep -q -- 'serve --bg --tcp 443 tcp://127.0.0.1:8446' "$PB/ts.log" && ok "tailnet-only: tailscale serve still hands TCP 443 to the entry point" || bad "tailnet-only serve" "$(cat "$PB/ts.log")"
+case "$OUT" in *"redirect URI on the app: https://mac-1.tailnet.example/signin-microsoft"*"publish ca"*) ok "tailnet-only: says the redirect URI for the tailnet name and how a member trusts the CA" ;; *) bad "tailnet-only guidance" "$OUT" ;; esac
+case "$(pb "$CLI" publish status 2>&1)" in *"PUBLISHED — https://mac-1.tailnet.example, sign-in: Microsoft (tenant t-1)"*) ok "publish status names the tailnet name" ;; *) bad "tailnet-only status" "$(pb "$CLI" publish status 2>&1)" ;; esac
+OUT="$(printf 's3cret-value\n' | pb env FAKE_TS_JSON="$TS_JSON" "$CLI" publish on --tailnet-only --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+[ "$RC" = 0 ] && grep -q '^    - "mac-1.tailnet.example"$' "$LAYER" && ok "--tailnet-only says the default explicitly" || bad "--tailnet-only" "rc=$RC: $OUT"
+# Both names: --host ADDS the public name beside the tailnet name — one Caddy site for both, one ingress list.
+OUT="$(printf 's3cret-value\n' | pb env FAKE_TS_JSON="$TS_JSON" "$CLI" publish on --host mac-1.example.com --sign-in microsoft --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+[ "$RC" = 0 ] && [ "$(awk '/^  additionalHosts:/{on=1;next} on&&/^    - /{print;next} on{exit}' "$LAYER" | sed 's/^ *- *//; s/"//g' | paste -sd, -)" = "mac-1.tailnet.example,mac-1.example.com" ] \
+  && ok "public + tailnet: the ingress lists both names" || bad "both names: hosts" "rc=$RC $(grep -A4 additionalHosts "$LAYER")"
+CF="$(sed -n '/Caddyfile: |/,/^---/p' "$E")"
+[ "$(printf '%s\n' "$CF" | grep -c '^    https://.*:8443 {$')" = 2 ] && [ "$(printf '%s\n' "$CF" | grep -c 'header_up X-MeshWeaver-Provenance tailnet')" = 2 ] \
+  && printf '%s\n' "$CF" | grep -A6 '^    https://mac-1.tailnet.example:8443 {$' | grep -q 'tls_server_name mac-1.tailnet.example$' \
+  && printf '%s\n' "$CF" | grep -A6 '^    https://mac-1.example.com:8443 {$' | grep -q 'tls_server_name mac-1.example.com$' \
+  && ! printf '%s\n' "$CF" | grep -q '__HOST\|site:' && grep -q 'caddyfile-hosts: "mac-1.tailnet.example mac-1.example.com"' "$E" \
+  && ok "public + tailnet: one marked Caddy site per name (no unmarked site), each with its own upstream SNI" || bad "two-name Caddyfile" "$CF"
+case "$OUT" in *"https://mac-1.tailnet.example/signin-microsoft"*"https://mac-1.example.com/signin-microsoft"*) ok "public + tailnet: a redirect URI for each name" ;; *) bad "both redirect URIs" "$OUT" ;; esac
+# The CA lives on a volume (a restart keeps the root a member trusted) and `publish off` keeps it.
+grep -q 'strategy: { type: Recreate, rollingUpdate: null }' "$HERE/../share/network-entry.yaml" && ok "Recreate clears the server-defaulted rollingUpdate (an earlier entry point upgrades)" || bad "Recreate strategy" "$(grep -n strategy "$HERE/../share/network-entry.yaml")"
+grep -q 'name: XDG_DATA_HOME, value: /data' "$HERE/../share/network-entry.yaml" && grep -q 'claimName: memex-network-entry-data' "$HERE/../share/network-entry.yaml" \
+  && ok "the entry point's CA lives on its data volume, not in /tmp" || bad "CA volume" "$(grep -n 'XDG_DATA_HOME\|claimName' "$HERE/../share/network-entry.yaml")"
+# publish ca: the root certificate out of the entry point, PEM only on stdout; refuses anything else.
+cat > "$PB/stubs/kubectl" <<'STUB'
+#!/bin/bash
+echo "$@" >> "${KLOG:-/dev/null}"
+case "$*" in *"--context colima -n memex exec deploy/memex-network-entry -- cat /data/caddy/pki/authorities/local/root.crt"*) printf '%s' "${FAKE_CA:-}" ;; esac
+exit 0
+STUB
+chmod +x "$PB/stubs/kubectl"
+PEM=$'-----BEGIN CERTIFICATE-----\nMIIBfake\n-----END CERTIFICATE-----'
+[ "$(pb env FAKE_CA="$PEM" "$CLI" publish ca 2>/dev/null)" = "$PEM" ] && ok "publish ca prints the LOCAL cluster's (context colima) entry-point root certificate (PEM only, on stdout)" || bad "publish ca" "$(pb env FAKE_CA="$PEM" "$CLI" publish ca 2>&1)"
+OUT="$(pb env FAKE_CA="" "$CLI" publish ca 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "publish ca refuses a missing CA" "exited 0" ;; *"no root certificate"*) ok "publish ca refuses when the entry point has no CA (and says where it looked)" ;; *) bad "publish ca missing" "$OUT" ;; esac
+: > "$PB/klog"
+pb env KLOG="$PB/klog" "$CLI" publish off >/dev/null 2>&1
+grep -q 'delete deployment/memex-network-entry service/memex-network-entry configmap/memex-network-entry' "$PB/klog" && ! grep -q 'pvc\|-f ' "$PB/klog" \
+  && ok "publish off deletes the entry point by name and keeps its CA volume" || bad "publish off keeps the CA" "$(cat "$PB/klog")"
+rm -f "$PB/stubs/kubectl"
+[ ! -f "$LAYER" ] && ok "publish off removes the layer" || bad "publish off" "layer still there"
+grep -q -- 'serve --tcp 443 off' "$PB/ts.log" && ok "publish off stops the tailscale serve" || bad "publish off serve" "$(cat "$PB/ts.log")"
+[ "$(pfaddr)" = "--address 0.0.0.0,:: 80:80 443:443 8443:443" ] && ok "not published: the front door binds every interface, all three mappings (unchanged)" || bad "unpublished front door" "$(pfaddr)"
+rm -rf "$PB"
+
+echo "── cert: a trusted certificate for the private-network name, per name in the entry point ──"
+CT="$(mktemp -d)"; mkdir -p "$CT/home"
+ct() { env PATH="$STUBS:$PATH" HOME="$CT/home" MEMEX_LOCAL_HOME="$CT/home/.memex-local" "$@"; }
+CFG=(--domain studio-2.net.example.test --email ops@example.test --client-id cid-1 --tenant ten-1 --subscription sub-1 --resource-group dns --zone net.example.test)
+OUT="$(printf 'dns-s3cret\n' | ct "$CLI" cert config "${CFG[@]}" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "cert config writes the configuration" || bad "cert config" "rc=$RC: $OUT"
+case "$OUT" in *dns-s3cret*) bad "cert config never prints the secret" "$OUT" ;; *) ok "cert config never prints the secret" ;; esac
+[ "$(ls -l "$CT/home/.memex-local/certs/dns01.secret" | cut -c1-10)" = "-rw-------" ] && [ "$(cat "$CT/home/.memex-local/certs/dns01.secret")" = "dns-s3cret" ] \
+  && ok "the DNS identity's secret is kept 0600 apart from the configuration" || bad "secret file" "$(ls -l "$CT/home/.memex-local/certs/")"
+! grep -q dns-s3cret "$CT/home/.memex-local/certs/dns01.env" && grep -q '^AZURE_ZONE_NAME=net.example.test$' "$CT/home/.memex-local/certs/dns01.env" \
+  && ok "the configuration names the zone and identity, nothing secret" || bad "dns01.env" "$(cat "$CT/home/.memex-local/certs/dns01.env")"
+OUT="$(printf 'x\n' | ct "$CLI" cert config --domain studio-2.example.test --email e --client-id c --tenant t --subscription s --resource-group r --zone net.example.test 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "a domain outside the zone is refused" "exited 0" ;; *"is not inside the zone"*) ok "a domain outside the zone the identity may write is refused" ;; *) bad "zone refusal" "$OUT" ;; esac
+LA="$(ct env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; cert_lego_args' "$CLI" | tr '\n' ' ')"
+case "$LA" in "run --accept-tos --email ops@example.test --dns azuredns --domains studio-2.net.example.test --key-type EC256 --renew-days 30 --path $CT/home/.memex-local/certs/lego ") ok "lego v5: one 'run' obtains or renews (within 30 days), DNS-01 in Azure DNS, EC256" ;; *) bad "lego args" "$LA" ;; esac
+# The entry point serves the trusted certificate for a name that has one, and its local CA for the others.
+mkdir -p "$CT/home/.memex-local/certs/lego/certificates"
+printf 'CERT\n' > "$CT/home/.memex-local/certs/lego/certificates/studio-2.net.example.test.crt"; printf 'KEY\n' > "$CT/home/.memex-local/certs/lego/certificates/studio-2.net.example.test.key"
+R="$(ct env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; render_network_entry "$1" studio-2.net.example.test mac-1.example.com' "$CLI" "$HERE/../share/network-entry.yaml")"
+grep -q 'tls /certs/studio-2.net.example.test.crt /certs/studio-2.net.example.test.key' <<<"$R" && ok "a name with a trusted certificate is served with it" || bad "trusted cert site" "$(grep -n 'tls ' <<<"$R")"
+[ "$(grep -c '^[[:space:]]*tls internal$' <<<"$R")" = 1 ] && ok "a name without one keeps the entry point's local CA" || bad "local CA site" "$(grep -n 'tls ' <<<"$R")"
+grep -q 'secretName: memex-network-entry-certs, optional: true' <<<"$R" && grep -q 'memex-local/certs-digest: "[0-9a-f]\{16\}"' <<<"$R" \
+  && ok "the certificates mount optionally, and a renewal changes the pod's digest (restart onto it)" || bad "certs mount/digest" "$(grep -n 'certs' <<<"$R")"
+! grep -q '__TLS__\|__CERTS_DIGEST__' <<<"$R" && ok "no placeholder is left in the rendered entry point" || bad "placeholders left" "$(grep -n '__' <<<"$R")"
+R0="$(ct env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; render_network_entry "$1" other.example.com' "$CLI" "$HERE/../share/network-entry.yaml")"
+grep -q 'memex-local/certs-digest: "none"' <<<"$R0" && grep -q 'tls internal' <<<"$R0" && ok "with no certificate at all, the entry point is unchanged (local CA)" || bad "no-cert render" "$(grep -n 'tls \|digest' <<<"$R0")"
+case "$(ct "$CLI" cert status 2>&1)" in *"studio-2.net.example.test"*) ok "cert status names the configured domain" ;; *) bad "cert status" "$(ct "$CLI" cert status 2>&1)" ;; esac
+rm -rf "$CT"
+
+echo "── internal on: the fleet default — the private-network name, its certificate, sign-in, over the network only ──"
+IN="$(mktemp -d)"; mkdir -p "$IN/stubs" "$IN/home"
+cat > "$IN/stubs/tailscale" <<STUB
+#!/bin/bash
+echo "\$@" >> "$IN/ts.log"
+case "\$*" in *"status --json"*) printf '%s' '{"BackendState":"Running","Self":{"DNSName":"studio-2.net.example.test."}}' ;; esac
+exit 0
+STUB
+chmod +x "$IN/stubs/tailscale"
+cat > "$IN/stubs/kubectl" <<STUB
+#!/bin/bash
+echo "\$@" >> "$IN/k.log"
+case "\$*" in
+  *"configmap memex-portal-config"*"Microsoft__ClientId"*) printf '%s' "\${FAKE_CM_ID:-}" ;;
+  *"configmap memex-portal-config"*"EnableDevLogin"*) printf '%s' "\${FAKE_CM_DEV:-}" ;;
+  *"configmap memex-portal-config"*"InvitationOnly"*) printf '%s' "\${FAKE_CM_INV-true}" ;;
+  *"rollout status"*) exit "\${FAKE_ROLLOUT_RC:-0}" ;;
+esac
+exit 0
+STUB
+chmod +x "$IN/stubs/kubectl"
+inn() { env PATH="$IN/stubs:$STUBS:$PATH" HOME="$IN/home" MEMEX_LOCAL_HOME="$IN/home/.memex-local" "$@"; }
+IL="$IN/home/.memex-local/internal.yaml"
+OUT="$(printf '' | inn "$CLI" internal on --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "internal on refuses an empty secret" "exited 0" ;; *"empty or too short"*) ok "internal on refuses an EMPTY secret (a failed 'az … |' pipes nothing) and writes nothing" ;; *) bad "empty secret refusal" "$OUT" ;; esac
+[ ! -f "$IL" ] && ok "a refused internal on writes no layer" || bad "no layer on refusal" "$(cat "$IL")"
+OUT="$(printf 's3cret\n' | inn "$CLI" internal on --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "a too-short secret is refused" "exited 0" ;; *"too short"*) ok "a too-short secret is refused" ;; *) bad "short secret" "$OUT" ;; esac
+OUT="$(printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn "$CLI" internal on --tenant common --client-id c-1 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "a multi-directory tenant is refused" "exited 0" ;; *"a named directory"*) ok "a multi-directory tenant is refused" ;; *) bad "tenant refusal" "$OUT" ;; esac
+OUT="$(printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn "$CLI" internal on --tenant t-1 --client-id c-1 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "internal on writes the layer" || bad "internal on" "rc=$RC: $OUT"
+case "$OUT" in *abcdefghijklmnopqrstuvwxyz0123*) bad "internal on never prints the secret" "$OUT" ;; *) ok "internal on never prints the secret" ;; esac
+grep -q '^#Host: studio-2.net.example.test$' "$IL" && grep -q 'Authentication__Microsoft__ClientId: "c-1"' "$IL" && grep -q 'Authentication__Microsoft__TenantId: "t-1"' "$IL" \
+  && grep -q 'Features__Onboarding__InvitationOnly: "true"' "$IL" && [ "$(ls -l "$IL" | cut -c1-10)" = "-rw-------" ] \
+  && ok "the layer: the private-network name (read from tailscale), Microsoft sign-in, invitation-only, 0600" || bad "internal layer" "$(sed 's/ClientSecret: .*/ClientSecret: <redacted>/' "$IL")"
+grep -q 'Authentication__EnableDevLogin: "false"' "$IL" && ok "internal only turns the passwordless development sign-in OFF explicitly" || bad "dev login off" "$(grep -c DevLogin "$IL")"
+[ -s "$IN/k.log" ] && ! grep -v -- '^--context colima ' "$IN/k.log" | grep -q . \
+  && ok "every kubectl call of internal on is pinned to the LOCAL cluster (--context colima): a private key never lands in another context" || bad "kubectl context" "$(cat "$IN/k.log")"
+! grep -q -- 'serve --bg' "$IN/ts.log" && case "$OUT" in *"NOT opened yet"*) true ;; *) false ;; esac \
+  && ok "the private network is NOT opened while the running portal lacks the sign-in (no exposure before update)" || bad "serve before sign-in" "$(cat "$IN/ts.log")"
+printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn env FAKE_CM_ID=c-1 FAKE_CM_DEV=true "$CLI" internal on --tenant t-1 --client-id c-1 >/dev/null 2>&1
+! grep -q -- 'serve --bg' "$IN/ts.log" && ok "nor while the running portal still has the development sign-in on" || bad "serve with dev login" "$(cat "$IN/ts.log")"
+printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn env FAKE_CM_ID=c-1 FAKE_CM_DEV=false FAKE_CM_INV=false "$CLI" internal on --tenant t-1 --client-id c-1 >/dev/null 2>&1
+! grep -q -- 'serve --bg' "$IN/ts.log" && ok "nor while the running portal is not invitation-only" || bad "serve without invitation-only" "$(cat "$IN/ts.log")"
+printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn env FAKE_CM_ID=c-1 FAKE_CM_DEV=false FAKE_ROLLOUT_RC=1 "$CLI" internal on --tenant t-1 --client-id c-1 >/dev/null 2>&1
+! grep -q -- 'serve --bg' "$IN/ts.log" && ok "nor before the portal's rollout has completed (the configmap changes before the pods)" || bad "serve before rollout" "$(cat "$IN/ts.log")"
+printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn env FAKE_CM_ID=c-1 FAKE_CM_DEV=false "$CLI" internal on --tenant t-1 --client-id c-1 >/dev/null 2>&1
+grep -q -- 'serve --bg --tcp 443 tcp://127.0.0.1:8443' "$IN/ts.log" && ok "once the portal carries the sign-in, tailscale serve forwards TCP 443 to the loopback front door (TLS passthrough)" || bad "tailscale serve" "$(cat "$IN/ts.log")"
+grep -q 'internal_args=(--set-string "config.memex_portal.Authentication__EnableDevLogin=false"' "$CLI" && grep -q -- '--set-string "config.memex_portal.Features__Onboarding__InvitationOnly=true")' "$CLI" && grep -q '    -f "$OVERLAY" \\$' "$CLI" \
+  && awk '/-f "\$OVERLAY" \\$/{o=NR} /internal_args\[@\]\+/{i=NR} END{exit !(o && i==o+1)}' "$CLI" \
+  && ok "helm: dev sign-in forced off and invitation-only forced on AFTER the overlay (an overlay cannot undo either)" || bad "dev login after overlay" "order"
+case "$OUT" in *"https://studio-2.net.example.test/signin-microsoft"*"/auth/callback/Microsoft"*"/auth/ea/callback"*) ok "internal on names the three redirect URIs to register" ;; *) bad "redirect URIs" "$OUT" ;; esac
+grep -q 'mode_args+=(-f "$INTERNAL_FILE")' "$CLI" && ok "helm_deploy layers the internal-only file" || bad "helm layer" "missing"
+M="$(inn env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; internal_ingress_manifest studio-2.net.example.test "nginx.ingress.kubernetes.io/proxy-body-size: \"50m\""' "$CLI")"
+grep -q 'name: memex-portal-net$' <<<"$M" && grep -q 'secretName: memex-portal-net-tls' <<<"$M" && grep -q 'host: "studio-2.net.example.test"' <<<"$M" \
+  && grep -q 'service: { name: memex-portal-service, port: { number: 8080 } }' <<<"$M" && grep -q '    nginx.ingress.kubernetes.io/proxy-body-size: "50m"' <<<"$M" \
+  && ok "a SEPARATE Ingress for the name: its own TLS Secret, the portal's annotations, the portal service" || bad "internal ingress manifest" "$M"
+# The front door binds loopback only while internal-only (the network reaches it through tailscale serve).
+PFI="$HERE/../share/port-forward.sh"
+pfi=$(env MEMEX_LOCAL_HOME="$IN/home/.memex-local" MEMEX_HEADLESS=1 MEMEX_PORT=8443 bash -c '
+  colima() { return 0; }; kubectl() { case "$*" in *port-forward*) printf "%s\n" "$*" ;; *) return 0 ;; esac; }; export -f colima kubectl
+  sed "s#^\( *\)exec kubectl#\1kubectl#; s#^exec kubectl#kubectl#" "$1" | bash 2>/dev/null | grep port-forward | head -n 1' _ "$PFI" 2>/dev/null | grep -o -- '--address .*')
+[ "$pfi" = "--address 127.0.0.1,::1 8443:443" ] && ok "internal only: the front door binds loopback only" || bad "internal front door" "$pfi"
+inn "$CLI" internal off >/dev/null 2>&1
+[ ! -f "$IL" ] && grep -q -- 'serve --tcp 443 off' "$IN/ts.log" && ok "internal off removes the layer and the tailscale serve" || bad "internal off" "$(cat "$IN/ts.log")"
+rm -rf "$IN"
+
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
-for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel backlease llm relay autoupdate; do
+for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease fleet llm relay publish autoupdate; do
   case "$help_out" in
     *"$cmd"*) ;;
     *) bad "help documents '$cmd'" "not in the usage text"; continue ;;

@@ -209,6 +209,43 @@ This covers gaps G1 and G4 of the Mac host gap analysis. A headless host still n
 remaining gaps closed: a pull credential that is not a person's `az login`, Colima at boot, and a
 reachable hostname.
 
+## Join the fleet — one command (`memex-local fleet join`)
+
+A new Mac Studio joins the fleet with ONE command and ONE browser sign-in. The control instance does
+the rest (design: MeshWeaver.Plugins `Hosting/MacStudioFleet.md` §2b):
+
+```bash
+memex-local fleet join --control https://<control-instance> --id studio-2
+```
+
+1. The command runs preflight and reads the macOS account (it never assumes one).
+2. It makes a throw-away RSA-3072 key under `~/.memex-local/enrol/` (0600), prints the key's
+   **fingerprint**, and opens the control instance's approval page `Hosting/Heartbeats/Enrol/<request>`.
+3. A global administrator of the control instance checks that the page shows the same fingerprint and
+   presses **Approve**. The page shows an **enrolment code**: the machine's heartbeat key and
+   announcement key, sealed to this Mac's throw-away key (RSA-OAEP-SHA256). The code is ciphertext,
+   so it is safe to copy.
+4. Paste the code into the terminal. The command opens it with macOS's own `openssl`, deletes the
+   throw-away key and writes `~/.memex-local/fleet.yaml` (0600). It never prints a key value, only the
+   `sha256:` fingerprints, which the control instance's enrolment record shows too.
+5. It runs `backlease enroll`, starts Ollama under launchd (`com.memex.local.ollama`, bound to every
+   interface so the VM reaches it, restarted after a reboot), and runs `update`. In registry mode,
+   `update` pulls the **public GHCR** images anonymously, so no `az login` is needed (`--from-acr`
+   still works).
+
+`memex-local fleet status` shows the join and both fingerprints.
+
+**A fleet Mac's template carries the Hosting app.** In registry mode, a joined (`fleet join`) or
+back-leased (`backlease enroll`) Mac layers `share/values.local.fleet-host.yaml`. That layer names
+`Plugins/Hosting` in `PluginCatalog:InstallByDefault` and keeps the platform baseline with
+`InstallPreInstalledPackages=true`. The Mac's first instance therefore installs Hosting by itself; the
+heartbeat and the self-update patcher both ship in Hosting. `MEMEX_FLEET_HOST=0` opts out. Inside the
+autoupdate agent, a registry-mode re-apply also pulls the public GHCR image (`MEMEX_AUTOUPDATE_IMAGE=0`
+opts out). A template that needs a newer platform, such as a package's `minMeshVersion`, therefore lands
+with no hand on the machine. What the registry serves the instance is still its plan's decision.
+ On the control instance,
+`Hosting/Heartbeats/Enrolments` lists every join with the first step not yet measured done.
+
 ## Auto-update of the CLI and its chart — on by default
 
 A Homebrew install keeps **itself** current: `memex-local up` and `memex-local update` arm a
@@ -381,3 +418,69 @@ Cannot be run in this environment — verify on a real Apple-Silicon Mac:
 - The local-build image path (`dotnet publish -t:PublishContainer`) and/or the
   ACR pull (`az acr login`).
 - The end-to-end `curl https://memex.localhost:8443/` returning `http=200`.
+
+## Publishing a Mac on the private network
+
+`memex-local publish on --sign-in microsoft --tenant <directory id> --client-id <id> < secret-file`
+makes the portal also answer at the Mac's **own name on the private network** — the MagicDNS name
+`tailscale status --json` reports as `.Self.DNSName` (e.g. `mac-1.<tailnet suffix>`), read by the
+command and never typed. A member device on the network opens `https://<that name>` and reaches the Mac
+directly: nothing public is involved and no bridge is needed. This is the default; `--tailnet-only` says
+it explicitly. Without tailscale, or with tailscale not connected, there is no such name and a tailnet-only
+publish refuses, saying why.
+
+It writes `~/.memex-local/publish.yaml` (0600): the name as an additional ingress host (the portal's
+links keep `memex.localhost`), the Microsoft sign-in (a NAMED directory only), and invitation-only
+admission — the first person to sign in becomes the administrator, everyone after needs an invitation.
+The client secret is read from STDIN, never an argument, and never printed. The portal treats the tailnet
+name like any non-local host, so the real provider signs people in there; the development sign-in answers
+on localhost names only, and never for a request the entry point marked (Google, Apple and LinkedIn are a
+follow-up: the chart carries no client secret for them yet). `publish status` reads it back;
+`publish off` removes it; `memex-local update` applies either.
+
+While the layer exists the front door (`share/port-forward.sh`) binds **loopback only, on the
+unprivileged port alone** (macOS allows an unprivileged low-port bind on wildcard addresses only), so
+locally the portal is `https://memex.localhost:<port>` (default 8443). The private network gets its
+OWN entry point (`share/network-entry.yaml`, a small in-cluster Caddy behind its own loopback forward on
+8446): `tailscale serve --tcp 443 tcp://127.0.0.1:8446` is the one way in, and the proxy has one site per
+published name, each marking EVERY request `X-MeshWeaver-Provenance: tailnet` (overwriting whatever the
+sender claimed) — there is no unmarked site, and a name the Mac does not publish gets no answer. The
+network policy must let no member reach 8443, 8444 (the e2e portal) or 8446 (a user-space network client
+delivers to loopback-bound ports too): TCP 443 is the one way in.
+
+### What a member device needs
+
+1. **Join the private network** (MeshWeaver.Deploy `deploy/headscale/README.md`) with MagicDNS on, so the
+   Mac's name resolves.
+2. **Trust the entry point's CA.** The entry point serves `tls internal`: a certificate from its own
+   local CA, which no browser and no WKWebView trusts until the device does. On the published Mac, after
+   `memex-local update`:
+
+   ```bash
+   memex-local publish ca > memex-entry-ca.crt
+   ```
+
+   prints the root certificate (PEM). It lives on the entry point's data volume, so a pod restart or a
+   re-publish keeps the same root and a device trusts it once; `publish off` keeps it too
+   (`kubectl -n memex delete pvc memex-network-entry-data` forgets it). Install it on the device:
+   - **macOS**: `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain memex-entry-ca.crt`
+     (or open it in Keychain Access and set *When using this certificate: Always Trust*).
+   - **iOS / iPadOS**: AirDrop or mail the file, install the profile (Settings → *Profile Downloaded*),
+     then turn it on under Settings → General → About → *Certificate Trust Settings*. Safari and the apps'
+     WKWebView use that trust store.
+   - **Windows / Linux**: import it as a trusted root (`certutil -addstore Root`, or
+     `/usr/local/share/ca-certificates/` + `update-ca-certificates`), and in Firefox under its own
+     certificate settings.
+3. **Register the sign-in redirect URI for the tailnet name** on the provider's app registration —
+   for Microsoft `https://<tailnet name>/signin-microsoft` (`publish on` prints the exact URI for every
+   name). Without it the provider refuses the sign-in with a redirect-URI mismatch. The command changes
+   no app registration itself.
+
+### Also at a public name (optional)
+
+`memex-local publish on --host <name> --sign-in microsoft …` ADDS a public name the private network's
+ingress bridge (`deploy/tailnet-bridge/`) forwards to the same port 443 with `Host` = the public name. The
+tailnet name is still published beside it when tailscale reports one (without one the public name is
+published alone, and the command says so); each name gets its own marked site and needs its own redirect
+URI. A public name is never the default.
+
