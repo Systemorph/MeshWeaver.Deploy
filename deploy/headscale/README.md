@@ -117,6 +117,42 @@ Never `helm install` by hand. An estate vendors this chart byte-identical into i
 repository, writes its overlay (host, ingress class and issuer, OIDC issuer/client/allow-list, Key Vault
 names) and applies it with the governed `ApplyChart` InstanceAction from a `Hosting/ChartRelease` record.
 
+## Keys for servers — minted by a governed action, never by hand
+
+A person's machine joins with their own sign-in. A SERVER (a pod, a headless Mac) joins with a PRE-AUTH
+KEY. Two paths exist, for two shapes of consumer:
+
+- **Declared pre-auth keys** (above): a long-lived, renewed, often reusable key in a Kubernetes Secret in
+  the headscale namespace — for a consumer that re-joins as a fresh node on every restart (the ingress bridge).
+- **A minted one-time key** (this section): a SINGLE-USE, tagged key stored in Key Vault and mounted by the
+  consumer through the Secrets Store CSI driver as a FILE — for a consumer that keeps its node identity on its
+  own volume and must never see a Kubernetes Secret (the estate's Grafana node). It is minted by the operator verb `deploy/hosting-operator/bin/hosting-tailnet-key`
+— run by the approved secret-write action on the control instance (MeshWeaver.Plugins
+`Hosting/AksOperationsViaActions.md` → "A tailnet key"), never by a person with `kubectl exec`:
+
+```
+hosting-tailnet-key --namespace <ns> --release <headscale release> --vault <vault> --object <vault object>
+                    --tags tag:<a>[,tag:<b>] --expiration <N>m|<N>h
+```
+
+1. It finds the ONE running pod of the release and reads the policy that pod RUNS (the ConfigMap its
+   `config` volume mounts). **Every requested tag must be declared in `tagOwners`** — Headscale itself mints a
+   key for ANY tag (measured on 0.29.7: `preauthkeys create --tags tag:undeclared` answers 0 with a key), so
+   this check is the only thing that keeps an approval from minting a tag the reviewed policy never named.
+2. It runs `headscale preauthkeys create --tags … --expiration … -o json` inside that pod (the binary
+   directly; the image is distroless). Never `--reusable`, never `--ephemeral`, never untagged — and the
+   answer is refused unless it reads back single-use, non-ephemeral, with exactly the requested tags.
+3. It writes the key into Key Vault through a mode-600 `--file`, tagged with metadata only (`mw-source=
+   tailnet-key`, `mw-tags`, `mw-expires`, `mw-key-id`, `mw-fp`, `mw-set-by`, `mw-set-at`), and confirms the
+   version by a metadata read. A key the vault does not take is EXPIRED in Headscale before the step fails.
+4. The key is never printed, never on an argv, never in a `::hosting::` fact; what crosses back is its id,
+   tags, expiry and a sha256 fingerprint.
+
+The expiration is bounded to **10 minutes – 24 hours**: the key's one consumer is the server's next start,
+and a single-use key that outlives that window is a standing credential in the vault for nothing. The server
+keeps its identity on its own volume afterwards. It runs on the operations lane with that lane's cluster
+credential; the in-cluster operator ServiceAccount holds no `pods/exec` and is not widened for it.
+
 ## Joining a machine
 
 - **macOS:** `brew install --cask tailscale` (the app, with its network extension) or
