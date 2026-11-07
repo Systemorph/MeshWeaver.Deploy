@@ -139,6 +139,22 @@ readonly BACKLEASE_FILE="$LOCAL_HOME/backlease.yaml"
 # residency declared (a model whose residency is Unknown is never used for mail triage), and the
 # utility tier mapped to it (the tier the inbox triage, reply drafting and calendar suggestions ask).
 readonly LLM_FILE="$LOCAL_HOME/llm.yaml"
+# ── FLEET JOIN — this Mac joins the fleet in one command (MeshWeaver.Plugins Hosting/MacStudioFleet §2b) ──
+# Written by `memex-local fleet join` from the enrolment code a control-instance global admin issued: the
+# machine's heartbeat key and its announcement key (secrets.memex_portal, 0600) and the control inbox URL.
+# One values layer after back-lease and before the overlay (an overlay value still wins). The throw-away
+# RSA key the code is sealed to lives under $FLEET_DIR only until the code is opened.
+readonly FLEET_FILE="$LOCAL_HOME/fleet.yaml"
+readonly FLEET_DIR="$LOCAL_HOME/enrol"
+readonly FLEET_CODE_PREFIX="mwenrol1."
+# The host's Ollama under launchd (survives a reboot), bound to every interface so the Colima VM reaches
+# it by the gateway IP — the nohup'd `ollama serve` did not survive a reboot (MacStudioFleet §2b gap 9).
+readonly OLLAMA_PLIST_LABEL="com.memex.local.ollama"
+readonly OLLAMA_PLIST_DST="$HOME/Library/LaunchAgents/${OLLAMA_PLIST_LABEL}.plist"
+# The public, multi-arch GHCR images registry mode pulls ANONYMOUSLY — the registry the in-pod
+# self-updater follows (values.local.registry-mode.yaml). No `az login` (gap 5).
+readonly GHCR="ghcr.io/systemorph"
+readonly GHCR_DEFAULT_TAG="latest"
 readonly BACKLEASE_DIR="$LOCAL_HOME/backlease"
 readonly BACKLEASE_SAMPLER="$LOCAL_HOME/backlease-sampler.sh"
 readonly BACKLEASE_PLIST_LABEL="com.memex.local.backlease"
@@ -692,6 +708,181 @@ cmd_backlease() {
 }
 
 
+# ---------------------------------------------------------------------------
+# §19 — FLEET JOIN: one command, the control instance does the rest (MeshWeaver.Plugins Hosting/MacStudioFleet §2b)
+# ---------------------------------------------------------------------------
+# `fleet join --control <url> --id <id>`: preflight; a throw-away RSA-3072 key; the link to the control
+# instance's approval page (Hosting/Heartbeats/Enrol/<request>) with the key's fingerprint to compare;
+# the enrolment code a global admin's Approve shows, opened with the key (RSA-OAEP-SHA256 — macOS's own
+# LibreSSL does it); the fleet layer with the two keys; back-lease, Ollama, and `update`. No secret value
+# is ever printed: the CLI prints FINGERPRINTS (sha256:<12 hex>, the control instance's own format).
+fleet_value() { awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$FLEET_FILE" 2>/dev/null; }
+
+# A fact for the request: printable, at most 96 characters, of the shape the control instance admits.
+fleet_fact() { printf '%s' "$1" | LC_ALL=C tr -cd 'A-Za-z0-9 ._@()+-' | cut -c1-96; }
+
+# The hardware id: the serial number, else the platform UUID.
+fleet_machine_id() {
+  local id
+  id="$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformSerialNumber/ { print $4; exit }')"
+  [ -n "$id" ] || id="$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformUUID/ { print $4; exit }')"
+  fleet_fact "${id:-unknown}"
+}
+
+# The key fingerprint as the control instance shows it: first 32 hex digits of SHA-256 over the DER key, in fours.
+fleet_key_fingerprint() {
+  openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | shasum -a 256 | cut -c1-32 | sed -e 's/..../& /g' -e 's/ $//'
+}
+
+# A value's fingerprint in the control instance's format (SecretFingerprint.Of): sha256:<first 12 hex>.
+fleet_value_fingerprint() { printf 'sha256:%s' "$(printf '%s' "$1" | shasum -a 256 | cut -c1-12)"; }
+
+# base64url without padding, of stdin.
+fleet_b64url() { base64 | tr -d '\n=' | tr '+/' '-_'; }
+
+# The request the control instance's Enrol page parses (MachineEnrolment.Parse): v1 JSON, base64url.
+fleet_request() {
+  local id="$1" host="$2" user="$3" machine="$4" spki="$5"
+  printf '{"v":1,"deployment":"%s","host":"%s","user":"%s","machine":"%s","key":"%s"}' \
+    "$id" "$host" "$user" "$machine" "$spki" | fleet_b64url
+}
+
+# Opens an enrolment code with the throw-away key into a 0600 JSON file. Fails closed, naming why.
+fleet_open_code() {
+  local code="$1" key="$2" out="$3" ct
+  case "$code" in "$FLEET_CODE_PREFIX"*) ;; *) die "that is not an enrolment code (it starts with '$FLEET_CODE_PREFIX') — copy it from the control instance's page" ;; esac
+  ct="$(mktemp "$FLEET_DIR/code.XXXXXX")"
+  printf '%s' "${code#"$FLEET_CODE_PREFIX"}" | base64 -D > "$ct" 2>/dev/null || { rm -f "$ct"; die "the enrolment code is not base64 — copy all of it"; }
+  ( umask 077
+    openssl pkeyutl -decrypt -inkey "$key" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+      -pkeyopt rsa_mgf1_md:sha256 -in "$ct" -out "$out" 2>/dev/null ) \
+    || { rm -f "$ct" "$out"; die "the enrolment code does not open with this Mac's key — it was issued for another join; approve THIS link again"; }
+  rm -f "$ct"
+}
+
+# One member of the opened payload ({"v":1,"d":…,"m":…,"c":…}), via macOS's plutil (no jq/python needed).
+fleet_payload() { plutil -extract "$1" raw -o - "$2" 2>/dev/null; }
+
+write_fleet_file() {
+  local control="$1" id="$2" report="$3" announce="$4"
+  mkdir -p "$LOCAL_HOME"
+  ( umask 077; cat > "$FLEET_FILE" ) <<YAML
+# memex-local FLEET — managed by \`memex-local fleet join\` (MeshWeaver.Plugins Hosting/MacStudioFleet §2b).
+# The two keys below were issued by the control instance (${control}) when a global administrator approved
+# this Mac, and reached it only sealed to a key this Mac held. Never copy them anywhere; re-run
+# \`fleet join\` to rotate. Layered by helm_deploy after back-lease and before the overlay.
+config:
+  memex_portal:
+    Hosting__Deployment: "${id}"
+    Hosting__ControlInbox__Url: "${control}/api/hooks/Hosting/PlatformBuilds"
+secrets:
+  memex_portal:
+    Hosting__ModuleReportSecret: "${report}"
+    Hosting__ControlInbox__Secret: "${announce}"
+YAML
+  chmod 600 "$FLEET_FILE"
+}
+
+cmd_fleet() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    join)
+      local control="" id="" open_link="yes" code_file="" do_update="yes"
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --control)   shift; control="${1:?--control needs the control instance URL}" ;;
+          --id)        shift; id="${1:?--id needs the deployment id}" ;;
+          --no-open)   open_link="no" ;;
+          --code-file) shift; code_file="${1:?--code-file needs a path}" ;;
+          --no-update) do_update="no" ;;
+          *) die "fleet join: unknown flag '$1'" ;;
+        esac
+        shift
+      done
+      [ -n "$control" ] || control="$(managed_pref ControlUrl)"
+      [ -n "$id" ]      || id="$(managed_pref DeploymentId)"
+      control="${control%/}"
+      case "$control" in https://*) ;; *) die "fleet join: --control must be the control instance's https URL (got '${control:-<none>}')" ;; esac
+      printf '%s' "$id" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$' \
+        || die "fleet join: --id must be lower-case letters, digits and dashes (at most 63), starting and ending with a letter or digit — it becomes Deployments/<id> on control"
+      need openssl openssl; need plutil plutil; need shasum shasum
+
+      step "Preflight (MacStudioFleet §2b step 1)"
+      local user host machine t missing=""
+      user="$(id -un)"; host="$(fleet_fact "$(scutil --get LocalHostName 2>/dev/null || hostname -s)")"; machine="$(fleet_machine_id)"
+      info "macOS account: $user · host: $host · hardware id: $machine"
+      for t in colima docker kubectl helm ollama tailscale; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+      [ -z "$missing" ] || warn "missing:$missing — 'brew install$missing' (tailscale joins the private network; the rest run the stack)"
+
+      step "A throw-away key for this join (step 2)"
+      mkdir -p "$FLEET_DIR"; chmod 700 "$FLEET_DIR"
+      local key="$FLEET_DIR/$id.key.pem"
+      [ -f "$key" ] || ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$key" 2>/dev/null ) \
+        || die "could not generate the throw-away key"
+      local spki fp url
+      spki="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | base64 | tr -d '\n')"
+      fp="$(fleet_key_fingerprint "$key")"
+      url="$control/Hosting/Heartbeats/Enrol/$(fleet_request "$id" "$host" "$(fleet_fact "$user")" "$machine" "$spki")"
+      ok "key fingerprint: $fp"
+      info "Open this link, sign in as a global administrator of the control instance, CHECK that the page"
+      info "shows the fingerprint above, and press 'Approve and issue the keys':"
+      printf '\n%s\n\n' "$url"
+      [ "$open_link" = "yes" ] && command -v open >/dev/null 2>&1 && open "$url" >/dev/null 2>&1 || true
+
+      local code=""
+      if [ -n "$code_file" ]; then
+        code="$(tr -d ' \n\r' < "$code_file")"
+      else
+        printf 'Paste the enrolment code the page shows, then press Enter:\n> '
+        IFS= read -r code
+        code="$(printf '%s' "$code" | tr -d ' \r')"
+      fi
+      local payload="$FLEET_DIR/$id.payload.json"
+      fleet_open_code "$code" "$key" "$payload"
+      local d m c
+      d="$(fleet_payload d "$payload")"; m="$(fleet_payload m "$payload")"; c="$(fleet_payload c "$payload")"
+      rm -f "$payload"
+      [ "$d" = "$id" ] || die "the code was issued for '$d', not '$id' — approve the link this run printed"
+      [ -n "$m" ] && [ -n "$c" ] || die "the code opened but carries no keys — approve the link again"
+      write_fleet_file "$control" "$id" "$m" "$c"
+      rm -f "$key"
+      ok "joined as '$id' — heartbeat key $(fleet_value_fingerprint "$m"), announcement key $(fleet_value_fingerprint "$c") (the control instance's enrolment record shows the same fingerprints)"
+
+      step "Back-lease, local models and the image (steps 5)"
+      if registry_mode; then
+        cmd_backlease enroll --control "$control" --deployment "$id"
+      else
+        warn "not in REGISTRY MODE — run 'memex-local registry <url>' and then 'memex-local backlease enroll --control $control --deployment $id'"
+      fi
+      if command -v tailscale >/dev/null 2>&1 && ! tailscale status >/dev/null 2>&1; then
+        info "Private network: 'tailscale up --login-server <the network's login server>' (one browser sign-in until control mints pre-auth keys — MacStudioFleet §2b gap 2)"
+      fi
+      if [ "$do_update" = "yes" ] && colima_running; then
+        setup_ollama
+        cmd_update
+      else
+        info "Apply it: memex-local update"
+      fi
+      info "Progress: the control instance's Hosting/Heartbeats/Enrolments lists this join and its first heartbeat"
+      ;;
+    status)
+      [ $# -eq 0 ] || die "fleet status: unknown flag '$1'"
+      if [ -f "$FLEET_FILE" ]; then
+        local m c
+        m="$(awk '$1 == "Hosting__ModuleReportSecret:" { gsub(/"/, "", $2); print $2; exit }' "$FLEET_FILE")"
+        c="$(awk '$1 == "Hosting__ControlInbox__Secret:" { gsub(/"/, "", $2); print $2; exit }' "$FLEET_FILE")"
+        ok "JOINED as '$(fleet_value Hosting__Deployment)' — control inbox $(fleet_value Hosting__ControlInbox__Url)"
+        info "heartbeat key:    $(fleet_value_fingerprint "$m")"
+        info "announcement key: $(fleet_value_fingerprint "$c")"
+        cmd_backlease status
+      else
+        info "not joined — memex-local fleet join --control https://<control-instance> --id <id>"
+      fi
+      ;;
+    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] | status}" ;;
+  esac
+}
+
 llm_value() { awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$LLM_FILE" 2>/dev/null; }
 
 # The Colima VM's gateway to the host: where the Mac's own services answer (Ollama on :11434).
@@ -1046,6 +1237,24 @@ so the tag was lost between then and now (a prune, a competing build, or a tag o
 another flow). Re-run the image step; do NOT roll."
 }
 
+# The PUBLIC GHCR images, pulled anonymously (MacStudioFleet §2b gap 5) — what registry mode runs and what
+# the in-pod self-updater follows. No credential is sent; a pull that fails names the tag, never `az login`.
+image_pull_ghcr() {
+  local tag="${1:-$GHCR_DEFAULT_TAG}"
+  need docker docker
+  step "Pulling multi-arch images from the public $GHCR (tag=$tag, anonymous — no Azure sign-in needed)"
+  local img
+  for img in memex-portal-ai memex-migration; do
+    docker pull --platform linux/arm64 "$GHCR/$img:$tag" \
+      || die "cannot pull $GHCR/$img:$tag — the tag may not exist (public tags: latest, 3.0.0-ci.<n>); no credential is involved"
+  done
+  docker tag "$GHCR/memex-portal-ai:$tag" "$PORTAL_IMAGE"
+  docker tag "$GHCR/memex-migration:$tag" "$MIGRATION_IMAGE"
+  ok "Pulled $GHCR images onto $PORTAL_IMAGE / $MIGRATION_IMAGE"
+  verify_image_resolvable "$PORTAL_IMAGE"
+  verify_image_resolvable "$MIGRATION_IMAGE"
+}
+
 image_pull_acr() {                                     # §3 Option A
   local tag="${1:-$ACR_DEFAULT_TAG}" channel="${2:-}"
   need docker docker
@@ -1195,6 +1404,12 @@ helm_deploy() {
     mode_args+=(-f "$BACKLEASE_FILE")
     info "BACK-LEASE: this Mac reports to $(backlease_control) as '$(backlease_deployment)' and heartbeats every $(backlease_interval)s"
   fi
+  # FLEET layer (`memex-local fleet join`): the machine's own heartbeat + announcement keys and the
+  # control inbox URL — after back-lease, before the user's overlay, so an overlay value still wins.
+  if [ -f "$FLEET_FILE" ]; then
+    mode_args+=(-f "$FLEET_FILE")
+    info "FLEET: joined as '$(fleet_value Hosting__Deployment)' — keys from the enrolment code (never printed)"
+  fi
   # LOCAL MODEL layer (`memex-local llm use`): the host's Ollama is the portal's utility-tier model.
   if [ -f "$LLM_FILE" ]; then
     mode_args+=(-f "$LLM_FILE")
@@ -1298,11 +1513,35 @@ apply_logging() {
 # ---------------------------------------------------------------------------
 # §10 — host-native Ollama wired into the cluster by name (ollama:11434)
 # ---------------------------------------------------------------------------
+# A launchd login agent running `ollama serve` with OLLAMA_HOST=0.0.0.0:11434: it starts at login and
+# restarts on exit, which the nohup'd process it replaces never did (a rebooted Mac had no model).
+install_ollama_agent() {
+  local bin; bin="$(command -v ollama)" || die "ollama is not on PATH — brew install ollama"
+  mkdir -p "$HOME/Library/LaunchAgents" "$LOCAL_HOME"
+  cat > "$OLLAMA_PLIST_DST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${OLLAMA_PLIST_LABEL}</string>
+  <key>ProgramArguments</key><array><string>${bin}</string><string>serve</string></array>
+  <key>EnvironmentVariables</key><dict><key>OLLAMA_HOST</key><string>0.0.0.0:11434</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${LOCAL_HOME}/ollama.log</string>
+  <key>StandardErrorPath</key><string>${LOCAL_HOME}/ollama.log</string>
+</dict>
+</plist>
+PLIST
+  launchctl bootout "gui/$(id -u)" "$OLLAMA_PLIST_DST" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$OLLAMA_PLIST_DST"
+}
+
 setup_ollama() {
   step "Wiring host-native Ollama (Metal GPU) — model ${OLLAMA_MODEL} as qwen3.6-code (§10)"
   if ! curl -fsS "http://127.0.0.1:11434/api/version" >/dev/null 2>&1; then
-    info "Starting 'ollama serve' bound to 0.0.0.0:11434 (so the VM can reach it)"
-    OLLAMA_HOST=0.0.0.0:11434 nohup ollama serve >"$LOCAL_HOME/ollama.log" 2>&1 &
+    info "Starting 'ollama serve' under launchd ($OLLAMA_PLIST_LABEL), bound to 0.0.0.0:11434 so the VM can reach it"
+    install_ollama_agent
     # Wait on readiness rather than a fixed sleep.
     local i=0
     until curl -fsS "http://127.0.0.1:11434/api/version" >/dev/null 2>&1; do
@@ -2533,12 +2772,15 @@ cmd_up() {
   # Registry mode runs the CI-built image — the whole point is consuming what the registry bakes
   # against — so ACR is the default there; a source build stays one flag away (--build).
   local image_source="build" acr_tag="$ACR_DEFAULT_TAG" with_obs="no" rebuild_base="" channel="$CHANNEL" verdict
-  registry_mode && image_source="acr"
+  # Registry mode runs the CI-built image from the PUBLIC GHCR, anonymously (MacStudioFleet §2b gap 5):
+  # a fleet Mac updates without Azure credentials. ACR stays one flag away (--from-acr, --channel).
+  registry_mode && image_source="ghcr"
   [ -n "$channel" ] && image_source="acr"
   while [ $# -gt 0 ]; do
     case "$1" in
       --channel) shift; channel="${1:?--channel needs a label, e.g. 3-latest}"; image_source="acr" ;;
       --from-acr) image_source="acr" ;;
+      --from-ghcr) image_source="ghcr" ;;
       --build)    image_source="build" ;;
       --skip-image) image_source="skip" ;;
       --tag) shift; acr_tag="${1:?--tag needs a value}"; channel="" ;;
@@ -2556,6 +2798,7 @@ cmd_up() {
   case "$image_source" in                        # §3
     build) image_build_local "$rebuild_base"; portal_next_build_local ;;   # portal + migration, then the /next React GUI
     acr)   image_pull_acr "$acr_tag" "$channel" ;;
+    ghcr)  image_pull_ghcr "$( [ "$acr_tag" = "$ACR_DEFAULT_TAG" ] && echo "$GHCR_DEFAULT_TAG" || echo "$acr_tag")" ;;
     skip)  info "Skipping image step (--skip-image); relying on IfNotPresent/cache" ;;
   esac
 
@@ -2809,12 +3052,13 @@ cmd_logs() {
 
 cmd_update() {
   local image_source="build" acr_tag="$ACR_DEFAULT_TAG" rebuild_base="" channel="$CHANNEL" verdict
-  registry_mode && image_source="acr"              # §17 — same default as `up`
+  registry_mode && image_source="ghcr"             # §17 — same default as `up`: the public GHCR, anonymously
   [ -n "$channel" ] && image_source="acr"
   while [ $# -gt 0 ]; do
     case "$1" in
       --channel) shift; channel="${1:?--channel needs a label, e.g. 3-latest}"; image_source="acr" ;;
       --from-acr|--acr) image_source="acr" ;;
+      --from-ghcr) image_source="ghcr" ;;
       --build) image_source="build" ;;
       # Force a rebuild of the portal-ai BASE (the Node + Claude Code + Copilot layer). It is cached
       # by image presence, so a changed deploy/base-images/portal-ai/Dockerfile is otherwise never
@@ -2839,6 +3083,7 @@ cmd_update() {
   case "$image_source" in
     build) image_build_local "$rebuild_base"; portal_next_build_local ;;   # §3 Option B — portal + migration, then the /next React GUI
     acr)   image_pull_acr "$acr_tag" "$channel" ;;   # §3 Option A — retags onto the chart's image names
+    ghcr)  image_pull_ghcr "$( [ "$acr_tag" = "$ACR_DEFAULT_TAG" ] && echo "$GHCR_DEFAULT_TAG" || echo "$acr_tag")" ;;
     skip)  info "reusing the images already in Colima's store — config re-apply only" ;;
   esac
 
@@ -3016,8 +3261,8 @@ USAGE:
 COMMANDS:
   up [--build|--from-acr|--skip-image] [--tag T] [--with-observability] [--rebuild-base]
                   Bring the whole stack up (idempotent). Default image source:
-                  --from-acr in registry mode (the CI-built multi-arch image, native
-                  arm64 member), --build otherwise (Option B, source → Colima's
+                  --from-ghcr in registry mode (the public CI-built multi-arch image,
+                  pulled anonymously — no Azure sign-in; --from-acr still works), --build otherwise (Option B, source → Colima's
                   Docker store — the no-cloud-creds path).
   registry <url> [--key mwr_…] [--id ID] | status | off
                   REGISTRY MODE (§17): make this install a CONSUMER of a remote plugin
@@ -3034,6 +3279,14 @@ COMMANDS:
   llm use [--model qwen3.6] [--residency Eu|Global] | status | off
                   LOCAL MODEL: the Mac own Ollama serves the portal utility tier (inbox
                   triage, reply drafts, calendar suggestions). Addressed by IP; apply with update.
+  fleet join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] | status
+                  JOIN THIS MAC TO THE FLEET in one command (MeshWeaver.Plugins Hosting/MacStudioFleet
+                  §2b): prints a link to the control instance's approval page with this Mac's key
+                  fingerprint; a global administrator approves it there and the page shows an
+                  enrolment code sealed to this Mac's throw-away key; paste it here. Then writes
+                  ~/.memex-local/fleet.yaml (the heartbeat and announcement keys, 0600 — never
+                  printed, only their sha256 fingerprints), runs backlease enroll, starts Ollama
+                  under launchd, and updates from the public GHCR. 'status' shows the fingerprints.
   backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] | status | off
   relay pair --instance <https url> --owner <user id> --binary <dir|file> | status | off [--forget]
                   DEVICE RELAY (Hosting/DeviceRelay): let a cloud instance's inbox read the
@@ -3598,6 +3851,7 @@ main() {
     update)        cmd_update "$@" ;;
     registry)      cmd_registry "$@" ;;
     backlease)     cmd_backlease "$@" ;;
+    fleet)         cmd_fleet "$@" ;;
     llm)           cmd_llm "$@" ;;
     relay)         cmd_relay "$@" ;;
     verify)        cmd_verify "$@" ;;
