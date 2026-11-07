@@ -1284,7 +1284,7 @@ grep -q '^    - "mac-1.example.com"$' "$LAYER" && grep -q 'Authentication__Micro
   && grep -q 'Authentication__Microsoft__TenantId: "t-1"' "$LAYER" && grep -q 'Features__Onboarding__InvitationOnly: "true"' "$LAYER" \
   && grep -q 'Authentication__Microsoft__ClientSecret: "s3cret-value"' "$LAYER" \
   && ok "the layer: additional host, provider + tenant, invitation-only, the secret" || bad "the layer's content" "$(sed 's/ClientSecret: .*/ClientSecret: <redacted>/' "$LAYER")"
-grep -q -- 'serve --bg --tcp 443 tcp://127.0.0.1:8443' "$PB/ts.log" && ok "publish on points tailscale serve at the loopback front door's port" || bad "tailscale serve" "$(cat "$PB/ts.log" 2>/dev/null)"
+grep -q -- 'serve --bg --tcp 443 tcp://127.0.0.1:8444' "$PB/ts.log" && ok "publish on serves the network the ENTRY POINT's port only (not the front door)" || bad "tailscale serve" "$(cat "$PB/ts.log" 2>/dev/null)"
 case "$(pb "$CLI" publish status 2>&1)" in *"https://mac-1.example.com, sign-in: Microsoft (tenant t-1), admission: invitation-only"*) ok "publish status reads the layer back" ;; *) bad "publish status" "$(pb "$CLI" publish status 2>&1)" ;; esac
 # The front door: loopback only while published, every interface otherwise (kubectl is the suite's stub).
 PF="$HERE/../share/port-forward.sh"
@@ -1292,6 +1292,10 @@ pfaddr() { env PATH="$PB/stubs:$STUBS:$PATH" MEMEX_LOCAL_HOME="$PB/home/.memex-l
   colima() { return 0; }; kubectl() { case "$*" in *port-forward*) printf "%s\n" "$*" ;; *) return 0 ;; esac; }; export -f colima kubectl
   sed "s#^\( *\)exec kubectl#\1kubectl#; s#^exec kubectl#kubectl#" "$1" | bash | grep -m1 port-forward' _ "$PF" 2>/dev/null | grep -o -- '--address .*'; }
 [ "$(pfaddr)" = "--address 127.0.0.1,::1 8443:443" ] && ok "published: the front door binds loopback only, on the unprivileged port alone" || bad "published front door" "$(pfaddr)"
+E="$PB/home/.memex-local/network-entry.yaml"
+grep -q 'header_up X-MeshWeaver-Provenance tailnet' "$E" && grep -q 'https://mac-1.example.com:8443 {' "$E" && ! grep -q '__HOST__' "$E" \
+  && ok "the entry point marks every request and serves the public name only" || bad "network entry manifest" "$(head -40 "$E" 2>/dev/null)"
+grep -q 'svc/memex-network-entry' "$PF" && grep -q -- '"${entry_port}:8443"' "$PF" && ok "published: the entry point has its own loopback forward" || bad "entry forward" "missing in port-forward.sh"
 grep -q '<key>MEMEX_LOCAL_HOME</key>' "$HERE/../share/com.memex.local.plist" && grep -q -- '-e "s|__LOCAL_HOME__|${LOCAL_HOME}|g"' "$CLI" \
   && ok "the LaunchAgent carries the state directory the forward reads publish.yaml from" || bad "MEMEX_LOCAL_HOME reaches the LaunchAgent" "plist or sed missing"
 pb "$CLI" publish off >/dev/null 2>&1

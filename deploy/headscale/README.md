@@ -44,7 +44,7 @@ preauthKeys:
   enabled: true
   image: { repository: <registry>/headscale-keys }   # tag defaults to image.tag (same commit)
   keys:
-    - { name: tailnet-bridge, user: tailnet-bridge, reusable: true, ephemeral: true, validHours: 720, renewHours: 168 }
+    - { name: tailnet-bridge, user: tailnet-bridge, reusable: true, ephemeral: true, validHours: 720, renewHours: 168, tags: ["tag:bridge"] }
 ```
 
 ```mermaid
@@ -80,6 +80,8 @@ sequenceDiagram
   write as the new key (`pending-expire`) and retried every pass until headscale confirms it no longer
   accepts it; a key whose Secret write was refused is expired immediately (retried for the life of the
   process if that fails). Every such failure fails the pass and is logged.
+- `tags` makes the key a TAGGED key (the machine is addressed by tag in the policy, not as a member of its
+  user); the policy's `tagOwners` must grant the tag to that user, or headscale refuses the mint.
 - The pod template hashes the declaration only, never the Secrets, so a key renewal does not restart the
   control server.
 - The key never appears in a log, an argv or the environment: headscale writes it to a mode-600 file, the

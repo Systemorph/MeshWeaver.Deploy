@@ -87,6 +87,15 @@ open_setup_if_waiting &
 # MEMEX_LOCAL_HOME comes from the LaunchAgent (__LOCAL_HOME__), so a non-default state dir is honoured.
 if [ -f "${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/publish.yaml" ]; then
   echo "$(date -u +%FT%TZ) published at a public name — the front door binds loopback only, port ${HOST_PORT}"
+  # The network's OWN entry point (memex-local publish → share/network-entry.yaml), loopback only too:
+  # tailscale serve forwards the network's TCP 443 here, and the proxy behind it marks every request.
+  # Held in a restart loop beside the front door; the front door is the process launchd watches.
+  entry_port="${MEMEX_ENTRY_PORT:-8444}"
+  ( while true; do
+      kubectl --context "$KUBE_CONTEXT" port-forward -n "${MEMEX_NAMESPACE:-memex}" svc/memex-network-entry \
+        --address 127.0.0.1,::1 "${entry_port}:8443"
+      sleep 5
+    done ) &
   exec kubectl --context "$KUBE_CONTEXT" port-forward -n ingress-nginx svc/ingress-nginx-controller \
       --address 127.0.0.1,::1 "${HOST_PORT}:443"
 fi

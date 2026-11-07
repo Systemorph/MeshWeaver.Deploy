@@ -19,7 +19,8 @@ data:
           "reusable" (default false $k.reusable)
           "ephemeral" (default false $k.ephemeral)
           "validHours" (int (default 720 $k.validHours))
-          "renewHours" (int (default 168 $k.renewHours))) }}
+          "renewHours" (int (default 168 $k.renewHours))
+          "tags" (default list $k.tags)) }}
     {{- end }}
     {{- toJson $keys | nindent 4 }}
 {{- range $k := .Values.preauthKeys.keys }}

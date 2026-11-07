@@ -19,7 +19,7 @@
 #   headscale-keys --once     one pass; exit status = the number of keys that could not be ensured
 #
 # Inputs (env): KEYS_CONFIG (default /etc/headscale-keys/keys.json — a JSON array of
-#   {name, user, secret, reusable, ephemeral, validHours, renewHours}), HEADSCALE_CONFIG (default
+#   {name, user, secret, reusable, ephemeral, validHours, renewHours, tags}), HEADSCALE_CONFIG (default
 #   /etc/headscale/config.yaml), KUBE_API (default https://kubernetes.default.svc), KUBE_TOKEN_FILE,
 #   KUBE_CA_FILE, KUBE_NAMESPACE_FILE (default under /var/run/secrets/headscale-keys).
 set -uo pipefail
@@ -64,7 +64,7 @@ user_id() { # the numeric id of a headscale user, created when absent
 
 # The declaration a key was minted for: user, flags and lifetime. A changed declaration is a new key — a
 # still-valid key must not keep enrolling machines under the user or flags it was minted for.
-declaration_of() { jq -c '{user, reusable: (.reusable // false), ephemeral: (.ephemeral // false), validHours: (.validHours // 720)}' <<<"$1" | sha256sum | cut -c1-16; }
+declaration_of() { jq -c '{user, reusable: (.reusable // false), ephemeral: (.ephemeral // false), validHours: (.validHours // 720), tags: ((.tags // []) | sort)}' <<<"$1" | sha256sum | cut -c1-16; }
 
 # Expire one key and confirm headscale no longer accepts it (an already expired or deleted key is done).
 revoke() {
@@ -120,7 +120,7 @@ drain_pending() {
 }
 
 ensure_key() { # ensure_key <one entry of keys.json, as JSON> → 0 when the Secret holds a good key and nothing replaced is still valid
-  local entry="$1" name user secret reusable ephemeral valid renew ns secret_json reason uid flags=() old_id decl pending new_id
+  local entry="$1" name user secret reusable ephemeral valid renew ns secret_json reason uid flags=() old_id decl pending new_id tags
   name=$(jq -r .name <<<"$entry"); user=$(jq -r .user <<<"$entry"); secret=$(jq -r .secret <<<"$entry")
   reusable=$(jq -r '.reusable // false' <<<"$entry"); ephemeral=$(jq -r '.ephemeral // false' <<<"$entry")
   valid=$(jq -r '.validHours // 720' <<<"$entry"); renew=$(jq -r '.renewHours // 168' <<<"$entry")
@@ -141,6 +141,10 @@ ensure_key() { # ensure_key <one entry of keys.json, as JSON> → 0 when the Sec
   uid=$(user_id "$user") || return 1
   [ "$reusable" = true ] && flags+=(--reusable)
   [ "$ephemeral" = true ] && flags+=(--ephemeral)
+  # Tags (e.g. tag:bridge) make the machine a TAGGED node: the network policy addresses it by tag, not
+  # as a member of its user. headscale refuses a tag the policy's tagOwners does not grant that user.
+  tags=$(jq -r '(.tags // []) | join(",")' <<<"$entry")
+  [ -n "$tags" ] && flags+=(--tags "$tags")
   umask 077
   if ! hs preauthkeys create -u "$uid" -e "${valid}h" "${flags[@]}" -o json > "$work/minted.json" 2>"$work/mint.err"; then
     log "key $name: headscale refused to mint ($(head -c 200 "$work/mint.err"))"; rm -f "$work/minted.json"; return 1

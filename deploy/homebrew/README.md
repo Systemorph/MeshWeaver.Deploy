@@ -429,8 +429,13 @@ only), and invitation-only admission — the first person to sign in becomes the
 after needs an invitation. The client secret is read from STDIN, never an argument, and never printed.
 While the layer exists the front door (`share/port-forward.sh`) binds **loopback only, on the
 unprivileged port alone** (macOS allows an unprivileged low-port bind on wildcard addresses only), so
-locally the portal is `https://memex.localhost:<port>` (default 8443), and
-`tailscale serve --tcp 443 tcp://127.0.0.1:<port>` is the one way in, from the private network. The
+locally the portal is `https://memex.localhost:<port>` (default 8443). The private network gets its
+OWN entry point (`share/network-entry.yaml`, a small in-cluster proxy behind its own loopback forward on
+8444): `tailscale serve --tcp 443 tcp://127.0.0.1:8444` is the one way in, and the proxy marks EVERY request
+`X-MeshWeaver-Provenance: tailnet` (overwriting whatever the sender claimed) and serves the public name
+only, so the portal refuses the open sign-in for network traffic whatever its `Host` says. The network
+policy must let only the bridge (`tag:bridge`) reach TCP 443 and no member reach 8443 or 8444 (a
+userspace network client delivers to loopback-bound ports too). The
 development sign-in answers on localhost names only, so a public name always needs a real provider
 (Google, Apple and LinkedIn for a public name are a follow-up: the chart carries no client secret for
 them yet). `publish status` reads it back; `publish off` removes it; `memex-local update` applies either.
