@@ -139,6 +139,16 @@ readonly BACKLEASE_FILE="$LOCAL_HOME/backlease.yaml"
 # residency declared (a model whose residency is Unknown is never used for mail triage), and the
 # utility tier mapped to it (the tier the inbox triage, reply drafting and calendar suggestions ask).
 readonly LLM_FILE="$LOCAL_HOME/llm.yaml"
+# ── CERTIFICATES for the machine's private-network name (Let's Encrypt over DNS-01; `memex-local cert`) ──
+# dns01.env names the DNS zone and the identity allowed to write its challenge records (nothing secret);
+# dns01.secret is that identity's client secret (0600) — delivered by the enrolment channel, never typed into
+# a chat or printed. lego keeps the account and the certificates under $CERT_DIR/lego; a launchd agent
+# re-runs `cert issue` daily, which renews only within 30 days of expiry.
+readonly CERT_DIR="$LOCAL_HOME/certs"
+readonly CERT_ENV="$CERT_DIR/dns01.env"
+readonly CERT_SECRET="$CERT_DIR/dns01.secret"
+readonly CERT_PLIST_LABEL="com.memex.local.cert"
+readonly CERT_PLIST_DST="$HOME/Library/LaunchAgents/${CERT_PLIST_LABEL}.plist"
 # ── FLEET JOIN — this Mac joins the fleet in one command (MeshWeaver.Plugins Hosting/MacStudioFleet §2b) ──
 # Written by `memex-local fleet join` from the enrolment code a control-instance global admin issued: the
 # machine's heartbeat key and its announcement key (secrets.memex_portal, 0600) and the control inbox URL.
@@ -756,8 +766,13 @@ publish_signin_summary() {
 # The tailscaled socket to talk to: MEMEX_TAILSCALE_SOCKET, else a USER-SPACE tailscaled's socket under the
 # person's home ($HOME/.tailscale/tailscaled.sock — the shape a fleet Mac runs), else the system default.
 # Without it `tailscale serve` talks to a daemon that is not running and fails.
+# The fleet's own shape is a ROOT LaunchDaemon (com.meshweaver.fleet.tailscaled, socket /var/run/tailscaled.socket
+# — deploy/macos/intune/fleet-bootstrap.sh): it is up before anyone logs in, which the Tailscale app is not.
+# Order: MEMEX_TAILSCALE_SOCKET, that root daemon's socket, a user-space daemon's under the home, the default.
 tailscale_socket() {
+  local root_sock="${MEMEX_TAILSCALED_ROOT_SOCKET:-/var/run/tailscaled.socket}"
   if [ -n "${MEMEX_TAILSCALE_SOCKET:-}" ]; then printf '%s' "$MEMEX_TAILSCALE_SOCKET"
+  elif [ -S "$root_sock" ]; then printf '%s' "$root_sock"
   elif [ -S "$HOME/.tailscale/tailscaled.sock" ]; then printf '%s' "$HOME/.tailscale/tailscaled.sock"
   fi
 }
@@ -808,13 +823,144 @@ tailnet_name() {
 # once per name (__HOST__), __HOSTS__ = the names space-separated. Names are validated DNS names by now.
 render_network_entry() {
   local template="$1"; shift
-  awk -v names="$*" '
-    BEGIN { n = split(names, h, " ") }
+  # per name: a publicly trusted certificate when `memex-local cert` holds one for it, else the local CA
+  local withcert="" h digest=""
+  for h in "$@"; do [ -f "$(cert_file "$h" crt)" ] && [ -f "$(cert_file "$h" key)" ] && withcert="$withcert $h"; done
+  [ -n "$withcert" ] && digest="$(for h in $withcert; do cat "$(cert_file "$h" crt)"; done | shasum -a 256 | cut -c1-16)"
+  awk -v names="$*" -v withcert="$withcert" -v digest="${digest:-none}" '
+    BEGIN { n = split(names, h, " "); m = split(withcert, w, " "); for (j = 1; j <= m; j++) has[w[j]] = 1 }
     /# site:begin/ { inblock = 1; block = ""; next }
-    inblock && /# site:end/ { inblock = 0; for (i = 1; i <= n; i++) { b = block; gsub(/__HOST__/, h[i], b); printf "%s", b }; next }
+    inblock && /# site:end/ { inblock = 0; for (i = 1; i <= n; i++) { b = block; gsub(/__HOST__/, h[i], b); t = (h[i] in has) ? "tls /certs/" h[i] ".crt /certs/" h[i] ".key" : "tls internal"; gsub(/__TLS__/, t, b); printf "%s", b }; next }
     inblock { block = block $0 "\n"; next }
-    { gsub(/__HOSTS__/, names); print }
+    { gsub(/__HOSTS__/, names); gsub(/__CERTS_DIGEST__/, digest); print }
   ' "$template"
+}
+
+# ---------------------------------------------------------------------------
+# §18c — CERTIFICATES for the machine's private-network name (`memex-local cert`)
+# ---------------------------------------------------------------------------
+# `cert config --domain <machine>.net.<domain> --email <contact> --client-id <id> --tenant <id> --subscription <id>
+#   --resource-group <rg> --zone <zone>` with the client secret on STDIN; `cert issue` obtains (or renews, within
+# 30 days) a Let's Encrypt certificate over DNS-01 with lego, hands it to the network entry point as the Secret
+# memex-network-entry-certs, and arms a daily launchd re-run; `cert status` reads it back.
+cert_value() { awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); gsub(/"/, ""); print; exit }' "$CERT_ENV" 2>/dev/null; }
+
+# A certificate file of lego's layout for <name>: crt | key.
+cert_file() { printf '%s/lego/certificates/%s.%s' "$CERT_DIR" "$1" "$2"; }
+
+# The certificate's expiry (notAfter) or empty.
+cert_expiry() { [ -f "$(cert_file "$1" crt)" ] && openssl x509 -in "$(cert_file "$1" crt)" -noout -enddate 2>/dev/null | sed 's/^notAfter=//'; }
+
+# The lego invocation for issue-or-renew. Pure: prints the argument list one per line (tests read it).
+cert_lego_args() {
+  printf '%s\n' run --accept-tos --email "$(cert_value LEGO_EMAIL)" --dns azuredns --domains "$(cert_value CERT_DOMAIN)" \
+    --key-type EC256 --renew-days 30 --path "$CERT_DIR/lego"
+}
+
+# Puts every certificate lego holds into the entry point's Secret, then re-renders the entry point so its pod
+# restarts onto them (the digest annotation changes). Skipped quietly when the stack is not up.
+cert_install() {
+  local args=() f n
+  for f in "$CERT_DIR"/lego/certificates/*.crt; do
+    [ -f "$f" ] || continue
+    n="$(basename "$f" .crt)"
+    case "$n" in *.issuer) continue ;; esac
+    [ -f "$CERT_DIR/lego/certificates/$n.key" ] || continue
+    args+=(--from-file="$n.crt=$f" --from-file="$n.key=$CERT_DIR/lego/certificates/$n.key")
+  done
+  [ "${#args[@]}" -gt 0 ] || return 0
+  colima_running || { info "the stack is not running — the certificate reaches the entry point at the next 'publish on'"; return 0; }
+  kubectl -n "$NAMESPACE" create secret generic memex-network-entry-certs ${args[@]+"${args[@]}"} --dry-run=client -o yaml \
+    | kubectl -n "$NAMESPACE" apply -f - >/dev/null 2>&1 || { warn "could not write the Secret memex-network-entry-certs"; return 1; }
+  ok "certificate(s) handed to the network entry point (Secret memex-network-entry-certs)"
+  if [ -f "$LOCAL_HOME/network-entry.yaml" ] && [ -f "$PUBLISH_FILE" ]; then
+    info "re-rendering the entry point onto the certificate: memex-local publish on is re-run by the next 'memex-local update'; applying now"
+    local share names; share="$(resolve_share)"
+    names="$(awk -F'"' '/memex-local\/caddyfile-hosts:/ { print $2; exit }' "$LOCAL_HOME/network-entry.yaml")"
+    # shellcheck disable=SC2086
+    render_network_entry "$share/network-entry.yaml" $names > "$LOCAL_HOME/network-entry.yaml" \
+      && kubectl -n "$NAMESPACE" apply -f "$LOCAL_HOME/network-entry.yaml" >/dev/null 2>&1 \
+      && ok "network entry point re-rendered (serves the trusted certificate for $(cert_value CERT_DOMAIN))"
+  fi
+}
+
+install_cert_agent() {
+  local self; self="$(command -v memex-local 2>/dev/null || printf '%s' "$0")"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$CERT_PLIST_DST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${CERT_PLIST_LABEL}</string>
+  <key>ProgramArguments</key><array><string>${self}</string><string>cert</string><string>issue</string><string>--no-agent</string></array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>MEMEX_LOCAL_HOME</key><string>${LOCAL_HOME}</string></dict>
+  <key>StartInterval</key><integer>86400</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>${CERT_DIR}/renew.log</string>
+  <key>StandardErrorPath</key><string>${CERT_DIR}/renew.log</string>
+</dict>
+</plist>
+PLIST
+  launchctl bootout "gui/$(id -u)" "$CERT_PLIST_DST" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$CERT_PLIST_DST" >/dev/null 2>&1 && ok "daily renewal armed (launchd $CERT_PLIST_LABEL; lego renews within 30 days of expiry)" \
+    || warn "could not load the renewal agent $CERT_PLIST_LABEL"
+}
+
+cmd_cert() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    config)
+      local domain="" email="" cid="" tenant="" sub_id="" rg="" zone="" secret
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --domain) shift; domain="${1:?}" ;; --email) shift; email="${1:?}" ;; --client-id) shift; cid="${1:?}" ;;
+          --tenant) shift; tenant="${1:?}" ;; --subscription) shift; sub_id="${1:?}" ;; --resource-group) shift; rg="${1:?}" ;;
+          --zone) shift; zone="${1:?}" ;; *) die "cert config: unknown flag '$1'" ;;
+        esac; shift
+      done
+      for v in domain email cid tenant sub_id rg zone; do [ -n "${!v}" ] || die "cert config: --${v//_/-} is required (cid = --client-id, sub_id = --subscription, rg = --resource-group)"; done
+      case "$domain" in *.*) ;; *) die "cert config: --domain must be a full name (e.g. <machine>.net.<domain>)" ;; esac
+      case "$domain" in *".$zone") ;; *) die "cert config: --domain '$domain' is not inside the zone '$zone' the identity may write" ;; esac
+      [ -t 0 ] && die "cert config: pipe the DNS-01 identity's client secret on STDIN — it is never an argument and never printed"
+      secret="$(cat)"; secret="${secret%$'\n'}"; [ -n "$secret" ] || die "cert config: no client secret on STDIN"
+      mkdir -p "$CERT_DIR"; chmod 700 "$CERT_DIR"
+      ( umask 077; printf '%s' "$secret" > "$CERT_SECRET" ); unset secret
+      ( umask 077; cat > "$CERT_ENV" ) <<ENV
+# memex-local CERTIFICATES — managed by \`memex-local cert config\`. Nothing secret here; the client secret is in dns01.secret.
+CERT_DOMAIN=${domain}
+LEGO_EMAIL=${email}
+AZURE_CLIENT_ID=${cid}
+AZURE_TENANT_ID=${tenant}
+AZURE_SUBSCRIPTION_ID=${sub_id}
+AZURE_RESOURCE_GROUP=${rg}
+AZURE_ZONE_NAME=${zone}
+ENV
+      ok "certificate configuration written ($CERT_ENV; the secret in $CERT_SECRET, 0600, never printed) — next: memex-local cert issue"
+      ;;
+    issue)
+      local agent="yes"; [ "${1:-}" = "--no-agent" ] && agent="no"
+      [ -f "$CERT_ENV" ] && [ -s "$CERT_SECRET" ] || die "cert issue: not configured — memex-local cert config … < secret"
+      need lego lego
+      local domain; domain="$(cert_value CERT_DOMAIN)"
+      local args=(); while IFS= read -r a; do args+=("$a"); done < <(cert_lego_args)
+      step "Certificate for $domain (Let's Encrypt, DNS-01 in $(cert_value AZURE_ZONE_NAME); renews within 30 days of expiry)"
+      env AZURE_AUTH_METHOD=env AZURE_CLIENT_ID="$(cert_value AZURE_CLIENT_ID)" AZURE_CLIENT_SECRET_FILE="$CERT_SECRET" \
+          AZURE_TENANT_ID="$(cert_value AZURE_TENANT_ID)" AZURE_SUBSCRIPTION_ID="$(cert_value AZURE_SUBSCRIPTION_ID)" \
+          AZURE_RESOURCE_GROUP="$(cert_value AZURE_RESOURCE_GROUP)" AZURE_ZONE_NAME="$(cert_value AZURE_ZONE_NAME)" \
+          lego ${args[@]+"${args[@]}"} || die "cert issue: lego could not obtain or renew the certificate for $domain (its output is above)"
+      ok "certificate for $domain valid until $(cert_expiry "$domain")"
+      cert_install
+      [ "$agent" = "yes" ] && install_cert_agent
+      ;;
+    status)
+      if [ ! -f "$CERT_ENV" ]; then info "no certificate configured — memex-local cert config … < secret, then memex-local cert issue"; return 0; fi
+      local domain; domain="$(cert_value CERT_DOMAIN)"
+      if [ -n "$(cert_expiry "$domain")" ]; then ok "certificate for $domain valid until $(cert_expiry "$domain")"; else warn "no certificate for $domain yet — memex-local cert issue"; fi
+      if launchctl print "gui/$(id -u)/${CERT_PLIST_LABEL}" >/dev/null 2>&1; then ok "daily renewal agent loaded ($CERT_PLIST_LABEL)"; else warn "renewal agent $CERT_PLIST_LABEL NOT loaded — memex-local cert issue arms it"; fi
+      ;;
+    *) die "usage: memex-local cert {config --domain <name> --email <e> --client-id <id> --tenant <id> --subscription <id> --resource-group <rg> --zone <zone> < secret | issue | status}" ;;
+  esac
 }
 
 # The entry point's root certificate (Caddy's `tls internal` CA, on the entry point's data volume): what a
@@ -903,6 +1049,12 @@ cmd_publish() {
       if [ -z "$ts_name" ]; then
         [ -n "$host" ] || die "publish on: no tailnet name to publish (see above) — join the private network ('tailscale up --login-server <the network's login server>'), or add a public name with --host <name>"
         info "no tailnet name: publishing the public name ${host} only"
+      fi
+      # The DEFAULT for a fleet Mac is internal only: the portal answers at its private-network name, over the
+      # private network, with a publicly trusted certificate (`memex-local cert`). A public name (--host, through
+      # the ingress bridge) is an explicit option on request, never part of onboarding.
+      if [ -n "$ts_name" ] && [ ! -f "$(cert_file "$ts_name" crt)" ]; then
+        warn "no trusted certificate for ${ts_name} yet — the entry point serves its local CA until 'memex-local cert issue' (MeshWeaver.Plugins Hosting/MacStudioOnboarding)"
       fi
       local names=() n host_lines=""
       [ -n "$ts_name" ] && names+=("$ts_name")
@@ -1095,7 +1247,7 @@ cmd_fleet() {
           --control)   shift; control="${1:?--control needs the control instance URL}" ;;
           --id)        shift; id="${1:?--id needs the deployment id}" ;;
           --no-open)   open_link="no" ;;
-          --code-file) shift; code_file="${1:?--code-file needs a path}" ;;
+          --code-file) shift; code_file="${1:?--code-file needs a path}" ;;   # absent → print the link, exit 3 (unattended)
           --no-update) do_update="no" ;;
           *) die "fleet join: unknown flag '$1'" ;;
         esac
@@ -1132,6 +1284,12 @@ cmd_fleet() {
       [ "$open_link" = "yes" ] && command -v open >/dev/null 2>&1 && open "$url" >/dev/null 2>&1 || true
 
       local code=""
+      printf '%s\n' "$url" > "$FLEET_DIR/$id.link"
+      if [ -n "$code_file" ] && [ ! -f "$code_file" ]; then
+        # unattended (a device-management run): nothing to paste into — say what is awaited and come back
+        info "WAITING for the approval on control and the enrolment code at $code_file (the link is also in $FLEET_DIR/$id.link)"
+        exit 3
+      fi
       if [ -n "$code_file" ]; then
         code="$(tr -d ' \n\r' < "$code_file")"
       else
@@ -3631,6 +3789,12 @@ COMMANDS:
                   printed, only their sha256 fingerprints), runs backlease enroll, starts Ollama
                   under launchd, and updates from the public GHCR. 'status' shows the fingerprints.
   backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] | status | off
+  cert config --domain <machine>.net.<domain> --email <e> --client-id <id> --tenant <id> --subscription <id>
+       --resource-group <rg> --zone <zone> < secret | issue | status
+                  A PUBLICLY TRUSTED certificate for this Mac's private-network name (Let's Encrypt over
+                  DNS-01, lego): 'issue' obtains or renews it (within 30 days of expiry), hands it to
+                  the network entry point (Secret memex-network-entry-certs) and arms a daily launchd
+                  renewal. The DNS identity's secret is read from STDIN, kept 0600, never printed.
   publish on [--tailnet-only | --host <name>] --sign-in microsoft --tenant <id> --client-id <id> < secret | status | ca | off
                   PUBLISH (Hosting/MacStudioFleet §6): this Mac's portal also answers at its OWN name
                   on the private network (tailscale's MagicDNS name, read from 'tailscale status
@@ -4208,6 +4372,7 @@ main() {
     fleet)         cmd_fleet "$@" ;;
     llm)           cmd_llm "$@" ;;
     publish)       cmd_publish "$@" ;;
+    cert)          cmd_cert "$@" ;;
     relay)         cmd_relay "$@" ;;
     verify)        cmd_verify "$@" ;;
     autoroll)      cmd_autoroll "$@" ;;
