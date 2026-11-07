@@ -1295,6 +1295,12 @@ buildHosts:
   # cgroup, and the runner REFUSES TO START when the declared slots exceed that (MW_BUILD_STAGE_SLOTS, build-run.py
   # `stage_slots_refusal`) — so lowering `resources` means lowering this too. 1 = every run serial.
   stageSlots: 8
+  # The WARM WORKSPACE (MeshWeaver.Plugins Hosting/BuildQueue.md §7.2): a replica keeps one checkout per repository under its
+  # work volume across runs and moves it to each run's exact sha (fetch through the mirror, checkout, reset, clean except
+  # obj/ and bin/), so MSBuild builds incrementally; wiped whenever the platform set or images change, a fresh clone on any
+  # failure. Every run's plan says `incremental, seeded from <sha>` or `clean (why)`. Off by default; turned on per host
+  # once a measured run proves it (the Mac first).
+  warmWorkspace: false
   # KEDA: polling, the scale-to-zero calm window, and the scale-down stabilization window (longer
   # than a claim's round trip, so a replica is not removed between two runs).
   pollingInterval: 15

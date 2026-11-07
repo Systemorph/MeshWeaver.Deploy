@@ -2813,7 +2813,15 @@ def default_checkout(repo: str, sha: str, refs: list, dest: str, token: Optional
                           f"{(r.stderr or '').strip()[-400:]}")
     git = git or run_git
     wanted = [sha] + [r for r in (refs or []) if isinstance(r, str) and r]
+    _update_mirror(repo, url, mirror_root, mirror, wanted, git, log)
+    git("clone", "--no-checkout", "--quiet", "--reference", mirror, url, dest)
+    git("-C", dest, "fetch", "--quiet", "origin", *wanted)
+    git("-C", dest, "checkout", "--quiet", "--detach", sha)
 
+
+def _update_mirror(repo: str, url: str, mirror_root: str, mirror: str, wanted: list, git: Callable[..., None],
+                   log: Callable[[str], None]) -> None:
+    """Create or fetch the shared mirror under its exclusive lock, then fetch the wanted refs into it."""
     os.makedirs(mirror_root, exist_ok=True)
     with open(os.path.join(mirror_root, f".{repo}.lock"), "w") as lock:
         _flock(lock)
@@ -2829,9 +2837,86 @@ def default_checkout(repo: str, sha: str, refs: list, dest: str, token: Optional
             git("-C", mirror, "fetch", "--quiet", "--prune", "origin")
         # A PR head (refs/pull/N/head) or the exact sha may not be on a mirrored ref yet.
         git("-C", mirror, "fetch", "--quiet", "origin", *wanted)
-    git("clone", "--no-checkout", "--quiet", "--reference", mirror, url, dest)
-    git("-C", dest, "fetch", "--quiet", "origin", *wanted)
-    git("-C", dest, "checkout", "--quiet", "--detach", sha)
+
+
+# ───────────────────────────────── the warm workspace (Plugins Hosting/BuildQueue.md §7.2) ─────────────────────
+#
+# Owner, 2026-11-07: "a consistently checked out state on the file system of the pod … keep updating the parts of the
+# git repos and use dotnet build with correct caching". With MW_BUILD_WARM_WORKSPACE=true a replica keeps ONE checkout
+# per repository under `<work>/.warm/<repo>` across runs (a replica runs one run at a time; its stage slots share that
+# run's tree, exactly as they share a fresh one). Each run moves it to the exact sha — fetch through the mirror,
+# checkout --force --detach, reset --hard, `git clean -ffdx` EXCEPT `obj/` and `bin/` — so MSBuild's incremental state
+# survives and every tracked or untracked file is exactly the commit's. The workspace is WIPED whenever its key (the
+# platform set, the framework identity and the images the host runs) changes, and on any failure of the warm path the
+# run falls back to a fresh clone, said. Every run states which it got: `incremental, seeded from <sha>` or `clean (why)`.
+WARM_DIR = ".warm"
+WARM_STATE = ".mw-warm.json"
+WARM_KEEP = ("obj/", "bin/")
+
+
+def warm_key(env: dict, identity: str) -> str:
+    """What invalidates a warm workspace: the platform set, the framework identity and the images the host runs. Pure."""
+    parts = [f"platform={env.get('MW_BUILD_PLATFORM_VERSION', '')}", f"identity={identity}"]
+    parts += [f"{k}={env.get(k, '')}" for k in ("MW_BUILD_TESTER_DIGEST", "MW_BUILD_PORTAL_DIGEST", "MW_BUILD_RUNNER_DIGEST")]
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:32]
+
+
+def warm_enabled(env: dict) -> bool:
+    return (env.get("MW_BUILD_WARM_WORKSPACE") or "").strip().lower() in ("1", "true", "yes")
+
+
+def warm_checkout(repo: str, sha: str, refs: list, dest: str, token: Optional[str], env: dict, log: Callable[[str], None],
+                  key: str, deadline: Optional[float] = None, git: Optional[Callable[..., None]] = None,
+                  fresh: Optional[Callable[..., None]] = None) -> str:
+    """Move the replica's warm workspace `dest` to `sha` (see above); returns the plan line naming how it was seeded.
+    Never leaves a half-moved tree: any failure wipes `dest` and clones it fresh (`fresh`, default_checkout)."""
+    fresh = fresh or default_checkout
+    state_file = os.path.join(dest, ".git", WARM_STATE)
+    try:
+        with open(state_file) as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        state = None
+    reason = ("no warm workspace yet" if state is None
+              else "the platform set or images changed — wiped" if state.get("key") != key
+              else None)
+    if reason is None:
+        base = env.get("MW_BUILD_GIT_BASE", "https://github.com/Systemorph").rstrip("/")
+        url = f"{base}/{repo}.git"
+        mirror_root = os.path.join(env.get("MW_BUILD_CACHE", "/cache"), "git")
+        mirror = os.path.join(mirror_root, f"{repo}.git")
+        genv = {**{k: env[k] for k in ("PATH", "LANG", "SSL_CERT_FILE", "SSL_CERT_DIR") if env.get(k)},
+                "HOME": os.path.dirname(dest), **git_auth_env(token)}
+
+        def run_git(*args: str) -> None:
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and left <= 0:
+                raise Refusal("the run's deadline passed during the checkout")
+            try:
+                r = subprocess.run(["git", *args], env=genv, capture_output=True, text=True, timeout=left)
+            except subprocess.TimeoutExpired:
+                raise Refusal("git did not finish inside the run's deadline — killed")
+            if r.returncode != 0:
+                raise Refusal(f"git {args[2] if args[0] == '-C' else args[0]} failed (exit {r.returncode}): {(r.stderr or '').strip()[-300:]}")
+        g = git or run_git
+        wanted = [sha] + [r for r in (refs or []) if isinstance(r, str) and r]
+        try:
+            _update_mirror(repo, url, mirror_root, mirror, wanted, g, log)
+            g("-C", dest, "fetch", "--quiet", "origin", *wanted)
+            g("-C", dest, "checkout", "--quiet", "--force", "--detach", sha)
+            g("-C", dest, "reset", "--quiet", "--hard", sha)
+            g("-C", dest, "clean", "-ffdxq", *[a for k in WARM_KEEP for a in ("-e", k)])
+            line = f"workspace: incremental, seeded from {str(state.get('sha', '?'))[:12]} (obj/ and bin/ kept)"
+        except Refusal as e:
+            reason = f"the warm path failed ({str(e)[:160]}) — wiped"
+    if reason is not None:
+        shutil.rmtree(dest, ignore_errors=True)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        fresh(repo, sha, refs, dest, token, env, log, deadline=deadline)
+        line = f"workspace: clean ({reason})"
+    with open(state_file, "w") as fh:
+        json.dump({"key": key, "sha": sha, "at": int(time.time())}, fh)
+    return line
 
 
 def _flock(fh) -> bool:
@@ -3052,6 +3137,7 @@ class Host:
         self.claim_id = ""
         self.probe: Optional[str] = None
         self.run_scope = {"channel": self.channel}
+        self.workspace_line = ""
 
     def preflight(self) -> None:
         missing = []
@@ -3319,7 +3405,9 @@ class Host:
         started = self.clock()
         self.sweep_workspaces()
         workdir = tempfile.mkdtemp(prefix=f"{repo}-{sha[:12]}-", dir=self.work)
-        checkout_dir = os.path.join(workdir, "src")
+        # the warm workspace (§7.2) lives OUTSIDE the run's workdir, so the run's cleanup never removes it
+        checkout_dir = (os.path.join(self.work, WARM_DIR, repo) if warm_enabled(self.env) and self.checkout is default_checkout
+                        else os.path.join(workdir, "src"))
         outputs_dir = os.path.join(workdir, "out")
         self.artifacts_dir = os.path.join(workdir, "artifacts")
         stages: list[dict] = []
@@ -3379,8 +3467,14 @@ class Host:
             try:
                 # The checkout is bounded by the run's deadline: a stalled clone or fetch ends the run
                 # RED inside the pod's grace period, never holds the claim indefinitely.
-                self.checkout(repo, sha, claim.get("refs") or [], checkout_dir, token, self.env, self.log,
-                              deadline=time.monotonic() + max(1.0, self.run_deadline - (self.clock() - started)))
+                co_deadline = time.monotonic() + max(1.0, self.run_deadline - (self.clock() - started))
+                if checkout_dir.startswith(os.path.join(self.work, WARM_DIR) + os.sep):
+                    self.workspace_line = warm_checkout(repo, sha, claim.get("refs") or [], checkout_dir, token, self.env, self.log,
+                                                        warm_key(self.env, self.identity), deadline=co_deadline)
+                    self.log(self.workspace_line)
+                else:
+                    self.workspace_line = "workspace: clean (a fresh clone per run — MW_BUILD_WARM_WORKSPACE is not set)"
+                    self.checkout(repo, sha, claim.get("refs") or [], checkout_dir, token, self.env, self.log, deadline=co_deadline)
                 # ONE merged tree per attempt (policy suites-test-fresh-merge): a pull-request run's
                 # head is merged onto ONE base — the claim's `mergeBaseSha`, or main's tip resolved
                 # ONCE from the mirror when the claim names none — and every stage runs on that tree.
@@ -3422,6 +3516,9 @@ class Host:
             if merge_base:
                 plan_event["mergeBase"] = merge_base
             plan.add([plan_event])
+            if self.workspace_line:
+                # how the tree was seeded (§7.2): every verdict can be traced to the state it started from
+                plan.add([{"kind": "line", "text": self.workspace_line}])
             if fanout:
                 plan.add([{"kind": "line", "text": f"fan-out: up to {slots} stage(s) in flight at once (the repository "
                                                    f"declares `parallel`; a build stage runs alone)"}])
@@ -3766,6 +3863,8 @@ class Host:
         except OSError:
             return gone
         for n in names:
+            if n == WARM_DIR:
+                continue    # the replica's warm workspaces live across runs (§7.2); a key change or a failure wipes them
             full = os.path.join(self.work, n)
             try:
                 if os.path.isdir(full) and not os.path.islink(full) and now - os.path.getmtime(full) > 2 * self.run_deadline:
@@ -5028,6 +5127,60 @@ def self_test() -> int:
               not any(c[:2] == ("clone", "--mirror") for c in calls)
               and any(c[:4] == ("-C", mirror, "fetch", "--quiet") and "--prune" in c for c in calls), calls)
         check("mirror/the checkout is detached at the sha", calls[-1][-2:] == ("--detach", "d" * 40), calls[-1])
+
+        # ── 5b'. the warm workspace (§7.2), against REAL git: a local origin, the real mirror path ───────────
+        if shutil.which("git"):
+            wroot = os.path.join(tmp, "warm-git")
+            origin = os.path.join(wroot, "origin", "R.git")
+            seed = os.path.join(wroot, "seed")
+            os.makedirs(seed)
+            genv_g = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": wroot, "GIT_CONFIG_NOSYSTEM": "1",
+                      "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+
+            def sh(*a, cwd=seed):
+                return subprocess.run(list(a), cwd=cwd, env=genv_g, check=True, capture_output=True, text=True).stdout.strip()
+            sh("git", "init", "-q", "-b", "main")
+            open(os.path.join(seed, "a.cs"), "w").write("v1")
+            sh("git", "add", "-A"); sh("git", "commit", "-qm", "one")
+            c1 = sh("git", "rev-parse", "HEAD")
+            open(os.path.join(seed, "a.cs"), "w").write("v2")
+            sh("git", "commit", "-qam", "two")
+            c2 = sh("git", "rev-parse", "HEAD")
+            os.makedirs(os.path.dirname(origin))
+            sh("git", "clone", "-q", "--bare", seed, origin, cwd=wroot)
+            wenv = {"PATH": genv_g["PATH"], "MW_BUILD_GIT_BASE": "file://" + os.path.dirname(origin),
+                    "MW_BUILD_CACHE": os.path.join(wroot, "cache")}
+            ws = os.path.join(wroot, "work", WARM_DIR, "R")
+            line1 = warm_checkout("R", c1, [], ws, None, wenv, lambda m: None, key="k1")
+            check("warm/the first run is a CLEAN clone, said", line1.startswith("workspace: clean (no warm workspace yet"), line1)
+            check("warm/the tree is the commit", open(os.path.join(ws, "a.cs")).read() == "v1")
+            os.makedirs(os.path.join(ws, "src", "obj")); open(os.path.join(ws, "src", "obj", "state.cache"), "w").write("x")
+            open(os.path.join(ws, "stray.txt"), "w").write("left by a PR")
+            open(os.path.join(ws, "a.cs"), "w").write("edited in place")
+            line2 = warm_checkout("R", c2, [], ws, None, wenv, lambda m: None, key="k1")
+            check("warm/the second run is INCREMENTAL and names the sha it was seeded from",
+                  line2 == f"workspace: incremental, seeded from {c1[:12]} (obj/ and bin/ kept)", line2)
+            check("warm/tracked files are exactly the new commit (a local edit is gone)", open(os.path.join(ws, "a.cs")).read() == "v2")
+            check("warm/an untracked file is cleaned", not os.path.exists(os.path.join(ws, "stray.txt")))
+            check("warm/obj/ is KEPT for MSBuild's incremental build", os.path.isfile(os.path.join(ws, "src", "obj", "state.cache")))
+            line3 = warm_checkout("R", c2, [], ws, None, wenv, lambda m: None, key="k2")
+            check("warm/a new platform set or image WIPES the workspace", line3.startswith("workspace: clean (the platform set or images changed")
+                  and not os.path.exists(os.path.join(ws, "src", "obj")), line3)
+            line4 = warm_checkout("R", "f" * 40, [], ws, None, dict(wenv), lambda m: None, key="k2",
+                                  fresh=lambda *a, **k: default_checkout("R", c1, [], ws, None, wenv, lambda m: None))
+            check("warm/a failed warm path wipes and falls back to a fresh clone, said",
+                  line4.startswith("workspace: clean (the warm path failed") and open(os.path.join(ws, "a.cs")).read() == "v1", line4)
+            check("warm/the key rides on the platform set, the identity and the images",
+                  warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.1"}, "c003") != warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.2"}, "c003")
+                  and warm_key({}, "a") != warm_key({}, "b") and warm_key({"MW_BUILD_RUNNER_DIGEST": "x"}, "a") != warm_key({}, "a"))
+            check("warm/opt-in only", warm_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}) and not warm_enabled({}))
+            import types as _types
+            os.makedirs(os.path.join(wroot, "work", "R-old-run"))
+            for d in (os.path.join(wroot, "work", WARM_DIR), os.path.join(wroot, "work", "R-old-run")):
+                os.utime(d, (0, 0))
+            swept = Host.sweep_workspaces(_types.SimpleNamespace(work=os.path.join(wroot, "work"), run_deadline=60.0))
+            check("warm/the workspace sweep removes an old run's workspace but never the warm workspaces",
+                  swept == ["R-old-run"] and os.path.isdir(ws), swept)
 
         # ── 5c. the ONE credential: AcrPull by workload identity, host-only ──────────────
         fed = os.path.join(tmp, "azure-identity-token")
@@ -8001,7 +8154,7 @@ def self_test() -> int:
         return 1
     print("build-run self-test: all cases passed (diagnostics, dedup, vstest + xunit results, structured events, "
           "stage declaration, the bwrap argv, the env allow-list, the token file, the startup sandbox probe, "
-          "pid-namespace leftovers, one merged tree per PR attempt, the network-boundary self-check, trunk-only BUILD-stage cache promotion under recomputed keys, the plan, batch seq, the lease heartbeat, the claimId, the git mirror, cache scoping per stage, the NuGet fallback folder bound for every stage, the warm NuGet cache filled from the default branch's tip once per key (and never from a PR), the refset key, the H9 artifact hand-over (a file: store and the build API), the workload-identity pull, the registry bundle index (H8), plugins refresh BEFORE claim, fresh process per "
+          "pid-namespace leftovers, one merged tree per PR attempt, the network-boundary self-check, trunk-only BUILD-stage cache promotion under recomputed keys, the plan, batch seq, the lease heartbeat, the claimId, the git mirror, the warm workspace (incremental over real git, wiped on a key change, a fresh clone on failure, never swept), cache scoping per stage, the NuGet fallback folder bound for every stage, the warm NuGet cache filled from the default branch's tip once per key (and never from a PR), the refset key, the H9 artifact hand-over (a file: store and the build API), the workload-identity pull, the registry bundle index (H8), plugins refresh BEFORE claim, fresh process per "
           "stage, fail-fast, channel + publish, 409, undeclared stages, stage timeout, run deadline)")
     return 0
 
