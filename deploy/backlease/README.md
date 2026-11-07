@@ -35,6 +35,14 @@ memex-local buildhost priority off       # remove it; the VM runs at its default
 ```
 
 State: `~/.memex-local/buildhost-priority.state`. Log, transitions only: `~/.memex-local/buildhost-priority.log`.
+Overrides set in the installing shell (`COLIMA_HOME`, `MEMEX_BUILD_PRIO_*`) are written into the agent's
+environment.
+
+**Headless Macs.** On a Mac without a GUI login session (the `.pkg`'s *Unattended host*, see
+`deploy/macos/README.md`), no LaunchAgent can load. There the governor runs as a background process of the
+service user, with its pid in `~/.memex-local/buildhost-priority.pid`. The unattended daemon
+(`memex-daemon.sh`) starts it again after every boot once it has been installed. `MEMEX_HEADLESS=1` forces
+this mode.
 
 ### Why a switch, and not nice or a fixed background policy
 

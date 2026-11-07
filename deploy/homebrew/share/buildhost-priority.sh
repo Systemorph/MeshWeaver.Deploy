@@ -35,6 +35,8 @@
 # Usage (memex-local runs these; first-attach.sh runs --install too):
 #   buildhost-priority.sh --install [--profile build]   copy this script to ~/.memex-local, write and load
 #                                                        the launchd agent com.memex.local.buildhost-priority
+#                                                        (no GUI session, or MEMEX_HEADLESS=1: a background
+#                                                        process recorded in ~/.memex-local/buildhost-priority.pid)
 #   buildhost-priority.sh --uninstall                   unload it and give the VM its default policy back
 #   buildhost-priority.sh --status                      the agent, the VM process, its mode and thread priorities
 #   buildhost-priority.sh                               the governor loop (what the agent runs)
@@ -174,6 +176,17 @@ run() {
   done
 }
 
+# The settings the installing shell overrode travel into the agent: a COLIMA_HOME outside ~/.colima (or the agent
+# would look for the VM where it is not and never act) and every MEMEX_BUILD_PRIO_* threshold, interval or path.
+persisted_env() {
+  local v
+  for v in COLIMA_HOME MEMEX_BUILD_PRIO_INTERVAL MEMEX_BUILD_PRIO_YIELD_AT MEMEX_BUILD_PRIO_RESUME_BELOW \
+           MEMEX_BUILD_PRIO_RESUME_AFTER MEMEX_BUILD_PRIO_OLLAMA_BUSY MEMEX_BUILD_PRIO_STATE MEMEX_BUILD_PRIO_LOG; do
+    [ -n "${!v:-}" ] && printf '        <key>%s</key><string>%s</string>\n' "$v" "${!v}"
+  done
+  return 0
+}
+
 plist() {
   local script="$1"
   cat <<PLIST
@@ -191,6 +204,7 @@ plist() {
         <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>MEMEX_BUILD_PROFILE</key><string>${PROFILE}</string>
         <key>MEMEX_LOCAL_HOME</key><string>${LOCAL_HOME}</string>
+$(persisted_env)
     </dict>
     <!-- Interactive: the governor itself must run promptly when the machine is contended — a launchd agent's
          default policy ranks it BELOW the build VM it has to demote. It sleeps between ticks. -->
@@ -204,12 +218,35 @@ plist() {
 PLIST
 }
 
+PID_FILE="$LOCAL_HOME/buildhost-priority.pid"
+
+# Is there a GUI login session to load a LaunchAgent into? A headless Mac (the .pkg's "Unattended host",
+# deploy/macos/README.md) has none: there the governor runs as a background process of the service user,
+# recorded in $PID_FILE, and the unattended daemon (memex-daemon.sh) starts it again after every boot.
+gui_session() { [ "${MEMEX_HEADLESS:-}" != 1 ] && launchctl print "gui/$(id -u)" >/dev/null 2>&1; }
+
+headless_pid() { local p; p="$(cat "$PID_FILE" 2>/dev/null || true)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null && printf '%s' "$p"; return 0; }
+
+stop_headless() {
+  local p; p="$(headless_pid)"
+  [ -z "$p" ] || { kill "$p" 2>/dev/null || true; local n=0; while kill -0 "$p" 2>/dev/null && [ "$n" -lt 10 ]; do sleep 1; n=$((n + 1)); done; }
+  rm -f "$PID_FILE"
+}
+
 install_agent() {
   local self dst plist_dst
   self="${BASH_SOURCE[0]}"; dst="$LOCAL_HOME/buildhost-priority.sh"
   plist_dst="$HOME/Library/LaunchAgents/${LABEL}.plist"
-  mkdir -p "$LOCAL_HOME" "$HOME/Library/LaunchAgents"
+  mkdir -p "$LOCAL_HOME"
   [ "$self" -ef "$dst" ] 2>/dev/null || install -m 0755 "$self" "$dst"
+  if ! gui_session; then
+    stop_headless
+    MEMEX_BUILD_PROFILE="$PROFILE" MEMEX_LOCAL_HOME="$LOCAL_HOME" nohup /bin/bash "$dst" run >> "$LOG_FILE" 2>&1 < /dev/null &
+    echo $! > "$PID_FILE"
+    echo "started the governor headless (no GUI session; pid $!, profile $PROFILE; state $STATE_FILE, log $LOG_FILE)"
+    return 0
+  fi
+  mkdir -p "$HOME/Library/LaunchAgents"
   plist "$dst" > "$plist_dst"
   launchctl bootout "gui/$(id -u)" "$plist_dst" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$(id -u)" "$plist_dst" || { echo "ERROR: launchctl could not load $plist_dst" >&2; return 1; }
@@ -222,14 +259,18 @@ uninstall_agent() {
     launchctl bootout "gui/$(id -u)" "$plist_dst" >/dev/null 2>&1 || true
     rm -f "$plist_dst"
   fi
-  # bootout sends TERM, whose trap restores the default policy; do it here too in case the agent was not running.
+  stop_headless
+  # bootout and kill send TERM, whose trap restores the default policy; do it here too in case nothing was running.
   apply_mode full "$(vm_pids)" || true
-  echo "removed launchd agent $LABEL; the build VM runs at its default policy"
+  rm -f "$LOCAL_HOME/buildhost-priority.sh"
+  echo "removed the governor $LABEL; the build VM runs at its default policy"
 }
 
 status() {
   local pids p
-  if launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1; then echo "agent: $LABEL loaded"; else echo "agent: $LABEL NOT loaded"; fi
+  if launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1; then echo "agent: $LABEL loaded"
+  elif [ -n "$(headless_pid)" ]; then echo "agent: headless process $(headless_pid) running"
+  else echo "agent: $LABEL NOT loaded, no headless process"; fi
   [ -f "$STATE_FILE" ] && sed 's/^/  /' "$STATE_FILE" || echo "  no state yet ($STATE_FILE)"
   pids="$(vm_pids)"
   [ -n "$pids" ] || { echo "build VM ($PROFILE): not running"; return 0; }

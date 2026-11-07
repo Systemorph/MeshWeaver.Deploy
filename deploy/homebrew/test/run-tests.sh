@@ -1722,6 +1722,21 @@ printf '#!/bin/bash\n[ "$1" = -t ] && case "$2" in */colima-build/disk) echo 424
   && ok "profile default maps to Lima instance colima, any other to colima-<profile>" || bad "instance_dir" ""
 rm -rf "$GT"
 OUT="$(bash "$GOV" --install --profile 'Bad Name' 2>&1)" && bad "a bad profile was accepted" "$OUT" || ok "the governor refuses a profile that is not a Colima profile name"
+PE="$(env COLIMA_HOME=/srv/colima MEMEX_BUILD_PRIO_YIELD_AT=300 MEMEX_BUILD_PRIO_LIB=1 bash -c '. "$0"; plist /x/gov.sh' "$GOV")"
+grep -q '<key>COLIMA_HOME</key><string>/srv/colima</string>' <<<"$PE" && grep -q '<key>MEMEX_BUILD_PRIO_YIELD_AT</key><string>300</string>' <<<"$PE" \
+  && ! grep -q 'MEMEX_BUILD_PRIO_INTERVAL' <<<"$PE" \
+  && ok "the installing shell's COLIMA_HOME and MEMEX_BUILD_PRIO_* overrides travel into the agent (and only those set)" || bad "persisted env" "$PE"
+GH="$(mktemp -d)"; mkdir -p "$GH/stubs"
+for t in launchctl taskpolicy lsof; do printf '#!/bin/bash\necho "%s $*" >> "%s/log"\nexit 0\n' "$t" "$GH" > "$GH/stubs/$t"; done; chmod +x "$GH/stubs/"*
+OUT="$(env PATH="$GH/stubs:$PATH" HOME="$GH" MEMEX_LOCAL_HOME="$GH/.ml" MEMEX_HEADLESS=1 bash "$GOV" --install --profile build 2>&1)"
+GP="$(cat "$GH/.ml/buildhost-priority.pid" 2>/dev/null)"
+[ -n "$GP" ] && kill -0 "$GP" 2>/dev/null && ! grep -q 'bootstrap' "$GH/log" 2>/dev/null && [ ! -e "$GH/Library/LaunchAgents/com.memex.local.buildhost-priority.plist" ] \
+  && ok "headless (no GUI session) the governor runs as a background process recorded in a pid file, no LaunchAgent" || bad "headless install" "$OUT / $(cat "$GH/log" 2>/dev/null)"
+env PATH="$GH/stubs:$PATH" HOME="$GH" MEMEX_LOCAL_HOME="$GH/.ml" bash "$GOV" --uninstall >/dev/null 2>&1
+[ -n "$GP" ] && ! kill -0 "$GP" 2>/dev/null && [ ! -e "$GH/.ml/buildhost-priority.pid" ] && ok "--uninstall stops the headless process too" || { bad "headless uninstall" ""; [ -n "$GP" ] && kill "$GP" 2>/dev/null; }
+rm -rf "$GH"
+grep -q 'MEMEX_HEADLESS=1 .*buildhost-priority.sh" --install' "$HERE/../../macos/libexec/memex-daemon.sh" \
+  && ok "the unattended daemon starts the governor headless after every boot, once installed" || bad "daemon starts governor" ""
 
 FJB="$(awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI")"
 grep -q '( cmd_buildhost apply ) || warn' <<<"$FJB" && grep -q -- '--no-buildhost) with_build="no"' <<<"$FJB" \

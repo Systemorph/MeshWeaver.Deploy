@@ -175,4 +175,6 @@ helm upgrade --install build-host-mac "$chart" --kube-context "$ctx" -n build-ma
 k -n build-mac get deploy,scaledobject,pvc
 
 echo "== 5/5 fleet jobs at the lowest priority (launchd governor for profile $profile)"
-bash "$here/../homebrew/share/buildhost-priority.sh" --install --profile "$profile"
+# The runners are deployed by now: a governor that cannot load is reported, never a failed attach.
+bash "$here/../homebrew/share/buildhost-priority.sh" --install --profile "$profile" \
+  || echo "WARN: the priority governor did not load — the build VM competes at the default band; re-run: bash deploy/homebrew/share/buildhost-priority.sh --install --profile $profile" >&2
