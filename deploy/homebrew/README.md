@@ -233,7 +233,17 @@ memex-local fleet join --control https://<control-instance> --id studio-2
    `update` pulls the **public GHCR** images anonymously, so no `az login` is needed (`--from-acr`
    still works).
 
-`memex-local fleet status` shows the join and both fingerprints. On the control instance,
+`memex-local fleet status` shows the join and both fingerprints.
+
+**A fleet Mac's template carries the Hosting app.** In registry mode, a joined (`fleet join`) or
+back-leased (`backlease enroll`) Mac layers `share/values.local.fleet-host.yaml`. That layer names
+`Plugins/Hosting` in `PluginCatalog:InstallByDefault` and keeps the platform baseline with
+`InstallPreInstalledPackages=true`. The Mac's first instance therefore installs Hosting by itself; the
+heartbeat and the self-update patcher both ship in Hosting. `MEMEX_FLEET_HOST=0` opts out. Inside the
+autoupdate agent, a registry-mode re-apply also pulls the public GHCR image (`MEMEX_AUTOUPDATE_IMAGE=0`
+opts out). A template that needs a newer platform, such as a package's `minMeshVersion`, therefore lands
+with no hand on the machine. What the registry serves the instance is still its plan's decision.
+ On the control instance,
 `Hosting/Heartbeats/Enrolments` lists every join with the first step not yet measured done.
 
 ## Auto-update of the CLI and its chart — on by default

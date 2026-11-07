@@ -669,6 +669,14 @@ if command -v helm >/dev/null 2>&1; then
   else
     bad "rendered: registry mode with the clear emits no InstallByDefault key" "with clear: $with_clear key(s); without: $without_clear"
   fi
+  fh="$(render -f "$HERE/../share/values.local.fleet-host.yaml" --set-json 'pluginCatalog.installByDefault=[]')"
+  # (here-strings, not printf | grep -q: under pipefail an early-exiting grep SIGPIPEs the printf)
+  if grep -q 'PluginCatalog__InstallByDefault__0: "Plugins/Hosting"' <<<"$fh" \
+     && grep -q 'PluginCatalog__InstallPreInstalledPackages: "true"' <<<"$fh"; then
+    ok "rendered: the fleet-host template names Plugins/Hosting exactly and keeps the platform baseline"
+  else
+    bad "rendered: fleet-host template" "$(printf '%s\n' "$fh" | grep -E 'InstallByDefault|InstallPreInstalled' | head -5)"
+  fi
 else
   printf '  skip  rendered registry-mode InstallByDefault check — helm is not on PATH here (the static check above still ran)\n'
 fi
@@ -1012,6 +1020,22 @@ case "$OUT" in *"JOINED as 'studio-2'"*"sha256:"*) ok "fleet status shows the jo
 case "$OUT" in *"$M"*|*"$C"*) bad "fleet status never prints a key value" "a value is in the output" ;; *) ok "fleet status prints no key value" ;; esac
 grep -q 'mode_args+=(-f "$FLEET_FILE")' "$CLI" && ok "helm_deploy layers the fleet file" || bad "helm_deploy layers the fleet file" "no -f \$FLEET_FILE"
 rm -rf "$FJ"
+
+echo "── a fleet Mac's template carries Hosting (fleet join / backlease, registry mode) ──"
+FH="$(mktemp -d)"; mkdir -p "$FH/home/.memex-local"
+fh_lib() { env HOME="$FH/home" MEMEX_LOCAL_HOME="$FH/home/.memex-local" MEMEX_LOCAL_LIB=1 "$@" bash -c ". \"$CLI\"; fleet_host && echo yes || echo no"; }
+[ "$(fh_lib)" = "no" ] && ok "not registered, not joined: no fleet-host template" || bad "fleet_host off by default" "$(fh_lib)"
+printf 'pluginCatalog:\n  registryUrl: "https://memex.example.test"\n' > "$FH/home/.memex-local/registry.yaml"
+[ "$(fh_lib)" = "no" ] && ok "registry mode alone (a personal Mac) is not a fleet host" || bad "registry alone" "$(fh_lib)"
+: > "$FH/home/.memex-local/backlease.yaml"
+[ "$(fh_lib)" = "yes" ] && ok "a back-leased Mac in registry mode is a fleet host (Hosting by template)" || bad "backlease → fleet host" "$(fh_lib)"
+[ "$(fh_lib MEMEX_FLEET_HOST=0)" = "no" ] && ok "MEMEX_FLEET_HOST=0 opts out" || bad "opt-out" "$(fh_lib MEMEX_FLEET_HOST=0)"
+rm "$FH/home/.memex-local/backlease.yaml"; : > "$FH/home/.memex-local/fleet.yaml"
+[ "$(fh_lib)" = "yes" ] && ok "a joined Mac (fleet join) is a fleet host" || bad "fleet join → fleet host" "$(fh_lib)"
+awk '/^cmd_update\(\) \{/,/^}$/' "$CLI" | grep -q 'image_source="ghcr"' && awk '/^cmd_update\(\) \{/,/^}$/' "$CLI" | grep -q 'MEMEX_IN_AUTOUPDATE' \
+  && ok "inside the autoupdate agent, a registry-mode update --skip-image still follows the public GHCR image" || bad "autoupdate follows GHCR" "missing in cmd_update"
+grep -q 'mode_args+=(-f "$share_dir/values.local.fleet-host.yaml")' "$CLI" && ok "helm_deploy layers the fleet-host template" || bad "helm_deploy layers fleet-host" "missing"
+rm -rf "$FH"
 
 echo "── registry mode pulls the public GHCR anonymously; Ollama runs under launchd ──"
 grep -q 'image_pull_ghcr() {' "$CLI" && ! awk '/^image_pull_ghcr\(\) \{/,/^}$/' "$CLI" | grep -q 'az ' \
