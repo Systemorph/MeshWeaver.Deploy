@@ -766,8 +766,13 @@ publish_signin_summary() {
 # The tailscaled socket to talk to: MEMEX_TAILSCALE_SOCKET, else a USER-SPACE tailscaled's socket under the
 # person's home ($HOME/.tailscale/tailscaled.sock — the shape a fleet Mac runs), else the system default.
 # Without it `tailscale serve` talks to a daemon that is not running and fails.
+# The fleet's own shape is a ROOT LaunchDaemon (com.meshweaver.fleet.tailscaled, socket /var/run/tailscaled.socket
+# — deploy/macos/intune/fleet-bootstrap.sh): it is up before anyone logs in, which the Tailscale app is not.
+# Order: MEMEX_TAILSCALE_SOCKET, that root daemon's socket, a user-space daemon's under the home, the default.
 tailscale_socket() {
+  local root_sock="${MEMEX_TAILSCALED_ROOT_SOCKET:-/var/run/tailscaled.socket}"
   if [ -n "${MEMEX_TAILSCALE_SOCKET:-}" ]; then printf '%s' "$MEMEX_TAILSCALE_SOCKET"
+  elif [ -S "$root_sock" ]; then printf '%s' "$root_sock"
   elif [ -S "$HOME/.tailscale/tailscaled.sock" ]; then printf '%s' "$HOME/.tailscale/tailscaled.sock"
   fi
 }
@@ -1242,7 +1247,7 @@ cmd_fleet() {
           --control)   shift; control="${1:?--control needs the control instance URL}" ;;
           --id)        shift; id="${1:?--id needs the deployment id}" ;;
           --no-open)   open_link="no" ;;
-          --code-file) shift; code_file="${1:?--code-file needs a path}" ;;
+          --code-file) shift; code_file="${1:?--code-file needs a path}" ;;   # absent → print the link, exit 3 (unattended)
           --no-update) do_update="no" ;;
           *) die "fleet join: unknown flag '$1'" ;;
         esac
@@ -1279,6 +1284,12 @@ cmd_fleet() {
       [ "$open_link" = "yes" ] && command -v open >/dev/null 2>&1 && open "$url" >/dev/null 2>&1 || true
 
       local code=""
+      printf '%s\n' "$url" > "$FLEET_DIR/$id.link"
+      if [ -n "$code_file" ] && [ ! -f "$code_file" ]; then
+        # unattended (a device-management run): nothing to paste into — say what is awaited and come back
+        info "WAITING for the approval on control and the enrolment code at $code_file (the link is also in $FLEET_DIR/$id.link)"
+        exit 3
+      fi
       if [ -n "$code_file" ]; then
         code="$(tr -d ' \n\r' < "$code_file")"
       else
