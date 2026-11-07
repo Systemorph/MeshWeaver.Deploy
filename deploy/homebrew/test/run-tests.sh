@@ -1635,10 +1635,81 @@ inn "$CLI" internal off >/dev/null 2>&1
 [ ! -f "$IL" ] && grep -q -- 'serve --tcp 443 off' "$IN/ts.log" && ok "internal off removes the layer and the tailscale serve" || bad "internal off" "$(cat "$IN/ts.log")"
 rm -rf "$IN"
 
+echo "── buildhost: build runners sized from the host, KEDA, no helm by hand ──"
+lib() { env MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c 'set -euo pipefail; . "$0"; shift; "$@"' "$CLI" _ "$@"; }
+P="$(lib buildhost_plan 18 128 8 16 0)"
+[ "$P" = "$(printf 'vm_cpu=16\nvm_mem=104\nrunners_min=1\nrunners_max=4\nrunner_cpu=4\nrunner_cpu_request=3500m\nrunner_mem_request=20\nrunner_mem_limit=24\nstage_slots=4\nstage_total=16')" ] \
+  && ok "an 18-core / 128 GiB Mac: build VM 16 CPU / 104 GiB, runners 1…4 × 4 CPU (request 3.5: system pods fit), 20–24 GiB, 4 stage slots = 16 stage containers" || bad "plan 18/128" "$P"
+P="$(lib buildhost_plan 18 128 8 16 23)"
+grep -q '^vm_mem=81$' <<<"$P" && grep -q '^runner_mem_limit=19$' <<<"$P" && grep -q '^runner_mem_request=15$' <<<"$P" \
+  && ok "the largest local model's memory is kept out of the build VM (23 GiB model → 81 GiB VM, 19 GiB runners)" || bad "plan with model" "$P"
+P="$(lib buildhost_plan 12 36 4 8 0)"
+grep -q '^runners_max=2$' <<<"$P" && grep -q '^runner_mem_limit=8$' <<<"$P" && ok "a smaller Mac gets fewer runners (12 cores → 2), never an over-committed one" || bad "plan small" "$P"
+P="$(lib buildhost_plan 5 64 4 8 0 2>&1)" && bad "a 5-core host is refused" "$P" || { grep -q 'at least 6' <<<"$P" && ok "a host without room for one runner is refused, with the reason" || bad "few cores reason" "$P"; }
+P="$(lib buildhost_plan 18 32 8 16 0 2>&1)" && bad "a memory-starved host is refused" "$P" || { grep -q 'needs at least 8 GiB' <<<"$P" && ok "a host without memory for one runner is refused, with the arithmetic" || bad "low memory reason" "$P"; }
+P="$(env MEMEX_BUILD_MIN_WARM=9 MEMEX_LOCAL_LIB=1 bash -c '. "$0"; buildhost_plan 18 128 8 16 0' "$CLI")"
+grep -q '^runners_min=4$' <<<"$P" && ok "the warm floor never exceeds the ceiling" || bad "min clamp" "$P"
+M="$(env MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c '. "$0"; ollama() { printf "%s\n" "NAME ID SIZE MODIFIED" "qwen3.6:latest abc 23.4 GB 2 days ago" "qwen2.5:0.5b def 397 MB 3 days ago"; }; largest_model_gib' "$CLI")"
+[ "$M" = 24 ] && ok "the largest model's size is read from 'ollama list' and rounded UP (23.4 GB → 24)" || bad "largest model" "$M"
+# apply against recording stubs: a missing VM is created at the plan; an installed release is sized; never the portal's context.
+BH="$(mktemp -d)"; mkdir -p "$BH/stubs"
+for t in colima helm kubectl; do cat > "$BH/stubs/$t" <<STUB
+#!/bin/bash
+# Version probes (the toolchain resolver's floor check) are answered at the manifest's version; nothing reaches a real binary.
+case "\$*" in *version*) case "$t" in colima) echo "colima version 0.10.3" ;; kubectl) echo "Client Version: v1.37.1" ;; helm) echo "v4.3.1+gabc" ;; esac; exit 0 ;; esac
+echo "$t \$*" >> "$BH/log"
+case "$t \$*" in
+  "colima list"*) printf '%s' "\${FAKE_COLIMA_LIST:-}" ;;
+  "helm "*" status build-host-mac"*) exit "\${FAKE_RELEASE_RC:-1}" ;;
+esac
+exit 0
+STUB
+done; chmod +x "$BH/stubs/"*
+# PATH holds the stubs and the system directories ONLY (no Homebrew), and MEMEX_PREFIX names an empty
+# prefix: the resolver can find no real colima, helm or kubectl — a test must never start a VM.
+mkdir -p "$BH/prefix"
+bh() { env PATH="$BH/stubs:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" MEMEX_PREFIX="$BH/prefix" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
+OUT="$(bh "$CLI" buildhost apply 2>&1)"
+grep -q 'colima start -p build --cpu 16 --memory 104 --disk 100 --runtime containerd --kubernetes' "$BH/log" && grep -q 'kubectl --context colima-build get crd scaledobjects.keda.sh' "$BH/log" \
+  && case "$OUT" in *"first attach installs it"*) true ;; *) false ;; esac \
+  && ok "apply creates the build VM at the plan (containerd, k3s), checks KEDA in colima-build, and names the first attach for a missing release" || bad "apply create" "$OUT / $(cat "$BH/log")"
+: > "$BH/log"
+OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
+grep -q 'helm --kube-context colima-build -n build-mac upgrade build-host-mac .* --reuse-values --set buildHosts.mac.minReplicas=1 --set buildHosts.mac.maxReplicas=4 --set-string buildHosts.resources.requests.cpu=3500m --set-string buildHosts.resources.requests.memory=20Gi --set-string buildHosts.resources.limits.cpu=4 --set-string buildHosts.resources.limits.memory=24Gi --set buildHosts.stageSlots=4' "$BH/log" \
+  && ! grep -q 'colima start\|colima stop' "$BH/log" \
+  && ok "an installed release is sized in place (--reuse-values, its own context); a VM that covers the plan is not restarted" || bad "apply size" "$OUT / $(cat "$BH/log")"
+: > "$BH/log"
+OUT="$(bh FAKE_COLIMA_LIST=$'{"name":"default","cpus":8,"memory":17179869184}\n{"name":"build","status":"Running","cpus":8,"memory":25769803776}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
+! grep -q 'colima stop' "$BH/log" && grep -q 'maxReplicas=2 ' "$BH/log" && case "$OUT" in *"apply --resize"*) true ;; *) false ;; esac \
+  && ok "a smaller VM is NOT restarted without --resize: the runners are sized to what it has, and the resize is named" || bad "apply no resize" "$OUT / $(cat "$BH/log")"
+: > "$BH/log"
+bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":8,"memory":25769803776}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize >/dev/null 2>&1
+grep -q 'colima stop -p build' "$BH/log" && grep -q 'colima start -p build --cpu 16 --memory 104' "$BH/log" && grep -q 'maxReplicas=4 ' "$BH/log" \
+  && ok "--resize restarts the build VM at the plan and sizes the runners to it" || bad "apply resize" "$(cat "$BH/log")"
+: > "$BH/log"
+bh FAKE_COLIMA_LIST='{"name":"build","status":"Stopped","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply >/dev/null 2>&1
+grep -q '^colima start -p build$' "$BH/log" && grep -q 'upgrade build-host-mac' "$BH/log" && ok "a STOPPED build VM is started before its release is sized (never a helm call against a stopped cluster)" || bad "stopped vm" "$(cat "$BH/log")"
+grep -q 'kubectl --context colima-build -n keda wait --for=condition=Available deployment --all' "$BH/log" && ok "KEDA is checked for Available deployments, not only its CRD" || bad "keda health" "$(cat "$BH/log")"
+OUT="$(bh MEMEX_HOST_MEM_GIB=abc "$CLI" buildhost plan 2>&1)" && bad "a non-numeric probe was used" "$OUT" || { case "$OUT" in *"instead of a whole number"*) ok "a host probe that is not a whole number stops the plan (never sized from 0)" ;; *) bad "probe validation" "$OUT" ;; esac; }
+rm -rf "$BH"
+FJB="$(awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI")"
+grep -q '( cmd_buildhost apply ) || warn' <<<"$FJB" && grep -q -- '--no-buildhost) with_build="no"' <<<"$FJB" \
+  && ok "fleet join runs buildhost apply by default (--no-buildhost skips it), and a failure there never ends the join" || bad "fleet join buildhost" ""
+# back-lease: the owner DECLARES how full a leased Mac may get.
+[ "$(lib percent_arg 85 --x)" = 85 ] && [ "$(lib percent_arg 85% --x)" = 85 ] && ok "a threshold is a whole percentage (85 or 85%)" || bad "percent ok" ""
+lib percent_arg 5 --x >/dev/null 2>&1 && bad "5% accepted" "" || ok "a threshold below 10% is refused"
+lib percent_arg 99 --x >/dev/null 2>&1 && bad "99% accepted" "" || ok "a threshold above 95% is refused"
+lib percent_arg 0.7 --x >/dev/null 2>&1 && bad "0.7 accepted" "" || ok "a fraction is refused (whole percentages only)"
+BL="$(mktemp -d)"
+env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$BL" HOME="$BL" bash -c '. "$0"; write_backlease_file https://control.example.test mac-1 30 "" 85 60 90 80' "$CLI" >/dev/null 2>&1
+grep -q 'Hosting__BackLease__HostLoadMax: "85%"' "$BL/backlease.yaml" && grep -q 'Hosting__BackLease__HostMemoryMax: "60%"' "$BL/backlease.yaml" && grep -q 'Hosting__BackLease__VmCpuMax: "90%"' "$BL/backlease.yaml" && grep -q 'Hosting__BackLease__VmMemoryMax: "80%"' "$BL/backlease.yaml" \
+  && ok "the back-lease layer declares the host load/memory and VM CPU/memory ceilings for the heartbeat" || bad "backlease thresholds" "$(ls "$BL"; cat "$BL"/backlease.yaml 2>/dev/null)"
+rm -rf "$BL"
+
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
-for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease fleet llm relay publish autoupdate; do
+for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease buildhost fleet llm relay publish autoupdate; do
   case "$help_out" in
     *"$cmd"*) ;;
     *) bad "help documents '$cmd'" "not in the usage text"; continue ;;

@@ -598,8 +598,16 @@ backlease_control()    { backlease_value "Hosting__ReportTo"; }
 backlease_deployment() { backlease_value "Hosting__Deployment"; }
 backlease_interval()   { local v; v="$(backlease_value "Hosting__BackLease__Interval")"; printf '%s' "${v:-30}"; }
 
+# A placement threshold as a whole percentage within 10…95 (the owner decides how full a leased Mac may get).
+percent_arg() {
+  local v="${1%\%}"
+  case "$v" in ''|*[!0-9]*) echo "ERROR: $2 must be a whole percentage (10–95), got '$1'" >&2; return 1 ;; esac
+  [ "$v" -ge 10 ] && [ "$v" -le 95 ] || { echo "ERROR: $2 must be between 10 and 95 percent, got '$1'" >&2; return 1; }
+  printf '%s' "$v"
+}
+
 write_backlease_file() {
-  local control="$1" deployment="$2" interval="$3" repo="$4"
+  local control="$1" deployment="$2" interval="$3" repo="$4" load_max="${5:-70}" mem_max="${6:-70}" vm_cpu_max="${7:-70}" vm_mem_max="${8:-70}"
   mkdir -p "$LOCAL_HOME" "$BACKLEASE_DIR"
   ( umask 077; cat > "$BACKLEASE_FILE" ) <<YAML
 # memex-local BACK-LEASE — managed by \`memex-local backlease\`; re-run \`enroll\` to change, \`off\` to
@@ -617,6 +625,10 @@ config:
     Hosting__BackLease__Enabled: "true"
     Hosting__BackLease__Interval: "${interval}"
     Hosting__BackLease__ReadingsPath: "/host-readings/readings.json"
+    Hosting__BackLease__HostLoadMax: "${load_max}%"
+    Hosting__BackLease__HostMemoryMax: "${mem_max}%"
+    Hosting__BackLease__VmCpuMax: "${vm_cpu_max}%"
+    Hosting__BackLease__VmMemoryMax: "${vm_mem_max}%"
 ${repo:+    Hosting__BackLease__Repository: "${repo}"
 }extraVolumes:
   - name: backlease-readings
@@ -674,9 +686,13 @@ cmd_backlease() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
     enroll)
-      local control="" deployment="" interval="30" repo=""
+      local control="" deployment="" interval="30" repo="" load_max="70" mem_max="70" vm_cpu_max="70" vm_mem_max="70"
       while [ $# -gt 0 ]; do
         case "$1" in
+          --host-load-max)   shift; load_max="$(percent_arg "${1:?--host-load-max needs a percentage}" --host-load-max)" || exit 1 ;;
+          --host-memory-max) shift; mem_max="$(percent_arg "${1:?--host-memory-max needs a percentage}" --host-memory-max)" || exit 1 ;;
+          --vm-cpu-max)      shift; vm_cpu_max="$(percent_arg "${1:?--vm-cpu-max needs a percentage}" --vm-cpu-max)" || exit 1 ;;
+          --vm-memory-max)   shift; vm_mem_max="$(percent_arg "${1:?--vm-memory-max needs a percentage}" --vm-memory-max)" || exit 1 ;;
           --control)    shift; control="${1:?--control needs a URL}" ;;
           --deployment) shift; deployment="${1:?--deployment needs an id}" ;;
           --interval)   shift; interval="${1:?--interval needs seconds}" ;;
@@ -697,8 +713,8 @@ cmd_backlease() {
       # Preconditions the design names (Hosting/BackLease §2): registry mode, Colima up, the portal reachable.
       registry_mode || die "backlease enroll: this install is not in REGISTRY MODE — run 'memex-local registry <url>' first (a leased machine consumes the registry's bundles, it cannot be its own registry)"
       colima_running || die "backlease enroll: Colima is not running — 'memex-local up' first"
-      write_backlease_file "${control%/}" "$deployment" "$interval" "$repo"
-      ok "back-lease layer written: $BACKLEASE_FILE (reports to ${control%/} as '$deployment', heartbeat every ${interval}s)"
+      write_backlease_file "${control%/}" "$deployment" "$interval" "$repo" "$load_max" "$mem_max" "$vm_cpu_max" "$vm_mem_max"
+      ok "back-lease layer written: $BACKLEASE_FILE (reports to ${control%/} as '$deployment', heartbeat every ${interval}s; leased work only while host load < ${load_max}%, host memory < ${mem_max}%, VM CPU < ${vm_cpu_max}%, VM memory < ${vm_mem_max}%)"
       install_backlease_sampler "$interval"
       backlease_declarations "${control%/}" "$deployment"
       info "Apply it: memex-local update   (re-renders the chart with the back-lease layer; the portal's heartbeat arms on its next activation)"
@@ -733,7 +749,7 @@ cmd_backlease() {
         info "back-lease was not on"
       fi
       ;;
-    *) die "usage: memex-local backlease {enroll --control <url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] | status | off}" ;;
+    *) die "usage: memex-local backlease {enroll --control <url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>] | status | off}" ;;
   esac
 }
 
@@ -1393,7 +1409,7 @@ cmd_fleet() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
     join)
-      local control="" id="" open_link="yes" code_file="" do_update="yes" with_obs="yes"
+      local control="" id="" open_link="yes" code_file="" do_update="yes" with_obs="yes" with_build="yes"
       while [ $# -gt 0 ]; do
         case "$1" in
           --control)   shift; control="${1:?--control needs the control instance URL}" ;;
@@ -1402,6 +1418,7 @@ cmd_fleet() {
           --code-file) shift; code_file="${1:?--code-file needs a path}" ;;   # absent → print the link, exit 3 (unattended)
           --no-update) do_update="no" ;;
           --no-observability) with_obs="no" ;;
+          --no-buildhost) with_build="no" ;;
           *) die "fleet join: unknown flag '$1'" ;;
         esac
         shift
@@ -1478,6 +1495,10 @@ cmd_fleet() {
           # A subshell: a die inside (preflight, helm) fails THIS step, loudly, and the join carries on.
           ( cmd_observability ) || warn "observability did not install — re-run 'memex-local observability'"
         fi
+        if [ "$with_build" = "yes" ]; then
+          step "Build runners (a build VM sized from this host, KEDA; the release on its first attach)"
+          ( cmd_buildhost apply ) || warn "the build host did not finish — re-run 'memex-local buildhost apply'"
+        fi
       else
         info "Apply it: memex-local update"
       fi
@@ -1497,7 +1518,7 @@ cmd_fleet() {
         info "not joined — memex-local fleet join --control https://<control-instance> --id <id>"
       fi
       ;;
-    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] [--no-observability] | status}" ;;
+    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] | status}" ;;
   esac
 }
 
@@ -3920,6 +3941,206 @@ cmd_observability() {                            # §11
   info "Then open http://localhost:3000  (user: admin)  — query {namespace=\"memex\"}"
 }
 
+# ---------------------------------------------------------------------------
+# BUILD HOST — the Mac's build runners, sized from the host (MeshWeaver.Plugins Hosting/MacStudioFleet §2b.5)
+# ---------------------------------------------------------------------------
+# The runners live in their OWN Colima profile (containerd: a user-namespaced pod), never in the portal's.
+readonly BUILD_PROFILE="${MEMEX_BUILD_PROFILE:-build}"
+readonly BUILD_NS="build-mac"
+readonly BUILD_RELEASE="build-host-mac"
+readonly BUILD_CPU_PER_RUNNER="${MEMEX_BUILD_CPU_PER_RUNNER:-4}"   # one runner's CPU = its stage slots
+readonly BUILD_MIN_WARM="${MEMEX_BUILD_MIN_WARM:-1}"               # KEDA floor: runners kept warm
+readonly BUILD_HEADROOM_GIB=8                                      # macOS, the menu bar apps, file cache
+readonly BUILD_SYSTEM_GIB=4                                        # k3s, KEDA and the kubelet inside the VM
+readonly BUILD_RUNNER_MAX_GIB=24                                   # one runner's memory limit, at most
+build_ctx() { if [ "$BUILD_PROFILE" = default ]; then printf colima; else printf 'colima-%s' "$BUILD_PROFILE"; fi; }
+build_kubectl() { kubectl --context "$(build_ctx)" "$@"; }
+
+host_cores() { [ -n "${MEMEX_HOST_CORES:-}" ] && { printf '%s' "$MEMEX_HOST_CORES"; return; }; sysctl -n hw.ncpu 2>/dev/null || nproc; }
+host_mem_gib() {
+  [ -n "${MEMEX_HOST_MEM_GIB:-}" ] && { printf '%s' "$MEMEX_HOST_MEM_GIB"; return; }
+  local b; b="$(sysctl -n hw.memsize 2>/dev/null || awk '/^MemTotal:/ { print $2 * 1024 }' /proc/meminfo)"
+  printf '%s' "$(( b / 1073741824 ))"
+}
+# The largest local model's size in whole GiB (rounded up) — it is resident in unified memory when it answers.
+largest_model_gib() {
+  [ -n "${MEMEX_MODEL_GIB:-}" ] && { printf '%s' "$MEMEX_MODEL_GIB"; return; }
+  command -v ollama >/dev/null 2>&1 || { printf 0; return; }
+  ollama list 2>/dev/null | awk 'NR > 1 { for (i = 1; i < NF; i++) if ($(i+1) ~ /^(GB|MB)$/) { v = ($(i+1) == "GB") ? $i : $i / 1024; if (v > m) m = v } }
+    END { printf "%d", (m == int(m)) ? m : int(m) + 1 }'
+}
+
+# The plan, as key=value lines, from the host and the portal VM. Pure arithmetic over its inputs:
+#   build VM CPU   = cores − 2 (macOS and Ollama keep two)
+#   build VM GiB   = host − portal VM − largest model − headroom
+#   runners (max)  = VM CPU / CPU per runner, each with stage slots = CPU per runner, so the stage containers
+#                    of all runners together ≈ the VM's CPUs; KEDA keeps BUILD_MIN_WARM warm and scales to max
+#   runner memory  = (VM GiB − the VM's own system share) / max runners, capped; request = limit − 4 GiB
+#   (host − portal VM: every OTHER Colima profile's memory is subtracted, see other_vms_gib)
+buildhost_plan() {
+  # $3 (the portal VM's CPU) is not subtracted: the two VMs share the host's cores, and macOS schedules
+  # whichever is busy; memory is not shared, so the portal VM's memory is.
+  local cores="$1" mem="$2" pmem="$4" model="$5" per="$BUILD_CPU_PER_RUNNER"
+  local cpu=$(( cores - 2 )) vmem=$(( mem - pmem - model - BUILD_HEADROOM_GIB ))
+  [ "$cpu" -ge "$per" ] || { echo "error=the host has $cores cores; a build VM needs at least $(( per + 2 )) (cores − 2 ≥ one runner's $per CPU)"; return 1; }
+  local runners=$(( cpu / per )) lim req
+  lim=$(( (vmem - BUILD_SYSTEM_GIB) / runners )); [ "$lim" -le "$BUILD_RUNNER_MAX_GIB" ] || lim="$BUILD_RUNNER_MAX_GIB"
+  [ "$lim" -ge 8 ] || { echo "error=only ${vmem} GiB left for the build VM (host ${mem} − portal VM ${pmem} − model ${model} − headroom ${BUILD_HEADROOM_GIB}); a runner needs at least 8 GiB"; return 1; }
+  req=$(( lim - 4 ))
+  local minw="$BUILD_MIN_WARM"; [ "$minw" -le "$runners" ] || minw="$runners"
+  # The CPU REQUEST sits half a core under the limit: k3s, KEDA and the kubelet request CPU too, and N runners
+  # requesting the VM's every core would leave the last one Pending. The limit still lets each use its 4.
+  printf 'vm_cpu=%s\nvm_mem=%s\nrunners_min=%s\nrunners_max=%s\nrunner_cpu=%s\nrunner_cpu_request=%sm\nrunner_mem_request=%s\nrunner_mem_limit=%s\nstage_slots=%s\nstage_total=%s\n' \
+    "$cpu" "$vmem" "$minw" "$runners" "$per" "$(( per * 1000 - 500 ))" "$req" "$lim" "$per" "$(( runners * per ))"
+}
+plan_value() { awk -F= -v k="$1" '$1 == k { print $2; exit }' <<<"$2"; }
+
+# The current build VM's size (CPU and GiB) from colima, or empty when the profile does not exist.
+build_vm_size() {
+  # `colima list --json` prints one object per profile (memory in bytes); the profile is matched by NAME.
+  colima list --json 2>/dev/null | python3 -c 'import json,sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    d = json.loads(line)
+    if d.get("name") == sys.argv[1]:
+        print(d.get("cpus", 0), int(int(d.get("memory", 0)) / 1073741824), d.get("status", "Unknown"))
+        break' "$BUILD_PROFILE" 2>/dev/null || true
+}
+
+# The memory every OTHER Colima profile claims (GiB) — the portal's and any other VM on this Mac, running
+# or not (a stopped VM starts again at its size) — or the portal VM's configured size, whichever is larger.
+other_vms_gib() {
+  local sum
+  sum="$(colima list --json 2>/dev/null | python3 -c 'import json,sys
+t = 0
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    d = json.loads(line)
+    if d.get("name") != sys.argv[1]: t += int(d.get("memory", 0))
+print(t // 1073741824)' "$BUILD_PROFILE" 2>/dev/null)" || sum=0
+  [ "${sum:-0}" -ge "$COLIMA_MEM" ] 2>/dev/null || sum="$COLIMA_MEM"
+  printf '%s' "$sum"
+}
+
+# The tools the build host needs, resolved like every other command (an existing install meeting the floor,
+# else the installer's vendored copy) — never whatever `colima`/`helm` happens to be first on PATH.
+buildhost_tools() { tools_activate; need colima colima; need kubectl kubernetes-cli; need helm helm; }
+
+# `colima start -p <profile>` makes that profile's context the CURRENT kubectl context, which every unpinned
+# portal command would then follow into the build cluster. Run it, then put the previous context back.
+colima_keep_context() {
+  local prev rc=0
+  prev="$(kubectl config current-context 2>/dev/null || true)"
+  "$@" || rc=$?
+  if [ -n "$prev" ]; then kubectl config use-context "$prev" >/dev/null 2>&1 || warn "could not restore the kubectl context '$prev' — run 'kubectl config use-context $prev'"; fi
+  return "$rc"
+}
+
+cmd_buildhost() {
+  local sub="${1:-status}"; shift || true
+  buildhost_tools
+  local plan others probe
+  others="$(other_vms_gib)"
+  # Every probe is a whole number, or nothing is computed from it (an empty sysctl would read as 0 and
+  # hand the build VM the whole machine).
+  for probe in "$(host_cores)" "$(host_mem_gib)" "$others" "$(largest_model_gib)"; do
+    case "$probe" in ''|*[!0-9]*) die "buildhost: a host probe returned '$probe' instead of a whole number (cores, memory, other VMs, largest model) — set MEMEX_HOST_CORES / MEMEX_HOST_MEM_GIB / MEMEX_MODEL_GIB to override" ;; esac
+  done
+  [ "$(host_mem_gib)" -gt 0 ] && [ "$(host_cores)" -gt 0 ] || die "buildhost: the host reported 0 cores or 0 GiB — refusing to size from it"
+  plan="$(buildhost_plan "$(host_cores)" "$(host_mem_gib)" "$COLIMA_CPU" "$others" "$(largest_model_gib)")" \
+    || die "buildhost: $(plan_value error "$plan")"
+  local cpu vmem
+  cpu="$(plan_value vm_cpu "$plan")"; vmem="$(plan_value vm_mem "$plan")"
+  case "$sub" in
+    plan)
+      [ $# -eq 0 ] || die "buildhost plan: takes no arguments"
+      info "host: $(host_cores) cores, $(host_mem_gib) GiB; other VMs ${others} GiB (the portal's included); largest model $(largest_model_gib) GiB"
+      info "build VM (profile $BUILD_PROFILE): ${cpu} CPU / ${vmem} GiB"
+      info "runners: $(plan_value runners_min "$plan") warm … $(plan_value runners_max "$plan") (KEDA), each ${BUILD_CPU_PER_RUNNER} CPU / $(plan_value runner_mem_request "$plan")–$(plan_value runner_mem_limit "$plan") GiB, $(plan_value stage_slots "$plan") stage slots → up to $(plan_value stage_total "$plan") stage containers at once"
+      ;;
+    apply)
+      local resize="no"
+      while [ $# -gt 0 ]; do case "$1" in --resize) resize="yes" ;; *) die "buildhost apply: unknown flag '$1'" ;; esac; shift; done
+      local size have_cpu have_mem
+      size="$(build_vm_size)"
+      if [ -z "$size" ]; then
+        step "Creating the build VM (Colima profile $BUILD_PROFILE: ${cpu} CPU / ${vmem} GiB, containerd, k3s)"
+        colima_keep_context colima start -p "$BUILD_PROFILE" --cpu "$cpu" --memory "$vmem" --disk 100 --runtime containerd --kubernetes \
+          --k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet \
+          || die "buildhost: could not start the build VM (colima start -p $BUILD_PROFILE)"
+      else
+        local have_status
+        read -r have_cpu have_mem have_status <<<"$size"
+        if [ "$have_status" != "Running" ] && { [ "$resize" != "yes" ] || { [ "${have_cpu:-0}" -ge "$cpu" ] && [ "${have_mem:-0}" -ge "$vmem" ]; }; }; then
+          step "Starting the build VM (profile $BUILD_PROFILE is ${have_status:-not running})"
+          colima_keep_context colima start -p "$BUILD_PROFILE" || die "buildhost: could not start the build VM (colima start -p $BUILD_PROFILE)"
+        fi
+        if [ "${have_cpu:-0}" -lt "$cpu" ] || [ "${have_mem:-0}" -lt "$vmem" ]; then
+          if [ "$resize" = "yes" ]; then
+            step "Resizing the build VM ${have_cpu} CPU / ${have_mem} GiB → ${cpu} / ${vmem} (a restart: running builds are re-queued by the build API; the disk is kept)"
+            colima stop -p "$BUILD_PROFILE" || die "buildhost: could not stop the build VM for the resize"
+            colima_keep_context colima start -p "$BUILD_PROFILE" --cpu "$cpu" --memory "$vmem" \
+              || die "buildhost: the build VM stopped but did not start at ${cpu} CPU / ${vmem} GiB — 'colima start -p $BUILD_PROFILE' starts it again"
+          else
+            warn "the build VM is ${have_cpu} CPU / ${have_mem} GiB, the plan is ${cpu} / ${vmem} — 'memex-local buildhost apply --resize' restarts it at that size"
+            cpu="$have_cpu"; vmem="$have_mem"
+            plan="$(buildhost_plan $(( cpu + 2 )) $(( vmem + others + $(largest_model_gib) + BUILD_HEADROOM_GIB )) "$COLIMA_CPU" "$others" "$(largest_model_gib)")" \
+              || die "buildhost: the current build VM is too small for one runner — 'memex-local buildhost apply --resize'"
+          fi
+        else
+          ok "build VM ${have_cpu} CPU / ${have_mem} GiB covers the plan"
+        fi
+      fi
+      buildhost_keda
+      if helm --kube-context "$(build_ctx)" -n "$BUILD_NS" status "$BUILD_RELEASE" >/dev/null 2>&1; then
+        step "Sizing the runners: $(plan_value runners_min "$plan")…$(plan_value runners_max "$plan") × ${BUILD_CPU_PER_RUNNER} CPU, $(plan_value stage_slots "$plan") stage slots"
+        helm --kube-context "$(build_ctx)" -n "$BUILD_NS" upgrade "$BUILD_RELEASE" "$(resolve_chart)" --reuse-values \
+          --set "buildHosts.mac.minReplicas=$(plan_value runners_min "$plan")" \
+          --set "buildHosts.mac.maxReplicas=$(plan_value runners_max "$plan")" \
+          --set-string "buildHosts.resources.requests.cpu=$(plan_value runner_cpu_request "$plan")" \
+          --set-string "buildHosts.resources.requests.memory=$(plan_value runner_mem_request "$plan")Gi" \
+          --set-string "buildHosts.resources.limits.cpu=${BUILD_CPU_PER_RUNNER}" \
+          --set-string "buildHosts.resources.limits.memory=$(plan_value runner_mem_limit "$plan")Gi" \
+          --set "buildHosts.stageSlots=$(plan_value stage_slots "$plan")" >/dev/null \
+          || die "buildhost: helm could not size the release $BUILD_RELEASE"
+        ok "runners sized: up to $(plan_value stage_total "$plan") stage containers at once"
+      else
+        warn "no build-host release yet: the first attach installs it with this Mac's worker token (MeshWeaver.Deploy deploy/backlease/first-attach.sh --profile $BUILD_PROFILE …); then re-run 'memex-local buildhost apply' to size it. Target: the token arrives through the enrolment channel (Hosting/MacStudioFleet §2b.5)"
+      fi
+      ;;
+    status)
+      [ $# -eq 0 ] || die "buildhost status: takes no arguments"
+      local size2; size2="$(build_vm_size)"
+      if [ -z "$size2" ]; then info "no build VM (Colima profile $BUILD_PROFILE) — memex-local buildhost apply"; return 0; fi
+      ok "build VM $BUILD_PROFILE: $size2 (CPU, GiB); plan ${cpu} / ${vmem}"
+      helm --kube-context "$(build_ctx)" -n "$BUILD_NS" get values "$BUILD_RELEASE" -o json 2>/dev/null | python3 -c 'import json,sys
+v = json.load(sys.stdin).get("buildHosts", {})
+m, r = v.get("mac", {}), v.get("resources", {})
+print("  runners %s…%s, %s stage slots, requests %s, limits %s" % (m.get("minReplicas", "?"), m.get("maxReplicas", "?"), v.get("stageSlots", "?"), r.get("requests"), r.get("limits")))' 2>/dev/null \
+        || warn "no build-host release $BUILD_RELEASE in $(build_ctx)"
+      build_kubectl -n "$BUILD_NS" get pods --no-headers 2>/dev/null | awk '{ print "  " $1 "  " $3 }' || true
+      ;;
+    *) die "usage: memex-local buildhost {plan | apply [--resize] | status}" ;;
+  esac
+}
+
+# KEDA in the build VM: the runners' scaler. Idempotent.
+buildhost_keda() {
+  if build_kubectl get crd scaledobjects.keda.sh >/dev/null 2>&1; then
+    build_kubectl -n keda wait --for=condition=Available deployment --all --timeout=120s >/dev/null 2>&1 \
+      || die "buildhost: KEDA is installed in $(build_ctx) but its deployments are not Available — the runners could not scale ('kubectl --context $(build_ctx) -n keda get pods')"
+    ok "KEDA ready in $(build_ctx)"; return 0
+  fi
+  step "Installing KEDA into $(build_ctx)"
+  helm repo add kedacore https://kedacore.github.io/charts >/dev/null 2>&1 || true
+  helm repo update kedacore >/dev/null 2>&1 || true
+  helm --kube-context "$(build_ctx)" upgrade --install keda kedacore/keda -n keda --create-namespace --wait >/dev/null \
+    || die "buildhost: could not install KEDA into $(build_ctx)"
+  build_kubectl get crd scaledobjects.keda.sh >/dev/null 2>&1 || die "buildhost: KEDA installed but scaledobjects.keda.sh is missing in $(build_ctx)"
+}
+
 # The effective host profile — what `up` would size the VM and pull for. Refuses an unknown profile.
 cmd_profile() {
   [ $# -eq 0 ] || die "profile: takes no arguments (set MEMEX_PROFILE=mac-studio|mac-mini)"
@@ -4016,7 +4237,7 @@ COMMANDS:
   llm use [--model qwen3.6] [--residency Eu|Global] | status | off
                   LOCAL MODEL: the Mac own Ollama serves the portal utility tier (inbox
                   triage, reply drafts, calendar suggestions). Addressed by IP; apply with update.
-  fleet join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] [--no-observability] | status
+  fleet join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] | status
                   JOIN THIS MAC TO THE FLEET in one command (MeshWeaver.Plugins Hosting/MacStudioFleet
                   §2b): prints a link to the control instance's approval page with this Mac's key
                   fingerprint; a global administrator approves it there and the page shows an
@@ -4024,9 +4245,16 @@ COMMANDS:
                   ~/.memex-local/fleet.yaml (the heartbeat and announcement keys, 0600 — never
                   printed, only their sha256 fingerprints), runs backlease enroll, starts Ollama
                   under launchd on the Mac's loopback, updates from the public GHCR and installs
-                  the observability stack sized for the VM (--no-observability skips it).
+                  the observability stack sized for the VM (--no-observability skips it) and
+                  the build VM sized from this host (buildhost apply; --no-buildhost skips it).
                   'status' shows the fingerprints.
-  backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] | status | off
+  buildhost plan | apply [--resize] | status
+                  BUILD RUNNERS sized from this host: a build VM (Colima profile build, containerd)
+                  of cores − 2 CPU and host − portal VM − largest model − headroom GiB; runners of
+                  4 CPU with 4 stage slots each, 1 warm … VM CPU / 4 under KEDA, so the stage
+                  containers together fill the VM. 'apply' creates the VM and KEDA and sizes an
+                  installed release; --resize restarts a smaller VM at the planned size.
+  backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>] | status | off
   internal on --tenant <id> --client-id <id> < secret | status | off
                   INTERNAL ONLY — the fleet default: the portal answers at this Mac's private-network
                   name (https://<machine>.net.<domain>) over the private network only, with its
@@ -4614,6 +4842,7 @@ main() {
     registry)      cmd_registry "$@" ;;
     backlease)     cmd_backlease "$@" ;;
     fleet)         cmd_fleet "$@" ;;
+    buildhost)     cmd_buildhost "$@" ;;
     llm)           cmd_llm "$@" ;;
     publish)       cmd_publish "$@" ;;
     cert)          cmd_cert "$@" ;;
