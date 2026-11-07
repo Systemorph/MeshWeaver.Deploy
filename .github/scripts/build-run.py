@@ -2842,16 +2842,22 @@ def _update_mirror(repo: str, url: str, mirror_root: str, mirror: str, wanted: l
 # ───────────────────────────────── the warm workspace (Plugins Hosting/BuildQueue.md §7.2) ─────────────────────
 #
 # Owner, 2026-11-07: "a consistently checked out state on the file system of the pod … keep updating the parts of the
-# git repos and use dotnet build with correct caching". With MW_BUILD_WARM_WORKSPACE=true a replica keeps ONE checkout
-# per repository under `<work>/.warm/<repo>` across runs (a replica runs one run at a time; its stage slots share that
-# run's tree, exactly as they share a fresh one). Each run moves it to the exact sha — fetch through the mirror,
-# checkout --force --detach, reset --hard, `git clean -ffdx` EXCEPT `obj/` and `bin/` — so MSBuild's incremental state
-# survives and every tracked or untracked file is exactly the commit's. The workspace is WIPED whenever its key (the
-# platform set, the framework identity and the images the host runs) changes, and on any failure of the warm path the
-# run falls back to a fresh clone, said. Every run states which it got: `incremental, seeded from <sha>` or `clean (why)`.
+# git repos and use dotnet build with correct caching". With MW_BUILD_WARM_WORKSPACE=true:
+#   * ONE warm MAIN workspace per repository per replica, `<work>/.warm/<repo>`, written ONLY by the host and ONLY from the
+#     default branch: while the host is idle it moves the workspace to the mirror's tip (fetch, checkout --force --detach,
+#     reset --hard, `git clean -ffdx` except obj/ and bin/) and runs the TIP's own declared `warmBuild` command in it, in
+#     the sandbox, once per (tip, key) — as the warm NuGet cache is filled from the tip, never from a run's content
+#     (StandingBuildHosts §4: a pull request never writes a shared cache);
+#   * EVERY run gets a disposable COPY of it in its own workdir (`cp -a --reflink=auto`), moves the copy to its exact sha
+#     the same way and builds incrementally in the copy; the copy goes with the workdir, so no run can poison, or even see,
+#     what a later run reads. A run's compiler servers end with its stage sandbox (the pid-namespace leftover check).
+# The warm workspace is WIPED whenever its key (the platform set, the framework identity and the images the host runs)
+# changes; any failure of the warm path falls back to a fresh clone, said. Every run states what it got:
+# `workspace: incremental copy of main@<tip> (…) moved to <sha>` or `workspace: clean (why)`.
 WARM_DIR = ".warm"
 WARM_STATE = ".mw-warm.json"
 WARM_KEEP = ("obj/", "bin/")
+WARM_BUILD_MAX_MINUTES = 60
 
 
 def warm_key(env: dict, identity: str) -> str:
@@ -2865,58 +2871,123 @@ def warm_enabled(env: dict) -> bool:
     return (env.get("MW_BUILD_WARM_WORKSPACE") or "").strip().lower() in ("1", "true", "yes")
 
 
-def warm_checkout(repo: str, sha: str, refs: list, dest: str, token: Optional[str], env: dict, log: Callable[[str], None],
-                  key: str, deadline: Optional[float] = None, git: Optional[Callable[..., None]] = None,
-                  fresh: Optional[Callable[..., None]] = None) -> str:
-    """Move the replica's warm workspace `dest` to `sha` (see above); returns the plan line naming how it was seeded.
-    Never leaves a half-moved tree: any failure wipes `dest` and clones it fresh (`fresh`, default_checkout)."""
-    fresh = fresh or default_checkout
-    state_file = os.path.join(dest, ".git", WARM_STATE)
+def warm_state(warm: str) -> Optional[dict]:
     try:
-        with open(state_file) as fh:
-            state = json.load(fh)
+        with open(os.path.join(warm, ".git", WARM_STATE)) as fh:
+            st = json.load(fh)
+        return st if isinstance(st, dict) else None
     except (OSError, ValueError):
-        state = None
-    reason = ("no warm workspace yet" if state is None
-              else "the platform set or images changed — wiped" if state.get("key") != key
-              else None)
-    if reason is None:
-        base = env.get("MW_BUILD_GIT_BASE", "https://github.com/Systemorph").rstrip("/")
-        url = f"{base}/{repo}.git"
-        mirror_root = os.path.join(env.get("MW_BUILD_CACHE", "/cache"), "git")
-        mirror = os.path.join(mirror_root, f"{repo}.git")
-        genv = {**{k: env[k] for k in ("PATH", "LANG", "SSL_CERT_FILE", "SSL_CERT_DIR") if env.get(k)},
-                "HOME": os.path.dirname(dest), **git_auth_env(token)}
+        return None
 
-        def run_git(*args: str) -> None:
-            left = None if deadline is None else deadline - time.monotonic()
-            if left is not None and left <= 0:
-                raise Refusal("the run's deadline passed during the checkout")
-            try:
-                r = subprocess.run(["git", *args], env=genv, capture_output=True, text=True, timeout=left)
-            except subprocess.TimeoutExpired:
-                raise Refusal("git did not finish inside the run's deadline — killed")
-            if r.returncode != 0:
-                raise Refusal(f"git {args[2] if args[0] == '-C' else args[0]} failed (exit {r.returncode}): {(r.stderr or '').strip()[-300:]}")
-        g = git or run_git
-        wanted = [sha] + [r for r in (refs or []) if isinstance(r, str) and r]
+
+def write_warm_state(warm: str, state: dict) -> None:
+    with open(os.path.join(warm, ".git", WARM_STATE), "w") as fh:
+        json.dump(state, fh)
+
+
+def validate_warm_build(doc: object) -> Optional[dict]:
+    """`"warmBuild": {"command": …, "timeoutMinutes": N}` beside `stages` (the DEFAULT BRANCH tip's): what builds the warm
+    main workspace. Absent → None (the workspace then carries sources only). Malformed → Refusal."""
+    if not isinstance(doc, dict) or "warmBuild" not in doc:
+        return None
+    w = doc["warmBuild"]
+    if not isinstance(w, dict) or not isinstance(w.get("command"), str) or not w["command"].strip():
+        raise Refusal("`warmBuild` needs a non-empty `command`")
+    tmo = w.get("timeoutMinutes", 30)
+    if not isinstance(tmo, (int, float)) or isinstance(tmo, bool) or not 0 < tmo <= WARM_BUILD_MAX_MINUTES:
+        raise Refusal(f"`warmBuild.timeoutMinutes` {tmo!r} is outside (0, {WARM_BUILD_MAX_MINUTES}]")
+    return {"command": w["command"], "timeoutMinutes": float(tmo)}
+
+
+def _git_runner(env: dict, home: str, token: Optional[str], deadline: Optional[float]) -> Callable[..., None]:
+    genv = {**{k: env[k] for k in ("PATH", "LANG", "SSL_CERT_FILE", "SSL_CERT_DIR") if env.get(k)}, "HOME": home, **git_auth_env(token)}
+
+    def run_git(*args: str) -> None:
+        left = None if deadline is None else deadline - time.monotonic()
+        if left is not None and left <= 0:
+            raise Refusal("the deadline passed during a git step")
         try:
-            _update_mirror(repo, url, mirror_root, mirror, wanted, g, log)
-            g("-C", dest, "fetch", "--quiet", "origin", *wanted)
-            g("-C", dest, "checkout", "--quiet", "--force", "--detach", sha)
-            g("-C", dest, "reset", "--quiet", "--hard", sha)
-            g("-C", dest, "clean", "-ffdxq", *[a for k in WARM_KEEP for a in ("-e", k)])
-            line = f"workspace: incremental, seeded from {str(state.get('sha', '?'))[:12]} (obj/ and bin/ kept)"
+            # no hook and no fsmonitor ever run from a workspace's own .git: the git steps here run OUTSIDE the sandbox
+            r = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+                               env={**genv, "GIT_CONFIG_NOSYSTEM": "1"}, capture_output=True, text=True, timeout=left)
+        except subprocess.TimeoutExpired:
+            raise Refusal("git did not finish inside the deadline — killed")
+        if r.returncode != 0:
+            raise Refusal(f"git {args[2] if args[0] == '-C' else args[0]} failed (exit {r.returncode}): {(r.stderr or '').strip()[-300:]}")
+    return run_git
+
+
+def _move_tree(git: Callable[..., None], tree: str, sha: str, wanted: list) -> None:
+    """Move an existing checkout to `sha`: fetch, checkout --force --detach, reset --hard, clean all but obj/ and bin/."""
+    git("-C", tree, "fetch", "--quiet", "origin", *wanted)
+    git("-C", tree, "checkout", "--quiet", "--force", "--detach", sha)
+    git("-C", tree, "reset", "--quiet", "--hard", sha)
+    git("-C", tree, "clean", "-ffdxq", *[a for k in WARM_KEEP for a in ("-e", k)])
+
+
+def _copy_tree(src: str, dest: str) -> None:
+    """A run's private copy of the warm workspace: a reflink copy where the filesystem offers one, a plain copy otherwise."""
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    r = subprocess.run(["cp", "-a", "--reflink=auto", src, dest], capture_output=True, text=True)
+    if r.returncode != 0:     # a cp without --reflink (BSD): copy it ourselves, links kept as links
+        shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(src, dest, symlinks=True)
+
+
+def advance_warm_main(repo: str, tip: str, warm: str, env: dict, log: Callable[[str], None], key: str,
+                      git: Optional[Callable[..., None]] = None, fresh: Optional[Callable[..., None]] = None) -> str:
+    """Move the warm MAIN workspace to the default branch's `tip` (host-only; never a run's content). Wiped on a key change
+    or any failure, then cloned fresh. Returns the line saying what happened."""
+    fresh = fresh or default_checkout
+    st = warm_state(warm)
+    reason = ("no warm main workspace yet" if st is None else "the platform set or images changed — wiped" if st.get("key") != key else None)
+    if reason is None and st is not None and st.get("tip") == tip:
+        return f"warm main workspace: already at main@{tip[:12]}"
+    if reason is None:
+        g = git or _git_runner(env, os.path.dirname(warm), None, None)
+        base = env.get("MW_BUILD_GIT_BASE", "https://github.com/Systemorph").rstrip("/")
+        mirror_root = os.path.join(env.get("MW_BUILD_CACHE", "/cache"), "git")
+        try:
+            _update_mirror(repo, f"{base}/{repo}.git", mirror_root, os.path.join(mirror_root, f"{repo}.git"), [tip], g, log)
+            _move_tree(g, warm, tip, [tip])
+            write_warm_state(warm, {"key": key, "tip": tip, "built": None})
+            return f"warm main workspace: moved to main@{tip[:12]} (obj/ and bin/ kept)"
         except Refusal as e:
             reason = f"the warm path failed ({str(e)[:160]}) — wiped"
-    if reason is not None:
-        shutil.rmtree(dest, ignore_errors=True)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        fresh(repo, sha, refs, dest, token, env, log, deadline=deadline)
-        line = f"workspace: clean ({reason})"
-    with open(state_file, "w") as fh:
-        json.dump({"key": key, "sha": sha, "at": int(time.time())}, fh)
-    return line
+    shutil.rmtree(warm, ignore_errors=True)
+    os.makedirs(os.path.dirname(warm), exist_ok=True)
+    fresh(repo, tip, [], warm, None, env, log)
+    write_warm_state(warm, {"key": key, "tip": tip, "built": None})
+    return f"warm main workspace: cloned at main@{tip[:12]} ({reason})"
+
+
+def seed_run_from_warm(repo: str, sha: str, refs: list, warm: str, dest: str, token: Optional[str], env: dict,
+                       log: Callable[[str], None], key: str, deadline: Optional[float] = None,
+                       git: Optional[Callable[..., None]] = None, fresh: Optional[Callable[..., None]] = None) -> str:
+    """A run's checkout `dest`: a disposable COPY of the warm main workspace moved to `sha`, or a fresh clone. The warm
+    workspace itself is only READ. Returns the plan line naming how the run's tree was seeded."""
+    fresh = fresh or default_checkout
+    st = warm_state(warm)
+    reason = ("no warm main workspace yet (the host builds it from main's tip while idle)" if st is None
+              else "the warm workspace is for another platform set or images" if st.get("key") != key else None)
+    if reason is None and st is not None:
+        g = git or _git_runner(env, os.path.dirname(dest), token, deadline)
+        base = env.get("MW_BUILD_GIT_BASE", "https://github.com/Systemorph").rstrip("/")
+        mirror_root = os.path.join(env.get("MW_BUILD_CACHE", "/cache"), "git")
+        wanted = [sha] + [r for r in (refs or []) if isinstance(r, str) and r]
+        try:
+            _copy_tree(warm, dest)
+            _update_mirror(repo, f"{base}/{repo}.git", mirror_root, os.path.join(mirror_root, f"{repo}.git"), wanted, g, log)
+            _move_tree(g, dest, sha, wanted)
+            built = st.get("built")
+            how = "built by the tip's warmBuild" if built == st.get("tip") else "sources only — not built yet"
+            return f"workspace: incremental copy of main@{str(st.get('tip', '?'))[:12]} ({how}), moved to {sha[:12]} (obj/ and bin/ kept)"
+        except (Refusal, OSError, shutil.Error) as e:
+            reason = f"the warm copy failed ({str(e)[:160]})"
+    shutil.rmtree(dest, ignore_errors=True)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    fresh(repo, sha, refs, dest, token, env, log, deadline=deadline)
+    return f"workspace: clean ({reason})"
 
 
 def _flock(fh) -> bool:
@@ -3138,6 +3209,8 @@ class Host:
         self.probe: Optional[str] = None
         self.run_scope = {"channel": self.channel}
         self.workspace_line = ""
+        # repositories whose warm main workspace the host keeps (§7.2), learned from the runs it took
+        self.warm_repos: set = set()
 
     def preflight(self) -> None:
         missing = []
@@ -3389,8 +3462,69 @@ class Host:
             return "stopping"
         claim = self.claim()
         if claim is None:
+            if not self.drained and warm_enabled(self.env):
+                self.warm_main_when_idle()
             return "drained" if self.drained else "idle"
         return self.run(claim)
+
+    def warm_main_when_idle(self) -> None:
+        """§7.2, the HOST's half: while nothing is claimable, move each known repository's warm main workspace to the
+        default branch's tip and run the TIP's declared `warmBuild` in it, in the sandbox, once per (tip, key). Never raises:
+        warming is optional, so a failure is said, the workspace is wiped, and the next idle cycle retries."""
+        key = warm_key(self.env, self.identity)
+        for repo in sorted(self.warm_repos):
+            if self.stopping:
+                return
+            warm = os.path.join(self.work, WARM_DIR, repo)
+            scratch = tempfile.mkdtemp(prefix=".warm-", dir=self.work)
+            try:
+                mirror = os.path.join(self.cache, "git", f"{repo}.git")
+                # the tip as GitHub has it now, not as the last run's fetch left the mirror
+                base = self.env.get("MW_BUILD_GIT_BASE", "https://github.com/Systemorph").rstrip("/")
+                _update_mirror(repo, f"{base}/{repo}.git", os.path.join(self.cache, "git"), mirror, [],
+                               _git_runner(self.env, scratch, None, time.monotonic() + 600), self.log)
+                genv = {**{k: self.env[k] for k in ("PATH", "LANG") if self.env.get(k)}, "HOME": scratch, "GIT_TERMINAL_PROMPT": "0"}
+                rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", "HEAD^{commit}"], genv)
+                tip = out.strip().splitlines()[-1].strip().lower() if rc == 0 and out.strip() else ""
+                if not SHA.match(tip):
+                    continue
+                st = warm_state(warm)
+                if st is not None and st.get("key") == key and st.get("tip") == tip and st.get("built") in (tip, "none"):
+                    continue
+                self.log(advance_warm_main(repo, tip, warm, self.env, self.log, key))
+                try:
+                    with open(os.path.join(warm, ".github", "build-stages.json")) as fh:
+                        decl = validate_warm_build(json.load(fh))
+                except (OSError, ValueError, Refusal) as e:
+                    self.log(f"warm main workspace: the tip {tip[:12]} declares no usable warmBuild ({e}) — sources only")
+                    decl = None
+                if decl is None:
+                    write_warm_state(warm, {"key": key, "tip": tip, "built": "none"})
+                    continue
+                extra = {**self.platform_env(), "MW_BUILD_REPO": repo}
+                extra.pop("MW_PLATFORM_SOURCE", None)
+                writable = []
+                platform_src = self.env.get("MW_PLATFORM_SOURCE", "")
+                if platform_src and os.path.isdir(platform_src):
+                    psrc = os.path.join(scratch, "platform")
+                    extra["MW_PLATFORM_SOURCE"] = writable_platform_source(platform_src, psrc)
+                    writable.append(psrc)
+                out_dir = os.path.join(scratch, "out")
+                os.makedirs(out_dir)
+                started = self.clock()
+                rc, text = self._sandboxed_capture(decl["command"], warm, out_dir, scratch, extra,
+                                                   [mirror, os.path.join(self.cache, "nuget")], writable, decl["timeoutMinutes"] * 60)
+                if rc == 0:
+                    write_warm_state(warm, {"key": key, "tip": tip, "built": tip})
+                    self.log(f"warm main workspace: built main@{tip[:12]} with the tip's warmBuild in {int(self.clock() - started)} s")
+                else:
+                    shutil.rmtree(warm, ignore_errors=True)
+                    self.log(f"warm main workspace: the tip's warmBuild failed (exit {rc}) — wiped, retried when idle: {text.strip()[-300:]}")
+            except (Refusal, subprocess.SubprocessError, OSError, ValueError) as e:
+                shutil.rmtree(warm, ignore_errors=True)
+                self.log(f"warm main workspace for {repo}: not warmed ({type(e).__name__}: {str(e)[:200]}) — wiped, retried when idle")
+            finally:
+                shutil.rmtree(scratch, ignore_errors=True)
 
     # -- step 3/4: run ----------------------------------------------------------------------
     def run(self, claim: dict) -> str:
@@ -3405,9 +3539,8 @@ class Host:
         started = self.clock()
         self.sweep_workspaces()
         workdir = tempfile.mkdtemp(prefix=f"{repo}-{sha[:12]}-", dir=self.work)
-        # the warm workspace (§7.2) lives OUTSIDE the run's workdir, so the run's cleanup never removes it
-        checkout_dir = (os.path.join(self.work, WARM_DIR, repo) if warm_enabled(self.env) and self.checkout is default_checkout
-                        else os.path.join(workdir, "src"))
+        # the run's tree is always its OWN (a copy of the warm main workspace when that is on, §7.2), gone with the workdir
+        checkout_dir = os.path.join(workdir, "src")
         outputs_dir = os.path.join(workdir, "out")
         self.artifacts_dir = os.path.join(workdir, "artifacts")
         stages: list[dict] = []
@@ -3468,9 +3601,11 @@ class Host:
                 # The checkout is bounded by the run's deadline: a stalled clone or fetch ends the run
                 # RED inside the pod's grace period, never holds the claim indefinitely.
                 co_deadline = time.monotonic() + max(1.0, self.run_deadline - (self.clock() - started))
-                if checkout_dir.startswith(os.path.join(self.work, WARM_DIR) + os.sep):
-                    self.workspace_line = warm_checkout(repo, sha, claim.get("refs") or [], checkout_dir, token, self.env, self.log,
-                                                        warm_key(self.env, self.identity), deadline=co_deadline)
+                if warm_enabled(self.env) and self.checkout is default_checkout:
+                    self.warm_repos.add(repo)
+                    self.workspace_line = seed_run_from_warm(repo, sha, claim.get("refs") or [], os.path.join(self.work, WARM_DIR, repo),
+                                                             checkout_dir, token, self.env, self.log, warm_key(self.env, self.identity),
+                                                             deadline=co_deadline)
                     self.log(self.workspace_line)
                 else:
                     self.workspace_line = "workspace: clean (a fresh clone per run — MW_BUILD_WARM_WORKSPACE is not set)"
@@ -5150,26 +5285,72 @@ def self_test() -> int:
             sh("git", "clone", "-q", "--bare", seed, origin, cwd=wroot)
             wenv = {"PATH": genv_g["PATH"], "MW_BUILD_GIT_BASE": "file://" + os.path.dirname(origin),
                     "MW_BUILD_CACHE": os.path.join(wroot, "cache")}
-            ws = os.path.join(wroot, "work", WARM_DIR, "R")
-            line1 = warm_checkout("R", c1, [], ws, None, wenv, lambda m: None, key="k1")
-            check("warm/the first run is a CLEAN clone, said", line1.startswith("workspace: clean (no warm workspace yet"), line1)
-            check("warm/the tree is the commit", open(os.path.join(ws, "a.cs")).read() == "v1")
-            os.makedirs(os.path.join(ws, "src", "obj")); open(os.path.join(ws, "src", "obj", "state.cache"), "w").write("x")
-            open(os.path.join(ws, "stray.txt"), "w").write("left by a PR")
-            open(os.path.join(ws, "a.cs"), "w").write("edited in place")
-            line2 = warm_checkout("R", c2, [], ws, None, wenv, lambda m: None, key="k1")
-            check("warm/the second run is INCREMENTAL and names the sha it was seeded from",
-                  line2 == f"workspace: incremental, seeded from {c1[:12]} (obj/ and bin/ kept)", line2)
-            check("warm/tracked files are exactly the new commit (a local edit is gone)", open(os.path.join(ws, "a.cs")).read() == "v2")
-            check("warm/an untracked file is cleaned", not os.path.exists(os.path.join(ws, "stray.txt")))
-            check("warm/obj/ is KEPT for MSBuild's incremental build", os.path.isfile(os.path.join(ws, "src", "obj", "state.cache")))
-            line3 = warm_checkout("R", c2, [], ws, None, wenv, lambda m: None, key="k2")
-            check("warm/a new platform set or image WIPES the workspace", line3.startswith("workspace: clean (the platform set or images changed")
-                  and not os.path.exists(os.path.join(ws, "src", "obj")), line3)
-            line4 = warm_checkout("R", "f" * 40, [], ws, None, dict(wenv), lambda m: None, key="k2",
-                                  fresh=lambda *a, **k: default_checkout("R", c1, [], ws, None, wenv, lambda m: None))
-            check("warm/a failed warm path wipes and falls back to a fresh clone, said",
-                  line4.startswith("workspace: clean (the warm path failed") and open(os.path.join(ws, "a.cs")).read() == "v1", line4)
+            warm = os.path.join(wroot, "work", WARM_DIR, "R")
+            log0 = lambda m: None
+            run1 = os.path.join(wroot, "work", "run1", "src")
+            line0 = seed_run_from_warm("R", c1, [], warm, run1, None, wenv, log0, key="k1")
+            check("warm/with no warm main workspace a run is a CLEAN clone, said",
+                  line0.startswith("workspace: clean (no warm main workspace yet") and open(os.path.join(run1, "a.cs")).read() == "v1", line0)
+            adv = advance_warm_main("R", c2, warm, wenv, log0, key="k1")
+            check("warm/the HOST clones the warm main workspace at main's tip", adv.startswith(f"warm main workspace: cloned at main@{c2[:12]}")
+                  and open(os.path.join(warm, "a.cs")).read() == "v2", adv)
+            # the tip's warm build (stood in for here) leaves incremental state in obj/
+            os.makedirs(os.path.join(warm, "src", "obj")); open(os.path.join(warm, "src", "obj", "state.cache"), "w").write("main")
+            write_warm_state(warm, {"key": "k1", "tip": c2, "built": c2})
+            run2 = os.path.join(wroot, "work", "run2", "src")
+            line2 = seed_run_from_warm("R", c1, [], warm, run2, None, wenv, log0, key="k1")
+            check("warm/a run is an INCREMENTAL COPY of main's warm workspace, moved to its own sha, saying so",
+                  line2 == f"workspace: incremental copy of main@{c2[:12]} (built by the tip's warmBuild), moved to {c1[:12]} (obj/ and bin/ kept)", line2)
+            check("warm/the run's tree is exactly its commit, with main's obj/ carried for MSBuild",
+                  open(os.path.join(run2, "a.cs")).read() == "v1" and open(os.path.join(run2, "src", "obj", "state.cache")).read() == "main")
+            # a (pull-request) run writes into its copy: none of it reaches the warm workspace
+            open(os.path.join(run2, "src", "obj", "state.cache"), "w").write("POISON")
+            open(os.path.join(run2, "planted.dll"), "w").write("x")
+            check("warm/a run can NEVER write the warm workspace (its writes stay in its own copy)",
+                  open(os.path.join(warm, "src", "obj", "state.cache")).read() == "main" and not os.path.exists(os.path.join(warm, "planted.dll"))
+                  and open(os.path.join(warm, "a.cs")).read() == "v2")
+            adv2 = advance_warm_main("R", c2, warm, wenv, log0, key="k1")
+            check("warm/the host does nothing when the warm workspace is already at the tip", adv2.startswith("warm main workspace: already at"), adv2)
+            write_warm_state(warm, {"key": "k1", "tip": c1, "built": c1})
+            open(os.path.join(warm, "stray.txt"), "w").write("x")
+            adv3 = advance_warm_main("R", c2, warm, wenv, log0, key="k1")
+            check("warm/the host MOVES it to a new tip, keeping obj/ and cleaning the rest",
+                  adv3.startswith(f"warm main workspace: moved to main@{c2[:12]}") and os.path.isfile(os.path.join(warm, "src", "obj", "state.cache"))
+                  and not os.path.exists(os.path.join(warm, "stray.txt")), adv3)
+            run3 = os.path.join(wroot, "work", "run3", "src")
+            line3 = seed_run_from_warm("R", c1, [], warm, run3, None, wenv, log0, key="k2")
+            check("warm/a run on another platform set or image never uses the warm workspace (clean, said)",
+                  line3.startswith("workspace: clean (the warm workspace is for another platform set") and not os.path.exists(os.path.join(run3, "src", "obj")), line3)
+            adv4 = advance_warm_main("R", c2, warm, wenv, log0, key="k2")
+            check("warm/the host WIPES the warm workspace on a key change", adv4.startswith("warm main workspace: cloned") and "changed" in adv4
+                  and not os.path.exists(os.path.join(warm, "src", "obj")), adv4)
+            run4 = os.path.join(wroot, "work", "run4", "src")
+            line4 = seed_run_from_warm("R", "f" * 40, [], warm, run4, None, wenv, log0, key="k2",
+                                       fresh=lambda *a, **k: default_checkout("R", c1, [], run4, None, wenv, log0))
+            check("warm/a failed warm copy falls back to a fresh clone, said",
+                  line4.startswith("workspace: clean (the warm copy failed") and open(os.path.join(run4, "a.cs")).read() == "v1", line4)
+            hookdir = os.path.join(warm, ".git", "hooks"); os.makedirs(hookdir, exist_ok=True)
+            marker_h = os.path.join(wroot, "hook-ran")
+            with open(os.path.join(hookdir, "post-checkout"), "w") as fh:
+                fh.write(f"#!/bin/sh\ntouch {marker_h}\n")
+            os.chmod(os.path.join(hookdir, "post-checkout"), 0o755)
+            write_warm_state(warm, {"key": "k2", "tip": c2, "built": c2})
+            seed_run_from_warm("R", c1, [], warm, os.path.join(wroot, "work", "run6", "src"), None, wenv, log0, key="k2")
+            check("warm/no git hook in a workspace's .git ever runs (the git steps run outside the sandbox)", not os.path.exists(marker_h))
+            with open(os.path.join(warm, ".git", WARM_STATE), "w") as fh:
+                fh.write("[]")
+            line7 = seed_run_from_warm("R", c1, [], warm, os.path.join(wroot, "work", "run7", "src"), None, wenv, log0, key="k2")
+            check("warm/a state that is not an object is no warm workspace (a clean clone, never a crash)", line7.startswith("workspace: clean (no warm main"), line7)
+            check("warm/the warmBuild declaration is validated",
+                  validate_warm_build({"stages": []}) is None
+                  and validate_warm_build({"warmBuild": {"command": "dotnet build", "timeoutMinutes": 20}}) == {"command": "dotnet build", "timeoutMinutes": 20.0})
+            for bad_w in ({"warmBuild": {}}, {"warmBuild": {"command": "x", "timeoutMinutes": 0}}, {"warmBuild": {"command": "x", "timeoutMinutes": 61}}):
+                try:
+                    validate_warm_build(bad_w)
+                    check(f"warm/{bad_w} is refused", False, "accepted")
+                except Refusal:
+                    pass
+            ws = warm
             check("warm/the key rides on the platform set, the identity and the images",
                   warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.1"}, "c003") != warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.2"}, "c003")
                   and warm_key({}, "a") != warm_key({}, "b") and warm_key({"MW_BUILD_RUNNER_DIGEST": "x"}, "a") != warm_key({}, "a"))
@@ -5345,6 +5526,40 @@ def self_test() -> int:
             kw.setdefault("git_runner", lambda args, env_: (0, "e" * 40 + "\n" if "rev-parse" in args else ""))
             return Host(env if "env" not in kw else kw.pop("env"), api, log=lambda s: None, sandbox=_EnvSandbox(),
                         leftovers=lambda: [], sleep=lambda s: None, **kw)
+
+        # ── the warm main workspace's IDLE half (§7.2), on a real host loop over real git: nothing claimable → the host moves
+        #    the warm workspace to main's tip and runs the TIP's declared warmBuild in the sandbox, once per tip ───────────
+        if shutil.which("git"):
+            open(os.path.join(seed, ".github-stages.tmp"), "w").close()
+            os.makedirs(os.path.join(seed, ".github"), exist_ok=True)
+            with open(os.path.join(seed, ".github", "build-stages.json"), "w") as fh:
+                json.dump({"stages": [], "warmBuild": {"command": "mkdir -p src/obj && echo built-by-tip > src/obj/warm.txt && pwd > src/obj/where.txt",
+                                                       "timeoutMinutes": 5}}, fh)
+            os.remove(os.path.join(seed, ".github-stages.tmp"))
+            sh("git", "add", "-A"); sh("git", "commit", "-qm", "declare warmBuild")
+            c3 = sh("git", "rev-parse", "HEAD")
+            sh("git", "--git-dir", origin, "fetch", "-q", seed, "+main:main", cwd=wroot)
+            idle_work = os.path.join(wroot, "idle-work")
+            os.makedirs(idle_work)
+            hi = host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})] * 3, ("POST", "/claim"): [(204, None)] * 3}),
+                      env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_WORK=idle_work, MW_BUILD_CACHE=wenv["MW_BUILD_CACHE"],
+                               MW_BUILD_GIT_BASE=wenv["MW_BUILD_GIT_BASE"]),
+                      git_runner=_git_run)
+            hi.warm_repos.add("R")
+            hi.cycle()
+            iw = os.path.join(idle_work, WARM_DIR, "R")
+            st_i = warm_state(iw) or {}
+            check("warm-idle/with nothing claimable the host builds main's tip with the TIP's warmBuild, in the warm workspace",
+                  st_i.get("tip") == c3 and st_i.get("built") == c3
+                  and open(os.path.join(iw, "src", "obj", "warm.txt")).read().strip() == "built-by-tip", st_i)
+            open(os.path.join(iw, "src", "obj", "warm.txt"), "w").write("untouched")
+            hi.cycle()
+            check("warm-idle/a tip already built is not built again", open(os.path.join(iw, "src", "obj", "warm.txt")).read() == "untouched")
+            run5 = os.path.join(idle_work, "run5", "src")
+            line5 = seed_run_from_warm("R", c1, [], iw, run5, None, wenv, lambda m: None, key=warm_key(hi.env, hi.identity))
+            check("warm-idle/the next run starts from that built state",
+                  line5.startswith(f"workspace: incremental copy of main@{c3[:12]} (built by the tip's warmBuild)")
+                  and os.path.isfile(os.path.join(run5, "src", "obj", "warm.txt")), line5)
 
         h = host(_FakeApi({("GET", "/hosts/inputs"): on_inputs, ("POST", "/claim"): on_claim}))
         h.preflight()
@@ -8154,7 +8369,7 @@ def self_test() -> int:
         return 1
     print("build-run self-test: all cases passed (diagnostics, dedup, vstest + xunit results, structured events, "
           "stage declaration, the bwrap argv, the env allow-list, the token file, the startup sandbox probe, "
-          "pid-namespace leftovers, one merged tree per PR attempt, the network-boundary self-check, trunk-only BUILD-stage cache promotion under recomputed keys, the plan, batch seq, the lease heartbeat, the claimId, the git mirror, the warm workspace (incremental over real git, wiped on a key change, a fresh clone on failure, never swept), cache scoping per stage, the NuGet fallback folder bound for every stage, the warm NuGet cache filled from the default branch's tip once per key (and never from a PR), the refset key, the H9 artifact hand-over (a file: store and the build API), the workload-identity pull, the registry bundle index (H8), plugins refresh BEFORE claim, fresh process per "
+          "pid-namespace leftovers, one merged tree per PR attempt, the network-boundary self-check, trunk-only BUILD-stage cache promotion under recomputed keys, the plan, batch seq, the lease heartbeat, the claimId, the git mirror, the warm workspace (main-only, advanced by the host from the tip; every run an incremental COPY it can never write back; wiped on a key change; a fresh clone on failure; never swept), cache scoping per stage, the NuGet fallback folder bound for every stage, the warm NuGet cache filled from the default branch's tip once per key (and never from a PR), the refset key, the H9 artifact hand-over (a file: store and the build API), the workload-identity pull, the registry bundle index (H8), plugins refresh BEFORE claim, fresh process per "
           "stage, fail-fast, channel + publish, 409, undeclared stages, stage timeout, run deadline)")
     return 0
 
