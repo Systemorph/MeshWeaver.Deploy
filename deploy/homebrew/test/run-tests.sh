@@ -900,6 +900,72 @@ lm bash -c '. "$0"; version_ge 0.40.14 0.32.12 && ! version_ge 0.31.9 0.32.12 &&
   && ok "version_ge orders Ollama releases numerically" || bad "version_ge" ""
 rm -rf "$LMH"
 
+echo "── the OWNER: collected at onboarding, the instance's global administrator (2026-11-08) ──"
+OWH="$(mktemp -d)"; mkdir -p "$OWH/home/.memex-local" "$OWH/stubs"
+# `defaults` answers the managed preferences from FAKE_PREF_<Key>; nothing set = no preference.
+cat > "$OWH/stubs/defaults" <<'STUB'
+#!/bin/bash
+k="${!#}"; v="FAKE_PREF_$k"; [ -n "${!v:-}" ] && { echo "${!v}"; exit 0; }; exit 1
+STUB
+chmod +x "$OWH/stubs/defaults"
+ow() { env HOME="$OWH/home" MEMEX_LOCAL_HOME="$OWH/home/.memex-local" MEMEX_LOCAL_LIB=1 PATH="$OWH/stubs:$STUBS:$PATH" "$@"; }
+OOV="$OWH/home/.memex-local/values.local.yaml"
+seed_overlay() { cat > "$OOV" <<'YAML'
+secrets:
+  memex_portal:
+    OpenAICompatible__ApiKey: "ollama"
+config:
+  memex_portal:
+    Portal__InstanceName: "Local"
+ingress:
+  host: "memex.localhost"
+YAML
+}
+seed_overlay
+OUT="$(ow env MEMEX_OWNER=alice MEMEX_OWNER_EMAIL=alice@example.com bash -c 'set -euo pipefail; . "$0"; ensure_owner_admin "" "" require; echo DONE' "$CLI" 2>&1)"
+if grep -q DONE <<<"$OUT" \
+   && awk '/^config:/{c=1} /^ingress:/{c=0} c' "$OOV" | grep -qx '    Auth__GlobalAdmins__0: "alice"' \
+   && awk '/^config:/{c=1} /^ingress:/{c=0} c' "$OOV" | grep -qx '    Instance__Owner__Id: "alice"' \
+   && awk '/^config:/{c=1} /^ingress:/{c=0} c' "$OOV" | grep -qx '    Instance__Owner__Email: "alice@example.com"' \
+   && ! awk '/^secrets:/{c=1} /^config:/{c=0} c' "$OOV" | grep -q 'Owner\|GlobalAdmins' \
+   && grep -qx '    Portal__InstanceName: "Local"' "$OOV" && grep -qx '  host: "memex.localhost"' "$OOV"; then
+  ok "the owner lands in config.memex_portal of the instance's OWN overlay (admin key + id + e-mail), secrets and the rest untouched"
+else bad "owner write" "$OUT
+$(cat "$OOV")"; fi
+cp "$OOV" "$OWH/before"
+ow env MEMEX_OWNER=alice MEMEX_OWNER_EMAIL=alice@example.com bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" >/dev/null 2>&1
+cmp -s "$OOV" "$OWH/before" && ok "a re-run with the same owner changes nothing (idempotent)" || bad "owner re-run changed the overlay" "$(diff "$OWH/before" "$OOV")"
+ow bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" >/dev/null 2>&1 && cmp -s "$OOV" "$OWH/before" \
+  && ok "an unattended re-run with no source keeps the owner the overlay records (no prompt, no failure)" || bad "re-run without source" "$(cat "$OOV")"
+OUT="$(ow bash -c '. "$0"; cmd_owner --id bob --email bob@example.com' "$CLI" 2>&1)"
+[ "$(grep -c 'Auth__GlobalAdmins__0' "$OOV")" = 1 ] && grep -qx '    Auth__GlobalAdmins__0: "bob"' "$OOV" && grep -qx '    Instance__Owner__Email: "bob@example.com"' "$OOV" \
+  && grep -q "was 'alice'" <<<"$OUT" && ok "'memex-local owner --id … --email …' changes the owner in place (one admin key, never a second)" || bad "owner change" "$OUT
+$(cat "$OOV")"
+seed_overlay
+OUT="$(ow bash -c 'set -euo pipefail; . "$0"; ensure_owner_admin "" "" require; echo SURVIVED' "$CLI" 2>&1 </dev/null)"; RC=$?
+[ "$RC" != 0 ] && ! grep -q SURVIVED <<<"$OUT" && grep -q "no OWNER" <<<"$OUT" && ! grep -q GlobalAdmins "$OOV" \
+  && ok "an UNATTENDED install with no owner FAILS, naming how to give one (never an instance without an administrator)" || bad "ownerless install passed" "rc=$RC $OUT"
+OUT="$(ow bash -c '. "$0"; ensure_owner_admin; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+grep -q SURVIVED <<<"$OUT" && grep -q "NO OWNER" <<<"$OUT" && ok "an update of an existing ownerless install warns loudly but does not halt the roll" || bad "update ownerless" "$OUT"
+OUT="$(ow env FAKE_PREF_OwnerId=carol FAKE_PREF_OwnerEmail=carol@example.com bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" 2>&1 </dev/null)"
+grep -qx '    Auth__GlobalAdmins__0: "carol"' "$OOV" && ok "an MDM's managed preferences OwnerId / OwnerEmail supply the owner of an unattended install" || bad "managed pref owner" "$OUT"
+for bad_id in 'a b' 'x;rm' ''\''q'\'''; do
+  OUT="$(ow bash -c '. "$0"; ensure_owner_admin "$1" "" require; echo SURVIVED' "$CLI" "$bad_id" 2>&1 </dev/null)"
+  grep -q SURVIVED <<<"$OUT" && bad "owner id '$bad_id' accepted" "$OUT" || ok "an owner id like '$bad_id' is refused"
+done
+OUT="$(ow bash -c '. "$0"; ensure_owner_admin carol not-an-email require; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+grep -q SURVIVED <<<"$OUT" && bad "a malformed e-mail accepted" "$OUT" || ok "a malformed owner e-mail is refused"
+grep -q 'Auth__GlobalAdmins\|Instance__Owner' "$HERE/../share/"*.yaml && bad "a SHARED values file names the owner (it belongs to each install's own overlay)" "$(grep -n 'Auth__GlobalAdmins\|Instance__Owner' "$HERE/../share/"*.yaml)" \
+  || ok "no shared values file (defaults, template, mode layers) names an owner or an admin"
+B="$(fn_body cmd_up)"; grep -B1 '^  ensure_overlay$' <<<"$B" | grep -q '^  OWNER_REQUIRED=require$' && ok "up REQUIRES an owner before anything is deployed" || bad "up owner requirement" ""
+B="$(fn_body cmd_fleet)"; grep -A1 'OWNER_REQUIRED=require' <<<"$B" | grep -q 'ensure_overlay' \
+  && [ "$(grep -n 'OWNER_REQUIRED=require' <<<"$B" | head -1 | cut -d: -f1)" -lt "$(grep -n 'cmd_backlease enroll' <<<"$B" | head -1 | cut -d: -f1)" ] \
+  && ok "fleet join collects the owner FIRST — before the opt-in questions that owner answers" || bad "fleet join owner order" ""
+FA="$HERE/../../backlease/first-attach.sh"
+[ "$(grep -n 'owner status' "$FA" | head -1 | cut -d: -f1)" -lt "$(grep -n 'Accept fleet jobs' "$FA" | head -1 | cut -d: -f1)" ] \
+  && grep -q 'this Mac has no OWNER' "$FA" && ok "first-attach refuses a Mac with no owner, before the opt-in and before any change" || bad "first-attach owner" ""
+rm -rf "$OWH"
+
 echo "── release-channel labels: a seed, resolved to a VERSION (G1) ────"
 
 # docker / az stubs for the channel path ONLY (a separate dir, so no other test sees a docker).
@@ -1242,8 +1308,10 @@ M="$(printf 'a%.0s' $(seq 64))"; C="$(printf 'b%.0s' $(seq 64))"
 # (payload built first: bash 3.2 splits escaped quotes nested inside "$(…)")
 P2='{"v":1,"d":"studio-2","m":"'"$M"'","c":"'"$C"'"}'; P9='{"v":1,"d":"studio-9","m":"'"$M"'","c":"'"$C"'"}'
 sealed="$(seal "$P2" "$KEY")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/code.txt"
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/code.txt" 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/code.txt" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*"joined as 'studio-2'"*) ok "fleet join opens a code sealed to its key and joins" ;; *) bad "fleet join with a good code" "rc=$RC: $OUT" ;; esac
+OUT2="$(env PATH="$STUBS:$PATH" HOME="$FJ/home2" MEMEX_LOCAL_HOME="$FJ/home2/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --code-file "$FJ/code.txt" 2>&1 </dev/null)"; RC2=$?
+case "$RC2:$OUT2" in 0:*) bad "an unattended fleet join without an owner joined" "$OUT2" ;; *"no OWNER"*) ok "an unattended fleet join without an owner FAILS before anything is joined" ;; *) bad "ownerless join" "rc=$RC2 $OUT2" ;; esac
 case "$OUT" in *"$M"*|*"$C"*) bad "fleet join never prints a key value" "a value is in the output" ;; *) ok "fleet join prints no key value (fingerprints only)" ;; esac
 case "$OUT" in *"Hosting/Heartbeats/Enrol/"*) ok "fleet join prints the control instance's approval link" ;; *) bad "approval link" "$OUT" ;; esac
 F="$FJ/home/.memex-local/fleet.yaml"
@@ -1258,19 +1326,19 @@ fmode="$(ls -l "$F" 2>/dev/null | cut -c1-10)"
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$KEY" 2>/dev/null ); OTHER="$FJ/other.pem"
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$OTHER" 2>/dev/null )
 sealed="$(seal "$P2" "$OTHER")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/wrong.txt"
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/wrong.txt" 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/wrong.txt" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "a code for another key is refused" "exited 0" ;; *"does not open with this Mac's key"*) ok "a code sealed to another key is refused by name" ;; *) bad "wrong-key refusal" "$OUT" ;; esac
 sealed="$(seal "$P9" "$KEY")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/other-id.txt"
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/other-id.txt" 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/other-id.txt" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "a code for another id is refused" "exited 0" ;; *"issued for 'studio-9'"*) ok "a code issued for another id is refused by name" ;; *) bad "other-id refusal" "$OUT" ;; esac
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id Bad_Id --no-open 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id Bad_Id --no-open 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "a bad id is refused" "exited 0" ;; *"--id must be lower-case"*) ok "an id that cannot be a record id is refused" ;; *) bad "bad id refusal" "$OUT" ;; esac
 OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet status 2>&1)"
 case "$OUT" in *"JOINED as 'studio-2'"*"sha256:"*) ok "fleet status shows the join and the key fingerprints" ;; *) bad "fleet status" "$OUT" ;; esac
 case "$OUT" in *"$M"*|*"$C"*) bad "fleet status never prints a key value" "a value is in the output" ;; *) ok "fleet status prints no key value" ;; esac
 # Unattended (a device-management run): no code yet → the link is printed and kept, exit 3, nothing joined.
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$FJ/home/.memex-local/enrol/studio-3.key.pem" 2>/dev/null )
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --code-file "$FJ/none.code" 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --code-file "$FJ/none.code" 2>&1)"; RC=$?
 case "$RC:$OUT" in 3:*"WAITING for the approval on control and the enrolment code at $FJ/none.code"*) ok "unattended: no code yet → says what it waits for, exit 3" ;; *) bad "unattended join waits" "rc=$RC: $OUT" ;; esac
 grep -q '/Hosting/Heartbeats/Enrol/' "$FJ/home/.memex-local/enrol/studio-3.link" 2>/dev/null && ok "unattended: the approval link is kept in enrol/<id>.link" || bad "link kept" "$(cat "$FJ/home/.memex-local/enrol/studio-3.link" 2>/dev/null)"
 [ -f "$FJ/home/.memex-local/enrol/studio-3.key.pem" ] && ok "unattended: the throw-away key is kept for the run that brings the code" || bad "key kept while waiting" "gone"
