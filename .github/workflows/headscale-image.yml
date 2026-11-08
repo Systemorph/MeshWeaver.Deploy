@@ -95,7 +95,11 @@ jobs:
           image: { repository: registry.example.com/headscale, tag: "0.29.7-0000000" }
           host: headscale.example.com
           ingress: { className: nginx, clusterIssuer: letsencrypt }
-          dns: { baseDomain: tailnet.internal }
+          dns:
+            baseDomain: tailnet.internal
+            # one declared name beside the machines' own (dns.extraRecords): served by MagicDNS, asserted below
+            extraRecords:
+              - { name: proof.mac.tailnet.internal, type: A, value: 100.64.0.77 }
           EOF
           mkdir -p cfg
           helm template hs deploy/headscale/helm -f ci-values.yaml -s templates/configmap.yaml > cm.yaml
@@ -123,7 +127,14 @@ jobs:
           ip=$(docker exec ts tailscale ip -4)
           online=$($hc nodes list -o json | jq -r '[.[] | select(.online == true)] | length')
           [ "$online" = 1 ] || { echo "::error::headscale lists ${online} online node(s), expected 1"; exit 1; }
-          echo "a stock Tailscale client joined the chart's config: $ip, 1 node online"
+          # dns.extraRecords: the declared name resolves to its value through the client's MagicDNS resolver, and an
+          # undeclared sibling does not (the negative control — the assertion can tell the two apart).
+          rec=$(docker exec ts tailscale dns query proof.mac.tailnet.internal A 2>&1 || true)
+          grep -Eq 'proof\.mac\.tailnet\.internal\.[[:space:]].*TypeA[[:space:]]+100\.64\.0\.77' <<<"$rec" \
+            || { echo "::error::MagicDNS does not answer the declared extra record:"; echo "$rec"; exit 1; }
+          none=$(docker exec ts tailscale dns query nosuch.mac.tailnet.internal A 2>&1 || true)
+          ! grep -q '100\.64\.0\.77' <<<"$none" || { echo "::error::an UNDECLARED name answered the record's address"; exit 1; }
+          echo "a stock Tailscale client joined the chart's config: $ip, 1 node online; MagicDNS serves the declared extra record"
       - name: Chart renders nothing by default, the objects when enabled, and refuses what it cannot run
         run: |
           set -euo pipefail
@@ -157,6 +168,23 @@ jobs:
           refuse "host is missing"                      -f ci-values.yaml --set host=
           refuse "dns.baseDomain contains host"         -f ci-values.yaml --set dns.baseDomain=example.com
           refuse "the ingress has no TLS source"        -f ci-values.yaml --set ingress.clusterIssuer=
+          rec=(--set 'dns.extraRecords[0].type=A' --set 'dns.extraRecords[0].value=100.64.0.7')
+          refuse "an extra record is a wildcard"        -f ci-values.yaml "${rec[@]}" --set 'dns.extraRecords[0].name=*.mac.tailnet.internal'
+          refuse "an extra record has a label over 63 characters" -f ci-values.yaml "${rec[@]}" --set "dns.extraRecords[0].name=$(printf 'a%.0s' $(seq 1 64)).tailnet.internal"
+          refuse "an extra record is outside baseDomain" -f ci-values.yaml "${rec[@]}" --set 'dns.extraRecords[0].name=proof.example.com'
+          refuse "an extra record is not an IPv4 address" -f ci-values.yaml --set 'dns.extraRecords[0].name=a.tailnet.internal' --set 'dns.extraRecords[0].type=A' --set 'dns.extraRecords[0].value=300.1.1.1'
+          for v6 in 12345:: ::1::2 :::::: fd7a:115c:a1e0:0:0:0:0:0:1 FD7A::1; do
+            refuse "an extra record's AAAA value '$v6' is not a lower-case IPv6 address" -f ci-values.yaml --set 'dns.extraRecords[0].name=a.tailnet.internal' --set 'dns.extraRecords[0].type=AAAA' --set "dns.extraRecords[0].value=$v6"
+          done
+          for v6 in fd7a:115c:a1e0::7 ::1 fd7a:115c:a1e0:ab12:4843:cd96:6258:b240; do
+            helm template hs deploy/headscale/helm -f ci-values.yaml --set 'dns.extraRecords[0].name=a.tailnet.internal' --set 'dns.extraRecords[0].type=AAAA' --set "dns.extraRecords[0].value=$v6" >/dev/null \
+              || { echo "::error::a valid AAAA value '$v6' was refused"; exit 1; }
+          done
+          refuse "an extra record has an unserved type" -f ci-values.yaml --set 'dns.extraRecords[0].name=a.tailnet.internal' --set 'dns.extraRecords[0].type=CNAME' --set 'dns.extraRecords[0].value=b.tailnet.internal'
+          refuse "an extra record is declared twice"    -f ci-values.yaml "${rec[@]}" --set 'dns.extraRecords[0].name=a.tailnet.internal' \
+                 --set 'dns.extraRecords[1].name=a.tailnet.internal' --set 'dns.extraRecords[1].type=A' --set 'dns.extraRecords[1].value=100.64.0.8'
+          grep -q 'name: "proof.mac.tailnet.internal", type: "A", value: "100.64.0.77"' <<<"$(helm template hs deploy/headscale/helm -f ci-values.yaml -s templates/configmap.yaml)" \
+            || { echo "::error::dns.extraRecords did not render into dns.extra_records"; exit 1; }
           refuse "OIDC admits every account"            -f ci-values.yaml "${oidc[@]}" "${kv[@]}"
           refuse "OIDC has no client-secret source"     -f ci-values.yaml "${oidc[@]}" --set 'oidc.allowedDomains[0]=example.com'
           refuse "OIDC names two secret sources"        -f ci-values.yaml "${oidc[@]}" "${kv[@]}" --set 'oidc.allowedDomains[0]=example.com' --set oidc.clientSecret.existingSecret=s

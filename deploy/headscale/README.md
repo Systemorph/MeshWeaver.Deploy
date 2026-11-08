@@ -91,6 +91,29 @@ sequenceDiagram
   runs the loop in the build against a real server and a stand-in API server (`test/kube-stub.py`): 20
   assertions, including a changed declaration, a refused Secret write, and no key in the log.
 
+## Declared names — `dns.extraRecords`
+
+MagicDNS answers every machine as `<machine>.<dns.baseDomain>`, and is AUTHORITATIVE for that zone: a name under
+it that no machine holds answers NXDOMAIN on a member, whatever public DNS says. A second service on one machine —
+a second portal a Mac runs beside its first (`memex-local instances`, at `<instance>.<machine>.<baseDomain>`) —
+therefore needs its name DECLARED here, pointing at that machine's network address:
+
+```yaml
+dns:
+  baseDomain: tailnet.internal
+  extraRecords:
+    - { name: proof.mac.tailnet.internal, type: A, value: 100.64.0.7 }
+```
+
+Rendered into Headscale's `dns.extra_records` (served since 0.23; 0.29.7 measured: a stock Tailscale client's
+`tailscale dns query` answers the declared name, and an undeclared sibling does not — the lane asserts both). One
+record per name: a Tailscale client matches MagicDNS names EXACTLY, so a wildcard would never be served, and the
+render refuses one. It also refuses a name with a label over 63 characters or over 253 in all, a name outside `dns.baseDomain` (it would shadow a public name — and since
+`baseDomain` may never contain `host`, the server's own name can never be declared), a type other than `A`/`AAAA`,
+a value that is not an address of that type (IPv4 dotted quad; IPv6 lower-case, eight groups or one `::`), and a
+name+type declared twice.
+A change rolls the pod (`checksum/config`), as every config change does.
+
 ## Relays (DERP)
 
 Machines that cannot reach each other directly relay through **Tailscale's public DERP servers**

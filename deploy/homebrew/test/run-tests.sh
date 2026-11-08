@@ -477,6 +477,11 @@ else bad "values.local.defaults.yaml names 'memex-local setup' as the token comm
 if grep -q '^    InstanceSetup__HostPlatform: "mac"$' "$DEFAULTS"; then
   ok "values.local.defaults.yaml declares InstanceSetup__HostPlatform: mac for the package step"
 else bad "values.local.defaults.yaml declares InstanceSetup__HostPlatform: mac for the package step" "$(grep -n HostPlatform "$DEFAULTS")"; fi
+# …and keeps each person's Claude Code login on the persisted /data hostPath: the chart default
+# (empty) puts it on the container's writable layer, where a restart or an update deletes it.
+if grep -q '^    ClaudeCode__ConfigDirRoot: "/data/' "$DEFAULTS"; then
+  ok "values.local.defaults.yaml keeps Claude Code logins under the persisted /data"
+else bad "values.local.defaults.yaml keeps Claude Code logins under the persisted /data" "$(grep -n ClaudeCode__ConfigDirRoot "$DEFAULTS")"; fi
 
 echo "── a gate's own INPUT must be reachable (static — needs a live pod) ──"
 
