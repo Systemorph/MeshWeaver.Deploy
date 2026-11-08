@@ -42,6 +42,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from typing import Callable, Optional
+from xml.sax.saxutils import escape as xml_escape
 
 LABEL = "com.memex.local.buildhost-follow"
 VERSION = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$")
@@ -82,6 +83,8 @@ def desired_set(api: str, follow: str, get: Fetcher) -> "tuple[Optional[dict], s
         return None, "control's answer is not JSON"
     if not isinstance(doc, dict) or doc.get("complete") is not True:
         return None, f"channel {follow} names no COMPLETE set"
+    if doc.get("channel") != follow:
+        return None, f"control answered channel {doc.get('channel')!r}'s set, not {follow!r}'s"
     s = {k: doc.get(k) for k in FIELDS}
     if not (isinstance(s["platformVersion"], str) and VERSION.match(s["platformVersion"])):
         return None, f"channel {follow}'s version {s['platformVersion']!r} is not a platform version"
@@ -148,15 +151,15 @@ def agent_dir(profile: str) -> str:
 
 
 def plist(script: str, chart: str, a) -> str:
-    args = [sys.executable or "/usr/bin/python3", script, "--once", "--profile", a.profile, "--follow", a.follow,
-            "--api", a.api, "--chart", chart]
-    items = "".join(f"<string>{x}</string>" for x in args)
-    log = os.path.join(agent_dir(a.profile), "follow.log")
+    args = [sys.executable or "/usr/bin/python3", script, "--once", "--profile", a.profile, "--channel", a.channel,
+            "--follow", a.follow, "--api", a.api, "--chart", chart]
+    items = "".join(f"<string>{xml_escape(x)}</string>" for x in args)
+    log = xml_escape(os.path.join(agent_dir(a.profile), "follow.log"))
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>{LABEL}.{a.profile}</string>
+    <key>Label</key><string>{xml_escape(LABEL + "." + a.profile)}</string>
     <key>ProgramArguments</key><array>{items}</array>
     <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
     <key>StartInterval</key><integer>{a.interval}</integer>
@@ -291,6 +294,10 @@ def self_test() -> int:
                                os.path.join(t, "nochart"), "mac", control(good), h)
         check("no chart beside the agent: nothing applied", h.upgrades() == [] and "no chart" in line, line)
 
+        h = Helm(old)
+        line, rc = go(control({**good, "channel": "qa"}), h)
+        check("an answer naming ANOTHER channel's set is never applied", h.upgrades() == [] and "not 'latest'" in line, line)
+
         seen = []
         follow_once("https://ops.example/api/builds/", "latest", "r", "n", "c", chart, "mac",
                     lambda url: (seen.append(url), (200, json.dumps(good)))[1], Helm(old))
@@ -301,6 +308,19 @@ def self_test() -> int:
         check("the agent runs one pass every interval with the attach's api and chart",
               f"<string>{LABEL}.build</string>" in p and "<integer>300</integer>" in p and "<string>--once</string>" in p
               and "<string>https://ops.example/api/builds</string>" in p and "<string>/x/helm</string>" in p, p)
+        a2 = argparse.Namespace(profile="build", follow="latest", api="https://ops.example/api/builds?a=1&b=<2>", interval=300, channel="lab")
+        p2 = plist("/x/follow-set.py", "/x/helm", a2)
+        check("the agent targets the channel it was installed for (--channel reaches the agent's arguments)",
+              "<string>--channel</string><string>lab</string>" in p2, p2)
+        check("plist values are XML-escaped (an & or < in --api never yields a plist launchd rejects)",
+              "?a=1&amp;b=&lt;2&gt;" in p2 and "&b=<2>" not in p2, p2)
+        import xml.dom.minidom
+        try:
+            xml.dom.minidom.parseString(p2.split("\n", 1)[1])
+            parsed = True
+        except Exception as e:  # noqa: BLE001 — any parse failure is the finding
+            parsed = repr(e)
+        check("the escaped plist is well-formed XML", parsed is True, parsed)
 
     if fails:
         for f in fails:
@@ -308,7 +328,8 @@ def self_test() -> int:
         return 1
     print("follow-set self-test: all cases passed (behind → upgraded with exactly the four set values and --reuse-values, "
           "pinned context; current → nothing; unreachable/503/incomplete/unnamed/malformed → nothing (fail closed); "
-          "pending release never overlapped; failed upgrade red; dry-run; no chart; the complete-set route; the agent plist)")
+          "another channel's answer refused; pending release never overlapped; failed upgrade red; dry-run; no chart; the complete-set route; "
+          "the agent plist names its channel and escapes every value)")
     return 0
 
 

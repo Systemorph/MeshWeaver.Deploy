@@ -37,13 +37,13 @@
 #      `build-worker-mac` (key `token`) and `build-pull` (kubernetes.io/dockerconfigjson: kubelet image pulls ONLY) and `build-registry-key-mac` (the READ-ONLY
 #      instance key the runner reads the plugin registry's bundle index with — a build host holds no registry credential);
 #   4. `helm upgrade --install build-host-mac` of THIS checkout's chart with build-host-mac.values.yaml and the set given;
+#   5. fleet jobs at the LOWEST priority on this Mac: loads the launchd governor (deploy/homebrew/share/buildhost-priority.sh
+#      --install) that puts the build VM's process in the background band while the owner, the portal VM or Ollama want
+#      the cores, and gives it every idle core otherwise (nice/renice do nothing on macOS — see the script's header).
 #   6. FOLLOWS the sealed set from then on (follow-set.py, launchd com.memex.local.buildhost-follow.<profile>): every 5 min
 #      it reads the complete set channel `--follow` (default latest) runs from control and, when the release runs another,
 #      re-applies THIS chart with that set (--reuse-values) — so the host never falls behind what main needs and nobody
 #      re-runs this script to move it. The runners drain their run in hand on the roll. `--follow off` attaches pinned.
-#   5. fleet jobs at the LOWEST priority on this Mac: loads the launchd governor (deploy/homebrew/share/buildhost-priority.sh
-#      --install) that puts the build VM's process in the background band while the owner, the portal VM or Ollama want
-#      the cores, and gives it every idle core otherwise (nice/renice do nothing on macOS — see the script's header).
 # The set (version + tester/portal/runner digests) is the one the operations record names for `latest`; it is passed,
 # never committed. The runner digest must be a multi-arch index carrying linux/arm64.
 set -euo pipefail
@@ -269,8 +269,11 @@ echo "== 6/6 follow the sealed set of channel ${follow}"
 # Installed AFTER the runners exist; a follower that cannot load is reported, never a failed attach (the host still runs
 # the set given, and a re-attach installs it again).
 if [ "$follow" = off ]; then
-  python3 "$here/follow-set.py" --uninstall --profile "$profile" >/dev/null 2>&1 || true
-  echo "   --follow off: this host stays on $version until it is attached again"
+  if python3 "$here/follow-set.py" --uninstall --profile "$profile" >/dev/null; then
+    echo "   --follow off: this host stays on $version until it is attached again"
+  else
+    echo "WARN: the follow agent could not be removed — it may still move this host off $version; remove it: python3 deploy/backlease/follow-set.py --uninstall --profile $profile" >&2
+  fi
 else
   python3 "$here/follow-set.py" --install --profile "$profile" --follow "$follow" --api "$api" --chart "$chart" \
     || echo "WARN: the follow agent did not load — this host stays on $version until it is attached again; re-run: python3 deploy/backlease/follow-set.py --install --profile $profile --follow $follow --api $api" >&2
