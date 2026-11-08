@@ -2940,7 +2940,12 @@ def artifact_unit(unit: str) -> str:
     tag = hashlib.sha256(unit.encode()).hexdigest()[:12]
     room = max(16, ARTIFACT_UNIT_MAX - len(head) - 1 - len(tag) - 2 - len(ext))
     short = f"{stem[:room]}~{tag}" + (f".{ext}" if ext else "")
-    return f"{head}/{short}" if head else short
+    out = f"{head}/{short}" if head else short
+    if len(out) > ARTIFACT_UNIT_MAX:
+        # the DIRECTORY itself is too long: keep only the unit's top directory (what consumers group by) and the hash
+        top = unit.split("/", 1)[0][:64]
+        out = f"{top}/~{hashlib.sha256(unit.encode()).hexdigest()[:24]}" + (f".{ext}" if ext else "")
+    return out
 
 
 def sandbox_readonly_roots(env: dict) -> list[str]:
@@ -6140,6 +6145,10 @@ def self_test() -> int:
     check("artifact/a unit too long for the store's receipt is shortened deterministically, its directory and extension kept",
           len(short_unit) <= ARTIFACT_UNIT_MAX and short_unit.startswith("diagnostics/portal-hosts/test-logs/") and short_unit.endswith(".log")
           and artifact_unit(long_unit) == short_unit and artifact_unit(long_unit + "x") != short_unit, short_unit)
+    deep = "diagnostics/" + "/".join(["d" * 40] * 8) + "/x.log"
+    check("artifact/a unit whose DIRECTORY is too long still fits, its top directory and extension kept",
+          len(artifact_unit(deep)) <= ARTIFACT_UNIT_MAX and artifact_unit(deep).startswith("diagnostics/~")
+          and artifact_unit(deep).endswith(".log") and artifact_unit(deep) != artifact_unit(deep + "x"), artifact_unit(deep))
     check("artifact/a unit that fits is never renamed (consumers read gate-log/gate.log by name)",
           artifact_unit("gate-log/gate.log") == "gate-log/gate.log")
     mav = Host({}, None, log=lambda s: None).sandbox.argv("true", "/w/run-7/src", "/w/o", {}, mount=SANDBOX_CHECKOUT)
