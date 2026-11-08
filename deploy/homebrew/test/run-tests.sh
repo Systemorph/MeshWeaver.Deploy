@@ -789,6 +789,9 @@ case "$*" in
   # The real /api/ps shape: each model's nested `details` object sits BETWEEN its name and its context.
   *api/ps*) echo '{"models":[{"name":"qwen3.8:27b-mlx","size":1,"details":{"format":"safetensors","family":""},"context_length":65536,"runner":"mlx"},{"name":"qwen3.6-code:latest","details":{"family":"qwen"},"context_length":131072},{"name":"llama3.3:70b","details":{},"context_length":32768}]}' ;;
   *api/tags*)               echo "{\"models\":[${FAKE_TAGS:-}]}" ;;
+  # /api/show: the capabilities Ollama reports; FAKE_NO_VISION drops "vision" (a text-only model).
+  *api/show*) if [ -n "${FAKE_NO_VISION:-}" ]; then echo '{"capabilities":["completion","tools"]}'
+              else echo '{"capabilities":["completion","vision","tools","thinking"]}'; fi ;;
   *) exit 0 ;;
 esac
 STUB
@@ -926,6 +929,53 @@ OUT="$(lm env MEMEX_EMBED_MODEL=all-minilm bash -c '. "$0"; ensure_embed_model; 
   && ok "an embedding model the platform cannot size is REFUSED (never a 1536-dim schema every insert then fails)" || bad "unsized model accepted" "$OUT"
 grep -q '^  ensure_embed_model$' <<<"$(fn_body setup_ollama)" && ok "setup_ollama (up, update, fleet join) pulls the embedding model" || bad "no embed pull" ""
 grep -q 'memex_migration:' <<<"$(fn_body cmd_llm)" && bad "'llm use' still writes a provider-less migration endpoint" "" || ok "'llm use' leaves embeddings to the per-install layer (no provider-less migration endpoint)"
+
+echo "── every AI service on this Mac: all chat tiers + OCR on the local model (2026-11-08) ──"
+: > "$OVL"
+lm env MEMEX_OLLAMA_MODEL=qwen3:8b FAKE_TAGS='{"name":"qwen3:8b"},{"name":"qwen3.6-code:latest"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+for t in utility reasoning review; do
+  grep -qx "    AI__Tiers__$t: \"Provider/OpenAICompatible/qwen3:8b\"" "$AUTO" && ok "the $t tier runs on this Mac's model" || bad "tier $t not local" "$(cat "$AUTO")"
+done
+grep -qx '    AI__Tiers__coding: "Provider/OpenAICompatible/qwen3.6-code"' "$AUTO" && ok "the coding tier takes the code model when Ollama has it" || bad "coding tier" "$(cat "$AUTO")"
+grep -qx '    Ocr__Engine: "OllamaVision"' "$AUTO" && grep -qx "    Ocr__OllamaVision__Endpoint: \"$EP\"" "$AUTO" && grep -qx '    Ocr__OllamaVision__Model: "qwen3:8b"' "$AUTO" \
+  && ok "OCR reads with the chat model on this Mac (it reports vision): OllamaVision, host-safe endpoint" || bad "OCR keys" "$(cat "$AUTO")"
+lm env MEMEX_OLLAMA_MODEL=qwen3:8b FAKE_NO_VISION=1 FAKE_TAGS='{"name":"qwen3:8b"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+grep -q 'Ocr__' "$AUTO" && bad "OCR configured on a model without vision" "$(cat "$AUTO")" || ok "a chat model without vision configures no OCR engine (never a model that cannot read images)"
+grep -qx '    AI__Tiers__coding: "Provider/OpenAICompatible/qwen3:8b"' "$AUTO" && ok "no code model: the coding tier stays on the chat model" || bad "coding fallback" "$(cat "$AUTO")"
+if command -v helm >/dev/null 2>&1; then
+  lm env MEMEX_OLLAMA_MODEL=qwen3:8b FAKE_TAGS='{"name":"qwen3:8b"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+  R="$(helm template memex "$HERE/../../helm" -f "$HERE/../../helm/values.yaml" -f "$DEF" -f "$AUTO" 2>&1)"
+  grep -q 'Ocr__Engine: "OllamaVision"' <<<"$R" && grep -q 'Ocr__OllamaVision__Model: "qwen3:8b"' <<<"$R" && grep -q 'AI__Tiers__utility: "Provider/OpenAICompatible/qwen3:8b"' <<<"$R" \
+    && ok "the render carries the OCR engine and the utility tier into the portal ConfigMap" || bad "render OCR/tiers" "$(grep -n 'Ocr__\|AI__Tiers' <<<"$R")"
+fi
+# The OCR smoke: a real image call through the engine's endpoint and model, from inside the pod.
+cat > "$LMH/stubs/kubectl" <<'STUB'
+#!/bin/bash
+case "$*" in
+  *"-- env") [ -n "${FAKE_EXEC_FAILS:-}" ] && exit 1
+             [ -n "${FAKE_NO_OCR:-}" ] && exit 0
+             printf 'Ocr__Engine=%s\nOcr__OllamaVision__Endpoint=http://ollama.memex.svc.cluster.local:11434/v1\nOcr__OllamaVision__Model=qwen3.8:27b-mlx\n' "${FAKE_OCR_ENGINE-OllamaVision}" ;;
+  *"sh -c"*) printf '%s\n%s\n' "${FAKE_SMOKE_CODE:-200}" "${FAKE_SMOKE_BODY-{\"choices\":[{\"message\":{\"content\":\"red\"}}]}}" ;;
+esac
+exit 0
+STUB
+chmod +x "$LMH/stubs/kubectl"
+OUT="$(lm bash -c '. "$0"; ocr_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && grep -q "read an image" <<<"$OUT" && ok "OCR smoke: the local vision model reading an image from inside the pod passes" || bad "ocr smoke 200" "rc=$RC $OUT"
+for c in 400 404 000; do
+  OUT="$(lm env FAKE_SMOKE_CODE=$c bash -c '. "$0"; ocr_smoke' "$CLI" 2>&1)"; RC=$?
+  [ "$RC" = 1 ] && ok "OCR smoke: HTTP $c fails" || bad "ocr smoke $c passed" "$OUT"
+done
+OUT="$(lm env FAKE_SMOKE_BODY='{"error":"x"}' bash -c '. "$0"; ocr_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && ok "OCR smoke: a 200 with no completion FAILS" || bad "ocr body ignored" "rc=$RC $OUT"
+OUT="$(lm env FAKE_OCR_ENGINE=HttpService bash -c '. "$0"; ocr_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && ok "OCR smoke: an engine other than this Mac's OllamaVision FAILS" || bad "foreign engine passed" "rc=$RC $OUT"
+OUT="$(lm env FAKE_NO_OCR=1 bash -c '. "$0"; ocr_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && grep -q "no engine configured" <<<"$OUT" && ok "OCR smoke: no engine is SAID (not a silent pass)" || bad "no-OCR silent" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EXEC_FAILS=1 bash -c '. "$0"; ocr_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && ok "OCR smoke: a pod whose environment cannot be read FAILS" || bad "ocr exec failure passed" "rc=$RC $OUT"
+grep -q 'ocr_smoke ||' <<<"$(fn_body embed_smoke_or_die)" && grep -q 'ocr_smoke' <<<"$(fn_body cmd_doctor)" && grep -q 'ocr_smoke' <<<"$(fn_body cmd_status)" \
+  && ok "up/update gate on the OCR smoke; doctor and status report it" || bad "ocr gate wiring" ""
 
 # The embedding smoke: a real vector of the platform's width, from inside the pod.
 cat > "$LMH/stubs/kubectl" <<'STUB'

@@ -1842,6 +1842,13 @@ ollama_context_window() {
     | awk -v n="\"name\":\"$m\"" '$0 == n { hit = 1; next } /^"name"/ { hit = 0 } hit && /^"context_length"/ { sub(/.*:/, ""); print; exit }' || true
 }
 
+# "yes" when Ollama on this Mac reports the vision capability for model $1, else "no" (also when Ollama
+# does not answer — OCR is then left unconfigured and the OCR smoke says so, never a silent cloud engine).
+ollama_model_has_vision() {
+  curl -fsS -m 10 "http://127.0.0.1:11434/api/show" -d "{\"model\":\"$1\"}" 2>/dev/null \
+    | grep -q '"capabilities":\[[^]]*"vision"' && printf yes || printf no
+}
+
 # 0 when Ollama on this Mac lists model $1 (a bare name matches its :latest tag).
 ollama_has_model() {
   local m="$1"; case "$m" in *:*) ;; *) m="$m:latest" ;; esac
@@ -1951,6 +1958,19 @@ write_llm_auto_layer() {
     if [ -n "$model" ]; then
       echo "    OpenAICompatible__Models__0: \"$model\""
       echo "    AI__Tiers__chat: \"Provider/OpenAICompatible/$model\""
+      # EVERY tier on this Mac (maintainer, 2026-11-08: every AI service on a Mac install defaults to a
+      # local model). An unmapped tier falls to the platform's default, which on an install with a
+      # cloud provider enabled is a cloud model. Coding takes the code model when Ollama has it.
+      echo "    AI__Tiers__utility: \"Provider/OpenAICompatible/$model\""
+      echo "    AI__Tiers__reasoning: \"Provider/OpenAICompatible/$model\""
+      echo "    AI__Tiers__review: \"Provider/OpenAICompatible/$model\""
+      echo "    AI__Tiers__coding: \"Provider/OpenAICompatible/${second:-$model}\""
+      if [ "$(ollama_model_has_vision "$model")" = "yes" ]; then
+        # OCR on the same model (it reads images): no second model in memory, no cloud OCR.
+        echo "    Ocr__Engine: \"OllamaVision\""
+        echo "    Ocr__OllamaVision__Endpoint: \"$OLLAMA_ENDPOINT\""
+        echo "    Ocr__OllamaVision__Model: \"$model\""
+      fi
       if [ -n "$w0" ]; then
         echo "    OpenAICompatible__ContextWindowTokens__0__Model: \"$model\""
         echo "    OpenAICompatible__ContextWindowTokens__0__Tokens: \"$w0\""
@@ -2091,8 +2111,43 @@ embed_smoke() {
   return 1
 }
 
+# A REAL image call from INSIDE the portal pod: the vision model the OCR engine names reads a tiny PNG
+# through the endpoint the portal's OCR engine uses (the same /chat/completions image_url request). 0 on success; a configured
+# engine that does not answer fails; no engine at all is said, loudly, never a silent pass.
+ocr_smoke() {
+  local envs engine endpoint model out code
+  if ! envs="$(kubectl -n "$NAMESPACE" exec deploy/memex-portal-deployment -c memex-portal -- env 2>/dev/null)"; then
+    warn "OCR smoke: could not read the portal pod's environment (is the portal running?)"; return 1
+  fi
+  engine="$(printf '%s\n' "$envs" | sed -n 's/^Ocr__Engine=//p' | head -1)"
+  endpoint="$(printf '%s\n' "$envs" | sed -n 's/^Ocr__OllamaVision__Endpoint=//p' | head -1)"
+  model="$(printf '%s\n' "$envs" | sed -n 's/^Ocr__OllamaVision__Model=//p' | head -1)"
+  if [ -z "$engine" ]; then
+    warn "OCR: no engine configured — documents and images are not read (the chat model has no vision capability, or MEMEX_OLLAMA_MODEL=none)"; return 0
+  fi
+  [ "$engine" = "OllamaVision" ] || { warn "OCR smoke: the portal's Ocr__Engine is '$engine', not this Mac's OllamaVision"; return 1; }
+  step "OCR smoke: the local vision model reads an image from inside the portal pod ($model at $endpoint)"
+  # A solid red 8x8 PNG: proves the image path end to end (a base64 image_url accepted by the model the
+  # OCR engine names, a completion back) without depending on how well a model reads tiny text.
+  local png="iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC"
+  out="$(kubectl -n "$NAMESPACE" exec deploy/memex-portal-deployment -c memex-portal -- sh -c '
+    code="$(curl -sS -o /tmp/memex-ocr-smoke.json -w "%{http_code}" -m 300 -H "Content-Type: application/json" \
+      -d "{\"model\":\"$1\",\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"One word: the colour of this image.\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,$3\"}}]}]}" \
+      "${2%/}/chat/completions" 2>/dev/null)"
+    printf "%s\n" "${code:-000}"; head -c 400 /tmp/memex-ocr-smoke.json 2>/dev/null; rm -f /tmp/memex-ocr-smoke.json' \
+    _ "$model" "$endpoint" "$png" 2>&1)" || true
+  code="$(printf '%s\n' "$out" | head -1)"
+  case "$code" in
+    200) if printf '%s' "$out" | grep -q '"choices"'; then ok "OCR smoke: HTTP 200 — $model read an image through $endpoint (inside the portal pod)"; return 0; fi
+         warn "OCR smoke: HTTP 200 but no completion: $(printf '%s' "$out" | sed -n 2p | cut -c1-160)" ;;
+    *)   warn "OCR smoke: HTTP $code from $endpoint for $model: $(printf '%s' "$out" | sed -n 2p | cut -c1-200)" ;;
+  esac
+  return 1
+}
+
 embed_smoke_or_die() {
   if [ "${MEMEX_LLM_SMOKE:-1}" = "0" ]; then warn "MEMEX_LLM_SMOKE=0 — the embedding smoke is SKIPPED; nothing proves semantic search embeds"; return 0; fi
+  ocr_smoke || die "the portal's OCR does NOT answer through the local vision model — see the line above; re-check with 'memex-local doctor'"
   embed_smoke || die "the portal's embeddings do NOT answer through the local model — see the line above (it names the cause and the fix); re-check with 'memex-local doctor'"
 }
 
@@ -4301,7 +4356,7 @@ cmd_status() {
   step "Health"
   # Diagnostic: report every check, never abort the rest of `status` on a red one.
   verify_usable || true
-  if colima_running; then llm_chat_smoke || true; embed_smoke || true; fi
+  if colima_running; then llm_chat_smoke || true; embed_smoke || true; ocr_smoke || true; fi
 }
 
 # The ONE calm line `up` and `update` print when verify_usable answered 2 ("still installing").
@@ -4922,6 +4977,7 @@ cmd_doctor() {
   if colima_running && kubectl -n "$NAMESPACE" get deploy/memex-portal-deployment >/dev/null 2>&1; then
     llm_chat_smoke || warn "the portal's chat does NOT answer through its local model"
     embed_smoke || warn "the portal's embeddings do NOT answer through the local model"
+    ocr_smoke || warn "the portal's OCR does NOT answer through the local vision model"
   fi
 }
 
