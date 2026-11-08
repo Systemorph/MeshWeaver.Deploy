@@ -96,11 +96,10 @@ config:
     Portal__AppleTouchIcon: "_content/Memex.Portal.Shared/brand/local-180.png"
 
     # ---- Local LLM via host-native Ollama (LocalColimaMac.md §10) ------------
-    OpenAICompatible__Endpoint: "http://ollama:11434/v1"
-    OpenAICompatible__Models__0: "qwen3.6-code"
-    # Auto-discover the endpoint's model list instead of the static Models[] above.
-    # Read as a Boolean — must be "true"/"false", never left empty (issue #352).
-    OpenAICompatible__DiscoverModels: "false"
+    # NOT set here: the endpoint follows the product (share/values.local.defaults.yaml) and the
+    # model, its context window and the default chat tier follow this Mac (llm.auto.yaml, written
+    # by every up/update). To pin a model of your own, set it here — this file wins:
+    #   OpenAICompatible__Models__0: "qwen3:8b"
 
     # NOTE: behaviour defaults that should FOLLOW the product (e.g. the startup
     # bake) are NOT in this template — they live in the tracked layer
@@ -124,9 +123,4 @@ ingress:
   tlsSecret: "memex-portal-tls"
 
 # ---- External Ollama, fronted by an in-cluster Service (LocalColimaMac.md §10)
-# host = Colima's host-gateway IP (the host where `ollama serve` runs).
-ollama:
-  external:
-    enabled: true
-    host: "192.168.5.2"
-    port: 11434
+# Enabled by the tracked defaults; its host (Colima's gateway) is resolved per install (llm.auto.yaml).

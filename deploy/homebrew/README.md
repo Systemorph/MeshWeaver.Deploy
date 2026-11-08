@@ -187,9 +187,9 @@ platform image in Colima's VM, sized for the host
 
 | Profile | VM | Host-native model | Host memory |
 |---|---|---|---|
-| `mac-studio` | 12 CPU / 32 GiB | `qwen3.6` (~23 GB) | 64 GB or more |
+| `mac-studio` | 12 CPU / 32 GiB | `qwen3.8:27b-mlx` (~18 GB) | 64 GB or more |
 | `mac-mini` | 6 CPU / 12 GiB | `qwen3:8b` (~5 GB) | 24 GB or more |
-| (unset) | 8 CPU / 16 GiB | `qwen3.6` | the developer-laptop defaults |
+| (unset) | 8 CPU / 16 GiB | `qwen3.8:27b-mlx` on Apple Silicon with ≥ 32 GB left beside the VM (a 48 GB Mac), else `qwen3:8b` | the developer-laptop defaults |
 
 **Channels** (`--channel <label>` on `up`/`update`, or `MEMEX_CHANNEL`) follow a declared
 release-channel label instead of `main`. `main` is the promoted set before it is armed. `3-latest` is
@@ -327,7 +327,7 @@ rolled in place; the **migration** is re-run as a Job (it has no Deployment).
 | §5 mkcert TLS | `mkcert -install` + mint cert + `kubectl create secret tls memex-portal-tls` | `setup_tls()` |
 | §6 Hostname | `memex.localhost` (auto-resolves), port `8443` | constants `HOSTNAME_LOCAL` / `HOST_PORT` |
 | §7 Durable access | `port-forward.sh` + `com.memex.local.plist`, `launchctl bootstrap` | `install_launchd()` (assets in `share/`) |
-| §10 Local LLM | `OLLAMA_HOST=127.0.0.1:11434 ollama serve` (the VM reaches it through its gateway; proven from inside the VM, LAN-wide only as a loud fallback); `ollama pull qwen3.6`; `ollama cp … qwen3.6-code` | `setup_ollama()` + overlay `ollama.external` + `OpenAICompatible__*` |
+| §10 Local LLM | `brew services start ollama` (loopback 127.0.0.1:11434, `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`; memex-local's own agent as the fallback; the VM reaches it through its gateway); `ollama pull qwen3.8:27b-mlx`; the portal calls `http://ollama.memex.svc.cluster.local:11434/v1` — a Host Ollama admits (the short name `ollama:11434` is answered 403) | `setup_ollama()` + `ensure_chat_model()` + tracked defaults (endpoint, `ollama.external`) + `~/.memex-local/llm.auto.yaml` (model, context window, `AI__Tiers__chat`, gateway IP) + `llm_chat_smoke()` (a real completion from inside the pod; `up`/`update` fail on a 403 or any non-200) |
 | §11 Observability | `helm upgrade --install loki grafana/loki-stack -f share/values.observability.yaml` (sized for the VM; `fleet join` runs it) | `cmd_observability()` |
 | §12 Instance identity | `Portal__InstanceName/Color` | overlay `config.memex_portal` |
 | §14 Verify | assert the portal is USABLE — it serves, `/login` is routed, and the DefaultViews/GraphViews packs are present | `verify_usable()` (`up` / `update` / `verify`; behaviour-tested in `test/run-tests.sh`) |
@@ -393,7 +393,8 @@ log, ollama log, grafana password) — exactly the paths the doc uses.
 | `MEMEX_CHART_DIR` | `$MEMEX_REPO/deploy/helm` or vendored copy | explicit chart dir |
 | `MEMEX_LOG_LEVEL` | `Debug` | verbose log level (`Trace` for max) |
 | `MEMEX_COLIMA_CPU` / `MEMEX_COLIMA_MEM` | `8` / `16` (or the profile's) | VM sizing (§2) |
-| `MEMEX_OLLAMA_MODEL` | `qwen3.6` (or the profile's) | host-native model `up` pulls; `none` skips it |
+| `MEMEX_OLLAMA_MODEL` | `qwen3.8:27b-mlx` / `qwen3:8b` by host memory (or the profile's) | the default chat model `up`/`update` pull and the portal names; `none` skips it |
+| `MEMEX_LLM_SMOKE` | `1` | `0` skips the post-install chat smoke (loudly) |
 | `MEMEX_PROFILE` | unset | Mac host profile, `mac-studio` or `mac-mini` (below) |
 | `MEMEX_CHANNEL` | unset (`main`) | release-channel label `up`/`update`/`autoroll` follow (below) |
 | `MEMEX_PORT` | `8443` | host port for the forward (§6/§7) |
@@ -413,7 +414,7 @@ Cannot be run in this environment — verify on a real Apple-Silicon Mac:
 - `brew install` of the formula (needs Homebrew + network).
 - `colima start --kubernetes` (needs virtualization + `socket_vmnet`).
 - `mkcert -install` (writes the CA to the **System keychain** — interactive auth).
-- `ollama serve` + `ollama pull qwen3.6` (downloads the model; needs the Metal GPU
+- `brew services start ollama` + `ollama pull qwen3.8:27b-mlx` (downloads the model; needs the Metal GPU
   for performance).
 - The local-build image path (`dotnet publish -t:PublishContainer`) and/or the
   ACR pull (`az acr login`).

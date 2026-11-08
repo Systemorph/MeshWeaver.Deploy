@@ -692,14 +692,22 @@ echo "── Mac host profiles (Doc/Architecture/ReleaseEditions G4) ───�
 
 prof() { OUT="$(env "$@" MEMEX_LOCAL_HOME="$RHOME" "$CLI" profile 2>&1)"; RC=$?; }
 prof MEMEX_PROFILE=mac-studio
-case "$RC:$OUT" in 0:*"12 CPU / 32 GiB"*"qwen3.6"*) ok "mac-studio sizes a 12/32 VM with qwen3.6" ;;
-  *) bad "mac-studio sizes a 12/32 VM with qwen3.6" "exited $RC: $OUT" ;; esac
+case "$RC:$OUT" in 0:*"12 CPU / 32 GiB"*"qwen3.8:27b-mlx"*) ok "mac-studio sizes a 12/32 VM with qwen3.8:27b-mlx" ;;
+  *) bad "mac-studio sizes a 12/32 VM with qwen3.8:27b-mlx" "exited $RC: $OUT" ;; esac
 prof MEMEX_PROFILE=mac-mini
 case "$RC:$OUT" in 0:*"6 CPU / 12 GiB"*"qwen3:8b"*) ok "mac-mini sizes a 6/12 VM with qwen3:8b" ;;
   *) bad "mac-mini sizes a 6/12 VM with qwen3:8b" "exited $RC: $OUT" ;; esac
-prof MEMEX_PROFILE=
-case "$RC:$OUT" in 0:*"8 CPU / 16 GiB"*"qwen3.6"*) ok "no profile keeps the laptop defaults (8/16, qwen3.6)" ;;
-  *) bad "no profile keeps the laptop defaults (8/16, qwen3.6)" "exited $RC: $OUT" ;; esac
+# No profile: the model follows the host's memory — qwen3.8 on Apple Silicon with >= 32 GiB beside the VM
+# (a 48 GB Mac with the default 16 GiB VM), the fallback below that line and on Intel.
+prof MEMEX_PROFILE= MEMEX_HOST_MEM_GIB=48 MEMEX_HOST_ARCH=arm64
+case "$RC:$OUT" in 0:*"8 CPU / 16 GiB"*"qwen3.8:27b-mlx"*) ok "no profile, 48 GB Apple Silicon: 8/16 VM, default chat model qwen3.8:27b-mlx" ;;
+  *) bad "no profile, 48 GB Apple Silicon: 8/16 VM, default chat model qwen3.8:27b-mlx" "exited $RC: $OUT" ;; esac
+prof MEMEX_PROFILE= MEMEX_HOST_MEM_GIB=47 MEMEX_HOST_ARCH=arm64
+case "$RC:$OUT" in 0:*"model:     qwen3:8b"*) ok "no profile, 47 GB: the fallback qwen3:8b (one GiB under the line)" ;;
+  *) bad "no profile, 47 GB: the fallback qwen3:8b" "exited $RC: $OUT" ;; esac
+prof MEMEX_PROFILE= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=x86_64
+case "$RC:$OUT" in 0:*"model:     qwen3:8b"*) ok "no profile, Intel Mac: the fallback qwen3:8b (MLX needs Apple Silicon)" ;;
+  *) bad "no profile, Intel Mac: the fallback qwen3:8b" "exited $RC: $OUT" ;; esac
 prof MEMEX_PROFILE=mac-mini MEMEX_COLIMA_MEM=20 MEMEX_OLLAMA_MODEL=none
 case "$RC:$OUT" in 0:*"6 CPU / 20 GiB"*"model:     none"*) ok "an explicit MEMEX_COLIMA_MEM / MEMEX_OLLAMA_MODEL beats the profile" ;;
   *) bad "an explicit MEMEX_COLIMA_MEM / MEMEX_OLLAMA_MODEL beats the profile" "exited $RC: $OUT" ;; esac
@@ -707,6 +715,141 @@ prof MEMEX_PROFILE=mac-studo
 case "$RC:$OUT" in 0:*) bad "an unknown profile refuses (never read as the default)" "exited 0: $OUT" ;;
   *"unknown MEMEX_PROFILE"*) ok "an unknown profile refuses (never read as the default)" ;;
   *) bad "an unknown profile refuses (never read as the default)" "refused without saying why: $OUT" ;; esac
+
+echo "── local model: the host-safe Ollama endpoint, never 403 (2026-11-08) ──"
+# REGRESSION for the chat 403 on every install: the portal called http://ollama:11434/v1 and Ollama, bound
+# to loopback, refused the Host header `ollama:11434`. ollama_host_admitted states Ollama's rule; the
+# endpoint memex-local configures must pass it, and the old one must FAIL it (the negative control that
+# proves the rule can say no). `memex-local doctor` re-measures the same pair against the live Ollama.
+lm() { env HOME="$LMH/home" MEMEX_LOCAL_HOME="$LMH/home/.memex-local" MEMEX_LOCAL_LIB=1 PATH="$LMH/stubs:$STUBS:$PATH" "$@"; }
+LMH="$(mktemp -d)"; mkdir -p "$LMH/stubs" "$LMH/home/.memex-local"
+EP="$(lm bash -c '. "$0"; printf %s "$OLLAMA_ENDPOINT"' "$CLI")"
+[ "$EP" = "http://ollama.memex.svc.cluster.local:11434/v1" ] && ok "the portal's Ollama endpoint is the Service's cluster FQDN ($EP)" || bad "endpoint" "$EP"
+lm bash -c '. "$0"; ollama_host_admitted "$(url_hostport "$OLLAMA_ENDPOINT")"' "$CLI" \
+  && ok "Ollama's loopback Host rule ADMITS the configured endpoint's host (ends in .local)" || bad "endpoint host refused by the rule" "$EP"
+lm bash -c '. "$0"; ollama_host_admitted ollama:11434' "$CLI" \
+  && bad "the rule admits 'ollama:11434' — the regression this guards would pass unseen" "" \
+  || ok "negative control: the rule REFUSES 'ollama:11434' (the 403 every install got)"
+for h in 192.168.5.2:11434 localhost:11434 127.0.0.1:11434 ollama.internal:11434 host.lima.internal:11434; do
+  lm bash -c '. "$0"; ollama_host_admitted "$1"' "$CLI" "$h" && ok "the rule admits $h" || bad "the rule refuses $h" ""
+done
+for h in ollama.example.com:11434 8.8.8.8:11434 ollama.memex.svc:11434; do
+  lm bash -c '. "$0"; ollama_host_admitted "$1"' "$CLI" "$h" && bad "the rule admits $h" "" || ok "the rule refuses $h"
+done
+DEF="$HERE/../share/values.local.defaults.yaml"
+grep -qx "    OpenAICompatible__Endpoint: \"$EP\"" "$DEF" && ok "the tracked defaults layer carries the same endpoint (existing installs get it on brew upgrade)" \
+  || bad "defaults endpoint differs from OLLAMA_ENDPOINT" "$(grep -n OpenAICompatible__Endpoint "$DEF")"
+TPL="$HERE/../share/values.local.yaml"
+grep -Eq '^ +OpenAICompatible__(Endpoint|Models__0):' "$TPL" && bad "the overlay template still SETS the endpoint/model (an overlay wins over every layer)" "$(grep -n OpenAICompatible "$TPL")" \
+  || ok "the overlay template sets no Ollama endpoint or model (the layers below answer them)"
+grep -v '^ *#' "$DEF" "$TPL" | grep -q 'ollama:11434' && bad "a values file still names the 403 endpoint ollama:11434" "$(grep -n 'ollama:11434' "$DEF" "$TPL")" || ok "no values file names the short Service name"
+
+# migrate_overlay_llm: the exact stale template lines leave an EXISTING overlay; an owner's choice stays.
+OVL="$LMH/home/.memex-local/values.local.yaml"
+cat > "$OVL" <<'YAML'
+config:
+  memex_portal:
+    OpenAICompatible__Endpoint: "http://ollama:11434/v1"
+    OpenAICompatible__Models__0: "qwen3.6-code"
+    OpenAICompatible__DiscoverModels: "false"
+ingress:
+  host: "memex.localhost"
+ollama:
+  external:
+    enabled: true
+    host: "192.168.5.2"
+    port: 11434
+YAML
+OUT="$(lm bash -c 'set -euo pipefail; . "$0"; migrate_overlay_llm; echo MIG_DONE' "$CLI" 2>&1)"
+case "$OUT" in *MIG_DONE*) ;; *) bad "migrate_overlay_llm aborted" "$OUT" ;; esac
+if ! grep -q 'ollama:11434\|qwen3.6-code\|192.168.5.2' "$OVL" && grep -q 'memex.localhost' "$OVL" && grep -q 'DiscoverModels' "$OVL" \
+   && [ -f "$OVL.bak-llm" ]; then ok "an existing overlay loses exactly the stale endpoint, model and gateway lines (copy kept), nothing else"
+else bad "overlay migration" "$(cat "$OVL")"; fi
+cat > "$OVL" <<'YAML'
+config:
+  memex_portal:
+    OpenAICompatible__Endpoint: "http://10.0.0.7:11434/v1"
+    OpenAICompatible__Models__0: "llama3.3:70b"
+YAML
+cp "$OVL" "$LMH/before"; rm -f "$OVL.bak-llm"
+lm bash -c '. "$0"; migrate_overlay_llm' "$CLI" >/dev/null 2>&1
+cmp -s "$OVL" "$LMH/before" && [ ! -f "$OVL.bak-llm" ] && ok "an owner's own endpoint and model are never touched (no copy written)" || bad "owner choice clobbered" "$(cat "$OVL")"
+
+# write_llm_auto_layer: model + Ollama's window + chat tier + the VM gateway; the owner's model wins.
+cat > "$LMH/stubs/curl" <<'STUB'
+#!/bin/bash
+case "$*" in
+  *api/show*qwen3.8*)       echo '{"model_info":{"general.architecture":"qwen3_5","qwen3_5.context_length":262144}}' ;;
+  *api/show*qwen3.6-code*)  echo '{"model_info":{"qwen3_5.context_length":131072}}' ;;
+  *api/show*llama3.3*)      echo '{"model_info":{"llama.context_length":131072}}' ;;
+  *api/show*)               exit 22 ;;
+  *api/tags*)               echo "{\"models\":[${FAKE_TAGS:-}]}" ;;
+  *) exit 0 ;;
+esac
+STUB
+cat > "$LMH/stubs/colima" <<'STUB'
+#!/bin/bash
+case "$*" in *"ip route"*) echo "default via 192.168.5.9 dev eth0" ;; esac; exit 0
+STUB
+chmod +x "$LMH/stubs/"*
+AUTO="$LMH/home/.memex-local/llm.auto.yaml"; : > "$OVL"
+lm env MEMEX_OLLAMA_MODEL= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=arm64 FAKE_TAGS='{"name":"qwen3.8:27b-mlx"},{"name":"qwen3.6-code:latest"}' \
+  bash -c 'set -euo pipefail; . "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+if grep -qx '    OpenAICompatible__Models__0: "qwen3.8:27b-mlx"' "$AUTO" \
+   && grep -qx '    AI__Tiers__chat: "Provider/OpenAICompatible/qwen3.8:27b-mlx"' "$AUTO" \
+   && grep -qx '    OpenAICompatible__ContextWindowTokens__0__Tokens: "262144"' "$AUTO" \
+   && grep -qx '    OpenAICompatible__Models__1: "qwen3.6-code"' "$AUTO" \
+   && grep -qx '    OpenAICompatible__ContextWindowTokens__1__Tokens: "131072"' "$AUTO" \
+   && grep -qx '    host: "192.168.5.9"' "$AUTO"; then
+  ok "llm.auto.yaml: qwen3.8 as Models__0 + default chat tier, Ollama's window (262144) declared, the old alias kept as Models__1, the VM's own gateway"
+else bad "auto layer (default)" "$(cat "$AUTO")"; fi
+printf 'config:\n  memex_portal:\n    OpenAICompatible__Models__0: "llama3.3:70b"\n' > "$OVL"
+lm env MEMEX_OLLAMA_MODEL= FAKE_TAGS='{"name":"llama3.3:70b"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+grep -qx '    AI__Tiers__chat: "Provider/OpenAICompatible/llama3.3:70b"' "$AUTO" && grep -qx '    OpenAICompatible__ContextWindowTokens__0__Tokens: "131072"' "$AUTO" \
+  && ok "an owner's explicit model is the one the chat tier names and the window is declared for (never clobbered by qwen3.8)" || bad "auto layer (owner model)" "$(cat "$AUTO")"
+: > "$OVL"
+lm env MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+grep -q 'Models__0\|AI__Tiers' "$AUTO" && bad "MEMEX_OLLAMA_MODEL=none still names a model" "$(cat "$AUTO")" || ok "MEMEX_OLLAMA_MODEL=none names no model"
+# helm_deploy layers llm.auto.yaml right after the tracked defaults and before every other layer.
+HD="$(awk '/^helm_deploy\(\) \{/,/^}$/' "$CLI")"
+grep -A3 -- '-f "$share_dir/values.local.defaults.yaml"' <<<"$HD" | grep -q -- '-f "$LLM_AUTO_FILE"' \
+  && grep -q '^  migrate_overlay_llm$' <<<"$HD" && grep -q '^  write_llm_auto_layer$' <<<"$HD" \
+  && ok "helm_deploy migrates the overlay, writes llm.auto.yaml, and layers it right after the tracked defaults" || bad "helm_deploy layering" ""
+
+# The chat smoke: the pod's answer decides. A 403 FAILS and names the Host-header cause; 200 passes.
+cat > "$LMH/stubs/kubectl" <<'STUB'
+#!/bin/bash
+case "$*" in
+  *"printenv OpenAICompatible__Endpoint"*) echo "${FAKE_EP-http://ollama.memex.svc.cluster.local:11434/v1}" ;;
+  *"printenv OpenAICompatible__Models__0"*) echo "qwen3.8:27b-mlx" ;;
+  *"sh -c"*) printf '%s\n%s\n' "${FAKE_SMOKE_CODE:-200}" '{"choices":[{"message":{"content":"OK"}}]}' ;;
+esac
+exit 0
+STUB
+chmod +x "$LMH/stubs/kubectl"
+OUT="$(lm env FAKE_SMOKE_CODE=200 bash -c '. "$0"; llm_chat_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && grep -q "HTTP 200" <<<"$OUT" && ok "chat smoke: HTTP 200 from inside the pod passes" || bad "smoke 200" "rc=$RC $OUT"
+OUT="$(lm env FAKE_SMOKE_CODE=403 FAKE_EP=http://ollama:11434/v1 bash -c '. "$0"; llm_chat_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && grep -q "refused the Host header 'ollama:11434'" <<<"$OUT" && grep -q "svc.cluster.local" <<<"$OUT" \
+  && ok "chat smoke: a 403 FAILS and names Ollama's Host-header check and the endpoint to use" || bad "smoke 403" "rc=$RC $OUT"
+for c in 404 500 000; do
+  OUT="$(lm env FAKE_SMOKE_CODE=$c bash -c '. "$0"; llm_chat_smoke' "$CLI" 2>&1)"; RC=$?
+  [ "$RC" = 1 ] && ok "chat smoke: HTTP $c fails" || bad "smoke $c passed" "$OUT"
+done
+OUT="$(lm env FAKE_SMOKE_CODE=403 bash -c '. "$0"; llm_chat_smoke_or_die; echo SURVIVED' "$CLI" 2>&1)"; RC=$?
+[ "$RC" != 0 ] && ! grep -q SURVIVED <<<"$OUT" && ok "the smoke GATE stops the command on a 403 (up/update/fleet join fail loudly)" || bad "gate passed a 403" "$OUT"
+for c in cmd_up cmd_update; do
+  awk "/^${c}\\(\\) \\{/,/^}\$/" "$CLI" | grep -q '^  llm_chat_smoke_or_die$' && ok "$c runs the chat smoke gate" || bad "$c has no smoke gate" ""
+done
+awk '/^cmd_doctor\(\) \{/,/^}$/' "$CLI" | grep -q 'llm_host_probe' && awk '/^cmd_doctor\(\) \{/,/^}$/' "$CLI" | grep -q 'llm_chat_smoke' \
+  && ok "doctor re-measures the Host rule on the live Ollama and runs the chat smoke" || bad "doctor checks" ""
+awk '/^cmd_status\(\) \{/,/^}$/' "$CLI" | grep -q 'llm_chat_smoke' && ok "status runs the chat smoke" || bad "status smoke" ""
+awk '/^cmd_update\(\) \{/,/^}$/' "$CLI" | grep -q 'setup_ollama' && ok "update pulls the default chat model too (existing installs get qwen3.8)" || bad "update setup_ollama" ""
+grep -q '<key>OLLAMA_FLASH_ATTENTION</key><string>1</string><key>OLLAMA_KV_CACHE_TYPE</key><string>q8_0</string>' "$CLI" \
+  && ok "memex-local's own Ollama agent carries the tuning env (flash attention, q8_0 KV cache)" || bad "agent tuning env" ""
+lm bash -c '. "$0"; version_ge 0.40.14 0.32.12 && ! version_ge 0.31.9 0.32.12 && version_ge 0.32.12 0.32.12' "$CLI" \
+  && ok "version_ge orders Ollama releases numerically" || bad "version_ge" ""
+rm -rf "$LMH"
 
 echo "── release-channel labels: a seed, resolved to a VERSION (G1) ────"
 
