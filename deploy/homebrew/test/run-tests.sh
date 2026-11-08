@@ -916,6 +916,21 @@ B="$(fn_body cmd_update)"; grep -q 'if \[ -n "$residency" \] || \[ -n "${MEMEX_R
 lm env MEMEX_RESIDENCY=at bash -c 'set -euo pipefail; . "$0"; residency_onboard ""' "$CLI" >/dev/null 2>&1
 [ "$(cat "$RESF")" = "AT" ] && ok "MEMEX_RESIDENCY is persisted by the onboarding (AT)" || bad "env not persisted" "$(cat "$RESF")"
 printf 'CH\n' > "$RESF"
+# An invalid declaration FAILS the run (never a quiet un-declare through a $( ) that swallowed the die).
+printf 'C1\n' > "$RESF"
+OUT="$(lm env MEMEX_OLLAMA_MODEL= FAKE_TAGS='{"name":"qwen3.8:27b-mlx"}' bash -c '. "$0"; write_llm_auto_layer; echo WROTE' "$CLI" 2>&1)"
+! grep -q WROTE <<<"$OUT" && grep -q "'C1' is not a residency" <<<"$OUT" && ok "a corrupted residency file fails up/update loudly instead of writing the layer as Unknown" || bad "corrupted residency swallowed" "$OUT"
+OUT="$(lm env MEMEX_RESIDENCY=x9 bash -c '. "$0"; accept_load; echo LOADED' "$CLI" 2>&1)"
+! grep -q LOADED <<<"$OUT" && ok "an invalid MEMEX_RESIDENCY fails the backlease answers too" || bad "invalid env swallowed by accept_load" "$OUT"
+# End to end through the CLI's own dispatcher (not the sourced function).
+EH="$(mktemp -d)"
+OUT="$(env MEMEX_LOCAL_HOME="$EH" HOME="$EH" PATH="$STUBS:$PATH" "$CLI" residency ch 2>&1)"; RC=$?
+[ "$RC" = 0 ] && [ "$(cat "$EH/residency" 2>/dev/null)" = "CH" ] && ok "'memex-local residency ch' through main() declares CH" || bad "CLI residency dispatch" "rc=$RC $OUT"
+OUT="$(env MEMEX_LOCAL_HOME="$EH" HOME="$EH" PATH="$STUBS:$PATH" "$CLI" residency 2>&1)"
+grep -q 'residency: CH' <<<"$OUT" && ok "'memex-local residency' through main() prints it" || bad "CLI residency print" "$OUT"
+env MEMEX_LOCAL_HOME="$EH" HOME="$EH" PATH="$STUBS:$PATH" "$CLI" residency C1 >/dev/null 2>&1 && bad "CLI accepted residency C1" "" \
+  || { [ "$(cat "$EH/residency")" = "CH" ] && ok "'memex-local residency C1' through main() is refused and changes nothing"; } || bad "CLI refusal changed the file" ""
+rm -rf "$EH"
 rm -f "$RESF"
 # The default is not in Ollama (pull failed / Ollama too old): name a model Ollama HAS, never a 404.
 lm env MEMEX_OLLAMA_MODEL= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=arm64 FAKE_TAGS='{"name":"qwen3.6-code:latest"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1

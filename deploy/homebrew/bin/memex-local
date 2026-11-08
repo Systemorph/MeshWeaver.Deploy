@@ -692,6 +692,7 @@ accept_list() {
 accept_load() {
   local p="Hosting__BackLease__Accept"
   # the residency a token answer states defaults to the INSTALL declaration (memex-local residency)
+  install_residency_valid
   ACC_TOK_RES="$(install_residency)"
   # a fresh machine has no layer yet: both off (the readers below are only run against a file that exists)
   [ -f "$BACKLEASE_FILE" ] || return 0
@@ -1920,6 +1921,11 @@ install_residency() {
   accept_check_residency "$v" "$RESIDENCY_FILE"; residency_norm "$v"
 }
 
+# install_residency's validation, run in THIS shell: a die inside $(install_residency) would end only the
+# subshell and quietly un-declare the install (a hand-corrupted file, a bad MEMEX_RESIDENCY). Every caller that
+# reads the value through a command substitution calls this first, so an invalid declaration fails the run.
+install_residency_valid() { install_residency >/dev/null; }
+
 # Persists a declaration ("" = asked, none declared). Validated before anything is written.
 residency_write() {
   local v="$1"
@@ -1979,6 +1985,7 @@ llm_residency_drift_warn() {
 cmd_residency() {
   case "${1:-}" in
     "")
+      install_residency_valid
       local v; v="$(install_residency)"
       if [ -n "$v" ]; then ok "residency: $v — the local models process prompts here (OpenAICompatible__DataResidency)"
       else info "residency: none declared — the local models read as Unknown (memex-local residency CH|Eu|Global|<ISO code>)"; fi
@@ -1995,6 +2002,7 @@ cmd_residency() {
 write_llm_auto_layer() {
   local model gw second="" w0="" w1="" residency
   model="$(effective_chat_model)"
+  install_residency_valid
   residency="$(install_residency)"
   gw="$(llm_host_ip)"
   mkdir -p "$LOCAL_HOME"
@@ -2137,6 +2145,7 @@ cmd_llm() {
         shift
       done
       if [ -n "$residency" ]; then accept_check_residency "$residency" "llm use: --residency"; residency="$(residency_norm "$residency")"; fi
+      install_residency_valid
       local effective_res="${residency:-$(install_residency)}"
       case "$model" in ''|*[!A-Za-z0-9._:/-]*) die "llm use: --model '$model' is not a valid Ollama model name" ;; esac
       curl -fsS -m 5 "http://127.0.0.1:${port}/v1/models" 2>/dev/null | grep -q -E "\"id\":\"${model}(:[^\"]*)?\"" \
@@ -2172,6 +2181,7 @@ YAML
       ;;
     status)
       [ $# -eq 0 ] || die "llm status: unknown flag '$1'"
+      install_residency_valid
       if [ -f "$LLM_FILE" ]; then
         local endpoint; endpoint="$(llm_value OpenAICompatible__Endpoint)"
         local lres; lres="$(llm_value OpenAICompatible__DataResidency)"
