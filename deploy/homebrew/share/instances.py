@@ -93,13 +93,28 @@ def state_dir(name):
 
 
 def write_json_atomic(path, data, mode=0o644):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = "%s.tmp-%d" % (path, os.getpid())
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    """tmp + rename. The bridge directory is writable by the first instance's pod, so nothing it could plant is
+    followed: the directory must not be a symlink, and the temp file — an unpredictable name — is created with
+    O_EXCL|O_NOFOLLOW (a planted file or symlink fails the write instead of redirecting it). The final rename
+    replaces whatever sits at `path` (a symlink included) without following it."""
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    if os.path.islink(d):
+        raise Failed("%s is a symbolic link — refusing to write through it" % d)
+    tmp = os.path.join(d, ".%s.tmp-%s" % (os.path.basename(path), secrets.token_hex(8)))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def read_json(path):
@@ -158,6 +173,8 @@ def check_spec(spec, operation, stored=None):
             raise Refused("spec.owner.email %r is not an e-mail address" % (mail,))
         out["owner"] = {"id": oid, "email": mail}
     else:
+        if not base.get("hostName") or not base.get("owner"):
+            raise Refused("no instance to update — create it first")
         for key in ("hostName", "owner", "name"):
             if key in spec and spec[key] not in (None, base.get(key)):
                 raise Refused("update never changes %s (it is %r)" % (key, base.get(key)))
@@ -990,6 +1007,10 @@ def claim_next():
             os.replace(src, dst)
         except OSError:
             continue  # another claimer won, or the portal is still renaming
+        if os.path.islink(dst) or not os.path.isfile(dst):
+            os.remove(dst)
+            refuse_file(stem, None, None, "the job is not a regular file (a symbolic link is never followed)")
+            continue
         if terminal_result(stem):
             os.remove(dst)
             say("job %s already has a terminal result — not re-run" % stem)
@@ -1055,6 +1076,9 @@ def recover():
 def agent(once):
     for d in ("jobs", "running", "results"):
         os.makedirs(bridge(d), exist_ok=True)
+        if os.path.islink(bridge(d)):
+            say("%s is a symbolic link — the executor refuses to run on a bridge it does not own" % bridge(d))
+            return 1
     if once:
         # every waiting job, one after the other, then one inventory
         recover()

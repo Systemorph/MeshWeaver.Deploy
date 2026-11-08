@@ -2092,6 +2092,14 @@ for c in "local-instance-bad-name-create-a|is not ^[a-z]" "local-instance-memex-
   id="${c%%|*}"; want="${c#*|}"; r="$(res "$id")"
   case "$r" in "Refused|"*"$want"*) ok "a job is Refused with its reason: $id ($want)" ;; *) bad "refusal $id" "got '$r' — $(cat "$IX/agent.out")" ;; esac
 done
+# The bridge is writable by the first instance's pod: a planted symlink is never followed.
+printf 'secret-on-the-mac' > "$IX/outside.txt"; ln -s "$IX/outside.txt" "$IXB/jobs/local-instance-link-stop-a.json"; runonce
+case "$(res local-instance-link-stop-a)" in "Refused|"*"symbolic link is never followed"*) ok "a job that is a symbolic link is Refused, never read" ;; *) bad "symlink job" "$(res local-instance-link-stop-a)" ;; esac
+grep -rq 'secret-on-the-mac' "$IXB" && bad "a symlinked job's target leaked into the bridge" "" || ok "the symlink's target never reaches a result"
+mv "$IXB/results" "$IX/results-real"; ln -s "$IX" "$IXB/results"; job local-instance-x-stop-a "$(J local-instance-x-stop-a stop proof)"
+ix "$CLI" instances agent run-once >"$IX/agent.out" 2>&1
+grep -q 'symbolic link' "$IX/agent.out" && [ ! -e "$IX/local-instance-x-stop-a.json" ] && ok "a results/ replaced by a symlink stops the executor (nothing written through it)" || bad "results symlink" "$(cat "$IX/agent.out")"
+rm "$IXB/results" "$IXB/jobs/local-instance-x-stop-a.json"; mv "$IX/results-real" "$IXB/results"
 [ -f "$IXB/results/invalid-bad-name.json" ] && ok "a job file whose name is not a job id is answered Refused too (invalid-<name>)" || bad "invalid file name" "$(ls "$IXB/results")"
 [ -z "$(find "$IXB/jobs" "$IXB/running" -name '*.json' 2>/dev/null)" ] && ok "every refused job left jobs/ and running/" || bad "leftovers" "$(ls -R "$IXB")"
 
