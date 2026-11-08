@@ -1954,7 +1954,7 @@ write_llm_auto_layer() {
       echo "  memex_portal:"
       echo "    OpenAICompatible__Models__0: \"$model\""
       echo "    AI__Tiers__chat: \"Provider/OpenAICompatible/$model\""
-      if [ -n "$vision" ]; then
+      if [ -n "$vision" ] && [ -n "$OLLAMA_ENDPOINT" ]; then
         # OCR of pictures and scanned pages through the same host-safe endpoint (MeshWeaver.Ocr OllamaVision).
         echo "    Ocr__Engine: \"OllamaVision\""
         echo "    Ocr__OllamaVision__Endpoint: \"$OLLAMA_ENDPOINT\""
@@ -1980,7 +1980,7 @@ write_llm_auto_layer() {
     off) info "LOCAL OCR: off (MEMEX_OCR=none) — no OCR engine declared; pictures and scanned pages are not read" ;;
     yes) info "LOCAL OCR + VISION: $vision reads and describes pictures and scanned pages on this Mac (ingestion: tables, summaries, icons)" ;;
     unknown) [ -n "$model" ] && warn "⚠️  LOCAL VISION UNCONFIRMED: Ollama did not answer the capability probe for $model${second:+ / $second} — no OCR engine declared this time; the next 'memex-local update' retries (is Ollama running? curl -s http://127.0.0.1:11434/api/version)" ;;
-    missing) [ -n "$model" ] && warn "⚠️  LOCAL VISION UNCONFIRMED: Ollama does not have $model${second:+ / $second} pulled — no OCR engine declared this time (ollama pull $model; the next 'memex-local update' declares it)" ;;
+    missing) [ -n "$model" ] && warn "⚠️  LOCAL VISION UNCONFIRMED: Ollama does not have $model pulled — no OCR engine declared this time (ollama pull $model; the next 'memex-local update' declares it)" ;;
     no) [ -n "$model" ] && warn "⚠️  NO LOCAL VISION: $model${second:+ and $second} report no 'vision' capability — uploaded pictures and scanned PDFs will NOT be read or described on this install (choose a vision model: memex-local llm use --model qwen3.8:27b-mlx)" ;;
   esac
   if [ -z "$model" ]; then
@@ -4265,7 +4265,7 @@ ocr_vision_status() {
     off) info "ingestion: OCR off (MEMEX_OCR=none)" ;;
     yes) ok "ingestion: $OCR_VISION_MODEL has vision — pictures and scanned pages are read, described and taken apart on this Mac" ;;
     unknown) warn "ingestion: could not confirm vision for $model${second:+ / $second} — Ollama did not answer the capability probe"; return 1 ;;
-    missing) warn "ingestion: $model${second:+ / $second} not pulled in Ollama — pictures and scanned PDFs are not read (ollama pull $model)"; return 1 ;;
+    missing) warn "ingestion: $model is not pulled in Ollama — pictures and scanned PDFs are not read (ollama pull $model)"; return 1 ;;
     *) warn "ingestion: $model${second:+ and $second} have NO vision capability — pictures and scanned PDFs are not read (memex-local llm use --model <a vision model>)"; return 1 ;;
   esac
 }
