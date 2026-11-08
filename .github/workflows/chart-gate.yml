@@ -118,7 +118,11 @@ jobs:
       - name: Install shellcheck (pinned, checksum-verified)
         run: |
           set -euo pipefail
-          curl -fsSLo "$RUNNER_TEMP/sc.tar.xz" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          # A release download through github.com's CDN answers 5xx for minutes at a time (measured 2026-11-08: 504/502 on
+          # every attempt for over an hour on ubuntu-latest while the same URL answered 200 elsewhere). Bounded retries ride
+          # out a transient one; the checksum below still decides what is installed.
+          curl -fsSL --retry 6 --retry-all-errors --retry-delay 20 --connect-timeout 20 --max-time 120 \
+            -o "$RUNNER_TEMP/sc.tar.xz" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
           echo "${SHELLCHECK_SHA256}  $RUNNER_TEMP/sc.tar.xz" | sha256sum -c -
           # The runner image carries no `xz`, so `tar -J` cannot exec it; python's stdlib reads xz.
           python3 -c 'import sys, tarfile; tarfile.open(sys.argv[1], "r:xz").extractall(sys.argv[2], filter="data")' \
@@ -413,7 +417,11 @@ jobs:
       - name: Install shellcheck (pinned, checksum-verified)
         run: |
           set -euo pipefail
-          curl -fsSLo "$RUNNER_TEMP/sc.tar.xz" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          # A release download through github.com's CDN answers 5xx for minutes at a time (measured 2026-11-08: 504/502 on
+          # every attempt for over an hour on ubuntu-latest while the same URL answered 200 elsewhere). Bounded retries ride
+          # out a transient one; the checksum below still decides what is installed.
+          curl -fsSL --retry 6 --retry-all-errors --retry-delay 20 --connect-timeout 20 --max-time 120 \
+            -o "$RUNNER_TEMP/sc.tar.xz" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
           echo "${SHELLCHECK_SHA256}  $RUNNER_TEMP/sc.tar.xz" | sha256sum -c -
           # The runner image carries no `xz`, so `tar -J` cannot exec it; python's stdlib reads xz.
           python3 -c 'import sys, tarfile; tarfile.open(sys.argv[1], "r:xz").extractall(sys.argv[2], filter="data")' \
