@@ -1105,6 +1105,17 @@ OUT="$(PATH="$FAO/bin:$PATH" MEMEX_HEADLESS=1 bash "$FA" "${FA_ARGS[@]}" --owner
 grep -qx 'owner --id bob --email bob@example.com' "$FAO/calls" && grep -q "owner: bob" <<<"$OUT" \
   && ok "first-attach --owner/--owner-email (executed) records the owner through memex-local and names who answers the opt-in" || bad "first-attach --owner" "$OUT
 $(cat "$FAO/calls")"
+# an owner line FOLLOWED by more output (the real CLI names the work identity next): `status | grep -q` under pipefail
+# reads that as 141 (SIGPIPE) and refused an owned Mac as ownerless (eiger, 2026-11-08)
+cat > "$FAO/bin/memex-local" <<STUB
+#!/bin/bash
+case "\$*" in "owner status") echo " ok  instance OWNER (global administrator): bob <bob@example.com>"; sleep 0.2
+  for i in \$(seq 2000); do echo "    this Mac's work identity: bob@example.com (line \$i)"; done; exit 0 ;; esac
+exit 0
+STUB
+OUT="$(PATH="$FAO/bin:$PATH" MEMEX_HEADLESS=1 bash "$FA" "${FA_ARGS[@]}" </dev/null 2>&1)"
+! grep -q "has no OWNER" <<<"$OUT" && grep -q "owner: bob" <<<"$OUT" \
+  && ok "first-attach reads an owner the CLI reports before further output (no SIGPIPE under pipefail)" || bad "first-attach owner SIGPIPE" "$OUT"
 rm -rf "$FAO"
 B="$(fn_body cmd_fleet)"; grep -A1 'OWNER_REQUIRED=require' <<<"$B" | grep -q 'ensure_overlay' \
   && [ "$(grep -n 'OWNER_REQUIRED=require' <<<"$B" | head -1 | cut -d: -f1)" -lt "$(grep -n 'cmd_backlease enroll' <<<"$B" | head -1 | cut -d: -f1)" ] \
