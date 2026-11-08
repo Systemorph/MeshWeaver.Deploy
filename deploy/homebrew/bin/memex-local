@@ -652,16 +652,19 @@ accept_load() {
 accept_norm() { local v; v="$(printf '%s' "$1" | tr ',' ' ' | xargs 2>/dev/null || true)"; [ "${2:-}" = lower ] && v="$(printf '%s' "$v" | tr 'A-Z' 'a-z')"; printf '%s' "$v"; }
 
 # Validators — each dies naming the value. A pattern: a host, `*.` + a host (one label or more below it), or `*`.
+# 🚨 Lists are split on spaces with globbing OFF (`set -f`): a bare `*` pattern must never expand to file names.
 accept_check_patterns() {
   local x; [ -n "$1" ] || die "$2: name at least one instance (a host, *.domain, or *)"
+  set -f
   for x in $1; do
     printf '%s' "$x" | grep -Eq '^(\*|(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+)$' \
-      || die "$2: '$x' is not an instance pattern (a host such as control.systemorph.com, *.meshweaver.cloud, or *)"
+      || { set +f; die "$2: '$x' is not an instance pattern (a host such as control.systemorph.com, *.meshweaver.cloud, or *)"; }
   done
+  set +f
 }
-accept_check_models()   { local x; for x in $1; do printf '%s' "$x" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:/-]*$' || die "$2: '$x' is not a model name"; done; }
-accept_check_channels() { local x; for x in $1; do printf '%s' "$x" | grep -Eq '^[a-z0-9][a-z0-9-]*$' || die "$2: '$x' is not a channel"; done; }
-accept_check_repos()    { local x; for x in $1; do printf '%s' "$x" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || die "$2: '$x' is not owner/repo"; done; }
+accept_check_models()   { local x; set -f; for x in $1; do printf '%s' "$x" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:/-]*$' || { set +f; die "$2: '$x' is not a model name"; }; done; set +f; }
+accept_check_channels() { local x; set -f; for x in $1; do printf '%s' "$x" | grep -Eq '^[a-z0-9][a-z0-9-]*$' || { set +f; die "$2: '$x' is not a channel"; }; done; set +f; }
+accept_check_repos()    { local x; set -f; for x in $1; do printf '%s' "$x" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || { set +f; die "$2: '$x' is not owner/repo"; }; done; set +f; }
 accept_check_maxc()     { case "$1" in [1-8]) ;; *) die "$2: must be 1–8 (got '$1')" ;; esac; }
 accept_check_residency() { [ -z "$1" ] || printf '%s' "$1" | grep -Eq '^[A-Za-z]{2,8}$' || die "$2: '$1' is not a residency (e.g. CH, Eu)"; }
 
@@ -731,6 +734,7 @@ accept_validate() {
 # The YAML lines of the layer's opt-in block (under config.memex_portal). Enabled is always written, so OFF is declared.
 accept_block() {
   local p="    Hosting__BackLease__Accept" i x
+  set -f
   printf '%s__Jobs__Enabled: "%s"\n' "$p" "$ACC_JOBS_ENABLED"
   i=0; for x in $ACC_JOBS_FROM;     do printf '%s__Jobs__From__%d: "%s"\n' "$p" "$i" "$x"; i=$((i+1)); done
   i=0; for x in $ACC_JOBS_CHANNELS; do printf '%s__Jobs__Channels__%d: "%s"\n' "$p" "$i" "$x"; i=$((i+1)); done
@@ -740,6 +744,7 @@ accept_block() {
   i=0; for x in $ACC_TOK_MODELS; do printf '%s__Tokens__Models__%d: "%s"\n' "$p" "$i" "$x"; i=$((i+1)); done
   printf '%s__Tokens__MaxConcurrency: "%s"\n' "$p" "$ACC_TOK_MAXC"
   [ -z "$ACC_TOK_RES" ] || printf '%s__Tokens__Residency: "%s"\n' "$p" "$ACC_TOK_RES"
+  set +f
 }
 
 # One line per switch, for enroll, accept and status.

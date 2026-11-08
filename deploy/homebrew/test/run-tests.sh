@@ -1002,6 +1002,9 @@ OUT2="$(mp_env "$CLI" backlease accept tokens --from '*' --models= </dev/null 2>
   || case "$OUT2" in *"name the models"*) ok "tokens switched on without models is refused" ;; *) bad "tokens without models message" "$OUT2" ;; esac
 OUT="$(mp_env "$CLI" backlease accept jobs </dev/null 2>&1)" && bad "headless accept with no flags accepted" "$OUT" \
   || case "$OUT" in *"give --from"*) ok "a headless 'accept jobs' with no flags is refused — nothing is assumed" ;; *) bad "headless accept message" "$OUT" ;; esac
+# a bare `*` is a pattern, never a glob over the working directory's files
+(cd "$HERE" && mp_env "$CLI" backlease accept tokens --from '*' --models qwen3.8:27b-mlx </dev/null >/dev/null 2>&1)
+has 'Hosting__BackLease__Accept__Tokens__From__0: "*"' && ! has 'Accept__Tokens__From__1' && ok "'*' is written as the pattern '*', never expanded to file names" || bad "star pattern globbed" "$(grep Tokens__From "$BLF")"
 OUT="$(mp_env "$CLI" backlease status </dev/null 2>&1)"
 case "$OUT" in *"accepts JOBS from"*) ok "backlease status prints the opt-in" ;; *) bad "status prints opt-in" "$OUT" ;; esac
 rm -rf "$MP"
