@@ -911,6 +911,11 @@ OUT="$(lm bash -c '. "$0"; cmd_residency' "$CLI" 2>&1)"
 grep -q 'residency: CH' <<<"$OUT" && ok "memex-local residency prints the declaration" || bad "residency print" "$OUT"
 B="$(fn_body cmd_status)"; grep -q 'cmd_residency' <<<"$B" && ok "status prints the declared residency" || bad "status residency" ""
 B="$(fn_body cmd_up)"; grep -q 'residency_onboard "$residency"' <<<"$B" && ok "up runs the residency onboarding" || bad "up onboarding" ""
+B="$(fn_body cmd_update)"; grep -q 'if \[ -n "$residency" \] || \[ -n "${MEMEX_RESIDENCY:-}" \]; then residency_onboard "$residency"; fi' <<<"$B" \
+  && ok "update persists an explicit --residency or MEMEX_RESIDENCY (never asks)" || bad "update residency persistence" ""
+lm env MEMEX_RESIDENCY=at bash -c 'set -euo pipefail; . "$0"; residency_onboard ""' "$CLI" >/dev/null 2>&1
+[ "$(cat "$RESF")" = "AT" ] && ok "MEMEX_RESIDENCY is persisted by the onboarding (AT)" || bad "env not persisted" "$(cat "$RESF")"
+printf 'CH\n' > "$RESF"
 rm -f "$RESF"
 # The default is not in Ollama (pull failed / Ollama too old): name a model Ollama HAS, never a 404.
 lm env MEMEX_OLLAMA_MODEL= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=arm64 FAKE_TAGS='{"name":"qwen3.6-code:latest"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1

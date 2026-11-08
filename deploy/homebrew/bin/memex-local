@@ -194,7 +194,7 @@ readonly LLM_AUTO_FILE="$LOCAL_HOME/llm.auto.yaml"
 # looks like "your prompts go to China". The file holds the one value; an EMPTY file records that the owner
 # was asked and declared none (Unknown), so `up` does not ask again. Nothing is ever guessed: the macOS
 # region only SUGGESTS the prompt's default, and a run with nobody to ask declares nothing.
-# MEMEX_RESIDENCY (env) and --residency (up/update) declare it for a headless run and are persisted.
+# MEMEX_RESIDENCY (env) and --residency (up/update) declare it for a headless run and are persisted by both.
 readonly RESIDENCY_FILE="$LOCAL_HOME/residency"
 # ── CERTIFICATES for the machine's private-network name (Let's Encrypt over DNS-01; `memex-local cert`) ──
 # dns01.env names the DNS zone and the identity allowed to write its challenge records (nothing secret);
@@ -4522,8 +4522,9 @@ cmd_update() {
   preflight
   colima_running || die "Colima is not running — run 'memex-local up' first"
   ensure_overlay                                 # reuse the existing overlay/secrets (idempotent)
-  # update never ASKS (the autoupdate agent runs it headless); an explicit --residency is declared here.
-  [ -z "$residency" ] || residency_onboard "$residency"
+  # update never ASKS (the autoupdate agent runs it headless); an explicit --residency or MEMEX_RESIDENCY is
+  # declared (persisted) here, exactly as on `up`, so the next update without it keeps the same value.
+  if [ -n "$residency" ] || [ -n "${MEMEX_RESIDENCY:-}" ]; then residency_onboard "$residency"; fi
   # The local model follows the product on update too: Ollama started/tuned, the default chat model pulled
   # once (an existing install gets qwen3.8 here), before helm_deploy names it.
   if [ "${MEMEX_SKIP_OLLAMA:-}" != "1" ]; then setup_ollama; fi
