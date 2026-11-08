@@ -1,0 +1,13 @@
+<!--
+  Intune "App configuration policies → Managed devices → iOS → Configuration designer / XML data" for
+  Memex (cloud.meshweaver.memex). Intune substitutes {{userprincipalname}} with the enrolled user's UPN; the
+  app reads it from NSUserDefaults "com.apple.configuration.managed" and offers that account first at
+  Microsoft sign-in (login_hint / domain_hint). Reaches the app only when Intune deploys Memex (MDM-managed).
+  Same keys as deploy/ios/intune/graph/memex-app-configuration.json.
+-->
+<dict>
+  <key>loginHint</key>
+  <string>{{userprincipalname}}</string>
+  <key>userPrincipalName</key>
+  <string>{{userprincipalname}}</string>
+</dict>

@@ -1,0 +1,17 @@
+{
+  "@odata.type": "#microsoft.graph.iosStoreApp",
+  "displayName": "Microsoft Authenticator",
+  "publisher": "Microsoft Corporation",
+  "description": "Carries the Microsoft Enterprise SSO plug-in on iOS; required for deploy/ios/intune/profiles/microsoft-enterprise-sso.mobileconfig.",
+  "bundleId": "com.microsoft.azureauthenticator",
+  "appStoreUrl": "https://apps.apple.com/app/microsoft-authenticator/id983156458",
+  "applicableDeviceType": {
+    "@odata.type": "#microsoft.graph.iosDeviceType",
+    "iPad": true,
+    "iPhoneAndIPod": true
+  },
+  "minimumSupportedOperatingSystem": {
+    "@odata.type": "#microsoft.graph.iosMinimumOperatingSystem",
+    "v16_0": true
+  }
+}

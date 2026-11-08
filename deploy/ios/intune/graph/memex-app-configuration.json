@@ -1,0 +1,22 @@
+{
+  "@odata.type": "#microsoft.graph.iosMobileAppConfiguration",
+  "displayName": "Fleet — Memex sign-in (iOS)",
+  "description": "Managed app configuration for Memex (cloud.meshweaver.memex): loginHint / userPrincipalName = {{userprincipalname}}. Source: MeshWeaver.Deploy deploy/ios/intune/app-config/memex.appconfig.xml",
+  "targetedMobileApps": [
+    "<intune-mobileApp-id-of-Memex>"
+  ],
+  "settings": [
+    {
+      "@odata.type": "#microsoft.graph.appConfigurationSettingItem",
+      "appConfigKey": "loginHint",
+      "appConfigKeyType": "stringType",
+      "appConfigKeyValue": "{{userprincipalname}}"
+    },
+    {
+      "@odata.type": "#microsoft.graph.appConfigurationSettingItem",
+      "appConfigKey": "userPrincipalName",
+      "appConfigKeyType": "stringType",
+      "appConfigKeyValue": "{{userprincipalname}}"
+    }
+  ]
+}

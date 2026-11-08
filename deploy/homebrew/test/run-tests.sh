@@ -913,6 +913,15 @@ cat > "$OWH/stubs/defaults" <<'STUB'
 k="${!#}"; v="FAKE_PREF_$k"; [ -n "${!v:-}" ] && { echo "${!v}"; exit 0; }; exit 1
 STUB
 chmod +x "$OWH/stubs/defaults"
+# Stubbed from the FIRST owner test on: a developer's own Platform SSO registration must never become a test's owner.
+# `app-sso platform -s` answers from FAKE_PSSO (a file holding its output) or fails with FAKE_PSSO_FAILS.
+cat > "$OWH/stubs/app-sso" <<'STUB'
+#!/bin/bash
+[ -n "${FAKE_PSSO_FAILS:-}" ] && { echo "app-sso: error" >&2; exit 1; }
+[ -n "${FAKE_PSSO:-}" ] && { cat "$FAKE_PSSO"; exit 0; }
+printf 'Device Configuration:\n (null)\n\nLogin Configuration:\n (null)\n\nUser Configuration:\n (null)\n'
+STUB
+chmod +x "$OWH/stubs/app-sso"
 ow() { env HOME="$OWH/home" MEMEX_LOCAL_HOME="$OWH/home/.memex-local" MEMEX_LOCAL_LIB=1 PATH="$OWH/stubs:$STUBS:$PATH" "$@"; }
 OOV="$OWH/home/.memex-local/values.local.yaml"
 seed_overlay() { cat > "$OOV" <<'YAML'
@@ -998,6 +1007,71 @@ seed_overlay
 OUT="$(ow env FAKE_PREF_OwnerId=carol FAKE_PREF_OwnerEmail=carol@example.com bash -c '. "$0"; cmd_owner --id bob' "$CLI" 2>&1 </dev/null)"
 grep -qx '    Auth__GlobalAdmins__0: "bob"' "$OOV" && ! grep -q 'carol@example.com' "$OOV" \
   && ok "an MDM's OwnerEmail (for carol) is never written for a different owner (bob)" || bad "pref email inherited" "$(cat "$OOV")"
+echo "── the DEVICE'S WORK IDENTITY: an Intune-managed Mac's Entra account is its owner and sign-in default ──"
+cat > "$OWH/psso-registered.txt" <<'TXT'
+Time: 2026-11-08 10:23:19 +0000
+
+Device Configuration:
+ {
+    accountDisplayName = "Example";
+    loginUserName = "device-not-a-user@example.com";
+}
+
+Login Configuration:
+ (null)
+
+User Configuration:
+ {
+    created = "2026-11-01 08:00:00 +0000";
+    loginUserName = "jane.roe@example.com";
+    uniqueIdentifier = "00000000-0000-0000-0000-000000000000";
+}
+
+SSO Tokens:
+ (null)
+TXT
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; work_identity' "$CLI" 2>&1)"
+[ "$OUT" = "$(printf 'jane.roe@example.com\tmanaged preference UserPrincipalName (com.memex.local)')" ] \
+  && ok "work identity: the Intune managed preference UserPrincipalName is read first" || bad "work identity (pref)" "$OUT"
+OUT="$(ow env FAKE_PSSO="$OWH/psso-registered.txt" bash -c '. "$0"; work_identity' "$CLI" 2>&1)"
+[ "$OUT" = "$(printf 'jane.roe@example.com\tPlatform SSO (app-sso platform -s)')" ] \
+  && ok "work identity: a Platform SSO registration's USER loginUserName (never the device block's)" || bad "work identity (PSSO)" "$OUT"
+OUT="$(ow env FAKE_PREF_UserPrincipalName=max.muster@example.com FAKE_PSSO="$OWH/psso-registered.txt" bash -c '. "$0"; work_identity' "$CLI" 2>&1)"
+[ "${OUT%%$'\t'*}" = "max.muster@example.com" ] && ok "work identity: the managed preference wins over Platform SSO" || bad "work identity order" "$OUT"
+OUT="$(ow bash -c '. "$0"; work_identity; echo "[end]"' "$CLI" 2>&1)"
+[ "$OUT" = "[end]" ] && ok "work identity: an unregistered Mac (no preference, PSSO all (null)) has none" || bad "work identity (absent)" "$OUT"
+OUT="$(ow env FAKE_PSSO_FAILS=1 bash -c 'set -euo pipefail; . "$0"; work_identity; echo "[end]"' "$CLI" 2>&1)"
+[ "$OUT" = "[end]" ] && ok "work identity: a failing app-sso is no identity, never an error" || bad "work identity (failure)" "$OUT"
+OUT="$(ow env FAKE_PREF_UserPrincipalName='{{userprincipalname}}' bash -c '. "$0"; work_identity; echo "[end]"' "$CLI" 2>&1)"
+[ "$OUT" = "[end]" ] && ok "work identity: an Intune token left unsubstituted is no identity" || bad "work identity (raw token)" "$OUT"
+seed_overlay
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c 'set -euo pipefail; . "$0"; ensure_owner_admin "" "" require; echo DONE' "$CLI" 2>&1 </dev/null)"
+grep -q DONE <<<"$OUT" && grep -qx '    Auth__GlobalAdmins__0: "jane.roe"' "$OOV" && grep -qx '    Instance__Owner__Email: "jane.roe@example.com"' "$OOV" \
+  && grep -qx '    Authentication__Microsoft__LoginHint: "jane.roe@example.com"' "$OOV" && grep -qx '    Authentication__Microsoft__DomainHint: "example.com"' "$OOV" \
+  && ! awk '/^secrets:/{c=1} /^config:/{c=0} c' "$OOV" | grep -q 'Hint' \
+  && ok "an unattended install on a managed Mac: the work identity is the owner (id = UPN prefix) and the Microsoft sign-in hint" || bad "work identity owner" "$OUT
+$(cat "$OOV")"
+cp "$OOV" "$OWH/before"
+ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" >/dev/null 2>&1 </dev/null
+cmp -s "$OOV" "$OWH/before" && ok "the work-identity owner and hint are idempotent" || bad "work identity re-run" "$(diff "$OWH/before" "$OOV")"
+seed_overlay
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com MEMEX_OWNER=bob MEMEX_OWNER_EMAIL=bob@example.com bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" 2>&1 </dev/null)"
+grep -qx '    Auth__GlobalAdmins__0: "bob"' "$OOV" && ! grep -q 'jane.roe' "$OOV" && ! grep -q 'LoginHint' "$OOV" \
+  && ok "an explicit owner wins over the work identity, and no hint names a different person" || bad "explicit owner vs work identity" "$OUT
+$(cat "$OOV")"
+seed_overlay
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; cmd_owner --id bob --email bob@example.com' "$CLI" 2>&1 </dev/null)"
+! grep -q 'jane.roe' "$OOV" && ok "'owner --id bob' on a Mac managed for jane: jane's e-mail is never attributed to bob" || bad "work email inherited" "$(cat "$OOV")"
+seed_overlay
+OUT="$(ow bash -c '. "$0"; ensure_owner_admin "" "" require; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+! grep -q SURVIVED <<<"$OUT" && ! grep -q 'Hint' "$OOV" && ok "no work identity: the owner rule is unchanged (an unattended install without one fails)" || bad "no identity changed the rule" "$OUT"
+seed_overlay
+ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" >/dev/null 2>&1 </dev/null
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; cmd_owner status' "$CLI" 2>&1 </dev/null)"
+grep -q "work identity: jane.roe@example.com (from managed preference UserPrincipalName" <<<"$OUT" && grep -q "sign-in hint: jane.roe@example.com" <<<"$OUT" \
+  && ok "'owner status' names the work identity, its source and the sign-in hint" || bad "owner status work identity" "$OUT"
+OUT="$(ow bash -c '. "$0"; cmd_owner status' "$CLI" 2>&1 </dev/null)"
+grep -q "work identity: none" <<<"$OUT" && ok "'owner status' says when the Mac has no work identity" || bad "owner status none" "$OUT"
 # The config section without a memex_portal map, and NOT last in the file: the map goes INSIDE config.
 printf 'secrets:\n  memex_portal:\n    X: "1"\nconfig:\n  other: "y"\ningress:\n  host: "memex.localhost"\n' > "$OOV"
 ow bash -c '. "$0"; overlay_set_portal_config Auth__GlobalAdmins__0 dave' "$CLI" >/dev/null 2>&1
@@ -2338,6 +2412,71 @@ grep -q 'mode_args+=(-f "$INSTANCES_FILE")' <<<"$HD" && [ "$(grep -n 'mode_args+
 grep -q 'instances-host' "$HERE/../share/instances.py" && bad "instances.py names the bridge layer" "" || ok "a created instance never gets the bridge layer (instances.py does not know it)"
 grep -c 'ensure_instances_agent  ' "$CLI" | grep -qx 2 && ok "up and update install the executor agent (registry mode)" || bad "agent install" "$(grep -n ensure_instances_agent "$CLI")"
 rm -rf "$IX"
+
+echo "── back-lease sampler: host.ownerCpuPercent is the owner's CPU over the interval (Hosting/BackLease §14.5) ──"
+OC="$(mktemp -d)"; mkdir -p "$OC/stubs" "$OC/dir" "$OC/home/.colima/_lima/colima-build" "$OC/home/.colima/_lima/colima"
+: > "$OC/home/.colima/_lima/colima-build/disk"; : > "$OC/home/.colima/_lima/colima/disk"
+# the build VM is pid 20 (holds the build profile's disk), the portal VM pid 21 (the default profile's)
+printf '#!/bin/bash\n[ "$1" = -t ] && case "$2" in */colima-build/disk) echo 20 ;; */_lima/colima/disk) echo 21 ;; esac\n' > "$OC/stubs/lsof"; chmod +x "$OC/stubs/lsof"
+printf '#!/bin/bash\ncat "%s/ps.now"\n' "$OC" > "$OC/stubs/fakeps"; chmod +x "$OC/stubs/fakeps"
+SAMPLER="$HERE/../share/backlease-sampler.sh"
+oc() { env PATH="$OC/stubs:$PATH" HOME="$OC/home" COLIMA_HOME= MEMEX_LOCAL_HOME="$OC/none" MEMEX_LOCAL_SHARE= MEMEX_BUILD_PRIO_SCRIPT="${OC_GOV-$GOV}" \
+  MEMEX_BACKLEASE_DIR="$OC/dir" MEMEX_BACKLEASE_INTERVAL=30 MEMEX_SAMPLER_PS="$OC/stubs/fakeps" MEMEX_SAMPLER_NOW="$1" MEMEX_BACKLEASE_SAMPLER_LIB=1 \
+  bash -c '. "$0"; owner_cpu' "$SAMPLER"; }
+printf '  0 1:00.00 kernel_task\n  10 0:10.00 /Applications/Safari\n  20 1:00:00.00 VZ build\n  21 30:00.00 VZ portal\n  30 0:05.00 /opt/homebrew/bin/ollama serve\n  31 0:05.00 /opt/homebrew/Cellar/ollama/0.40.14/libexec/lib/ollama/llama-server --model x\n' > "$OC/ps.now"
+[ -z "$(oc 1000)" ] && ok "the first sample reports NO ownerCpuPercent (absent, never a guess)" || bad "first sample" "$(oc 1000)"
+# 30 s later: Safari +30 s CPU (100 %), a new owner process +15 s (50 %); the VMs, Ollama and kernel_task all busy
+printf '  0 9:00.00 kernel_task\n  10 0:40.00 /Applications/Safari\n  11 0:15.00 /usr/bin/make\n  20 2:00:00.00 VZ build\n  21 45:00.00 VZ portal\n  30 1:05.00 /opt/homebrew/bin/ollama serve\n  31 9:05.00 /opt/homebrew/Cellar/ollama/0.40.14/libexec/lib/ollama/llama-server --model x\n' > "$OC/ps.now"
+[ "$(oc 1030)" = 150 ] && ok "ownerCpuPercent = the owner's CPU-time delta over the interval, excluding Ollama (serve + llama-server), both VMs and kernel_task" || bad "ownerCpuPercent value" "$(oc 1030)"
+[ -z "$(oc 1200)" ] && ok "a gap longer than three intervals reports nothing (a stale window is not a reading)" || bad "stale gap" "$(oc 1200)"
+[ -z "$(OC_GOV="$OC/missing.sh" oc 1230)" ] && ok "no governor library to measure with → the field is absent" || bad "no governor" ""
+# the splice: only into a JSON object — a degraded host reading stays valid JSON
+osp() { env HOSTJSON="$1" MEMEX_BACKLEASE_DIR="$OC/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "%s" "$HOSTJSON"; }; owner_cpu() { printf 150; }
+  sample_models() { printf "[]"; }; sample_vm() { printf null; }; colima() { return 1; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }
+  OUT="$1"; write_sample; cat "$OUT"' "$SAMPLER" "$OC/out.json"; }
+osp '{"cores":2}' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"]=={"cores":2,"ownerCpuPercent":150}' 2>/dev/null \
+  && ok "ownerCpuPercent is spliced into the host object" || bad "splice into object" "$(osp '{"cores":2}')"
+osp 'null' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"] is None' 2>/dev/null \
+  && ok "a degraded (non-object) host reading stays valid JSON — nothing is spliced into it" || bad "splice into null" "$(osp null)"
+# a baseline that cannot be rotated is no reading, and the stamp never runs ahead of the baseline it measures from
+rm -f "$OC/dir/owner-cpu."*; printf '  10 0:50.00 /Applications/Safari\n' > "$OC/ps.now"
+oc 2000 >/dev/null; chmod 555 "$OC/dir"; r1="$(oc 2030)"; chmod 755 "$OC/dir"
+printf '  10 1:50.00 /Applications/Safari\n' > "$OC/ps.now"
+r2="$(oc 2060)"
+[ -z "$r1" ] && [ "$r2" = 100 ] && ok "a failed baseline rotation reports nothing, and the next reading divides by the baseline's own age (100 %, never doubled)" || bad "rotation failure" "r1=$r1 r2=$r2"
+OUT="$(MEMEX_BACKLEASE_SAMPLER_LIB=1 MEMEX_BACKLEASE_DIR="$OC/dir" bash "$SAMPLER" 2>&1)"; RC=$?
+[ "$RC" = 2 ] && case "$OUT" in *"for sourcing only"*) true ;; *) false ;; esac \
+  && ok "library mode fails CLOSED: executed with the variable set, the sampler stops loudly instead of sampling" || bad "lib guard fails open" "rc=$RC $OUT"
+rm -rf "$OC"
+
+echo "── token slots: the machine's capacity; the owner's ceiling is optional (Hosting/BackLease §14.5) ──"
+TS="$(mktemp -d)"; mkdir -p "$TS/home"
+printf '#!/bin/bash\nexit 0\n' > "$TS/launchctl"; chmod +x "$TS/launchctl"
+ts() { env PATH="$TS:$STUBS:$PATH" HOME="$TS/home" MEMEX_LOCAL_HOME="$TS/home/.memex-local" "$@"; }
+TSF="$TS/home/.memex-local/backlease.yaml"; tsh() { grep -qF "$1" "$TSF" 2>/dev/null; }
+ts "$CLI" registry https://memex.example.test --id ci-ts >/dev/null 2>&1
+ts env MEMEX_PROFILE=mac-studio "$CLI" backlease enroll --control https://control.example.test --deployment studio-1 --accept-tokens='*.meshweaver.cloud' --token-models qwen3.8:27b-mlx --residency CH </dev/null >/dev/null 2>&1
+tsh 'Hosting__BackLease__Accept__Tokens__Slots: "2"' && ! tsh 'Tokens__MaxConcurrency' && ! tsh 'Tokens__YieldAtPercent' \
+  && ok "a mac-studio with tokens on gets Slots 2 and NO owner ceiling (the whole machine); no YieldAtPercent unless asked" || bad "mac-studio slots" "$(grep Tokens "$TSF")"
+ts env MEMEX_PROFILE= MEMEX_HOST_MODEL_NAME="Mac Studio" "$CLI" backlease accept tokens --slots none </dev/null >/dev/null 2>&1
+tsh 'Hosting__BackLease__Accept__Tokens__Slots: "2"' && ok "with no profile, Mac Studio hardware is measured as 2 slots" || bad "hardware slots" "$(grep Tokens "$TSF")"
+ts env MEMEX_PROFILE= MEMEX_HOST_MODEL_NAME="MacBook Pro" "$CLI" backlease accept tokens --slots none </dev/null >/dev/null 2>&1
+! tsh 'Tokens__Slots' && ok "a host nobody measured writes no Slots (the code's default applies)" || bad "no slots on other hosts" "$(grep Tokens "$TSF")"
+ts "$CLI" backlease accept tokens --slots 4 --max-concurrency 1 --yield-at 150 </dev/null >/dev/null 2>&1
+tsh 'Tokens__Slots: "4"' && tsh 'Tokens__MaxConcurrency: "1"' && tsh 'Tokens__YieldAtPercent: "150"' \
+  && ok "--slots (calibrated), --max-concurrency (owner ceiling) and --yield-at are written as given" || bad "slots overrides" "$(grep Tokens "$TSF")"
+ts "$CLI" backlease accept tokens --max-concurrency none --yield-at none </dev/null >/dev/null 2>&1
+! tsh 'Tokens__MaxConcurrency' && ! tsh 'Tokens__YieldAtPercent' && tsh 'Tokens__Slots: "4"' \
+  && ok "'none' clears the owner ceiling and the yield threshold; the calibrated slots stand" || bad "none clears" "$(grep Tokens "$TSF")"
+OUT="$(ts "$CLI" backlease accept tokens --slots 40 </dev/null 2>&1)" && bad "40 slots accepted" "$OUT" || ok "slots outside 1–32 are refused"
+# a layer from the first opt-in release (tokens on, MaxConcurrency 1 by default, no Slots): update adds the slots and keeps the ceiling
+sed -i '' -e '/Tokens__Slots/d' -e 's/Tokens__MaxConcurrency: .*/Tokens__MaxConcurrency: "1"/' "$TSF" 2>/dev/null
+grep -q 'Tokens__MaxConcurrency' "$TSF" || printf '    Hosting__BackLease__Accept__Tokens__MaxConcurrency: "1"\n' >> "$TSF"
+ts env MEMEX_PROFILE=mac-studio MEMEX_LOCAL_LIB=1 bash -c '. "$0"; backlease_migrate_accept' "$CLI" >/dev/null 2>&1
+tsh 'Tokens__Slots: "2"' && tsh 'Tokens__MaxConcurrency: "1"' \
+  && ok "update gives a pre-slots layer its measured slots and keeps the recorded ceiling (never widened without the owner)" || bad "pre-slots migration" "$(grep Tokens "$TSF")"
+OUT="$(ts "$CLI" backlease accept tokens --yield-at 5 </dev/null 2>&1)" && bad "yield-at 5 accepted" "$OUT" || ok "a yield threshold outside 10–3200 % is refused"
+rm -rf "$TS"
 
 echo "── the CLI still knows every command it documents ────────────────"
 

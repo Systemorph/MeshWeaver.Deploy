@@ -1,0 +1,41 @@
+{
+  "@odata.type": "#microsoft.graph.iosDeviceFeaturesConfiguration",
+  "displayName": "Fleet — Microsoft Enterprise SSO (iOS)",
+  "description": "Microsoft Enterprise SSO plug-in, Redirect type (Microsoft Authenticator). Source: MeshWeaver.Deploy deploy/ios/intune/profiles/microsoft-enterprise-sso.mobileconfig",
+  "iosSingleSignOnExtension": {
+    "@odata.type": "#microsoft.graph.iosRedirectSingleSignOnExtension",
+    "extensionIdentifier": "com.microsoft.azureauthenticator.ssoextension",
+    "teamIdentifier": "SGGM6D27TK",
+    "urlPrefixes": [
+      "https://login.microsoftonline.com",
+      "https://login.microsoft.com",
+      "https://sts.windows.net",
+      "https://login.partner.microsoftonline.cn",
+      "https://login.chinacloudapi.cn",
+      "https://login.microsoftonline.us",
+      "https://login-us.microsoftonline.com"
+    ],
+    "configurations": [
+      {
+        "@odata.type": "#microsoft.graph.keyIntegerValuePair",
+        "key": "browser_sso_interaction_enabled",
+        "value": 1
+      },
+      {
+        "@odata.type": "#microsoft.graph.keyIntegerValuePair",
+        "key": "disable_explicit_app_prompt",
+        "value": 1
+      },
+      {
+        "@odata.type": "#microsoft.graph.keyIntegerValuePair",
+        "key": "Enable_SSO_On_All_ManagedApps",
+        "value": 1
+      },
+      {
+        "@odata.type": "#microsoft.graph.keyStringValuePair",
+        "key": "AppPrefixAllowList",
+        "value": "com.apple.,cloud.meshweaver."
+      }
+    ]
+  }
+}

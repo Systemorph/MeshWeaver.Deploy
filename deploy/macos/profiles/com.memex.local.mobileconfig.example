@@ -35,6 +35,9 @@
                  their e-mail. An unattended install with no owner FAILS rather than run without an administrator.
                  In Intune, a user-affinity device can fill these from the primary user: {{partialupn}} when the
                  user id is the UPN prefix, and {{mail}}. -->
+            <!-- A person's managed Mac needs neither: memex-local derives the owner from UserPrincipalName
+                 (deploy/macos/intune/profiles/com.memex.local.mobileconfig, Intune token {{userprincipalname}}),
+                 id = its prefix, e-mail = the UPN. An explicit OwnerId / OwnerEmail here wins over it. -->
             <key>OwnerId</key>
             <string>jane.roe</string>
             <key>OwnerEmail</key>
