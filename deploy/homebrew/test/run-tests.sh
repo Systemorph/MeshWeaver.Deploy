@@ -909,7 +909,11 @@ G="$(lm bash -c 'set -euo pipefail; . "$0"; accept_load; printf %s "$ACC_TOK_RES
 [ "$G" = "CH" ] && ok "backlease accept tokens: the residency defaults to the install declaration (CH)" || bad "backlease residency default" "'$G'"
 OUT="$(lm bash -c '. "$0"; cmd_residency' "$CLI" 2>&1)"
 grep -q 'residency: CH' <<<"$OUT" && ok "memex-local residency prints the declaration" || bad "residency print" "$OUT"
-B="$(fn_body cmd_status)"; grep -q 'cmd_residency' <<<"$B" && ok "status prints the declared residency" || bad "status residency" ""
+B="$(fn_body cmd_status)"; grep -q '( cmd_residency ) || warn' <<<"$B" && ok "status prints the declared residency, and an invalid one never aborts the rest of status" || bad "status residency" ""
+printf 'C1\n' > "$RESF"
+OUT="$(lm bash -c '. "$0"; ( cmd_residency ) || warn "invalid"; echo STATUS_GOES_ON' "$CLI" 2>&1)"
+grep -q STATUS_GOES_ON <<<"$OUT" && ok "…proven: a corrupted declaration leaves the status run going" || bad "status aborted" "$OUT"
+printf 'CH\n' > "$RESF"
 B="$(fn_body cmd_up)"; grep -q 'residency_onboard "$residency"' <<<"$B" && ok "up runs the residency onboarding" || bad "up onboarding" ""
 B="$(fn_body cmd_update)"; grep -q 'if \[ -n "$residency" \] || \[ -n "${MEMEX_RESIDENCY:-}" \]; then residency_onboard "$residency"; fi' <<<"$B" \
   && ok "update persists an explicit --residency or MEMEX_RESIDENCY (never asks)" || bad "update residency persistence" ""

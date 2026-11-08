@@ -4325,7 +4325,8 @@ cmd_status() {
     warn "agent '$PLIST_LABEL' not loaded"
   fi
   step "Residency (where the local models process prompts)"
-  cmd_residency || true
+  # A subshell: an invalid declaration's die must not end `status` before the Health lines (a diagnostic).
+  ( cmd_residency ) || warn "the residency declaration in $RESIDENCY_FILE is invalid — fix it: memex-local residency CH|Eu|… (or --clear)"
   step "Health"
   # Diagnostic: report every check, never abort the rest of `status` on a red one.
   verify_usable || true
