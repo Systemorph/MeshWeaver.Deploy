@@ -14,8 +14,9 @@
 #
 # THE OWNER'S OPT-IN (MeshWeaver.Plugins Hosting/BackLease §13). Before anything is changed it ASKS — in a terminal —
 # whether this Mac accepts fleet jobs and from which instances (offered: control.systemorph.com), and whether it serves
-# token requests and from which instances (offered: *.meshweaver.cloud). A headless run takes the flags; with no answer
-# both stay OFF. The answers are written with `memex-local backlease accept` into the Mac's back-lease layer (the
+# token requests and from which instances (offered: *.meshweaver.cloud). An enrolled Mac's SAVED answers are the defaults
+# and a class left unanswered keeps its saved answer; a fresh Mac with no answer stays OFF. A headless run takes the flags.
+# Both answers are validated by the CLI's rules (`backlease accept … --dry-run`) before anything is changed. The answers are written with `memex-local backlease accept` into the Mac's back-lease layer (the
 # heartbeat carries them; control enforces them and can never switch them on). Attaching the runners is not an opt-in.
 #
 # What it does, in order, and nothing else:
@@ -70,26 +71,45 @@ fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: --version must be x.y.z" >&2; exit 2; }
 for d in "$tester" "$portal" "$runner"; do [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "ERROR: $d is not sha256:<64 hex>" >&2; exit 2; }; done
 
-# ── the owner's opt-in: asked FIRST, applied LAST (Hosting/BackLease §13.3) ───────────────────────────────────
+# ── the owner's opt-in: asked FIRST, VALIDATED before anything changes, applied LAST (Hosting/BackLease §13.3) ──
+# An enrolled Mac's SAVED answers are the defaults, and a class nobody answers keeps its saved answer: re-running this
+# script to move the runners onto a newer set never resets the owner's consent. A fresh Mac with no answer stays OFF.
+ml="$(command -v memex-local || printf '%s' "$here/../homebrew/bin/memex-local")"
+layer="${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/backlease.yaml"
+saved() { awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$layer" 2>/dev/null || true; }
+saved_list() { awk -v p="$1__" 'index($1, p) == 1 { v = $0; sub(/^[^:]*:[ ]*/, "", v); gsub(/"/, "", v); printf "%s%s", (c++ ? " " : ""), v }' "$layer" 2>/dev/null || true; }
+P=Hosting__BackLease__Accept
 ask() { local a; printf '%s [%s] ' "$1" "$2" >&2; IFS= read -r a || a=""; printf '%s' "${a:-$2}"; }
+yn_default() { [ "$1" = true ] && printf 'Y/n' || printf 'y/N'; }
 if [ -t 0 ] && [ "${MEMEX_HEADLESS:-0}" != 1 ]; then
   if [ -z "$acc_jobs" ]; then
-    case "$(ask "Accept fleet jobs (builds and other queue work) on this Mac?" "y/N")" in
-      [Yy]|[Yy][Ee][Ss]) acc_jobs="$(ask "  From which instances?" "control.systemorph.com")" ;; *) acc_jobs=off ;;
+    case "$(ask "Accept fleet jobs (builds and other queue work) on this Mac?" "$(yn_default "$(saved ${P}__Jobs__Enabled)")")" in
+      [Yy]|[Yy][Ee][Ss]|Y/n) f="$(saved_list ${P}__Jobs__From)"; acc_jobs="$(ask "  From which instances?" "${f:-control.systemorph.com}")" ;;
+      *) acc_jobs=off ;;
     esac
   fi
   if [ -z "$acc_tokens" ]; then
-    case "$(ask "Accept token requests (serve local models to other instances)?" "y/N")" in
-      [Yy]|[Yy][Ee][Ss]) acc_tokens="$(ask "  From which instances?" "*.meshweaver.cloud")"
-                         acc_models="$(ask "  Which models?" "${acc_models:-qwen3.8:27b-mlx qwen3.6}")"
-                         acc_res="$(ask "  Where is this machine (residency, e.g. CH or Eu)?" "$acc_res")" ;;
+    case "$(ask "Accept token requests (serve local models to other instances)?" "$(yn_default "$(saved ${P}__Tokens__Enabled)")")" in
+      [Yy]|[Yy][Ee][Ss]|Y/n) f="$(saved_list ${P}__Tokens__From)"; acc_tokens="$(ask "  From which instances?" "${f:-*.meshweaver.cloud}")"
+                         f="$(saved_list ${P}__Tokens__Models)"; acc_models="$(ask "  Which models?" "${acc_models:-${f:-qwen3.8:27b-mlx qwen3.6}}")"
+                         acc_res="$(ask "  Where is this machine (residency, e.g. CH or Eu)?" "${acc_res:-$(saved ${P}__Tokens__Residency)}")" ;;
       *) acc_tokens=off ;;
     esac
   fi
 fi
-# nobody asked and no flag: OFF — a default is offered, never applied
-acc_jobs="${acc_jobs:-off}"; acc_tokens="${acc_tokens:-off}"
-if [ "$acc_tokens" != off ] && [ -z "$acc_models" ]; then echo "ERROR: --accept-tokens needs --token-models (the models this Mac serves)" >&2; exit 2; fi
+# what each answer becomes: '' = unanswered (keep the saved answer; a fresh Mac stays OFF)
+jobs_args=(); tokens_args=()
+case "$acc_jobs" in '') ;; off) jobs_args=(--off) ;; *) jobs_args=(--from "$acc_jobs" --channels mac) ;; esac
+case "$acc_tokens" in '') ;; off) tokens_args=(--off) ;; *) tokens_args=(--from "$acc_tokens" ${acc_models:+--models "$acc_models"} ${acc_res:+--residency "$acc_res"}) ;; esac
+# BOTH answers are checked by the CLI's own rules NOW — before any infrastructure or preference changes
+if [ -x "$ml" ]; then
+  if [ "${#jobs_args[@]}" -gt 0 ]; then MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept jobs "${jobs_args[@]}" --dry-run >/dev/null || { echo "ERROR: the jobs opt-in answer is invalid (above). Nothing was changed." >&2; exit 2; }; fi
+  if [ "${#tokens_args[@]}" -gt 0 ]; then MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept tokens "${tokens_args[@]}" --dry-run >/dev/null || { echo "ERROR: the tokens opt-in answer is invalid (above). Nothing was changed." >&2; exit 2; }; fi
+fi
+if [ ! -x "$ml" ] || [ ! -f "$layer" ]; then
+  echo "WARN: this Mac has no back-lease layer (memex-local backlease enroll) — the opt-in answers are NOT recorded, and control" >&2
+  echo "      treats an unenrolled machine as accepting nothing. Enrol it; enrolment asks both questions." >&2
+fi
 
 # The build host runs in its OWN Colima profile (default `build`), never in the profile memex-local's portal uses: that one
 # runs the docker runtime, which cannot start a pod with hostUsers: false, and bwrap needs that pod's Unmasked /proc.
@@ -213,16 +233,12 @@ echo "== 5/5 fleet jobs at the lowest priority (launchd governor for profile $pr
 bash "$here/../homebrew/share/buildhost-priority.sh" --install --profile "$profile" \
   || echo "WARN: the priority governor did not load — the build VM competes at the default band; re-run: bash deploy/homebrew/share/buildhost-priority.sh --install --profile $profile" >&2
 
-echo "== the owner's opt-in (jobs: $acc_jobs · tokens: $acc_tokens)"
-# The answers live in the back-lease layer the portal's heartbeat reads; the runners alone carry no heartbeat.
-ml="$(command -v memex-local || printf '%s' "$here/../homebrew/bin/memex-local")"
-if [ -x "$ml" ] && [ -f "${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/backlease.yaml" ]; then
-  if [ "$acc_jobs" = off ]; then MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept jobs --off
-  else MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept jobs --from "$acc_jobs" --channels mac; fi
-  if [ "$acc_tokens" = off ]; then MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept tokens --off
-  else MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept tokens --from "$acc_tokens" --models "$acc_models" ${acc_res:+--residency "$acc_res"}; fi
-  echo "   written to the back-lease layer — 'memex-local update' applies it (the next heartbeat carries it to control)"
-else
-  echo "WARN: this Mac has no back-lease layer (memex-local backlease enroll) — the answers above are NOT recorded, and control" >&2
-  echo "      treats an unenrolled machine as accepting nothing. Enrol it; enrolment asks both questions again." >&2
+echo "== the owner's opt-in (jobs: ${acc_jobs:-unchanged} · tokens: ${acc_tokens:-unchanged})"
+# The answers live in the back-lease layer the portal's heartbeat reads (the runners alone carry no heartbeat). Both were
+# validated before step 0, so neither write below can be refused on its answer.
+if [ -x "$ml" ] && [ -f "$layer" ]; then
+  [ "${#jobs_args[@]}" -eq 0 ] || MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept jobs "${jobs_args[@]}"
+  [ "${#tokens_args[@]}" -eq 0 ] || MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept tokens "${tokens_args[@]}"
+  [ "${#jobs_args[@]}${#tokens_args[@]}" = 00 ] && echo "   no answer given — the saved opt-in stands" \
+    || echo "   written to the back-lease layer — 'memex-local update' applies it (the next heartbeat carries it to control)"
 fi

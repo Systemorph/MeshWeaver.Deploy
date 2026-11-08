@@ -1002,6 +1002,17 @@ OUT2="$(mp_env "$CLI" backlease accept tokens --from '*' --models= </dev/null 2>
   || case "$OUT2" in *"name the models"*) ok "tokens switched on without models is refused" ;; *) bad "tokens without models message" "$OUT2" ;; esac
 OUT="$(mp_env "$CLI" backlease accept jobs </dev/null 2>&1)" && bad "headless accept with no flags accepted" "$OUT" \
   || case "$OUT" in *"give --from"*) ok "a headless 'accept jobs' with no flags is refused — nothing is assumed" ;; *) bad "headless accept message" "$OUT" ;; esac
+# --dry-run validates by the same rules and writes nothing (first-attach.sh checks its answers this way first)
+before="$(cat "$BLF")"
+mp_env "$CLI" backlease accept jobs --off --dry-run </dev/null >/dev/null 2>&1 && [ "$(cat "$BLF")" = "$before" ] \
+  && ok "accept --dry-run validates and writes nothing" || bad "dry run wrote" "$(diff <(printf '%s' "$before") "$BLF")"
+mp_env "$CLI" backlease accept tokens --from 'bad pattern!' --dry-run </dev/null >/dev/null 2>&1 && bad "dry run accepted a bad pattern" "" \
+  || ok "accept --dry-run refuses a malformed answer"
+FA="$HERE/../../backlease/first-attach.sh"
+[ "$(grep -n -- '--dry-run >/dev/null' "$FA" | head -1 | cut -d: -f1)" -lt "$(grep -n '^echo "== 0/5 preconditions"' "$FA" | cut -d: -f1)" ] \
+  && ok "first-attach validates both opt-in answers BEFORE it changes any infrastructure" || bad "first-attach validates late" ""
+grep -q "case \"\$acc_jobs\" in '') ;;" "$FA" && grep -q '\[ "${#jobs_args\[@\]}" -eq 0 \] ||' "$FA" \
+  && ok "first-attach leaves an unanswered class at its saved answer (a re-run never resets consent)" || bad "first-attach preserves answers" ""
 # a bare `*` is a pattern, never a glob over the working directory's files
 (cd "$HERE" && mp_env "$CLI" backlease accept tokens --from '*' --models qwen3.8:27b-mlx </dev/null >/dev/null 2>&1)
 has 'Hosting__BackLease__Accept__Tokens__From__0: "*"' && ! has 'Accept__Tokens__From__1' && ok "'*' is written as the pattern '*', never expanded to file names" || bad "star pattern globbed" "$(grep Tokens__From "$BLF")"

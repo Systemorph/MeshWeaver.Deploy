@@ -905,7 +905,12 @@ cmd_backlease() {
     accept)
       # Changes the owner's opt-in after enrolment (Hosting/BackLease §13.3). Re-writes the layer with every other
       # value as it stands; `memex-local update` applies it (the portal re-renders; the next heartbeat carries it).
-      [ -f "$BACKLEASE_FILE" ] || die "backlease accept: this Mac is not enrolled — 'memex-local backlease enroll …' first (it asks both questions)"
+      # --dry-run (anywhere): validate the answer by these rules and write nothing — first-attach.sh checks its
+      # answers this way BEFORE it changes any infrastructure.
+      local dry=no a rest=()
+      for a in "$@"; do [ "$a" = --dry-run ] && dry=yes || rest+=("$a"); done
+      set -- ${rest[@]+"${rest[@]}"}
+      [ "$dry" = yes ] || [ -f "$BACKLEASE_FILE" ] || die "backlease accept: this Mac is not enrolled — 'memex-local backlease enroll …' first (it asks both questions)"
       accept_load
       local class="${1:-}"; [ $# -gt 0 ] && shift
       case "$class" in
@@ -941,6 +946,7 @@ cmd_backlease() {
       esac
       accept_ask
       accept_validate
+      if [ "$dry" = yes ]; then ok "opt-in answer valid (dry run — nothing written)"; accept_summary; return 0; fi
       write_backlease_file "$(backlease_control)" "$(backlease_deployment)" "$(backlease_interval)" "$(backlease_value Hosting__BackLease__Repository)" \
         "$(backlease_ceiling Hosting__BackLease__HostLoadMax)" "$(backlease_ceiling Hosting__BackLease__HostMemoryMax)" \
         "$(backlease_ceiling Hosting__BackLease__VmCpuMax)" "$(backlease_ceiling Hosting__BackLease__VmMemoryMax)"
