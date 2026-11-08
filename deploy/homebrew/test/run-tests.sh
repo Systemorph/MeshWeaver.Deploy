@@ -721,6 +721,7 @@ echo "── local model: the host-safe Ollama endpoint, never 403 (2026-11-08) 
 # to loopback, refused the Host header `ollama:11434`. ollama_host_admitted states Ollama's rule; the
 # endpoint memex-local configures must pass it, and the old one must FAIL it (the negative control that
 # proves the rule can say no). `memex-local doctor` re-measures the same pair against the live Ollama.
+fn_body() { awk "/^$1\\(\\) \\{/,/^}\$/" "$CLI"; }
 lm() { env HOME="$LMH/home" MEMEX_LOCAL_HOME="$LMH/home/.memex-local" MEMEX_LOCAL_LIB=1 PATH="$LMH/stubs:$STUBS:$PATH" "$@"; }
 LMH="$(mktemp -d)"; mkdir -p "$LMH/stubs" "$LMH/home/.memex-local"
 EP="$(lm bash -c '. "$0"; printf %s "$OLLAMA_ENDPOINT"' "$CLI")"
@@ -817,6 +818,27 @@ grep -q 'ContextWindowTokens' "$AUTO" && bad "a model Ollama cannot load still g
 : > "$OVL"
 lm env MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
 grep -q 'Models__0\|AI__Tiers' "$AUTO" && bad "MEMEX_OLLAMA_MODEL=none still names a model" "$(cat "$AUTO")" || ok "MEMEX_OLLAMA_MODEL=none names no model"
+# …and writes no empty `memex_portal:` (a YAML null that helm merges by DELETING every tracked default).
+if command -v helm >/dev/null 2>&1; then
+  R="$(helm template memex "$HERE/../../helm" -f "$HERE/../../helm/values.yaml" -f "$DEF" -f "$AUTO" 2>&1)"
+  grep -q 'InstanceSetup__TokenCommand: "memex-local setup"' <<<"$R" && grep -q 'OpenAICompatible__Endpoint: "http://ollama.memex.svc.cluster.local' <<<"$R" \
+    && ok "a no-model llm.auto.yaml leaves every tracked default in the render" || bad "no-model layer erased the defaults" "$(cat "$AUTO")"
+else
+  grep -q 'memex_portal:' "$AUTO" && bad "a no-model layer writes memex_portal:" "$(cat "$AUTO")" || ok "a no-model llm.auto.yaml writes no memex_portal map"
+fi
+# The default is not in Ollama (pull failed / Ollama too old): name a model Ollama HAS, never a 404.
+lm env MEMEX_OLLAMA_MODEL= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=arm64 FAKE_TAGS='{"name":"qwen3.6-code:latest"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+grep -qx '    OpenAICompatible__Models__0: "qwen3.6-code"' "$AUTO" && ok "a failed qwen3.8 pull keeps the model the install already ran (qwen3.6-code), never one that answers 404" || bad "auto layer names a missing model" "$(cat "$AUTO")"
+lm env MEMEX_OLLAMA_MODEL= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=arm64 FAKE_TAGS='{"name":"qwen3:8b"},{"name":"qwen3.6-code:latest"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+grep -qx '    OpenAICompatible__Models__0: "qwen3:8b"' "$AUTO" && ok "…and prefers the fallback qwen3:8b when Ollama has it" || bad "fallback preference" "$(cat "$AUTO")"
+# IPv6 literals, bracketed (what a Host header carries) and bare.
+for h in '[::1]:11434' '::1'; do
+  lm bash -c '. "$0"; ollama_host_admitted "$1"' "$CLI" "$h" && ok "the rule admits $h" || bad "the rule refuses $h" ""
+done
+# fleet join's MEMEX_SKIP_OLLAMA=1 is honoured by update (Ollama is set up once per join, not twice).
+B="$(fn_body cmd_update)"
+grep -q 'if \[ "${MEMEX_SKIP_OLLAMA:-}" != "1" \]; then setup_ollama; fi' <<<"$B" && grep -q 'MEMEX_SKIP_OLLAMA=1 cmd_update' "$CLI" \
+  && ok "fleet join sets Ollama up once: update honours MEMEX_SKIP_OLLAMA=1" || bad "MEMEX_SKIP_OLLAMA" ""
 # helm_deploy layers llm.auto.yaml right after the tracked defaults and before every other layer.
 HD="$(awk '/^helm_deploy\(\) \{/,/^}$/' "$CLI")"
 grep -A3 -- '-f "$share_dir/values.local.defaults.yaml"' <<<"$HD" | grep -q -- '-f "$LLM_AUTO_FILE"' \
@@ -827,8 +849,8 @@ grep -A3 -- '-f "$share_dir/values.local.defaults.yaml"' <<<"$HD" | grep -q -- '
 cat > "$LMH/stubs/kubectl" <<'STUB'
 #!/bin/bash
 case "$*" in
-  *"printenv OpenAICompatible__Endpoint"*) echo "${FAKE_EP-http://ollama.memex.svc.cluster.local:11434/v1}" ;;
-  *"printenv OpenAICompatible__Models__0"*) echo "qwen3.8:27b-mlx" ;;
+  *"-- env") [ -n "${FAKE_EXEC_FAILS:-}" ] && exit 1
+             printf 'OpenAICompatible__Endpoint=%s\nOpenAICompatible__Models__0=qwen3.8:27b-mlx\n' "${FAKE_EP-http://ollama.memex.svc.cluster.local:11434/v1}" ;;
   *"sh -c"*) printf '%s\n%s\n' "${FAKE_SMOKE_CODE:-200}" '{"choices":[{"message":{"content":"OK"}}]}' ;;
 esac
 exit 0
@@ -843,15 +865,21 @@ for c in 404 500 000; do
   OUT="$(lm env FAKE_SMOKE_CODE=$c bash -c '. "$0"; llm_chat_smoke' "$CLI" 2>&1)"; RC=$?
   [ "$RC" = 1 ] && ok "chat smoke: HTTP $c fails" || bad "smoke $c passed" "$OUT"
 done
+OUT="$(lm env FAKE_EXEC_FAILS=1 bash -c '. "$0"; llm_chat_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && ok "chat smoke: a pod whose environment cannot be read FAILS (never a skipped pass)" || bad "smoke exec failure passed" "rc=$RC $OUT"
 OUT="$(lm env FAKE_SMOKE_CODE=403 bash -c '. "$0"; llm_chat_smoke_or_die; echo SURVIVED' "$CLI" 2>&1)"; RC=$?
 [ "$RC" != 0 ] && ! grep -q SURVIVED <<<"$OUT" && ok "the smoke GATE stops the command on a 403 (up/update/fleet join fail loudly)" || bad "gate passed a 403" "$OUT"
+# Each body is captured FIRST: `awk … | grep -q` under pipefail fails when grep exits early and awk
+# takes SIGPIPE on a long function (cmd_update) — green on one runner, red on the next.
 for c in cmd_up cmd_update; do
-  awk "/^${c}\\(\\) \\{/,/^}\$/" "$CLI" | grep -q '^  llm_chat_smoke_or_die$' && ok "$c runs the chat smoke gate" || bad "$c has no smoke gate" ""
+  B="$(fn_body "$c")"
+  grep -q '^  llm_chat_smoke_or_die$' <<<"$B" && ok "$c runs the chat smoke gate" || bad "$c has no smoke gate" ""
 done
-awk '/^cmd_doctor\(\) \{/,/^}$/' "$CLI" | grep -q 'llm_host_probe' && awk '/^cmd_doctor\(\) \{/,/^}$/' "$CLI" | grep -q 'llm_chat_smoke' \
+B="$(fn_body cmd_doctor)"
+grep -q 'llm_host_probe' <<<"$B" && grep -q 'llm_chat_smoke' <<<"$B" \
   && ok "doctor re-measures the Host rule on the live Ollama and runs the chat smoke" || bad "doctor checks" ""
-awk '/^cmd_status\(\) \{/,/^}$/' "$CLI" | grep -q 'llm_chat_smoke' && ok "status runs the chat smoke" || bad "status smoke" ""
-awk '/^cmd_update\(\) \{/,/^}$/' "$CLI" | grep -q 'setup_ollama' && ok "update pulls the default chat model too (existing installs get qwen3.8)" || bad "update setup_ollama" ""
+B="$(fn_body cmd_status)"; grep -q 'llm_chat_smoke' <<<"$B" && ok "status runs the chat smoke" || bad "status smoke" ""
+B="$(fn_body cmd_update)"; grep -q 'setup_ollama' <<<"$B" && ok "update pulls the default chat model too (existing installs get qwen3.8)" || bad "update setup_ollama" ""
 grep -q '<key>OLLAMA_FLASH_ATTENTION</key><string>1</string><key>OLLAMA_KV_CACHE_TYPE</key><string>q8_0</string>' "$CLI" \
   && ok "memex-local's own Ollama agent carries the tuning env (flash attention, q8_0 KV cache)" || bad "agent tuning env" ""
 lm bash -c '. "$0"; version_ge 0.40.14 0.32.12 && ! version_ge 0.31.9 0.32.12 && version_ge 0.32.12 0.32.12' "$CLI" \
