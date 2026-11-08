@@ -302,6 +302,7 @@ The refusals, and why each one exists:
       "runDeadline" $runDeadline "stageSlots" $stageSlots
       "warmWorkspace" (eq (toString ($b.warmWorkspace | default false)) "true")
       "moduleHub" (eq (toString ($b.moduleHub | default false)) "true")
+      "sharedTree" (eq (toString ($b.sharedTree | default false)) "true")
       "scaleDownStabilizationSeconds" (int ($b.scaleDownStabilizationSeconds | default 300))
       "sandbox" $sandbox
       "pollingInterval" (int ($b.pollingInterval | default 15)) "cooldownPeriod" (int ($b.cooldownPeriod | default 600))

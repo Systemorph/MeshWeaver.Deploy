@@ -10,7 +10,11 @@
 #     [--profile build] [--plugins-registry <https URL> --instance-key-secret <vault object of a READ-ONLY mwi_ key>] \
 #     --version <x.y.z> --tester sha256:… --portal sha256:… --runner sha256:…
 #     [--accept-jobs <patterns> | --no-accept-jobs] [--accept-tokens <patterns> | --no-accept-tokens]
-#     [--token-models <m>] [--residency <X>]
+#     [--token-models <m>] [--residency <X>] [--owner <user-id> --owner-email <e-mail>]
+#
+# THE OWNER comes first: the Mac's owner (recorded by `memex-local owner`, the instance's global administrator) is the
+# person whose answers the opt-in records. Given with --owner/--owner-email it is written through memex-local; a Mac
+# with no owner recorded is REFUSED before anything changes.
 #
 # THE OWNER'S OPT-IN (MeshWeaver.Plugins Hosting/BackLease §13). Before anything is changed it ASKS — in a terminal —
 # whether this Mac accepts fleet jobs and from which instances (offered: control.systemorph.com), and whether it serves
@@ -43,11 +47,13 @@ here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 chart="$here/../helm"
 profile=build api= registry= vault= worker= pull= pulluser= version= tester= portal= runner= pluginsreg= instkey=
 acc_jobs='' acc_tokens='' acc_models='' acc_res=''   # empty = not answered by a flag; "off" = declined
+owner_id='' owner_email=
 while [ $# -gt 0 ]; do
   # `--flag=value` is the same as `--flag value` (the form memex-local documents for the opt-in flags)
   case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}";; esac
   case "$1" in
     --no-accept-jobs) acc_jobs=off; shift; continue;;
+    --owner) owner_id="${2:?--owner needs the owner user id}";; --owner-email) owner_email="${2:?--owner-email needs the owner e-mail}";;
     --no-accept-tokens) acc_tokens=off; shift; continue;;
     --accept-jobs) acc_jobs="${2:?--accept-jobs needs instance patterns}";; --accept-tokens) acc_tokens="${2:?--accept-tokens needs instance patterns}";;
     --token-models) acc_models="${2:?--token-models needs model names}";; --residency) acc_res="${2:?--residency needs a residency (e.g. CH, Eu)}";;
@@ -72,6 +78,22 @@ if [ -n "$pluginsreg$instkey" ]; then
 fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: --version must be x.y.z" >&2; exit 2; }
 for d in "$tester" "$portal" "$runner"; do [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "ERROR: $d is not sha256:<64 hex>" >&2; exit 2; }; done
+
+# ── THE OWNER (onboarding rule, 2026-11-08: "in onboarding we collect the owner. he will be global admin") ─────
+# This Mac's owner is recorded by memex-local (`memex-local owner`): the global administrator of its instance and
+# the person whose answers the opt-in below records. Given here (--owner/--owner-email) it is written through the CLI;
+# otherwise the one memex-local already holds stands. NO owner = no attach: nothing below runs for an ownerless Mac.
+ml0="$(command -v memex-local || printf '%s' "$here/../homebrew/bin/memex-local")"
+[ -x "$ml0" ] || { echo "ERROR: memex-local is not installed — this Mac's owner is recorded by it (brew install memex-local)" >&2; exit 2; }
+if [ -n "$owner_id$owner_email" ]; then
+  "$ml0" owner ${owner_id:+--id "$owner_id"} ${owner_email:+--email "$owner_email"} >&2 || { echo "ERROR: the owner was not recorded (above). Nothing was changed." >&2; exit 2; }
+fi
+# capture first: `cmd | grep -q` under pipefail is red whenever grep exits on its match before cmd finishes writing (141,
+# SIGPIPE) — which read a Mac WITH an owner as ownerless
+owner_status="$("$ml0" owner status 2>&1 || true)"
+grep -q 'instance OWNER' <<<"$owner_status" \
+  || { echo "ERROR: this Mac has no OWNER — give --owner <user-id> --owner-email <e-mail> (or run 'memex-local owner --id … --email …'). Nothing was changed." >&2; exit 2; }
+echo "owner: $(grep 'instance OWNER' <<<"$owner_status" | sed 's/.*global administrator): //') — answers the opt-in below" >&2
 
 # ── the owner's opt-in: asked FIRST, VALIDATED before anything changes, applied LAST (Hosting/BackLease §13.3) ──
 # An enrolled Mac's SAVED answers are the defaults, and a class nobody answers keeps its saved answer: re-running this

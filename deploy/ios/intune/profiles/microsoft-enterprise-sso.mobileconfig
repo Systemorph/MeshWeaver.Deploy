@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  iOS / iPadOS: the Microsoft Enterprise SSO plug-in (Redirect type), shipped inside Microsoft Authenticator.
+  With it, a Microsoft sign-in on a managed iPhone — Safari, ASWebAuthenticationSession in the Memex app —
+  uses the MDM-enrolled work account, silently. Requires: the device enrolled in Intune and Microsoft
+  Authenticator installed (deploy/ios/intune/graph/microsoft-authenticator-app.json pushes it as required).
+  TeamIdentifier is required on macOS only; iOS ignores it (Apple, ExtensibleSingleSignOn payload).
+  Enable_SSO_On_All_ManagedApps lets every MDM-managed app (Memex once Intune deploys it) use the plug-in;
+  AppPrefixAllowList REPLACES the iOS default (com.apple.), so it restates it and adds cloud.meshweaver.
+  Doc: deploy/macos/intune/README.md "Microsoft sign-in".
+-->
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.extensiblesso</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.systemorph.intune.ios.microsoft-sso.extensiblesso</string>
+            <key>PayloadUUID</key>
+            <string>1AF64652-7392-4B81-A49A-88C9B28039A2</string>
+            <key>PayloadDisplayName</key>
+            <string>Microsoft Enterprise SSO plug-in</string>
+            <key>Type</key>
+            <string>Redirect</string>
+            <key>ExtensionIdentifier</key>
+            <string>com.microsoft.azureauthenticator.ssoextension</string>
+            <key>TeamIdentifier</key>
+            <string>SGGM6D27TK</string>
+            <key>URLs</key>
+            <array>
+                <string>https://login.microsoftonline.com</string>
+                <string>https://login.microsoft.com</string>
+                <string>https://sts.windows.net</string>
+                <string>https://login.partner.microsoftonline.cn</string>
+                <string>https://login.chinacloudapi.cn</string>
+                <string>https://login.microsoftonline.us</string>
+                <string>https://login-us.microsoftonline.com</string>
+            </array>
+            <key>ExtensionData</key>
+            <dict>
+                <key>browser_sso_interaction_enabled</key>
+                <integer>1</integer>
+                <key>disable_explicit_app_prompt</key>
+                <integer>1</integer>
+                <key>Enable_SSO_On_All_ManagedApps</key>
+                <integer>1</integer>
+                <key>AppPrefixAllowList</key>
+                <string>com.apple.,cloud.meshweaver.</string>
+            </dict>
+        </dict>
+    </array>
+    <key>PayloadDisplayName</key>
+    <string>Microsoft Enterprise SSO plug-in (iOS)</string>
+    <key>PayloadIdentifier</key>
+    <string>com.systemorph.intune.ios.microsoft-sso</string>
+    <key>PayloadOrganization</key>
+    <string>Systemorph</string>
+    <key>PayloadRemovalDisallowed</key>
+    <true/>
+    <key>PayloadScope</key>
+    <string>System</string>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>D6FC6738-AFA0-40C5-B9B2-C7DE383F95E8</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+</dict>
+</plist>
