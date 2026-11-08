@@ -1496,6 +1496,15 @@ OUT="$(env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/h
 OUT="$(env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/home/.memex-local" MEMEX_HEADLESS=1 FAKE_LAUNCHCTL_LOG="$HL/launchctl.log" MEMEX_PF_BIND_BUDGET=2 MEMEX_LOCAL_LIB=1 bash -c '. "$1"; install_launchd' _ "$CLI" 2>&1)"
 [ ! -f "$HL/home/.memex-local/daemon.stopped" ] && ok "an explicit 'up' (install_launchd) removes the stop marker" || bad "up removes daemon.stopped" "$OUT"
 case "$(cat "$DAEMON")" in *'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/memex/bin"'*) ok "memex-daemon.sh lists /opt/memex/bin LAST (existing installations first)" ;; *) bad "daemon PATH order" "$(grep -n 'export PATH' "$DAEMON")" ;; esac
+# The 'up' above started a REAL forward loop (nohup … &). Stop it the way 'down' does — removing the
+# directory does not end a process — or every run leaves one behind (measured: 16 on one build host).
+env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/home/.memex-local" MEMEX_HEADLESS=1 MEMEX_LOCAL_LIB=1 \
+  bash -c '. "$1"; uninstall_launchd' _ "$CLI" >/dev/null 2>&1
+pgrep -f "$HL/home/.memex-local/port-forward.sh" >/dev/null 2>&1 && pkill -f "$HL/home/.memex-local/port-forward.sh" 2>/dev/null
+sleep 1
+pgrep -f "$HL/home/.memex-local/port-forward.sh" >/dev/null 2>&1 \
+  && bad "the headless tests leave a port-forward process running" "$(pgrep -fl "$HL/home/.memex-local/port-forward.sh")" \
+  || ok "the headless tests leave no port-forward process behind"
 rm -rf "$HL"
 
 echo "── auto-update: a Homebrew install follows the tap by default ────"
