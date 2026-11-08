@@ -44,6 +44,8 @@ chart="$here/../helm"
 profile=build api= registry= vault= worker= pull= pulluser= version= tester= portal= runner= pluginsreg= instkey=
 acc_jobs='' acc_tokens='' acc_models='' acc_res=''   # empty = not answered by a flag; "off" = declined
 while [ $# -gt 0 ]; do
+  # `--flag=value` is the same as `--flag value` (the form memex-local documents for the opt-in flags)
+  case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}";; esac
   case "$1" in
     --no-accept-jobs) acc_jobs=off; shift; continue;;
     --no-accept-tokens) acc_tokens=off; shift; continue;;
