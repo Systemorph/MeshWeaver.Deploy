@@ -820,6 +820,22 @@ accept_block() {
   set +f
 }
 
+# A layer written before token slots existed has tokens on and no Slots: give it the machine's measured slots, so the
+# heartbeat advertises them on this update without a re-answer. It NEVER widens what the owner limited: a recorded
+# MaxConcurrency is kept as the owner's ceiling — including the "1" that the first opt-in release wrote by default,
+# which cannot be told apart from a chosen 1 (`memex-local backlease accept tokens --max-concurrency none` lifts it).
+backlease_migrate_accept() {
+  [ -f "$BACKLEASE_FILE" ] || return 0
+  accept_load
+  [ "$ACC_TOK_ENABLED" = true ] && [ -z "$ACC_TOK_SLOTS" ] || return 0
+  ACC_TOK_SLOTS="$(token_slots_default)"
+  [ -n "$ACC_TOK_SLOTS" ] || return 0
+  write_backlease_file "$(backlease_control)" "$(backlease_deployment)" "$(backlease_interval)" "$(backlease_value Hosting__BackLease__Repository || true)" \
+    "$(backlease_ceiling Hosting__BackLease__HostLoadMax)" "$(backlease_ceiling Hosting__BackLease__HostMemoryMax)" \
+    "$(backlease_ceiling Hosting__BackLease__VmCpuMax)" "$(backlease_ceiling Hosting__BackLease__VmMemoryMax)"
+  info "back-lease: this Mac now advertises ${ACC_TOK_SLOTS} token slot(s)${ACC_TOK_MAXC:+ under the owner ceiling of $ACC_TOK_MAXC (lift it: memex-local backlease accept tokens --max-concurrency none)}"
+}
+
 # One line per switch, for enroll, accept and status.
 accept_summary() {
   if [ "$ACC_JOBS_ENABLED" = true ]; then
@@ -4389,6 +4405,7 @@ autoupdate_image_source() {
 
 cmd_update() {
   local image_source="build" acr_tag="$ACR_DEFAULT_TAG" rebuild_base="" channel="$CHANNEL" verdict
+  backlease_migrate_accept
   registry_mode && image_source="ghcr"             # §17 — same default as `up`: the public GHCR, anonymously
   [ -n "$channel" ] && image_source="acr"
   while [ $# -gt 0 ]; do

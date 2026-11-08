@@ -196,7 +196,12 @@ write_sample() {
   } > "$tmp" && mv -f "$tmp" "$OUT"
 }
 
-[ "${MEMEX_BACKLEASE_SAMPLER_LIB:-}" = 1 ] && return 0 2>/dev/null
+# library mode (tests source this file): fails CLOSED — executed with the variable set, it stops loudly instead of
+# falling through into the sampling loop
+if [ "${MEMEX_BACKLEASE_SAMPLER_LIB:-}" = 1 ]; then
+  (return 0 2>/dev/null) && return 0
+  echo "backlease-sampler.sh: MEMEX_BACKLEASE_SAMPLER_LIB=1 is for sourcing only — not sampling" >&2; exit 2
+fi
 if [ "${1:-}" = "--once" ]; then write_sample; exit 0; fi
 while true; do
   write_sample || true

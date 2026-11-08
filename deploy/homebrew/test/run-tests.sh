@@ -2053,6 +2053,9 @@ oc 2000 >/dev/null; chmod 555 "$OC/dir"; r1="$(oc 2030)"; chmod 755 "$OC/dir"
 printf '  10 1:50.00 /Applications/Safari\n' > "$OC/ps.now"
 r2="$(oc 2060)"
 [ -z "$r1" ] && [ "$r2" = 100 ] && ok "a failed baseline rotation reports nothing, and the next reading divides by the baseline's own age (100 %, never doubled)" || bad "rotation failure" "r1=$r1 r2=$r2"
+OUT="$(MEMEX_BACKLEASE_SAMPLER_LIB=1 MEMEX_BACKLEASE_DIR="$OC/dir" bash "$SAMPLER" 2>&1)"; RC=$?
+[ "$RC" = 2 ] && case "$OUT" in *"for sourcing only"*) true ;; *) false ;; esac \
+  && ok "library mode fails CLOSED: executed with the variable set, the sampler stops loudly instead of sampling" || bad "lib guard fails open" "rc=$RC $OUT"
 rm -rf "$OC"
 
 echo "── token slots: the machine's capacity; the owner's ceiling is optional (Hosting/BackLease §14.5) ──"
@@ -2075,6 +2078,12 @@ ts "$CLI" backlease accept tokens --max-concurrency none --yield-at none </dev/n
 ! tsh 'Tokens__MaxConcurrency' && ! tsh 'Tokens__YieldAtPercent' && tsh 'Tokens__Slots: "4"' \
   && ok "'none' clears the owner ceiling and the yield threshold; the calibrated slots stand" || bad "none clears" "$(grep Tokens "$TSF")"
 OUT="$(ts "$CLI" backlease accept tokens --slots 40 </dev/null 2>&1)" && bad "40 slots accepted" "$OUT" || ok "slots outside 1–32 are refused"
+# a layer from the first opt-in release (tokens on, MaxConcurrency 1 by default, no Slots): update adds the slots and keeps the ceiling
+sed -i '' -e '/Tokens__Slots/d' -e 's/Tokens__MaxConcurrency: .*/Tokens__MaxConcurrency: "1"/' "$TSF" 2>/dev/null
+grep -q 'Tokens__MaxConcurrency' "$TSF" || printf '    Hosting__BackLease__Accept__Tokens__MaxConcurrency: "1"\n' >> "$TSF"
+ts env MEMEX_PROFILE=mac-studio MEMEX_LOCAL_LIB=1 bash -c '. "$0"; backlease_migrate_accept' "$CLI" >/dev/null 2>&1
+tsh 'Tokens__Slots: "2"' && tsh 'Tokens__MaxConcurrency: "1"' \
+  && ok "update gives a pre-slots layer its measured slots and keeps the recorded ceiling (never widened without the owner)" || bad "pre-slots migration" "$(grep Tokens "$TSF")"
 OUT="$(ts "$CLI" backlease accept tokens --yield-at 5 </dev/null 2>&1)" && bad "yield-at 5 accepted" "$OUT" || ok "a yield threshold outside 10–3200 % is refused"
 rm -rf "$TS"
 

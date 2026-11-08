@@ -209,6 +209,11 @@ ceiling is unset the Mac serves at its full slot count. `--token-yield-at <pct>`
 sampler reports `host.ownerCpuPercent`: the owner's CPU over the interval, excluding Ollama, the build VM, the
 portal VM and `kernel_task` (which can take whole cores under thermal pressure). That is what the Mac yields to.
 
+**Upgrading a Mac enrolled before token slots existed.** `memex-local update` adds the measured `Tokens__Slots`. A
+recorded `Tokens__MaxConcurrency` is kept as the owner's ceiling. That includes the `1` the first opt-in release
+wrote by default, because it cannot be told apart from a chosen 1. Lift it with
+`memex-local backlease accept tokens --max-concurrency none`.
+
 Change an answer later with `memex-local backlease accept jobs|tokens [--from …] [--off] …`,
 then `memex-local update`. `backlease status` prints the answers. They are written as
 `Hosting__BackLease__Accept__*` into `~/.memex-local/backlease.yaml`. The heartbeat carries them to control,
