@@ -167,6 +167,29 @@ After the wizard the portal restarts and installs the packages you chose. While 
 packages — this finishes by itself"*. That is a state, not an error; only exit 1 (a red with a
 remedy) means something is broken.
 
+### The owner — collected at onboarding, the instance's global administrator
+
+**The general onboarding rule (maintainer, 2026-11-08): every onboarding collects the OWNER, and the owner is the
+instance's global administrator.** `up`, `fleet join`, the `.pkg`'s unattended daemon and
+`deploy/backlease/first-attach.sh` all collect it. It is a MeshWeaver **user id**, the id the owner signs in as
+(for example `rbuergi`, not the e-mail), plus their **e-mail**. Both are written into this install's OWN overlay,
+never into the image or a shared values file:
+
+| overlay key (`config.memex_portal`) | what it does |
+|---|---|
+| `Auth__GlobalAdmins__0` | the portal seeds `Admin/_Access/<id>_Access`: the owner is global administrator and can install packages (such as ClaudeCode) from Admin |
+| `Instance__Owner__Id`, `Instance__Owner__Email` | the owner as recorded on the instance |
+
+Sources, first that answers: `--owner <id> --owner-email <e-mail>` on `up` / `fleet join` (or `first-attach.sh`),
+`MEMEX_OWNER` / `MEMEX_OWNER_EMAIL`, the managed preferences `OwnerId` / `OwnerEmail` (an MDM profile), what the
+overlay already records, and on a terminal a question that suggests your login name. **An unattended install with no
+owner fails**: an instance never comes up without an administrator. An `update` of an older, ownerless install warns
+loudly instead, so an auto-update never halts.
+
+Change the owner later with `memex-local owner --id <user-id> --email <e-mail>`, then `memex-local update --skip-image`.
+Never edit the YAML by hand. `memex-local owner status` shows the owner. Re-running any of these is idempotent.
+The same owner answers the fleet opt-in questions (`backlease accept`).
+
 ### First-run secrets & OAuth
 
 On first `up`, the CLI generates `~/.memex-local/values.local.yaml` from the
