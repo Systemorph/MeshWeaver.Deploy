@@ -717,7 +717,7 @@ def validate_module_hub(doc: object) -> Optional[dict]:
             if d not in out:
                 raise Refusal(f"`moduleHub.modules.{mid}` depends on {d!r}, which is not declared")
     recipe = mh.get("recipe", [])
-    if not isinstance(recipe, list) or not all(isinstance(p, str) and p and ".." not in p.split("/") for p in recipe):
+    if not isinstance(recipe, list) or not all(isinstance(p, str) and p and not p.startswith("/") and ".." not in p.split("/") for p in recipe):
         raise Refusal("`moduleHub.recipe` must list relative paths")
     module_order(out)       # refuses a cycle
     return {"modules": out, "recipe": sorted(set(recipe))}
@@ -858,7 +858,8 @@ class ModuleHubBroker:
         """A stage-written JSON file, opened no-follow through the held descriptor; None while it is not (yet) a complete
         JSON object — it is then asked again on the next pass, never consumed as empty."""
         try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.fd[kind])
+            # O_NONBLOCK: a FIFO the stage planted must never block the broker's open (the regular-file check follows)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd[kind])
         except OSError:
             return None
         try:
@@ -901,7 +902,7 @@ class ModuleHubBroker:
                     os.makedirs(os.path.join(dest, rel_dir, d), exist_ok=True)
                 for f in filenames:
                     try:
-                        ffd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+                        ffd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
                     except OSError:
                         return f"build/{module}/ carries a link or unreadable entry ({os.path.join(rel_dir, f)}) — refused"
                     try:
@@ -5595,7 +5596,8 @@ def self_test() -> int:
         for bad_mh, why_mh in (({"moduleHub": {"modules": {"A": {"paths": ["x"], "deps": ["Z"]}}}}, "not declared"),
                                ({"moduleHub": {"modules": {"A": {"paths": ["x"], "deps": ["B"]}, "B": {"paths": ["y"], "deps": ["A"]}}}}, "cycle"),
                                ({"moduleHub": {"modules": {"../A": {"paths": ["x"]}}}}, "safe path segment"),
-                               ({"moduleHub": {"modules": {"A": {"paths": ["../x"]}}}}, "relative paths")):
+                               ({"moduleHub": {"modules": {"A": {"paths": ["../x"]}}}}, "relative paths"),
+                               ({"moduleHub": {"modules": {"A": {"paths": ["x"]}}, "recipe": ["/tmp/recipe"]}}, "relative paths")):
             try:
                 validate_module_hub(bad_mh)
                 check(f"modhub/{why_mh} is refused", False, "accepted")
@@ -5763,6 +5765,27 @@ def self_test() -> int:
                   sum(1 for c in api_s.calls if c[0] == "PUT") == uploads_before and comp_s and comp_s[-1]["succeeded"] is False
                   and ("link" in comp_s[-1]["error"] or "not a plain directory" in comp_s[-1]["error"]), comp_s)
             bs.stop("test end")
+        # a FIFO planted where the host reads (a request, an output file) never blocks the broker: it is refused at once
+        bf, api_f = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Grant", "step": {"seq": 61}})],
+                                 ("PUT", "/modules/MeshWeaver.Plugins/B/outputs/"): put_,
+                                 ("POST", "/modules/MeshWeaver.Plugins/B/complete"): lambda p_, b_: (200, {"accepted": True})})
+        os.mkfifo(os.path.join(bf.io, "req", "X.json"))
+        t0_ = time.monotonic()
+        bf.poll_once()
+        check("modhub/a FIFO planted as a request never blocks the broker", time.monotonic() - t0_ < 5 and not os.path.exists(os.path.join(bf.out, "resp", "X.json")))
+        with open(os.path.join(bf.io, "req", "B.json"), "w") as fh:
+            json.dump({"module": "B"}, fh)
+        bf.poll_once()
+        os.makedirs(os.path.join(bf.io, "build", "B"), exist_ok=True)
+        os.mkfifo(os.path.join(bf.io, "build", "B", "B.dll"))
+        with open(os.path.join(bf.io, "done", "B.json"), "w") as fh:
+            json.dump({"succeeded": True}, fh)
+        t0_ = time.monotonic()
+        bf.poll_once()
+        comp_f = [c[2] for c in api_f.calls if c[1].endswith("/complete")]
+        check("modhub/a FIFO planted in an output never blocks the broker and fails the hand-over",
+              time.monotonic() - t0_ < 5 and comp_f and comp_f[-1]["succeeded"] is False, comp_f)
+        bf.stop("test end")
         # a done file still being written is not consumed: it is read again once it is a complete JSON object
         bp, api_p = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Grant", "step": {"seq": 31}})],
                                  ("PUT", "/modules/MeshWeaver.Plugins/B/outputs/"): put_,
