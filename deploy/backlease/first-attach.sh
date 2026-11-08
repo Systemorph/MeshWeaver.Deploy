@@ -17,7 +17,8 @@
 #      CHECKS before changing anything: KEDA installed and ready, the node's allocatable, less what its pods already request, covers the host's floor and peak (replicas × requests),
 #      both vault objects readable;
 #   1. loads the `mw-build-host` AppArmor profile (`userns` only) into the Colima VM, persisted under /etc/apparmor.d,
-#      and proves an UNPRIVILEGED user namespace starts under it;
+#      and proves an UNPRIVILEGED user namespace starts under it; raises the VM's inotify limits (8192 instances per user,
+#      persisted under /etc/sysctl.d) and checks the kernel took them;
 #   2. creates namespace `build-mac`;
 #   3. creates two Secrets there from the values read in step 0, on stdin only — never a process argument, never printed:
 #      `build-worker-mac` (key `token`) and `build-pull` (kubernetes.io/dockerconfigjson: kubelet image pulls ONLY) and `build-registry-key-mac` (the READ-ONLY
@@ -119,6 +120,15 @@ vm aa-exec -p mw-build-host -- unshare -U -r true \
 vm unshare -U -r true 2>/dev/null \
   && echo "   note: unprivileged user namespaces start even WITHOUT the profile in this VM" \
   || echo "   loaded: an unprivileged user namespace starts under mw-build-host, and not without it"
+
+# inotify: every hosted test mesh and every MSBuild node watches files, and the VM's default of 128 inotify instances per user
+# failed 71 portal-host tests on the first Mac (2026-11-08: "The configured user limit (128) on the number of inotify
+# instances has been reached"). The build VM's kernel limits are host configuration, set here and persisted.
+printf '%s\n' 'fs.inotify.max_user_instances = 8192' 'fs.inotify.max_user_watches = 1048576' \
+  | vm sudo sh -c 'cat > /etc/sysctl.d/90-mw-build-host.conf && sysctl -q -p /etc/sysctl.d/90-mw-build-host.conf'
+got="$(vm sysctl -n fs.inotify.max_user_instances)"
+[ "${got:-0}" -ge 8192 ] || { echo "ERROR: fs.inotify.max_user_instances is ${got:-unreadable} in the build VM after setting 8192" >&2; exit 1; }
+echo "   inotify: ${got} instances per user (persisted in /etc/sysctl.d/90-mw-build-host.conf)"
 
 echo "== 2/5 namespace build-mac"
 k create namespace build-mac --dry-run=client -o yaml | k apply -f - >/dev/null
