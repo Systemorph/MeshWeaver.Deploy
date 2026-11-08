@@ -48,7 +48,7 @@ while [ $# -gt 0 ]; do
     --no-accept-jobs) acc_jobs=off; shift; continue;;
     --no-accept-tokens) acc_tokens=off; shift; continue;;
     --accept-jobs) acc_jobs="${2:?--accept-jobs needs instance patterns}";; --accept-tokens) acc_tokens="${2:?--accept-tokens needs instance patterns}";;
-    --token-models) acc_models="$2";; --residency) acc_res="$2";;
+    --token-models) acc_models="${2:?--token-models needs model names}";; --residency) acc_res="${2:?--residency needs a residency (e.g. CH, Eu)}";;
     --profile) profile="$2";; --api) api="$2";; --registry) registry="$2";; --vault) vault="$2";;
     --worker-secret) worker="$2";; --pull-secret) pull="$2";; --pull-user) pulluser="$2";;
     --plugins-registry) pluginsreg="$2";; --instance-key-secret) instkey="$2";;
@@ -99,7 +99,9 @@ if [ -t 0 ] && [ "${MEMEX_HEADLESS:-0}" != 1 ]; then
 fi
 # what each answer becomes: '' = unanswered (keep the saved answer; a fresh Mac stays OFF)
 jobs_args=(); tokens_args=()
-case "$acc_jobs" in '') ;; off) jobs_args=(--off) ;; *) jobs_args=(--from "$acc_jobs" --channels mac) ;; esac
+# `mac` is the FIRST-attach default for the channel narrowing only: a saved channel list is the owner's and is kept
+# (like the saved repositories, which this script never passes).
+case "$acc_jobs" in '') ;; off) jobs_args=(--off) ;; *) jobs_args=(--from "$acc_jobs"); [ -n "$(saved_list ${P}__Jobs__Channels)" ] || jobs_args+=(--channels mac) ;; esac
 case "$acc_tokens" in '') ;; off) tokens_args=(--off) ;; *) tokens_args=(--from "$acc_tokens" ${acc_models:+--models "$acc_models"} ${acc_res:+--residency "$acc_res"}) ;; esac
 # BOTH answers are checked by the CLI's own rules NOW — before any infrastructure or preference changes
 if [ -x "$ml" ]; then

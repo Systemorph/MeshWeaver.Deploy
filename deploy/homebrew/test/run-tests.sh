@@ -1013,6 +1013,9 @@ FA="$HERE/../../backlease/first-attach.sh"
   && ok "first-attach validates both opt-in answers BEFORE it changes any infrastructure" || bad "first-attach validates late" ""
 grep -q "case \"\$acc_jobs\" in '') ;;" "$FA" && grep -q '\[ "${#jobs_args\[@\]}" -eq 0 \] ||' "$FA" \
   && ok "first-attach leaves an unanswered class at its saved answer (a re-run never resets consent)" || bad "first-attach preserves answers" ""
+grep -q 'saved_list ${P}__Jobs__Channels)" \] || jobs_args+=(--channels mac)' "$FA" \
+  && ok "first-attach narrows jobs to channel mac only when no channel list is saved (a saved list is the owner's)" || bad "first-attach keeps saved channels" ""
+OUT="$(bash "$FA" --token-models 2>&1)"; case "$OUT" in *"--token-models needs model names"*) ok "first-attach names a value flag given last without its value" ;; *) bad "first-attach bare \$2" "$OUT" ;; esac
 # a bare `*` is a pattern, never a glob over the working directory's files
 (cd "$HERE" && mp_env "$CLI" backlease accept tokens --from '*' --models qwen3.8:27b-mlx </dev/null >/dev/null 2>&1)
 has 'Hosting__BackLease__Accept__Tokens__From__0: "*"' && ! has 'Accept__Tokens__From__1' && ok "'*' is written as the pattern '*', never expanded to file names" || bad "star pattern globbed" "$(grep Tokens__From "$BLF")"
