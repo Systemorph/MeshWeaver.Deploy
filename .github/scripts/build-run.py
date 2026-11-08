@@ -7455,7 +7455,9 @@ def self_test() -> int:
             os.makedirs(idle_work)
             ienv = dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_RUN_OVERLAY="true", MW_BUILD_IN_NS="1", MW_BUILD_WORK=idle_work,
                         MW_BUILD_CACHE=wenv["MW_BUILD_CACHE"], MW_BUILD_GIT_BASE=wenv["MW_BUILD_GIT_BASE"])
-            ienv.pop("MW_PLATFORM_SOURCE", None)
+            # the platform source is the fixture's (its .source-commit is on the local platform master): a runner image's own
+            # prepared tree names a commit no local origin holds
+            ienv["MW_PLATFORM_SOURCE"] = image_src
             hi = host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})] * 3, ("POST", "/claim"): [(204, None)] * 3}),
                       env=ienv, git_runner=_git_run)
             hi.warm_repos.add("R")
@@ -8007,7 +8009,7 @@ def self_test() -> int:
             rw = os.path.join(tmp, "run-73b")
             renv = dict(env_s, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_RUN_OVERLAY="true", MW_BUILD_WORK=os.path.join(rw, "work"),
                         MW_BUILD_CACHE=os.path.join(wroot, "cache"), MW_BUILD_GIT_BASE="file://" + os.path.dirname(origin))
-            renv.pop("MW_PLATFORM_SOURCE", None)
+            renv["MW_PLATFORM_SOURCE"] = image_src
             os.makedirs(renv["MW_BUILD_WORK"])
             rclaim = {"path": f"Hosting/Builds/R/{c5}-stable", "repo": "R", "sha": c5, "refs": [], "isTrunk": True,
                       "publish": False, "stages": []}
