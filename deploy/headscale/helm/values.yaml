@@ -43,6 +43,13 @@ dns:
   # false: a machine keeps its own resolvers; MagicDNS names are answered alongside them.
   overrideLocalDns: false
   nameservers: []
+  # Names MagicDNS answers beside the machines' own (Headscale dns.extra_records): one {name, type, value} per
+  # name — a Tailscale client matches MagicDNS names EXACTLY, so there are no wildcards. The use: a second
+  # portal on one Mac (memex-local instances) at <instance>.<machine>.<baseDomain>, pointing at that Mac's
+  # network address. Inside baseDomain only; type A (IPv4) or AAAA (IPv6). The render refuses anything else.
+  #   extraRecords:
+  #     - { name: proof.eiger.tailnet.internal, type: A, value: 100.64.0.7 }
+  extraRecords: []
 
 # The relays machines fall back to when no direct path exists. Tailscale's public DERP map until the
 # fleet runs its own relay (an embedded DERP needs UDP 3478 for STUN, which an HTTP ingress cannot carry).

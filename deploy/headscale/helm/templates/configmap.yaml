@@ -53,6 +53,11 @@ data:
           {{- toYaml .Values.dns.nameservers | nindent 10 }}
           {{- else }} []
           {{- end }}
+      extra_records:
+        {{- range (.Values.dns.extraRecords | default list) }}
+        - { name: {{ .name | quote }}, type: {{ .type | quote }}, value: {{ .value | quote }} }
+        {{- else }} []
+        {{- end }}
     unix_socket: /var/run/headscale/headscale.sock
     unix_socket_permission: "0770"
     logtail:

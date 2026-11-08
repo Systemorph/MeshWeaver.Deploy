@@ -20,6 +20,7 @@
 #   port-forward  (Re)start the host:8443 -> ingress:443 forward (troubleshooting).
 #   observability Install Grafana/Loki/Promtail/Prometheus (LocalColimaMac.md §11).
 #   doctor        Preflight: check required tools + cluster reachability.
+#   owner         The instance OWNER (id + e-mail) — its global administrator (owner --id <id> --email <e-mail>).
 #   help | version
 #
 # Each step is annotated with the LocalColimaMac.md section it automates so the
@@ -456,7 +457,13 @@ preflight() {
 # ---------------------------------------------------------------------------
 # §1/§4 — ensure the local overlay exists (generate secrets once)
 # ---------------------------------------------------------------------------
+# The overlay, then its owner (the instance's global administrator — ensure_owner_admin).
 ensure_overlay() {
+  ensure_overlay_file
+  ensure_owner_admin "${OWNER_ARG_ID:-}" "${OWNER_ARG_EMAIL:-}" "${OWNER_REQUIRED:-}"
+}
+
+ensure_overlay_file() {
   mkdir -p "$LOCAL_HOME"
   if [ -f "$OVERLAY" ]; then
     info "overlay exists: $OVERLAY"
@@ -1727,6 +1734,8 @@ cmd_fleet() {
           --no-update) do_update="no" ;;
           --no-observability) with_obs="no" ;;
           --no-buildhost) with_build="no" ;;
+          --owner) shift; OWNER_ARG_ID="${1:?--owner needs the owner user id}" ;;
+          --owner-email) shift; OWNER_ARG_EMAIL="${1:?--owner-email needs the owner e-mail}" ;;
           *) accept_flag "$@"
              [ "$ACC_USED" != 0 ] || die "fleet join: unknown flag '$1'"
              # the opt-in flags pass through to backlease enroll, which asks what they leave unanswered
@@ -1736,6 +1745,10 @@ cmd_fleet() {
       done
       [ -n "$control" ] || control="$(managed_pref ControlUrl)"
       [ -n "$id" ]      || id="$(managed_pref DeploymentId)"
+      # The OWNER first: the Mac's global administrator, and the person whose answers the opt-in questions
+      # below record. A join never proceeds without one.
+      OWNER_REQUIRED=require
+      ensure_overlay
       control="${control%/}"
       case "$control" in https://*) ;; *) die "fleet join: --control must be the control instance's https URL (got '${control:-<none>}')" ;; esac
       printf '%s' "$id" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$' \
@@ -2054,6 +2067,178 @@ llm_host_probe() {
   else warn "Ollama answers HTTP $cg to Host '$good' — the portal's chat will fail"; return 1; fi
   if [ "$cb" = "403" ]; then ok "negative control: Ollama refuses Host '$bad' (HTTP 403), as its loopback rule says"
   else info "negative control: Ollama answered HTTP $cb to Host '$bad' (403 expected on a loopback-bound Ollama; a LAN-wide bind admits every host)"; fi
+}
+
+# ---------------------------------------------------------------------------
+# THE OWNER — collected at onboarding, the instance's global administrator (`memex-local owner`)
+# ---------------------------------------------------------------------------
+# Maintainer, 2026-11-08: "generally: in onboarding we collect the owner. he will be global admin." (It
+# surfaced when installing a package such as ClaudeCode failed on his own Mac Studio: he held no Admin grant.)
+#
+# Every onboarding path — `up`, `fleet join`, the .pkg's unattended daemon, first-attach — collects the OWNER
+# as a first-class field: a MESH user id (the id they sign in as: on the first Mac Studio `rbuergi`) and their
+# e-mail. Both land in THIS install's own overlay, never the image and never the tracked defaults every
+# install shares (the chart gate pins that the defaults render no Auth__GlobalAdmins key):
+#   Auth__GlobalAdmins__0   the id — GlobalAdminSeed turns it into Admin/_Access/<id>_Access (global admin)
+#   Instance__Owner__Id     the id   } the owner as recorded on the instance, for the portal to show and to
+#   Instance__Owner__Email  the e-mail } match against the account that signs in
+# Sources, first that answers: `owner --id/--email` (or `--owner`/`--owner-email` on up / fleet join),
+# MEMEX_OWNER / MEMEX_OWNER_EMAIL, the managed preferences OwnerId / OwnerEmail (an MDM profile), what the
+# overlay already records, and — only on an interactive terminal — a question. An UNATTENDED install with
+# no owner FAILS: an instance never comes up without an administrator. Changed later with
+# `memex-local owner --id <id> --email <e-mail>`, never by editing YAML. The same owner answers the
+# opt-in questions (`backlease accept`: which instance's jobs, which instances' token requests).
+readonly OWNER_KEY="Auth__GlobalAdmins__0"
+# Written by every successful helm_deploy: this install HAS been deployed. Only such an install may come up
+# without an owner (with a loud warning) — the unattended daemon re-runs `up` on it at every start, and a
+# running Mac must never be halted by its own restart. A Mac that was never deployed has no marker, so a
+# failed ownerless `up` stays failed on every re-run. An install deployed BEFORE the marker existed is
+# recognised WITHOUT the cluster (the daemon's boot-time `up` runs this gate before Colima is started): by
+# the ingress certificate, which only `up`'s setup_tls writes, after the owner gate and after Colima is up —
+# so a Mac that never got past this gate cannot have one, and every pre-marker deployed install does. Its
+# Helm release counts too, when the cluster answers. Either way the next deploy writes the marker. Nothing
+# else counts: the port-forward script, for one, `memex-local port-forward` writes at any time.
+readonly DEPLOYED_MARKER="$LOCAL_HOME/deployed"
+install_deployed() {
+  [ -f "$DEPLOYED_MARKER" ] && return 0
+  [ -f "$CERT_FILE" ] && return 0
+  colima_running 2>/dev/null && helm status "$RELEASE" -n "$NAMESPACE" >/dev/null 2>&1
+}
+readonly OWNER_ID_KEY="Instance__Owner__Id"
+readonly OWNER_EMAIL_KEY="Instance__Owner__Email"
+
+valid_owner_id() { case "$1" in ''|*[!A-Za-z0-9._@-]*) return 1 ;; esac; return 0; }
+valid_owner_email() { case "$1" in *[!A-Za-z0-9._%+@-]*|*@*@*) return 1 ;; ?*@?*.?*) return 0 ;; esac; return 1; }
+
+# Sets config.memex_portal.<key> in the overlay to <value>, idempotently: an existing line under
+# config → memex_portal is rewritten in place, otherwise the key goes in right after that map's header
+# (created when the overlay has none). The secrets → memex_portal map is never touched. 0600 kept.
+overlay_set_portal_config() {   # $3 = "delete": remove the key instead of setting it
+  local key="$1" value="$2" tmp
+  [ -f "$OVERLAY" ] || die "no overlay at $OVERLAY — run 'memex-local up' first"
+  tmp="$(mktemp "${OVERLAY}.XXXXXX")" || die "cannot write beside $OVERLAY"
+  # Three cases, all inside the TOP-LEVEL `config:` section: the key exists under its memex_portal map
+  # (rewritten in place); the map exists without it (inserted at the map's end); `config:` has no such map
+  # (one is added at the END of the config section — never at the end of the file, where it would land
+  # under whatever section happens to be last). No `config:` at all: both are appended.
+  awk -v k="$key" -v v="$value" -v del="${3:-}" '
+    function kv() { if (del == "") print "    " k ": \"" v "\""; done = 1 }
+    function close_config() {
+      if (incfg && !done && del == "") { if (!sawmap) print "  memex_portal:"; kv() }
+    }
+    /^[^ #][^:]*:/ {                       # a top-level key ends the previous section
+      if (inmap && !done) kv()
+      if (incfg) close_config()
+      inmap = 0; incfg = ($1 == "config:"); if (incfg) sawconfig = 1
+      print; next
+    }
+    incfg && $0 == "  memex_portal:" { sawmap = 1; inmap = 1; print; next }
+    inmap && /^  [^ #]/ { if (!done) kv(); inmap = 0 }
+    inmap && $1 == k ":" { if (!done) kv(); next }
+    { print }
+    END {
+      if (inmap && !done) kv()
+      if (incfg) close_config()
+      if (!sawconfig && del == "") { print "config:"; print "  memex_portal:"; kv() }
+    }
+  ' "$OVERLAY" > "$tmp" || { rm -f "$tmp"; die "could not rewrite $OVERLAY"; }
+  [ -s "$tmp" ] || { rm -f "$tmp"; die "the rewrite of $OVERLAY came out empty — left unchanged"; }
+  chmod 600 "$tmp"; mv "$tmp" "$OVERLAY"
+}
+
+# 0 when this run may ask a person.
+owner_can_ask() { [ -t 0 ] && [ -t 1 ] && [ "${HEADLESS:-}" != "1" ] && [ "${MEMEX_NO_PROMPT:-}" != "1" ]; }
+
+# One owner field: $1 explicit value, $2 env value, $3 managed-pref key, $4 overlay key, $5 question,
+# $6 suggested answer. Prints the value or nothing.
+owner_field() {
+  local v="${1:-${2:-}}"
+  [ -n "$v" ] || v="$(managed_pref "$3")"
+  [ -n "$v" ] || v="$(overlay_value "$4")"
+  if [ -z "$v" ] && owner_can_ask; then
+    printf '%s%s: ' "$5" "${6:+ [$6]}" >&2
+    read -r v || v=""
+    [ -n "$v" ] || v="${6:-}"
+  fi
+  printf '%s' "$v"
+}
+
+# Records the owner in the overlay (idempotent; quiet when unchanged). $1 = id, $2 = e-mail (explicit).
+# $3 = "require": an install path — no owner is a FAILURE, never an instance without an administrator.
+ensure_owner_admin() {
+  local id email have_id have_email changed=""
+  id="$(owner_field "${1:-}" "${MEMEX_OWNER:-}" OwnerId "$OWNER_ID_KEY" \
+        "The instance's OWNER becomes its global administrator. Your MeshWeaver user id (the id you sign in as, not your e-mail)" \
+        "$(id -un 2>/dev/null)")"
+  [ -n "$id" ] || id="$(overlay_value "$OWNER_KEY")"   # an install that recorded only the admin key (before Instance__Owner__*)
+  if [ -z "$id" ]; then
+    # "require": an onboarding (fleet join) — always. "require-fresh": `up`, which the unattended daemon also
+    # re-runs at every start — required until the install has been DEPLOYED (install_deployed), a loud
+    # warning for a deployed ownerless one, so a running fleet Mac is never halted by its own restart.
+    if [ "${3:-}" = "require" ] || { [ "${3:-}" = "require-fresh" ] && ! install_deployed; }; then
+      die "no OWNER for this instance — an install never comes up without its administrator. Give one: memex-local owner --id <user-id> --email <e-mail> (or MEMEX_OWNER / MEMEX_OWNER_EMAIL, or the managed preferences OwnerId / OwnerEmail), then re-run"
+    fi
+    warn "this instance has NO OWNER, so no global administrator — memex-local owner --id <user-id> --email <e-mail>"
+    return 0
+  fi
+  valid_owner_id "$id" || die "owner: '$id' is not a user id (letters, digits and . _ @ - only)"
+  have_id="$(overlay_value "$OWNER_KEY")"; have_email="$(overlay_value "$OWNER_EMAIL_KEY")"
+  # A DIFFERENT owner never inherits the previous owner's recorded e-mail: the overlay's e-mail is read only
+  # for the owner it was recorded with. An id change without an e-mail removes the old one.
+  local email_key="$OWNER_EMAIL_KEY" email_pref="OwnerEmail" pref_id
+  if [ -n "$have_id" ] && [ "$have_id" != "$id" ]; then email_key="__no_such_key__"; fi
+  # …and the same for the managed preference: its OwnerEmail belongs to ITS OwnerId only.
+  pref_id="$(managed_pref OwnerId)"
+  # A lone OwnerEmail (no OwnerId beside it) was recorded for nobody, so it is ignored as well.
+  if [ "$pref_id" != "$id" ]; then email_pref="__no_such_pref__"; fi
+  email="$(owner_field "${2:-}" "${MEMEX_OWNER_EMAIL:-}" "$email_pref" "$email_key" "The owner's e-mail (the account they sign in with)" "")"
+  if [ -n "$email" ] && ! valid_owner_email "$email"; then die "owner: '$email' is not an e-mail address"; fi
+  # The owner is an id AND an e-mail (the e-mail is what the portal matches the signed-in account against).
+  # Where an owner is required, so is the e-mail; elsewhere a missing one is a warning.
+  if [ -z "$email" ]; then
+    if [ "${3:-}" = "require" ] || { [ "${3:-}" = "require-fresh" ] && ! install_deployed; }; then
+      die "the owner '$id' has no e-mail — give --owner-email <e-mail> (or MEMEX_OWNER_EMAIL, or the managed preference OwnerEmail beside OwnerId), then re-run"
+    fi
+    warn "owner '$id' has no e-mail recorded — the portal cannot match it against the signed-in account (memex-local owner --email <e-mail>)"
+  fi
+  [ "$have_id" = "$id" ] || { overlay_set_portal_config "$OWNER_KEY" "$id"; changed=1; }
+  if [ -z "$email" ] && [ -n "$have_email" ] && [ -n "$have_id" ] && [ "$have_id" != "$id" ]; then
+    overlay_set_portal_config "$OWNER_EMAIL_KEY" "" delete; changed=1
+  fi
+  [ "$(overlay_value "$OWNER_ID_KEY")" = "$id" ] || { overlay_set_portal_config "$OWNER_ID_KEY" "$id"; changed=1; }
+  if [ -n "$email" ] && [ "$have_email" != "$email" ]; then overlay_set_portal_config "$OWNER_EMAIL_KEY" "$email"; changed=1; fi
+  if [ -n "$changed" ]; then
+    ok "instance OWNER '$id'${email:+ <$email>} is its global administrator (in $OVERLAY${have_id:+, was '$have_id'}) — applied by the next deploy"
+  else
+    info "instance owner (global administrator): $id${email:+ <$email>}"
+  fi
+}
+
+cmd_owner() {
+  local id="" email=""
+  case "${1:-status}" in
+    status)
+      local have; have="$(overlay_value "$OWNER_KEY")"
+      if [ -n "$have" ]; then ok "instance OWNER (global administrator): $have${have:+ $(e="$(overlay_value "$OWNER_EMAIL_KEY")"; [ -n "$e" ] && printf '<%s>' "$e")}"
+      else warn "no OWNER — memex-local owner --id <user-id> --email <e-mail>"; fi
+      return 0 ;;
+  esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --id) shift; id="${1:?--id needs the owner user id}" ;;
+      --email) shift; email="${1:?--email needs the owner e-mail}" ;;
+      -*) die "usage: memex-local owner [--id <user-id>] [--email <e-mail>] | status" ;;
+      *) id="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$id$email" ] || die "usage: memex-local owner [--id <user-id>] [--email <e-mail>] | status"
+  ensure_overlay_file
+  # Changing the owner: an explicit id/e-mail REPLACES what the overlay recorded.
+  [ -z "$id" ] && id="$(overlay_value "$OWNER_KEY")"
+  [ -n "$id" ] || die "owner: give the owner's user id too (--id)"
+  ensure_owner_admin "$id" "$email"
+  info "Apply it: memex-local update --skip-image"
 }
 
 # ---------------------------------------------------------------------------
@@ -2685,6 +2870,7 @@ helm_deploy() {
     warn "could not make $PORTAL_DATA_DIR writable on the node — portal may crashloop on DataProtection keys${perms_err:+: $perms_err}"
   fi
   if [ -f "$INTERNAL_FILE" ]; then internal_serve_when_signed_in || true; fi
+  : > "$DEPLOYED_MARKER" 2>/dev/null || true   # this install has been deployed (install_deployed)
 }
 
 # ---------------------------------------------------------------------------
@@ -4121,12 +4307,17 @@ cmd_up() {
       --tag) shift; acr_tag="${1:?--tag needs a value}"; channel="" ;;
       --with-observability) with_obs="yes" ;;
       --rebuild-base) rebuild_base="--rebuild-base" ;;
+      --owner) shift; OWNER_ARG_ID="${1:?--owner needs the owner user id}" ;;
+      --owner-email) shift; OWNER_ARG_EMAIL="${1:?--owner-email needs the owner e-mail}" ;;
       *) die "up: unknown flag '$1'" ;;
     esac
     shift
   done
 
   preflight
+  # An install collects its OWNER, the global administrator — a FRESH one without an owner FAILS
+  # (ensure_owner_admin; an existing ownerless install, which the unattended daemon re-runs `up` on, warns).
+  OWNER_REQUIRED=require-fresh
   ensure_overlay
   start_colima                                   # §2
 
@@ -4838,7 +5029,7 @@ cmd_doctor() {
   done
   step "Managed preferences ($MANAGED_PREF_DOMAIN)"
   local k v any=""
-  for k in ControlUrl DeploymentId RegistryUrl Channel Profile; do
+  for k in ControlUrl DeploymentId RegistryUrl Channel Profile OwnerId OwnerEmail; do
     v="$(managed_pref "$k")"; [ -n "$v" ] && { info "$k: $v"; any=1; }
   done
   [ -n "$any" ] || info "none set (an MDM profile or 'defaults write $MANAGED_PREF_DOMAIN <Key> <value>' pre-fills enroll/registry)"
@@ -4882,6 +5073,7 @@ USAGE:
 
 COMMANDS:
   up [--build|--from-acr|--skip-image] [--tag T] [--with-observability] [--rebuild-base]
+     [--owner <user-id> --owner-email <e-mail>]
                   Bring the whole stack up (idempotent). Default image source:
                   --from-ghcr in registry mode (the public CI-built multi-arch image,
                   pulled anonymously — no Azure sign-in; --from-acr still works), --build otherwise (Option B, source → Colima's
@@ -5037,6 +5229,12 @@ COMMANDS:
   port-forward    (Re)start the host:${HOST_PORT} -> ingress:443 forward.
   observability   Install Grafana/Loki/Promtail/Prometheus (§11).
   doctor          Preflight: host profile, tools, chart/assets, cluster.
+  owner [--id <user-id>] [--email <e-mail>] | status
+                  The instance OWNER (collected at onboarding) is its global administrator:
+                  Auth__GlobalAdmins__0 + Instance__Owner__Id/Email in this install's own overlay
+                  (idempotent; this command is how it changes later). up / fleet join take
+                  --owner/--owner-email, MEMEX_OWNER / MEMEX_OWNER_EMAIL or the managed preferences
+                  OwnerId / OwnerEmail, and ask on a terminal; an unattended install without one FAILS.
   profile         The effective host profile: VM size, model, channel, running version.
   channel <L>     Resolve a channel label to the version it names now (no deploy).
   help | version
@@ -5536,6 +5734,7 @@ main() {
     port-forward)  cmd_port_forward "$@" ;;
     observability) cmd_observability "$@" ;;
     doctor)        cmd_doctor "$@" ;;
+    owner)         cmd_owner "$@" ;;
     profile)       cmd_profile "$@" ;;
     channel)       cmd_channel "$@" ;;
     version|--version|-v) cmd_version ;;
