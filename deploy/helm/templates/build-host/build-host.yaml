@@ -230,6 +230,9 @@ spec:
             - { name: MW_BUILD_RUN_DEADLINE_SECONDS, value: {{ $b.runDeadline | quote }} }
             # Fan-out: how many of a `parallel` run's stages run at once; the runner checks it against its cgroup.
             - { name: MW_BUILD_STAGE_SLOTS, value: {{ $b.stageSlots | quote }} }
+            # The warm workspace (MeshWeaver.Plugins Hosting/BuildQueue.md §7.2): one checkout per repository kept across runs
+            # under the work volume, moved to each run's exact sha with obj/ and bin/ kept, wiped on a set change.
+            - { name: MW_BUILD_WARM_WORKSPACE, value: {{ ternary "true" "false" $b.warmWorkspace | quote }} }
             # The module-hub broker (MeshWeaver.Plugins Hosting/BuildQueue.md §7.4): the host asks the per-module build hubs on a
             # stage's behalf, with fingerprints IT computes from a default-branch declaration (`moduleHub`).
             - { name: MW_BUILD_MODULE_HUB_ENABLED, value: {{ ternary "true" "false" $b.moduleHub | quote }} }

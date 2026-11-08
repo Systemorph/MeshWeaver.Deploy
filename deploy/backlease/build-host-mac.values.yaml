@@ -33,6 +33,9 @@ buildHosts:
   # Fan-out within a replica: 4 stages of a `parallel` run at once within its 4 CPU / 24 GiB limit; the chart default (8)
   # would exceed the replica's cgroup, and the runner refuses to start on that.
   stageSlots: 4
+  # The warm workspace (Hosting/BuildQueue.md §7.2): the Mac measures it first, before any cluster host turns it on. Each
+  # replica's warm copy lives under its work volume (the 40 GiB above), beside the run's disposable copy.
+  warmWorkspace: true
   cacheClaimName: "build-cache-mac"
   # The Mac's only class is node-local; the replicas share it on the one node (ReadWriteOnce is per node).
   cache: {create: true, storageClass: "local-path", size: "20Gi", accessMode: "ReadWriteOnce"}

@@ -219,6 +219,8 @@ for ch, (tester, portal, runner, mx, pv, mn) in want.items():
     if skip != {"tester", "portal", "oras"}:
         problems.append(f"{ch}: the identity token is not restricted to the build container (skip-containers {sorted(skip)})")
     env = {e["name"]: e for e in build.get("env", [])}
+    if env.get("MW_BUILD_WARM_WORKSPACE", {}).get("value") != "false":
+        problems.append(f"{ch}: the warm workspace is not OFF by default (MW_BUILD_WARM_WORKSPACE={env.get('MW_BUILD_WARM_WORKSPACE')})")
     if env.get("MW_BUILD_MODULE_HUB_ENABLED", {}).get("value") != "false":
         problems.append(f"{ch}: the module-hub broker is not OFF by default (MW_BUILD_MODULE_HUB_ENABLED={env.get('MW_BUILD_MODULE_HUB_ENABLED')})")
     if "BUILD_TOKEN" in env:
@@ -583,7 +585,7 @@ fi
 #     and scales by channel=mac against the public build API, and its cache claim is ReadWriteOnce on the node-local class.
 if helm template build-host-mac "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-host-mac.yaml" --namespace memex \
      > "$WORK/mac.yaml" 2> "$WORK/mac.err"; then
-  python3 - "$WORK/mac.yaml" <<'PY2' && ok "an extra channel 'mac' renders build-host-mac (claiming channel=mac at the public API) with a ReadWriteOnce cache, and nothing of the portal" || report "the mac first-attach render is wrong (above)"
+  python3 - "$WORK/mac.yaml" <<'PY2' && ok "an extra channel 'mac' renders build-host-mac (claiming channel=mac at the public API, warm workspace on) with a ReadWriteOnce cache, and nothing of the portal" || report "the mac first-attach render is wrong (above)"
 import sys, yaml
 docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
 by = {(d["kind"], d["metadata"]["name"]): d for d in docs}
@@ -594,6 +596,7 @@ if not dep:
 else:
     env = {e["name"]: e.get("value") for c in dep["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
     if env.get("MW_BUILD_CHANNEL") != "mac": problems.append(f"MW_BUILD_CHANNEL={env.get('MW_BUILD_CHANNEL')!r}")
+    if env.get("MW_BUILD_WARM_WORKSPACE") != "true": problems.append(f"the Mac's warm workspace is not on: MW_BUILD_WARM_WORKSPACE={env.get('MW_BUILD_WARM_WORKSPACE')!r}")
     if env.get("BUILD_API") != "https://control.example.com/api/builds": problems.append(f"BUILD_API={env.get('BUILD_API')!r}")
     if env.get("MW_REGISTRY_URL") != "https://registry.example.com" or env.get("MW_REGISTRY_KEY_FILE") != "/run/registry-key/key":
         problems.append("the plugins layer is not read through the registry bundle index (H8)")
