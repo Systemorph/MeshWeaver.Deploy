@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS: the Microsoft Enterprise SSO plug-in (Redirect type), shipped inside Intune Company Portal.
+  With it, a Microsoft sign-in on a managed Mac — Safari, the Memex desktop app, a local Memex instance's
+  "Sign in with Microsoft" — uses the work account the Mac was registered with in Company Portal, silently.
+  Requires: the Mac enrolled in Intune and Company Portal installed (it carries the extension).
+  Keys: Microsoft Learn, "Microsoft Enterprise SSO plug-in for Apple devices" (read 2026-11-08).
+  AppPrefixAllowList REPLACES the default (com.apple. + com.microsoft. on macOS), so it restates both
+  and adds cloud.meshweaver. (the Memex apps). Doc: deploy/macos/intune/README.md "Microsoft sign-in".
+-->
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.extensiblesso</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.systemorph.intune.macos.microsoft-sso.extensiblesso</string>
+            <key>PayloadUUID</key>
+            <string>C59E0C8F-814E-49F6-A542-EBB7E0D5011E</string>
+            <key>PayloadDisplayName</key>
+            <string>Microsoft Enterprise SSO plug-in</string>
+            <key>Type</key>
+            <string>Redirect</string>
+            <key>ExtensionIdentifier</key>
+            <string>com.microsoft.CompanyPortalMac.ssoextension</string>
+            <key>TeamIdentifier</key>
+            <string>UBF8T346G9</string>
+            <key>URLs</key>
+            <array>
+                <string>https://login.microsoftonline.com</string>
+                <string>https://login.microsoft.com</string>
+                <string>https://sts.windows.net</string>
+                <string>https://login.partner.microsoftonline.cn</string>
+                <string>https://login.chinacloudapi.cn</string>
+                <string>https://login.microsoftonline.us</string>
+                <string>https://login-us.microsoftonline.com</string>
+            </array>
+            <key>ExtensionData</key>
+            <dict>
+                <key>browser_sso_interaction_enabled</key>
+                <integer>1</integer>
+                <key>disable_explicit_app_prompt</key>
+                <integer>1</integer>
+                <key>AppPrefixAllowList</key>
+                <string>com.apple.,com.microsoft.,cloud.meshweaver.</string>
+            </dict>
+        </dict>
+    </array>
+    <key>PayloadDisplayName</key>
+    <string>Microsoft Enterprise SSO plug-in (macOS)</string>
+    <key>PayloadIdentifier</key>
+    <string>com.systemorph.intune.macos.microsoft-sso</string>
+    <key>PayloadOrganization</key>
+    <string>Systemorph</string>
+    <key>PayloadRemovalDisallowed</key>
+    <true/>
+    <key>PayloadScope</key>
+    <string>System</string>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>ED3F37E9-D0B7-4629-BD46-72273A75322B</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+</dict>
+</plist>

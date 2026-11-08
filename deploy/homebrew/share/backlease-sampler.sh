@@ -14,6 +14,7 @@
 #
 # Sources, all without sudo:
 #   host   sysctl -n hw.ncpu / hw.memsize; vm_stat (page size × active+wired+compressed);
+#          ownerCpuPercent — the OWNER's CPU over the interval (see owner_cpu below);
 #          sysctl -n vm.loadavg; pmset -g therm (CPU_Speed_Limit → thermal level); df -k $HOME;
 #          sysctl -n kern.boottime; pmset -g batt (power source)
 #   models ollama's native API: /api/tags (installed) + /api/ps (loaded)
@@ -126,6 +127,44 @@ out = {
 print(json.dumps(out))' 2>/dev/null || printf 'null'
 }
 
+# host.ownerCpuPercent — the CPU the OWNER is using, in percent of ONE core (200 = two cores busy), averaged over the
+# interval since the previous sample (MeshWeaver.Plugins Hosting/BackLease §14.5: an idle Mac takes the fleet's work
+# up to its slots and yields fast once its owner is active). Every process EXCEPT the fleet's own: Ollama (serve, its
+# runners, llama-server), the build VM (Colima profile `build`) and the portal's VM (profile `default`) — each VM
+# found as the process holding its profile's boot disk open, never by name — and kernel_task. It is the build
+# governor's "others" (share/buildhost-priority.sh, whose sample_cpu and vm_pids it reuses, sourced in a subshell)
+# minus Ollama and the portal VM. It is a delta of `ps` CPU time, never an instant snapshot. Prints nothing — and the
+# field is ABSENT — when it cannot be measured: no governor library, the first sample, or a gap longer than three
+# intervals (a sampler that slept would report an average of a stale window).
+GOVERNOR="${MEMEX_BUILD_PRIO_SCRIPT:-}"
+[ -n "$GOVERNOR" ] || { [ -f "${MEMEX_LOCAL_SHARE:-}/buildhost-priority.sh" ] && GOVERNOR="${MEMEX_LOCAL_SHARE}/buildhost-priority.sh"; }
+[ -n "$GOVERNOR" ] || GOVERNOR="${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/buildhost-priority.sh"
+owner_cpu() {
+  local prev="$DIR/owner-cpu.prev" cur="$DIR/owner-cpu.cur" stamp="$DIR/owner-cpu.at" now t0 dt reading had_prev=no
+  [ -f "$GOVERNOR" ] || return 0
+  now="${MEMEX_SAMPLER_NOW:-$(date +%s)}"
+  t0="$(cat "$stamp" 2>/dev/null || true)"
+  [ -f "$prev" ] && [ -n "$t0" ] && had_prev=yes
+  reading="$(${MEMEX_SAMPLER_PS:-ps -A -o pid=,time=,command=} 2>/dev/null | (
+      # shellcheck source=buildhost-priority.sh
+      MEMEX_BUILD_PRIO_LIB=1 . "$GOVERNOR" >/dev/null 2>&1 || exit 1
+      # vm_pids reads the governor's PROFILE: the build VM, then the portal's VM
+      excl="$(PROFILE=build vm_pids) $(PROFILE=default vm_pids)"
+      sample_cpu "$([ "$had_prev" = yes ] && printf '%s' "$prev" || printf '/dev/null')" "$cur" "$excl") 2>/dev/null)" || return 0
+  # a baseline that cannot be rotated is NO reading — the next sample starts over (never a stale baseline divided
+  # by one interval, which would report about twice the owner's CPU)
+  if ! mv -f "$cur" "$prev" 2>/dev/null || ! printf '%s' "$now" > "$stamp" 2>/dev/null; then
+    rm -f "$prev" "$stamp" 2>/dev/null; return 0
+  fi
+  [ "$had_prev" = yes ] || return 0
+  case "$t0" in ''|*[!0-9]*) return 0 ;; esac
+  dt=$(( now - t0 ))
+  [ "$dt" -ge 1 ] && [ "$dt" -le $(( INTERVAL * 3 )) ] || return 0
+  case "$reading" in *[0-9]' '*[0-9]) ;; *) return 0 ;; esac
+  # centiseconds of CPU per elapsed second = percent of one core
+  printf '%s' $(( ( ${reading% *} - ${reading#* } ) / dt ))
+}
+
 health_of() { # name, probe-exit → "ok" or the reason
   if [ "$2" = 0 ]; then printf '"%s":"ok"' "$1"; else printf '"%s":"%s"' "$1" "$3"; fi
 }
@@ -133,6 +172,9 @@ health_of() { # name, probe-exit → "ok" or the reason
 write_sample() {
   local host models vm m_rc v_rc colima_rc portal_rc tmp
   host="$(sample_host)"
+  local owner; owner="$(owner_cpu)"
+  # spliced only into a JSON OBJECT: a degraded host reading (anything not ending in `}`) is written as it was
+  case "$owner" in ''|*[!0-9]*) ;; *) case "$host" in '{'*'}') host="${host%\}},\"ownerCpuPercent\":$owner}" ;; esac ;; esac
   models="$(sample_models)"; m_rc=$?
   vm="$(sample_vm)"; v_rc=$?
   colima status >/dev/null 2>&1; colima_rc=$?
@@ -154,6 +196,12 @@ write_sample() {
   } > "$tmp" && mv -f "$tmp" "$OUT"
 }
 
+# library mode (tests source this file): fails CLOSED — executed with the variable set, it stops loudly instead of
+# falling through into the sampling loop
+if [ "${MEMEX_BACKLEASE_SAMPLER_LIB:-}" = 1 ]; then
+  (return 0 2>/dev/null) && return 0
+  echo "backlease-sampler.sh: MEMEX_BACKLEASE_SAMPLER_LIB=1 is for sourcing only — not sampling" >&2; exit 2
+fi
 if [ "${1:-}" = "--once" ]; then write_sample; exit 0; fi
 while true; do
   write_sample || true

@@ -87,6 +87,15 @@ config:
     # memex-local's own constant OLLAMA_ENDPOINT carries the same value; its test pins the two together.
     OpenAICompatible__Endpoint: "http://ollama.memex.svc.cluster.local:11434/v1"
     OpenAICompatible__DiscoverModels: "false"
+    # ---- Claude Code: each person's CLI login survives a restart -------------------------------
+    # The Claude Code harness runs the `claude` CLI inside the portal pod and keeps each person's
+    # login at {ConfigDirRoot}/{user}/.claude (CLAUDE_CONFIG_DIR). The chart default is empty, which
+    # means the container's own ~/.claude: ONE login shared by every user, on the container's
+    # writable layer, gone on the next restart or `memex-local update`. The chart's /mnt/users
+    # mount is an emptyDir here (no users claim on a laptop), so it would lose the logins too.
+    # /data is the hostPath memex-local already persists (persistDataVolume), so the logins
+    # live there. Measured on a Mac Studio, 2026-11-08: ConfigDirRoot empty, /home/app/.claude absent.
+    ClaudeCode__ConfigDirRoot: "/data/users"
 
 # ---- Portal Ingress: the TLS Secret is minted by `memex-local up`, not issued -------------------
 # The chart refuses an ingress that names a `tlsSecret` with no issuer reaching it (an ingress
