@@ -3444,7 +3444,9 @@ class SharedTree:
             if gen is None:
                 break
             fh = self._lock(self._lock_of(gen), fcntl.LOCK_SH)
-            if fh is not None and os.path.isdir(gen) and os.path.isdir(self.warm_of(gen)):
+            # only the generation that is STILL current after the lock is handed out: a retired one (even one a failed
+            # collect left half-deleted) is never copied — `current` is the one name a collector never deletes
+            if fh is not None and self.current() == gen and os.path.isdir(self.warm_of(gen)):
                 held = gen
                 break
             if fh is not None:
@@ -3477,8 +3479,10 @@ class SharedTree:
         if cur is None:
             os.makedirs(gen)
             return gen
-        proc = subprocess.Popen(["cp", "-a", cur, gen], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                start_new_session=True)
+        # stderr to a FILE, read as a bounded tail afterwards: a pipe nobody drains blocks `cp` once it fills (a full
+        # volume makes cp print one error per file) and would hold the writer lock to the deadline
+        errf = tempfile.TemporaryFile()
+        proc = subprocess.Popen(["cp", "-a", cur, gen], stdout=subprocess.DEVNULL, stderr=errf, start_new_session=True)
         try:
             while True:
                 try:
@@ -3495,12 +3499,17 @@ class SharedTree:
             except OSError:
                 pass
             proc.wait()
+            errf.close()
             shutil.rmtree(gen, ignore_errors=True)
             raise
         if rc != 0:
-            err = (proc.stderr.read() if proc.stderr else b"").decode(errors="replace")
+            size = errf.seek(0, os.SEEK_END)
+            errf.seek(max(0, size - 4096))
+            err = errf.read().decode(errors="replace")
+            errf.close()
             shutil.rmtree(gen, ignore_errors=True)
             raise Refusal(f"the shared tree's current generation could not be copied (exit {rc}): {err.strip()[-200:]}")
+        errf.close()
         return gen
 
     def publish(self, gen: str) -> None:
@@ -3530,11 +3539,14 @@ class SharedTree:
                 continue                        # a reader is copying it: kept until the next collect
             try:
                 shutil.rmtree(gen, ignore_errors=True)
-                gone.append(name)
-                try:
-                    os.remove(lock)             # a reader that opens it after this finds the generation gone and re-reads
-                except OSError:
-                    pass
+                if not os.path.exists(gen):
+                    gone.append(name)
+                    try:
+                        os.remove(lock)         # a reader that opens it after this finds the generation gone and re-reads
+                    except OSError:
+                        pass
+                # a deletion that failed partway keeps its lock file: the next collector excludes readers through the SAME
+                # inode, and readers never take a retired generation anyway (reader(): it must still be `current`)
             finally:
                 fh.close()
         return gone
@@ -6297,6 +6309,13 @@ def self_test() -> int:
             check("shared/the generation a reader holds is NEVER deleted under it", os.path.isdir(g1) and st_.current() == g2)
         check("shared/once released, the old generation is collected", SharedTree(sroot, "R").collect() == [os.path.basename(g1)]
               and not os.path.exists(g1))
+        # a RETIRED generation (here: one a failed collect left behind) is never handed to a reader, only the current one
+        with st_.writer() as w_r:
+            g_old = st_.current(); g_new = w_r.stage(); fill(g_new, "gen2b")
+            os.symlink(os.path.relpath(g_new, st_.root), os.path.join(st_.root, ".tmp-cur")); os.replace(os.path.join(st_.root, ".tmp-cur"), os.path.join(st_.root, "current"))
+        with st_.reader() as w_cur:
+            check("shared/a reader is only ever handed the CURRENT generation, never a retired one",
+                  w_cur == st_.warm_of(g_new) and w_cur != st_.warm_of(g_old))
         # NO TORN READS: readers copying while a writer publishes generation after generation see ONE generation, whole
         torn: list = []
         worker_errors: list = []
