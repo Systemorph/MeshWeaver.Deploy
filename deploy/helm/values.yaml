@@ -1311,6 +1311,12 @@ buildHosts:
   # one writer at a time by a file lock, readers hold the generation they copy) instead of once per replica in its work
   # volume — every replica starts warm, and a roll keeps it. Needs a cache volume every replica mounts. Off by default.
   sharedTree: false
+  # The RUN OVERLAY (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3b): with the shared tree on, a run's tree is an OVERLAY —
+  # the published generation read-only beneath, the run's own upper layer taking every write — instead of a full copy
+  # (measured on the Mac, 2026-11-08: 32 s and 18 GiB per run copied → 3 s and 20 KiB mounted). The runner re-enters itself
+  # in its own user + mount namespace (`unshare -Urm`) to mount it, and falls back to the copy, said, where the host
+  # cannot. A run can then not write the shared tree at all. Off by default.
+  runOverlay: false
   # KEDA: polling, the scale-to-zero calm window, and the scale-down stabilization window (longer
   # than a claim's round trip, so a replica is not removed between two runs).
   pollingInterval: 15

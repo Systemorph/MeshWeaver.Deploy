@@ -2956,6 +2956,14 @@ def sandbox_readonly_roots(env: dict) -> list[str]:
                         "/portal", "/tester", "/tools", "/core-tests") if p]
 
 
+def outer_ids(env: dict) -> Optional[tuple]:
+    """The pod's uid/gid when this runner lives in its own user namespace (`enter_run_namespace`), else None."""
+    if env.get(IN_NS_ENV) != "1":
+        return None
+    u, g = str(env.get("MW_BUILD_OUTER_UID", "")), str(env.get("MW_BUILD_OUTER_GID", ""))
+    return (u, g) if u.isdigit() and g.isdigit() else None
+
+
 class Sandbox:
     """`bwrap` per stage: user, PID, mount, IPC and UTS namespaces; `--die-with-parent`; a fresh
     /proc; `--clearenv` + the allow-list; the system and the caches bound READ-ONLY; writable only
@@ -2964,9 +2972,11 @@ class Sandbox:
 
     SYSTEM_RO = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt")
 
-    def __init__(self, bwrap: str, readonly: Iterable[str]) -> None:
+    def __init__(self, bwrap: str, readonly: Iterable[str], ids: Optional[tuple] = None) -> None:
         self.bwrap = bwrap
         self.readonly = tuple(readonly)
+        # inside the runner's OWN user namespace (run overlay) this process is uid 0: a stage keeps the pod's uid/gid
+        self.ids = ids
 
     def argv(self, command: str, checkout: str, outputs: str, env: dict,
              readonly: Iterable[str] = (), writable: Iterable[str] = (), mount: Optional[str] = None,
@@ -2980,6 +2990,8 @@ class Sandbox:
         a = [self.bwrap, "--die-with-parent", "--new-session",
              "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try",
              "--clearenv"]
+        if self.ids:
+            a[a.index("--unshare-user") + 1:a.index("--unshare-user") + 1] = ["--uid", str(self.ids[0]), "--gid", str(self.ids[1])]
         for k in sorted(env):
             a += ["--setenv", k, env[k]]
         # The tmpfs mounts come FIRST: bwrap applies mounts in order, so a tmpfs laid after a bind hides
@@ -3414,6 +3426,91 @@ def shared_tree_enabled(env: dict) -> bool:
 SHARED_DIR = "shared"
 
 
+GENERATION_SAMPLE = 32
+
+
+def _file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def generation_manifest(gen: str) -> dict:
+    """What a published generation IS: every file's content hash, and the stat fingerprint (size, mtime, ctime, inode) it
+    had once hashed. An unprivileged process cannot set a ctime back, so a later write to any file of the generation —
+    content, mode or a rewrite that restores the mtime — no longer matches; `digest` covers the whole list."""
+    entries = []
+    for d, dirs, files in os.walk(gen):
+        dirs.sort()
+        for n in sorted(files):
+            full = os.path.join(d, n)
+            rel = os.path.relpath(full, gen)
+            st_ = os.lstat(full)
+            if stat.S_ISLNK(st_.st_mode):
+                entries.append([rel, "link", 0, st_.st_mtime_ns, st_.st_ctime_ns, st_.st_ino, os.readlink(full)])
+            elif stat.S_ISREG(st_.st_mode):
+                entries.append([rel, "file", st_.st_size, st_.st_mtime_ns, st_.st_ctime_ns, st_.st_ino, _file_sha256(full)])
+        for n in list(dirs):
+            if os.path.islink(os.path.join(d, n)):   # a symlinked directory: recorded as a link, never followed
+                full = os.path.join(d, n)
+                st_ = os.lstat(full)
+                entries.append([os.path.relpath(full, gen), "link", 0, st_.st_mtime_ns, st_.st_ctime_ns, st_.st_ino, os.readlink(full)])
+                dirs.remove(n)
+    entries.sort(key=lambda e: e[0])
+    return {"generation": os.path.basename(gen), "entries": entries,
+            "digest": hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode()).hexdigest()}
+
+
+def verify_generation(gen: str, manifest_path: str, sample: int = GENERATION_SAMPLE,
+                      rnd: Optional[random.Random] = None) -> Optional[str]:
+    """None when `gen` is exactly what its publisher hashed, else WHY not: no manifest, a manifest whose digest does not
+    cover its entries, another generation's manifest, a file added, missing or changed since (stat fingerprint), or — for
+    a random sample of files — content that no longer hashes as recorded. Reads stat for every file, content for `sample`."""
+    try:
+        with open(manifest_path, encoding="utf-8") as fh:
+            m = json.load(fh)
+    except (OSError, ValueError):
+        return "no integrity manifest (published before the check, or removed)"
+    entries = m.get("entries") if isinstance(m, dict) else None
+    if not isinstance(entries, list):
+        return "the integrity manifest is malformed"
+    if hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode()).hexdigest() != m.get("digest"):
+        return "the integrity manifest's digest does not cover its entries"
+    if m.get("generation") != os.path.basename(gen):
+        return f"the manifest is generation {m.get('generation')!r}'s, not {os.path.basename(gen)!r}'s"
+    want = {e[0]: e for e in entries if isinstance(e, list) and len(e) == 7}
+    seen = set()
+    for d, dirs, files in os.walk(gen):
+        names = list(files) + [n for n in dirs if os.path.islink(os.path.join(d, n))]
+        dirs[:] = [n for n in dirs if not os.path.islink(os.path.join(d, n))]
+        for n in names:
+            full = os.path.join(d, n)
+            rel = os.path.relpath(full, gen)
+            e = want.get(rel)
+            if e is None:
+                return f"{rel} was added after the generation was published"
+            try:
+                st_ = os.lstat(full)
+            except OSError:
+                return f"{rel} cannot be read"
+            if [st_.st_size if e[1] == "file" else 0, st_.st_mtime_ns, st_.st_ctime_ns, st_.st_ino] != e[2:6]:
+                return f"{rel} changed after the generation was published"
+            seen.add(rel)
+    missing = sorted(set(want) - seen)
+    if missing:
+        return f"{missing[0]} was removed after the generation was published"
+    files = [e for e in want.values() if e[1] == "file"]
+    for e in (rnd or random.Random()).sample(files, min(sample, len(files))):
+        try:
+            if _file_sha256(os.path.join(gen, e[0])) != e[6]:
+                return f"{e[0]}'s content no longer hashes as published"
+        except OSError:
+            return f"{e[0]} cannot be read"
+    return None
+
+
 class SharedTree:
     """ONE warm main tree per repository on the shared cache volume, as GENERATIONS: `gens/<id>/` holds a tree
     (`.warm/<repo>`) and its host-private git directory and state (`.warm-host/<repo>`, the warm_private layout), and the
@@ -3431,6 +3528,12 @@ class SharedTree:
         # a generation's reader lock lives OUTSIDE the directory a collector deletes: an open of a lock inside it could
         # recreate the file on a new inode mid-delete and admit a reader the collector's lock no longer excludes
         self.locks = os.path.join(self.root, "locks")
+        # a generation's integrity manifest, beside it and never inside it (a run's overlay sees only the generation)
+        self.manifests = os.path.join(self.root, "manifests")
+        self.last_refusal: Optional[str] = None
+
+    def manifest_of(self, gen: str) -> str:
+        return os.path.join(self.manifests, os.path.basename(gen) + ".json")
 
     def _lock_of(self, gen: str) -> str:
         os.makedirs(self.locks, exist_ok=True)
@@ -3461,7 +3564,8 @@ class SharedTree:
 
     @contextlib.contextmanager
     def reader(self):
-        """The current generation's warm tree, held against deletion while the block runs; None when none is published."""
+        """The current generation's warm tree, held against deletion while the block runs; None when none is published —
+        or when it fails its integrity check (`verify_generation`; why in `last_refusal`)."""
         import fcntl
         fh, held = None, None
         for attempt in range(6):                 # a generation collected between the readlink and the lock: read again
@@ -3481,6 +3585,13 @@ class SharedTree:
             # only the generation that is STILL current after the lock is handed out: a retired one (even one a failed
             # collect left half-deleted) is never copied — `current` is the one name a collector never deletes
             if self.current() == gen and os.path.isdir(self.warm_of(gen)):
+                # INTEGRITY before use: the generation must be exactly what its publisher hashed — else it is no warm tree
+                why = verify_generation(gen, self.manifest_of(gen))
+                if why is not None:
+                    self.last_refusal = f"generation {os.path.basename(gen)} refused: {why}"
+                    fh.close()
+                    fh = None
+                    break
                 held = gen
                 break
             fh.close()                           # retired between the readlink and the lock: read `current` again
@@ -3548,6 +3659,14 @@ class SharedTree:
         return gen
 
     def publish(self, gen: str) -> None:
+        # the generation's integrity manifest FIRST: a reader verifies against it before it uses the generation, so a
+        # generation is never current without one
+        os.makedirs(self.manifests, exist_ok=True)
+        man = self.manifest_of(gen)
+        part = man + f".{os.getpid()}.part"
+        with open(part, "w", encoding="utf-8") as fh:
+            json.dump(generation_manifest(gen), fh, separators=(",", ":"))
+        os.replace(part, man)
         tmp = os.path.join(self.root, f".current-{os.getpid()}")
         try:
             os.remove(tmp)
@@ -3576,6 +3695,10 @@ class SharedTree:
                 shutil.rmtree(gen, ignore_errors=True)
                 if not os.path.exists(gen):
                     gone.append(name)
+                    try:
+                        os.remove(self.manifest_of(gen))
+                    except OSError:
+                        pass
                     try:
                         os.remove(lock)         # a reader that opens it after this finds the generation gone and re-reads
                     except OSError:
@@ -3697,6 +3820,108 @@ def _trusted_tree(git: Callable[..., None], gitdir: str, tree: str, sha: str, mi
     git("--git-dir", gitdir, "update-ref", "--no-deref", "HEAD", sha)
 
 
+RUN_OVERLAY_ENV = "MW_BUILD_RUN_OVERLAY"
+IN_NS_ENV = "MW_BUILD_IN_NS"
+_OVERLAY_PROBE = ("d=$(mktemp -d) && mkdir \"$d/l\" \"$d/u\" \"$d/w\" \"$d/m\" && echo x > \"$d/l/f\" && "
+                  "mount -t overlay overlay -o \"lowerdir=$d/l,upperdir=$d/u,workdir=$d/w\" \"$d/m\" && "
+                  "echo y > \"$d/m/f\" && umount \"$d/m\" && [ \"$(cat \"$d/l/f\")\" = x ] && [ \"$(cat \"$d/u/f\")\" = y ]; "
+                  "rc=$?; chmod -R u+rwx \"$d\"; rm -rf \"$d\"; exit $rc")
+
+
+def run_overlay_enabled(env: dict) -> bool:
+    """A run's tree is an OVERLAY of the shared generation (read-only lower, per-run upper) — asked for by the chart
+    (`buildHosts.runOverlay` → MW_BUILD_RUN_OVERLAY) AND this process living in its own user+mount namespace, where it may
+    mount one (`enter_run_namespace`). Only with the shared tree: its published generations never change in place."""
+    return (str(env.get(RUN_OVERLAY_ENV, "")).lower() == "true" and env.get(IN_NS_ENV) == "1"
+            and shared_tree_enabled(env))
+
+
+def enter_run_namespace(argv: list, env: dict, log: Callable[[str], None],
+                        which: Callable[[str], Optional[str]] = shutil.which,
+                        probe: Optional[Callable[[list], int]] = None,
+                        execvpe: Callable[..., None] = os.execvpe) -> None:
+    """Re-exec this runner inside its OWN user + mount namespace (`unshare -Urm`, private propagation) when the run overlay
+    is asked for, so a run's tree can be an overlay mount that every host git step and every stage sandbox (bwrap, nested)
+    of this process sees. An exec, no fork: the same pid keeps receiving SIGTERM. Returns only when NOT re-executed — the
+    overlay is not asked for, this process already is in its namespace, or the host cannot make one (no `unshare`, or the
+    probe — a real overlay mount, a write through it, the lower untouched — fails), which is said; runs then COPY the tree."""
+    if str(env.get(RUN_OVERLAY_ENV, "")).lower() != "true" or env.get(IN_NS_ENV) == "1":
+        return
+    u = which("unshare")
+    if not u:
+        log("run overlay: no `unshare` on this host — every run copies the warm tree")
+        return
+    cmd = [u, "-Urm", "--propagation", "private", "sh", "-c", _OVERLAY_PROBE]
+    try:
+        rc = probe(cmd) if probe else subprocess.run(cmd, capture_output=True, timeout=60).returncode
+    except (OSError, subprocess.SubprocessError) as e:
+        rc = f"{type(e).__name__}"
+    if rc != 0:
+        log(f"run overlay: this host cannot mount an overlay in its own user namespace (probe: {rc}) — every run copies the warm tree")
+        return
+    new = dict(env, **{IN_NS_ENV: "1", "MW_BUILD_OUTER_UID": str(os.getuid()), "MW_BUILD_OUTER_GID": str(os.getgid())})
+    log("run overlay: re-entering this runner in its own user + mount namespace — a run's tree is an overlay of the shared generation")
+    execvpe(u, [u, "-Urm", "--propagation", "private", sys.executable, os.path.abspath(__file__), *argv], new)
+
+
+def _mount_runner(cmd: list) -> "tuple[int, str]":
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, str(e)
+
+
+def _overlay_tree(lower: str, dest: str, sh: Callable[[list], "tuple[int, str]"] = _mount_runner) -> None:
+    """A run's tree as an OVERLAY: `lower` (the shared generation's warm tree) read-only beneath, `dest.upper` taking every
+    write the run makes — so the run writes only its DELTA and can never change the shared tree. `.git` of the lower is
+    hidden (the run gets a fresh one). Raises Refusal when the mount is refused; the caller copies instead."""
+    if any(c in lower for c in ",:\\") or not os.path.isdir(lower):
+        raise Refusal(f"the generation's path cannot be an overlay lower ({lower!r})")
+    up, wk = dest + ".upper", dest + ".ovlwork"
+    for d in (up, wk, dest):
+        os.makedirs(d, exist_ok=True)
+    rc, out = sh(["mount", "-t", "overlay", "overlay", "-o", f"lowerdir={lower},upperdir={up},workdir={wk}", dest])
+    if rc != 0:
+        release_run_tree(dest, sh)
+        raise Refusal(f"the overlay mount was refused ({out[:160] or rc})")
+    g = os.path.join(dest, ".git")
+    if os.path.isdir(g) and not os.path.islink(g):
+        shutil.rmtree(g)
+    elif os.path.lexists(g):
+        os.remove(g)
+
+
+def release_run_tree(dest: str, sh: Callable[[list], "tuple[int, str]"] = _mount_runner,
+                     ismount: Callable[[str], bool] = os.path.ismount) -> None:
+    """Undo `_overlay_tree`: unmount (lazily, should a stage still hold a file) and make the overlay's work directory —
+    created mode 000 by the kernel — removable. Never raises: the workspace sweep removes whatever is left."""
+    try:
+        if ismount(dest):
+            rc, _ = sh(["umount", dest])
+            if rc != 0:
+                sh(["umount", "-l", dest])
+    except OSError:
+        pass
+    for root in (dest + ".ovlwork", dest + ".upper"):
+        for d, dirs, _files in os.walk(root, topdown=True, onerror=lambda e: None):
+            for n in dirs:
+                try:
+                    os.chmod(os.path.join(d, n), 0o700)
+                except OSError:
+                    pass
+        try:
+            os.chmod(root, 0o700)
+        except OSError:
+            pass
+
+
+def remove_workspace(path: str, release: Callable[[str], None] = release_run_tree) -> None:
+    """Remove a run's workspace, its overlay (if any) released first."""
+    release(os.path.join(path, "src"))
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def _copy_tree(src: str, dest: str, deadline: Optional[float] = None) -> None:
     """A run's private copy of the warm tree (no `.git` travels: the run gets a fresh one): a reflink copy where the
     filesystem offers one, a plain `cp -a` otherwise — both bounded by the run's checkout deadline."""
@@ -3750,7 +3975,8 @@ def advance_warm_main(repo: str, tip: str, warm: str, env: dict, log: Callable[[
 
 def seed_run_from_warm(repo: str, sha: str, refs: list, warm: str, dest: str, token: Optional[str], env: dict,
                        log: Callable[[str], None], key: str, deadline: Optional[float] = None,
-                       git: Optional[Callable[..., None]] = None, fresh: Optional[Callable[..., None]] = None) -> str:
+                       git: Optional[Callable[..., None]] = None, fresh: Optional[Callable[..., None]] = None,
+                       overlay: bool = False, mount: Optional[Callable[[str, str], None]] = None) -> str:
     """A run's checkout `dest`: a disposable COPY of the warm tree with a FRESH, host-made `.git` (objects borrowed from the
     mirror), moved to `sha` — or a fresh clone. The warm workspace is only READ, and an interrupted build is never used.
     Returns the plan line naming how the run's tree was seeded."""
@@ -3767,7 +3993,15 @@ def seed_run_from_warm(repo: str, sha: str, refs: list, warm: str, dest: str, to
         mirror = os.path.join(mirror_root, f"{repo}.git")
         wanted = [sha] + [r for r in (refs or []) if isinstance(r, str) and r]
         try:
-            _copy_tree(warm, dest, deadline)
+            layered = None
+            if overlay:
+                try:
+                    (mount or _overlay_tree)(warm, dest)
+                    layered = True
+                except (Refusal, OSError) as e:
+                    log(f"run overlay: {e} — this run copies the warm tree")
+            if not layered:
+                _copy_tree(warm, dest, deadline)
             _update_mirror(repo, f"{base}/{repo}.git", mirror_root, mirror, wanted, g, log)
             # the run's own .git, made by the host: a normal repository (the PR merge runs in it), objects from the mirror
             g("init", "--quiet", dest)
@@ -3789,9 +4023,11 @@ def seed_run_from_warm(repo: str, sha: str, refs: list, warm: str, dest: str, to
             g("-C", dest, "update-ref", "--no-deref", "HEAD", sha)
             built = st.get("built")
             how = "built by the tip's warmBuild" if built == st.get("tip") else "sources only — not built yet"
-            return f"workspace: incremental copy of main@{str(st.get('tip', '?'))[:12]} ({how}), moved to {sha[:12]} (obj/ and bin/ kept)"
+            kind = "overlay (the run writes only its delta)" if layered else "incremental copy"
+            return f"workspace: {kind} of main@{str(st.get('tip', '?'))[:12]} ({how}), moved to {sha[:12]} (obj/ and bin/ kept)"
         except (Refusal, OSError, shutil.Error) as e:
             reason = f"the warm copy failed ({str(e)[:160]})"
+    release_run_tree(dest)
     shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     fresh(repo, sha, refs, dest, token, env, log, deadline=deadline)
@@ -3943,7 +4179,8 @@ class Host:
         # The staged image roots are bound read-only, `--ro-bind-try` (absent on a set that names no
         # such image): /core-tests is where a set's mw-core-tests image is staged, and core's shard and
         # doc-gate stages run `python3 /core-tests/core-tests.py …` from it.
-        self.sandbox = sandbox or Sandbox(env.get("BWRAP", "bwrap"), sandbox_readonly_roots(env))
+        self.sandbox = sandbox or Sandbox(env.get("BWRAP", "bwrap"), sandbox_readonly_roots(env), outer_ids(env))
+        self.run_holds = contextlib.ExitStack()
         self.leftovers = leftovers or pid_namespace_leftovers
         self.reap = reap or reap_children
         self.registry_get = registry_get or _registry_get
@@ -4576,6 +4813,7 @@ class Host:
         if claim.get("claimId"):
             self.claim_id = str(claim["claimId"])
         self.run_env = prepared_env()
+        self.run_holds = contextlib.ExitStack()        # what the run holds until its tree is released (the generation's lock)
         with Heartbeat() as hb:
             self.heartbeat = hb
             outcome = "lost"
@@ -4594,8 +4832,11 @@ class Host:
                     # H9: the workspace goes only after every receipt was ACKNOWLEDGED. It is kept
                     # (and named) for the instance's re-queue, and swept once older than two deadlines.
                     self.log(f"{path}: receipts not acknowledged — keeping the workspace {workdir}")
+                    release_run_tree(checkout_dir)
                 else:
-                    shutil.rmtree(workdir, ignore_errors=True)
+                    remove_workspace(workdir)
+                # the overlay is gone: only now may the generation beneath it be collected
+                self.run_holds.close()
 
     def _sink_for(self, repo: str, sha: str, stage: str) -> EventSink:
         """ONE sink per stage route for the whole run, so its batch numbers are one sequence."""
@@ -4625,10 +4866,26 @@ class Host:
                 co_deadline = time.monotonic() + max(1.0, self.run_deadline - (self.clock() - started))
                 if warm_enabled(self.env) and self.checkout is default_checkout:
                     self.warm_repos.add(repo)
-                    if shared_tree_enabled(self.env):
+                    if shared_tree_enabled(self.env) and run_overlay_enabled(self.env):
+                        # the SHARED tree's published generation as the run's read-only LOWER layer: held against deletion
+                        # for the WHOLE run (released in run() after the unmount), so a collect never removes it under the
+                        # overlay; the run writes only its upper layer, never the shared tree
+                        tree_ = SharedTree(self.cache, repo)
+                        shared_warm = self.run_holds.enter_context(tree_.reader())
+                        if tree_.last_refusal:
+                            self.log(f"shared tree: {repo} {tree_.last_refusal} — this run starts from a clean checkout")
+                        self.workspace_line = seed_run_from_warm(
+                            repo, sha, claim.get("refs") or [],
+                            shared_warm or os.path.join(self.cache, SHARED_DIR, repo, "none", WARM_DIR, repo),
+                            checkout_dir, token, self.env, self.log, warm_key(self.env, self.identity), deadline=co_deadline,
+                            overlay=shared_warm is not None)
+                    elif shared_tree_enabled(self.env):
                         # the SHARED tree's published generation, held against deletion while it is copied; the run writes
                         # only its own copy, never the shared tree
-                        with SharedTree(self.cache, repo).reader() as shared_warm:
+                        tree_ = SharedTree(self.cache, repo)
+                        with tree_.reader() as shared_warm:
+                            if tree_.last_refusal:
+                                self.log(f"shared tree: {repo} {tree_.last_refusal} — this run starts from a clean checkout")
                             self.workspace_line = seed_run_from_warm(
                                 repo, sha, claim.get("refs") or [],
                                 shared_warm or os.path.join(self.cache, SHARED_DIR, repo, "none", WARM_DIR, repo),
@@ -5066,7 +5323,7 @@ class Host:
             full = os.path.join(self.work, n)
             try:
                 if os.path.isdir(full) and not os.path.islink(full) and now - os.path.getmtime(full) > 2 * self.run_deadline:
-                    shutil.rmtree(full, ignore_errors=True)
+                    remove_workspace(full)
                     gone.append(n)
             except OSError:
                 continue
@@ -5844,6 +6101,8 @@ def main(argv: list[str]) -> int:
             print(f"build-run: {e}", file=sys.stderr)
             return 1
     env = dict(os.environ)
+    if a.host or a.once:
+        enter_run_namespace(argv, env, lambda m: print(f"build-run: {m}", flush=True))
     try:
         host = Host(env, Api(env.get("BUILD_API", ""), read_worker_token(env)))
         host.preflight()
@@ -6427,6 +6686,9 @@ def self_test() -> int:
         # a RETIRED generation (here: one a failed collect left behind) is never handed to a reader, only the current one
         with st_.writer() as w_r:
             g_old = st_.current(); g_new = w_r.stage(); fill(g_new, "gen2b")
+            os.makedirs(st_.manifests, exist_ok=True)       # what publish writes first: the generation's manifest
+            with open(st_.manifest_of(g_new), "w") as mfh:
+                json.dump(generation_manifest(g_new), mfh)
             os.symlink(os.path.relpath(g_new, st_.root), os.path.join(st_.root, ".tmp-cur")); os.replace(os.path.join(st_.root, ".tmp-cur"), os.path.join(st_.root, "current"))
         with st_.reader() as w_cur:
             check("shared/a reader is only ever handed the CURRENT generation, never a retired one",
@@ -6503,6 +6765,209 @@ def self_test() -> int:
             check("shared/no published generation reads as no warm tree (a clean checkout follows)", none_ is None)
         check("shared/opt-in only, and only with the warm workspace", shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true", "MW_BUILD_SHARED_TREE": "true"})
               and not shared_tree_enabled({"MW_BUILD_SHARED_TREE": "true"}) and not shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}))
+
+        # ── the RUN OVERLAY: a run's tree is the shared generation (read-only lower) + its own upper ──────────────
+        ns_log, execd = [], []
+        def _exec(*a):
+            execd.append(a)
+        ov_env = {"MW_BUILD_RUN_OVERLAY": "true"}
+        enter_run_namespace(["--host"], {}, ns_log.append, which=lambda n: "/usr/bin/unshare", probe=lambda c: 0, execvpe=_exec)
+        check("overlay/not asked for: the runner is not re-executed", execd == [], execd)
+        enter_run_namespace(["--host"], dict(ov_env, MW_BUILD_IN_NS="1"), ns_log.append, which=lambda n: "/usr/bin/unshare",
+                            probe=lambda c: 0, execvpe=_exec)
+        check("overlay/already in its namespace: never re-executed again", execd == [], execd)
+        enter_run_namespace(["--host"], ov_env, ns_log.append, which=lambda n: None, probe=lambda c: 0, execvpe=_exec)
+        check("overlay/no unshare: not re-executed, and said", execd == [] and "no `unshare`" in ns_log[-1], ns_log)
+        enter_run_namespace(["--host"], ov_env, ns_log.append, which=lambda n: "/usr/bin/unshare", probe=lambda c: 1, execvpe=_exec)
+        check("overlay/a host that cannot mount an overlay in a user namespace: not re-executed, and said (runs copy)",
+              execd == [] and "cannot mount an overlay" in ns_log[-1], ns_log)
+        probed = []
+        enter_run_namespace(["--host"], ov_env, ns_log.append, which=lambda n: "/usr/bin/unshare",
+                            probe=lambda c: (probed.append(c), 0)[1], execvpe=_exec)
+        check("overlay/the probe is a REAL overlay mount inside `unshare -Urm` (a write through it, the lower untouched)",
+              probed and probed[0][:4] == ["/usr/bin/unshare", "-Urm", "--propagation", "private"]
+              and "mount -t overlay" in probed[0][-1] and "umount" in probed[0][-1], probed)
+        check("overlay/a capable host re-executes this runner under unshare -Urm with the outer ids and the marker",
+              len(execd) == 1 and execd[0][1][:4] == ["/usr/bin/unshare", "-Urm", "--propagation", "private"]
+              and execd[0][1][-1] == "--host" and execd[0][2].get("MW_BUILD_IN_NS") == "1"
+              and execd[0][2].get("MW_BUILD_OUTER_UID") == str(os.getuid()), execd)
+        check("overlay/enabled only with the marker AND the shared tree",
+              run_overlay_enabled({"MW_BUILD_RUN_OVERLAY": "true", "MW_BUILD_IN_NS": "1", "MW_BUILD_WARM_WORKSPACE": "true", "MW_BUILD_SHARED_TREE": "true"})
+              and not run_overlay_enabled({"MW_BUILD_RUN_OVERLAY": "true", "MW_BUILD_WARM_WORKSPACE": "true", "MW_BUILD_SHARED_TREE": "true"})
+              and not run_overlay_enabled({"MW_BUILD_RUN_OVERLAY": "true", "MW_BUILD_IN_NS": "1", "MW_BUILD_WARM_WORKSPACE": "true"}))
+        ids_av = Sandbox("bwrap", [], ("1654", "1654")).argv("true", "/w/s", "/w/o", {})
+        plain_av = Sandbox("bwrap", []).argv("true", "/w/s", "/w/o", {})
+        check("overlay/in the runner's namespace a stage keeps the pod's uid/gid (--uid/--gid right after --unshare-user)",
+              ids_av[ids_av.index("--unshare-user") + 1:ids_av.index("--unshare-user") + 5] == ["--uid", "1654", "--gid", "1654"], ids_av)
+        check("overlay/outside it the sandbox argv is unchanged (negative control)", "--uid" not in plain_av, plain_av)
+        check("overlay/outer ids only inside the namespace", outer_ids({"MW_BUILD_IN_NS": "1", "MW_BUILD_OUTER_UID": "1654", "MW_BUILD_OUTER_GID": "1654"})
+              == ("1654", "1654") and outer_ids({"MW_BUILD_OUTER_UID": "1654", "MW_BUILD_OUTER_GID": "1654"}) is None)
+        # the mount itself, its refusal, and the release — with a recording runner
+        calls = []
+        def _sh_ok(cmd):
+            calls.append(cmd)
+            return 0, ""
+        low = st_.warm_of(last_good)
+        ovl_dest = os.path.join(tmp, "ovl-run", "src")
+        os.makedirs(os.path.dirname(ovl_dest), exist_ok=True)
+        _overlay_tree(low, ovl_dest, _sh_ok)
+        check("overlay/the run's tree is mounted with the generation as the read-only lower and the run's own upper",
+              calls and calls[0][:4] == ["mount", "-t", "overlay", "overlay"]
+              and calls[0][5] == f"lowerdir={low},upperdir={ovl_dest}.upper,workdir={ovl_dest}.ovlwork" and calls[0][6] == ovl_dest, calls)
+        refused = None
+        try:
+            _overlay_tree(low, os.path.join(tmp, "ovl-run2", "src"), lambda c: (1, "permission denied"))
+        except Refusal as e:
+            refused = str(e)
+        check("overlay/a refused mount is a Refusal naming why (the caller copies instead)", refused and "permission denied" in refused, refused)
+        for bad in ("/a,b", "/a:b"):
+            try:
+                _overlay_tree(bad, os.path.join(tmp, "ovl-run3", "src"), _sh_ok)
+                bad_ok = False
+            except Refusal:
+                bad_ok = True
+            check(f"overlay/a lower path overlayfs cannot parse ({bad!r}) is refused, never mounted wrong", bad_ok)
+        um = []
+        wk = os.path.join(tmp, "ovl-rel", "src.ovlwork", "work")
+        os.makedirs(wk, exist_ok=True)
+        os.chmod(wk, 0)
+        release_run_tree(os.path.join(tmp, "ovl-rel", "src"), lambda c: (um.append(c), (0, ""))[1], ismount=lambda p: True)
+        check("overlay/release unmounts the run's tree", um == [["umount", os.path.join(tmp, "ovl-rel", "src")]], um)
+        remove_workspace(os.path.join(tmp, "ovl-rel"), release=lambda d: release_run_tree(d, lambda c: (0, ""), ismount=lambda p: False))
+        check("overlay/the kernel's mode-000 work directory is made removable and the workspace is gone",
+              not os.path.exists(os.path.join(tmp, "ovl-rel")))
+        # seeding through an overlay, through a refused overlay (copy), and the plan line naming which
+        if shutil.which("git"):
+            sg = os.path.join(tmp, "ovl-seed-origin")
+            subprocess.run(["git", "init", "-q", sg], check=True)
+            open(os.path.join(sg, "a.txt"), "w").write("a")
+            subprocess.run(["git", "-C", sg, "add", "."], check=True)
+            subprocess.run(["git", "-C", sg, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "c"], check=True)
+            sha_ = subprocess.run(["git", "-C", sg, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+            lower_ = os.path.join(tmp, "ovl-seed-lower", WARM_DIR, "R")
+            os.makedirs(os.path.join(lower_, "obj"), exist_ok=True)
+            open(os.path.join(lower_, "a.txt"), "w").write("a")
+            open(os.path.join(lower_, "obj", "x"), "w").write("built")
+            os.makedirs(os.path.join(warm_private(lower_)), exist_ok=True)
+            with open(os.path.join(warm_private(lower_), "state.json"), "w") as fh:
+                json.dump({"key": "k", "tip": sha_, "built": sha_}, fh)
+            senv = {"MW_BUILD_GIT_BASE": os.path.dirname(sg), "MW_BUILD_CACHE": os.path.join(tmp, "ovl-seed-cache"), "PATH": os.environ.get("PATH", "")}
+            os.makedirs(os.path.join(tmp, "ovl-seed-cache", "git"), exist_ok=True)
+            subprocess.run(["git", "clone", "-q", "--bare", sg, os.path.join(tmp, "ovl-seed-cache", "git", "R.git")], check=True)
+            mounted = []
+            def _fake_mount(lower, dest):         # the overlay's VIEW, emulated: the lower's files under dest
+                mounted.append((lower, dest))
+                shutil.copytree(lower, dest, dirs_exist_ok=True)
+            def _g(*a):
+                r = subprocess.run(["git", *a], capture_output=True, text=True, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+                if r.returncode != 0:
+                    raise Refusal(r.stderr.strip()[:200])
+            d1 = os.path.join(tmp, "ovl-seed-run1", "src")
+            ln = seed_run_from_warm("R", sha_, [], lower_, d1, None, senv, lambda m: None, "k", git=_g, overlay=True, mount=_fake_mount)
+            check("overlay/a run seeded through the overlay names it in its plan line, and mounts the generation",
+                  ln.startswith("workspace: overlay (the run writes only its delta) of main@") and mounted == [(lower_, d1)], (ln, mounted))
+            seen_log = []
+            def _refuse(lower, dest):
+                raise Refusal("the overlay mount was refused (permission denied)")
+            d2 = os.path.join(tmp, "ovl-seed-run2", "src")
+            ln2 = seed_run_from_warm("R", sha_, [], lower_, d2, None, senv, seen_log.append, "k", git=_g, overlay=True, mount=_refuse)
+            check("overlay/a refused overlay falls back to the COPY, said in the log, never to a clean clone",
+                  ln2.startswith("workspace: incremental copy of main@") and any("this run copies the warm tree" in m for m in seen_log)
+                  and open(os.path.join(d2, "obj", "x")).read() == "built", (ln2, seen_log))
+            d3 = os.path.join(tmp, "ovl-seed-run3", "src")
+            ln3 = seed_run_from_warm("R", sha_, [], lower_, d3, None, senv, lambda m: None, "k", git=_g)
+            check("overlay/without it the run copies, exactly as before (negative control)",
+                  ln3.startswith("workspace: incremental copy of main@"), ln3)
+        # the REAL kernel path where this host can show it: an unprivileged overlay in a user+mount namespace
+        # (on a real filesystem: overlayfs takes no upper on overlayfs, and a container's /tmp often IS one — a host runs
+        # its trees on /work and /cache; MW_BUILD_SELFTEST_REAL_DIR points the case there)
+        real_root = os.environ.get("MW_BUILD_SELFTEST_REAL_DIR") or tmp
+        on_overlay = subprocess.run(["findmnt", "-no", "FSTYPE", "-T", real_root], capture_output=True, text=True).stdout.strip() == "overlay" \
+            if shutil.which("findmnt") else False
+        if sys.platform.startswith("linux") and on_overlay:
+            print(f"build-run self-test: overlay/REAL skipped — {real_root} is itself on overlayfs (set MW_BUILD_SELFTEST_REAL_DIR)")
+        elif sys.platform.startswith("linux") and shutil.which("unshare") and subprocess.run(
+                ["unshare", "-Urm", "true"], capture_output=True).returncode == 0:
+            real = tempfile.mkdtemp(prefix="ovl-real-", dir=real_root)
+            os.makedirs(os.path.join(real, "lower", "sub"))
+            open(os.path.join(real, "lower", "sub", "a.txt"), "w").write("shared")
+            open(os.path.join(real, "lower", "b.txt"), "w").write("keep")
+            script = (f"mkdir -p {real}/run/src && "
+                      f"mount -t overlay overlay -o lowerdir={real}/lower,upperdir={real}/run/src.upper,workdir={real}/run/src.ovlwork {real}/run/src && "
+                      f"echo run > {real}/run/src/sub/a.txt && echo new > {real}/run/src/c.txt && rm {real}/run/src/b.txt && umount {real}/run/src")
+            os.makedirs(os.path.join(real, "run", "src.upper"))
+            os.makedirs(os.path.join(real, "run", "src.ovlwork"))
+            rr = subprocess.run(["unshare", "-Urm", "sh", "-c", script], capture_output=True, text=True)
+            check("overlay/REAL: the run's writes land in its upper and the shared lower is untouched",
+                  rr.returncode == 0 and open(os.path.join(real, "lower", "sub", "a.txt")).read() == "shared"
+                  and os.path.exists(os.path.join(real, "lower", "b.txt"))
+                  and open(os.path.join(real, "run", "src.upper", "sub", "a.txt")).read().strip() == "run"
+                  and open(os.path.join(real, "run", "src.upper", "c.txt")).read().strip() == "new", rr.stderr[-300:])
+            remove_workspace(os.path.join(real, "run"), release=lambda d: release_run_tree(d, ismount=lambda p: False))
+            check("overlay/REAL: the workspace (upper, kernel work dir) is removed", not os.path.exists(os.path.join(real, "run")))
+            shutil.rmtree(real, ignore_errors=True)
+
+        # ── GENERATION INTEGRITY: a reader uses a generation only while it is exactly what its publisher hashed ───
+        def _published(name: str) -> "tuple[SharedTree, str]":
+            t_ = SharedTree(os.path.join(tmp, f"integ-{name}"), "R")
+            with t_.writer() as w_i:
+                g_i = w_i.stage()
+                os.makedirs(os.path.join(t_.warm_of(g_i), "src", "obj"), exist_ok=True)
+                for i_ in range(5):
+                    open(os.path.join(t_.warm_of(g_i), "src", f"f{i_}.cs"), "w").write(f"class C{i_} {{}}")
+                open(os.path.join(t_.warm_of(g_i), "src", "obj", "out.dll"), "wb").write(b"\0" * 4096)
+                os.symlink("f0.cs", os.path.join(t_.warm_of(g_i), "src", "link.cs"))
+                w_i.publish(g_i)
+            return t_, g_i
+        t0, g0 = _published("clean")
+        check("integrity/publish writes the generation's manifest beside it (never inside it)",
+              os.path.isfile(t0.manifest_of(g0)) and not os.path.commonpath([t0.manifest_of(g0), g0]) == g0)
+        with t0.reader() as r0:
+            check("integrity/an untampered generation is handed to a reader (negative control)", r0 == t0.warm_of(g0) and t0.last_refusal is None,
+                  t0.last_refusal)
+        check("integrity/verify reads every file's stat and a full sample's content (here: all)",
+              verify_generation(g0, t0.manifest_of(g0), sample=1000) is None)
+        tampers = {
+            "content": lambda t_, g_: open(os.path.join(t_.warm_of(g_), "src", "f1.cs"), "w").write("class Evil {}"),
+            "content-mtime-restored": lambda t_, g_: (lambda pth, st0: (open(pth, "w").write("class C2 {X}"),
+                                                                         os.utime(pth, ns=(st0.st_atime_ns, st0.st_mtime_ns))))(
+                os.path.join(t_.warm_of(g_), "src", "f2.cs"), os.stat(os.path.join(t_.warm_of(g_), "src", "f2.cs"))),
+            "added": lambda t_, g_: open(os.path.join(t_.warm_of(g_), "src", "obj", "planted.dll"), "wb").write(b"x"),
+            "removed": lambda t_, g_: os.remove(os.path.join(t_.warm_of(g_), "src", "f3.cs")),
+            "relinked": lambda t_, g_: (os.remove(os.path.join(t_.warm_of(g_), "src", "link.cs")),
+                                        os.symlink("/etc/passwd", os.path.join(t_.warm_of(g_), "src", "link.cs"))),
+            "mode": lambda t_, g_: os.chmod(os.path.join(t_.warm_of(g_), "src", "f4.cs"), 0o777),
+            "manifest-forged": lambda t_, g_: (lambda m_: (m_["entries"].pop(), open(t_.manifest_of(g_), "w").write(json.dumps(m_))))(
+                json.load(open(t_.manifest_of(g_)))),
+            "manifest-removed": lambda t_, g_: os.remove(t_.manifest_of(g_)),
+        }
+        expect = {"content": "changed", "content-mtime-restored": "changed", "added": "added", "removed": "removed",
+                  "relinked": "changed", "mode": "changed", "manifest-forged": "digest", "manifest-removed": "no integrity manifest"}
+        for name_, tamper in tampers.items():
+            t_, g_ = _published(name_)
+            time.sleep(0.05)                                  # a later write gets a later ctime even at coarse granularity
+            tamper(t_, g_)
+            with t_.reader() as r_:
+                check(f"integrity/a generation {name_} after publish is refused, never handed to a run ({expect[name_]})",
+                      r_ is None and t_.last_refusal and expect[name_] in t_.last_refusal, t_.last_refusal)
+        # the content sample catches what stat cannot: a manifest whose recorded hash no longer matches the bytes
+        t5, g5 = _published("sample")
+        m5 = json.load(open(t5.manifest_of(g5)))
+        for e_ in m5["entries"]:
+            if e_[0].endswith("f0.cs"):
+                e_[6] = "0" * 64
+        m5["digest"] = hashlib.sha256(json.dumps(m5["entries"], separators=(",", ":")).encode()).hexdigest()
+        open(t5.manifest_of(g5), "w").write(json.dumps(m5))
+        check("integrity/a content hash that no longer matches is refused when sampled",
+              "no longer hashes" in (verify_generation(g5, t5.manifest_of(g5), sample=1000) or ""))
+        check("integrity/another generation's manifest is refused",
+              "not" in (verify_generation(g5, t0.manifest_of(g0), sample=0) or ""))
+        t0.collect()
+        with t0.writer() as w_c:
+            g_next = w_c.stage()
+            w_c.publish(g_next)
+        check("integrity/a collected generation's manifest goes with it", not os.path.exists(t0.manifest_of(g0))
+              and os.path.isfile(t0.manifest_of(g_next)))
 
         # ── 5b'. the warm workspace (§7.2), against REAL git: a local origin, the real mirror path ───────────
         if shutil.which("git"):

@@ -44,6 +44,9 @@ buildHosts:
   # this node mounts, so every replica starts warm and a roll keeps it (a per-replica tree lived in the pod's work volume
   # and was lost on every roll — measured 2026-11-08).
   sharedTree: true
+  # The run overlay (Hosting/BuildQueue.md §7.3b): each run mounts the shared generation read-only and writes only its
+  # delta — no 18 GiB copy per run, and no run can write the shared tree (measured 2026-11-08: 32 s → 3 s, 18 GiB → 20 KiB).
+  runOverlay: true
   cacheClaimName: "build-cache-mac"
   # The Mac's only class is node-local; the replicas share it on the one node (ReadWriteOnce is per node).
   cache: {create: true, storageClass: "local-path", size: "20Gi", accessMode: "ReadWriteOnce"}
