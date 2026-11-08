@@ -93,29 +93,43 @@ def state_dir(name):
 
 
 def write_json_atomic(path, data, mode=0o644):
-    """tmp + rename. The bridge directory is writable by the first instance's pod, so nothing it could plant is
-    followed: the directory must not be a symlink, and the temp file — an unpredictable name — is created with
-    O_EXCL|O_NOFOLLOW (a planted file or symlink fails the write instead of redirecting it). The final rename
-    replaces whatever sits at `path` (a symlink included) without following it."""
-    d = os.path.dirname(path)
+    """tmp + rename, both relative to ONE directory handle. The bridge directory is writable by the first
+    instance's pod, so nothing it could plant is followed: the directory is opened once with O_NOFOLLOW (a
+    symlinked directory fails), the temp file — an unpredictable name — is created through that handle with
+    O_EXCL|O_NOFOLLOW, and the rename happens through the same handle, so swapping the directory for a symlink
+    after the check redirects nothing. The rename replaces whatever sits at `path` without following it.
+    The handle is made the working directory for the two calls (fchdir) rather than passed as dir_fd: macOS's
+    /usr/bin/python3 (3.9) has no dir_fd for rename. The executor is single-threaded, so nothing else races
+    the working directory, and it is restored before returning."""
+    d = os.path.dirname(path) or "."
     os.makedirs(d, exist_ok=True)
-    if os.path.islink(d):
-        raise Failed("%s is a symbolic link — refusing to write through it" % d)
-    tmp = os.path.join(d, ".%s.tmp-%s" % (os.path.basename(path), secrets.token_hex(8)))
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.write("\n")
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    except BaseException:
+        dfd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as e:
+        raise Failed("%s cannot be opened as a directory without following a link (%s) — refusing to write" % (d, e))
+    name = os.path.basename(path)
+    tmp = ".%s.tmp-%s" % (name, secrets.token_hex(8))
+    here = os.open(".", os.O_RDONLY)
+    try:
+        os.fchdir(dfd)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
         try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
-
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+                f.flush()
+                os.fchmod(f.fileno(), mode)
+            os.replace(tmp, name)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.fchdir(here)
+        os.close(here)
+        os.close(dfd)
 
 def read_json(path):
     with open(path, encoding="utf-8") as f:
