@@ -76,6 +76,10 @@ jobs:
         run: bash -n deploy/homebrew/bin/memex-local
       - name: shellcheck (memex-local)
         run: shellcheck -S warning deploy/homebrew/bin/memex-local deploy/homebrew/test/run-tests.sh
+      # The instances executor (share/instances.py) runs under macOS's /usr/bin/python3 — 3.9 on current macOS —
+      # so it must parse at that grammar, not only at this runner's newer one.
+      - name: instances.py parses (Python 3.9 grammar)
+        run: python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read(), feature_version=(3, 9))" deploy/homebrew/share/instances.py
       # This runner is bash 5 and has no colima/kubectl/helm, so what it CAN prove is asserted by
       # running the CLI against stub tools and by static assertions for the two traps a Linux runner
       # can never reach by execution — the heredoc backtick and macOS bash 3.2's empty-array abort.
