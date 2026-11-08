@@ -2629,7 +2629,7 @@ printf '  0 9:00.00 kernel_task\n  10 0:40.00 /Applications/Safari\n  11 0:15.00
 [ -z "$(oc 1200)" ] && ok "a gap longer than three intervals reports nothing (a stale window is not a reading)" || bad "stale gap" "$(oc 1200)"
 [ -z "$(OC_GOV="$OC/missing.sh" oc 1230)" ] && ok "no governor library to measure with → the field is absent" || bad "no governor" ""
 # the splice: only into a JSON object — a degraded host reading stays valid JSON
-osp() { env HOSTJSON="$1" MEMEX_BACKLEASE_DIR="$OC/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "%s" "$HOSTJSON"; }; owner_cpu() { printf 150; }
+osp() { env HOSTJSON="$1" MEMEX_BACKLEASE_DIR="$OC/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "%s" "$HOSTJSON"; }; owner_cpu() { printf 150; }; host_cpu() { :; }; net_rate() { :; }
   sample_models() { printf "[]"; }; sample_vm() { printf null; }; colima() { return 1; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }
   OUT="$1"; write_sample; cat "$OUT"' "$SAMPLER" "$OC/out.json"; }
 osp '{"cores":2}' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"]=={"cores":2,"ownerCpuPercent":150}' 2>/dev/null \
@@ -2646,6 +2646,32 @@ OUT="$(MEMEX_BACKLEASE_SAMPLER_LIB=1 MEMEX_BACKLEASE_DIR="$OC/dir" bash "$SAMPLE
 [ "$RC" = 2 ] && case "$OUT" in *"for sourcing only"*) true ;; *) false ;; esac \
   && ok "library mode fails CLOSED: executed with the variable set, the sampler stops loudly instead of sampling" || bad "lib guard fails open" "rc=$RC $OUT"
 rm -rf "$OC"
+
+echo "── back-lease sampler: host.cpuPercent and the network rate (Hosting/FleetMetricHistory) ──"
+NR="$(mktemp -d)"; mkdir -p "$NR/dir"
+SAMPLER="$HERE/../share/backlease-sampler.sh"
+printf 'Processes: 1 total\nCPU usage: 10.00%% user, 5.00%% sys, 85.00%% idle \nProcesses: 1 total\nCPU usage: 30.50%% user, 7.25%% sys, 62.25%% idle \n' > "$NR/top.out"
+hc() { env MEMEX_BACKLEASE_DIR="$NR/dir" MEMEX_SAMPLER_TOP="cat $1" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; host_cpu' "$SAMPLER"; }
+[ "$(hc "$NR/top.out")" = 37.8 ] && ok "cpuPercent = 100 − idle of the SECOND top sample (a delta, never the boot average)" || bad "cpuPercent" "$(hc "$NR/top.out")"
+printf 'garbage\n' > "$NR/top.bad"
+[ -z "$(hc "$NR/top.bad")" ] && ok "an unparseable top reports no cpuPercent (absent, never 0)" || bad "cpu garbage" "$(hc "$NR/top.bad")"
+ns() { # $1 = now, $2 = en0 Ibytes, $3 = en0 Obytes
+  printf 'Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll\nlo0   16384 <Link#1>                       9     0      99999        9     0      99999     0\nen0   1500  <Link#11>   aa:bb:cc:dd:ee:ff  100   0  %s  100   0  %s  0\nen0   1500  192.168.1     192.168.1.10   100   0  555  100   0  555  -\nen1   1500  <Link#12>   aa:bb:cc:dd:ee:00  1     0  1000  1   0  2000  0\nutun0 1380  <Link#20>                      5     0      77777        5     0      77777     0\n' "$2" "$3" > "$NR/netstat.out"
+  env MEMEX_BACKLEASE_DIR="$NR/dir" MEMEX_BACKLEASE_INTERVAL=30 MEMEX_SAMPLER_NOW="$1" MEMEX_SAMPLER_NETSTAT="cat $NR/netstat.out" MEMEX_BACKLEASE_SAMPLER_LIB=1 \
+    bash -c '. "$0"; net_rate' "$SAMPLER"; }
+[ -z "$(ns 1000 1000000 500000 2>&1)" ] && ok "the first network sample reports nothing (no window yet), and says nothing on stderr" || bad "net first" "$(ns 1000 1000000 500000 2>&1)"
+[ "$(ns 1030 4000000 1100000)" = "100000 20000" ] && ok "netIn/Out = the en* link-level byte delta over the interval (loopback, utun and address rows excluded)" || bad "net rate" "$(ns 1030 4000000 1100000)"
+[ -z "$(ns 1200 5000000 1200000)" ] && ok "a gap longer than three intervals reports nothing" || bad "net gap" "$(ns 1200 5000000 1200000)"
+[ -z "$(ns 1230 100 100)" ] && ok "a counter that went backwards (reboot, reset) reports nothing, never a negative rate" || bad "net reset" "$(ns 1230 100 100)"
+[ "$(ns 1260 3100 2100)" = "100 67" ] && ok "after a reset the next window measures again" || bad "net after reset" "$(ns 1260 3100 2100)"
+ws() { env HOSTJSON="$1" MEMEX_BACKLEASE_DIR="$NR/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "%s" "$HOSTJSON"; }; owner_cpu() { :; }; host_cpu() { printf 12.5; }; net_rate() { printf "100 200"; }
+  sample_models() { printf "[]"; }; sample_vm() { printf null; }; colima() { return 1; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }
+  OUT="$1"; write_sample; cat "$OUT"' "$SAMPLER" "$NR/out.json"; }
+ws '{"cores":2}' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"]=={"cores":2,"cpuPercent":12.5,"netInBytesPerSec":100,"netOutBytesPerSec":200}' 2>/dev/null \
+  && ok "cpuPercent and the network rate are spliced into the host object" || bad "net/cpu splice" "$(ws '{"cores":2}')"
+ws 'null' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"] is None' 2>/dev/null \
+  && ok "a degraded host reading stays valid JSON with the new fields too" || bad "net/cpu splice into null" "$(ws null)"
+rm -rf "$NR"
 
 echo "── token slots: the machine's capacity; the owner's ceiling is optional (Hosting/BackLease §14.5) ──"
 TS="$(mktemp -d)"; mkdir -p "$TS/home"
