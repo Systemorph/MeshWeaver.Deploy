@@ -779,10 +779,12 @@ cmp -s "$OVL" "$LMH/before" && [ ! -f "$OVL.bak-llm" ] && ok "an owner's own end
 cat > "$LMH/stubs/curl" <<'STUB'
 #!/bin/bash
 case "$*" in
-  *api/show*qwen3.8*)       echo '{"model_info":{"general.architecture":"qwen3_5","qwen3_5.context_length":262144}}' ;;
-  *api/show*qwen3.6-code*)  echo '{"model_info":{"qwen3_5.context_length":131072}}' ;;
-  *api/show*llama3.3*)      echo '{"model_info":{"llama.context_length":131072}}' ;;
-  *api/show*)               exit 22 ;;
+  *api/generate*qwen3.8*|*api/generate*qwen3.6-code*|*api/generate*llama3.3*) echo '{"done":true}' ;;
+  *api/generate*)           exit 22 ;;
+  # /api/ps: the context each LOADED model is served with — deliberately not the trained window
+  # (qwen3.8 is trained for 262144; this fake server serves it at 65536, as a smaller Mac would).
+  # The real /api/ps shape: each model's nested `details` object sits BETWEEN its name and its context.
+  *api/ps*) echo '{"models":[{"name":"qwen3.8:27b-mlx","size":1,"details":{"format":"safetensors","family":""},"context_length":65536,"runner":"mlx"},{"name":"qwen3.6-code:latest","details":{"family":"qwen"},"context_length":131072},{"name":"llama3.3:70b","details":{},"context_length":32768}]}' ;;
   *api/tags*)               echo "{\"models\":[${FAKE_TAGS:-}]}" ;;
   *) exit 0 ;;
 esac
@@ -797,16 +799,21 @@ lm env MEMEX_OLLAMA_MODEL= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=arm64 FAKE_TAG
   bash -c 'set -euo pipefail; . "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
 if grep -qx '    OpenAICompatible__Models__0: "qwen3.8:27b-mlx"' "$AUTO" \
    && grep -qx '    AI__Tiers__chat: "Provider/OpenAICompatible/qwen3.8:27b-mlx"' "$AUTO" \
-   && grep -qx '    OpenAICompatible__ContextWindowTokens__0__Tokens: "262144"' "$AUTO" \
+   && grep -qx '    OpenAICompatible__ContextWindowTokens__0__Tokens: "65536"' "$AUTO" \
    && grep -qx '    OpenAICompatible__Models__1: "qwen3.6-code"' "$AUTO" \
    && grep -qx '    OpenAICompatible__ContextWindowTokens__1__Tokens: "131072"' "$AUTO" \
    && grep -qx '    host: "192.168.5.9"' "$AUTO"; then
-  ok "llm.auto.yaml: qwen3.8 as Models__0 + default chat tier, Ollama's window (262144) declared, the old alias kept as Models__1, the VM's own gateway"
+  ok "llm.auto.yaml: qwen3.8 as Models__0 + default chat tier, the window Ollama SERVES it with (65536, not the trained 262144), the old alias kept as Models__1, the VM's own gateway"
 else bad "auto layer (default)" "$(cat "$AUTO")"; fi
 printf 'config:\n  memex_portal:\n    OpenAICompatible__Models__0: "llama3.3:70b"\n' > "$OVL"
 lm env MEMEX_OLLAMA_MODEL= FAKE_TAGS='{"name":"llama3.3:70b"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
-grep -qx '    AI__Tiers__chat: "Provider/OpenAICompatible/llama3.3:70b"' "$AUTO" && grep -qx '    OpenAICompatible__ContextWindowTokens__0__Tokens: "131072"' "$AUTO" \
+grep -qx '    AI__Tiers__chat: "Provider/OpenAICompatible/llama3.3:70b"' "$AUTO" && grep -qx '    OpenAICompatible__ContextWindowTokens__0__Tokens: "32768"' "$AUTO" \
   && ok "an owner's explicit model is the one the chat tier names and the window is declared for (never clobbered by qwen3.8)" || bad "auto layer (owner model)" "$(cat "$AUTO")"
+: > "$OVL"
+printf 'config:\n  memex_portal:\n    OpenAICompatible__Models__0: "missing:1b"\n' > "$OVL"
+lm env MEMEX_OLLAMA_MODEL= bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+grep -q 'ContextWindowTokens' "$AUTO" && bad "a model Ollama cannot load still got a window declared (a guess)" "$(cat "$AUTO")" \
+  || ok "a model Ollama cannot load gets NO window (undeclared and logged, never guessed)"
 : > "$OVL"
 lm env MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
 grep -q 'Models__0\|AI__Tiers' "$AUTO" && bad "MEMEX_OLLAMA_MODEL=none still names a model" "$(cat "$AUTO")" || ok "MEMEX_OLLAMA_MODEL=none names no model"
