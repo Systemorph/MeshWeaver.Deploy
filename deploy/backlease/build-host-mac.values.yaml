@@ -36,6 +36,10 @@ buildHosts:
   # The warm workspace (Hosting/BuildQueue.md §7.2): the Mac measures it first, before any cluster host turns it on. Each
   # replica's warm copy lives under its work volume (the 40 GiB above), beside the run's disposable copy.
   warmWorkspace: true
+  # The module-hub broker (Hosting/BuildQueue.md §7.4): the host asks control's per-module build hubs for each module a
+  # `modules` stage names — a Hit is fetched and verified instead of built, a Grant is built once and handed back by its
+  # hash. The Mac measures it first, with the warm workspace; inert until a repository's default branch declares `moduleHub`.
+  moduleHub: true
   cacheClaimName: "build-cache-mac"
   # The Mac's only class is node-local; the replicas share it on the one node (ReadWriteOnce is per node).
   cache: {create: true, storageClass: "local-path", size: "20Gi", accessMode: "ReadWriteOnce"}
