@@ -694,6 +694,8 @@ prof() { OUT="$(env "$@" MEMEX_LOCAL_HOME="$RHOME" "$CLI" profile 2>&1)"; RC=$?;
 prof MEMEX_PROFILE=mac-studio
 case "$RC:$OUT" in 0:*"12 CPU / 32 GiB"*"qwen3.8:27b-mlx"*) ok "mac-studio sizes a 12/32 VM with qwen3.8:27b-mlx" ;;
   *) bad "mac-studio sizes a 12/32 VM with qwen3.8:27b-mlx" "exited $RC: $OUT" ;; esac
+case "$OUT" in *"extra:     <none>"*) ok "a mac-studio pulls no extra model: its chat model is qwen3.8 itself" ;;
+  *) bad "mac-studio extra model" "$OUT" ;; esac
 prof MEMEX_PROFILE=mac-mini
 case "$RC:$OUT" in 0:*"6 CPU / 12 GiB"*"qwen3:8b"*) ok "mac-mini sizes a 6/12 VM with qwen3:8b" ;;
   *) bad "mac-mini sizes a 6/12 VM with qwen3:8b" "exited $RC: $OUT" ;; esac
@@ -1153,6 +1155,64 @@ OUT="$(mp_env "$CLI" backlease enroll --control https://other.example.test --dep
 case "$RC:$OUT" in 0:*"reports to https://other.example.test as 'flag-wins'"*) ok "an explicit flag wins over the managed preference" ;; *) bad "flag wins over preference" "rc=$RC: $OUT" ;; esac
 OUT="$(env PATH="$STUBS:$PATH" HOME="$MP/home" MEMEX_LOCAL_HOME="$MP/home/.memex-local" "$CLI" backlease enroll 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "no flag and no preference → refused" "exited 0" ;; *"--control must be the control instance's https URL"*"managed preference com.memex.local ControlUrl"*) ok "no flag and no preference → refused, naming the flag AND the preference key" ;; *) bad "refusal names flag + preference" "$OUT" ;; esac
+
+echo "── the owner's opt-in: jobs and tokens are OFF until the owner says from whom (Hosting/BackLease §13) ──"
+BLF="$MP/home/.memex-local/backlease.yaml"
+has() { grep -qF "$1" "$BLF" 2>/dev/null; }
+# a headless enrolment with no answer: both switches declared OFF, no source written
+mp_env "$CLI" backlease enroll --control https://control.example.test --deployment mac-a </dev/null >/dev/null 2>&1
+has 'Hosting__BackLease__Accept__Jobs__Enabled: "false"' && has 'Hosting__BackLease__Accept__Tokens__Enabled: "false"' && ! has 'Accept__Jobs__From__0' && ! has 'Accept__Tokens__From__0' \
+  && ok "headless enrolment with no answer declares both switches OFF — the offered defaults are never applied" || bad "no answer = off" "$(cat "$BLF")"
+# the flags opt in, with exactly the sources named
+OUT="$(mp_env "$CLI" backlease enroll --control https://control.example.test --deployment mac-a --accept-jobs=control.systemorph.com --job-channels mac --job-repos Systemorph/MeshWeaver.Plugins \
+  --accept-tokens='*.meshweaver.cloud' --token-models qwen3.8:27b-mlx --token-max-concurrency 1 --residency CH </dev/null 2>&1)"; RC=$?
+[ "$RC" = 0 ] && has 'Hosting__BackLease__Accept__Jobs__Enabled: "true"' && has 'Hosting__BackLease__Accept__Jobs__From__0: "control.systemorph.com"' \
+  && has 'Hosting__BackLease__Accept__Jobs__Channels__0: "mac"' && has 'Hosting__BackLease__Accept__Jobs__Repos__0: "Systemorph/MeshWeaver.Plugins"' \
+  && has 'Hosting__BackLease__Accept__Tokens__Enabled: "true"' && has 'Hosting__BackLease__Accept__Tokens__From__0: "*.meshweaver.cloud"' \
+  && has 'Hosting__BackLease__Accept__Tokens__Models__0: "qwen3.8:27b-mlx"' && has 'Hosting__BackLease__Accept__Tokens__MaxConcurrency: "1"' && has 'Hosting__BackLease__Accept__Tokens__Residency: "CH"' \
+  && ok "the opt-in flags write every Accept key, sources and models as given" || bad "opt-in flags" "rc=$RC $OUT $(cat "$BLF")"
+case "$OUT" in *"accepts JOBS from: control.systemorph.com"*"accepts TOKEN requests from: *.meshweaver.cloud"*) ok "enrolment prints what the Mac accepts and from whom" ;; *) bad "enroll prints the opt-in" "$OUT" ;; esac
+# re-running without answers keeps them (idempotent: the current answers are the defaults)
+mp_env "$CLI" backlease enroll --control https://control.example.test --deployment mac-a </dev/null >/dev/null 2>&1
+has 'Hosting__BackLease__Accept__Tokens__From__0: "*.meshweaver.cloud"' && has 'Hosting__BackLease__Accept__Jobs__Enabled: "true"' \
+  && ok "re-enrolling with no answer keeps the owner's answers" || bad "re-enroll keeps answers" "$(cat "$BLF")"
+# withdrawing one class touches nothing else
+mp_env "$CLI" backlease enroll --control https://control.example.test --deployment mac-a --host-load-max 85 </dev/null >/dev/null 2>&1
+OUT="$(mp_env "$CLI" backlease accept tokens --off </dev/null 2>&1)"; RC=$?
+[ "$RC" = 0 ] && has 'Hosting__BackLease__Accept__Tokens__Enabled: "false"' && has 'Hosting__BackLease__Accept__Jobs__Enabled: "true"' \
+  && has 'Hosting__BackLease__HostLoadMax: "85%"' && has 'Hosting__ReportTo: "https://control.example.test"' && has 'Hosting__Deployment: "mac-a"' \
+  && ok "accept tokens --off withdraws tokens only; jobs, the ceilings and the enrolment stand" || bad "accept --off" "rc=$RC $OUT $(cat "$BLF")"
+mp_env "$CLI" backlease accept tokens --from '*.meshweaver.cloud' --models qwen3.8:27b-mlx --residency CH </dev/null >/dev/null 2>&1
+has 'Hosting__BackLease__Accept__Tokens__Enabled: "true"' && ok "accept tokens --from … switches tokens back on" || bad "accept tokens on" "$(cat "$BLF")"
+# refusals: a bad pattern, tokens without models, a headless accept with nothing to say
+OUT="$(mp_env "$CLI" backlease accept jobs --from 'not a host!' </dev/null 2>&1)" && bad "a bad pattern accepted" "$OUT" \
+  || case "$OUT" in *"is not an instance pattern"*) ok "a malformed instance pattern is refused, never widened" ;; *) bad "bad pattern message" "$OUT" ;; esac
+OUT="$(mp_env "$CLI" backlease accept jobs --from meshweaver </dev/null 2>&1)" && bad "a single-label pattern accepted" "$OUT" || ok "a bare single-label name is not a pattern"
+OUT2="$(mp_env "$CLI" backlease accept tokens --from '*' --models= </dev/null 2>&1)" && bad "tokens without models accepted" "$OUT2" \
+  || case "$OUT2" in *"name the models"*) ok "tokens switched on without models is refused" ;; *) bad "tokens without models message" "$OUT2" ;; esac
+OUT="$(mp_env "$CLI" backlease accept jobs </dev/null 2>&1)" && bad "headless accept with no flags accepted" "$OUT" \
+  || case "$OUT" in *"give --from"*) ok "a headless 'accept jobs' with no flags is refused — nothing is assumed" ;; *) bad "headless accept message" "$OUT" ;; esac
+# --dry-run validates by the same rules and writes nothing (first-attach.sh checks its answers this way first)
+before="$(cat "$BLF")"
+mp_env "$CLI" backlease accept jobs --off --dry-run </dev/null >/dev/null 2>&1 && [ "$(cat "$BLF")" = "$before" ] \
+  && ok "accept --dry-run validates and writes nothing" || bad "dry run wrote" "$(diff <(printf '%s' "$before") "$BLF")"
+mp_env "$CLI" backlease accept tokens --from 'bad pattern!' --dry-run </dev/null >/dev/null 2>&1 && bad "dry run accepted a bad pattern" "" \
+  || ok "accept --dry-run refuses a malformed answer"
+FA="$HERE/../../backlease/first-attach.sh"
+[ "$(grep -n -- '--dry-run >/dev/null' "$FA" | head -1 | cut -d: -f1)" -lt "$(grep -n '^echo "== 0/5 preconditions"' "$FA" | cut -d: -f1)" ] \
+  && ok "first-attach validates both opt-in answers BEFORE it changes any infrastructure" || bad "first-attach validates late" ""
+grep -q "case \"\$acc_jobs\" in '') ;;" "$FA" && grep -q '\[ "${#jobs_args\[@\]}" -eq 0 \] ||' "$FA" \
+  && ok "first-attach leaves an unanswered class at its saved answer (a re-run never resets consent)" || bad "first-attach preserves answers" ""
+grep -q 'saved_list ${P}__Jobs__Channels)" \] || jobs_args+=(--channels mac)' "$FA" \
+  && ok "first-attach narrows jobs to channel mac only when no channel list is saved (a saved list is the owner's)" || bad "first-attach keeps saved channels" ""
+OUT="$(bash "$FA" --token-models 2>&1)"; case "$OUT" in *"--token-models needs model names"*) ok "first-attach names a value flag given last without its value" ;; *) bad "first-attach bare \$2" "$OUT" ;; esac
+OUT="$(bash "$FA" --accept-jobs= 2>&1)"; case "$OUT" in *"--accept-jobs needs instance patterns"*) ok "first-attach reads --accept-jobs=<patterns> as --accept-jobs <patterns> (an empty one is named, not skipped)" ;; *) bad "first-attach equals form" "$OUT" ;; esac
+OUT="$(bash "$FA" --accept-tokens='*.meshweaver.cloud' 2>&1)"; case "$OUT" in *"unknown argument"*) bad "first-attach refuses --accept-tokens=…" "$OUT" ;; *) ok "first-attach takes --accept-tokens=<patterns> (no unknown-argument refusal)" ;; esac
+# a bare `*` is a pattern, never a glob over the working directory's files
+(cd "$HERE" && mp_env "$CLI" backlease accept tokens --from '*' --models qwen3.8:27b-mlx </dev/null >/dev/null 2>&1)
+has 'Hosting__BackLease__Accept__Tokens__From__0: "*"' && ! has 'Accept__Tokens__From__1' && ok "'*' is written as the pattern '*', never expanded to file names" || bad "star pattern globbed" "$(grep Tokens__From "$BLF")"
+OUT="$(mp_env "$CLI" backlease status </dev/null 2>&1)"
+case "$OUT" in *"accepts JOBS from"*) ok "backlease status prints the opt-in" ;; *) bad "status prints opt-in" "$OUT" ;; esac
 rm -rf "$MP"
 
 echo "── fleet join: the enrolment code opens only with this Mac's key (MacStudioFleet §2b) ──"

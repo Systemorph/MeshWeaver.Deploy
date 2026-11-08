@@ -9,6 +9,15 @@
 #     --pull-user <registry token name> \
 #     [--profile build] [--plugins-registry <https URL> --instance-key-secret <vault object of a READ-ONLY mwi_ key>] \
 #     --version <x.y.z> --tester sha256:… --portal sha256:… --runner sha256:…
+#     [--accept-jobs <patterns> | --no-accept-jobs] [--accept-tokens <patterns> | --no-accept-tokens]
+#     [--token-models <m>] [--residency <X>]
+#
+# THE OWNER'S OPT-IN (MeshWeaver.Plugins Hosting/BackLease §13). Before anything is changed it ASKS — in a terminal —
+# whether this Mac accepts fleet jobs and from which instances (offered: control.systemorph.com), and whether it serves
+# token requests and from which instances (offered: *.meshweaver.cloud). An enrolled Mac's SAVED answers are the defaults
+# and a class left unanswered keeps its saved answer; a fresh Mac with no answer stays OFF. A headless run takes the flags.
+# Both answers are validated by the CLI's rules (`backlease accept … --dry-run`) before anything is changed. The answers are written with `memex-local backlease accept` into the Mac's back-lease layer (the
+# heartbeat carries them; control enforces them and can never switch them on). Attaching the runners is not an opt-in.
 #
 # What it does, in order, and nothing else:
 #   0. pins EVERY kubectl and helm call to the build profile's context (`colima-<profile>`, never the mutable current one) —
@@ -33,8 +42,15 @@ set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 chart="$here/../helm"
 profile=build api= registry= vault= worker= pull= pulluser= version= tester= portal= runner= pluginsreg= instkey=
+acc_jobs='' acc_tokens='' acc_models='' acc_res=''   # empty = not answered by a flag; "off" = declined
 while [ $# -gt 0 ]; do
+  # `--flag=value` is the same as `--flag value` (the form memex-local documents for the opt-in flags)
+  case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}";; esac
   case "$1" in
+    --no-accept-jobs) acc_jobs=off; shift; continue;;
+    --no-accept-tokens) acc_tokens=off; shift; continue;;
+    --accept-jobs) acc_jobs="${2:?--accept-jobs needs instance patterns}";; --accept-tokens) acc_tokens="${2:?--accept-tokens needs instance patterns}";;
+    --token-models) acc_models="${2:?--token-models needs model names}";; --residency) acc_res="${2:?--residency needs a residency (e.g. CH, Eu)}";;
     --profile) profile="$2";; --api) api="$2";; --registry) registry="$2";; --vault) vault="$2";;
     --worker-secret) worker="$2";; --pull-secret) pull="$2";; --pull-user) pulluser="$2";;
     --plugins-registry) pluginsreg="$2";; --instance-key-secret) instkey="$2";;
@@ -56,6 +72,48 @@ if [ -n "$pluginsreg$instkey" ]; then
 fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: --version must be x.y.z" >&2; exit 2; }
 for d in "$tester" "$portal" "$runner"; do [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "ERROR: $d is not sha256:<64 hex>" >&2; exit 2; }; done
+
+# ── the owner's opt-in: asked FIRST, VALIDATED before anything changes, applied LAST (Hosting/BackLease §13.3) ──
+# An enrolled Mac's SAVED answers are the defaults, and a class nobody answers keeps its saved answer: re-running this
+# script to move the runners onto a newer set never resets the owner's consent. A fresh Mac with no answer stays OFF.
+ml="$(command -v memex-local || printf '%s' "$here/../homebrew/bin/memex-local")"
+layer="${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/backlease.yaml"
+saved() { awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$layer" 2>/dev/null || true; }
+saved_list() { awk -v p="$1__" 'index($1, p) == 1 { v = $0; sub(/^[^:]*:[ ]*/, "", v); gsub(/"/, "", v); printf "%s%s", (c++ ? " " : ""), v }' "$layer" 2>/dev/null || true; }
+P=Hosting__BackLease__Accept
+ask() { local a; printf '%s [%s] ' "$1" "$2" >&2; IFS= read -r a || a=""; printf '%s' "${a:-$2}"; }
+yn_default() { [ "$1" = true ] && printf 'Y/n' || printf 'y/N'; }
+if [ -t 0 ] && [ "${MEMEX_HEADLESS:-0}" != 1 ]; then
+  if [ -z "$acc_jobs" ]; then
+    case "$(ask "Accept fleet jobs (builds and other queue work) on this Mac?" "$(yn_default "$(saved ${P}__Jobs__Enabled)")")" in
+      [Yy]|[Yy][Ee][Ss]|Y/n) f="$(saved_list ${P}__Jobs__From)"; acc_jobs="$(ask "  From which instances?" "${f:-control.systemorph.com}")" ;;
+      *) acc_jobs=off ;;
+    esac
+  fi
+  if [ -z "$acc_tokens" ]; then
+    case "$(ask "Accept token requests (serve local models to other instances)?" "$(yn_default "$(saved ${P}__Tokens__Enabled)")")" in
+      [Yy]|[Yy][Ee][Ss]|Y/n) f="$(saved_list ${P}__Tokens__From)"; acc_tokens="$(ask "  From which instances?" "${f:-*.meshweaver.cloud}")"
+                         f="$(saved_list ${P}__Tokens__Models)"; acc_models="$(ask "  Which models?" "${acc_models:-${f:-qwen3.8:27b-mlx qwen3.6}}")"
+                         acc_res="$(ask "  Where is this machine (residency, e.g. CH or Eu)?" "${acc_res:-$(saved ${P}__Tokens__Residency)}")" ;;
+      *) acc_tokens=off ;;
+    esac
+  fi
+fi
+# what each answer becomes: '' = unanswered (keep the saved answer; a fresh Mac stays OFF)
+jobs_args=(); tokens_args=()
+# `mac` is the FIRST-attach default for the channel narrowing only: a saved channel list is the owner's and is kept
+# (like the saved repositories, which this script never passes).
+case "$acc_jobs" in '') ;; off) jobs_args=(--off) ;; *) jobs_args=(--from "$acc_jobs"); [ -n "$(saved_list ${P}__Jobs__Channels)" ] || jobs_args+=(--channels mac) ;; esac
+case "$acc_tokens" in '') ;; off) tokens_args=(--off) ;; *) tokens_args=(--from "$acc_tokens" ${acc_models:+--models "$acc_models"} ${acc_res:+--residency "$acc_res"}) ;; esac
+# BOTH answers are checked by the CLI's own rules NOW — before any infrastructure or preference changes
+if [ -x "$ml" ]; then
+  if [ "${#jobs_args[@]}" -gt 0 ]; then MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept jobs "${jobs_args[@]}" --dry-run >/dev/null || { echo "ERROR: the jobs opt-in answer is invalid (above). Nothing was changed." >&2; exit 2; }; fi
+  if [ "${#tokens_args[@]}" -gt 0 ]; then MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept tokens "${tokens_args[@]}" --dry-run >/dev/null || { echo "ERROR: the tokens opt-in answer is invalid (above). Nothing was changed." >&2; exit 2; }; fi
+fi
+if [ ! -x "$ml" ] || [ ! -f "$layer" ]; then
+  echo "WARN: this Mac has no back-lease layer (memex-local backlease enroll) — the opt-in answers are NOT recorded, and control" >&2
+  echo "      treats an unenrolled machine as accepting nothing. Enrol it; enrolment asks both questions." >&2
+fi
 
 # The build host runs in its OWN Colima profile (default `build`), never in the profile memex-local's portal uses: that one
 # runs the docker runtime, which cannot start a pod with hostUsers: false, and bwrap needs that pod's Unmasked /proc.
@@ -178,3 +236,13 @@ echo "== 5/5 fleet jobs at the lowest priority (launchd governor for profile $pr
 # The runners are deployed by now: a governor that cannot load is reported, never a failed attach.
 bash "$here/../homebrew/share/buildhost-priority.sh" --install --profile "$profile" \
   || echo "WARN: the priority governor did not load — the build VM competes at the default band; re-run: bash deploy/homebrew/share/buildhost-priority.sh --install --profile $profile" >&2
+
+echo "== the owner's opt-in (jobs: ${acc_jobs:-unchanged} · tokens: ${acc_tokens:-unchanged})"
+# The answers live in the back-lease layer the portal's heartbeat reads (the runners alone carry no heartbeat). Both were
+# validated before step 0, so neither write below can be refused on its answer.
+if [ -x "$ml" ] && [ -f "$layer" ]; then
+  [ "${#jobs_args[@]}" -eq 0 ] || MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept jobs "${jobs_args[@]}"
+  [ "${#tokens_args[@]}" -eq 0 ] || MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept tokens "${tokens_args[@]}"
+  [ "${#jobs_args[@]}${#tokens_args[@]}" = 00 ] && echo "   no answer given — the saved opt-in stands" \
+    || echo "   written to the back-lease layer — 'memex-local update' applies it (the next heartbeat carries it to control)"
+fi
