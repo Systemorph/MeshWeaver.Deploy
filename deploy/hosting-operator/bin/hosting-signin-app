@@ -76,7 +76,7 @@ verify_app() {
     hosting::say signin_app_verify unknown
     return 0
   fi
-  if printf '%s\n' "$uris" | grep -qxF "$redirect"; then
+  if grep -qxF -- "$redirect" <<< "$uris"; then
     hosting::log "verified  app ${client_id} redirects to ${redirect}"
     hosting::say signin_app_verify true
     return 0

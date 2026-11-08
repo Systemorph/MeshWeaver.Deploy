@@ -87,7 +87,7 @@ missing_keys() {
     fi
     for p in "${pairs[@]}"; do
       [ "${p%%|*}" = "$secret" ] || continue
-      printf '%s\n' "$names" | grep -qxF "${p#*|}" || printf '%s\n' "$p"
+      grep -qxF -- "${p#*|}" <<< "$names" || printf '%s\n' "$p"
     done
   done
 }

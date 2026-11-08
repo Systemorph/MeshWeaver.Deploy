@@ -154,7 +154,7 @@ for tag in sorted((policy.get("tagOwners") or {}).keys()):
     print(tag)
 ')" || hosting::die "could not read tagOwners from the policy in configmap/${config_map} (absent, or not valid HuJSON). Nothing was minted."
 for t in "${tag_list[@]}"; do
-  printf '%s\n' "$owned" | grep -qxF -- "$t" \
+  grep -qxF -- "$t" <<< "$owned" \
     || hosting::die "tag '${t}' is not declared in the tagOwners of the policy headscale runs (configmap/${config_map}: ${owned//$'\n'/, }) — headscale would mint it anyway, so this is refused here. Declare the tag in the policy (the headscale chart's values) and apply it first. Nothing was minted."
 done
 hosting::log "tags      ${tags} — every one declared in tagOwners"
@@ -222,8 +222,8 @@ if ! version_id="$(az keyvault secret set --vault-name "$vault" --name "$object"
   hosting::die "headscale minted key ${key_id} but vault ${vault} refused ${object}: $(tr -d '\n' < "$work/az.err" | cut -c1-300). The key was expired; nothing holds a live key."
 fi
 rm -f "$work/key"
-if [ -z "$version_id" ] \
-   || ! az keyvault secret list-versions --vault-name "$vault" --name "$object" --query "[?id=='${version_id}'].id" -o tsv 2>/dev/null | grep -qxF -- "$version_id"; then
+listed="$(az keyvault secret list-versions --vault-name "$vault" --name "$object" --query "[?id=='${version_id}'].id" -o tsv 2>/dev/null)"
+if [ -z "$version_id" ] || ! grep -qxF -- "$version_id" <<< "$listed"; then
   expire_key
   hosting::die "set ${object} in vault ${vault}, but the vault does not list the version it returned — refusing to report a key the server will not find. The key was expired."
 fi

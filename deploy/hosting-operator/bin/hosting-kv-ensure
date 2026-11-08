@@ -314,7 +314,7 @@ if [ -n "$values_half" ]; then
       0) hosting::log "keep    ${half_name} (holds exactly the record's declared keys)"
          kept=$((kept + 1))
          hosting::say kv_values_half kept ;;
-      3) if printf '%s\n' "$half_diff" | grep -q '^missing: '; then
+      3) if grep -q '^missing: ' <<< "$half_diff"; then
            hosting::die "${half_name} in vault ${vault} lacks declared key(s) — $(grep '^missing: ' <<< "$half_diff") — and a value cannot be invented. Put the key in the half, or drop it from the record's vaultValuesKeys. Nothing was written."
          fi
          hosting::log "filter  ${half_name} to the record's declared keys — $(tr '\n' ' ' <<< "$half_diff")(names only; values of kept keys unchanged; the previous version stays as the rollback)"

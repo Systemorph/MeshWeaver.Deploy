@@ -69,7 +69,8 @@ for object in "${objects[@]}"; do
     recover)
       az keyvault secret recover --vault-name "$vault" --name "$object" --output none 2>"$work/az.err" ;;
     purge)
-      if ! az keyvault secret list-deleted --vault-name "$vault" --query "[].name" -o tsv 2>"$work/az.err" | grep -qx "$object"; then
+      deleted="$(az keyvault secret list-deleted --vault-name "$vault" --query "[].name" -o tsv 2>"$work/az.err")"
+      if ! grep -qx -- "$object" <<< "$deleted"; then
         hosting::die "refusing to purge ${object}: it is not soft-deleted in vault ${vault}. Delete it first and read its status — a purge is permanent, and must never be one click away from a live secret. ${done_count} of ${#objects[@]} object(s) were changed before this one."
       fi
       az keyvault secret purge --vault-name "$vault" --name "$object" 2>"$work/az.err" ;;

@@ -15,6 +15,14 @@
 # is proven by the first real provision, and it is why the rollout is staged.
 
 set -uo pipefail
+
+# grep_in <text> <grep args…> — grep over a VALUE, with no pipe. NEVER `printf … | grep -q`: under
+# pipefail a grep -q that matches exits while the writer may still be writing, the writer dies of
+# SIGPIPE (141) and the pipeline reads FALSE — a FAIL for a line that is there, or a PASS for a
+# negated check that should have failed. Intermittent on a loaded runner (MeshWeaver.Plugins
+# hosting-operator lane, run 42454937015, where hosting::kv_exists did it in the script under test).
+# The "no grep -q behind a pipe" guard at the end of this suite holds bin/, the stubs and this file to it.
+grep_in() { local text="$1"; shift; grep "$@" <<< "$text"; }
 BIN="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../bin" && pwd)"
 export PATH="$BIN:$PATH"
 
@@ -280,7 +288,7 @@ case "$_ps_out" in
 esac
 # …and the key never travels on a kubectl COMMAND LINE either (argv is readable by every process
 # in the pod). The stub logs every invocation verbatim; only an apply's STDIN may carry it.
-if grep -v '^  <stdin>' "$_ps_log" | grep -q 'mwi_'; then
+if grep_in "$(grep -v '^  <stdin>' "$_ps_log")" -q 'mwi_'; then
   bad "pull-secret never puts the key on a command line" "$(grep -v '^  <stdin>' "$_ps_log" | grep mwi_)"
 else
   ok "pull-secret never puts the key on a command line"
@@ -299,7 +307,7 @@ fi
 # Deployments/memex-reconcile-20260909-pv-capacity, the first run to reach the line after #3757:
 # `namespaces "memex" is forbidden: … cannot patch resource "namespaces"`. The only apply in the
 # log is the Secret's.
-if grep '^  <stdin>' "$_ps_log" | grep -q 'kind: Namespace'; then
+if grep_in "$(grep '^  <stdin>' "$_ps_log")" -q 'kind: Namespace'; then
   bad "pull-secret never APPLIES a namespace manifest" "$(grep '^  <stdin>' "$_ps_log" | grep 'kind: Namespace')"
 else
   ok "pull-secret never APPLIES a namespace manifest (apply = patch, which the role does not grant)"
@@ -307,7 +315,7 @@ fi
 # Content: the applied Secret is a dockerconfigjson for the registry, with the default username.
 if [ -f "$_ps_dir/applied-secret.yaml" ] \
    && grep -q '^type: kubernetes.io/dockerconfigjson' "$_ps_dir/applied-secret.yaml" \
-   && sed -n 's/^  .dockerconfigjson: //p' "$_ps_dir/applied-secret.yaml" | base64 -d | grep -q '"cr.meshweaver.cloud":{"username":"instance"'; then
+   && grep_in "$(sed -n 's/^  .dockerconfigjson: //p' "$_ps_dir/applied-secret.yaml" | base64 -d)" -q '"cr.meshweaver.cloud":{"username":"instance"'; then
   ok "the applied Secret is a dockerconfigjson for the registry, user 'instance'"
 else
   bad "the applied Secret is a dockerconfigjson for the registry" "applied: $(cat "$_ps_dir/applied-secret.yaml" 2>/dev/null)"
@@ -324,7 +332,7 @@ _ps_dir="$(mktemp -d)"; _ps_log="$_ps_dir/calls.log"; : > "$_ps_log"
 _ps_out="$(env PATH="$PS_STUBS:$PATH" HOSTING_PULL_SECRET_STUB_LOG="$_ps_log" HOSTING_PULL_SECRET_STUB_DIR="$_ps_dir" HOSTING_PULL_SECRET_STUB_NS_EXISTS=1 \
   hosting-pull-secret --namespace acme --registry cr.meshweaver.cloud --vault kv-example --secret acme-PluginCatalog-RegistryToken --name registry-pull 2>&1)"; _ps_rc=$?
 [ "$_ps_rc" -eq 0 ] && ok "pull-secret succeeds when the namespace already exists" || bad "pull-secret succeeds when the namespace already exists" "exited ${_ps_rc}: ${_ps_out}"
-if grep -q '^kubectl get namespace acme' "$_ps_log" && ! grep -q '^kubectl create namespace' "$_ps_log" && ! { grep '^  <stdin>' "$_ps_log" | grep -q 'kind: Namespace'; }; then
+if grep -q '^kubectl get namespace acme' "$_ps_log" && ! grep -q '^kubectl create namespace' "$_ps_log" && ! { grep_in "$(grep '^  <stdin>' "$_ps_log")" -q 'kind: Namespace'; }; then
   ok "an existing namespace is read and left alone — no create, no apply"
 else
   bad "an existing namespace is read and left alone" "$(cat "$_ps_log")"
@@ -439,6 +447,22 @@ rm -rf "$_kve_state"
 kve HOSTING_KVE_EXISTING="acme-Ai-KeyProtection-MasterKey acme-PluginCatalog-RegistryToken" -- --vault kv-example --prefix acme- --namespace acme
 [ "$_kve_rc" -eq 0 ] && ok "without --db-connection nothing about the database is touched" || bad "without --db-connection" "exited ${_kve_rc}: ${_kve_out}"
 case "$_kve_out" in *kv_db_connection*) bad "…and no kv_db_connection fact is reported" "said: ${_kve_out}" ;; *) ok "…and no kv_db_connection fact is reported" ;; esac
+rm -rf "$_kve_state"
+
+# 🚨 An object the vault LISTS is present — however long the listing. hosting::kv_exists used to
+# answer with `printf "$names" | grep -qx NAME` under pipefail: grep exits on its match, the writer
+# dies of SIGPIPE, and the pipeline reads "absent" (MeshWeaver.Plugins hosting-operator lane, run
+# 42454937015: "required Key Vault object(s) are missing: acme-PluginCatalog-RegistryToken" with the
+# object in the listing). Intermittent with a short listing on a loaded runner — CERTAIN with one
+# past the pipe buffer, which is what this case builds (~170 KiB after the two real names), so it
+# fails on every run of the old form. And for the master key "absent" means "mint a new one".
+kve HOSTING_KVE_EXISTING="acme-Ai-KeyProtection-MasterKey acme-PluginCatalog-RegistryToken" HOSTING_KVE_LIST_PAD=4000 \
+  -- --vault kv-example --prefix acme- --namespace acme
+[ "$_kve_rc" -eq 0 ] && ok "a vault listing past the pipe buffer still finds the objects it lists" \
+  || bad "a long listing still finds the objects it lists" "exited ${_kve_rc}: $(printf '%.600s' "$_kve_out")"
+case "$_kve_log" in *"secret set"*) bad "…and the master key it lists is NEVER re-minted" "az saw a write: $(grep_in "$_kve_log" 'secret set')" ;;
+  *) ok "…and the master key it lists is NEVER re-minted" ;; esac
+case "$_kve_out" in *"found   acme-PluginCatalog-RegistryToken"*) ok "…and the issued registry key it lists is found" ;; *) bad "the listed registry key is found" "said: $(printf '%.600s' "$_kve_out")" ;; esac
 rm -rf "$_kve_state"
 
 # The refusals, each naming the hand command that still works.
@@ -606,7 +630,7 @@ rm -rf "$_kve_state"
 printf '{"secrets":{"memex_portal":{"ConnectionStrings__memex":"x","memex_postgres_password":"y","Apple__PrivateKey":"z"}}}\n' > "$_kvh_fix"
 kve HOSTING_KVE_EXISTING="acme-Ai-KeyProtection-MasterKey acme-PluginCatalog-RegistryToken acme-db-connection helm-values-acme" HOSTING_KVE_HALF_FIXTURE="$_kvh_fix" \
   -- --vault kv-example --prefix acme- --namespace acme "${KVE_HALF[@]}" "${KVE_KEYS[@]}"
-if [ "$_kve_rc" -eq 0 ] && [ ! -f "$_kve_state/set.helm-values-acme" ] && printf '%s' "$_kve_out" | grep -q '::hosting:: kv_values_half=kept'; then
+if [ "$_kve_rc" -eq 0 ] && [ ! -f "$_kve_state/set.helm-values-acme" ] && grep_in "$_kve_out" -q '::hosting:: kv_values_half=kept'; then
   ok "a half holding exactly the declared keys is kept and nothing is written"
 else
   bad "an exact half is kept" "rc=${_kve_rc} out: ${_kve_out}"
@@ -616,7 +640,7 @@ rm -rf "$_kve_state"
 printf '{"secrets":{"memex_portal":{"ConnectionStrings__memex":"x","memex_postgres_password":"y"}}}\n' > "$_kvh_fix"
 kve HOSTING_KVE_EXISTING="acme-Ai-KeyProtection-MasterKey acme-PluginCatalog-RegistryToken acme-db-connection helm-values-acme" HOSTING_KVE_HALF_FIXTURE="$_kvh_fix" \
   -- --vault kv-example --prefix acme- --namespace acme "${KVE_HALF[@]}" "${KVE_KEYS[@]}"
-if [ "$_kve_rc" -ne 0 ] && [ ! -f "$_kve_state/set.helm-values-acme" ] && printf '%s' "$_kve_out" | grep -q 'missing: Apple__PrivateKey'; then
+if [ "$_kve_rc" -ne 0 ] && [ ! -f "$_kve_state/set.helm-values-acme" ] && grep_in "$_kve_out" -q 'missing: Apple__PrivateKey'; then
   ok "a half lacking a declared key is refused, naming it, and nothing is written"
 else
   bad "a half lacking a declared key is refused" "rc=${_kve_rc} out: ${_kve_out}"
@@ -625,7 +649,7 @@ rm -rf "$_kve_state"
 # Composing: a record declaring keys this step cannot compose is refused BEFORE anything is written.
 kve HOSTING_KVE_EXISTING="acme-Ai-KeyProtection-MasterKey acme-PluginCatalog-RegistryToken" HOSTING_KVE_PASSWORD_OBJECT=memex-postgres-password \
   -- --vault kv-example --prefix acme- --namespace acme "${KVE_DB[@]}" "${KVE_HALF[@]}" "${KVE_KEYS[@]}"
-if [ "$_kve_rc" -ne 0 ] && [ ! -f "$_kve_state/set.helm-values-acme" ] && printf '%s' "$_kve_out" | grep -q 'Apple__PrivateKey'; then
+if [ "$_kve_rc" -ne 0 ] && [ ! -f "$_kve_state/set.helm-values-acme" ] && grep_in "$_kve_out" -q 'Apple__PrivateKey'; then
   ok "composing for a record that declares an un-composable key refuses before writing, naming it"
 else
   bad "un-composable declared key refuses" "rc=${_kve_rc} out: ${_kve_out}"
@@ -715,7 +739,7 @@ rm -rf "$_kvv_state"
 
 # 🚨 NEGATIVE CONTROL: an UNDECLARED key is refused and nothing is read or written.
 kvv HOSTING_SECRETS="$(kvv_secrets '{"values-half:Stripe__ApiKey":"S-NEVER-PRINTED"}')" -- "${KVV_DECL[@]}" --key Stripe__ApiKey
-if [ "$_kvv_rc" -ne 0 ] && [ ! -f "$_kvv_state/sets" ] && printf '%s' "$_kvv_out" | grep -q 'not declared in the record'; then
+if [ "$_kvv_rc" -ne 0 ] && [ ! -f "$_kvv_state/sets" ] && grep_in "$_kvv_out" -q 'not declared in the record'; then
   ok "an undeclared key is refused, naming it, and nothing is written"
 else
   bad "an undeclared key is refused" "rc=${_kvv_rc} out: ${_kvv_out}"
@@ -725,7 +749,7 @@ rm -rf "$_kvv_state"
 
 # A key with no value handed over: refused, nothing written (the other-key value does not count).
 kvv HOSTING_SECRETS="$(kvv_secrets '{"values-half:MEMEX_PASSWORD":"P-NEVER-PRINTED"}')" -- "${KVV_DECL[@]}" --key ConnectionStrings__memex --key MEMEX_PASSWORD
-[ "$_kvv_rc" -ne 0 ] && [ ! -f "$_kvv_state/sets" ] && printf '%s' "$_kvv_out" | grep -q 'no value was handed over for ConnectionStrings__memex' \
+[ "$_kvv_rc" -ne 0 ] && [ ! -f "$_kvv_state/sets" ] && grep_in "$_kvv_out" -q 'no value was handed over for ConnectionStrings__memex' \
   && ok "a named key with no handed-over value refuses the whole write" || bad "missing value refuses" "rc=${_kvv_rc} out: ${_kvv_out}"
 rm -rf "$_kvv_state"
 # The vault-object entry of the same name is NOT a values-half value (prefix keeps them apart).
@@ -737,32 +761,32 @@ rm -rf "$_kvv_state"
 # The derived orleans string is refused while no half carries it — writing a first copy would freeze
 # the chart's derivation from ConnectionStrings__memex.
 kvv HOSTING_SECRETS="$(kvv_secrets '{"values-half:ConnectionStrings__orleans":"O-NEVER-PRINTED"}')" -- "${KVV_DECL[@]}" --key ConnectionStrings__orleans
-[ "$_kvv_rc" -ne 0 ] && [ ! -f "$_kvv_state/sets" ] && printf '%s' "$_kvv_out" | grep -q 'derived by the chart from ConnectionStrings__memex' \
+[ "$_kvv_rc" -ne 0 ] && [ ! -f "$_kvv_state/sets" ] && grep_in "$_kvv_out" -q 'derived by the chart from ConnectionStrings__memex' \
   && ok "a derived key no half carries is refused, naming its source" || bad "derived key refused" "rc=${_kvv_rc} out: ${_kvv_out}"
 rm -rf "$_kvv_state"
 
 # An ABSENT half is refused — composing one is the Provision's job. (Control: the present case above.)
 kvv HOSTING_KVV_ABSENT=1 HOSTING_SECRETS="$(kvv_secrets "{\"values-half:ConnectionStrings__memex\":\"${KVV_NEW_CS}\"}")" -- "${KVV_DECL[@]}" --key ConnectionStrings__memex
-[ "$_kvv_rc" -ne 0 ] && [ ! -f "$_kvv_state/sets" ] && printf '%s' "$_kvv_out" | grep -q 'hosting-kv-ensure --values-half' \
+[ "$_kvv_rc" -ne 0 ] && [ ! -f "$_kvv_state/sets" ] && grep_in "$_kvv_out" -q 'hosting-kv-ensure --values-half' \
   && ok "an absent half is refused, naming the step that composes one" || bad "absent half refused" "rc=${_kvv_rc} out: ${_kvv_out}"
 rm -rf "$_kvv_state"
 
 # LOST UPDATE: another writer stores a version between the read and the write → refused, nothing written.
 kvv HOSTING_KVV_RACE=2 HOSTING_SECRETS="$(kvv_secrets "{\"values-half:ConnectionStrings__memex\":\"${KVV_NEW_CS}\"}")" -- "${KVV_DECL[@]}" --key ConnectionStrings__memex
-[ "$_kvv_rc" -ne 0 ] && [ ! -f "$_kvv_state/sets" ] && printf '%s' "$_kvv_out" | grep -q 'another writer stored a version' \
+[ "$_kvv_rc" -ne 0 ] && [ ! -f "$_kvv_state/sets" ] && grep_in "$_kvv_out" -q 'another writer stored a version' \
   && ok "a version stored by another writer mid-run refuses the write" || bad "lost-update guard" "rc=${_kvv_rc} out: ${_kvv_out}"
 rm -rf "$_kvv_state"
 
 # READ-BACK: a write the vault acknowledges but does not keep is a failure, not a success.
 kvv HOSTING_KVV_LOSE=1 HOSTING_SECRETS="$(kvv_secrets "{\"values-half:ConnectionStrings__memex\":\"${KVV_NEW_CS}\"}")" -- "${KVV_DECL[@]}" --key ConnectionStrings__memex
-[ "$_kvv_rc" -ne 0 ] && printf '%s' "$_kvv_out" | grep -q 'read-back does not carry the handed-over value for: ConnectionStrings__memex' \
-  && ! printf '%s' "$_kvv_out" | grep -q 'kv_values_half=updated' \
+[ "$_kvv_rc" -ne 0 ] && grep_in "$_kvv_out" -q 'read-back does not carry the handed-over value for: ConnectionStrings__memex' \
+  && ! grep_in "$_kvv_out" -q 'kv_values_half=updated' \
   && ok "a write the read-back does not show is a named failure, never reported updated" || bad "read-back failure" "rc=${_kvv_rc} out: ${_kvv_out}"
 rm -rf "$_kvv_state"
 
 # A dry run reads no value and writes nothing.
 kvv HOSTING_DRY_RUN=true -- "${KVV_DECL[@]}" --key ConnectionStrings__memex
-[ "$_kvv_rc" -eq 0 ] && [ -z "$_kvv_log" ] && printf '%s' "$_kvv_out" | grep -q 'would change ConnectionStrings__memex in helm-values-acme' \
+[ "$_kvv_rc" -eq 0 ] && [ -z "$_kvv_log" ] && grep_in "$_kvv_out" -q 'would change ConnectionStrings__memex in helm-values-acme' \
   && ok "a dry run narrates the change and calls nothing" || bad "dry run" "rc=${_kvv_rc} out: ${_kvv_out} az: ${_kvv_log}"
 rm -rf "$_kvv_state"
 
@@ -1589,8 +1613,8 @@ case "$_rl_out" in *eyJ0b2tlbi1zZW50aW5lbC1ORVZFUi1QUklOVEVEIjp0cnVlfQ*) bad "th
 case "$_rl_out" in *"::hosting:: az_login=true"*) ok "the sign-in is reported to the mesh (az_login=true)" ;;
   *) bad "the sign-in is reported (az_login=true)" "said: ${_rl_out}" ;; esac
 # Order: the sign-in precedes the first step's marker in the output.
-_rl_login_pos="$(printf '%s' "$_rl_out" | grep -n 'azure     signed in' | head -1 | cut -d: -f1)"
-_rl_step_pos="$(printf '%s' "$_rl_out" | grep -n '::hosting:: step=First' | head -1 | cut -d: -f1)"
+_rl_login_pos="$(grep_in "$_rl_out" -n 'azure     signed in' | head -1 | cut -d: -f1)"
+_rl_step_pos="$(grep_in "$_rl_out" -n '::hosting:: step=First' | head -1 | cut -d: -f1)"
 if [ -n "$_rl_login_pos" ] && [ -n "$_rl_step_pos" ] && [ "$_rl_login_pos" -lt "$_rl_step_pos" ]; then
   ok "the sign-in happens before the first step"
 else
@@ -1647,7 +1671,7 @@ case "$_azs_after_dump" in *"az login assertion=job-token-rotated"*"storage blob
 case "$_azs_out" in *"session refreshed from a fresh federated token (between the dump and the upload)"*) ok "…and the run says it refreshed, and where" ;;
   *) bad "the refresh is narrated" "said: ${_azs_out}" ;; esac
 case "$_azs_out" in *job-token-*) bad "no assertion ever appears in the output" "it did: ${_azs_out}" ;; *) ok "no assertion ever appears in the output" ;; esac
-[ "$(printf '%s\n' "$_azs_log" | grep -c '^az login ')" -ge 3 ] && ok "run.sh signs in at the start AND again before the step (3+ sign-ins in all)" \
+[ "$(grep_in "$_azs_log" -c '^az login ')" -ge 3 ] && ok "run.sh signs in at the start AND again before the step (3+ sign-ins in all)" \
   || bad "a sign-in at the start and before the step" "log: ${_azs_log}"
 rm -rf "$_azs_state" "$_azs_tok"
 
@@ -1768,7 +1792,7 @@ case "$_cr_out" in *"unbound variable"*) bad "the stand-in dies where bash's own
 case "$_cr_out" in *"run.sh: ERROR: stopped with exit "*" at crash.env:3 without stating a cause, while running: printf "*'${W15A_NEVER_SET}'*) ok "…and run.sh reports it as a cause: the file and line, and the command as source text" ;;
   *) bad "reports file:line and the command" "said: ${_cr_out}" ;; esac
 case "$_cr_out" in *"run.sh: ERROR: step 1/1 'First' failed"*) ok "…and names the step it was in, in the step-failure line's shape" ;; *) bad "names the step" "said: ${_cr_out}" ;; esac
-[ "$(printf '%s\n' "$_cr_out" | grep -c ': ERROR: ')" -eq 2 ] && ok "…exactly once each" || bad "one cause line and one step line" "said: ${_cr_out}"
+[ "$(grep_in "$_cr_out" -c ': ERROR: ')" -eq 2 ] && ok "…exactly once each" || bad "one cause line and one step line" "said: ${_cr_out}"
 case "$_cr_out" in *step-one-ran*) bad "…and the step never runs" "it ran: ${_cr_out}" ;; *) ok "…and the step never runs" ;; esac
 
 # A step script, with an EXIT trap of its own (most have one, for a temp file): the report and the
@@ -1798,9 +1822,9 @@ case "$_cr_out" in *"hosting-selftest: ERROR: stopped with exit "*" at hosting-s
 [ "$_cr_rc" -ne 0 ] && [ -e "$_cr_dir/marker" ] && ok "…still exits non-zero, and its own cleanup still runs" || bad "exit status and cleanup survive" "rc=${_cr_rc}: ${_cr_out}"
 case "$_cr_out" in *"run.sh: ERROR: step"*) bad "…and claims no run.sh step (it is not run.sh)" "said: ${_cr_out}" ;; *) ok "…and claims no run.sh step (it is not run.sh)" ;; esac
 cr_step refusal
-[ "$_cr_rc" -eq 1 ] && [ "$(printf '%s\n' "$_cr_out" | grep -c ': ERROR: ')" -eq 1 ] && ok "a refusal (hosting::die) is reported once — nothing is added to it" || bad "a refusal is not doubled" "rc=${_cr_rc}: ${_cr_out}"
+[ "$_cr_rc" -eq 1 ] && [ "$(grep_in "$_cr_out" -c ': ERROR: ')" -eq 1 ] && ok "a refusal (hosting::die) is reported once — nothing is added to it" || bad "a refusal is not doubled" "rc=${_cr_rc}: ${_cr_out}"
 cr_step own-exit
-[ "$_cr_rc" -eq 3 ] && [ "$(printf '%s\n' "$_cr_out" | grep -c ': ERROR: ')" -eq 0 ] && ok "a deliberate \`exit 3\` keeps its status and gains no line" || bad "a deliberate exit is left alone" "rc=${_cr_rc}: ${_cr_out}"
+[ "$_cr_rc" -eq 3 ] && [ "$(grep_in "$_cr_out" -c ': ERROR: ')" -eq 0 ] && ok "a deliberate \`exit 3\` keeps its status and gains no line" || bad "a deliberate exit is left alone" "rc=${_cr_rc}: ${_cr_out}"
 cr_step success
 [ "$_cr_rc" -eq 0 ] && [ "$_cr_out" = fine ] && ok "success prints nothing extra" || bad "success is silent" "rc=${_cr_rc}: ${_cr_out}"
 rm -rf "$_cr_dir"
@@ -1808,8 +1832,8 @@ rm -rf "$_cr_dir"
 # The guard for the rule that makes the above true of every command: an EXIT trap of a script's own
 # REPLACES the one _common.sh installs, so it must call hosting::on_exit first.
 _cr_traps="$(grep -nE "^[[:space:]]*trap .* EXIT[[:space:]]*$" "$BIN"/hosting-* "$BIN"/run.sh || true)"
-_cr_bare="$(printf '%s\n' "$_cr_traps" | grep -vE "trap ['\"]hosting::on_exit; " || true)"
-[ -n "$_cr_traps" ] && ok "the EXIT-trap guard has traps to read ($(printf '%s\n' "$_cr_traps" | grep -c .) under bin/)" || bad "the EXIT-trap guard found no traps" "its pattern no longer matches bin/ — it would pass having checked nothing"
+_cr_bare="$(grep_in "$_cr_traps" -vE "trap ['\"]hosting::on_exit; " || true)"
+[ -n "$_cr_traps" ] && ok "the EXIT-trap guard has traps to read ($(grep_in "$_cr_traps" -c .) under bin/)" || bad "the EXIT-trap guard found no traps" "its pattern no longer matches bin/ — it would pass having checked nothing"
 [ -z "$_cr_bare" ] && ok "every EXIT trap under bin/ calls hosting::on_exit first" || bad "an EXIT trap replaces hosting::on_exit without calling it" "${_cr_bare}"
 unset _cr_dir _cr_tok _cr_out _cr_rc _cr_traps _cr_bare
 unset _azs_out _azs_rc _azs_log _azs_state _azs_tok _azs_after_dump
@@ -1837,7 +1861,7 @@ pv_resize grows 128Gi
   || bad "a smaller claim is grown" "exited ${_pv_rc}: ${_pv_out}"
 case "$_pv_log" in *'patch pvc memex-data --type merge -p {"spec":{"resources":{"requests":{"storage":"128Gi"}}}}'*) ok "the patch carries exactly the requested storage" ;;
   *) bad "the patch carries the requested storage" "kubectl saw: ${_pv_log}" ;; esac
-[ "$(printf '%s\n' "$_pv_log" | grep -c 'patch pvc')" = "1" ] && ok "…and is written ONCE" \
+[ "$(grep_in "$_pv_log" -c 'patch pvc')" = "1" ] && ok "…and is written ONCE" \
   || bad "the patch is written once" "kubectl saw: ${_pv_log}"
 case "$_pv_out" in *"::hosting:: pv_capacity=128Gi"*) ok "the capacity reported is the one READ BACK from status, not the request" ;;
   *) bad "the capacity is read back" "said: ${_pv_out}" ;; esac
@@ -1974,7 +1998,7 @@ for _p in 0/env/1 1/env/1 2/env/2; do
 done
 [ "$_ie_all" = 1 ] && ok "…from EVERY container that carries it — the portal and both gate sidecars" \
   || bad "the key is removed from every container that carries it" "patch: ${_ie_patch}"
-[ "$(printf '%s\n' "$_ie_log" | grep -c ' patch deployment ')" = "1" ] && ok "…in ONE patch (one new ReplicaSet, one rollout)" \
+[ "$(grep_in "$_ie_log" -c ' patch deployment ')" = "1" ] && ok "…in ONE patch (one new ReplicaSet, one rollout)" \
   || bad "the removal is one patch" "kubectl saw: ${_ie_log}"
 case "$_ie_patch" in '[{"op":"test","path":"/metadata/resourceVersion","value":"918273"}'*)
     ok "…guarded FIRST on the resourceVersion that was measured" ;;
@@ -2040,7 +2064,7 @@ case "$_ie_out" in *"FOLDED into it"*"::hosting:: inline_env_folded_generation=4
   *) bad "the fold is reported with its generation" "said: ${_ie_out}" ;; esac
 case "$_ie_out" in *"PluginCatalog__RegistryToken  EQUAL (len 31)"*) ok "…after the SAME equality measurement as a settled run" ;;
   *) bad "a folded run still measures the equality" "said: ${_ie_out}" ;; esac
-[ "$(printf '%s\n' "$_ie_log" | grep -c ' patch deployment ')" = "1" ] && ok "…in one guarded patch" \
+[ "$(grep_in "$_ie_log" -c ' patch deployment ')" = "1" ] && ok "…in one guarded patch" \
   || bad "a folded run patches once" "kubectl saw: ${_ie_log}"
 ie_no_value "…and no value is printed, patched or passed in an argv"
 
@@ -2578,7 +2602,7 @@ case "$_dp_out" in *"::hosting:: adopted=0"*) ok "a second run adopts nothing (t
 jq '.metadata.labels["app.kubernetes.io/managed-by"]="Helm" | .metadata.annotations["meta.helm.sh/release-name"]="other" | .metadata.annotations["meta.helm.sh/release-namespace"]="memex"' \
   "$DP_FIXTURES/live/secretproviderclass.secrets-store.csi.x-k8s.io_memex-kv.json" > "$_dp_dir/live/secretproviderclass.secrets-store.csi.x-k8s.io_memex-kv.json"
 : > "$_dp_log"; _dp_out="$(_dp_run)"; _dp_rc=$?
-if [ "$_dp_rc" -ne 0 ] && printf '%s' "$_dp_out" | grep -q "owned by release 'other'" && ! grep -q '^helm upgrade' "$_dp_log"; then
+if [ "$_dp_rc" -ne 0 ] && grep_in "$_dp_out" -q "owned by release 'other'" && ! grep -q '^helm upgrade' "$_dp_log"; then
   ok "an object owned by another release is refused, and helm never runs"
 else
   bad "an object owned by another release is refused" "rc=${_dp_rc} out: ${_dp_out} log: $(cat "$_dp_log")"
@@ -2612,8 +2636,8 @@ for _lk_case in "real:HOSTING_DEPLOY_STUB_TEMPLATE_FAILS=true:stubbed render fai
   : > "$_lk_log"
   # shellcheck disable=SC2086  # _lk_env is a list of NAME=value words for env
   _lk_out="$(_lk_run env $_lk_env)"
-  if printf '%s' "$_lk_out" | grep -q "$_lk_said" && printf '%s' "$_lk_out" | grep -q "$_lk_err" \
-     && ! printf '%s' "$_lk_out" | grep -qF "$_lk_sig" && ! printf '%s' "$_lk_out" | grep -q 'MODEL_URL'; then
+  if grep_in "$_lk_out" -q "$_lk_said" && grep_in "$_lk_out" -q "$_lk_err" \
+     && ! grep_in "$_lk_out" -qF "$_lk_sig" && ! grep_in "$_lk_out" -q 'MODEL_URL'; then
     ok "${_lk_name}: a failure names the tool's stderr line, never the manifest it printed"
   else
     bad "${_lk_name}: a failure names stderr, never the manifest" "out: ${_lk_out}"
@@ -2641,9 +2665,9 @@ _ap_run() { env PATH="$DP_STUBS:$PATH" HOSTING_CHART=/tmp HOSTING_DEPLOY_FIXTURE
 _ap_out="$(_ap_run env)"; _ap_rc=$?
 _ap_upgrade="$(grep '^helm upgrade' "$_ap_log" | head -1)"
 if [ "$_ap_rc" -eq 0 ] && [ -n "$_ap_upgrade" ] \
-   && ! printf '%s' "$_ap_upgrade" | grep -q -- '--atomic' \
-   && ! printf '%s' "$_ap_upgrade" | grep -q -- '--wait' \
-   && ! printf '%s' "$_ap_upgrade" | grep -q -- '--timeout'; then
+   && ! grep_in "$_ap_upgrade" -q -- '--atomic' \
+   && ! grep_in "$_ap_upgrade" -q -- '--wait' \
+   && ! grep_in "$_ap_upgrade" -q -- '--timeout'; then
   ok "helm upgrade carries no --atomic, no --wait and no --timeout"
 else
   bad "helm upgrade carries no --atomic/--wait/--timeout" "rc=${_ap_rc} upgrade line: '${_ap_upgrade}' out: ${_ap_out}"
@@ -2667,9 +2691,9 @@ case "$_ap_out" in *"NOT yet rolled out"*) ok "the log states the rollout has NO
 # A FAILED upgrade must not claim a rollback that no longer happens, and must name the way forward.
 : > "$_ap_log"
 _ap_out="$(_ap_run env HOSTING_DEPLOY_STUB_UPGRADE_FAILS=true)"; _ap_rc=$?
-if [ "$_ap_rc" -ne 0 ] && printf '%s' "$_ap_out" | grep -q 'was NOT rolled back' \
-   && printf '%s' "$_ap_out" | grep -q 'helm history' \
-   && ! printf '%s' "$_ap_out" | grep -q 'rolled back by --atomic'; then
+if [ "$_ap_rc" -ne 0 ] && grep_in "$_ap_out" -q 'was NOT rolled back' \
+   && grep_in "$_ap_out" -q 'helm history' \
+   && ! grep_in "$_ap_out" -q 'rolled back by --atomic'; then
   ok "a failed upgrade says it was NOT rolled back and names helm history"
 else
   bad "a failed upgrade reports honestly" "rc=${_ap_rc} out: ${_ap_out}"
@@ -2680,7 +2704,7 @@ fi
 # "assumed" — the exact regression this change exists to prevent.
 printf '{"name":"memex","info":{"status":"deployed"}}\n' > "$_ap_dir/status.json"; : > "$_ap_log"
 _ap_out="$(_ap_run env)"; _ap_rc=$?
-if [ "$_ap_rc" -ne 0 ] && printf '%s' "$_ap_out" | grep -q 'returned no revision'; then
+if [ "$_ap_rc" -ne 0 ] && grep_in "$_ap_out" -q 'returned no revision'; then
   ok "an apply with no readable revision is refused, not reported as done"
 else
   bad "an apply with no readable revision is refused" "rc=${_ap_rc} out: ${_ap_out}"
@@ -2735,8 +2759,8 @@ case "$_vh_out" in *"::hosting:: vault_values_bytes="*) ok "only the half's SIZE
 # quietly falls through to the chart's defaults, which is the #3780 boot failure itself.
 rm -f "$_vh_dir/vault/helm-values-memex"; : > "$_vh_log"
 _vh_out="$(_vh_run --vault kv-test)"; _vh_rc=$?
-if [ "$_vh_rc" -ne 0 ] && printf '%s' "$_vh_out" | grep -q 'helm-values-memex' \
-   && printf '%s' "$_vh_out" | grep -q 'hosting-kv-ensure --values-half' && printf '%s' "$_vh_out" | grep -q '3780' \
+if [ "$_vh_rc" -ne 0 ] && grep_in "$_vh_out" -q 'helm-values-memex' \
+   && grep_in "$_vh_out" -q 'hosting-kv-ensure --values-half' && grep_in "$_vh_out" -q '3780' \
    && ! grep -q '^helm ' "$_vh_log"; then
   ok "a declared half the vault does not hold is refused before helm, naming the governed remedy and #3780"
 else
@@ -2744,7 +2768,7 @@ else
 fi
 : > "$_vh_dir/vault/helm-values-memex"; : > "$_vh_log"
 _vh_out="$(_vh_run --vault kv-test)"; _vh_rc=$?
-if [ "$_vh_rc" -ne 0 ] && printf '%s' "$_vh_out" | grep -q 'EMPTY' && ! grep -q '^helm ' "$_vh_log"; then
+if [ "$_vh_rc" -ne 0 ] && grep_in "$_vh_out" -q 'EMPTY' && ! grep -q '^helm ' "$_vh_log"; then
   ok "an EMPTY half is refused too — a capture that wrote nothing is not 'no secrets'"
 else
   bad "an empty half is refused" "rc=${_vh_rc} out: ${_vh_out}"
@@ -2765,8 +2789,8 @@ fi
 printf 'extraVolumes:\n- name: kv-secrets\n  csi:\n    driver: secrets-store.csi.k8s.io\npgbackrest:\n  enabled: false\nsecrets:\n  memex_portal:\n    ConnectionStrings__orleans: "SENTINEL-NEVER-PRINTED"\n' > "$_vh_dir/vault/helm-values-memex"
 : > "$_vh_log"
 _vh_out="$(_vh_run --vault kv-test)"; _vh_rc=$?
-if [ "$_vh_rc" -ne 0 ] && printf '%s' "$_vh_out" | grep -q 'STRUCTURE' && printf '%s' "$_vh_out" | grep -q ' extraVolumes' \
-   && printf '%s' "$_vh_out" | grep -q 'hosting-kv-ensure --values-half' && ! grep -q '^helm ' "$_vh_log"; then
+if [ "$_vh_rc" -ne 0 ] && grep_in "$_vh_out" -q 'STRUCTURE' && grep_in "$_vh_out" -q ' extraVolumes' \
+   && grep_in "$_vh_out" -q 'hosting-kv-ensure --values-half' && ! grep -q '^helm ' "$_vh_log"; then
   ok "a half carrying a structural key is refused before helm, naming the key and the governed remedy (Memex#295)"
 else
   bad "a structural half is refused before helm" "rc=${_vh_rc} out: ${_vh_out} log: $(cat "$_vh_log")"
@@ -2776,7 +2800,7 @@ case "$_vh_out" in *SENTINEL-NEVER-PRINTED*|*secrets-store.csi*) bad "the struct
 printf 'config:\n  memex_portal:\n    Foo: "bar"\nsecrets:\n  memex_portal: {}\n' > "$_vh_dir/vault/helm-values-memex"
 : > "$_vh_log"
 _vh_out="$(_vh_run --vault kv-test)"; _vh_rc=$?
-[ "$_vh_rc" -ne 0 ] && printf '%s' "$_vh_out" | grep -q ' config' && ! grep -q '^helm ' "$_vh_log" \
+[ "$_vh_rc" -ne 0 ] && grep_in "$_vh_out" -q ' config' && ! grep -q '^helm ' "$_vh_log" \
   && ok "a structural MAP is refused too — it would silently supply every leaf the render omits" \
   || bad "a structural map is refused" "rc=${_vh_rc} out: ${_vh_out}"
 # All three families, quoted keys and comments: accepted and layered.
@@ -2794,7 +2818,7 @@ _vh_out="$(_vh_run --vault kv-test)"; _vh_rc=$?
 printf '{"secrets":{},"ingress":{"host":"h"}}\n' > "$_vh_dir/vault/helm-values-memex"
 : > "$_vh_log"
 _vh_out="$(_vh_run --vault kv-test)"; _vh_rc=$?
-[ "$_vh_rc" -ne 0 ] && printf '%s' "$_vh_out" | grep -q ' ingress' && ! grep -q '^helm ' "$_vh_log" \
+[ "$_vh_rc" -ne 0 ] && grep_in "$_vh_out" -q ' ingress' && ! grep -q '^helm ' "$_vh_log" \
   && ok "a JSON half carrying structure is refused" || bad "a JSON structural half is refused" "rc=${_vh_rc} out: ${_vh_out}"
 # 🚨 policy one-values-half-per-release (MeshWeaver#4685): with --vault-keys the half must feed
 # EXACTLY the record's declared keys — an undeclared key (a config leaf in a secret family,
@@ -2802,14 +2826,14 @@ _vh_out="$(_vh_run --vault kv-test)"; _vh_rc=$?
 printf 'secrets:\n  memex_portal:\n    ConnectionStrings__memex: "CS-SENTINEL-NEVER-PRINTED"\n    memex_postgres_password: "PW-SENTINEL-NEVER-PRINTED"\n  memex_migration:\n    ConnectionStrings__memex: "CS-SENTINEL-NEVER-PRINTED"\n' > "$_vh_dir/vault/helm-values-memex"
 : > "$_vh_log"
 _vh_out="$(_vh_run --vault kv-test --vault-keys ConnectionStrings__memex,ConnectionStrings__orleans,MEMEX_PASSWORD)"; _vh_rc=$?
-[ "$_vh_rc" -eq 0 ] && grep -q '^helm upgrade' "$_vh_log" && printf '%s' "$_vh_out" | grep -q '::hosting:: vault_values_keys=exact' \
+[ "$_vh_rc" -eq 0 ] && grep -q '^helm upgrade' "$_vh_log" && grep_in "$_vh_out" -q '::hosting:: vault_values_keys=exact' \
   && ok "a half feeding exactly the declared keys is layered (orleans derived by the chart, the password alias read as MEMEX_PASSWORD)" \
   || bad "an exact half is layered" "rc=${_vh_rc} out: ${_vh_out}"
 printf 'secrets:\n  memex_portal:\n    ConnectionStrings__memex: "CS-SENTINEL-NEVER-PRINTED"\n    memex_postgres_password: "PW-SENTINEL-NEVER-PRINTED"\n    Authentication__Google__ClientId: "CID-SENTINEL-NEVER-PRINTED"\n' > "$_vh_dir/vault/helm-values-memex"
 : > "$_vh_log"
 _vh_out="$(_vh_run --vault kv-test --vault-keys ConnectionStrings__memex,ConnectionStrings__orleans,MEMEX_PASSWORD)"; _vh_rc=$?
-if [ "$_vh_rc" -ne 0 ] && printf '%s' "$_vh_out" | grep -q 'undeclared: Authentication__Google__ClientId' \
-   && printf '%s' "$_vh_out" | grep -q 'one-values-half-per-release' && ! grep -q '^helm ' "$_vh_log"; then
+if [ "$_vh_rc" -ne 0 ] && grep_in "$_vh_out" -q 'undeclared: Authentication__Google__ClientId' \
+   && grep_in "$_vh_out" -q 'one-values-half-per-release' && ! grep -q '^helm ' "$_vh_log"; then
   ok "a half feeding an UNDECLARED key is refused before helm, naming the key and the policy"
 else
   bad "an over-supplying half is refused" "rc=${_vh_rc} out: ${_vh_out}"
@@ -2818,7 +2842,7 @@ case "$_vh_out" in *SENTINEL-NEVER-PRINTED*) bad "the key-set refusal names keys
   *) ok "the key-set refusal names keys, never values" ;; esac
 : > "$_vh_log"
 _vh_out="$(_vh_run --vault kv-test --vault-keys ConnectionStrings__memex,ConnectionStrings__orleans,MEMEX_PASSWORD,Authentication__Google__ClientId,Anthropic__ApiKey)"; _vh_rc=$?
-[ "$_vh_rc" -ne 0 ] && printf '%s' "$_vh_out" | grep -q 'missing: Anthropic__ApiKey' && ! grep -q '^helm ' "$_vh_log" \
+[ "$_vh_rc" -ne 0 ] && grep_in "$_vh_out" -q 'missing: Anthropic__ApiKey' && ! grep -q '^helm ' "$_vh_log" \
   && ok "a half lacking a DECLARED key is refused before helm, naming it" \
   || bad "a half lacking a declared key is refused" "rc=${_vh_rc} out: ${_vh_out}"
 # Without --vault-keys the same over-supplying half is layered as before (the plan opts in).
@@ -2835,12 +2859,12 @@ refuses_hard "--vault-keys that is not a list of names is refused" "not a comma-
 printf -- '- secrets\n' > "$_vh_dir/vault/helm-values-memex"
 : > "$_vh_log"
 _vh_out="$(_vh_run --vault kv-test)"; _vh_rc=$?
-[ "$_vh_rc" -ne 0 ] && printf '%s' "$_vh_out" | grep -q 'cannot be read' && ! grep -q '^helm ' "$_vh_log" \
+[ "$_vh_rc" -ne 0 ] && grep_in "$_vh_out" -q 'cannot be read' && ! grep -q '^helm ' "$_vh_log" \
   && ok "a half whose top level is not a mapping is refused as unreadable" || bad "an unreadable half is refused" "rc=${_vh_rc} out: ${_vh_out}"
 printf '# nothing but a comment\n' > "$_vh_dir/vault/helm-values-memex"
 : > "$_vh_log"
 _vh_out="$(_vh_run --vault kv-test)"; _vh_rc=$?
-[ "$_vh_rc" -ne 0 ] && printf '%s' "$_vh_out" | grep -q 'none of the families' && ! grep -q '^helm ' "$_vh_log" \
+[ "$_vh_rc" -ne 0 ] && grep_in "$_vh_out" -q 'none of the families' && ! grep -q '^helm ' "$_vh_log" \
   && ok "a half holding none of the families is refused" || bad "a family-less half is refused" "rc=${_vh_rc} out: ${_vh_out}"
 refuses_hard "a vault name that is not a plain name is refused before anything runs" "not a plain name" \
   env HOSTING_DRY_RUN=true HOSTING_CHART=/tmp hosting-deploy --namespace memex --release memex --database memex --values "$_vh_vals" --vault 'kv;rm -rf /'
@@ -2867,9 +2891,9 @@ _ki_run() { env PATH="$DP_STUBS:$PATH" HOSTING_CHART=/tmp HOSTING_DEPLOY_FIXTURE
 printf '# GENERATED from the Hosting/Deployment record by HelmValues\nportal:\n  imagePullSecret: "registry-pull"\nselfUpdate:\n  registry: "cr.example.test"\n' > "$_ki_vals"
 _ki_out="$(_ki_run)"; _ki_rc=$?
 _ki_up="$(grep '^helm upgrade' "$_ki_log" | head -1)"
-if [ "$_ki_rc" -eq 0 ] && printf '%s' "$_ki_up" | grep -q -- "--set portal.image=${_ki_running}" \
-   && printf '%s' "$_ki_up" | grep -q -- "--set migration.image=cr.example.test/memex-migration:3.0.0-ci.9101" \
-   && printf '%s' "$_ki_out" | grep -q "keeping the running ${_ki_running}"; then
+if [ "$_ki_rc" -eq 0 ] && grep_in "$_ki_up" -q -- "--set portal.image=${_ki_running}" \
+   && grep_in "$_ki_up" -q -- "--set migration.image=cr.example.test/memex-migration:3.0.0-ci.9101" \
+   && grep_in "$_ki_out" -q "keeping the running ${_ki_running}"; then
   ok "a portal: block carrying only imagePullSecret keeps the RUNNING image (portal + migration)"
 else
   bad "a pull-Secret-only portal: block keeps the running image" "rc=${_ki_rc} upgrade: '${_ki_up}' out: ${_ki_out}"
@@ -2878,14 +2902,14 @@ fi
 printf '# GENERATED from the Hosting/Deployment record by HelmValues\nportal:\n  imagePullSecret: "registry-pull"\nmigration:\n  image: "cr.example.test/memex-migration:1"\n' > "$_ki_vals"; : > "$_ki_log"
 _ki_out="$(_ki_run)"; _ki_rc=$?
 _ki_up="$(grep '^helm upgrade' "$_ki_log" | head -1)"
-[ "$_ki_rc" -eq 0 ] && printf '%s' "$_ki_up" | grep -q -- "--set portal.image=${_ki_running}" \
+[ "$_ki_rc" -eq 0 ] && grep_in "$_ki_up" -q -- "--set portal.image=${_ki_running}" \
   && ok "an image: under another block (migration:) does not count as portal.image" \
   || bad "an image: under another block does not count as portal.image" "rc=${_ki_rc} upgrade: '${_ki_up}'"
 # An EMPTY portal.image is no image either.
 printf '# GENERATED from the Hosting/Deployment record by HelmValues\nportal:\n  image: ""\n  imagePullSecret: "registry-pull"\n' > "$_ki_vals"; : > "$_ki_log"
 _ki_out="$(_ki_run)"; _ki_rc=$?
 _ki_up="$(grep '^helm upgrade' "$_ki_log" | head -1)"
-[ "$_ki_rc" -eq 0 ] && printf '%s' "$_ki_up" | grep -q -- "--set portal.image=${_ki_running}" \
+[ "$_ki_rc" -eq 0 ] && grep_in "$_ki_up" -q -- "--set portal.image=${_ki_running}" \
   && ok "an empty portal.image (\"\") keeps the running image" \
   || bad "an empty portal.image keeps the running image" "rc=${_ki_rc} upgrade: '${_ki_up}'"
 # A record that DOES render portal.image (a pinned tag) is left to the values: no override, no read.
@@ -2896,7 +2920,7 @@ _ki_up="$(grep '^helm upgrade' "$_ki_log" | head -1)"
 # step (policy roll-migrates-first), which runs the values' own migration image before helm.
 _ki_mig="$(grep -n '^hosting-migrate' "$_ki_log" | head -1 | cut -d: -f1)"
 _ki_upl="$(grep -n '^helm upgrade' "$_ki_log" | head -1 | cut -d: -f1)"
-if [ "$_ki_rc" -eq 0 ] && [ -n "$_ki_up" ] && ! printf '%s' "$_ki_up" | grep -q -- '--set portal.image=' \
+if [ "$_ki_rc" -eq 0 ] && [ -n "$_ki_up" ] && ! grep_in "$_ki_up" -q -- '--set portal.image=' \
    && grep -q '^hosting-migrate --namespace memex --release memex --image cr.example.test/memex-migration:7$' "$_ki_log" \
    && [ -n "$_ki_mig" ] && [ -n "$_ki_upl" ] && [ "$_ki_mig" -lt "$_ki_upl" ]; then
   ok "a rendered portal.image is left to the values (no --set override), and its migration runs BEFORE helm"
@@ -2906,7 +2930,7 @@ fi
 # Nothing running and no image anywhere: still the first-install refusal, before helm.
 printf '# GENERATED from the Hosting/Deployment record by HelmValues\nportal:\n  imagePullSecret: "registry-pull"\n' > "$_ki_vals"; rm -f "$_ki_dir/running-image"; : > "$_ki_log"
 _ki_out="$(_ki_run)"; _ki_rc=$?
-if [ "$_ki_rc" -ne 0 ] && printf '%s' "$_ki_out" | grep -q 'no image to deploy' && ! grep -q '^helm upgrade' "$_ki_log"; then
+if [ "$_ki_rc" -ne 0 ] && grep_in "$_ki_out" -q 'no image to deploy' && ! grep -q '^helm upgrade' "$_ki_log"; then
   ok "nothing running and no portal.image is refused before helm — never the chart default"
 else
   bad "nothing running and no portal.image is refused before helm" "rc=${_ki_rc} out: ${_ki_out} log: $(cat "$_ki_log")"
@@ -2920,9 +2944,9 @@ printf '# GENERATED from the Hosting/Deployment record by HelmValues\nportal:\n 
 printf '%s' "cr.example.test/memex-control:3.0.0-ci.10043" > "$_ki_dir/running-image"; : > "$_ki_log"
 _ki_out="$(_ki_run)"; _ki_rc=$?
 _ki_up="$(grep '^helm upgrade' "$_ki_log" | head -1)"
-if [ "$_ki_rc" -eq 0 ] && printf '%s' "$_ki_up" | grep -q -- "--set portal.image=cr.example.test/memex-control:3.0.0-ci.10043" \
-   && printf '%s' "$_ki_up" | grep -q -- "--set migration.image=cr.example.test/memex-migration:3.0.0-ci.10043" \
-   && ! printf '%s' "$_ki_up" | grep -q -- "--set migration.image=cr.example.test/memex-control"; then
+if [ "$_ki_rc" -eq 0 ] && grep_in "$_ki_up" -q -- "--set portal.image=cr.example.test/memex-control:3.0.0-ci.10043" \
+   && grep_in "$_ki_up" -q -- "--set migration.image=cr.example.test/memex-migration:3.0.0-ci.10043" \
+   && ! grep_in "$_ki_up" -q -- "--set migration.image=cr.example.test/memex-control"; then
   ok "a non-memex-portal-ai portal (memex-control) pairs memex-migration at its tag — never the portal image as the migration"
 else
   bad "memex-control pairs memex-migration, not itself" "rc=${_ki_rc} upgrade: '${_ki_up}' out: ${_ki_out}"
@@ -2930,7 +2954,7 @@ fi
 # A digest-pinned running image has no tag to pair: refused before helm, never a guessed migration.
 printf '%s' "cr.example.test/memex-control@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" > "$_ki_dir/running-image"; : > "$_ki_log"
 _ki_out="$(_ki_run)"; _ki_rc=$?
-if [ "$_ki_rc" -ne 0 ] && printf '%s' "$_ki_out" | grep -q 'cannot pair a memex-migration image' && ! grep -q '^helm upgrade' "$_ki_log"; then
+if [ "$_ki_rc" -ne 0 ] && grep_in "$_ki_out" -q 'cannot pair a memex-migration image' && ! grep -q '^helm upgrade' "$_ki_log"; then
   ok "a running image with no tag to pair is refused before helm"
 else
   bad "a digest-pinned running image is refused before helm" "rc=${_ki_rc} out: ${_ki_out} log: $(cat "$_ki_log")"
@@ -2956,9 +2980,9 @@ _wi_run() { env PATH="$DP_STUBS:$PATH" HOSTING_CHART=/tmp HOSTING_DEPLOY_FIXTURE
 _wi_out="$(_wi_run AZ_PORTAL_IDENTITY=example-portal-mi AZ_RESOURCE_GROUP=memex-aks-rg)"; _wi_rc=$?
 _wi_up="$(grep '^helm upgrade' "$_wi_log" | head -1)"; _wi_tp="$(grep '^helm template' "$_wi_log" | head -1)"
 if [ "$_wi_rc" -eq 0 ] && grep -q '^az identity show -g memex-aks-rg -n example-portal-mi --query clientId -o tsv$' "$_wi_log" \
-   && printf '%s' "$_wi_up" | grep -q -- '--set selfUpdate.azureClientId=11111111-2222-3333-4444-555555555555' \
-   && printf '%s' "$_wi_tp" | grep -q -- '--set selfUpdate.azureClientId=11111111-2222-3333-4444-555555555555' \
-   && printf '%s' "$_wi_out" | grep -q '::hosting:: portal_identity=11111111-2222-3333-4444-555555555555'; then
+   && grep_in "$_wi_up" -q -- '--set selfUpdate.azureClientId=11111111-2222-3333-4444-555555555555' \
+   && grep_in "$_wi_tp" -q -- '--set selfUpdate.azureClientId=11111111-2222-3333-4444-555555555555' \
+   && grep_in "$_wi_out" -q '::hosting:: portal_identity=11111111-2222-3333-4444-555555555555'; then
   ok "the client id is read from \$AZ_PORTAL_IDENTITY and --set as selfUpdate.azureClientId on the render AND the upgrade"
 else
   bad "the portal identity's client id reaches selfUpdate.azureClientId" "rc=${_wi_rc} upgrade: '${_wi_up}' log: $(cat "$_wi_log") out: ${_wi_out}"
@@ -2967,8 +2991,8 @@ fi
 : > "$_wi_log"
 _wi_out="$(_wi_run AZ_PORTAL_IDENTITY= )"; _wi_rc=$?
 _wi_up="$(grep '^helm upgrade' "$_wi_log" | head -1)"
-if [ "$_wi_rc" -eq 0 ] && [ -n "$_wi_up" ] && ! printf '%s' "$_wi_up" | grep -q -- 'selfUpdate.azureClientId' \
-   && ! grep -q '^az identity' "$_wi_log" && printf '%s' "$_wi_out" | grep -q '::hosting:: portal_identity=none'; then
+if [ "$_wi_rc" -eq 0 ] && [ -n "$_wi_up" ] && ! grep_in "$_wi_up" -q -- 'selfUpdate.azureClientId' \
+   && ! grep -q '^az identity' "$_wi_log" && grep_in "$_wi_out" -q '::hosting:: portal_identity=none'; then
   ok "no AZ_PORTAL_IDENTITY → no azureClientId set, no identity read, and portal_identity=none is said"
 else
   bad "no identity named sets nothing and says so" "rc=${_wi_rc} upgrade: '${_wi_up}' out: ${_wi_out}"
@@ -2976,7 +3000,7 @@ fi
 # An identity that does not exist is a refusal BEFORE helm — never a release with no credential.
 : > "$_wi_log"
 _wi_out="$(_wi_run AZ_PORTAL_IDENTITY=no-such-mi AZ_RESOURCE_GROUP=memex-aks-rg)"; _wi_rc=$?
-if [ "$_wi_rc" -ne 0 ] && printf '%s' "$_wi_out" | grep -q 'could not read the client id of the portal identity no-such-mi' \
+if [ "$_wi_rc" -ne 0 ] && grep_in "$_wi_out" -q 'could not read the client id of the portal identity no-such-mi' \
    && ! grep -q '^helm ' "$_wi_log"; then
   ok "an unreadable portal identity is refused before helm, naming it"
 else
@@ -2985,7 +3009,7 @@ fi
 # A REFUSED read says refused — it ruled nothing out.
 : > "$_wi_log"; : > "$_wi_dir/identity/example-portal-mi.forbidden"
 _wi_out="$(_wi_run AZ_PORTAL_IDENTITY=example-portal-mi AZ_RESOURCE_GROUP=memex-aks-rg)"; _wi_rc=$?
-if [ "$_wi_rc" -ne 0 ] && printf '%s' "$_wi_out" | grep -q 'REFUSED, not absent' && ! grep -q '^helm ' "$_wi_log"; then
+if [ "$_wi_rc" -ne 0 ] && grep_in "$_wi_out" -q 'REFUSED, not absent' && ! grep -q '^helm ' "$_wi_log"; then
   ok "a refused identity read is reported as REFUSED, not absent, before helm"
 else
   bad "a refused identity read is reported as refused" "rc=${_wi_rc} out: ${_wi_out}"
@@ -3003,8 +3027,8 @@ _pf_vals="$_pf_dir/values.yaml"; printf '# GENERATED from the Hosting/Deployment
 printf 'create secretproviderclass.secrets-store.csi.x-k8s.io\npatch deployment.apps\n' > "$_pf_dir/denied.txt"
 _pf_out="$(env PATH="$DP_STUBS:$PATH" HOSTING_CHART=/tmp HOSTING_DEPLOY_FIXTURE="$_pf_dir" HOSTING_DEPLOY_STUB_LOG="$_pf_log" \
   hosting-deploy --namespace memex --release memex --database memex --values "$_pf_vals" --image cr.example.test/memex-portal-ai:1 2>&1)"; _pf_rc=$?
-if [ "$_pf_rc" -ne 0 ] && printf '%s' "$_pf_out" | grep -q 'denied:.*create:secretproviderclass.secrets-store.csi.x-k8s.io' \
-   && printf '%s' "$_pf_out" | grep -q 'denied:.*patch:deployment.apps' && ! grep -q '^helm upgrade' "$_pf_log"; then
+if [ "$_pf_rc" -ne 0 ] && grep_in "$_pf_out" -q 'denied:.*create:secretproviderclass.secrets-store.csi.x-k8s.io' \
+   && grep_in "$_pf_out" -q 'denied:.*patch:deployment.apps' && ! grep -q '^helm upgrade' "$_pf_log"; then
   ok "every denied verb:kind is named in ONE refusal, and helm never runs"
 else
   bad "denied kinds are named before helm" "rc=${_pf_rc} out: ${_pf_out} log: $(cat "$_pf_log")"
@@ -3013,7 +3037,7 @@ fi
 rm -f "$_pf_dir/denied.txt"; printf '{"name":"memex","info":{"status":"pending-upgrade"},"version":41}\n' > "$_pf_dir/status.json"; : > "$_pf_log"
 _pf_out="$(env PATH="$DP_STUBS:$PATH" HOSTING_CHART=/tmp HOSTING_DEPLOY_FIXTURE="$_pf_dir" HOSTING_DEPLOY_STUB_LOG="$_pf_log" \
   hosting-deploy --namespace memex --release memex --database memex --values "$_pf_vals" --image cr.example.test/memex-portal-ai:1 2>&1)"; _pf_rc=$?
-if [ "$_pf_rc" -ne 0 ] && printf '%s' "$_pf_out" | grep -q "is 'pending-upgrade'" && ! grep -q '^helm upgrade' "$_pf_log"; then
+if [ "$_pf_rc" -ne 0 ] && grep_in "$_pf_out" -q "is 'pending-upgrade'" && ! grep -q '^helm upgrade' "$_pf_log"; then
   ok "a pending-* release is refused by name, and helm never runs"
 else
   bad "a pending-* release is refused by name" "rc=${_pf_rc} out: ${_pf_out}"
@@ -3040,8 +3064,8 @@ fi
 printf -- '---\napiVersion: apps/v1\nkind: Deployment\nmetadata: { name: node-headroom-silos }\nspec:\n  template:\n    spec:\n      priorityClassName: "node-headroom"\n' >> "$_pc_dir/rendered.yaml"
 # Absent → refused, naming the class and InfraDeploy, helm never reached.
 : > "$_pc_log"; _pc_out="$(_pc_run)"; _pc_rc=$?
-if [ "$_pc_rc" -ne 0 ] && printf '%s' "$_pc_out" | grep -q 'PriorityClass(es) the cluster does not have: node-headroom' \
-   && printf '%s' "$_pc_out" | grep -q 'apply InfraDeploy first' && ! grep -q '^helm upgrade' "$_pc_log"; then
+if [ "$_pc_rc" -ne 0 ] && grep_in "$_pc_out" -q 'PriorityClass(es) the cluster does not have: node-headroom' \
+   && grep_in "$_pc_out" -q 'apply InfraDeploy first' && ! grep -q '^helm upgrade' "$_pc_log"; then
   ok "an absent referenced PriorityClass is refused by name (apply InfraDeploy first), and helm never runs"
 else
   bad "an absent PriorityClass is refused before helm" "rc=${_pc_rc} out: ${_pc_out} log: $(cat "$_pc_log")"
@@ -3049,7 +3073,7 @@ fi
 # Refused read → REFUSED, not absent.
 mkdir -p "$_pc_dir/priorityclasses"; : > "$_pc_dir/priorityclasses/node-headroom.forbidden"
 : > "$_pc_log"; _pc_out="$(_pc_run)"; _pc_rc=$?
-if [ "$_pc_rc" -ne 0 ] && printf '%s' "$_pc_out" | grep -q 'REFUSED, not absent' && ! printf '%s' "$_pc_out" | grep -q 'does not have' \
+if [ "$_pc_rc" -ne 0 ] && grep_in "$_pc_out" -q 'REFUSED, not absent' && ! grep_in "$_pc_out" -q 'does not have' \
    && ! grep -q '^helm upgrade' "$_pc_log"; then
   ok "a refused PriorityClass read is reported as REFUSED, not absent, before helm"
 else
@@ -3058,7 +3082,7 @@ fi
 # Present → passes the preflight, helm runs.
 rm -f "$_pc_dir/priorityclasses/node-headroom.forbidden"; : > "$_pc_dir/priorityclasses/node-headroom"
 : > "$_pc_log"; _pc_out="$(_pc_run)"; _pc_rc=$?
-if [ "$_pc_rc" -eq 0 ] && printf '%s' "$_pc_out" | grep -q 'PriorityClass node-headroom is present' && grep -q '^helm upgrade' "$_pc_log"; then
+if [ "$_pc_rc" -eq 0 ] && grep_in "$_pc_out" -q 'PriorityClass node-headroom is present' && grep -q '^helm upgrade' "$_pc_log"; then
   ok "a present referenced PriorityClass passes the preflight, and helm runs"
 else
   bad "a present PriorityClass passes" "rc=${_pc_rc} out: ${_pc_out} log: $(cat "$_pc_log")"
@@ -3215,7 +3239,7 @@ ma check --manifest demo/good.yaml
 [ "$_ma_rc" -eq 0 ] && case "$_ma_out" in *"::hosting:: manifest_digest=sha256:${_ma_good}"*"::hosting:: manifest_objects=4"*"::hosting:: manifest_check=sha256:${_ma_good}"*) true ;; *) false ;; esac \
   && ok "check prints the digest, the objects and the server's dry-run answer" || bad "check" "rc ${_ma_rc}: ${_ma_out}"
 case "$_ma_log" in *"apply --dry-run=server"*) ;; *) bad "check asks the server for a DRY RUN" "kubectl saw: ${_ma_log}" ;; esac
-if printf '%s\n' "$_ma_log" | grep -q '^kubectl apply -f'; then bad "check never sends a real apply" "kubectl saw: ${_ma_log}"; else ok "check never sends a real apply"; fi
+if grep_in "$_ma_log" -q '^kubectl apply -f'; then bad "check never sends a real apply" "kubectl saw: ${_ma_log}"; else ok "check never sends a real apply"; fi
 ma apply --manifest demo/good.yaml --sha256 "sha256:${_ma_good}"
 [ "$_ma_rc" -eq 0 ] && case "$_ma_out" in *"::hosting:: manifest_applied=demo/good.yaml@sha256:${_ma_good}"*) true ;; *) false ;; esac \
   && ok "apply with the approved digest applies and reports what it applied" || bad "apply" "rc ${_ma_rc}: ${_ma_out}"
@@ -3241,7 +3265,7 @@ ma_tok() {  # ma_tok <env…>: check demo/good.yaml (its token Secret binds Serv
 }
 ma_tok MW_LIVE_TOKEN_SA=hosting-jobrunner
 [ "$_ma_rc" -ne 0 ] && case "$_ma_out" in *"already holds a token for ServiceAccount 'hosting-jobrunner'"*) true ;; *) false ;; esac \
-  && ! printf '%s\n' "$_ma_log" | grep -q 'apply' \
+  && ! grep_in "$_ma_log" -q 'apply' \
   && ok "a token Secret already filled for ANOTHER account is refused — an apply would keep the old token" || bad "foreign token" "rc ${_ma_rc}; kubectl: ${_ma_log}; ${_ma_out}"
 ma_tok MW_LIVE_TOKEN_SA=example
 [ "$_ma_rc" -eq 0 ] && case "$_ma_out" in *"exists, bound to example"*) true ;; *) false ;; esac \
@@ -3268,17 +3292,17 @@ if [ "$_ma_rc" -eq 0 ] \
    && printf '%s' "$_ma_sent" | jq -e '[.items[] | .kind] | sort == ["ClusterRole","Namespace","RoleBinding"]' >/dev/null 2>&1; then
   ok "a namespace the file creates is new: its objects are deferred by name, everything else is dry-run by the server"
 else bad "new namespace deferral" "rc ${_ma_rc}; sent: ${_ma_sent}; ${_ma_out}"; fi
-if printf '%s\n' "$_ma_log" | grep -q '^kubectl apply -f'; then bad "…and the check still sends no real apply" "kubectl saw: ${_ma_log}"; else ok "…and the check still sends no real apply"; fi
+if grep_in "$_ma_log" -q '^kubectl apply -f'; then bad "…and the check still sends no real apply" "kubectl saw: ${_ma_log}"; else ok "…and the check still sends no real apply"; fi
 # The same file once the namespace exists: nothing is deferred and the FILE itself goes to the server.
 ma_nsfile MW_LIVE_NS=fresh
-if [ "$_ma_rc" -eq 0 ] && case "$_ma_out" in *"deferred"*) false ;; *) true ;; esac && printf '%s' "$_ma_sent" | grep -q '^kind: Namespace # fixture'; then
+if [ "$_ma_rc" -eq 0 ] && case "$_ma_out" in *"deferred"*) false ;; *) true ;; esac && grep_in "$_ma_sent" -q '^kind: Namespace # fixture'; then
   ok "an existing namespace defers nothing — the file is dry-run whole"
 else bad "existing namespace" "rc ${_ma_rc}; sent: ${_ma_sent}; ${_ma_out}"; fi
 ma_refuses() {  # ma_refuses <what> <phrase> <parsed json>
   ma_fixture bad "kind: x" "$3"
   ma check --manifest demo/bad.yaml
   if [ "$_ma_rc" -ne 0 ] && case "$_ma_out" in *"$2"*) true ;; *) false ;; esac \
-     && ! printf '%s\n' "$_ma_log" | grep -q '^kubectl apply'; then ok "$1"; else bad "$1" "rc ${_ma_rc}; kubectl: ${_ma_log}; ${_ma_out}"; fi
+     && ! grep_in "$_ma_log" -q '^kubectl apply'; then ok "$1"; else bad "$1" "rc ${_ma_rc}; kubectl: ${_ma_log}; ${_ma_out}"; fi
 }
 ma_refuses "a kind outside the lane's set is refused (a Deployment)" "kind Deployment is not one this lane applies" '{"kind":"Deployment","metadata":{"name":"d","namespace":"n"}}'
 ma_refuses "a Secret carrying data is refused" "carries data" '{"kind":"Secret","type":"kubernetes.io/service-account-token","metadata":{"name":"s"},"data":{"k":"dg=="}}'
@@ -3342,7 +3366,7 @@ md "$_md_live_all" -- check --manifest demo/jobpath.yaml --object ServiceAccount
   && ok "check: the plan is the manifest's objects plus the explicit one, and its digest is the canonical plan's" || bad "delete check" "rc ${_md_rc}: ${_md_out}"
 case "$_md_out" in *"absent    ValidatingAdmissionPolicyBinding runner-fence"*"present   Namespace ops"*) ok "…naming each object present or absent" ;; *) bad "present/absent lines" "${_md_out}" ;; esac
 case "$_md_out" in *"contains  ops: serviceaccounts/runner — deleted with the namespace"*) ok "…and what a namespace delete takes with it" ;; *) bad "namespace contents" "${_md_out}" ;; esac
-if printf '%s\n' "$_md_log" | grep -v -- '--dry-run' | grep -q ' delete '; then bad "check never deletes" "kubectl saw: ${_md_log}"
+if grep_in "$(grep_in "$_md_log" -v -- '--dry-run')" -q ' delete '; then bad "check never deletes" "kubectl saw: ${_md_log}"
 elif [ "$_md_live" != "$_md_live_all" ]; then bad "check never deletes" "the cluster changed: ${_md_live}"
 else ok "check never deletes — the only deletes it sends are server dry runs"; fi
 md "$_md_live_all" -- check --object ServiceAccount/portal/stray --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray
@@ -3353,7 +3377,7 @@ md "$_md_live_all" -- delete --manifest demo/jobpath.yaml --object ServiceAccoun
   && ok "delete with the approved digest deletes and reads every object back absent" || bad "delete" "rc ${_md_rc}: ${_md_out}"
 if [ "$_md_live" = 'serviceaccounts portal keep-me' ]; then ok "…leaving exactly what the plan does not name"
 else bad "what the delete left" "live: ${_md_live}"; fi
-_md_order="$(printf '%s\n' "$_md_log" | grep -- '--wait=true' | sed 's/^kubectl //; s/^-n [^ ]* //' | cut -d' ' -f2 | tr '\n' ' ')"
+_md_order="$(grep_in "$_md_log" -- '--wait=true' | sed 's/^kubectl //; s/^-n [^ ]* //' | cut -d' ' -f2 | tr '\n' ' ')"
 case "$_md_order" in "rolebindings.rbac.authorization.k8s.io roles.rbac.authorization.k8s.io secrets serviceaccounts serviceaccounts validatingadmissionpolicies.admissionregistration.k8s.io namespaces ")
   ok "…in dependency order: bindings, roles, tokens, accounts, policies, the namespace LAST — and nothing absent is deleted" ;;
   *) bad "delete order" "deleted: ${_md_order}" ;; esac
@@ -3363,7 +3387,7 @@ md "$_md_live_all" -- delete --manifest demo/jobpath.yaml
   && ok "delete without a digest is refused before kubectl is asked anything" || bad "delete without digest" "rc ${_md_rc}; kubectl: ${_md_log}; ${_md_out}"
 md "$_md_live_all" -- delete --manifest demo/jobpath.yaml --sha256 "sha256:${_md_digest}"
 if [ "$_md_rc" -ne 0 ] && case "$_md_out" in *"not the objects that were approved"*) true ;; *) false ;; esac \
-   && ! printf '%s\n' "$_md_log" | grep -q ' delete ' && [ "$_md_live" = "$_md_live_all" ]; then
+   && ! grep_in "$_md_log" -q ' delete ' && [ "$_md_live" = "$_md_live_all" ]; then
   ok "a plan that is not the approved one (an object fewer) is refused, nothing deleted"
 else bad "digest mismatch" "rc ${_md_rc}; kubectl: ${_md_log}; ${_md_out}"; fi
 
@@ -3377,7 +3401,7 @@ md "$_md_live_all" MW_MD_DENY_DELETE=ops -- delete --manifest demo/jobpath.yaml 
 [ "$_md_rc" -ne 0 ] && [ "$_md_live" = "$_md_live_all" ] && case "$_md_out" in *"would not admit deleting Namespace ops"*) true ;; *) false ;; esac \
   && ok "a delete the server would not admit stops the run before anything is deleted" || bad "server refusal" "rc ${_md_rc}; live: ${_md_live}; ${_md_out}"
 md "" -- delete --manifest demo/jobpath.yaml --object ServiceAccount/portal/stray --sha256 "$_md_digest"
-[ "$_md_rc" -eq 0 ] && ! printf '%s\n' "$_md_log" | grep -q -- '--wait=true' && case "$_md_out" in *"deletion_present=0"*"deletion_absent=8"*) true ;; *) false ;; esac \
+[ "$_md_rc" -eq 0 ] && ! grep_in "$_md_log" -q -- '--wait=true' && case "$_md_out" in *"deletion_present=0"*"deletion_absent=8"*) true ;; *) false ;; esac \
   && ok "a plan already gone deletes nothing and still verifies every object absent (a re-run is safe)" || bad "already gone" "rc ${_md_rc}; ${_md_out}"
 
 # 🚨 THE KEPT WRITER PATH (Memex#314): every object of secret-writer.yaml is refused, whatever names it,
@@ -3396,7 +3420,7 @@ md_fixture writer \
 {"kind":"ServiceAccount","metadata":{"name":"hosting-secret-jobrunner","namespace":"control"}}'
 md "" -- check --manifest demo/writer.yaml
 [ "$_md_rc" -ne 0 ] && case "$_md_out" in *"refused   Namespace memex-secrets: KEPT"*"refused   ServiceAccount control/hosting-secret-jobrunner: KEPT"*) true ;; *) false ;; esac \
-  && ! printf '%s\n' "$_md_log" | grep -q ' get ' \
+  && ! grep_in "$_md_log" -q ' get ' \
   && ok "…and so is a manifest naming them (the namespace included), before the cluster is read" || bad "kept via manifest" "rc ${_md_rc}; ${_md_out}"
 # Negative control: the deny list is exact — the retired job-runner in the old portal namespace, and a
 # differently named token in control's namespace, are deletable.
@@ -3625,9 +3649,9 @@ _mg_run() { env PATH="$MG_STUBS:$PATH" HOSTING_MIGRATE_FIXTURE="$_mg_dir" HOSTIN
 # absent → created from the release's Job, retargeted, waited on, completed
 _mg_new; echo 2 > "$_mg_dir/polls"; echo succeeded > "$_mg_dir/outcome"
 _mg_out="$(_mg_run env)"; _mg_rc=$?
-if [ "$_mg_rc" -eq 0 ] && printf '%s' "$_mg_out" | grep -q "::hosting:: migration_job=${_mg_job}" \
-   && printf '%s' "$_mg_out" | grep -q '::hosting:: migration=completed' \
-   && printf '%s' "$_mg_out" | grep -q 'Database migration completed. Version: 57'; then
+if [ "$_mg_rc" -eq 0 ] && grep_in "$_mg_out" -q "::hosting:: migration_job=${_mg_job}" \
+   && grep_in "$_mg_out" -q '::hosting:: migration=completed' \
+   && grep_in "$_mg_out" -q 'Database migration completed. Version: 57'; then
   ok "an absent Job is created, waited on, and only then reported completed"
 else
   bad "an absent Job is created, waited on and reported completed" "rc=${_mg_rc} out: ${_mg_out}"
@@ -3660,7 +3684,7 @@ rm -rf "$_mg_dir"
 # already succeeded for this tag → reported, never re-run
 _mg_new; echo succeeded > "$_mg_dir/job-state"
 _mg_out="$(_mg_run env)"; _mg_rc=$?
-if [ "$_mg_rc" -eq 0 ] && printf '%s' "$_mg_out" | grep -q '::hosting:: migration=completed' && ! grep -q ' create -f -' "$_mg_log"; then
+if [ "$_mg_rc" -eq 0 ] && grep_in "$_mg_out" -q '::hosting:: migration=completed' && ! grep -q ' create -f -' "$_mg_log"; then
   ok "a Job that already SUCCEEDED for this tag is reported, not run again"
 else
   bad "an already-succeeded Job is not run again" "rc=${_mg_rc} log: $(cat "$_mg_log")"
@@ -3682,8 +3706,8 @@ rm -rf "$_mg_dir"
 # the Job fails → non-zero, names the Job, says the image must not move, never "completed"
 _mg_new; echo 1 > "$_mg_dir/polls"; echo failed > "$_mg_dir/outcome"
 _mg_out="$(_mg_run env)"; _mg_rc=$?
-if [ "$_mg_rc" -ne 0 ] && printf '%s' "$_mg_out" | grep -q "${_mg_job} FAILED" \
-   && printf '%s' "$_mg_out" | grep -q 'must not either' && ! printf '%s' "$_mg_out" | grep -q 'migration=completed'; then
+if [ "$_mg_rc" -ne 0 ] && grep_in "$_mg_out" -q "${_mg_job} FAILED" \
+   && grep_in "$_mg_out" -q 'must not either' && ! grep_in "$_mg_out" -q 'migration=completed'; then
   ok "a FAILED migration exits non-zero, names the Job, and never reports completed"
 else
   bad "a failed migration is a failed step" "rc=${_mg_rc} out: ${_mg_out}"
@@ -3694,7 +3718,7 @@ rm -rf "$_mg_dir"
 _mg_new; echo hang > "$_mg_dir/outcome"
 jq '(.items[] | select(.kind=="Job") | .spec.activeDeadlineSeconds) = 3' "$MG_FIXTURES/rendered.json" > "$_mg_dir/rendered.json"
 _mg_out="$(_mg_run env)"; _mg_rc=$?
-if [ "$_mg_rc" -ne 0 ] && printf '%s' "$_mg_out" | grep -q 'has not completed after' && ! printf '%s' "$_mg_out" | grep -q 'migration=completed'; then
+if [ "$_mg_rc" -ne 0 ] && grep_in "$_mg_out" -q 'has not completed after' && ! grep_in "$_mg_out" -q 'migration=completed'; then
   ok "a migration still running past its own budget is a failed step, not a pass"
 else
   bad "a migration past its budget fails" "rc=${_mg_rc} out: ${_mg_out}"
@@ -3704,7 +3728,7 @@ rm -rf "$_mg_dir"
 # REFUSED is not ABSENT: a Forbidden on the Job read stops before anything is created
 _mg_new; echo forbidden > "$_mg_dir/job-state"
 _mg_out="$(_mg_run env)"; _mg_rc=$?
-if [ "$_mg_rc" -ne 0 ] && printf '%s' "$_mg_out" | grep -q 'REFUSED, not absent' && ! grep -q ' create -f -' "$_mg_log"; then
+if [ "$_mg_rc" -ne 0 ] && grep_in "$_mg_out" -q 'REFUSED, not absent' && ! grep -q ' create -f -' "$_mg_log"; then
   ok "a Forbidden on the Job read is REFUSED (not absent) and nothing is created"
 else
   bad "a Forbidden job read is refused" "rc=${_mg_rc} out: ${_mg_out} log: $(cat "$_mg_log")"
@@ -3714,7 +3738,7 @@ rm -rf "$_mg_dir"
 # a release that renders no migration Job → refusal, nothing created
 _mg_new; jq '.items |= map(select(.kind != "Job"))' "$MG_FIXTURES/rendered.json" > "$_mg_dir/rendered.json"
 _mg_out="$(_mg_run env)"; _mg_rc=$?
-if [ "$_mg_rc" -ne 0 ] && printf '%s' "$_mg_out" | grep -q 'renders no migration Job' && ! grep -q ' create -f -' "$_mg_log"; then
+if [ "$_mg_rc" -ne 0 ] && grep_in "$_mg_out" -q 'renders no migration Job' && ! grep -q ' create -f -' "$_mg_log"; then
   ok "a release with no migration Job is a refusal — the image must not move without one"
 else
   bad "a release with no migration Job refuses" "rc=${_mg_rc} out: ${_mg_out}"
@@ -3728,7 +3752,7 @@ _mg_new; jq '(.items[] | select(.kind=="Job") | .spec.template.spec | .container
   "$MG_FIXTURES/rendered.json" > "$_mg_dir/rendered.json"; echo succeeded > "$_mg_dir/outcome"
 _mg_out="$(_mg_run env)"; _mg_rc=$?
 _mg_c="$_mg_dir/created.json"
-if [ "$_mg_rc" -eq 0 ] && printf '%s' "$_mg_out" | grep -q '::hosting:: migration=completed' && [ -f "$_mg_c" ] \
+if [ "$_mg_rc" -eq 0 ] && grep_in "$_mg_out" -q '::hosting:: migration=completed' && [ -f "$_mg_c" ] \
    && [ "$(jq -r '.spec.template.spec.containers[0].image' "$_mg_c")" = "$_mg_img" ] \
    && [ "$(jq -r '.spec.template.spec.initContainers[] | select(.name=="memex-migration-rehearsal") | .image' "$_mg_c")" = "$_mg_img" ] \
    && [ "$(jq -r '.spec.template.spec.initContainers[] | select(.name=="wait-for-postgres") | .image' "$_mg_c")" = "busybox:1.36" ]; then
@@ -3741,7 +3765,7 @@ rm -rf "$_mg_dir"
 _mg_new; jq '(.items[] | select(.kind=="Job") | .spec.template.spec) |= (.containers[0].name = "something-else" | .containers[0].image = "cr.example.test/memex-control:1" | .initContainers |= map(select(.name != "memex-migration-rehearsal")))' \
   "$MG_FIXTURES/rendered.json" > "$_mg_dir/rendered.json"
 _mg_out="$(_mg_run env)"; _mg_rc=$?
-if [ "$_mg_rc" -ne 0 ] && printf '%s' "$_mg_out" | grep -q 'nothing to retarget' && ! grep -q ' create -f -' "$_mg_log"; then
+if [ "$_mg_rc" -ne 0 ] && grep_in "$_mg_out" -q 'nothing to retarget' && ! grep -q ' create -f -' "$_mg_log"; then
   ok "a Job with no migration container (by image or by name) still refuses — nothing else runs as the migration"
 else
   bad "a Job with no migration container refuses" "rc=${_mg_rc} out: ${_mg_out}"
@@ -3751,7 +3775,7 @@ rm -rf "$_mg_dir"
 # no release at all → refusal naming helm's answer
 _mg_new; rm -f "$_mg_dir/manifest.yaml"
 _mg_out="$(_mg_run env)"; _mg_rc=$?
-[ "$_mg_rc" -ne 0 ] && printf '%s' "$_mg_out" | grep -q 'has no readable manifest' \
+[ "$_mg_rc" -ne 0 ] && grep_in "$_mg_out" -q 'has no readable manifest' \
   && ok "a release helm cannot find is a refusal naming helm's answer" \
   || bad "a missing release refuses" "rc=${_mg_rc} out: ${_mg_out}"
 rm -rf "$_mg_dir"
@@ -3759,8 +3783,8 @@ rm -rf "$_mg_dir"
 # dry run: reads, narrates the create, creates nothing, waits for nothing
 _mg_new
 _mg_out="$(_mg_run env HOSTING_DRY_RUN=true)"; _mg_rc=$?
-if [ "$_mg_rc" -eq 0 ] && printf '%s' "$_mg_out" | grep -q 'DRY-RUN would run: kubectl -n fabrikam create -f -' \
-   && [ ! -f "$_mg_dir/created.json" ] && ! printf '%s' "$_mg_out" | grep -q 'migration=completed'; then
+if [ "$_mg_rc" -eq 0 ] && grep_in "$_mg_out" -q 'DRY-RUN would run: kubectl -n fabrikam create -f -' \
+   && [ ! -f "$_mg_dir/created.json" ] && ! grep_in "$_mg_out" -q 'migration=completed'; then
   ok "a dry run narrates the Job, creates nothing and claims no migration"
 else
   bad "a dry run creates nothing" "rc=${_mg_rc} out: ${_mg_out}"
@@ -3789,7 +3813,7 @@ _mg_tag_run() { env PATH="$MG_STUBS:$PATH" HOSTING_MIGRATE_FIXTURE="$_mg_dir" HO
   hosting-migrate --namespace fabrikam --tag 3.0.0-ci.9101 2>&1; }
 _mg_new; echo fabrikam > "$_mg_dir/release-name"; echo 1 > "$_mg_dir/polls"; echo succeeded > "$_mg_dir/outcome"
 _mg_out="$(_mg_tag_run env)"; _mg_rc=$?
-if [ "$_mg_rc" -eq 0 ] && printf '%s' "$_mg_out" | grep -q '::hosting:: migration=completed' \
+if [ "$_mg_rc" -eq 0 ] && grep_in "$_mg_out" -q '::hosting:: migration=completed' \
    && grep -q '^helm get manifest fabrikam --namespace fabrikam' "$_mg_log" \
    && [ "$(jq -r '.spec.template.spec.containers[0].image' "$_mg_dir/created.json")" = "$_mg_img" ] \
    && [ "$(jq -r '.metadata.name' "$_mg_dir/created.json")" = "$_mg_job" ]; then
@@ -3800,7 +3824,7 @@ fi
 rm -rf "$_mg_dir"
 _mg_new; echo forbidden > "$_mg_dir/release-name"
 _mg_out="$(_mg_tag_run env)"; _mg_rc=$?
-if [ "$_mg_rc" -ne 0 ] && printf '%s' "$_mg_out" | grep -q 'REFUSED, not absent' && ! grep -q '^helm ' "$_mg_log"; then
+if [ "$_mg_rc" -ne 0 ] && grep_in "$_mg_out" -q 'REFUSED, not absent' && ! grep -q '^helm ' "$_mg_log"; then
   ok "--tag: a Forbidden on the release read is REFUSED (not 'no release'), and nothing else runs"
 else
   bad "--tag: a Forbidden release read is refused" "rc=${_mg_rc} out: ${_mg_out}"
@@ -3808,7 +3832,7 @@ fi
 rm -rf "$_mg_dir"
 _mg_new
 _mg_out="$(_mg_tag_run env)"; _mg_rc=$?
-if [ "$_mg_rc" -ne 0 ] && printf '%s' "$_mg_out" | grep -q 'cannot establish the helm release' && ! grep -q ' create -f -' "$_mg_log"; then
+if [ "$_mg_rc" -ne 0 ] && grep_in "$_mg_out" -q 'cannot establish the helm release' && ! grep -q ' create -f -' "$_mg_log"; then
   ok "--tag: a Deployment with no helm release is a refusal — the image must not move"
 else
   bad "--tag: no release is a refusal" "rc=${_mg_rc} out: ${_mg_out}"
@@ -3828,7 +3852,7 @@ _mg_del="$(grep -n "delete job ${_mg_job}" "$_mg_log" | head -1 | cut -d: -f1)"
 _mg_create="$(grep -n ' create -f -' "$_mg_log" | head -1 | cut -d: -f1)"
 if [ "$_mg_rc" -eq 0 ] && [ -n "$_mg_del" ] && [ -n "$_mg_create" ] && [ "$_mg_del" -lt "$_mg_create" ] \
    && [ "$(jq -r '.spec.template.spec.containers[0].image' "$_mg_dir/created.json")" = "$_mg_img" ] \
-   && printf '%s' "$_mg_out" | grep -q '::hosting:: migration=completed'; then
+   && grep_in "$_mg_out" -q '::hosting:: migration=completed'; then
   ok "--current --fresh: a Job that SUCCEEDED against the replaced database is deleted and run again at the RUNNING tag"
 else
   bad "--current --fresh re-runs the succeeded Job at the running tag" "rc=${_mg_rc} out: ${_mg_out} log: $(cat "$_mg_log")"
@@ -3846,7 +3870,7 @@ fi
 rm -rf "$_mg_dir"
 _mg_new; echo forbidden > "$_mg_dir/portal-image"
 _mg_out="$(_mg_cur_run env)"; _mg_rc=$?
-if [ "$_mg_rc" -ne 0 ] && printf '%s' "$_mg_out" | grep -q 'REFUSED, not absent' && ! grep -q '^helm ' "$_mg_log"; then
+if [ "$_mg_rc" -ne 0 ] && grep_in "$_mg_out" -q 'REFUSED, not absent' && ! grep -q '^helm ' "$_mg_log"; then
   ok "--current: a Forbidden on the portal image read is REFUSED, and nothing else runs"
 else
   bad "--current: a Forbidden image read is refused" "rc=${_mg_rc} out: ${_mg_out}"
@@ -3854,7 +3878,7 @@ fi
 rm -rf "$_mg_dir"
 _mg_new; echo "cr.example.test/memex-portal-ai" > "$_mg_dir/portal-image"
 _mg_out="$(_mg_cur_run env)"; _mg_rc=$?
-if [ "$_mg_rc" -ne 0 ] && printf '%s' "$_mg_out" | grep -q 'names no tag' && ! grep -q ' create -f -' "$_mg_log"; then
+if [ "$_mg_rc" -ne 0 ] && grep_in "$_mg_out" -q 'names no tag' && ! grep -q ' create -f -' "$_mg_log"; then
   ok "--current: a portal image with no tag is a refusal — no tag is guessed"
 else
   bad "--current: an untagged image refuses" "rc=${_mg_rc} out: ${_mg_out}"
@@ -3881,8 +3905,8 @@ Hand rollout to control plane	echo handed")")"; _il_rc=$?
 _il_m="$(grep -n '^hosting-migrate --namespace memex --tag 3.0.0-ci.9332$' "$_il_log" | head -1 | cut -d: -f1)"
 _il_s="$(grep -n 'set image' "$_il_log" | head -1 | cut -d: -f1)"
 if [ "$_il_rc" -eq 0 ] && [ -n "$_il_m" ] && [ -n "$_il_s" ] && [ "$_il_m" -lt "$_il_s" ] \
-   && printf '%s' "$_il_out" | grep -q '3 step(s)' \
-   && printf '%s' "$_il_out" | grep -q '::hosting:: migrate_interlock=1:memex:3.0.0-ci.9332'; then
+   && grep_in "$_il_out" -q '3 step(s)' \
+   && grep_in "$_il_out" -q '::hosting:: migrate_interlock=1:memex:3.0.0-ci.9332'; then
   ok "an image-only plan gets the target tag's migration BEFORE the image moves, and says so"
 else
   bad "the interlock migrates before an image-only set image" "rc=${_il_rc} out: ${_il_out} log: $(cat "$_il_log")"
@@ -3892,7 +3916,7 @@ rm -f "$_il_log"
 _il_log="$(mktemp)"
 _il_out="$(_il_run HOSTING_PLAN="$(plan "Run the database migration	hosting-migrate --namespace memex --release memex --image cr.example.test/memex-migration:3.0.0-ci.9332
 Set the portal image	${_il_set}")")"; _il_rc=$?
-if [ "$_il_rc" -eq 0 ] && [ "$(grep -c '^hosting-migrate' "$_il_log")" = "1" ] && ! printf '%s' "$_il_out" | grep -q 'migrate_interlock'; then
+if [ "$_il_rc" -eq 0 ] && [ "$(grep -c '^hosting-migrate' "$_il_log")" = "1" ] && ! grep_in "$_il_out" -q 'migrate_interlock'; then
   ok "a plan that already migrates the same tag first is untouched (exactly one migration)"
 else
   bad "a migrate-first plan is untouched" "rc=${_il_rc} out: ${_il_out} log: $(cat "$_il_log")"
@@ -3911,7 +3935,7 @@ rm -f "$_il_log"
 # 4. the interlock's migration FAILS → the image never moves, and the refusal names the policy
 _il_log="$(mktemp)"
 _il_out="$(_il_run HOSTING_INTERLOCK_MIGRATE_FAILS=true HOSTING_PLAN="$(plan "Set the portal image	${_il_set}")")"; _il_rc=$?
-if [ "$_il_rc" -ne 0 ] && ! grep -q 'set image' "$_il_log" && printf '%s' "$_il_out" | grep -q 'roll-migrates-first'; then
+if [ "$_il_rc" -ne 0 ] && ! grep -q 'set image' "$_il_log" && grep_in "$_il_out" -q 'roll-migrates-first'; then
   ok "a failed interlock migration stops the run BEFORE the image moves, naming the policy"
 else
   bad "a failed interlock migration stops the run" "rc=${_il_rc} out: ${_il_out} log: $(cat "$_il_log")"
@@ -3920,7 +3944,7 @@ rm -f "$_il_log"
 # 5. a portal image move the interlock cannot place (no namespace) is refused with nothing run
 _il_log="$(mktemp)"
 _il_out="$(_il_run HOSTING_PLAN="$(plan "Set the portal image	kubectl set image deployment/memex-portal-deployment memex-portal=cr.example.test/memex-portal-ai:3.0.0-ci.9332")")"; _il_rc=$?
-if [ "$_il_rc" -ne 0 ] && [ ! -s "$_il_log" ] && printf '%s' "$_il_out" | grep -q 'cannot place it'; then
+if [ "$_il_rc" -ne 0 ] && [ ! -s "$_il_log" ] && grep_in "$_il_out" -q 'cannot place it'; then
   ok "an image move whose namespace cannot be read is refused, and nothing runs"
 else
   bad "an unplaceable image move is refused" "rc=${_il_rc} out: ${_il_out} log: $(cat "$_il_log")"
@@ -3931,7 +3955,7 @@ rm -f "$_il_log"
 _il_log="$(mktemp)"
 _il_out="$(_il_run HOSTING_INTERLOCK_INIT_CONTAINERS="wait-for-postgres bundle-identity bundle-fetch" HOSTING_PLAN="$(plan "Set the portal image	${_il_set}")")"; _il_rc=$?
 if [ "$_il_rc" -eq 0 ] && [ "$(grep -c 'set image' "$_il_log")" = "1" ] \
-   && grep 'set image' "$_il_log" | grep -q 'memex-portal=cr.example.test/memex-portal-ai:3.0.0-ci.9332 bundle-identity=cr.example.test/memex-portal-ai:3.0.0-ci.9332$'; then
+   && grep_in "$(grep 'set image' "$_il_log")" -q 'memex-portal=cr.example.test/memex-portal-ai:3.0.0-ci.9332 bundle-identity=cr.example.test/memex-portal-ai:3.0.0-ci.9332$'; then
   ok "a portal image move carries the bundle-identity init container with it, in ONE set image (#6052)"
 else
   bad "the bundle-identity init container moves with the portal image" "rc=${_il_rc} out: ${_il_out} log: $(cat "$_il_log")"
@@ -3940,7 +3964,7 @@ rm -f "$_il_log"
 # 6b. …and a Deployment without that container (bundles off) gets the plan's set image unchanged
 _il_log="$(mktemp)"
 _il_out="$(_il_run HOSTING_INTERLOCK_INIT_CONTAINERS="wait-for-postgres" HOSTING_PLAN="$(plan "Set the portal image	${_il_set}")")"; _il_rc=$?
-if [ "$_il_rc" -eq 0 ] && grep 'set image' "$_il_log" | grep -q 'memex-portal=cr.example.test/memex-portal-ai:3.0.0-ci.9332$'; then
+if [ "$_il_rc" -eq 0 ] && grep_in "$(grep 'set image' "$_il_log")" -q 'memex-portal=cr.example.test/memex-portal-ai:3.0.0-ci.9332$'; then
   ok "without a bundle-identity init container the plan's set image runs unchanged"
 else
   bad "no bundle-identity: set image unchanged" "rc=${_il_rc} log: $(cat "$_il_log")"
@@ -3949,7 +3973,7 @@ rm -f "$_il_log"
 # 6c. an unreadable Deployment is a refusal: the image does not move on a guess
 _il_log="$(mktemp)"
 _il_out="$(_il_run HOSTING_INTERLOCK_GET_FAILS=true HOSTING_PLAN="$(plan "Set the portal image	${_il_set}")")"; _il_rc=$?
-if [ "$_il_rc" -ne 0 ] && ! grep -q 'set image' "$_il_log" && printf '%s' "$_il_out" | grep -q 'MeshWeaver#6052'; then
+if [ "$_il_rc" -ne 0 ] && ! grep -q 'set image' "$_il_log" && grep_in "$_il_out" -q 'MeshWeaver#6052'; then
   ok "an unreadable portal Deployment stops the run before the image moves, naming #6052"
 else
   bad "an unreadable Deployment is a refusal" "rc=${_il_rc} out: ${_il_out} log: $(cat "$_il_log")"
@@ -3958,7 +3982,7 @@ rm -f "$_il_log"
 # 6. a dry run narrates the interlock's step and runs nothing
 _il_log="$(mktemp)"
 _il_out="$(_il_run HOSTING_DRY_RUN=true HOSTING_PLAN="$(plan "Set the portal image	${_il_set}")")"; _il_rc=$?
-if [ "$_il_rc" -eq 0 ] && [ ! -s "$_il_log" ] && printf '%s' "$_il_out" | grep -q 'DRY-RUN would run: hosting-migrate --namespace memex --tag 3.0.0-ci.9332'; then
+if [ "$_il_rc" -eq 0 ] && [ ! -s "$_il_log" ] && grep_in "$_il_out" -q 'DRY-RUN would run: hosting-migrate --namespace memex --tag 3.0.0-ci.9332'; then
   ok "a dry run narrates the interlock's migration and runs nothing"
 else
   bad "a dry run narrates the interlock" "rc=${_il_rc} out: ${_il_out}"
@@ -3996,7 +4020,7 @@ else
 fi
 : > "$_md_log"; touch "$_md_dir/migrate-fails"
 _md_out="$(_md_run --image cr.example.test/memex-portal-ai:3.0.0-ci.9332)"; _md_rc=$?
-if [ "$_md_rc" -ne 0 ] && ! grep -q '^helm upgrade' "$_md_log" && printf '%s' "$_md_out" | grep -q 'helm upgrade NOT run'; then
+if [ "$_md_rc" -ne 0 ] && ! grep -q '^helm upgrade' "$_md_log" && grep_in "$_md_out" -q 'helm upgrade NOT run'; then
   ok "a failed migration stops the upgrade before helm — the image does not move"
 else
   bad "a failed migration stops the upgrade" "rc=${_md_rc} out: ${_md_out} log: $(cat "$_md_log")"
@@ -4081,7 +4105,7 @@ if [ "$(_au_issued)" = "0" ]; then ok "facts issues nothing"; else bad "facts is
 
 _au_new; touch "$_au_fix/metrics-forbidden"
 _au_facts="$(_au facts | sed -n 's/.*::hosting:: aks_facts=//p' | base64 -d 2>/dev/null)"
-if [ "$(jq -r '.deprecatedApis.read' <<<"$_au_facts")" = "false" ] && jq -r '.deprecatedApis.error' <<<"$_au_facts" | grep -q Forbidden; then
+if [ "$(jq -r '.deprecatedApis.read' <<<"$_au_facts")" = "false" ] && grep_in "$(jq -r '.deprecatedApis.error' <<<"$_au_facts")" -q Forbidden; then
   ok "an unreadable deprecated-API metric is carried as UNREAD with its error — never as 'none in use'"
 else
   bad "an unreadable deprecated-API metric is carried as UNREAD" "${_au_facts}"
@@ -4089,7 +4113,7 @@ fi
 
 _au_new; touch "$_au_fix/versions-forbidden"
 _au_facts="$(_au facts | sed -n 's/.*::hosting:: aks_facts=//p' | base64 -d 2>/dev/null)"
-if [ "$(jq -r '.versionsRead' <<<"$_au_facts")" = "false" ] && jq -r '.versionsError' <<<"$_au_facts" | grep -q AuthorizationFailed \
+if [ "$(jq -r '.versionsRead' <<<"$_au_facts")" = "false" ] && grep_in "$(jq -r '.versionsError' <<<"$_au_facts")" -q AuthorizationFailed \
    && [ "$(jq -r '.versions | length' <<<"$_au_facts")" = "0" ] && [ "$(jq -r '.controlPlaneUpgrades[-1]' <<<"$_au_facts")" = "1.35.7" ]; then
   ok "an unreadable REGION version graph (a subscription-scope read) is carried as UNREAD — the cluster's own upgrades still read"
 else
@@ -4109,11 +4133,11 @@ emits "gate --strict passes a converged, healthy cluster" "::hosting:: aks_gate=
 
 _au_new; _au_stuck "2099-01-01T00:00:00Z"
 _au_out="$(_au gate --strict --budget-seconds 5)"; _au_rc=$?
-if [ "$_au_rc" -ne 0 ] && printf '%s' "$_au_out" | grep -q "STUCK ROLL memex/memex-portal-deployment" \
-   && printf '%s' "$_au_out" | grep -q "template names cr.example.test/memex-portal-ai:3.0.0-ci.9260" \
-   && printf '%s' "$_au_out" | grep -q "serve cr.example.test/memex-portal-ai:3.0.0-ci.9218" \
-   && printf '%s' "$_au_out" | grep -q "refused before anything changed" \
-   && ! printf '%s' "$_au_out" | grep -q "::hosting:: aks_gate=" && [ "$(_au_issued)" = "0" ]; then
+if [ "$_au_rc" -ne 0 ] && grep_in "$_au_out" -q "STUCK ROLL memex/memex-portal-deployment" \
+   && grep_in "$_au_out" -q "template names cr.example.test/memex-portal-ai:3.0.0-ci.9260" \
+   && grep_in "$_au_out" -q "serve cr.example.test/memex-portal-ai:3.0.0-ci.9218" \
+   && grep_in "$_au_out" -q "refused before anything changed" \
+   && ! grep_in "$_au_out" -q "::hosting:: aks_gate=" && [ "$(_au_issued)" = "0" ]; then
   ok "a STUCK ROLL (template 9260 over serving 9218) refuses the pre-flight, naming both images, having issued nothing"
 else
   bad "a STUCK ROLL refuses the pre-flight gate" "rc=${_au_rc} out=${_au_out}"
@@ -4126,13 +4150,13 @@ refuses "between pools, a roll whose new pod is not Ready past its OWN startup b
 
 _au_new; _au_stuck "2099-01-01T00:00:00Z"
 _au_out="$(_au gate --budget-seconds 0)"; _au_rc=$?
-if [ "$_au_rc" -eq 0 ] && printf '%s' "$_au_out" | grep -q "::hosting:: aks_upgrade=incomplete" && [ -f "$_au_state/hosting-aks-upgrade.paused" ]; then
+if [ "$_au_rc" -eq 0 ] && grep_in "$_au_out" -q "::hosting:: aks_upgrade=incomplete" && [ -f "$_au_state/hosting-aks-upgrade.paused" ]; then
   ok "between pools, a gate still waiting at the job budget PAUSES (aks_upgrade=incomplete) — nothing failed"
 else
   bad "a gate still waiting at the job budget pauses" "rc=${_au_rc} out=${_au_out}"
 fi
 _au_out="$(_au verify --version 1.35.7)"
-if printf '%s' "$_au_out" | grep -q "::hosting:: aks_step=skipped" && ! printf '%s' "$_au_out" | grep -q "aks_upgrade=complete"; then
+if grep_in "$_au_out" -q "::hosting:: aks_step=skipped" && ! grep_in "$_au_out" -q "aks_upgrade=complete"; then
   ok "every later step of a paused run is skipped — verify included"
 else
   bad "every later step of a paused run is skipped" "${_au_out}"
@@ -4154,13 +4178,13 @@ refuses_hard "node-pool refuses a pool name that is not an AKS pool name" "is no
 
 _au_new
 _au_out="$(_au control-plane --version 1.34.7 --budget-seconds 5)"
-if printf '%s' "$_au_out" | grep -q "::hosting:: aks_step=already" && [ "$(_au_issued)" = "0" ]; then
+if grep_in "$_au_out" -q "::hosting:: aks_step=already" && [ "$(_au_issued)" = "0" ]; then
   ok "control-plane already at the version issues nothing"
 else bad "control-plane already at the version issues nothing" "${_au_out}"; fi
 
 _au_new
 _au_out="$(_au control-plane --version 1.35.7 --budget-seconds 5)"; _au_rc=$?
-if [ "$_au_rc" -eq 0 ] && printf '%s' "$_au_out" | grep -q "::hosting:: aks_step=done" \
+if [ "$_au_rc" -eq 0 ] && grep_in "$_au_out" -q "::hosting:: aks_step=done" \
    && grep -qx "az aks upgrade -g memex-aks-rg -n example-aks --kubernetes-version 1.35.7 --control-plane-only --yes --no-wait" "$_au_state/log" \
    && [ "$(_au_issued)" = "1" ]; then
   ok "a control-plane hop issues ONE control-plane-only upgrade and waits for the version"
@@ -4170,14 +4194,14 @@ fi
 
 _au_new; cp "$_au_fix/show.after.json" "$_au_fix/show.json"
 _au_out="$(_au control-plane --version 1.34.10 --budget-seconds 5)"
-if printf '%s' "$_au_out" | grep -q "already past this hop" && [ "$(_au_issued)" = "0" ]; then
+if grep_in "$_au_out" -q "already past this hop" && [ "$(_au_issued)" = "0" ]; then
   ok "a continuation meeting a hop an earlier run went PAST issues nothing — never a downgrade"
 else bad "a hop already gone past issues nothing" "${_au_out}"; fi
 
 _au_new
 _au_out="$(_au node-pool --pool cibuildv6 --version 1.35.7 --budget-seconds 5)"; _au_rc=$?
-if [ "$_au_rc" -eq 0 ] && printf '%s' "$_au_out" | grep -q "::hosting:: aks_step=detached" \
-   && printf '%s' "$_au_out" | grep -q "::hosting:: aks_upgrade=incomplete" \
+if [ "$_au_rc" -eq 0 ] && grep_in "$_au_out" -q "::hosting:: aks_step=detached" \
+   && grep_in "$_au_out" -q "::hosting:: aks_upgrade=incomplete" \
    && grep -q "^az aks nodepool upgrade -g memex-aks-rg --cluster-name example-aks -n cibuildv6 --kubernetes-version 1.35.7 --yes --no-wait" "$_au_state/log"; then
   ok "the pool hosting this job's own runner is issued and NOT waited on — detached, paused for a continuation"
 else
@@ -4186,7 +4210,7 @@ fi
 
 _au_new
 _au_out="$(_au node-pool --pool silos --version 1.35.7 --budget-seconds 5)"; _au_rc=$?
-if [ "$_au_rc" -eq 0 ] && printf '%s' "$_au_out" | grep -q "::hosting:: aks_step=done" && [ "$(_au_issued)" = "1" ]; then
+if [ "$_au_rc" -eq 0 ] && grep_in "$_au_out" -q "::hosting:: aks_step=done" && [ "$(_au_issued)" = "1" ]; then
   ok "a node-pool step issues ONE upgrade of that pool straight to the version and waits for it"
 else bad "a node-pool step issues one upgrade and waits" "rc=${_au_rc} out=${_au_out}"; fi
 
@@ -4232,8 +4256,8 @@ _dr_run() { env PATH="$DP_STUBS:$PATH" HOSTING_CHART=/tmp HOSTING_DEPLOY_FIXTURE
 printf '{"features":{"fleetops":{"enabled":false,"packages":["Plugins/Hosting"]}},"portal":{"image":"cr.example.test/memex-portal-ai:1"}}' > "$_dr_dir/live-values.json"
 printf '{"portal":{"image":"cr.example.test/memex-portal-ai:1"}}' > "$_dr_dir/supplied-values.json"
 _dr_out="$(_dr_run)"; _dr_rc=$?
-if [ "$_dr_rc" -ne 0 ] && printf '%s' "$_dr_out" | grep -q "would DROP 2 value(s)" \
-   && printf '%s' "$_dr_out" | grep -q "features.fleetops.enabled" && printf '%s' "$_dr_out" | grep -q "features.fleetops.packages" \
+if [ "$_dr_rc" -ne 0 ] && grep_in "$_dr_out" -q "would DROP 2 value(s)" \
+   && grep_in "$_dr_out" -q "features.fleetops.enabled" && grep_in "$_dr_out" -q "features.fleetops.packages" \
    && ! grep -q '^helm upgrade' "$_dr_log"; then
   ok "a live features flag the render does not carry is REFUSED by name, before helm"
 else
@@ -4242,7 +4266,7 @@ fi
 # The record now carries it → kept → the upgrade runs.
 printf '{"features":{"fleetops":{"enabled":false,"packages":["Plugins/Hosting"]}},"portal":{"image":"cr.example.test/memex-portal-ai:1"}}' > "$_dr_dir/supplied-values.json"; : > "$_dr_log"
 _dr_out="$(_dr_run)"; _dr_rc=$?
-[ "$_dr_rc" -eq 0 ] && grep -q '^helm upgrade' "$_dr_log" && printf '%s' "$_dr_out" | grep -q "nothing the live release carries is dropped" \
+[ "$_dr_rc" -eq 0 ] && grep -q '^helm upgrade' "$_dr_log" && grep_in "$_dr_out" -q "nothing the live release carries is dropped" \
   && ok "the same flag expressed by the record passes and the upgrade runs" \
   || bad "an expressed flag passes" "rc=${_dr_rc} out: ${_dr_out}"
 # A flag re-expressed in the bool shorthand (`fleetops: false`) covers the map form — no false refusal.
@@ -4298,8 +4322,8 @@ printf '{%s,"extraPortalConfig":{"A":"1","B":"2"},"hostingDeploy":{"recordOwned"
 printf '{%s,"extraPortalConfig":{"A":"1"}}' "$_dr_img" > "$_dr_dir/supplied-values.json"; : > "$_dr_log"
 _dr_out="$(_dr_run)"; _dr_rc=$?
 if [ "$_dr_rc" -eq 0 ] && grep -q '^helm upgrade' "$_dr_log" \
-   && printf '%s' "$_dr_out" | grep -q 'DROPPING extraPortalConfig.B — the record rendered it on the previous deploy' \
-   && printf '%s' "$_dr_out" | grep -q '::hosting:: dropped_value=owned:extraPortalConfig.B'; then
+   && grep_in "$_dr_out" -q 'DROPPING extraPortalConfig.B — the record rendered it on the previous deploy' \
+   && grep_in "$_dr_out" -q '::hosting:: dropped_value=owned:extraPortalConfig.B'; then
   ok "a key the record previously rendered and removed is DROPPED, with a log line naming it"
 else
   bad "a record-owned key the record removed is dropped and logged" "rc=${_dr_rc} out: ${_dr_out} calls: $(cat "$_dr_log")"
@@ -4307,9 +4331,9 @@ fi
 # NEGATIVE CONTROL: the same release, plus a hand-applied key the record NEVER rendered → still refused.
 printf '{%s,"extraPortalConfig":{"A":"1","B":"2"},"features":{"fleetops":{"enabled":false}},"hostingDeploy":{"recordOwned":["extraPortalConfig.A","extraPortalConfig.B","portal.image"]}}' "$_dr_img" > "$_dr_dir/live-values.json"; : > "$_dr_log"
 _dr_out="$(_dr_run)"; _dr_rc=$?
-if [ "$_dr_rc" -ne 0 ] && printf '%s' "$_dr_out" | grep -q 'would DROP 1 value(s)' \
-   && printf '%s' "$_dr_out" | grep -q 'features.fleetops.enabled' \
-   && printf '%s' "$_dr_out" | grep -q 'shows the record never rendered them' \
+if [ "$_dr_rc" -ne 0 ] && grep_in "$_dr_out" -q 'would DROP 1 value(s)' \
+   && grep_in "$_dr_out" -q 'features.fleetops.enabled' \
+   && grep_in "$_dr_out" -q 'shows the record never rendered them' \
    && ! grep -q '^helm upgrade' "$_dr_log"; then
   ok "NEGATIVE CONTROL: a live-only key the record never rendered is still REFUSED before helm (Memex#376)"
 else
@@ -4318,9 +4342,9 @@ fi
 # FALLBACK: no manifest (deployed before it existed) → today's behaviour: refused, naming the remedy.
 printf '{%s,"extraPortalConfig":{"A":"1","B":"2"}}' "$_dr_img" > "$_dr_dir/live-values.json"; : > "$_dr_log"
 _dr_out="$(_dr_run)"; _dr_rc=$?
-if [ "$_dr_rc" -ne 0 ] && printf '%s' "$_dr_out" | grep -q 'extraPortalConfig.B' \
-   && printf '%s' "$_dr_out" | grep -q 'carries no record-owned manifest yet' \
-   && printf '%s' "$_dr_out" | grep -q 'HOSTING_RETIRE_VALUES' && ! grep -q '^helm upgrade' "$_dr_log"; then
+if [ "$_dr_rc" -ne 0 ] && grep_in "$_dr_out" -q 'extraPortalConfig.B' \
+   && grep_in "$_dr_out" -q 'carries no record-owned manifest yet' \
+   && grep_in "$_dr_out" -q 'HOSTING_RETIRE_VALUES' && ! grep -q '^helm upgrade' "$_dr_log"; then
   ok "a release with no manifest falls back to refusing the drop, naming HOSTING_RETIRE_VALUES"
 else
   bad "a release with no manifest falls back to refusing" "rc=${_dr_rc} out: ${_dr_out} calls: $(cat "$_dr_log")"
@@ -4329,9 +4353,9 @@ fi
 : > "$_dr_log"
 _dr_out="$(HOSTING_RETIRE_VALUES='extraPortalConfig.B, extraPortalConfig.Gone' _dr_run)"; _dr_rc=$?
 if [ "$_dr_rc" -eq 0 ] && grep -q '^helm upgrade' "$_dr_log" \
-   && printf '%s' "$_dr_out" | grep -q 'DROPPING extraPortalConfig.B — the record retires it (HOSTING_RETIRE_VALUES)' \
-   && printf '%s' "$_dr_out" | grep -q 'entry extraPortalConfig.Gone matches nothing this upgrade drops' \
-   && ! printf '%s' "$_dr_out" | grep -q 'entry extraPortalConfig.B matches nothing'; then
+   && grep_in "$_dr_out" -q 'DROPPING extraPortalConfig.B — the record retires it (HOSTING_RETIRE_VALUES)' \
+   && grep_in "$_dr_out" -q 'entry extraPortalConfig.Gone matches nothing this upgrade drops' \
+   && ! grep_in "$_dr_out" -q 'entry extraPortalConfig.B matches nothing'; then
   ok "a release with no manifest drops a path the record RETIRES (HOSTING_RETIRE_VALUES), and names a spent entry"
 else
   bad "the record's retire declaration drops the path" "rc=${_dr_rc} out: ${_dr_out} calls: $(cat "$_dr_log")"
@@ -4339,7 +4363,7 @@ fi
 # A retire entry that is not a values path is refused, never guessed.
 : > "$_dr_log"
 _dr_out="$(HOSTING_RETIRE_VALUES='extraPortalConfig.B;$(rm -rf x)' _dr_run)"; _dr_rc=$?
-[ "$_dr_rc" -ne 0 ] && printf '%s' "$_dr_out" | grep -q 'not a dotted values path' && ! grep -q '^helm upgrade' "$_dr_log" \
+[ "$_dr_rc" -ne 0 ] && grep_in "$_dr_out" -q 'not a dotted values path' && ! grep -q '^helm upgrade' "$_dr_log" \
   && ok "a HOSTING_RETIRE_VALUES entry that is not a dotted path is refused" \
   || bad "a malformed retire entry is refused" "rc=${_dr_rc} out: ${_dr_out}"
 # Ownership is EXACT: a manifest leaf `extraPortalConfig.X` says nothing about a hand-applied
@@ -4347,7 +4371,7 @@ _dr_out="$(HOSTING_RETIRE_VALUES='extraPortalConfig.B;$(rm -rf x)' _dr_run)"; _d
 printf '{%s,"extraPortalConfig":{"A":"1","X":{"y":"hand"}},"hostingDeploy":{"recordOwned":["extraPortalConfig.A","extraPortalConfig.X","portal.image"]}}' "$_dr_img" > "$_dr_dir/live-values.json"
 printf '{%s,"extraPortalConfig":{"A":"1"}}' "$_dr_img" > "$_dr_dir/supplied-values.json"; : > "$_dr_log"
 _dr_out="$(_dr_run)"; _dr_rc=$?
-[ "$_dr_rc" -ne 0 ] && printf '%s' "$_dr_out" | grep -q 'extraPortalConfig.X.y' && ! grep -q '^helm upgrade' "$_dr_log" \
+[ "$_dr_rc" -ne 0 ] && grep_in "$_dr_out" -q 'extraPortalConfig.X.y' && ! grep -q '^helm upgrade' "$_dr_log" \
   && ok "ownership is exact: a hand-applied path UNDER a record-owned leaf is still refused" \
   || bad "a path under a record-owned leaf is refused" "rc=${_dr_rc} out: ${_dr_out}"
 # A retire path may carry `/` (an ingress annotation key).
@@ -4355,7 +4379,7 @@ printf '{%s,"ingress":{"annotations":{"cert-manager.io/cluster-issuer":"x"}}}' "
 printf '{%s}' "$_dr_img" > "$_dr_dir/supplied-values.json"; : > "$_dr_log"
 _dr_out="$(HOSTING_RETIRE_VALUES='ingress.annotations.cert-manager.io/cluster-issuer' _dr_run)"; _dr_rc=$?
 [ "$_dr_rc" -eq 0 ] && grep -q '^helm upgrade' "$_dr_log" \
-  && printf '%s' "$_dr_out" | grep -q 'DROPPING ingress.annotations.cert-manager.io/cluster-issuer' \
+  && grep_in "$_dr_out" -q 'DROPPING ingress.annotations.cert-manager.io/cluster-issuer' \
   && ok "a retire path carrying '/' (an annotation key) is accepted and dropped" \
   || bad "a retire path with '/' is accepted" "rc=${_dr_rc} out: ${_dr_out}"
 rm -rf "$_dr_dir"
@@ -4374,14 +4398,14 @@ DBR_ARGS=(--database acmedb --server pg.postgres.database.azure.com --user acmeo
 _dbr_new() { _dbr_state="$(mktemp -d)"; printf 'postgres\nacmedb\n' > "$_dbr_state/dbs"; }
 _dbr() { _dbr_out="$(env -u PGPASSWORD PATH="$DBR_STUBS:$PATH" HOSTING_DBR_STATE="$_dbr_state" hosting-db-reset "$@" 2>&1)"; _dbr_rc=$?
   _dbr_log="$(cat "$_dbr_state/pg.log" 2>/dev/null || true)"; _dbr_az="$(cat "$_dbr_state/az.log" 2>/dev/null || true)"; }
-_dbr_line() { printf '%s\n' "$_dbr_log" | grep -n -- "$1" | head -1 | cut -d: -f1; }
+_dbr_line() { grep_in "$_dbr_log" -n -- "$1" | head -1 | cut -d: -f1; }
 
 # keep, the happy path
 _dbr_new; _dbr keep "${DBR_ARGS[@]}" --request Ops/Actions/reset-acme-1
 if [ "$_dbr_rc" -eq 0 ] && grep -qx acmedb_kept_202610091200 "$_dbr_state/dbs" && grep -qx acmedb "$_dbr_state/dbs" \
-   && printf '%s' "$_dbr_out" | grep -q '::hosting:: kept_database=acmedb_kept_202610091200' \
-   && printf '%s' "$_dbr_out" | grep -q '::hosting:: kept_until=2026-10-23T12:00Z' \
-   && printf '%s' "$_dbr_out" | grep -q '::hosting:: reset=completed'; then
+   && grep_in "$_dbr_out" -q '::hosting:: kept_database=acmedb_kept_202610091200' \
+   && grep_in "$_dbr_out" -q '::hosting:: kept_until=2026-10-23T12:00Z' \
+   && grep_in "$_dbr_out" -q '::hosting:: reset=completed'; then
   ok "keep renames acmedb to acmedb_kept_<stamp>, creates an empty acmedb and reports both"
 else
   bad "keep renames, creates and reports" "rc=${_dbr_rc} out: ${_dbr_out} dbs: $(cat "$_dbr_state/dbs")"
@@ -4408,23 +4432,23 @@ rm -rf "$_dbr_state"
 _dbr_new; _dbr keep "${DBR_ARGS[@]}" --request Ops/Actions/reset-acme-1
 echo acmedb_kept_202609011200 >> "$_dbr_state/dbs"
 _dbr show "${DBR_ARGS[@]}"
-if [ "$_dbr_rc" -eq 0 ] && printf '%s' "$_dbr_out" | grep -q '::hosting:: kept_database=acmedb_kept_202610091200' \
-   && printf '%s' "$_dbr_out" | grep -q '::hosting:: kept_until=2026-10-23T12:00Z' \
-   && printf '%s' "$_dbr_out" | grep -q '::hosting:: kept_verified=true'; then
+if [ "$_dbr_rc" -eq 0 ] && grep_in "$_dbr_out" -q '::hosting:: kept_database=acmedb_kept_202610091200' \
+   && grep_in "$_dbr_out" -q '::hosting:: kept_until=2026-10-23T12:00Z' \
+   && grep_in "$_dbr_out" -q '::hosting:: kept_verified=true'; then
   ok "show reads the NEWEST stamped kept copy and its retention back from the server"
 else
   bad "show reports the newest kept copy" "rc=${_dbr_rc} out: ${_dbr_out}"
 fi
 rm -rf "$_dbr_state"
 _dbr_new; _dbr show "${DBR_ARGS[@]}"
-if [ "$_dbr_rc" -ne 0 ] && printf '%s' "$_dbr_out" | grep -q 'did NOT keep the previous database' && ! printf '%s' "$_dbr_out" | grep -q 'kept_verified'; then
+if [ "$_dbr_rc" -ne 0 ] && grep_in "$_dbr_out" -q 'did NOT keep the previous database' && ! grep_in "$_dbr_out" -q 'kept_verified'; then
   ok "show with no kept copy is a failed step naming that nothing was kept"
 else
   bad "show refuses when no copy exists" "rc=${_dbr_rc} out: ${_dbr_out}"
 fi
 rm -rf "$_dbr_state"
 _dbr_new; echo acmedb_kept_202609011200 >> "$_dbr_state/dbs"; _dbr show "${DBR_ARGS[@]}"
-if [ "$_dbr_rc" -ne 0 ] && printf '%s' "$_dbr_out" | grep -q "carries no 'meshweaver-kept-copy' comment"; then
+if [ "$_dbr_rc" -ne 0 ] && grep_in "$_dbr_out" -q "carries no 'meshweaver-kept-copy' comment"; then
   ok "show refuses a copy-shaped database without the kept-copy stamp"
 else
   bad "show refuses an unstamped copy" "rc=${_dbr_rc} out: ${_dbr_out}"
@@ -4433,8 +4457,8 @@ rm -rf "$_dbr_state"
 
 # live sessions → refused, nothing changed
 _dbr_new; echo 2 > "$_dbr_state/sessions"; _dbr keep "${DBR_ARGS[@]}"
-if [ "$_dbr_rc" -ne 0 ] && printf '%s' "$_dbr_out" | grep -q '2 session(s) are still connected' \
-   && ! printf '%s' "$_dbr_log" | grep -q 'RENAME\|CREATE DATABASE'; then
+if [ "$_dbr_rc" -ne 0 ] && grep_in "$_dbr_out" -q '2 session(s) are still connected' \
+   && ! grep_in "$_dbr_log" -q 'RENAME\|CREATE DATABASE'; then
   ok "keep refuses while sessions are connected, before any rename"
 else
   bad "keep refuses on live sessions" "rc=${_dbr_rc} out: ${_dbr_out} log: ${_dbr_log}"
@@ -4443,7 +4467,7 @@ rm -rf "$_dbr_state"
 
 # no such database → refused (a reset never creates a database it did not first keep)
 _dbr_new; printf 'postgres\n' > "$_dbr_state/dbs"; _dbr keep "${DBR_ARGS[@]}"
-if [ "$_dbr_rc" -ne 0 ] && printf '%s' "$_dbr_out" | grep -q 'does not exist' && ! printf '%s' "$_dbr_log" | grep -q 'CREATE DATABASE'; then
+if [ "$_dbr_rc" -ne 0 ] && grep_in "$_dbr_out" -q 'does not exist' && ! grep_in "$_dbr_log" -q 'CREATE DATABASE'; then
   ok "keep refuses when the database does not exist — it never creates one it did not keep a copy of"
 else
   bad "keep refuses an absent database" "rc=${_dbr_rc} out: ${_dbr_out}"
@@ -4452,7 +4476,7 @@ rm -rf "$_dbr_state"
 
 # a kept name that already exists (same minute) → refused, nothing changed
 _dbr_new; echo acmedb_kept_202610091200 >> "$_dbr_state/dbs"; _dbr keep "${DBR_ARGS[@]}"
-if [ "$_dbr_rc" -ne 0 ] && printf '%s' "$_dbr_out" | grep -q 'already exists' && ! printf '%s' "$_dbr_log" | grep -q 'RENAME'; then
+if [ "$_dbr_rc" -ne 0 ] && grep_in "$_dbr_out" -q 'already exists' && ! grep_in "$_dbr_log" -q 'RENAME'; then
   ok "keep refuses when the kept name already exists, before any rename"
 else
   bad "keep refuses a clash" "rc=${_dbr_rc} out: ${_dbr_out}"
@@ -4462,7 +4486,7 @@ rm -rf "$_dbr_state"
 # CREATE fails after the rename → the old name is put back, and the step fails
 _dbr_new; echo 'CREATE DATABASE' > "$_dbr_state/fail-on"; _dbr keep "${DBR_ARGS[@]}"
 if [ "$_dbr_rc" -ne 0 ] && grep -qx acmedb "$_dbr_state/dbs" && ! grep -qx acmedb_kept_202610091200 "$_dbr_state/dbs" \
-   && printf '%s' "$_dbr_out" | grep -q 'renamed back to acmedb' && ! printf '%s' "$_dbr_out" | grep -q 'reset=completed'; then
+   && grep_in "$_dbr_out" -q 'renamed back to acmedb' && ! grep_in "$_dbr_out" -q 'reset=completed'; then
   ok "a failed CREATE after the rename puts the old name back and fails the step — the instance keeps its database"
 else
   bad "a failed create rolls the rename back" "rc=${_dbr_rc} out: ${_dbr_out} dbs: $(cat "$_dbr_state/dbs")"
@@ -4471,7 +4495,7 @@ rm -rf "$_dbr_state"
 
 # a new database that is not empty → refused (never report an empty database that is not)
 _dbr_new; echo 3 > "$_dbr_state/tables"; _dbr keep "${DBR_ARGS[@]}"
-if [ "$_dbr_rc" -ne 0 ] && printf '%s' "$_dbr_out" | grep -q 'holds 3 table(s)' && ! printf '%s' "$_dbr_out" | grep -q 'reset=completed'; then
+if [ "$_dbr_rc" -ne 0 ] && grep_in "$_dbr_out" -q 'holds 3 table(s)' && ! grep_in "$_dbr_out" -q 'reset=completed'; then
   ok "a re-created database that is not empty is a failed step, never reset=completed"
 else
   bad "a non-empty new database fails" "rc=${_dbr_rc} out: ${_dbr_out}"
@@ -4483,7 +4507,7 @@ _dbr_new; echo acmedb_kept_202609011200 >> "$_dbr_state/dbs"
 echo "meshweaver-kept-copy of acmedb; keptAt=2026-09-01T12:00Z; keptUntil=2026-09-15T12:00Z; request=x" > "$_dbr_state/comment-acmedb_kept_202609011200"
 _dbr purge "${DBR_ARGS[@]}" --kept acmedb_kept_202609011200
 if [ "$_dbr_rc" -eq 0 ] && ! grep -qx acmedb_kept_202609011200 "$_dbr_state/dbs" && grep -qx acmedb "$_dbr_state/dbs" \
-   && printf '%s' "$_dbr_out" | grep -q '::hosting:: purged=acmedb_kept_202609011200'; then
+   && grep_in "$_dbr_out" -q '::hosting:: purged=acmedb_kept_202609011200'; then
   ok "purge drops a stamped kept copy past its retention — and nothing else"
 else
   bad "purge drops a due kept copy" "rc=${_dbr_rc} out: ${_dbr_out} dbs: $(cat "$_dbr_state/dbs")"
@@ -4494,7 +4518,7 @@ rm -rf "$_dbr_state"
 _dbr_new; echo acmedb_kept_202610091200 >> "$_dbr_state/dbs"; echo "2026-10-23T12:00Z" > "$_dbr_state/due"
 echo "meshweaver-kept-copy of acmedb; keptAt=2026-10-09T12:00Z" > "$_dbr_state/comment-acmedb_kept_202610091200"
 _dbr purge "${DBR_ARGS[@]}" --kept acmedb_kept_202610091200
-if [ "$_dbr_rc" -ne 0 ] && printf '%s' "$_dbr_out" | grep -q 'may be purged from 2026-10-23T12:00Z' && grep -qx acmedb_kept_202610091200 "$_dbr_state/dbs"; then
+if [ "$_dbr_rc" -ne 0 ] && grep_in "$_dbr_out" -q 'may be purged from 2026-10-23T12:00Z' && grep -qx acmedb_kept_202610091200 "$_dbr_state/dbs"; then
   ok "purge refuses a kept copy inside its retention, naming when it may go"
 else
   bad "purge refuses inside the retention" "rc=${_dbr_rc} out: ${_dbr_out}"
@@ -4504,7 +4528,7 @@ rm -rf "$_dbr_state"
 # purge: no marker → refused (never drop a database it cannot prove it kept)
 _dbr_new; echo acmedb_kept_202609011200 >> "$_dbr_state/dbs"
 _dbr purge "${DBR_ARGS[@]}" --kept acmedb_kept_202609011200
-if [ "$_dbr_rc" -ne 0 ] && printf '%s' "$_dbr_out" | grep -q "carries no 'meshweaver-kept-copy' comment" && grep -qx acmedb_kept_202609011200 "$_dbr_state/dbs"; then
+if [ "$_dbr_rc" -ne 0 ] && grep_in "$_dbr_out" -q "carries no 'meshweaver-kept-copy' comment" && grep -qx acmedb_kept_202609011200 "$_dbr_state/dbs"; then
   ok "purge refuses a database without the kept-copy marker"
 else
   bad "purge refuses an unmarked database" "rc=${_dbr_rc} out: ${_dbr_out}"
@@ -4525,7 +4549,7 @@ refuses_hard "hosting-db-reset refuses a request path with a quote" "not a plain
 
 # dry run: no vault read, no statement, says what it would do
 _dbr_new; _dbr_out="$(env -u PGPASSWORD PATH="$DBR_STUBS:$PATH" HOSTING_DBR_STATE="$_dbr_state" HOSTING_DRY_RUN=true hosting-db-reset keep "${DBR_ARGS[@]}" 2>&1)"; _dbr_rc=$?
-if [ "$_dbr_rc" -eq 0 ] && [ ! -s "$_dbr_state/pg.log" ] && [ ! -s "$_dbr_state/az.log" ] && printf '%s' "$_dbr_out" | grep -q 'kept_database=dry-run'; then
+if [ "$_dbr_rc" -eq 0 ] && [ ! -s "$_dbr_state/pg.log" ] && [ ! -s "$_dbr_state/az.log" ] && grep_in "$_dbr_out" -q 'kept_database=dry-run'; then
   ok "a dry-run keep reads no secret and issues no statement"
 else
   bad "a dry run touches nothing" "rc=${_dbr_rc} out: ${_dbr_out}"
@@ -4549,10 +4573,10 @@ _dbrt() { _dbrt_out="$(env -u PGPASSWORD -u HOSTING_DRY_RUN PATH="$DBRT_STUBS:$P
 
 # check, present and idle: reports state, size, sessions — and issues no statement that changes anything
 _dbrt_new; echo 123456 > "$_dbrt_state/size"; _dbrt hosting-db-retire check "${DBRT_ARGS[@]}"
-if [ "$_dbrt_rc" -eq 0 ] && printf '%s' "$_dbrt_out" | grep -q '::hosting:: retire_state=present' \
-   && printf '%s' "$_dbrt_out" | grep -q '::hosting:: size_bytes=123456' \
-   && printf '%s' "$_dbrt_out" | grep -q '::hosting:: sessions=0' \
-   && ! printf '%s' "$_dbrt_log" | grep -q 'DROP\|ALTER\|CREATE\|COMMENT'; then
+if [ "$_dbrt_rc" -eq 0 ] && grep_in "$_dbrt_out" -q '::hosting:: retire_state=present' \
+   && grep_in "$_dbrt_out" -q '::hosting:: size_bytes=123456' \
+   && grep_in "$_dbrt_out" -q '::hosting:: sessions=0' \
+   && ! grep_in "$_dbrt_log" -q 'DROP\|ALTER\|CREATE\|COMMENT'; then
   ok "check reads a present database's size and sessions and changes nothing"
 else
   bad "check reports present, size, sessions" "rc=${_dbrt_rc} out: ${_dbrt_out} log: ${_dbrt_log}"
@@ -4563,14 +4587,14 @@ rm -rf "$_dbrt_state"
 
 # check in a DRY RUN still reads (it IS the what-if) — and says "absent" for a database already gone
 _dbrt_new; printf 'postgres\nacmedb\n' > "$_dbrt_state/dbs"; _dbrt env HOSTING_DRY_RUN=true hosting-db-retire check "${DBRT_ARGS[@]}"
-if [ "$_dbrt_rc" -eq 0 ] && printf '%s' "$_dbrt_out" | grep -q '::hosting:: retire_state=absent' && [ -s "$_dbrt_state/pg.log" ]; then
+if [ "$_dbrt_rc" -eq 0 ] && grep_in "$_dbrt_out" -q '::hosting:: retire_state=absent' && [ -s "$_dbrt_state/pg.log" ]; then
   ok "a dry-run check reads the server and reports an already-absent database as absent (the what-if)"
 else
   bad "dry-run check reports absent" "rc=${_dbrt_rc} out: ${_dbrt_out}"
 fi
 rm -rf "$_dbrt_state"
 _dbrt_new; printf 'postgres\nacmedb\n' > "$_dbrt_state/dbs"; _dbrt hosting-db-retire check "${DBRT_ARGS[@]}"
-if [ "$_dbrt_rc" -ne 0 ] && printf '%s' "$_dbrt_out" | grep -q 'already absent'; then
+if [ "$_dbrt_rc" -ne 0 ] && grep_in "$_dbrt_out" -q 'already absent'; then
   ok "a real check of an absent database fails the plan before any backup — nothing to back up or drop"
 else
   bad "real check refuses an absent database" "rc=${_dbrt_rc} out: ${_dbrt_out}"
@@ -4579,14 +4603,14 @@ rm -rf "$_dbrt_state"
 
 # check with a session connected: a real run refuses, a dry run says it would
 _dbrt_new; echo 1 > "$_dbrt_state/sessions"; _dbrt hosting-db-retire check "${DBRT_ARGS[@]}"
-if [ "$_dbrt_rc" -ne 0 ] && printf '%s' "$_dbrt_out" | grep -q '1 session(s) are connected to oldcopy'; then
+if [ "$_dbrt_rc" -ne 0 ] && grep_in "$_dbrt_out" -q '1 session(s) are connected to oldcopy'; then
   ok "a real check refuses a database something is still connected to"
 else
   bad "real check refuses on a session" "rc=${_dbrt_rc} out: ${_dbrt_out}"
 fi
 rm -rf "$_dbrt_state"
 _dbrt_new; echo 1 > "$_dbrt_state/sessions"; _dbrt env HOSTING_DRY_RUN=true hosting-db-retire check "${DBRT_ARGS[@]}"
-if [ "$_dbrt_rc" -eq 0 ] && printf '%s' "$_dbrt_out" | grep -q '::hosting:: sessions=1' && printf '%s' "$_dbrt_out" | grep -q 'a real run would REFUSE'; then
+if [ "$_dbrt_rc" -eq 0 ] && grep_in "$_dbrt_out" -q '::hosting:: sessions=1' && grep_in "$_dbrt_out" -q 'a real run would REFUSE'; then
   ok "a dry-run check names the session a real run would refuse on"
 else
   bad "dry-run check names the session" "rc=${_dbrt_rc} out: ${_dbrt_out}"
@@ -4596,14 +4620,14 @@ rm -rf "$_dbrt_state"
 # drop: the control — an idle database behind a readable, non-empty archive IS dropped and proved gone
 _dbrt_new; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
 if [ "$_dbrt_rc" -eq 0 ] && ! grep -qx oldcopy "$_dbrt_state/dbs" && grep -qx acmedb "$_dbrt_state/dbs" \
-   && printf '%s' "$_dbrt_out" | grep -q '::hosting:: retired=oldcopy'; then
+   && grep_in "$_dbrt_out" -q '::hosting:: retired=oldcopy'; then
   ok "drop drops an idle database behind a readable archive — and nothing else — and reports retired=<db>"
 else
   bad "drop drops and reports" "rc=${_dbrt_rc} out: ${_dbrt_out} dbs: $(cat "$_dbrt_state/dbs")"
 fi
 case "$_dbrt_az" in *"storage blob show --blob-url ${DBRT_URI} --auth-mode login"*) ok "…the archive is read by its URL before the drop" ;; *) bad "archive read before the drop" "az: ${_dbrt_az}" ;; esac
-_drop_line="$(printf '%s\n' "$_dbrt_log" | grep -n 'DROP DATABASE "oldcopy"' | head -1 | cut -d: -f1)"
-_last_exists="$(printf '%s\n' "$_dbrt_log" | grep -n "datname = 'oldcopy'" | tail -1 | cut -d: -f1)"
+_drop_line="$(grep_in "$_dbrt_log" -n 'DROP DATABASE "oldcopy"' | head -1 | cut -d: -f1)"
+_last_exists="$(grep_in "$_dbrt_log" -n "datname = 'oldcopy'" | tail -1 | cut -d: -f1)"
 [ -n "$_drop_line" ] && [ -n "$_last_exists" ] && [ "$_drop_line" -lt "$_last_exists" ] \
   && ok "…and the server is asked AGAIN after the drop — absence is read back, not assumed" \
   || bad "absence is read back after the drop" "log: ${_dbrt_log}"
@@ -4612,15 +4636,15 @@ rm -rf "$_dbrt_state"
 
 # drop: no archive, or an empty one → refused, nothing dropped
 _dbrt_new; rm -f "$_dbrt_state/blob-size"; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
-if [ "$_dbrt_rc" -ne 0 ] && grep -qx oldcopy "$_dbrt_state/dbs" && ! printf '%s' "$_dbrt_log" | grep -q 'DROP' \
-   && printf '%s' "$_dbrt_out" | grep -q 'is NOT dropped'; then
+if [ "$_dbrt_rc" -ne 0 ] && grep -qx oldcopy "$_dbrt_state/dbs" && ! grep_in "$_dbrt_log" -q 'DROP' \
+   && grep_in "$_dbrt_out" -q 'is NOT dropped'; then
   ok "drop refuses when the archive it is bound to cannot be read — nothing is dropped"
 else
   bad "drop refuses a missing archive" "rc=${_dbrt_rc} out: ${_dbrt_out}"
 fi
 rm -rf "$_dbrt_state"
 _dbrt_new; echo 0 > "$_dbrt_state/blob-size"; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
-if [ "$_dbrt_rc" -ne 0 ] && grep -qx oldcopy "$_dbrt_state/dbs" && ! printf '%s' "$_dbrt_log" | grep -q 'DROP'; then
+if [ "$_dbrt_rc" -ne 0 ] && grep -qx oldcopy "$_dbrt_state/dbs" && ! grep_in "$_dbrt_log" -q 'DROP'; then
   ok "drop refuses a ZERO-byte archive — an empty archive is no backup"
 else
   bad "drop refuses an empty archive" "rc=${_dbrt_rc} out: ${_dbrt_out}"
@@ -4629,7 +4653,7 @@ rm -rf "$_dbrt_state"
 
 # drop: a session connected → refused, nothing dropped
 _dbrt_new; echo 2 > "$_dbrt_state/sessions"; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
-if [ "$_dbrt_rc" -ne 0 ] && grep -qx oldcopy "$_dbrt_state/dbs" && ! printf '%s' "$_dbrt_log" | grep -q 'DROP'; then
+if [ "$_dbrt_rc" -ne 0 ] && grep -qx oldcopy "$_dbrt_state/dbs" && ! grep_in "$_dbrt_log" -q 'DROP'; then
   ok "drop refuses while a session is connected — nothing is dropped under it"
 else
   bad "drop refuses on a session" "rc=${_dbrt_rc} out: ${_dbrt_out}"
@@ -4638,7 +4662,7 @@ rm -rf "$_dbrt_state"
 
 # drop: a server that answers DROP but keeps the database → a failed step, never retired=
 _dbrt_new; touch "$_dbrt_state/sticky-drop"; _dbrt hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
-if [ "$_dbrt_rc" -ne 0 ] && printf '%s' "$_dbrt_out" | grep -q 'still listed' && ! printf '%s' "$_dbrt_out" | grep -q 'retired=oldcopy'; then
+if [ "$_dbrt_rc" -ne 0 ] && grep_in "$_dbrt_out" -q 'still listed' && ! grep_in "$_dbrt_out" -q 'retired=oldcopy'; then
   ok "a DROP the server reports but does not perform is a failed step, never retired=<db>"
 else
   bad "a lying drop fails" "rc=${_dbrt_rc} out: ${_dbrt_out}"
@@ -4647,7 +4671,7 @@ rm -rf "$_dbrt_state"
 
 # drop dry run: narrates, reads no secret, issues no statement
 _dbrt_new; _dbrt env HOSTING_DRY_RUN=true hosting-db-retire drop "${DBRT_ARGS[@]}" --store-uri "$DBRT_URI"
-if [ "$_dbrt_rc" -eq 0 ] && [ ! -s "$_dbrt_state/pg.log" ] && [ ! -s "$_dbrt_state/az.log" ] && printf '%s' "$_dbrt_out" | grep -q 'retired=dry-run' \
+if [ "$_dbrt_rc" -eq 0 ] && [ ! -s "$_dbrt_state/pg.log" ] && [ ! -s "$_dbrt_state/az.log" ] && grep_in "$_dbrt_out" -q 'retired=dry-run' \
    && grep -qx oldcopy "$_dbrt_state/dbs"; then
   ok "a dry-run drop reads no secret, issues no statement and drops nothing"
 else
@@ -4705,8 +4729,8 @@ case "$_inv_fact" in *'"schemaCount" : 2'*'"schema" : "acme"'*'"schema" : "publi
 case "$_inv_out" in *"::hosting:: inventory_schemas=2"*"::hosting:: inventory_nodes=6"*) ok "…plus the schema count and the TOTAL node count (not one schema's)" ;; *) bad "reports schema and node totals" "said: ${_inv_out}" ;; esac
 case "$_inv_log" in *"PGOPTIONS=-c default_transaction_read_only=on"*) ok "the session is opened READ-ONLY (default_transaction_read_only=on)" ;; *) bad "session is read-only" "psql saw: ${_inv_log}" ;; esac
 case "$_inv_sql" in *"BEGIN TRANSACTION READ ONLY;"*) ok "…and the statement runs inside BEGIN TRANSACTION READ ONLY" ;; *) bad "read-only transaction" "sql: ${_inv_sql}" ;; esac
-if printf '%s' "$_inv_sql" | grep -Eiq '\b(insert|update|delete|drop|create|alter|truncate|grant|revoke|vacuum|reindex|cluster|copy)\b'; then
-  bad "the SQL carries no write verb" "found one in: $(printf '%s' "$_inv_sql" | grep -Ei '\b(insert|update|delete|drop|create|alter|truncate|grant|revoke|vacuum|reindex|cluster|copy)\b')"
+if grep_in "$_inv_sql" -Eiq '\b(insert|update|delete|drop|create|alter|truncate|grant|revoke|vacuum|reindex|cluster|copy)\b'; then
+  bad "the SQL carries no write verb" "found one in: $(grep_in "$_inv_sql" -Ei '\b(insert|update|delete|drop|create|alter|truncate|grant|revoke|vacuum|reindex|cluster|copy)\b')"
 else ok "the SQL carries no DDL or DML verb at all"; fi
 case "$_inv_sql" in *"relname IN"*) bad "every table of a partition schema is counted, not a list of satellite names" "sql: ${_inv_sql}" ;;
   *"NOT c.relispartition"*) ok "every table of a partition schema is counted (no name list), a partitioned table once at its parent" ;;
@@ -5107,14 +5131,14 @@ if find /dev/null -maxdepth 0 -printf '' >/dev/null 2>&1 && realpath -e / >/dev/
   # recursion and the thread printed after it both reach the condenser.
   dap MW_DUMP=podA/coredump.10.1791621003 HOSTING_DA_OVERFLOW=5000
   _dap_cs="$(printf '%s\n' "$_dap_out" | sed -n '/^@@MW-DUMP section	clrstack	/,/^@@MW-DUMP end	clrstack	/p')"
-  [ "$_dap_rc" -eq 0 ] && [ "$(printf '%s\n' "$_dap_cs" | grep -c '^@@MW-CUT 4700$')" = 1 ] \
+  [ "$_dap_rc" -eq 0 ] && [ "$(grep_in "$_dap_cs" -c '^@@MW-CUT 4700$')" = 1 ] \
     && case "$_dap_cs" in *"Generated.TheCallThatStartedIt.Run()"*"OS Thread Id: 0x2d (14)"*) true ;; *) false ;; esac \
-    && [ "$(printf '%s\n' "$_dap_cs" | grep -c 'Generated\.Recursion\.Step')" = 298 ] \
+    && [ "$(grep_in "$_dap_cs" -c 'Generated\.Recursion\.Step')" = 298 ] \
     && [ "$(printf '%s\n' "$_dap_cs" | tail -1 | cut -f4)" -gt 100000 ] \
     && ok "in the pod: a 5,000-frame thread keeps its top 200 and bottom 100 frames, the cut COUNTED (@@MW-CUT 4700), the thread after it intact, the full byte count reported" \
-    || bad "pod bounds a deep stack" "rc ${_dap_rc}; cut lines: $(printf '%s\n' "$_dap_cs" | grep '^@@MW-CUT')"
+    || bad "pod bounds a deep stack" "rc ${_dap_rc}; cut lines: $(grep_in "$_dap_cs" '^@@MW-CUT')"
   case "$_dap_out" in *"@@MW-DUMP section	printexception	printexception -nested 00007f1eb7841198"*"Exception type:   System.StackOverflowException"*) ok "in the pod: printexception reads the exception clrthreads names, by its address" ;;
-    *) bad "pod printexception by address" "out: $(printf '%s\n' "$_dap_out" | grep -A3 'section	printexception')" ;; esac
+    *) bad "pod printexception by address" "out: $(grep_in "$_dap_out" -A3 'section	printexception')" ;; esac
   # Negative control: the same dump with the per-thread bound lifted (head = 100,000 frames) is the
   # read before this change — the byte cap cuts INSIDE the deep thread, and its entry frame and the
   # thread printed after it are lost.
@@ -5185,12 +5209,12 @@ _ab_args=(--namespace acme --claim artifact-store --source-namespace control --s
 ab -- "${_ab_args[@]}"
 [ "$_ab_rc" -eq 0 ] && ok "binding the store into a consumer namespace succeeds" || bad "bind happy path" "exited ${_ab_rc}: ${_ab_out}"
 case "$_ab_out" in *"::hosting:: artifact_store_share=acmestore01/pvc-owner"*"::hosting:: artifact_store_created=1"*"::hosting:: artifact_store_bound=acme/artifact-store"*) ok "…reporting the share it read off the owner's PV, that it created the binding, and the claim read back Bound" ;; *) bad "bind facts" "out: ${_ab_out}" ;; esac
-_ab_pv="$(printf '%s\n' "$_ab_applied" | grep '"kind":"PersistentVolume"' | head -1)"
+_ab_pv="$(grep_in "$_ab_applied" '"kind":"PersistentVolume"' | head -1)"
 [ "$(printf '%s' "$_ab_pv" | jq -r '.metadata.name, (.spec.accessModes | join(",")), .spec.csi.readOnly, .spec.persistentVolumeReclaimPolicy, .spec.storageClassName, .spec.capacity.storage' | tr '\n' ' ')" = "artifact-store-acme ReadOnlyMany true Retain  512Gi " ] \
   && ok "the PV is READ-ONLY (ReadOnlyMany + csi.readOnly), Retain (unbinding never deletes the share), no class, the owner's capacity" || bad "pv shape" "pv: ${_ab_pv}"
 [ "$(printf '%s' "$_ab_pv" | jq -r '.spec.csi.volumeHandle, .spec.csi.volumeAttributes.storageAccount, .spec.csi.volumeAttributes.shareName, .spec.csi.nodeStageSecretRef.name, .spec.csi.nodeStageSecretRef.namespace, .spec.claimRef.namespace + "/" + .spec.claimRef.name' | tr '\n' ' ')" = "MC_example-rg_cluster_region#acmestore01#pvc-owner##artifact-store-acme#control acmestore01 pvc-owner azure-storage-account-acmestore01-secret control acme/artifact-store " ] \
   && ok "…on the owner's account and share, with a handle distinct per binding and the provisioner's key Secret in the owner's namespace" || bad "pv target" "pv: ${_ab_pv}"
-[ "$(printf '%s\n' "$_ab_applied" | grep '"kind":"PersistentVolumeClaim"' | jq -r '.metadata.namespace, .metadata.name, (.spec.accessModes | join(",")), .spec.volumeName, .spec.storageClassName' | tr '\n' ' ')" = "acme artifact-store ReadOnlyMany artifact-store-acme  " ] \
+[ "$(grep_in "$_ab_applied" '"kind":"PersistentVolumeClaim"' | jq -r '.metadata.namespace, .metadata.name, (.spec.accessModes | join(",")), .spec.volumeName, .spec.storageClassName' | tr '\n' ' ')" = "acme artifact-store ReadOnlyMany artifact-store-acme  " ] \
   && ok "…and the consumer's claim is ReadOnlyMany, bound by name to exactly that PV" || bad "pvc shape" "applied: ${_ab_applied}"
 
 ab HOSTING_AB_PV="$AB_FIX/existing-pv-same.json" HOSTING_AB_PVC="$AB_FIX/existing-pvc-bound.json" -- "${_ab_args[@]}"
@@ -5239,7 +5263,7 @@ ab HOSTING_AB_SRC_PV="$AB_FIX/owner-pv-explicit-attrs.json" -- "${_ab_args[@]}"
 [ "$_ab_rc" -eq 0 ] && case "$_ab_out" in *"artifact_store_share=acmestore02/pvc-explicit"*) true ;; *) false ;; esac \
   && ok "the owner PV's explicit storageAccount/shareName win over its handle (never the wrong share)" || bad "explicit attrs" "rc ${_ab_rc}; out: ${_ab_out}"
 ab HOSTING_AB_SRC_PV="$AB_FIX/owner-pv-custom-secret.json" -- "${_ab_args[@]}"
-[ "$_ab_rc" -eq 0 ] && [ "$(printf '%s\n' "$_ab_applied" | grep '"kind":"PersistentVolume"' | jq -r '.spec.csi.nodeStageSecretRef | "\(.name)/\(.namespace)"')" = "custom-share-key/control" ] \
+[ "$_ab_rc" -eq 0 ] && [ "$(grep_in "$_ab_applied" '"kind":"PersistentVolume"' | jq -r '.spec.csi.nodeStageSecretRef | "\(.name)/\(.namespace)"')" = "custom-share-key/control" ] \
   && ok "the owner PV's own nodeStageSecretRef is carried over (a share staged with a custom Secret)" || bad "custom secret" "rc ${_ab_rc}; applied: ${_ab_applied}"
 unset _ab_out _ab_rc _ab_calls _ab_applied _ab_pv _ab_args
 
@@ -5555,8 +5579,8 @@ case "$_cdr_args" in *"--set selfUpdate.azureClientId=11111111-2222-3333-4444-55
 : > "$_cdr_log"
 (cd "$_cd/estate" && env "${_cdr_env[@]}" HOSTING_CHART=/tmp hosting-deploy --namespace memex --release memex --database memex --values "$_cdr_vals" >/dev/null 2>&1); _cdr_drc=$?
 _cdr_up="$(grep '^helm upgrade' "$_cdr_log" | head -1)"
-_cdr_sets_deploy="$(printf '%s\n' "$_cdr_up" | grep -oE -- '--set [^ ]+' | sort)"
-_cdr_sets_drift="$(printf '%s\n' "$_cdr_args" | grep -oE -- '--set [^ ]+' | sort)"
+_cdr_sets_deploy="$(grep_in "$_cdr_up" -oE -- '--set [^ ]+' | sort)"
+_cdr_sets_drift="$(grep_in "$_cdr_args" -oE -- '--set [^ ]+' | sort)"
 if [ "$_cdr_drc" -eq 0 ] && [ -n "$_cdr_sets_deploy" ] && [ "$_cdr_sets_deploy" = "$_cdr_sets_drift" ]; then
   ok "the Audit's --set flags are EXACTLY hosting-deploy's for the same record ($(printf '%s\n' "$_cdr_sets_drift" | wc -l | tr -d ' ') flags, one shared composition)"
 else
@@ -5797,6 +5821,25 @@ refuses_hard "tailnet key: five tags are refused" "1–4 tags" hosting-tailnet-k
 refuses_hard "tailnet key: a duplicate tag is refused" "named twice" hosting-tailnet-key "${TK_ARGS[@]/tag:observability/tag:a,tag:a}"
 refuses_hard "tailnet key: a namespace with a metacharacter is refused" "not a plain name" hosting-tailnet-key "${TK_ARGS[@]/control/con;trol}"
 unset _tk_out _tk_rc _tk_kube _tk_az _tk_st
+
+echo
+echo "── no grep -q behind a pipe (SIGPIPE under pipefail reads a match as FALSE) ──"
+# Every script here runs under pipefail. `producer | grep -q` is then a race: grep exits on its
+# match, a producer still writing dies of SIGPIPE (141), and the condition reads FALSE — a present
+# vault object "absent" (run 42454937015), a negated assertion passing. Match a VALUE instead: a
+# here-string (`grep -q PATTERN <<< "$text"`), a bash pattern, or grep_in in this file. The guard
+# reads the lines that RUN (comments stripped) and fails naming each site.
+_gp_hits=""
+for _gp_f in "$BIN"/* "$(dirname -- "${BASH_SOURCE[0]}")"/stubs/*/* "${BASH_SOURCE[0]}"; do
+  [ -f "$_gp_f" ] || continue
+  _gp_hits+="$(sed -e 's/^[[:space:]]*#.*$//' "$_gp_f" | grep -nE '[|][[:space:]]*grep[[:space:]]+(-[[:alnum:]]+[[:space:]]+)*-[[:alnum:]]*q' | sed "s|^|${_gp_f}:|")"$'\n'
+done
+[ -z "${_gp_hits//$'\n'/}" ] && ok "no script, stub or check runs grep -q behind a pipe" || bad "grep -q behind a pipe (SIGPIPE race under pipefail)" "$_gp_hits"
+# Negative control: the guard's own pattern recognises the form it refuses.
+_gp_bar='|'  # spelled apart, so the guard's scan of this file does not find its own probe
+_gp_probe="$(printf '%s\n' "if az x ${_gp_bar} grep -qx \"\$n\"; then" "  foo ${_gp_bar}grep -c -q bar" '  grep -q x <<< "$y"' | grep -cE '[|][[:space:]]*grep[[:space:]]+(-[[:alnum:]]+[[:space:]]+)*-[[:alnum:]]*q')"
+[ "$_gp_probe" = "2" ] && ok "…and the guard sees both pipe forms and passes the here-string" || bad "the guard's pattern" "matched ${_gp_probe} of the 2 pipe forms"
+unset _gp_hits _gp_f _gp_probe _gp_bar
 
 echo
 echo "─────────────────────────────────────────────────────────────────"

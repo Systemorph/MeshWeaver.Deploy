@@ -84,7 +84,7 @@ if [ "$method $path" = "POST /api/instances/register" ]; then
   printf 'REGISTER %s boot=%s\n' "$reg_id" "$([ -n "$reg_boot" ] && echo present || echo empty)" >> "$state/log"
   [ "$mode" = "closed" ] && [ -z "$reg_boot" ] && answer 401 '{"error":"open registration is disabled"}'
   if [ -n "$reg_boot" ] && [ "$reg_boot" != "$(cat "$state/bootstrap" 2>/dev/null)" ]; then answer 403 '{"error":"bootstrap key not accepted"}'; fi
-  printf '%s' "$reg_id" | grep -Eq '^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]$' || answer 400 '{"error":"instanceId must be 3-48 chars of lowercase letters, digits and single hyphens"}'
+  grep -Eq -- '^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]$' <<< "$reg_id" || answer 400 '{"error":"instanceId must be 3-48 chars of lowercase letters, digits and single hyphens"}'
   while read -r h i s; do [ "$i" = "$reg_id" ] && answer 409 '{"error":"instance id is taken"}'; done < "$keys"
   minted="mwi_fake-registered-key-NEVER-PRINTED-${reg_id}"
   printf '%s %s current\n' "$(printf '%s' "$minted" | sha256sum | cut -c1-64)" "$reg_id" >> "$keys"
