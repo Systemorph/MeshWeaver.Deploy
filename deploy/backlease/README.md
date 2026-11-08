@@ -8,8 +8,29 @@ portal that `memex-local` runs stays in its own profile (`default`), and Ollama 
 |---|---|
 | Size the build VM and the runners from the host | `memex-local buildhost plan \| apply [--resize] \| status` (`deploy/homebrew/bin/memex-local`) |
 | First attach: AppArmor profile, Secrets, the `build-host-mac` release | `first-attach.sh` (this directory), header for the steps |
+| Following the sealed set from then on (no hand re-attach to move a set) | `follow-set.py` (this directory), installed by `first-attach.sh` step 6 |
 | The runners' values | `build-host-mac.values.yaml` |
 | Fleet jobs at the lowest priority | `deploy/homebrew/share/buildhost-priority.sh` (below) |
+
+## The host follows the sealed set — never re-run first-attach to move it
+
+`first-attach.sh` step 6 loads the launchd agent `com.memex.local.buildhost-follow.<profile>` (`follow-set.py`, this
+directory). Every 5 minutes it reads the COMPLETE set the followed channel runs from control
+(`GET /api/builds/channels/latest/set`: the set CD sealed, armed and handed over). When the `build-host-mac` release runs
+another set, it re-applies the chart first-attach copied beside it (`~/.memex-local/buildhost-follow/<profile>/helm`) with
+exactly the four set values (`--reuse-values`, the profile's own kube context).
+
+- **Draining** is the chart's own rollout. On SIGTERM a runner stops claiming and finishes the run in hand, within
+  `terminationGracePeriodSeconds`, which is the run deadline.
+- **It fails closed.** Nothing is applied when control is unreachable, the set is incomplete or malformed, the release
+  is mid-operation, or no chart sits beside the agent. Each pass writes one line to `follow.log` beside it.
+- **Why it follows `latest`:** that set is what main is built against, and it is the set a Mac must present to serve
+  `latest`'s runs.
+- **Pin a host** by attaching with `--follow off`.
+- **A chart change** still needs a re-attach, which re-copies the chart.
+
+Measured motivation, why the host pulls rather than control pushing, and how to operate it: MeshWeaver.Plugins
+`Hosting/MacStudioAttachRunbook.md` §8.
 
 ## Fleet jobs run at the lowest priority on a leased Mac
 
