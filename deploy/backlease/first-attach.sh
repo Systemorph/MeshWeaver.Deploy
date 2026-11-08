@@ -40,6 +40,8 @@
 #   5. fleet jobs at the LOWEST priority on this Mac: loads the launchd governor (deploy/homebrew/share/buildhost-priority.sh
 #      --install) that puts the build VM's process in the background band while the owner, the portal VM or Ollama want
 #      the cores, and gives it every idle core otherwise (nice/renice do nothing on macOS — see the script's header).
+#      And the network: deploy/homebrew/share/vm-netshape.sh --apply caps the build VM's internet traffic (tc, inside the
+#      VM) at a share of the link measured once with networkQuality, and marks it DSCP CS1.
 # The set (version + tester/portal/runner digests) is the one the operations record names for `latest`; it is passed,
 # never committed. The runner digest must be a multi-arch index carrying linux/arm64.
 set -euo pipefail
@@ -258,6 +260,10 @@ echo "== 5/5 fleet jobs at the lowest priority (launchd governor for profile $pr
 # The runners are deployed by now: a governor that cannot load is reported, never a failed attach.
 bash "$here/../homebrew/share/buildhost-priority.sh" --install --profile "$profile" \
   || echo "WARN: the priority governor did not load — the build VM competes at the default band; re-run: bash deploy/homebrew/share/buildhost-priority.sh --install --profile $profile" >&2
+# The network too (maintainer, 2026-11-08): the build VM's internet traffic is capped at a share of the measured link
+# and marked DSCP CS1, so an artefact upload never fills the owner's uplink (mw-netshape.service in the VM).
+bash "$here/../homebrew/share/vm-netshape.sh" --apply --profile "$profile" \
+  || echo "WARN: the build VM's network is NOT shaped — its uploads compete with the owner's traffic; re-run: bash deploy/homebrew/share/vm-netshape.sh --apply --profile $profile" >&2
 
 echo "== the owner's opt-in (jobs: ${acc_jobs:-unchanged} · tokens: ${acc_tokens:-unchanged})"
 # The answers live in the back-lease layer the portal's heartbeat reads (the runners alone carry no heartbeat). Both were

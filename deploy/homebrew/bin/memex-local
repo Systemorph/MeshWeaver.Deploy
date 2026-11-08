@@ -4890,6 +4890,7 @@ cmd_up() {
   ensure_overlay
   residency_onboard "$residency"                 # WHERE this machine processes prompts (asked once)
   start_colima                                   # §2
+  vm_netshape_apply default                      # the portal VM's pulls and sync yield to the owner's network
 
   case "$image_source" in                        # §3
     build) image_build_local "$rebuild_base"; portal_next_build_local ;;   # portal + migration, then the /next React GUI
@@ -5523,6 +5524,7 @@ cmd_buildhost() {
       fi
       buildhost_keda
       buildhost_priority_install
+      vm_netshape_apply "$BUILD_PROFILE"
       if helm --kube-context "$(build_ctx)" -n "$BUILD_NS" status "$BUILD_RELEASE" >/dev/null 2>&1; then
         step "Sizing the runners: $(plan_value runners_min "$plan")…$(plan_value runners_max "$plan") × ${BUILD_CPU_PER_RUNNER} CPU, $(plan_value stage_slots "$plan") stage slots"
         helm --kube-context "$(build_ctx)" -n "$BUILD_NS" upgrade "$BUILD_RELEASE" "$(resolve_chart)" --reuse-values \
@@ -5560,7 +5562,8 @@ print("  runners %s…%s, %s stage slots, requests %s, limits %s" % (m.get("minR
         *) die "usage: memex-local buildhost priority {install | off | status}" ;;
       esac
       ;;
-    *) die "usage: memex-local buildhost {plan | apply [--resize] | status | priority [install|off|status]}" ;;
+    net) shift_net_cmd "$BUILD_PROFILE" "$@" ;;
+    *) die "usage: memex-local buildhost {plan | apply [--resize] | status | priority [install|off|status] | net [apply|measure|off|status]}" ;;
   esac
 }
 
@@ -5574,6 +5577,34 @@ buildhost_priority_install() {
     && ok "launchd agent com.memex.local.buildhost-priority loaded ('memex-local buildhost priority status')" \
     || warn "the build-host priority governor did not load — the build VM competes with the owner at the default band; 'memex-local buildhost priority install'"
 }
+
+# Fleet traffic yields to the owner's network too (maintainer, 2026-11-08): inside the Colima VM of profile $1, Linux tc
+# caps internet-bound traffic at a declared share of the measured link (both directions), marks it DSCP CS1, and leaves
+# traffic to the Mac itself alone — share/vm-netshape.sh, persisted in the VM as mw-netshape.service. Measures the link
+# once (networkQuality) when nothing is recorded. Never fails the caller: an unshaped VM is reported, not fatal.
+vm_netshape_apply() {
+  [ "${MEMEX_NET_SHAPE:-on}" = off ] && { info "network shaping for profile $1 is off (MEMEX_NET_SHAPE=off)"; return 0; }
+  step "Fleet traffic yields to the owner's network: capping the $1 VM's internet traffic"
+  # Output goes to a file, never a command substitution: a `colima ssh` that starts a new ssh control master leaves it
+  # holding the substitution's pipe, and the caller would wait until that master exits.
+  local out; out="$(mktemp)"
+  if MEMEX_LOCAL_HOME="$LOCAL_HOME" bash "$(resolve_share)/vm-netshape.sh" --apply --profile "$1" > "$out" 2>&1 < /dev/null; then ok "$(tail -1 "$out")"
+  else warn "the $1 VM's traffic is NOT shaped — 'memex-local net apply --profile $1': $(tail -2 "$out" | tr '\n' ' ')"; fi
+  rm -f "$out"
+}
+
+# memex-local net {apply|measure|off|status} [--profile P] — and 'buildhost net …' for the build profile.
+shift_net_cmd() {
+  local profile="$1"; shift
+  [ "${1:-}" = net ] && shift
+  local sub="${1:-status}"; shift || true
+  while [ $# -gt 0 ]; do case "$1" in --profile) profile="${2:?--profile needs a Colima profile}"; shift ;; *) die "net: unknown flag '$1'" ;; esac; shift; done
+  local flag
+  case "$sub" in apply) flag=--apply ;; measure) flag=--measure ;; off) flag=--remove ;; status) flag=--status ;;
+    *) die "usage: memex-local net {apply | measure | off | status} [--profile default|build]" ;; esac
+  MEMEX_LOCAL_HOME="$LOCAL_HOME" bash "$(resolve_share)/vm-netshape.sh" "$flag" --profile "$profile"
+}
+cmd_net() { shift_net_cmd default "$@"; }
 
 # KEDA in the build VM: the runners' scaler. Idempotent.
 buildhost_keda() {
@@ -5724,6 +5755,13 @@ COMMANDS:
                   Fleet jobs run at the LOWEST priority: 'apply' also loads a launchd governor that
                   puts the build VM in the background band while the owner, the portal VM or Ollama
                   want the cores, and gives it every idle core otherwise ('priority off' removes it).
+                  'apply' also shapes the build VM's network ('buildhost net …', see 'net').
+  net apply | measure | off | status [--profile default|build]
+                  FLEET TRAFFIC YIELDS TO THE OWNER'S NETWORK: Linux tc inside the Colima VM caps its
+                  internet traffic (up and down) at MEMEX_NET_SHARE_PCT (default 25) % of the link,
+                  measured once with networkQuality, and marks it DSCP CS1; traffic to the Mac is
+                  exempt. MEMEX_NET_UP_KBIT / MEMEX_NET_DOWN_KBIT declare the caps (0 = none).
+                  'up' and 'buildhost apply' apply it; 'measure' re-measures; 'off' removes it.
   backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>]
             [--accept-jobs=<patterns> | --no-accept-jobs] [--job-channels <c>] [--job-repos <owner/repo>]
             [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--token-max-concurrency <n>|none]
@@ -6351,6 +6389,7 @@ main() {
     backlease)     cmd_backlease "$@" ;;
     fleet)         cmd_fleet "$@" ;;
     buildhost)     cmd_buildhost "$@" ;;
+    net)           cmd_net "$@" ;;
     llm)           cmd_llm "$@" ;;
     residency)     cmd_residency "$@" ;;
     publish)       cmd_publish "$@" ;;

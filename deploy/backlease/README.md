@@ -10,6 +10,7 @@ portal that `memex-local` runs stays in its own profile (`default`), and Ollama 
 | First attach: AppArmor profile, Secrets, the `build-host-mac` release | `first-attach.sh` (this directory), header for the steps |
 | The runners' values | `build-host-mac.values.yaml` |
 | Fleet jobs at the lowest priority | `deploy/homebrew/share/buildhost-priority.sh` (below) |
+| Fleet traffic yields to the owner's network | `deploy/homebrew/share/vm-netshape.sh` (below) |
 
 ## Fleet jobs run at the lowest priority on a leased Mac
 
@@ -65,3 +66,48 @@ whose command line names Ollama.
 
 Inside the build VM there is nothing more to lower. The host schedules the whole VM as one process, so
 priorities inside the guest do not reach the host, and the VM runs only k3s, KEDA and the build runners.
+
+## Fleet traffic yields to the owner's network
+
+The lowest priority covers the network too (maintainer, 2026-11-08). A build uploads artefacts and module outputs
+to control at whatever the line gives it, and a home router queues that upload in front of everyone else's
+packets: the owner's TV stream or video call then waits behind it. `vm-netshape.sh` shapes each Colima VM's
+traffic inside the VM with Linux `tc`, so nothing on the Mac or the router needs changing:
+
+| What | How |
+|---|---|
+| Uploads | an HTB token bucket on the VM's uplink device caps internet-bound traffic, with `fq_codel` under it |
+| Downloads | the same cap on an `ifb` device the uplink's ingress is redirected to (image pulls, NuGet, git) |
+| Marking | DSCP CS1 (lower effort) on every internet-bound packet, for routers and Wi-Fi that honour it |
+| Exempt | the VM's on-link subnet: the Mac itself (gateway, port forwards, kube API) |
+
+The cap is `MEMEX_NET_SHARE_PCT` (default 25) percent of the link in each direction. The link is measured
+ONCE with macOS `networkQuality`, which fills the line for about 20 s, and recorded in
+`~/.memex-local/netshape-<profile>.env`; a second profile reuses the first one's measurement. The owner declares
+the caps instead with `MEMEX_NET_UP_KBIT` / `MEMEX_NET_DOWN_KBIT` (0 = no cap in that direction; the marking
+stays). In the VM the shaper is `/usr/local/sbin/mw-netshape` under the systemd unit `mw-netshape.service`, so it
+survives a VM restart.
+
+`memex-local buildhost apply` and `first-attach.sh` shape the build VM; `memex-local up` shapes the portal's VM
+(profile `default`). `MEMEX_NET_SHAPE=off` skips both.
+
+```
+memex-local net status  [--profile default|build]   # recorded rates, the unit, the capped classes' counters
+memex-local net apply   [--profile …]               # (re)apply from the recorded rates
+memex-local net measure [--profile …]               # measure the link again, then apply
+memex-local net off     [--profile …]               # remove it; the VM's traffic is unshaped
+memex-local buildhost net …                         # the same for the build profile
+```
+
+Measured on the first Mac (Wi-Fi, link 279 Mbit/s up, 2026-11-08), pinging 1.1.1.1 from another machine on
+the same Wi-Fi while the build VM uploaded 400 MB:
+
+| | upload | LAN ping p95 | p99 | max |
+|---|---|---|---|---|
+| idle | — | 6–8 ms | 7–9 ms | 8–14 ms |
+| unshaped, two runs | 224–260 Mbit/s | 18–28 ms | 27–59 ms | 29–65 ms |
+| capped at 70 Mbit/s | 67 Mbit/s | 8–11 ms | 10–17 ms | 11–18 ms |
+
+HTB's default burst (one MTU) let a 70 Mbit/s cap pass only 9–43 Mbit/s in the VM. The capped class uses a
+64 KiB burst, about 7 ms at that rate, and holds 67 Mbit/s.
+
