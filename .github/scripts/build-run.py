@@ -2923,6 +2923,26 @@ def writable_platform_source(platform_src: str, dest: str) -> str:
     return dest
 
 
+ARTIFACT_UNIT_MAX = 200   # the store's receipt locator holds 512 characters; the repo, sha, run, stage and hash take ~200
+
+
+def artifact_unit(unit: str) -> str:
+    """`unit` as handed over: unchanged when it fits; otherwise its file name is shortened DETERMINISTICALLY — a prefix,
+    `~`, the first 12 hex of the full name's SHA-256, the extension kept — so the receipt's locator stays inside the
+    store's 512 characters (a test log named after a long test once took 513 and its hand-over was refused). Directories
+    are kept as they are, so a consumer's unit (`gate-log/gate.log`) is never renamed. Pure."""
+    if len(unit) <= ARTIFACT_UNIT_MAX:
+        return unit
+    head, _, name = unit.rpartition("/")
+    stem, dot, ext = name.rpartition(".")
+    if not dot or len(ext) > 12:
+        stem, ext = name, ""
+    tag = hashlib.sha256(unit.encode()).hexdigest()[:12]
+    room = max(16, ARTIFACT_UNIT_MAX - len(head) - 1 - len(tag) - 2 - len(ext))
+    short = f"{stem[:room]}~{tag}" + (f".{ext}" if ext else "")
+    return f"{head}/{short}" if head else short
+
+
 def sandbox_readonly_roots(env: dict) -> list[str]:
     """The host-side roots every stage's sandbox binds READ-ONLY: the tester, the portal's /app, the compile
     reference set (wherever MW_BUILD_COMPILE_REFS points — a path handed to a stage must be visible in it),
@@ -5558,7 +5578,7 @@ class Host:
             return self.store_runner(argv, timeout=min(1800.0, budget), cancel=cancel)
 
         for full in sorted(files):
-            unit = os.path.relpath(full, artifacts_dir).replace(os.sep, "/")
+            unit = artifact_unit(os.path.relpath(full, artifacts_dir).replace(os.sep, "/"))
             if "/" not in unit:
                 return receipts, f"{unit} is not under a unit directory ($MW_BUILD_ARTIFACTS/<unit>/<file>)"
             digest, size = _sha256_file(full), os.path.getsize(full)
@@ -5630,7 +5650,7 @@ class Host:
         API_UPLOAD_ATTEMPTS and the run budget; every other answer fails the stage at once, naming it."""
         receipts = []
         for full in sorted(files):
-            unit = os.path.relpath(full, artifacts_dir).replace(os.sep, "/")
+            unit = artifact_unit(os.path.relpath(full, artifacts_dir).replace(os.sep, "/"))
             if "/" not in unit:
                 return receipts, f"{unit} is not under a unit directory ($MW_BUILD_ARTIFACTS/<unit>/<file>)"
             digest, size = _sha256_file(full), os.path.getsize(full)
@@ -6115,6 +6135,13 @@ def self_test() -> int:
     # The host's OWN sandbox binds every staged image root read-only — /core-tests included: core's
     # shard and doc-gate stages run `python3 /core-tests/core-tests.py …` (core .github/build-stages.json).
     hav = " ".join(Host({}, None, log=lambda s: None).sandbox.argv("true", "/w/s", "/w/o", {}))
+    long_unit = "diagnostics/portal-hosts/test-logs/src__MeshWeaver.Fleet.Control.Test__bin__Release__net10.0__test-logs__" + "A" * 300 + ".log"
+    short_unit = artifact_unit(long_unit)
+    check("artifact/a unit too long for the store's receipt is shortened deterministically, its directory and extension kept",
+          len(short_unit) <= ARTIFACT_UNIT_MAX and short_unit.startswith("diagnostics/portal-hosts/test-logs/") and short_unit.endswith(".log")
+          and artifact_unit(long_unit) == short_unit and artifact_unit(long_unit + "x") != short_unit, short_unit)
+    check("artifact/a unit that fits is never renamed (consumers read gate-log/gate.log by name)",
+          artifact_unit("gate-log/gate.log") == "gate-log/gate.log")
     mav = Host({}, None, log=lambda s: None).sandbox.argv("true", "/w/run-7/src", "/w/o", {}, mount=SANDBOX_CHECKOUT)
     check("bwrap/a run's checkout appears at ONE fixed path inside the sandbox (the same for every run and the warm build)",
           mav[mav.index("/w/run-7/src") + 1] == SANDBOX_CHECKOUT and mav[mav.index("--chdir") + 1] == SANDBOX_CHECKOUT
