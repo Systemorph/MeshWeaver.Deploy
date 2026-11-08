@@ -3521,6 +3521,16 @@ def seed_run_from_warm(repo: str, sha: str, refs: list, warm: str, dest: str, to
             with open(os.path.join(dest, ".git", "objects", "info", "alternates"), "w") as fh:
                 fh.write(os.path.join(mirror, "objects") + "\n")
             g("-C", dest, "remote", "add", "origin", f"{base}/{repo}.git")
+            # start from the warm tree's OWN index (host-private, written by _trusted_tree), refreshed against the copied
+            # files: an empty index would make `read-tree -u` rewrite EVERY tracked file, giving sources newer timestamps
+            # than the carried obj/ and bin/ and defeating MSBuild's incremental checks. The refresh re-hashes a stat-dirty
+            # entry (the copy changed its inode and ctime) without touching the file, so the one-way `read-tree --reset -u`
+            # below rewrites only what differs from `sha` — a file the run's commit changed, or a tracked file the warmBuild
+            # modified (restored) — and leaves every unchanged file with the timestamp it had in the warm tree.
+            warm_index = os.path.join(warm_private(warm), "git", "index")
+            if os.path.isfile(warm_index) and not os.path.islink(warm_index):
+                shutil.copyfile(warm_index, os.path.join(dest, ".git", "index"))
+                g("-C", dest, "update-index", "-q", "--refresh")
             g("-C", dest, "read-tree", "--reset", "-u", sha)
             g("-C", dest, "clean", "-ffdxq", *[a for k in WARM_KEEP for a in ("-e", k)])
             g("-C", dest, "update-ref", "--no-deref", "HEAD", sha)
@@ -4110,6 +4120,7 @@ class Host:
                 return
             warm = os.path.join(self.work, WARM_DIR, repo)
             scratch = tempfile.mkdtemp(prefix=".warm-", dir=self.work)
+            tip = ""
             try:
                 mirror = os.path.join(self.cache, "git", f"{repo}.git")
                 # the tip as the runs last fetched it into the mirror (with their token): the idle path uses no network
@@ -4131,7 +4142,6 @@ class Host:
                     # the tree and the tip is NOT marked handled — it is retried after a pause, so a run is not left cloning
                     self.warm_failed[repo] = (tip, key, time.monotonic())
                     continue
-                self.warm_failed.pop(repo, None)
                 try:
                     with open(os.path.join(warm, ".github", "build-stages.json")) as fh:
                         decl = validate_warm_build(json.load(fh))
@@ -4140,6 +4150,7 @@ class Host:
                     decl = None
                 if decl is None:
                     write_warm_state(warm, {"key": key, "tip": tip, "built": "none"})
+                    self.warm_failed.pop(repo, None)
                     continue
                 # the image's PREPARED inputs, resolved for THIS build: `run_env` is the run's, and it is empty while idle
                 prepared = prepared_env()
@@ -4160,9 +4171,12 @@ class Host:
                                                    cancel=self.warm_cancel)
                 if rc == 0:
                     write_warm_state(warm, {"key": key, "tip": tip, "built": tip})
+                    self.warm_failed.pop(repo, None)
                     self.log(f"warm main workspace: built main@{tip[:12]} with the tip's warmBuild in {int(self.clock() - started)} s")
                 else:
                     wipe_warm(warm)
+                    # the cooldown covers a failed BUILD too: an unchanged failing tip is not prepared and rebuilt every pass
+                    self.warm_failed[repo] = (tip, key, time.monotonic())
                     self.log(f"warm main workspace: the tip's warmBuild failed (exit {rc}) — wiped, retried when idle: {text.strip()[-300:]}")
             except Lost:
                 # a claim (or SIGTERM) needs the host: the half-built workspace is wiped, never copied by a run
@@ -4171,6 +4185,8 @@ class Host:
                 return
             except (Refusal, subprocess.SubprocessError, OSError, ValueError) as e:
                 wipe_warm(warm)
+                if SHA.match(tip):
+                    self.warm_failed[repo] = (tip, key, time.monotonic())
                 self.log(f"warm main workspace for {repo}: not warmed ({type(e).__name__}: {str(e)[:200]}) — wiped, retried when idle")
             finally:
                 shutil.rmtree(scratch, ignore_errors=True)
@@ -5977,6 +5993,26 @@ def self_test() -> int:
             check("warm/a run can NEVER write the warm workspace (its writes stay in its own copy)",
                   open(os.path.join(warm, "src", "obj", "state.cache")).read() == "main" and not os.path.exists(os.path.join(warm, "planted.dll"))
                   and open(os.path.join(warm, "a.cs")).read() == "v2")
+            # SAME tip: no unchanged tracked file is rewritten, so sources stay OLDER than the carried obj/ (MSBuild's
+            # incremental check), while a tracked file the warmBuild modified is restored (review of Deploy#183)
+            old_t = 1_000_000_000
+            os.utime(os.path.join(warm, "a.cs"), (old_t, old_t))
+            run_s = os.path.join(wroot, "work", "run-same", "src")
+            seed_run_from_warm("R", c2, [], warm, run_s, None, wenv, log0, key="k1")
+            check("warm/a run at the warm tip keeps every unchanged tracked file's timestamp (nothing is rewritten)",
+                  int(os.stat(os.path.join(run_s, "a.cs")).st_mtime) == old_t and open(os.path.join(run_s, "a.cs")).read() == "v2",
+                  os.stat(os.path.join(run_s, "a.cs")).st_mtime)
+            open(os.path.join(warm, "a.cs"), "w").write("modified by warmBuild")
+            run_r = os.path.join(wroot, "work", "run-restore", "src")
+            seed_run_from_warm("R", c2, [], warm, run_r, None, wenv, log0, key="k1")
+            check("warm/a tracked file the warmBuild modified is restored to the commit in the run's copy",
+                  open(os.path.join(run_r, "a.cs")).read() == "v2")
+            run_c = os.path.join(wroot, "work", "run-changed", "src")
+            os.utime(os.path.join(warm, "a.cs"), (old_t, old_t))
+            seed_run_from_warm("R", c1, [], warm, run_c, None, wenv, log0, key="k1")
+            check("warm/a file the run's commit changes IS rewritten (newer than the carried outputs)",
+                  open(os.path.join(run_c, "a.cs")).read() == "v1" and int(os.stat(os.path.join(run_c, "a.cs")).st_mtime) > old_t)
+            open(os.path.join(warm, "a.cs"), "w").write("v2")
             adv2 = advance_warm_main("R", c2, warm, wenv, log0, key="k1")
             check("warm/the host does nothing when the warm workspace is already at the tip", adv2.startswith("warm main workspace: already at"), adv2)
             write_warm_state(warm, {"key": "k1", "tip": c1, "built": c1})
@@ -6575,6 +6611,20 @@ def self_test() -> int:
                 check("warm-idle/after the pause the failed tip is tried again", len(adv_calls) == 2, adv_calls)
             finally:
                 globals()["advance_warm_main"] = real_adv
+            # a failing warmBuild (advancement fine) observes the same cooldown: not re-prepared and rebuilt every pass
+            hf.warm_failed.clear()
+            builds: list = []
+            hf._sandboxed_capture = lambda *a_, **k_: (builds.append(1), (1, "boom"))[1]
+            hf.warm_main_when_idle()
+            hf.warm_main_when_idle()
+            check("warm-idle/a FAILED warmBuild is recorded and its tip is not rebuilt on the next idle pass",
+                  len(builds) == 1 and hf.warm_failed.get("R", ("",))[0] == c3, (builds, hf.warm_failed))
+            hf._sandboxed_capture = lambda *a_, **k_: (builds.append(1), (0, ""))[1]
+            hf.warm_failed["R"] = (c3, warm_key(hf.env, hf.identity), time.monotonic() - WARM_RETRY_SECONDS - 1)
+            hf.warm_main_when_idle()
+            check("warm-idle/a successful build after the pause clears the failure",
+                  len(builds) == 2 and "R" not in hf.warm_failed
+                  and (warm_state(os.path.join(fail_work, WARM_DIR, "R")) or {}).get("built") == c3, (builds, hf.warm_failed))
             run5 = os.path.join(idle_work, "run5", "src")
             line5 = seed_run_from_warm("R", c1, [], iw, run5, None, wenv, lambda m: None, key=warm_key(hi.env, hi.identity))
             # a claim STOPS a warm build in flight (its sandbox killed, the half-built workspace wiped) — never waits it out
