@@ -225,11 +225,32 @@ platform image in Colima's VM, sized for the host
 A Mac Studio's chat model is `qwen3.8:27b-mlx` itself. Any further model to offer is listed in `MEMEX_OLLAMA_EXTRA_MODELS`
 (`none` pulls none). Pulling a model does not offer it. A Mac serves the fleet only when its owner opts in.
 
+**Where the local models process prompts — the install's residency.** Every install declares ONE processing
+location, and the portal stamps it on each local (Ollama) model as its data residency
+(`OpenAICompatible__DataResidency` — `Eu`, `Global`, or a two-letter ISO code such as `CH`; only `Eu` counts as
+EU-only). Without it a local model reads as Unknown, and the model picker shows only its maker's flag: a Swiss
+Mac's `qwen` looks as if its prompts went to China, and a model whose residency is Unknown is never used for mail
+triage.
+
+- The first interactive `up` asks *"Where is this machine?"*. The macOS region (`AppleLocale`) only suggests the
+  default: an EU member state suggests `Eu`, Switzerland `CH`, anywhere else its ISO code. Type `none` to declare
+  nothing. Once answered, `up` does not ask again.
+- A headless install passes `up --residency CH` (or `MEMEX_RESIDENCY=CH`). With neither, nothing is declared and
+  the models stay Unknown. Nothing is ever guessed, and `Eu` is never applied silently.
+- On an existing install: `memex-local residency CH`, then `memex-local update --skip-image`
+  (`update --residency CH` does both). `memex-local residency` prints the declaration, `residency --clear` removes it,
+  and `status` and `llm status` print it.
+- It is kept in `~/.memex-local/residency` and written into the per-install layer `llm.auto.yaml`. An
+  `OpenAICompatible__DataResidency` line in the overlay `values.local.yaml` still wins.
+- `llm use --residency X` (any residency: `Eu`, `Global`, an ISO code) overrides it for the `llm` layer alone.
+  Without the flag, the layer copies nothing and the declaration applies. `backlease accept tokens` and
+  `fleet join` offer the declaration as the token residency when `--residency` is not given.
+
 **The owner's opt-in** (MeshWeaver.Plugins `Hosting/BackLease` §13). An enrolled Mac takes NO fleet jobs and serves
 NO token requests until its owner says yes and names the instances it takes each from. `fleet join` and
 `backlease enroll` ask both questions. The defaults are offered, not applied: jobs from `control.systemorph.com`,
-tokens from `*.meshweaver.cloud`, and the models `qwen3.8:27b-mlx qwen3.6`. The residency has no default; type
-where the machine is. A headless run passes `--accept-jobs=<patterns>` / `--no-accept-jobs` and
+tokens from `*.meshweaver.cloud`, and the models `qwen3.8:27b-mlx qwen3.6`. The residency defaults to the
+install's declaration (`memex-local residency`, above); with none declared, type where the machine is. A headless run passes `--accept-jobs=<patterns>` / `--no-accept-jobs` and
 `--accept-tokens=<patterns>` / `--no-accept-tokens` (with `--token-models`, `--residency`), and with no answer
 both stay off. **Token slots.** How many requests the machine serves at once is the machine's capacity, not an owner choice.
 A Mac Studio is 2. It is measured: Ollama 0.40's MLX runner decodes one request at a time, and one stream saturates
@@ -462,7 +483,7 @@ rolled in place; the **migration** is re-run as a Job (it has no Deployment).
 | §5 mkcert TLS | `mkcert -install` + mint cert + `kubectl create secret tls memex-portal-tls` | `setup_tls()` |
 | §6 Hostname | `memex.localhost` (auto-resolves), port `8443` | constants `HOSTNAME_LOCAL` / `HOST_PORT` |
 | §7 Durable access | `port-forward.sh` + `com.memex.local.plist`, `launchctl bootstrap` | `install_launchd()` (assets in `share/`) |
-| §10 Local LLM | `brew services start ollama` (loopback 127.0.0.1:11434, `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`; memex-local's own agent as the fallback; the VM reaches it through its gateway); `ollama pull qwen3.8:27b-mlx`; the portal calls `http://ollama.memex.svc.cluster.local:11434/v1` — a Host Ollama admits (the short name `ollama:11434` is answered 403) | `setup_ollama()` + `ensure_chat_model()` + tracked defaults (endpoint, `ollama.external`) + `~/.memex-local/llm.auto.yaml` (model, context window, `AI__Tiers__chat`, gateway IP) + `llm_chat_smoke()` (a real completion from inside the pod; `up`/`update` fail on a 403 or any non-200) |
+| §10 Local LLM | `brew services start ollama` (loopback 127.0.0.1:11434, `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`; memex-local's own agent as the fallback; the VM reaches it through its gateway); `ollama pull qwen3.8:27b-mlx`; the portal calls `http://ollama.memex.svc.cluster.local:11434/v1` — a Host Ollama admits (the short name `ollama:11434` is answered 403) | `setup_ollama()` + `ensure_chat_model()` + tracked defaults (endpoint, `ollama.external`) + `~/.memex-local/llm.auto.yaml` (model, context window, `AI__Tiers__chat`, gateway IP) + `llm_chat_smoke()` (a real completion from inside the pod; `up`/`update` fail on a 403 or any non-200). **Embeddings are local too:** `ensure_embed_model()` pulls `bge-m3` (1024-dim, multilingual), `llm.auto.yaml` sets `Embedding__Provider=Ollama`, `Embedding__Endpoint` (the same host-safe endpoint) and `Embedding__Model` for the portal AND the migration Job (which sizes the vector columns and backfills), and `embed_smoke()` proves a vector of the platform's width from inside the pod — a Mac install never embeds in the cloud |
 | §11 Observability | `helm upgrade --install loki grafana/loki-stack -f share/values.observability.yaml` (sized for the VM; `fleet join` runs it) | `cmd_observability()` |
 | §12 Instance identity | `Portal__InstanceName/Color` | overlay `config.memex_portal` |
 | §14 Verify | assert the portal is USABLE — it serves, `/login` is routed, and the DefaultViews/GraphViews packs are present | `verify_usable()` (`up` / `update` / `verify`; behaviour-tested in `test/run-tests.sh`) |
@@ -531,6 +552,8 @@ log, ollama log, grafana password) — exactly the paths the doc uses.
 | `MEMEX_LOG_LEVEL` | `Debug` | verbose log level (`Trace` for max) |
 | `MEMEX_COLIMA_CPU` / `MEMEX_COLIMA_MEM` | `8` / `16` (or the profile's) | VM sizing (§2) |
 | `MEMEX_OLLAMA_MODEL` | `qwen3.8:27b-mlx` / `qwen3:8b` by host memory (or the profile's) | the default chat model `up`/`update` pull and the portal names; `none` skips it |
+| `MEMEX_EMBED_MODEL` | `bge-m3` | the local embedding model (semantic search + content indexing) `up`/`update` pull and the portal and migration name; `nomic-embed-text` and `mxbai-embed-large` are the others the platform sizes; any other is refused; `none` leaves embeddings OFF (said, not silent) |
+| `MEMEX_RESIDENCY` | unset (none declared) | where this install processes prompts (`Eu`, `Global`, ISO code such as `CH`); `up` persists it (above) |
 | `MEMEX_LLM_SMOKE` | `1` | `0` skips the post-install chat smoke (loudly) |
 | `MEMEX_OCR` | unset | `none` turns the local OCR engine off. Unset: when the chat model reports the `vision` capability, `llm.auto.yaml` declares `Ocr__Engine=OllamaVision` on the same host-safe endpoint and model, so every instance on the Mac reads and describes pictures and scanned pages (MeshWeaver.Plugins `Indexing/DocumentEnrichment`); a chat model without vision is said loudly by `up`/`update` and reported red by `status`/`doctor` |
 | `MEMEX_PROFILE` | unset | Mac host profile, `mac-studio` or `mac-mini` (below) |
