@@ -1914,6 +1914,14 @@ effective_chat_model() {
   printf '%s' "$m"
 }
 
+# The SECOND model the portal names beside chat model $1: the old default alias (qwen3.6-code) while this Ollama
+# still has it, so an upgrade loses no model a thread may already name. ONE derivation for llm.auto.yaml and status.
+secondary_chat_model() {
+  if [ -n "$1" ] && [ "$1" != "$STALE_OLLAMA_MODEL" ] && ollama_has_model "$STALE_OLLAMA_MODEL"; then
+    printf '%s' "$STALE_OLLAMA_MODEL"
+  fi
+}
+
 # Writes $LLM_AUTO_FILE (see its constant). Models__1 keeps the old default alias (qwen3.6-code) when this
 # Ollama still has it, so an upgrade loses no model a thread may already name.
 write_llm_auto_layer() {
@@ -1921,9 +1929,7 @@ write_llm_auto_layer() {
   model="$(effective_chat_model)"
   gw="$(llm_host_ip)"
   mkdir -p "$LOCAL_HOME"
-  if [ -n "$model" ] && [ "$model" != "$STALE_OLLAMA_MODEL" ] && ollama_has_model "$STALE_OLLAMA_MODEL"; then
-    second="$STALE_OLLAMA_MODEL"
-  fi
+  second="$(secondary_chat_model "$model")"
   [ -n "$model" ] && w0="$(ollama_context_window "$model")"
   [ -n "$second" ] && w1="$(ollama_context_window "$second")"
   resolve_ocr_vision "$model" "$second"
@@ -1961,6 +1967,7 @@ write_llm_auto_layer() {
     echo "    host: \"$gw\""
   } > "$LLM_AUTO_FILE"
   case "$OCR_VISION_STATE" in
+    off) info "LOCAL OCR: off (MEMEX_OCR=none) — no OCR engine declared; pictures and scanned pages are not read" ;;
     yes) info "LOCAL OCR + VISION: $vision reads and describes pictures and scanned pages on this Mac (ingestion: tables, summaries, icons)" ;;
     unknown) [ -n "$model" ] && warn "⚠️  LOCAL VISION UNCONFIRMED: Ollama did not answer the capability probe for $model${second:+ / $second} — no OCR engine declared this time; the next 'memex-local update' retries (is Ollama running? curl -s http://127.0.0.1:11434/api/version)" ;;
     no) [ -n "$model" ] && warn "⚠️  NO LOCAL VISION: $model${second:+ and $second} report no 'vision' capability — uploaded pictures and scanned PDFs will NOT be read or described on this install (choose a vision model: memex-local llm use --model qwen3.8:27b-mlx)" ;;
@@ -4241,9 +4248,7 @@ cmd_status() {
 ocr_vision_status() {
   local model; model="$(effective_chat_model)"
   [ -n "$model" ] || { info "ingestion: no chat model — pictures are not read or described"; return 0; }
-  local second=""
-  if [ "$model" != "$STALE_OLLAMA_MODEL" ] && ollama_has_model "$STALE_OLLAMA_MODEL"; then second="$STALE_OLLAMA_MODEL"; fi
-  resolve_ocr_vision "$model" "$second"
+  resolve_ocr_vision "$model" "$(secondary_chat_model "$model")"
   case "$OCR_VISION_STATE" in
     off) info "ingestion: OCR off (MEMEX_OCR=none)" ;;
     yes) ok "ingestion: $OCR_VISION_MODEL has vision — pictures and scanned pages are read, described and taken apart on this Mac" ;;
