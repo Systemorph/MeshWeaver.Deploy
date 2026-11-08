@@ -185,6 +185,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import concurrent.futures
 import gzip
 import json
@@ -645,6 +646,475 @@ def validate_restore(doc: object) -> Optional[dict]:
         raise Refusal(f"`restore` timeoutMinutes {tmo!r} must be in (0, {DEFAULT_STAGE_TIMEOUT_MINUTES}]")
     return {"command": r["command"], "timeoutMinutes": float(tmo)}
 
+
+# ───────────────────────────────── the module-hub broker (Plugins Hosting/BuildQueue.md §7.4, "wiring") ─────────────
+#
+# Owner, 2026-11-07: "the inner most build job must be locked by a dedicated hub updating the file system and building one
+# module at a time". A stage never holds the worker token, so it cannot ask a module's hub itself: the HOST brokers. And a
+# stage is never trusted with a module's IDENTITY — a pull request's stage could otherwise store crafted bytes under main's
+# fingerprint, which main would then adopt. So:
+#   * the module map (`moduleHub.modules`: id → paths, deps; `moduleHub.recipe`: the shared build inputs) is read from the
+#     DEFAULT BRANCH tip's .github/build-stages.json, never from the run's tree;
+#   * the HOST computes every declared module's fingerprint right after the checkout (and merge), BEFORE any stage runs,
+#     from the pristine tree: sha256 over the module's paths' blob ids, the recipe's blob ids, its dependencies'
+#     fingerprints (transitively every input — known before anything builds; SEAM(ref-asm): the dependencies' API hashes
+#     replace them once the platform publishes its reference-assembly hash) and the toolchain/platform set;
+#   * the HOST decides lane and commit: a trunk run asks on main at the run's sha with its merge order (first-parent count
+#     from the mirror); any other run on the pull-request lane — so a pull request can never write main's sequence;
+#   * the stage only NAMES a module (`$MW_BUILD_MODULE_HUB/req/<module>.json`) and is answered (`resp/<module>.json`):
+#     `Hit` with the module's output extracted under `outputs/<module>/`, or `Grant` — then it builds the module into
+#     `build/<module>/` and says `done/<module>.json`; the host tars that directory deterministically, uploads it by its
+#     sha256, completes the step and answers `ack/<module>.json`. `Refused`/`Failed` name why.
+MODULE_HUB_POLL = 0.25
+MODULE_HUB_RETRY = 2.0
+MODULE_HUB_WAIT = 45 * 60
+MODULE_HUB_LEASE_MARGIN = 30      # seconds: hand nothing over this close to the lease's end (clock skew, the upload's own time)
+
+
+def pull_request_number(refs: list) -> Optional[int]:
+    """The pull request a claim's refs name: a `{kind: PullRequest, number}` object or a `refs/pull/<n>/head|merge` string
+    (both forms reach the host). Pure."""
+    for r in refs:
+        if isinstance(r, dict) and str(r.get("kind", "")).lower() == "pullrequest" and isinstance(r.get("number"), int):
+            return r["number"]
+        if isinstance(r, str):
+            m = re.fullmatch(r"refs/pull/(\d+)/(?:head|merge)", r.strip())
+            if m:
+                return int(m.group(1))
+    return None
+
+
+def module_hub_enabled(env: dict) -> bool:
+    return (env.get("MW_BUILD_MODULE_HUB_ENABLED") or "").strip().lower() in ("1", "true", "yes")
+
+
+def validate_module_hub(doc: object) -> Optional[dict]:
+    """`"moduleHub": {"modules": {"<id>": {"paths": [...], "deps": [...]}}, "recipe": [...]}` beside `stages` (the DEFAULT
+    BRANCH tip's). Absent → None. Malformed (unknown dep, a cycle, an unsafe id or path) → Refusal."""
+    if not isinstance(doc, dict) or "moduleHub" not in doc:
+        return None
+    mh = doc["moduleHub"]
+    mods = mh.get("modules") if isinstance(mh, dict) else None
+    if not isinstance(mods, dict) or not mods:
+        raise Refusal("`moduleHub.modules` must map module ids to {paths, deps}")
+    safe = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+    out: dict = {}
+    for mid, m in mods.items():
+        if not safe.match(str(mid)) or mid in (".", ".."):
+            raise Refusal(f"`moduleHub` module id {mid!r} is not one safe path segment")
+        paths = m.get("paths") if isinstance(m, dict) else None
+        deps = m.get("deps", []) if isinstance(m, dict) else None
+        if not isinstance(paths, list) or not paths or not all(isinstance(p, str) and p and not p.startswith("/") and ".." not in p.split("/") for p in paths):
+            raise Refusal(f"`moduleHub.modules.{mid}.paths` must be relative paths")
+        if not isinstance(deps, list) or not all(isinstance(d, str) for d in deps):
+            raise Refusal(f"`moduleHub.modules.{mid}.deps` must list module ids")
+        options = m.get("options", []) if isinstance(m, dict) else []
+        if not isinstance(options, list) or not all(isinstance(o, str) for o in options):
+            raise Refusal(f"`moduleHub.modules.{mid}.options` must list strings (the build options that shape the compile)")
+        out[mid] = {"paths": sorted(set(paths)), "deps": sorted(set(deps)), "options": sorted(set(options))}
+    for mid, m in out.items():
+        for d in m["deps"]:
+            if d not in out:
+                raise Refusal(f"`moduleHub.modules.{mid}` depends on {d!r}, which is not declared")
+    recipe = mh.get("recipe", [])
+    if not isinstance(recipe, list) or not all(isinstance(p, str) and p and not p.startswith("/") and ".." not in p.split("/") for p in recipe):
+        raise Refusal("`moduleHub.recipe` must list relative paths")
+    module_order(out)       # refuses a cycle
+    return {"modules": out, "recipe": sorted(set(recipe))}
+
+
+def widen_module_hub(trusted: dict, candidate: Optional[dict]) -> dict:
+    """The TRUSTED declaration widened by the run's own: per trusted module, its paths, recipe and options UNIONED with what
+    the candidate tree declares for it (a pull request that adds a dependency lists its directory — CI's
+    gen-module-hub --check holds the candidate to its projects). A union can only ADD inputs to a key — a candidate can
+    never remove a trusted path, rename a module or add one — so a lying candidate makes keys stricter, never looser. Pure."""
+    if not candidate:
+        return trusted
+    mods = {}
+    for mid, spec in trusted["modules"].items():
+        c = candidate["modules"].get(mid) or {}
+        # options are NOT unioned (a union would hide a REMOVED option): the trusted set and the candidate's set both enter
+        # the key, so any change to the candidate's options — an addition or a removal — moves it
+        mods[mid] = {"paths": sorted(set(spec["paths"]) | set(c.get("paths", []))), "deps": spec["deps"],
+                     "options": spec.get("options", []), "candidateOptions": sorted(set(c.get("options", [])))}
+    return {"modules": mods, "recipe": sorted(set(trusted["recipe"]) | set(candidate.get("recipe", [])))}
+
+
+def module_order(mods: dict) -> list:
+    """The declared modules leaves first (dependencies before dependents); a cycle is a Refusal. Pure."""
+    order, state = [], {}
+
+    def visit(m: str, trail: tuple) -> None:
+        if state.get(m) == 2:
+            return
+        if state.get(m) == 1:
+            raise Refusal(f"`moduleHub` declares a dependency cycle: {' → '.join(trail + (m,))}")
+        state[m] = 1
+        for d in mods[m]["deps"]:
+            visit(d, trail + (m,))
+        state[m] = 2
+        order.append(m)
+    for m in sorted(mods):
+        visit(m, ())
+    return order
+
+
+def module_fingerprints(decl: dict, ls_tree: Callable[[list], str], toolchain: str) -> dict:
+    """Every declared module's input fingerprint, from the PRISTINE tree (`ls_tree(paths)` → `git ls-tree -r HEAD -- paths`
+    output: mode, type, blob id and path per line). Dependencies' fingerprints are inputs, so the key is known for every
+    module before anything builds. Pure apart from `ls_tree`."""
+    recipe = ls_tree(decl["recipe"]) if decl["recipe"] else ""
+    fps: dict = {}
+    for m in module_order(decl["modules"]):
+        spec = decl["modules"][m]
+        rows = [f"module={m}", f"toolchain={toolchain}", *[f"option:{o}" for o in spec.get("options", [])],
+                *[f"candidate-option:{o}" for o in spec.get("candidateOptions", [])],
+                "sources:", ls_tree(spec["paths"]).strip(), "recipe:", recipe.strip()]
+        rows += [f"dep:{d}={fps[d]}" for d in spec["deps"]]          # SEAM(ref-asm): the dependency's API hash, once published
+        fps[m] = "sha256:" + hashlib.sha256("\n".join(rows).encode()).hexdigest()
+    return fps
+
+
+def deterministic_tar(src_dir: str, dest_file: str) -> str:
+    """Pack `src_dir` so equal content gives equal bytes (sorted entries, mtime 0, no owners, no links followed); return
+    the tar's sha256 (hex)."""
+    import tarfile
+    entries = []
+    for root, dirs, files in os.walk(src_dir):
+        dirs.sort()
+        for n in sorted(files):
+            entries.append(os.path.join(root, n))
+    with tarfile.open(dest_file, "w", format=tarfile.PAX_FORMAT) as tar:
+        for full in entries:
+            rel = os.path.relpath(full, src_dir)
+            if os.path.islink(full):
+                raise Refusal(f"the module output carries a symbolic link ({rel}) — not handed over")
+            ti = tarfile.TarInfo(rel)
+            ti.size = os.path.getsize(full)
+            ti.mtime, ti.uid, ti.gid, ti.uname, ti.gname = 0, 0, 0, "", ""
+            ti.mode = 0o755 if os.access(full, os.X_OK) else 0o644
+            with open(full, "rb") as fh:
+                tar.addfile(ti, fh)
+    return _sha256_file(dest_file)
+
+
+def safe_extract(tar_file: str, dest: str) -> None:
+    """Extract a module output, refusing anything but regular files and directories inside `dest`."""
+    import tarfile
+    os.makedirs(dest, exist_ok=True)
+    root = os.path.realpath(dest)
+    with tarfile.open(tar_file) as tar:
+        for ti in tar.getmembers():
+            target = os.path.realpath(os.path.join(root, ti.name))
+            if not (ti.isfile() or ti.isdir()) or not (target == root or target.startswith(root + os.sep)):
+                raise Refusal(f"the module output carries an unsafe entry ({ti.name!r})")
+        tar.extractall(root, filter="data") if hasattr(tarfile, "data_filter") else tar.extractall(root)
+
+
+class ModuleHubBroker:
+    """The host side of a stage's module-hub requests. Identity — fingerprint, lane, commit, order, holder — is the HOST's;
+    the stage only names modules and hands over the output directory the broker assigned.
+
+    🚨 The stage is NOT trusted with the filesystem either. Three directories:
+      * `io`  — bound WRITABLE into the stage: `req/<m>.json`, `done/<m>.json`, `build/<m>/`. The host never follows a path
+        through it: it holds directory descriptors opened BEFORE any stage ran, opens every entry with O_NOFOLLOW and accepts
+        regular files only, and copies an output into host-private staging before it packs it;
+      * `out` — bound READ-ONLY into the stage: `plan.json`, `resp/`, `ack/`, `outputs/<m>/` — written by the host alone;
+      * `host` — never bound: downloads, tars, staging. Nothing a stage can reach is ever read back as trusted.
+    """
+
+    def __init__(self, api: "Api", repo: str, sha: str, host: str, root: str, fingerprints: dict, trunk: bool,
+                 order: int, pull_request: Optional[int], log: Callable[[str], None],
+                 sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+                 slice_cache: Optional[str] = None) -> None:
+        self.api, self.repo, self.sha, self.host, self.root = api, repo, sha, host, root
+        self.fps, self.trunk, self.order, self.pr, self.log = fingerprints, trunk, order, pull_request, log
+        self.sleep, self.clock = sleep, clock
+        self.utcnow = lambda: datetime.datetime.now(datetime.timezone.utc)
+        self.slice_cache = slice_cache
+        self.io, self.out, self.priv = (os.path.join(root, d) for d in ("io", "out", "host"))
+        for d in ("io/req", "io/done", "io/build", "out/resp", "out/ack", "out/outputs", "host"):
+            os.makedirs(os.path.join(root, d), exist_ok=True)
+        # descriptors held from BEFORE any stage ran: a stage replacing a path with a link later redirects nothing
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        self.fd = {k: os.open(os.path.join(self.io, k), flags) for k in ("req", "done", "build")}
+        self.granted: dict = {}        # module → the step seq the hub granted THIS host; removed only once the server ACKED
+        self.lease_until: dict = {}    # module → the lease's end on the SERVER's clock
+        self.pending: dict = {}        # module → the monotonic time its Wait/Queued request is asked again
+        self.answered: set = set()
+        self.cancel = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self._write_out("plan.json", {"fingerprints": fingerprints, "lane": "Main" if trunk else "PullRequest"})
+
+    # ── the protocol's files ─────────────────────────────────────────────────────────────────────────────────────────
+    def _write_out(self, rel: str, doc: dict) -> None:
+        target = os.path.join(self.out, rel)
+        tmp = os.path.join(self.priv, "w-" + rel.replace("/", "-"))
+        with open(tmp, "w") as fh:
+            json.dump(doc, fh)
+        shutil.move(tmp, target)
+
+    def _read_io_json(self, kind: str, name: str) -> Optional[dict]:
+        """A stage-written JSON file, opened no-follow through the held descriptor; None while it is not (yet) a complete
+        JSON object — it is then asked again on the next pass, never consumed as empty."""
+        try:
+            # O_NONBLOCK: a FIFO the stage planted must never block the broker's open (the regular-file check follows)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd[kind])
+        except OSError:
+            return None
+        try:
+            import stat as _stat
+            if not _stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            with os.fdopen(fd, "rb", closefd=False) as fh:
+                doc = json.loads(fh.read(1 << 20).decode() or "x")
+            return doc if isinstance(doc, dict) else None
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None
+        finally:
+            os.close(fd)
+
+    def _list_io(self, kind: str) -> list:
+        try:
+            return sorted(os.listdir(self.fd[kind]))
+        except OSError:
+            return []
+
+    def _copy_output_private(self, module: str, dest: str) -> Optional[str]:
+        """Copy the stage's `build/<module>/` into host-private `dest` WITHOUT following a link anywhere: the module
+        directory is opened no-follow through the held `build` descriptor, the tree walked by descriptors
+        (os.fwalk, follow_symlinks=False), each file opened no-follow and accepted only as a regular file. Returns why
+        it was refused, or None."""
+        import stat as _stat
+        try:
+            mfd = os.open(module, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd["build"])
+        except OSError:
+            return f"build/{module}/ is missing or is not a plain directory"
+        try:
+            shutil.rmtree(dest, ignore_errors=True)
+            os.makedirs(dest)
+            count = 0
+            for dirpath, dirnames, filenames, dfd in os.fwalk(".", dir_fd=mfd, follow_symlinks=False):
+                rel_dir = os.path.normpath(dirpath)
+                for d in dirnames:
+                    if _stat.S_ISLNK(os.lstat(d, dir_fd=dfd).st_mode):
+                        return f"build/{module}/ carries a link ({os.path.join(rel_dir, d)}) — refused"
+                    os.makedirs(os.path.join(dest, rel_dir, d), exist_ok=True)
+                for f in filenames:
+                    try:
+                        ffd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+                    except OSError:
+                        return f"build/{module}/ carries a link or unreadable entry ({os.path.join(rel_dir, f)}) — refused"
+                    try:
+                        st = os.fstat(ffd)
+                        if not _stat.S_ISREG(st.st_mode):
+                            return f"build/{module}/ carries a non-file ({os.path.join(rel_dir, f)}) — refused"
+                        target = os.path.join(dest, rel_dir, f)
+                        with os.fdopen(ffd, "rb", closefd=False) as src, open(target, "wb") as dst:
+                            shutil.copyfileobj(src, dst, 1 << 20)
+                        if st.st_mode & 0o111:
+                            os.chmod(target, 0o755)
+                        count += 1
+                    finally:
+                        os.close(ffd)
+            return None if count else f"the stage reported success but left no output in build/{module}/"
+        finally:
+            os.close(mfd)
+
+    # ── the hub ──────────────────────────────────────────────────────────────────────────────────────────────────────
+    def _path(self, module: str, tail: str = "") -> str:
+        return f"/modules/{urllib.parse.quote(self.repo, safe='')}/{urllib.parse.quote(module, safe='')}{tail}"
+
+    def ask(self, module: str) -> Optional[dict]:
+        """ONE request to the module's hub. Returns the answer for the stage (Hit, Grant, Refused, Failed), or None when
+        the hub said Wait/Queued — then the module is asked again later, without holding the broker."""
+        fp = self.fps.get(module)
+        if fp is None:
+            return {"verdict": "Refused", "why": f"{module!r} is not a module the default branch declares (moduleHub)"}
+        body = {"commit": self.sha, "fingerprint": fp, "requester": self.host,
+                **({"lane": "Main", "order": self.order} if self.trunk else {"lane": "PullRequest", "pullRequest": self.pr})}
+        status, answer = self.api.call("POST", self._path(module, "/request"), body)
+        verdict = answer.get("verdict") if isinstance(answer, dict) else None
+        step = answer.get("step") if isinstance(answer, dict) else None
+        if status == 200 and verdict == "Grant" and isinstance(step, dict):
+            self.granted[module] = int(step.get("seq") or 0)
+            until = answer.get("leaseUntil") if isinstance(answer, dict) else None
+            try:
+                self.lease_until[module] = datetime.datetime.fromisoformat(str(until).replace("Z", "+00:00")) if until else None
+            except ValueError:
+                self.lease_until[module] = None
+            return {"verdict": "Grant", "seq": self.granted[module], "fingerprint": fp, "outputDir": os.path.join(self.io, "build", module)}
+        if status == 200 and verdict == "Hit" and isinstance(step, dict) and step.get("outputHash"):
+            return self._fetch(module, str(step["outputHash"]), int(step.get("seq") or 0))
+        if status == 409 or verdict == "Refused":
+            return {"verdict": "Refused", "why": (answer or {}).get("why") or (answer or {}).get("error") or f"refused ({status})"}
+        return None
+
+    def _fetch(self, module: str, output_hash: str, seq: int) -> dict:
+        """A Hit's output into the READ-ONLY `out/outputs/<module>/`: from this host's slice cache when it holds that hash,
+        else downloaded into HOST-PRIVATE scratch, verified against the hash, cached, then copied out."""
+        hexd = output_hash.split(":", 1)[-1]
+        if not re.fullmatch(r"[0-9a-f]{64}", hexd):
+            return {"verdict": "Failed", "why": f"the hub names an output that is no sha256 ({output_hash!r})"}
+        cached = self._cached(module, hexd)
+        source = "from this host's slice cache"
+        if cached is None:
+            tmp = os.path.join(self.priv, f"{module}.tar")
+            status, why = self.api.download(self._path(module, f"/outputs/{hexd}"), tmp, timeout=600)
+            if status != 200:
+                return {"verdict": "Failed", "why": f"the output {hexd[:12]} could not be fetched ({status}: {why})"}
+            if _sha256_file(tmp) != hexd:
+                return {"verdict": "Failed", "why": f"the fetched output does not hash to {hexd[:12]} — refused"}
+            cached = self._cache_put(module, hexd, tmp)
+            os.remove(tmp)
+            source = "fetched from the hub's store"
+        if cached is None:
+            return {"verdict": "Failed", "why": "the output could not be extracted"}
+        dest = os.path.join(self.out, "outputs", module)
+        shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(cached, dest, symlinks=False, ignore=shutil.ignore_patterns(".complete"))
+        return {"verdict": "Hit", "seq": seq, "outputHash": hexd, "outputDir": dest, "source": source}
+
+    def _cache_dir(self, module: str, hexd: str) -> str:
+        return os.path.join(self.slice_cache or os.path.join(self.priv, "slices"), self.repo, module, hexd)
+
+    def _cached(self, module: str, hexd: str) -> Optional[str]:
+        d = self._cache_dir(module, hexd)
+        return d if os.path.isfile(os.path.join(d, ".complete")) else None
+
+    def _cache_put(self, module: str, hexd: str, tar: str) -> Optional[str]:
+        """Extract a VERIFIED output into the (host-only) slice cache atomically: staging renamed into place."""
+        final = self._cache_dir(module, hexd)
+        if os.path.isfile(os.path.join(final, ".complete")):
+            return final
+        staging = f"{final}.staging-{os.getpid()}-{threading.get_ident()}"
+        shutil.rmtree(staging, ignore_errors=True)
+        safe_extract(tar, staging)
+        with open(os.path.join(staging, ".complete"), "w") as fh:
+            fh.write(hexd)
+        os.makedirs(os.path.dirname(final), exist_ok=True)
+        try:
+            os.rename(staging, final)
+        except OSError:
+            shutil.rmtree(staging, ignore_errors=True)
+        return final if os.path.isfile(os.path.join(final, ".complete")) else None
+
+    def complete(self, module: str, done: dict) -> dict:
+        seq = self.granted.get(module)
+        if seq is None:
+            return {"accepted": False, "why": f"this host holds no grant for {module!r}"}
+        fp = self.fps[module]
+        until = self.lease_until.get(module)
+        if until is not None and self.utcnow() >= until - datetime.timedelta(seconds=MODULE_HUB_LEASE_MARGIN):
+            return {"accepted": False, "succeeded": False, "why": f"the lease ended at {until.isoformat()} — nothing was handed over"}
+        body = {"holder": self.host, "seq": seq, "fingerprint": fp, "succeeded": False, "error": str(done.get("error") or "the stage reported a failure")[:2000]}
+        if done.get("succeeded") is True:
+            staged = os.path.join(self.priv, f"stage-{module}")
+            refused = self._copy_output_private(module, staged)
+            if refused:
+                body["error"] = refused
+            else:
+                tar = os.path.join(self.priv, f"{module}-out.tar")
+                try:
+                    hexd = deterministic_tar(staged, tar)
+                except Refusal as e:
+                    body["error"] = str(e)
+                else:
+                    status, answer = self.api.upload(self._path(module, f"/outputs/{hexd}"), {}, tar, os.path.getsize(tar),
+                                                     timeout=1800, cancel=self.cancel)
+                    if status in (200, 201):
+                        self._cache_put(module, hexd, tar)
+                        # SEAM(ref-asm): the reference-assembly hash once the platform publishes it; the output hash meanwhile
+                        body.update(succeeded=True, outputHash=f"sha256:{hexd}", refAsmHash=f"sha256:{hexd}", error=None)
+                    else:
+                        body["error"] = f"the output upload was refused ({status}: {_answer_text(answer)})"
+                    os.remove(tar)
+                shutil.rmtree(staged, ignore_errors=True)
+        status, answer = self.api.call("POST", self._path(module, "/complete"), body)
+        accepted = status == 200 and isinstance(answer, dict) and answer.get("accepted") is True
+        if status == 200 or status == 409:
+            # the server ANSWERED (accepted, or refused as no longer this host's): the grant is settled either way
+            self.granted.pop(module, None)
+        return {"accepted": accepted, "succeeded": accepted and body["succeeded"],
+                "why": (answer or {}).get("why") if isinstance(answer, dict) else f"{status}", "outputHash": body.get("outputHash")}
+
+    def release_open_grants(self, why: str) -> None:
+        """Complete every grant the server has not acknowledged as FAILED (the run is ending). Never raises."""
+        for module, seq in list(self.granted.items()):
+            try:
+                status, _ = self.api.call("POST", self._path(module, "/complete"),
+                                          {"holder": self.host, "seq": seq, "fingerprint": self.fps[module], "succeeded": False, "error": why})
+                if status in (200, 409):
+                    self.granted.pop(module, None)
+                self.log(f"module hub: {module} released ({why})")
+            except Exception as e:   # teardown never fails the run's verdict
+                self.log(f"module hub: {module} could not be released: {type(e).__name__}")
+
+    # ── the loop ─────────────────────────────────────────────────────────────────────────────────────────────────────
+    def poll_once(self) -> int:
+        """One pass: completions first (they free grants), then new requests, then Wait/Queued requests that are due.
+        A file is consumed only once it parsed as a complete JSON object. Returns how many answers it wrote."""
+        n = 0
+        for f in self._list_io("done"):
+            module = f[:-5] if f.endswith(".json") else None
+            if module is None or f"done:{module}" in self.answered or self.cancel.is_set():
+                continue
+            doc = self._read_io_json("done", f)
+            if doc is None:
+                continue                                  # still being written: asked again next pass
+            self.answered.add(f"done:{module}")
+            ack = self.complete(module, doc)
+            self._write_out(f"ack/{module}.json", ack)
+            self.log(f"module hub: {module} done → {'accepted' if ack.get('accepted') else 'refused'}")
+            n += 1
+        now = self.clock()
+        for f in self._list_io("req"):
+            module = f[:-5] if f.endswith(".json") else None
+            if module is None or f"req:{module}" in self.answered or self.cancel.is_set():
+                continue
+            if module in self.pending and self.pending[module] > now:
+                continue
+            if module not in self.pending and self._read_io_json("req", f) is None:
+                continue
+            answer = self.ask(module)
+            if answer is None:                            # Wait/Queued: asked again later, the broker moves on
+                self.pending[module] = now + MODULE_HUB_RETRY
+                continue
+            self.pending.pop(module, None)
+            self.answered.add(f"req:{module}")
+            self._write_out(f"resp/{module}.json", answer)
+            self.log(f"module hub: {module} req → {answer.get('verdict')}")
+            n += 1
+        return n
+
+    def serve(self) -> None:
+        while not self.cancel.is_set():
+            try:
+                if self.poll_once() == 0:
+                    self.cancel.wait(MODULE_HUB_POLL)
+            except Exception as e:      # the broker must never take the stage down; the stage sees no answer and times out
+                self.log(f"module hub broker: {type(e).__name__}: {str(e)[:200]}")
+                self.cancel.wait(MODULE_HUB_RETRY)
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def stop(self, why: str, bound: float = 60.0) -> None:
+        """Stop serving (an upload in flight observes the cancel), wait — bounded — for the thread, release every grant
+        the server has not acknowledged, close the held descriptors. FAIL-CLOSED: a thread that will not stop is Fatal, so
+        no next run starts beside a broker still talking to the hubs."""
+        self.cancel.set()
+        if self.thread is not None:
+            self.thread.join(timeout=bound)
+            if self.thread.is_alive():
+                raise Fatal(f"the module-hub broker did not stop within {bound:g} s — this host claims nothing more")
+        self.release_open_grants(why)
+        for fd in self.fd.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 def nuget_warm_key(ls_tree: str, command: str, platform: str) -> str:
     """The restore key of a tree from its `git ls-tree -r` listing: the blob ids of every NuGet-relevant file, the
@@ -1645,6 +2115,18 @@ class Api:
         except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
             return 0, str(e)
 
+
+    def download(self, path: str, dest: str, timeout: float) -> tuple[int, str]:
+        """GET `path`'s bytes into `dest` with the worker token, streamed; (status, why) — 0 = transport failure."""
+        req = urllib.request.Request(self.base + path, method="GET", headers={"Authorization": f"Bearer {self.token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=min(timeout, 600)) as r, open(dest, "wb") as fh:
+                shutil.copyfileobj(r, fh, 1 << 20)
+                return r.status, ""
+        except urllib.error.HTTPError as e:
+            return e.code, str(e.reason)
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+            return 0, str(e)
 
     def upload(self, path: str, query: dict, file_path: str, size: int, timeout: float,
                cancel: Optional[threading.Event] = None) -> tuple[int, object]:
@@ -2855,7 +3337,8 @@ def _update_mirror(repo: str, url: str, mirror_root: str, mirror: str, wanted: l
 # changes; any failure of the warm path falls back to a fresh clone, said. Every run states what it got:
 # `workspace: incremental copy of main@<tip> (…) moved to <sha>` or `workspace: clean (why)`.
 WARM_DIR = ".warm"
-WARM_PRIVATE = ".warm-host"     # under <work>: host-only git directories and state; never bound into any sandbox
+WARM_PRIVATE = ".warm-host"
+WARM_RETRY_SECONDS = 600.0   # a failed warm advancement is retried after this, never on every idle pass     # under <work>: host-only git directories and state; never bound into any sandbox
 WARM_KEEP = ("obj/", "bin/")
 WARM_BUILD_MAX_MINUTES = 60
 
@@ -2997,7 +3480,9 @@ def advance_warm_main(repo: str, tip: str, warm: str, env: dict, log: Callable[[
               else None)
     if reason is None and st is not None and st.get("tip") == tip:
         return f"warm main workspace: already at main@{tip[:12]}"
-    if reason is not None and st is not None:
+    if reason is not None:
+        # a MISSING, unreadable or non-object state proves nothing about the key the tree's obj/ and bin/ were built
+        # under, so it is wiped exactly like a known mismatch — outputs are kept only when valid state says the key matches
         wipe_warm(warm)
     try:
         os.makedirs(warm, exist_ok=True)
@@ -3005,7 +3490,7 @@ def advance_warm_main(repo: str, tip: str, warm: str, env: dict, log: Callable[[
         write_warm_state(warm, {"key": key, "tip": tip, "built": None})
         return (f"warm main workspace: moved to main@{tip[:12]} (obj/ and bin/ kept)" if reason is None
                 else f"warm main workspace: set up at main@{tip[:12]} ({reason})")
-    except Refusal as e:
+    except (Refusal, OSError) as e:
         wipe_warm(warm)
         return f"warm main workspace: not advanced ({str(e)[:160]}) — wiped, retried when idle"
 
@@ -3277,6 +3762,67 @@ class Host:
         self.warm_thread: Optional[threading.Thread] = None
         self.warm_cancel = threading.Event()
         self.warm_stop_seconds = 120.0
+        # repo -> (tip, key, monotonic time) of an advancement that FAILED: retried after WARM_RETRY_SECONDS, not every idle pass
+        self.warm_failed: dict = {}
+        self.module_broker: Optional[ModuleHubBroker] = None
+
+    def start_module_broker(self, repo: str, sha: str, claim: dict, trunk: bool, checkout: str, workdir: str) -> None:
+        """§7.4 wiring, the host's half: when the host is enabled for it and the DEFAULT BRANCH tip declares `moduleHub`,
+        fingerprint every declared module from the pristine tree and serve the stages' requests for the run. Never raises:
+        without a broker a stage builds as it always did (said)."""
+        self.module_broker = None
+        if not module_hub_enabled(self.env):
+            return
+        try:
+            mirror = os.path.join(self.cache, "git", f"{repo}.git")
+            genv = {**{k: self.env[k] for k in ("PATH", "LANG") if self.env.get(k)}, "HOME": workdir, "GIT_TERMINAL_PROMPT": "0"}
+            rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", "HEAD^{commit}"], genv)
+            tip = out.strip().splitlines()[-1].strip().lower() if rc == 0 and out.strip() else ""
+            rc, doc = self.git_runner(["--git-dir", mirror, "show", f"{tip}:.github/build-stages.json"], genv) if SHA.match(tip) else (1, "")
+            decl = validate_module_hub(json.loads(doc)) if rc == 0 else None
+            if decl is None:
+                self.log("module hub: the default branch declares no moduleHub — the stages build as before")
+                return
+            # the run's own declaration WIDENS the trusted one (a new dependency's directory), never narrows it
+            try:
+                with open(os.path.join(checkout, ".github", "build-stages.json")) as fh:
+                    candidate = validate_module_hub(json.load(fh))
+            except (OSError, ValueError, Refusal):
+                candidate = None
+            decl = widen_module_hub(decl, candidate)
+
+            def ls_tree(paths: list) -> str:
+                rc_, out_ = self.git_runner(["-C", checkout, "ls-tree", "-r", "HEAD", "--", *paths], genv)
+                if rc_ != 0:
+                    raise Refusal(f"git ls-tree failed (exit {rc_}): {out_.strip()[-200:]}")
+                return out_
+            toolchain = f"{self.platform_version}|{self.identity}|{self.env.get('MW_BUILD_RUNNER_DIGEST', '')}"
+            fps = module_fingerprints(decl, ls_tree, toolchain)
+            order = 0
+            if trunk:
+                rc, out = self.git_runner(["--git-dir", mirror, "rev-list", "--count", "--first-parent", sha], genv)
+                order = int(out.strip().splitlines()[-1]) if rc == 0 and out.strip().splitlines()[-1].isdigit() else 0
+                if order <= 0:
+                    self.log("module hub: the trunk commit's merge order could not be read — no broker for this run")
+                    return
+            pr = pull_request_number(claim.get("refs") or [])
+            if not trunk and pr is None:
+                self.log("module hub: a non-trunk run without a pull request ref — no broker for this run")
+                return
+            root = os.path.join(workdir, "module-hub")
+            self.module_broker = ModuleHubBroker(self.api, repo, sha, self.host, root, fps, trunk, order, pr, self.log,
+                                                 slice_cache=os.path.join(self.cache, "module-slices"))
+            self.module_broker.start()
+            self.log(f"module hub: {len(fps)} module(s) fingerprinted from the pristine tree; lane "
+                     f"{'main (order ' + str(order) + ')' if trunk else 'pull request #' + str(pr)}")
+        except (Refusal, ValueError, OSError, subprocess.SubprocessError) as e:
+            self.module_broker = None
+            self.log(f"module hub: not started ({type(e).__name__}: {str(e)[:200]}) — the stages build as before")
+
+    def stop_module_broker(self) -> None:
+        broker, self.module_broker = self.module_broker, None
+        if broker is not None:
+            broker.stop("the run ended before this module was handed over")
 
     def preflight(self) -> None:
         missing = []
@@ -3575,7 +4121,17 @@ class Host:
                 st = warm_state(warm)
                 if st is not None and st.get("key") == key and st.get("tip") == tip and st.get("built") in (tip, "none"):
                     continue
+                failed = self.warm_failed.get(repo)
+                if failed is not None and failed[:2] == (tip, key) and time.monotonic() - failed[2] < WARM_RETRY_SECONDS:
+                    continue
                 self.log(advance_warm_main(repo, tip, warm, self.env, self.log, key, deadline=time.monotonic() + 600))
+                moved = warm_state(warm)
+                if moved is None or moved.get("key") != key or moved.get("tip") != tip:
+                    # the advancement did not produce this tip under this key (it wiped and said why): nothing is read from
+                    # the tree and the tip is NOT marked handled — it is retried after a pause, so a run is not left cloning
+                    self.warm_failed[repo] = (tip, key, time.monotonic())
+                    continue
+                self.warm_failed.pop(repo, None)
                 try:
                     with open(os.path.join(warm, ".github", "build-stages.json")) as fh:
                         decl = validate_warm_build(json.load(fh))
@@ -3656,6 +4212,7 @@ class Host:
                                     outputs_dir, stages)
                 return outcome
             finally:
+                self.stop_module_broker()
                 self.heartbeat = None
                 self.run_env = {}
                 # A run refused before any stage never created its artifacts directory: nothing was
@@ -3718,6 +4275,8 @@ class Host:
                 prepared_inputs = load_prepared(os.path.join(checkout_dir, ".github", "build-stages.json"))
                 parallel = load_parallel(os.path.join(checkout_dir, ".github", "build-stages.json"))
                 stages = select_stages(declared, claim.get("stages"))
+                # the module-hub broker (§7.4 wiring): fingerprints from the PRISTINE tree, before any stage runs
+                self.start_module_broker(repo, sha, claim, trunk, checkout_dir, workdir)
                 if probe and claim.get("requestedStages"):
                     # A PROBE runs EXACTLY the stages it asked for (`requestedStages`; empty = every
                     # declared stage) and plans only those; one the repository does not declare is red.
@@ -3842,14 +4401,18 @@ class Host:
                 art_before = artifact_snapshot(art)
                 remaining = run_end - self.clock()
                 spec = dict(st, timeoutMinutes=min(st["timeoutMinutes"], remaining / 60))
-                stage_env = {**extra, "MW_BUILD_STAGE": st["name"], "NUGET_PACKAGES": nuget_dir, "MW_BUILD_ARTIFACTS": art}
+                stage_env = {**extra, "MW_BUILD_STAGE": st["name"], "NUGET_PACKAGES": nuget_dir, "MW_BUILD_ARTIFACTS": art,
+                             **({"MW_BUILD_MODULE_HUB": self.module_broker.io, "MW_BUILD_MODULE_HUB_OUT": self.module_broker.out}
+                                if self.module_broker else {})}
                 readonly = self.stage_readonly(repo, st) + prepared_ro
+                if self.module_broker:
+                    readonly = readonly + [self.module_broker.out]      # the host's answers: the stage reads, never writes
 
                 def work(spec=spec, sink=sink, art=art, stage_env=stage_env, readonly=readonly, name=st["name"],
                          art_before=art_before) -> None:
                     try:
                         ok = self.run_stage(spec, checkout_dir, outputs_dir, sink, stage_env,
-                                            readonly=readonly, writable=[art, nuget_dir],
+                                            readonly=readonly, writable=[art, nuget_dir, *([self.module_broker.io] if self.module_broker else [])],
                                             hand_over=lambda: self.hand_over_artifacts(repo, sha, name, art, deadline=run_end,
                                                                                        cancel=cancel),
                                             cancel=cancel,
@@ -4917,6 +5480,17 @@ class _FakeApi(Api):
                 return answers.pop(0) if len(answers) > 1 else answers[0]
         return 404, None
 
+    def download(self, path, dest, timeout):
+        self.calls.append(("GET-BYTES", path, None, {}))
+        for (m, p), answers in self.script.items():
+            if m == "GET-BYTES" and path.startswith(p):
+                status, data = answers(path) if callable(answers) else answers[0]
+                if status == 200:
+                    with open(dest, "wb") as fh:
+                        fh.write(data)
+                return status, "" if status == 200 else "refused"
+        return 404, "not found"
+
     def upload(self, path, query, file_path, size, timeout, cancel=None):
         abandoned(cancel, "fake-upload")
         with open(file_path, "rb") as fh:
@@ -5458,6 +6032,19 @@ def self_test() -> int:
                 fh.write("[]")
             line7 = seed_run_from_warm("R", c1, [], warm, os.path.join(wroot, "work", "run7", "src"), None, wenv, log0, key="k2")
             check("warm/a state that is not an object is no warm workspace (a clean clone, never a crash)", line7.startswith("workspace: clean (no warm main"), line7)
+            # an existing tree with a MISSING / non-object state: its obj/ and bin/ were built under an UNKNOWN key — wiped,
+            # never carried forward under the current one (review of Deploy#183)
+            os.makedirs(os.path.join(warm, "src", "obj"), exist_ok=True)
+            open(os.path.join(warm, "src", "obj", "unknown.cache"), "w").write("built under ?")
+            adv_u = advance_warm_main("R", c2, warm, wenv, log0, key="k2")
+            check("warm/a tree whose state is not an object is WIPED before it is advanced (outputs of an unknown key are not kept)",
+                  not os.path.exists(os.path.join(warm, "src", "obj", "unknown.cache")) and warm_state(warm) == {"key": "k2", "tip": c2, "built": None}, adv_u)
+            os.makedirs(os.path.join(warm, "src", "obj"), exist_ok=True)
+            open(os.path.join(warm, "src", "obj", "unknown.cache"), "w").write("built under ?")
+            os.remove(os.path.join(warm_private(warm), "state.json"))
+            adv_m = advance_warm_main("R", c1, warm, wenv, log0, key="k2")
+            check("warm/a tree with NO state is wiped before it is advanced",
+                  not os.path.exists(os.path.join(warm, "src", "obj", "unknown.cache")) and warm_state(warm) == {"key": "k2", "tip": c1, "built": None}, adv_m)
             check("warm/the warmBuild declaration is validated",
                   validate_warm_build({"stages": []}) is None
                   and validate_warm_build({"warmBuild": {"command": "dotnet build", "timeoutMinutes": 20}}) == {"command": "dotnet build", "timeoutMinutes": 20.0})
@@ -5479,6 +6066,289 @@ def self_test() -> int:
             swept = Host.sweep_workspaces(_types.SimpleNamespace(work=os.path.join(wroot, "work"), run_deadline=60.0))
             check("warm/the workspace sweep removes an old run's workspace but never the warm workspaces",
                   swept == ["R-old-run"] and os.path.isdir(ws), swept)
+        # ── 5b''. the module-hub broker (§7.4 wiring): identity is the HOST's, the stage only names a module ─────────
+        mh_doc = {"moduleHub": {"modules": {"A": {"paths": ["src/A"]}, "B": {"paths": ["src/B"], "deps": ["A"]}},
+                                "recipe": ["src/Directory.Build.props"]}}
+        mh = validate_module_hub(mh_doc)
+        check("modhub/the declaration is read, leaves first", module_order(mh["modules"]) == ["A", "B"], mh)
+        for bad_mh, why_mh in (({"moduleHub": {"modules": {"A": {"paths": ["x"], "deps": ["Z"]}}}}, "not declared"),
+                               ({"moduleHub": {"modules": {"A": {"paths": ["x"], "deps": ["B"]}, "B": {"paths": ["y"], "deps": ["A"]}}}}, "cycle"),
+                               ({"moduleHub": {"modules": {"../A": {"paths": ["x"]}}}}, "safe path segment"),
+                               ({"moduleHub": {"modules": {"A": {"paths": ["../x"]}}}}, "relative paths"),
+                               ({"moduleHub": {"modules": {"A": {"paths": ["x"]}}, "recipe": ["/tmp/recipe"]}}, "relative paths")):
+            try:
+                validate_module_hub(bad_mh)
+                check(f"modhub/{why_mh} is refused", False, "accepted")
+            except Refusal as e:
+                check(f"modhub/{why_mh} is refused, naming it", why_mh in str(e), str(e))
+        check("modhub/no declaration is no broker", validate_module_hub({"stages": []}) is None)
+        wid = widen_module_hub(mh, validate_module_hub({"moduleHub": {"modules": {"A": {"paths": ["src/NewDep"]}, "Evil": {"paths": ["x"]}},
+                                                                     "recipe": ["src/Directory.PlatformRefs.targets"]}}))
+        check("modhub/the run's declaration WIDENS the trusted one (a new dependency's paths, a recipe file) and never narrows it",
+              wid["modules"]["A"]["paths"] == ["src/A", "src/NewDep"] and wid["modules"]["B"]["paths"] == ["src/B"]
+              and "Evil" not in wid["modules"] and set(wid["recipe"]) == {"src/Directory.Build.props", "src/Directory.PlatformRefs.targets"}, wid)
+        trees = {"src/A": "100644 blob a1 src/A/a.cs", "src/B": "100644 blob b1 src/B/b.cs", "src/Directory.Build.props": "100644 blob r1 src/Directory.Build.props"}
+        fp1 = module_fingerprints(mh, lambda ps: "\n".join(trees[p] for p in ps), "tc")
+        trees["src/A"] = "100644 blob a2 src/A/a.cs"
+        fp2 = module_fingerprints(mh, lambda ps: "\n".join(trees[p] for p in ps), "tc")
+        check("modhub/a change in A moves A's fingerprint AND its dependent B's (a dependency's fingerprint is an input)",
+              fp1["A"] != fp2["A"] and fp1["B"] != fp2["B"])
+        trees["src/B"] = "100644 blob b2 src/B/b.cs"
+        fp3 = module_fingerprints(mh, lambda ps: "\n".join(trees[p] for p in ps), "tc")
+        check("modhub/a change in B moves only B", fp3["A"] == fp2["A"] and fp3["B"] != fp2["B"])
+        trees["src/Directory.Build.props"] = "100644 blob r2 src/Directory.Build.props"
+        fp4 = module_fingerprints(mh, lambda ps: "\n".join(trees[p] for p in ps), "tc")
+        check("modhub/a recipe change moves every module", fp4["A"] != fp3["A"] and fp4["B"] != fp3["B"])
+        check("modhub/the toolchain moves every module", module_fingerprints(mh, lambda ps: "\n".join(trees[p] for p in ps), "tc2")["A"] != fp4["A"])
+        mh_opt = validate_module_hub({"moduleHub": {"modules": {"A": {"paths": ["src/A"], "options": ["accept=targets lib"]},
+                                                              "B": {"paths": ["src/B"], "deps": ["A"]}}, "recipe": ["src/Directory.Build.props"]}})
+        check("modhub/a build option (the catalog's accept) moves the module and its dependents",
+              module_fingerprints(mh_opt, lambda ps: "\n".join(trees[p] for p in ps), "tc")["A"] != fp4["A"]
+              and module_fingerprints(mh_opt, lambda ps: "\n".join(trees[p] for p in ps), "tc")["B"] != fp4["B"])
+        # the output tar: equal content → equal bytes, whatever the mtimes; a link is refused; extraction stays inside
+        o1, o2 = os.path.join(tmp, "mh-o1"), os.path.join(tmp, "mh-o2")
+        for d_, t_ in ((o1, 1000), (o2, 2000)):
+            os.makedirs(os.path.join(d_, "lib"))
+            for n_, c_ in (("lib/A.dll", b"IL"), ("A.closure.txt", b"x")):
+                with open(os.path.join(d_, n_), "wb") as fh:
+                    fh.write(c_)
+                os.utime(os.path.join(d_, n_), (t_, t_))
+        h1 = deterministic_tar(o1, os.path.join(tmp, "mh1.tar"))
+        h2 = deterministic_tar(o2, os.path.join(tmp, "mh2.tar"))
+        check("modhub/the output tar is deterministic (mtimes do not matter)", h1 == h2, (h1, h2))
+        safe_extract(os.path.join(tmp, "mh1.tar"), os.path.join(tmp, "mh-x"))
+        check("modhub/the output extracts as packed", open(os.path.join(tmp, "mh-x", "lib", "A.dll"), "rb").read() == b"IL")
+        import tarfile as _tf
+        evil = os.path.join(tmp, "mh-evil.tar")
+        with _tf.open(evil, "w") as t_:
+            ti_ = _tf.TarInfo("../escape.txt"); ti_.size = 1
+            import io as _io
+            t_.addfile(ti_, _io.BytesIO(b"x"))
+        try:
+            safe_extract(evil, os.path.join(tmp, "mh-evil"))
+            check("modhub/an entry outside the destination is refused", False, "extracted")
+        except Refusal:
+            pass
+        os.symlink("/etc/passwd", os.path.join(o1, "link"))
+        try:
+            deterministic_tar(o1, os.path.join(tmp, "mh3.tar"))
+            check("modhub/a symbolic link in an output is refused", False, "packed")
+        except Refusal:
+            pass
+
+        def broker_with(script_, trunk_=False, order_=0, pr_=42):
+            root_ = tempfile.mkdtemp(prefix="mh-root-", dir=tmp)
+            api_ = _FakeApi(script_)
+            return ModuleHubBroker(api_, "MeshWeaver.Plugins", "a" * 40, "build-host-mac-6d5f7c9b8-x2k4q", root_, fp4, trunk_, order_,
+                                   None if trunk_ else pr_, lambda m: None, sleep=lambda s_: None), api_
+        uploaded = {}
+
+        def put_(path_, query_, data_, size_, timeout_):
+            uploaded[path_] = data_
+            return 201, {"sha256": path_.rsplit("/", 1)[-1]}
+        br, api_g = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Wait", "step": {"seq": 3}}), (200, {"verdict": "Grant", "step": {"seq": 4}})],
+                                 ("PUT", "/modules/MeshWeaver.Plugins/B/outputs/"): put_,
+                                 ("POST", "/modules/MeshWeaver.Plugins/B/complete"): lambda p_, b_: (200, {"accepted": True, "why": "published"})})
+        with open(os.path.join(br.io, "req", "B.json"), "w") as fh:
+            json.dump({"module": "B", "fingerprint": "sha256:" + "f" * 64, "lane": "Main"}, fh)   # what a stage may NOT decide
+        br.poll_once()
+        check("modhub/a Wait does not hold the broker: no answer yet, the module is asked again later",
+              not os.path.exists(os.path.join(br.out, "resp", "B.json")) and "B" in br.pending)
+        br.pending["B"] = 0                                   # its retry is due
+        br.poll_once()
+        resp_ = json.load(open(os.path.join(br.out, "resp", "B.json")))
+        reqs_ = [c[2] for c in api_g.calls if c[1].endswith("/request")]
+        check("modhub/Wait is re-asked until the hub grants", len(reqs_) == 2 and resp_["verdict"] == "Grant" and resp_["seq"] == 4, (reqs_, resp_))
+        check("modhub/the HOST's fingerprint, lane and holder are sent — never the stage's",
+              all(r_["fingerprint"] == fp4["B"] and r_["lane"] == "PullRequest" and r_["pullRequest"] == 42 and r_["requester"] == "build-host-mac-6d5f7c9b8-x2k4q"
+                  and r_["commit"] == "a" * 40 and "order" not in r_ for r_ in reqs_), reqs_)
+        os.makedirs(os.path.join(br.io, "build", "B"), exist_ok=True)
+        with open(os.path.join(br.io, "build", "B", "B.dll"), "wb") as fh:
+            fh.write(b"built B")
+        with open(os.path.join(br.io, "done", "B.json"), "w") as fh:
+            json.dump({"succeeded": True}, fh)
+        br.poll_once()
+        ack_ = json.load(open(os.path.join(br.out, "ack", "B.json")))
+        comp_ = [c[2] for c in api_g.calls if c[1].endswith("/complete")]
+        put_path = next(iter(uploaded))
+        check("modhub/a granted build's output is uploaded BY ITS HASH, then the step completed with the granted seq",
+              ack_["accepted"] and comp_ and comp_[0]["seq"] == 4 and comp_[0]["fingerprint"] == fp4["B"] and comp_[0]["holder"] == br.host
+              and comp_[0]["outputHash"] == "sha256:" + put_path.rsplit("/", 1)[-1]
+              and hashlib.sha256(uploaded[put_path]).hexdigest() == put_path.rsplit("/", 1)[-1], (ack_, comp_))
+        out_bytes = uploaded[put_path]
+        out_hex = put_path.rsplit("/", 1)[-1]
+        br2, api_h = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Hit", "step": {"seq": 4, "outputHash": "sha256:" + out_hex}})],
+                                  ("GET-BYTES", "/modules/MeshWeaver.Plugins/B/outputs/" + out_hex): [(200, out_bytes)]}, trunk_=True, order_=77)
+        with open(os.path.join(br2.io, "req", "B.json"), "w") as fh:
+            json.dump({"module": "B"}, fh)
+        br2.poll_once()
+        resp2 = json.load(open(os.path.join(br2.out, "resp", "B.json")))
+        check("modhub/a Hit is fetched, verified and extracted where the stage reads it",
+              resp2["verdict"] == "Hit" and open(os.path.join(resp2["outputDir"], "B.dll"), "rb").read() == b"built B", resp2)
+        sc = os.path.join(tmp, "mh-slices")
+        brc, api_c = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Hit", "step": {"seq": 4, "outputHash": "sha256:" + out_hex}})],
+                                  ("GET-BYTES", "/modules/MeshWeaver.Plugins/B/outputs/" + out_hex): [(200, out_bytes)]})
+        brc.slice_cache = sc
+        for round_ in (1, 2):
+            shutil.rmtree(os.path.join(brc.out, "resp"), ignore_errors=True); os.makedirs(os.path.join(brc.out, "resp"))
+            brc.answered.discard("req:B")
+            with open(os.path.join(brc.io, "req", "B.json"), "w") as fh:
+                json.dump({"module": "B"}, fh)
+            brc.poll_once()
+        downloads = [c for c in api_c.calls if c[0] == "GET-BYTES"]
+        resp_c = json.load(open(os.path.join(brc.out, "resp", "B.json")))
+        check("modhub/a slice already in this host's cache is used with NO download (the second Hit)",
+              len(downloads) == 1 and resp_c.get("source") == "from this host's slice cache"
+              and open(os.path.join(resp_c["outputDir"], "B.dll"), "rb").read() == b"built B"
+              and os.path.isfile(os.path.join(sc, "MeshWeaver.Plugins", "B", out_hex, ".complete")), (downloads, resp_c))
+        brl, api_l = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Grant", "step": {"seq": 9}, "leaseUntil": "2026-11-08T10:00:00Z"})],
+                                  ("PUT", "/modules/MeshWeaver.Plugins/B/outputs/"): put_,
+                                  ("POST", "/modules/MeshWeaver.Plugins/B/complete"): lambda p_, b_: (200, {"accepted": True})})
+        brl.utcnow = lambda: datetime.datetime(2026, 11, 8, 9, 59, 50, tzinfo=datetime.timezone.utc)   # 10 s before the end
+        with open(os.path.join(brl.io, "req", "B.json"), "w") as fh:
+            json.dump({"module": "B"}, fh)
+        brl.poll_once()
+        os.makedirs(os.path.join(brl.io, "build", "B"), exist_ok=True)
+        open(os.path.join(brl.io, "build", "B", "B.dll"), "wb").write(b"late")
+        with open(os.path.join(brl.io, "done", "B.json"), "w") as fh:
+            json.dump({"succeeded": True}, fh)
+        brl.poll_once()
+        ack_l = json.load(open(os.path.join(brl.out, "ack", "B.json")))
+        check("modhub/too close to the server's lease end, NOTHING is handed over (no upload, no completion)",
+              ack_l["accepted"] is False and "lease ended" in ack_l["why"]
+              and not any(c[1].endswith("/complete") or c[0] == "PUT" for c in api_l.calls), (ack_l, api_l.calls))
+        # 🚨 the stage cannot redirect the host: a LINKED output root, or a link inside it, is refused and nothing is uploaded
+        secret_dir = os.path.join(tmp, "host-secret"); os.makedirs(secret_dir, exist_ok=True)
+        open(os.path.join(secret_dir, "token"), "w").write("worker-token")
+        for shape in ("root-link", "inner-link"):
+            bs, api_s = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Grant", "step": {"seq": 21}})],
+                                     ("PUT", "/modules/MeshWeaver.Plugins/B/outputs/"): put_,
+                                     ("POST", "/modules/MeshWeaver.Plugins/B/complete"): lambda p_, b_: (200, {"accepted": True})})
+            with open(os.path.join(bs.io, "req", "B.json"), "w") as fh:
+                json.dump({"module": "B"}, fh)
+            bs.poll_once()
+            out_b = os.path.join(bs.io, "build", "B")
+            shutil.rmtree(out_b, ignore_errors=True)
+            if shape == "root-link":
+                os.symlink(secret_dir, out_b)
+            else:
+                os.makedirs(out_b); open(os.path.join(out_b, "B.dll"), "w").write("x")
+                os.symlink(os.path.join(secret_dir, "token"), os.path.join(out_b, "leak.txt"))
+            with open(os.path.join(bs.io, "done", "B.json"), "w") as fh:
+                json.dump({"succeeded": True}, fh)
+            uploads_before = sum(1 for c in api_s.calls if c[0] == "PUT")
+            bs.poll_once()
+            comp_s = [c[2] for c in api_s.calls if c[1].endswith("/complete")]
+            check(f"modhub/a {shape} in the stage's output is refused — nothing is packed or uploaded, the step fails",
+                  sum(1 for c in api_s.calls if c[0] == "PUT") == uploads_before and comp_s and comp_s[-1]["succeeded"] is False
+                  and ("link" in comp_s[-1]["error"] or "not a plain directory" in comp_s[-1]["error"]), comp_s)
+            bs.stop("test end")
+        # a FIFO planted where the host reads (a request, an output file) never blocks the broker: it is refused at once
+        bf, api_f = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Grant", "step": {"seq": 61}})],
+                                 ("PUT", "/modules/MeshWeaver.Plugins/B/outputs/"): put_,
+                                 ("POST", "/modules/MeshWeaver.Plugins/B/complete"): lambda p_, b_: (200, {"accepted": True})})
+        os.mkfifo(os.path.join(bf.io, "req", "X.json"))
+        t0_ = time.monotonic()
+        bf.poll_once()
+        check("modhub/a FIFO planted as a request never blocks the broker", time.monotonic() - t0_ < 5 and not os.path.exists(os.path.join(bf.out, "resp", "X.json")))
+        with open(os.path.join(bf.io, "req", "B.json"), "w") as fh:
+            json.dump({"module": "B"}, fh)
+        bf.poll_once()
+        os.makedirs(os.path.join(bf.io, "build", "B"), exist_ok=True)
+        os.mkfifo(os.path.join(bf.io, "build", "B", "B.dll"))
+        with open(os.path.join(bf.io, "done", "B.json"), "w") as fh:
+            json.dump({"succeeded": True}, fh)
+        t0_ = time.monotonic()
+        bf.poll_once()
+        comp_f = [c[2] for c in api_f.calls if c[1].endswith("/complete")]
+        check("modhub/a FIFO planted in an output never blocks the broker and fails the hand-over",
+              time.monotonic() - t0_ < 5 and comp_f and comp_f[-1]["succeeded"] is False, comp_f)
+        bf.stop("test end")
+        # a done file still being written is not consumed: it is read again once it is a complete JSON object
+        bp, api_p = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Grant", "step": {"seq": 31}})],
+                                 ("PUT", "/modules/MeshWeaver.Plugins/B/outputs/"): put_,
+                                 ("POST", "/modules/MeshWeaver.Plugins/B/complete"): lambda p_, b_: (200, {"accepted": True})})
+        with open(os.path.join(bp.io, "req", "B.json"), "w") as fh:
+            json.dump({"module": "B"}, fh)
+        bp.poll_once()
+        os.makedirs(os.path.join(bp.io, "build", "B"), exist_ok=True)
+        open(os.path.join(bp.io, "build", "B", "B.dll"), "wb").write(b"B")
+        open(os.path.join(bp.io, "done", "B.json"), "w").write('{"succee')
+        bp.poll_once()
+        check("modhub/a partial done file is not consumed (no completion sent)", not any(c[1].endswith("/complete") for c in api_p.calls))
+        open(os.path.join(bp.io, "done", "B.json"), "w").write('{"succeeded": true}')
+        bp.poll_once()
+        check("modhub/...and once complete it is processed (and the grant settles on the server's answer)",
+              any(c[1].endswith("/complete") and c[2]["succeeded"] for c in api_p.calls) and "B" not in bp.granted)
+        bp.stop("test end")
+        # a Wait on one module never holds another module's completion
+        bw, api_w = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Grant", "step": {"seq": 41}})],
+                                 ("POST", "/modules/MeshWeaver.Plugins/A/request"): [(200, {"verdict": "Wait", "step": {"seq": 1}})],
+                                 ("PUT", "/modules/MeshWeaver.Plugins/B/outputs/"): put_,
+                                 ("POST", "/modules/MeshWeaver.Plugins/B/complete"): lambda p_, b_: (200, {"accepted": True})})
+        with open(os.path.join(bw.io, "req", "B.json"), "w") as fh:
+            json.dump({"module": "B"}, fh)
+        bw.poll_once()
+        with open(os.path.join(bw.io, "req", "A.json"), "w") as fh:
+            json.dump({"module": "A"}, fh)
+        os.makedirs(os.path.join(bw.io, "build", "B"), exist_ok=True)
+        open(os.path.join(bw.io, "build", "B", "B.dll"), "wb").write(b"B")
+        with open(os.path.join(bw.io, "done", "B.json"), "w") as fh:
+            json.dump({"succeeded": True}, fh)
+        bw.poll_once()
+        check("modhub/a module waiting on its hub does not hold another module's completion",
+              os.path.exists(os.path.join(bw.out, "ack", "B.json")) and "A" in bw.pending)
+        bw.stop("test end")
+        # teardown releases a grant the server never acknowledged
+        bt, api_t2 = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Grant", "step": {"seq": 51}})],
+                                  ("POST", "/modules/MeshWeaver.Plugins/B/complete"): [(0, "connection reset"), (200, {"accepted": True})]})
+        with open(os.path.join(bt.io, "req", "B.json"), "w") as fh:
+            json.dump({"module": "B"}, fh)
+        bt.poll_once()
+        with open(os.path.join(bt.io, "done", "B.json"), "w") as fh:
+            json.dump({"succeeded": False, "error": "compile error"}, fh)
+        bt.poll_once()
+        check("modhub/a completion the server did not answer keeps the grant", "B" in bt.granted)
+        bt.stop("the run ended")
+        check("modhub/...and teardown releases it", "B" not in bt.granted
+              and sum(1 for c in api_t2.calls if c[1].endswith("/complete")) == 2)
+        check("modhub/the pull request is read from a string ref too", pull_request_number(["refs/pull/7/head"]) == 7
+              and pull_request_number([{"kind": "PullRequest", "number": 9}]) == 9 and pull_request_number(["refs/heads/main"]) is None)
+        removed = widen_module_hub(validate_module_hub({"moduleHub": {"modules": {"A": {"paths": ["src/A"], "options": ["opt-a", "opt-b"]}}}}),
+                                   validate_module_hub({"moduleHub": {"modules": {"A": {"paths": ["src/A"], "options": ["opt-a"]}}}}))
+        same = widen_module_hub(validate_module_hub({"moduleHub": {"modules": {"A": {"paths": ["src/A"], "options": ["opt-a", "opt-b"]}}}}),
+                                validate_module_hub({"moduleHub": {"modules": {"A": {"paths": ["src/A"], "options": ["opt-a", "opt-b"]}}}}))
+        check("modhub/a REMOVED option moves the key (the candidate's options enter it separately)",
+              module_fingerprints(removed, lambda ps: "x", "tc")["A"] != module_fingerprints(same, lambda ps: "x", "tc")["A"])
+        check("modhub/a TRUNK run asks on main with its merge order",
+              [c[2] for c in api_h.calls if c[1].endswith("/request")][0].get("order") == 77
+              and [c[2] for c in api_h.calls if c[1].endswith("/request")][0].get("lane") == "Main")
+        br3, api_t = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Hit", "step": {"seq": 4, "outputHash": "sha256:" + out_hex}})],
+                                  ("GET-BYTES", "/modules/MeshWeaver.Plugins/B/outputs/"): [(200, b"tampered")]})
+        with open(os.path.join(br3.io, "req", "B.json"), "w") as fh:
+            json.dump({"module": "B"}, fh)
+        br3.poll_once()
+        check("modhub/fetched bytes that do not hash to the step's output are refused",
+              json.load(open(os.path.join(br3.out, "resp", "B.json")))["verdict"] == "Failed")
+        with open(os.path.join(br3.io, "req", "Nope.json"), "w") as fh:
+            json.dump({}, fh)
+        br3.poll_once()
+        check("modhub/a module the default branch does not declare is refused, never asked",
+              json.load(open(os.path.join(br3.out, "resp", "Nope.json")))["verdict"] == "Refused"
+              and not any("/Nope/" in c[1] for c in api_t.calls))
+        with open(os.path.join(br3.io, "done", "B.json"), "w") as fh:
+            json.dump({"succeeded": True}, fh)
+        br3.poll_once()
+        check("modhub/a completion without this host's grant is refused locally", json.load(open(os.path.join(br3.out, "ack", "B.json")))["accepted"] is False)
+        brr, api_r = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Grant", "step": {"seq": 11}})],
+                                  ("POST", "/modules/MeshWeaver.Plugins/B/complete"): lambda p_, b_: (200, {"accepted": True})})
+        with open(os.path.join(brr.io, "req", "B.json"), "w") as fh:
+            json.dump({"module": "B"}, fh)
+        brr.poll_once()
+        brr.release_open_grants("the run ended")
+        rel = [c[2] for c in api_r.calls if c[1].endswith("/complete")]
+        check("modhub/at the run's end every open grant is completed as FAILED (no lease waits to lapse)",
+              rel and rel[0]["seq"] == 11 and rel[0]["succeeded"] is False and rel[0]["holder"] == brr.host, rel)
 
         # ── 5c. the ONE credential: AcrPull by workload identity, host-only ──────────────
         fed = os.path.join(tmp, "azure-identity-token")
@@ -5678,6 +6548,33 @@ def self_test() -> int:
             if hi.warm_thread:
                 hi.warm_thread.join(60)
             check("warm-idle/a tip already built is not built again", open(os.path.join(iw, "src", "obj", "warm.txt")).read() == "untouched")
+            # an advancement that FAILS (it wipes and says so, returning normally) must not mark the tip handled as "sources
+            # only": the next idle pass would skip that tip and every run would clone (review of Deploy#183)
+            fail_work = os.path.join(wroot, "idle-fail")
+            os.makedirs(fail_work)
+            hf = host(_FakeApi({}), env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_WORK=fail_work, MW_BUILD_CACHE=wenv["MW_BUILD_CACHE"],
+                                             MW_BUILD_GIT_BASE=wenv["MW_BUILD_GIT_BASE"]), git_runner=_git_run)
+            hf.warm_repos.add("R")
+            adv_calls: list = []
+            real_adv = globals()["advance_warm_main"]
+
+            def failing_adv(repo_, tip_, warm_, *a_, **k_):
+                adv_calls.append(tip_)
+                wipe_warm(warm_)
+                return "warm main workspace: not advanced (git failed) — wiped, retried when idle"
+            globals()["advance_warm_main"] = failing_adv
+            try:
+                hf.warm_main_when_idle()
+                fw = os.path.join(fail_work, WARM_DIR, "R")
+                check("warm-idle/a FAILED advancement records no state (the tip is not marked handled) and reads no declaration",
+                      warm_state(fw) is None and len(adv_calls) == 1 and hf.warm_failed.get("R", ("",))[0] == c3, (warm_state(fw), adv_calls))
+                hf.warm_main_when_idle()
+                check("warm-idle/the failed tip is retried after a pause, not on every idle pass", len(adv_calls) == 1, adv_calls)
+                hf.warm_failed["R"] = (c3, warm_key(hf.env, hf.identity), time.monotonic() - WARM_RETRY_SECONDS - 1)
+                hf.warm_main_when_idle()
+                check("warm-idle/after the pause the failed tip is tried again", len(adv_calls) == 2, adv_calls)
+            finally:
+                globals()["advance_warm_main"] = real_adv
             run5 = os.path.join(idle_work, "run5", "src")
             line5 = seed_run_from_warm("R", c1, [], iw, run5, None, wenv, lambda m: None, key=warm_key(hi.env, hi.identity))
             # a claim STOPS a warm build in flight (its sandbox killed, the half-built workspace wiped) — never waits it out
@@ -8543,7 +9440,7 @@ def self_test() -> int:
         return 1
     print("build-run self-test: all cases passed (diagnostics, dedup, vstest + xunit results, structured events, "
           "stage declaration, the bwrap argv, the env allow-list, the token file, the startup sandbox probe, "
-          "pid-namespace leftovers, one merged tree per PR attempt, the network-boundary self-check, trunk-only BUILD-stage cache promotion under recomputed keys, the plan, batch seq, the lease heartbeat, the claimId, the git mirror, the warm workspace (main-only, advanced by the host from the tip; every run an incremental COPY it can never write back; wiped on a key change; a fresh clone on failure; never swept), cache scoping per stage, the NuGet fallback folder bound for every stage, the warm NuGet cache filled from the default branch's tip once per key (and never from a PR), the refset key, the H9 artifact hand-over (a file: store and the build API), the workload-identity pull, the registry bundle index (H8), plugins refresh BEFORE claim, fresh process per "
+          "pid-namespace leftovers, one merged tree per PR attempt, the network-boundary self-check, trunk-only BUILD-stage cache promotion under recomputed keys, the plan, batch seq, the lease heartbeat, the claimId, the git mirror, the module-hub broker (host-computed fingerprints from a default-branch declaration, host-decided lane, hash-verified hand-over both ways), the warm workspace (main-only, advanced by the host from the tip; every run an incremental COPY it can never write back; wiped on a key change; a fresh clone on failure; never swept), cache scoping per stage, the NuGet fallback folder bound for every stage, the warm NuGet cache filled from the default branch's tip once per key (and never from a PR), the refset key, the H9 artifact hand-over (a file: store and the build API), the workload-identity pull, the registry bundle index (H8), plugins refresh BEFORE claim, fresh process per "
           "stage, fail-fast, channel + publish, 409, undeclared stages, stage timeout, run deadline)")
     return 0
 
