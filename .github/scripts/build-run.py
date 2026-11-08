@@ -677,10 +677,13 @@ MODULE_HUB_LEASE_MARGIN = 30      # seconds: hand nothing over this close to the
 
 
 def pull_request_number(refs: list) -> Optional[int]:
-    """The pull request a claim's refs name: a `{kind: PullRequest, number}` object or a `refs/pull/<n>/head|merge` string
-    (both forms reach the host). Pure."""
+    """The pull request a claim's refs name: a `{kind: PullRequest, number}` object — the operations instance's claim answer
+    serialises the kind as its NUMBER (BuildRefKind.PullRequest = 1; System.Text.Json's web defaults write enums as numbers),
+    other writers as the name — or a `refs/pull/<n>/head|merge` string (every form reaches the host). Pure."""
     for r in refs:
-        if isinstance(r, dict) and str(r.get("kind", "")).lower() == "pullrequest" and isinstance(r.get("number"), int):
+        kind = r.get("kind") if isinstance(r, dict) else None
+        is_pr = (kind == 1 and not isinstance(kind, bool)) or str(kind).strip().lower() in ("pullrequest", "pull_request", "1")
+        if isinstance(r, dict) and is_pr and isinstance(r.get("number"), int) and not isinstance(r.get("number"), bool):
             return r["number"]
         if isinstance(r, str):
             m = re.fullmatch(r"refs/pull/(\d+)/(?:head|merge)", r.strip())
@@ -6414,6 +6417,10 @@ def self_test() -> int:
               and sum(1 for c in api_t2.calls if c[1].endswith("/complete")) == 2)
         check("modhub/the pull request is read from a string ref too", pull_request_number(["refs/pull/7/head"]) == 7
               and pull_request_number([{"kind": "PullRequest", "number": 9}]) == 9 and pull_request_number(["refs/heads/main"]) is None)
+        check("modhub/the operations instance's claim answer names the kind by NUMBER (BuildRefKind.PullRequest = 1)",
+              pull_request_number([{"kind": 1, "name": "probe/x", "number": 5107, "baseRef": "main"}]) == 5107
+              and pull_request_number([{"kind": 0, "name": "main"}]) is None and pull_request_number([{"kind": True, "number": 3}]) is None
+              and pull_request_number([{"kind": 1, "number": True}]) is None)
         removed = widen_module_hub(validate_module_hub({"moduleHub": {"modules": {"A": {"paths": ["src/A"], "options": ["opt-a", "opt-b"]}}}}),
                                    validate_module_hub({"moduleHub": {"modules": {"A": {"paths": ["src/A"], "options": ["opt-a"]}}}}))
         same = widen_module_hub(validate_module_hub({"moduleHub": {"modules": {"A": {"paths": ["src/A"], "options": ["opt-a", "opt-b"]}}}}),
@@ -9305,6 +9312,11 @@ def self_test() -> int:
                                 refs=[{"kind": "PullRequest", "name": "probe/p-1", "number": 5105, "baseRef": "main"}]))
         check("merge/a probe NAMING a pull request is merged once onto main's tip, and its plan names the base",
               sum(1 for a in gl if "merge" in a) == 1 and plans() and plans()[0].get("mergeBase") == "e" * 40, (gl, plans()))
+        gl = []
+        merge_host(gl).run(dict(claim, isTrunk=False, isProbe=True, mergeBaseSha=None,
+                                refs=[{"kind": 1, "name": "probe/p-2", "number": 5107, "baseRef": "main"}]))
+        check("merge/a PR-named probe whose kind arrives as the NUMBER the claim answer writes is merged too",
+              sum(1 for a in gl if "merge" in a) == 1 and plans()[0].get("mergeBase") == "e" * 40, (gl, plans()))
         # a probe run's id rides on every events POST (and the token request); a normal run's never
         pq: list = []
         hpq = host(_FakeApi({("POST", "/token"): lambda p_, b: (pq.append(("token", None)), (404, None))[1],
