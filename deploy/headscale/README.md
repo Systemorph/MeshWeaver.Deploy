@@ -108,7 +108,7 @@ dns:
 Rendered into Headscale's `dns.extra_records` (served since 0.23; 0.29.7 measured: a stock Tailscale client's
 `tailscale dns query` answers the declared name, and an undeclared sibling does not — the lane asserts both). One
 record per name: a Tailscale client matches MagicDNS names EXACTLY, so a wildcard would never be served, and the
-render refuses one. It also refuses a name outside `dns.baseDomain` (it would shadow a public name — and since
+render refuses one. It also refuses a name with a label over 63 characters or over 253 in all, a name outside `dns.baseDomain` (it would shadow a public name — and since
 `baseDomain` may never contain `host`, the server's own name can never be declared), a type other than `A`/`AAAA`,
 a value that is not an address of that type (IPv4 dotted quad; IPv6 lower-case, eight groups or one `::`), and a
 name+type declared twice.
