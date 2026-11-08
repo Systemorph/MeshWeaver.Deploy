@@ -200,7 +200,16 @@ NO token requests until its owner says yes and names the instances it takes each
 tokens from `*.meshweaver.cloud`, and the models `qwen3.8:27b-mlx qwen3.6`. The residency has no default; type
 where the machine is. A headless run passes `--accept-jobs=<patterns>` / `--no-accept-jobs` and
 `--accept-tokens=<patterns>` / `--no-accept-tokens` (with `--token-models`, `--residency`), and with no answer
-both stay off. Change an answer later with `memex-local backlease accept jobs|tokens [--from …] [--off] …`,
+both stay off. **Token slots.** How many requests the machine serves at once is the machine's capacity, not an owner choice.
+A Mac Studio is 2. It is measured: Ollama 0.40's MLX runner decodes one request at a time, and one stream saturates
+an M5 Max at about 65 tok/s. memex-local writes `Tokens__Slots` whenever tokens are on. `--token-slots <n>` is a
+calibrated override (1–32), and `--token-max-concurrency <n>` is the owner's optional ceiling below it. When the
+ceiling is unset the Mac serves at its full slot count. `--token-yield-at <pct>` sets the owner-CPU threshold
+(percent of one core; the code's default is 200) and is written only when given. `none` clears either. The host
+sampler reports `host.ownerCpuPercent`: the owner's CPU over the interval, excluding Ollama, the build VM and the
+portal VM. That is what the Mac yields to.
+
+Change an answer later with `memex-local backlease accept jobs|tokens [--from …] [--off] …`,
 then `memex-local update`. `backlease status` prints the answers. They are written as
 `Hosting__BackLease__Accept__*` into `~/.memex-local/backlease.yaml`. The heartbeat carries them to control,
 which enforces them and can never switch them on.

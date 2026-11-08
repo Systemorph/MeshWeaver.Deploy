@@ -2022,6 +2022,48 @@ grep -q 'Hosting__BackLease__HostLoadMax: "85%"' "$BL/backlease.yaml" && grep -q
   && ok "the back-lease layer declares the host load/memory and VM CPU/memory ceilings for the heartbeat" || bad "backlease thresholds" "$(ls "$BL"; cat "$BL"/backlease.yaml 2>/dev/null)"
 rm -rf "$BL"
 
+echo "── back-lease sampler: host.ownerCpuPercent is the owner's CPU over the interval (Hosting/BackLease §14.5) ──"
+OC="$(mktemp -d)"; mkdir -p "$OC/stubs" "$OC/dir" "$OC/home/.colima/_lima/colima-build" "$OC/home/.colima/_lima/colima"
+: > "$OC/home/.colima/_lima/colima-build/disk"; : > "$OC/home/.colima/_lima/colima/disk"
+# the build VM is pid 20 (holds the build profile's disk), the portal VM pid 21 (the default profile's)
+printf '#!/bin/bash\n[ "$1" = -t ] && case "$2" in */colima-build/disk) echo 20 ;; */_lima/colima/disk) echo 21 ;; esac\n' > "$OC/stubs/lsof"; chmod +x "$OC/stubs/lsof"
+printf '#!/bin/bash\ncat "%s/ps.now"\n' "$OC" > "$OC/stubs/fakeps"; chmod +x "$OC/stubs/fakeps"
+SAMPLER="$HERE/../share/backlease-sampler.sh"
+oc() { env PATH="$OC/stubs:$PATH" HOME="$OC/home" COLIMA_HOME= MEMEX_LOCAL_HOME="$OC/none" MEMEX_LOCAL_SHARE= MEMEX_BUILD_PRIO_SCRIPT="${OC_GOV-$GOV}" \
+  MEMEX_BACKLEASE_DIR="$OC/dir" MEMEX_BACKLEASE_INTERVAL=30 MEMEX_SAMPLER_PS="$OC/stubs/fakeps" MEMEX_SAMPLER_NOW="$1" MEMEX_BACKLEASE_SAMPLER_LIB=1 \
+  bash -c '. "$0"; owner_cpu' "$SAMPLER"; }
+printf '  0 1:00.00 kernel_task\n  10 0:10.00 /Applications/Safari\n  20 1:00:00.00 VZ build\n  21 30:00.00 VZ portal\n  30 0:05.00 /opt/homebrew/bin/ollama serve\n  31 0:05.00 /opt/homebrew/Cellar/ollama/0.40.14/libexec/lib/ollama/llama-server --model x\n' > "$OC/ps.now"
+[ -z "$(oc 1000)" ] && ok "the first sample reports NO ownerCpuPercent (absent, never a guess)" || bad "first sample" "$(oc 1000)"
+# 30 s later: Safari +30 s CPU (100 %), a new owner process +15 s (50 %); the VMs, Ollama and kernel_task all busy
+printf '  0 9:00.00 kernel_task\n  10 0:40.00 /Applications/Safari\n  11 0:15.00 /usr/bin/make\n  20 2:00:00.00 VZ build\n  21 45:00.00 VZ portal\n  30 1:05.00 /opt/homebrew/bin/ollama serve\n  31 9:05.00 /opt/homebrew/Cellar/ollama/0.40.14/libexec/lib/ollama/llama-server --model x\n' > "$OC/ps.now"
+[ "$(oc 1030)" = 150 ] && ok "ownerCpuPercent = the owner's CPU-time delta over the interval, excluding Ollama (serve + llama-server), both VMs and kernel_task" || bad "ownerCpuPercent value" "$(oc 1030)"
+[ -z "$(oc 1200)" ] && ok "a gap longer than three intervals reports nothing (a stale window is not a reading)" || bad "stale gap" "$(oc 1200)"
+[ -z "$(OC_GOV="$OC/missing.sh" oc 1230)" ] && ok "no governor library to measure with → the field is absent" || bad "no governor" ""
+rm -rf "$OC"
+
+echo "── token slots: the machine's capacity; the owner's ceiling is optional (Hosting/BackLease §14.5) ──"
+TS="$(mktemp -d)"; mkdir -p "$TS/home"
+printf '#!/bin/bash\nexit 0\n' > "$TS/launchctl"; chmod +x "$TS/launchctl"
+ts() { env PATH="$TS:$STUBS:$PATH" HOME="$TS/home" MEMEX_LOCAL_HOME="$TS/home/.memex-local" "$@"; }
+TSF="$TS/home/.memex-local/backlease.yaml"; tsh() { grep -qF "$1" "$TSF" 2>/dev/null; }
+ts "$CLI" registry https://memex.example.test --id ci-ts >/dev/null 2>&1
+ts env MEMEX_PROFILE=mac-studio "$CLI" backlease enroll --control https://control.example.test --deployment studio-1 --accept-tokens='*.meshweaver.cloud' --token-models qwen3.8:27b-mlx --residency CH </dev/null >/dev/null 2>&1
+tsh 'Hosting__BackLease__Accept__Tokens__Slots: "2"' && ! tsh 'Tokens__MaxConcurrency' && ! tsh 'Tokens__YieldAtPercent' \
+  && ok "a mac-studio with tokens on gets Slots 2 and NO owner ceiling (the whole machine); no YieldAtPercent unless asked" || bad "mac-studio slots" "$(grep Tokens "$TSF")"
+ts env MEMEX_PROFILE= MEMEX_HOST_MODEL_NAME="Mac Studio" "$CLI" backlease accept tokens --slots none </dev/null >/dev/null 2>&1
+tsh 'Hosting__BackLease__Accept__Tokens__Slots: "2"' && ok "with no profile, Mac Studio hardware is measured as 2 slots" || bad "hardware slots" "$(grep Tokens "$TSF")"
+ts env MEMEX_PROFILE= MEMEX_HOST_MODEL_NAME="MacBook Pro" "$CLI" backlease accept tokens --slots none </dev/null >/dev/null 2>&1
+! tsh 'Tokens__Slots' && ok "a host nobody measured writes no Slots (the code's default applies)" || bad "no slots on other hosts" "$(grep Tokens "$TSF")"
+ts "$CLI" backlease accept tokens --slots 4 --max-concurrency 1 --yield-at 150 </dev/null >/dev/null 2>&1
+tsh 'Tokens__Slots: "4"' && tsh 'Tokens__MaxConcurrency: "1"' && tsh 'Tokens__YieldAtPercent: "150"' \
+  && ok "--slots (calibrated), --max-concurrency (owner ceiling) and --yield-at are written as given" || bad "slots overrides" "$(grep Tokens "$TSF")"
+ts "$CLI" backlease accept tokens --max-concurrency none --yield-at none </dev/null >/dev/null 2>&1
+! tsh 'Tokens__MaxConcurrency' && ! tsh 'Tokens__YieldAtPercent' && tsh 'Tokens__Slots: "4"' \
+  && ok "'none' clears the owner ceiling and the yield threshold; the calibrated slots stand" || bad "none clears" "$(grep Tokens "$TSF")"
+OUT="$(ts "$CLI" backlease accept tokens --slots 40 </dev/null 2>&1)" && bad "40 slots accepted" "$OUT" || ok "slots outside 1–32 are refused"
+OUT="$(ts "$CLI" backlease accept tokens --yield-at 5 </dev/null 2>&1)" && bad "yield-at 5 accepted" "$OUT" || ok "a yield threshold outside 10–3200 % is refused"
+rm -rf "$TS"
+
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
