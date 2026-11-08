@@ -4669,6 +4669,23 @@ class Host:
                     # A PROBE runs EXACTLY the stages it asked for (`requestedStages`; empty = every
                     # declared stage) and plans only those; one the repository does not declare is red.
                     stages = select_stages(declared, claim.get("requestedStages"))
+                elif not probe and trunk and claim.get("servedStages"):
+                    # a TRUNK run is never served in part: its verdict publishes, so every declared stage runs
+                    self.log("served stages ignored on a trunk run: every declared stage runs")
+                elif not probe and isinstance(claim.get("servedStages"), list) and claim.get("servedStages"):
+                    # A SERVED run (another channel's, taken by this serving host): only the stages this host's channel
+                    # is declared to run of it (control's Hosting:Builds:ServesStages). A declared name the repository
+                    # does not have is skipped — the declaration is the operator's, the stages the repository's — but a
+                    # list that matches NO declared stage (a renamed stage, a typo) is red, never a green run of nothing.
+                    wanted = [n for n in claim["servedStages"] if isinstance(n, str)]
+                    names = [st.get("name") for st in declared]
+                    matched = [n for n in wanted if n in names]
+                    if not matched:
+                        raise Refusal(f"served stages {', '.join(wanted) or '(none named)'} match none of the stages the "
+                                      f"repository declares ({', '.join(str(n) for n in names)})")
+                    stages = select_stages(declared, matched)
+                    self.log(f"served run: this host runs {', '.join(st['name'] for st in stages) or 'no stage'} of it "
+                             f"(declared for the serving channel: {', '.join(wanted)})")
             except Refusal as r:
                 sink = self._sink_for(repo, sha, last_stage)
                 sink.add([{"kind": "line", "text": f"run refused before any stage: {r}"},
@@ -10163,6 +10180,32 @@ def self_test() -> int:
         hrq.run(dict(claim, isProbe=True, probe="p-9", requestedStages=["nope"]))
         rf = [e for _, es in posted for e in es if e["kind"] == "run-finished"]
         check("probe/a requested stage the repository does not declare is red", rf and rf[0]["succeeded"] is False, rf)
+        # a SERVED run runs exactly the stages declared for the serving channel; an undeclared name is skipped, never red
+        posted.clear()
+        open(os.path.join(tmp, "rq"), "w").close()
+        hrq.run(dict(claim, isTrunk=False, servedStages=["a", "not-a-stage"]))
+        pl = [e for _, es in posted for e in es if e["kind"] == "plan"]
+        rf = [e for _, es in posted for e in es if e["kind"] == "run-finished"]
+        check("served/only the declared served stages are planned and run, an unknown name skipped",
+              pl and pl[0]["stages"] == ["a"] and open(os.path.join(tmp, "rq")).read().split() == ["a"]
+              and rf and rf[0]["succeeded"] is True, (pl, rf))
+        posted.clear()
+        open(os.path.join(tmp, "rq"), "w").close()
+        hrq.run(dict(claim, isTrunk=False, servedStages=[]))
+        pl = [e for _, es in posted for e in es if e["kind"] == "plan"]
+        check("served/no servedStages = every declared stage", pl and pl[0]["stages"] == ["a", "b"], pl)
+        posted.clear()
+        open(os.path.join(tmp, "rq"), "w").close()
+        hrq.run(dict(claim, isTrunk=False, servedStages=["renamed", "typo"]))
+        rf = [e for _, es in posted for e in es if e["kind"] == "run-finished"]
+        check("served/a list matching NO declared stage is red and runs nothing (never a green run of zero stages)",
+              rf and rf[0]["succeeded"] is False and "match none" in (rf[0].get("error") or "")
+              and open(os.path.join(tmp, "rq")).read().split() == [], rf)
+        posted.clear()
+        open(os.path.join(tmp, "rq"), "w").close()
+        hrq.run(dict(claim, isTrunk=True, servedStages=["a"]))
+        pl = [e for _, es in posted for e in es if e["kind"] == "plan"]
+        check("served/a trunk run ignores servedStages: every declared stage is planned", pl and pl[0]["stages"] == ["a", "b"], pl)
         plan_from_child = OutputParser("/w", "x").feed('::mw-event::{"kind":"plan","stages":["x"]}')
         check("plan/a child cannot emit the plan", plan_from_child and "refused" in plan_from_child[0]["text"], plan_from_child)
     finally:
