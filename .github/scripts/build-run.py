@@ -3439,11 +3439,15 @@ class SharedTree:
         """The current generation's warm tree, held against deletion while the block runs; None when none is published."""
         import fcntl
         fh, held = None, None
-        for _ in range(3):                       # a generation collected between the readlink and the lock: read again
+        for attempt in range(6):                 # a generation collected between the readlink and the lock: read again
             gen = self.current()
             if gen is None:
                 break
-            fh = self._lock(self._lock_of(gen), fcntl.LOCK_SH)
+            # NON-blocking: a collector holding a retired generation's lock is deleting it — never wait out a deletion
+            fh = self._lock(self._lock_of(gen), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            if fh is None:
+                time.sleep(0.05 * (attempt + 1))
+                continue
             # only the generation that is STILL current after the lock is handed out: a retired one (even one a failed
             # collect left half-deleted) is never copied — `current` is the one name a collector never deletes
             if fh is not None and self.current() == gen and os.path.isdir(self.warm_of(gen)):
@@ -4361,6 +4365,8 @@ class Host:
         with tree.writer() as w:
             if w is None:
                 return                                     # another replica is the writer: it warms, this one does not
+            # generations a replica killed mid-stage or mid-build left behind are reclaimed BEFORE another full copy
+            w.collect()
             try:
                 gen = w.stage(cancel=self.warm_cancel, deadline=time.monotonic() + 1800)
             except Lost:
@@ -4370,15 +4376,18 @@ class Host:
                 self.warm_failed[repo] = (tip_now, key, time.monotonic())
                 self.log(f"shared tree: {repo} not staged ({e})")
                 return
+            published = False
             try:
                 outcome = self._warm_one(repo, key, w.warm_of(gen))
                 if outcome == "built":
-                    w.publish(gen)
+                    w.publish(gen)                         # replaces `current`, then collects
+                    published = True
                     self.log(f"shared tree: {repo} generation {os.path.basename(gen)} published")
                     return
             except BaseException:
-                w.discard(gen)                             # never leave a staged generation behind a failure
-                raise
+                if not published and w.current() != gen:
+                    w.discard(gen)                         # an UNPUBLISHED generation never stays behind a failure
+                raise                                      # a published one is never deleted (a collect error after it)
             w.discard(gen)
             w.collect()
 
@@ -7140,12 +7149,41 @@ def self_test() -> int:
             check("shared/a publish that fails (ENOSPC) never raises, cools down and leaves no staged generation",
                   raised is None and hc.warm_failed.get("R", ("",))[0] == "u" * 40
                   and os.listdir(SharedTree(hcache2, "R").gens) == [], (raised, hc.warm_failed, os.listdir(SharedTree(hcache2, "R").gens)))
+            # a collect that fails AFTER the publish committed never deletes the published generation
+            he = host(_FakeApi({}), env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_SHARED_TREE="true", MW_BUILD_CACHE=hcache2))
+            he._warm_one = warm_stub(he, "E")
+            he._mirror_tip = lambda repo_: "v" * 40
+            real_collect = SharedTree.collect
+            calls_ = {"n": 0}
+
+            def failing_collect(self_):
+                calls_["n"] += 1
+                if calls_["n"] >= 2:                       # the pre-stage collect passes, the post-publish one fails
+                    raise OSError(5, "I/O error")
+                return real_collect(self_)
+            SharedTree.collect = failing_collect
+            try:
+                he._warm_shared("R", warm_key(he.env, he.identity))
+            finally:
+                SharedTree.collect = real_collect
+            cur_e = SharedTree(hcache2, "R").current()
+            check("shared/a collect failing AFTER the publish leaves the published generation current and intact",
+                  cur_e is not None and os.path.isdir(SharedTree(hcache2, "R").warm_of(cur_e)), cur_e)
+            # a generation a killed replica left behind is reclaimed before the next staging copy
+            orphan = os.path.join(SharedTree(hcache2, "R").gens, "00000000000000000001-1")
+            os.makedirs(os.path.join(orphan, WARM_DIR, "R"))
+            he.warm_failed.clear()
+            he._mirror_tip = lambda repo_: "w" * 40
+            he._warm_shared("R", warm_key(he.env, he.identity))
+            check("shared/an abandoned unpublished generation is reclaimed before another full copy is staged", not os.path.exists(orphan))
             hd = host(_FakeApi({}), env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_SHARED_TREE="true", MW_BUILD_CACHE=hcache2))
             staged_: list = []
             hd._warm_one = lambda *a_: staged_.append(1) or "built"
             hd._mirror_tip = lambda repo_: ""
+            gens_before = sorted(os.listdir(SharedTree(hcache2, "R").gens))
             hd._warm_shared("R", warm_key(hd.env, hd.identity))
-            check("shared/a mirror that names no tip stages nothing", staged_ == [] and os.listdir(SharedTree(hcache2, "R").gens) == [], staged_)
+            check("shared/a mirror that names no tip stages nothing",
+                  staged_ == [] and sorted(os.listdir(SharedTree(hcache2, "R").gens)) == gens_before, staged_)
             # the warm build's platform copy appears at the prepared tree's own path, never at its scratch path
             plat = os.path.join(wroot, "prepared-platform")
             os.makedirs(plat, exist_ok=True)
