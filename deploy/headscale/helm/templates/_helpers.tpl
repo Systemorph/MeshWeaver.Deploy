@@ -74,19 +74,16 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- if not (hasSuffix (printf ".%s" $.Values.dns.baseDomain) $n) }}
 {{- fail (printf "dns.extraRecords[%d]: name %q is not inside dns.baseDomain %q — MagicDNS answers that zone only, and a record outside it would shadow a public name" $i $n (toString $.Values.dns.baseDomain)) }}
 {{- end }}
-{{- if eq $n (toString $.Values.host) }}
-{{- fail (printf "dns.extraRecords[%d]: name %q is the control server's own host" $i $n) }}
-{{- end }}
 {{- if eq $t "A" }}
 {{- if not (regexMatch "^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$" $v) }}
 {{- fail (printf "dns.extraRecords[%d] (%s): value %q is not an IPv4 address" $i $n $v) }}
 {{- end }}
 {{- else if eq $t "AAAA" }}
-{{- if not (regexMatch "^[0-9a-fA-F:]+$" $v) }}
-{{- fail (printf "dns.extraRecords[%d] (%s): value %q is not an IPv6 address" $i $n $v) }}
-{{- end }}
-{{- if not (contains ":" $v) }}
-{{- fail (printf "dns.extraRecords[%d] (%s): value %q is not an IPv6 address" $i $n $v) }}
+{{- /* Eight 1–4-digit groups, or fewer around exactly ONE `::` (at most seven groups then). */}}
+{{- $full := regexMatch "^([0-9a-f]{1,4}:){7}[0-9a-f]{1,4}$" $v }}
+{{- $short := and (regexMatch "^(([0-9a-f]{1,4}:)*[0-9a-f]{1,4})?::(([0-9a-f]{1,4}:)*[0-9a-f]{1,4})?$" $v) (eq (len (splitList "::" $v)) 2) (le (len (regexFindAll "[0-9a-f]{1,4}" $v -1)) 7) }}
+{{- if not (or $full $short) }}
+{{- fail (printf "dns.extraRecords[%d] (%s): value %q is not a lower-case IPv6 address" $i $n $v) }}
 {{- end }}
 {{- else }}
 {{- fail (printf "dns.extraRecords[%d] (%s): type %q — only A and AAAA are served" $i $n $t) }}

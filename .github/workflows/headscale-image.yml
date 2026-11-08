@@ -172,6 +172,13 @@ jobs:
           refuse "an extra record is a wildcard"        -f ci-values.yaml "${rec[@]}" --set 'dns.extraRecords[0].name=*.mac.tailnet.internal'
           refuse "an extra record is outside baseDomain" -f ci-values.yaml "${rec[@]}" --set 'dns.extraRecords[0].name=proof.example.com'
           refuse "an extra record is not an IPv4 address" -f ci-values.yaml --set 'dns.extraRecords[0].name=a.tailnet.internal' --set 'dns.extraRecords[0].type=A' --set 'dns.extraRecords[0].value=300.1.1.1'
+          for v6 in 12345:: ::1::2 :::::: fd7a:115c:a1e0:0:0:0:0:0:1 FD7A::1; do
+            refuse "an extra record's AAAA value '$v6' is not a lower-case IPv6 address" -f ci-values.yaml --set 'dns.extraRecords[0].name=a.tailnet.internal' --set 'dns.extraRecords[0].type=AAAA' --set "dns.extraRecords[0].value=$v6"
+          done
+          for v6 in fd7a:115c:a1e0::7 ::1 fd7a:115c:a1e0:ab12:4843:cd96:6258:b240; do
+            helm template hs deploy/headscale/helm -f ci-values.yaml --set 'dns.extraRecords[0].name=a.tailnet.internal' --set 'dns.extraRecords[0].type=AAAA' --set "dns.extraRecords[0].value=$v6" >/dev/null \
+              || { echo "::error::a valid AAAA value '$v6' was refused"; exit 1; }
+          done
           refuse "an extra record has an unserved type" -f ci-values.yaml --set 'dns.extraRecords[0].name=a.tailnet.internal' --set 'dns.extraRecords[0].type=CNAME' --set 'dns.extraRecords[0].value=b.tailnet.internal'
           refuse "an extra record is declared twice"    -f ci-values.yaml "${rec[@]}" --set 'dns.extraRecords[0].name=a.tailnet.internal' \
                  --set 'dns.extraRecords[1].name=a.tailnet.internal' --set 'dns.extraRecords[1].type=A' --set 'dns.extraRecords[1].value=100.64.0.8'

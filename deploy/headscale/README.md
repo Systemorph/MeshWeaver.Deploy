@@ -108,8 +108,10 @@ dns:
 Rendered into Headscale's `dns.extra_records` (served since 0.23; 0.29.7 measured: a stock Tailscale client's
 `tailscale dns query` answers the declared name, and an undeclared sibling does not — the lane asserts both). One
 record per name: a Tailscale client matches MagicDNS names EXACTLY, so a wildcard would never be served, and the
-render refuses one. It also refuses a name outside `dns.baseDomain` (it would shadow a public name), the server's own
-`host`, a type other than `A`/`AAAA`, a value that is not an address of that type, and a name+type declared twice.
+render refuses one. It also refuses a name outside `dns.baseDomain` (it would shadow a public name — and since
+`baseDomain` may never contain `host`, the server's own name can never be declared), a type other than `A`/`AAAA`,
+a value that is not an address of that type (IPv4 dotted quad; IPv6 lower-case, eight groups or one `::`), and a
+name+type declared twice.
 A change rolls the pod (`checksum/config`), as every config change does.
 
 ## Relays (DERP)
