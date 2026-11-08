@@ -4179,11 +4179,18 @@ class Host:
                 extra = {**self.platform_env(), **prepared, "MW_BUILD_REPO": repo}
                 extra.pop("MW_PLATFORM_SOURCE", None)
                 writable = []
+                warm_binds = []
                 platform_src = self.env.get("MW_PLATFORM_SOURCE", "") or prepared.get("MW_PLATFORM_SOURCE", "")
                 if platform_src and os.path.isdir(platform_src):
                     psrc = os.path.join(scratch, "platform")
-                    extra["MW_PLATFORM_SOURCE"] = writable_platform_source(platform_src, psrc)
-                    writable.append(psrc)
+                    writable_platform_source(platform_src, psrc)
+                    # the writable copy appears AT the prepared tree's own path — the path a run's stages are handed — so a
+                    # warm build that names the platform by MW_PLATFORM_SOURCE records the same platform paths in obj/ as
+                    # a run does (a later bind hides the read-only one beneath it). The copy and its outputs are the warm
+                    # build's and are discarded with its scratch: a repository that wants platform OUTPUTS reused clones
+                    # the platform into its checkout, under the warm tree (MeshWeaver.Plugins scripts/host-warm-build.sh).
+                    extra["MW_PLATFORM_SOURCE"] = platform_src
+                    warm_binds.append((psrc, platform_src))
                 out_dir = os.path.join(scratch, "out")
                 os.makedirs(out_dir)
                 started = self.clock()
@@ -4194,7 +4201,7 @@ class Host:
                 rc, text = self._sandboxed_capture(decl["command"], warm, out_dir, scratch, extra,
                                                    [mirror, os.path.join(self.cache, "nuget")], writable, decl["timeoutMinutes"] * 60,
                                                    cancel=self.warm_cancel, mount=SANDBOX_CHECKOUT,
-                                                   binds=[(warm_nuget_dir, SANDBOX_NUGET)])
+                                                   binds=[(warm_nuget_dir, SANDBOX_NUGET), *warm_binds])
                 if rc == 0:
                     write_warm_state(warm, {"key": key, "tip": tip, "built": tip})
                     self.warm_failed.pop(repo, None)
@@ -6636,7 +6643,10 @@ def self_test() -> int:
             check("warm-idle/the warm build sees its tree at the SAME in-sandbox path a run's stages see theirs",
                   _EnvSandbox.last_mount == SANDBOX_CHECKOUT, _EnvSandbox.last_mount)
             check("warm-idle/the warm build's package folder is bound at the SAME in-sandbox path a run's stages restore into",
-                  len(_EnvSandbox.last_binds) == 1 and _EnvSandbox.last_binds[0][1] == SANDBOX_NUGET, _EnvSandbox.last_binds)
+                  _EnvSandbox.last_binds and _EnvSandbox.last_binds[0][1] == SANDBOX_NUGET, _EnvSandbox.last_binds)
+            check("warm-idle/the warm build's writable platform copy (when the host has one) appears at the prepared tree's own path",
+                  all(b[1] == (hi.env.get("MW_PLATFORM_SOURCE") or prepared_env().get("MW_PLATFORM_SOURCE"))
+                      and b[0].endswith("/platform") for b in _EnvSandbox.last_binds[1:]), _EnvSandbox.last_binds)
             check("warm-idle/with nothing claimable the host builds main's tip with the TIP's warmBuild, in the warm workspace",
                   st_i.get("tip") == c3 and st_i.get("built") == c3
                   and open(os.path.join(iw, "src", "obj", "warm.txt")).read().strip() == "built-by-tip", st_i)
@@ -6686,6 +6696,20 @@ def self_test() -> int:
             check("warm-idle/a successful build after the pause clears the failure",
                   len(builds) == 2 and "R" not in hf.warm_failed
                   and (warm_state(os.path.join(fail_work, WARM_DIR, "R")) or {}).get("built") == c3, (builds, hf.warm_failed))
+            # the warm build's platform copy appears at the prepared tree's own path, never at its scratch path
+            plat = os.path.join(wroot, "prepared-platform")
+            os.makedirs(plat, exist_ok=True)
+            open(os.path.join(plat, "Directory.Build.props"), "w").write("<Project />")
+            seen_b: list = []
+            hf.env["MW_PLATFORM_SOURCE"] = plat
+            hf.warm_failed.clear()
+            write_warm_state(os.path.join(fail_work, WARM_DIR, "R"), {"key": "other", "tip": "x", "built": None})
+            hf._sandboxed_capture = lambda *a_, **k_: (seen_b.append((dict(a_[4]), list(k_.get("binds") or []))), (0, ""))[1]
+            hf.warm_main_when_idle()
+            check("warm-idle/the platform copy is bound at the PREPARED path and named by it (the path a run's stages see)",
+                  seen_b and seen_b[0][0].get("MW_PLATFORM_SOURCE") == plat
+                  and any(b[1] == plat and b[0] != plat and b[0].endswith("/platform") for b in seen_b[0][1])
+                  and any(b[1] == SANDBOX_NUGET for b in seen_b[0][1]), seen_b)
             run5 = os.path.join(idle_work, "run5", "src")
             line5 = seed_run_from_warm("R", c1, [], iw, run5, None, wenv, lambda m: None, key=warm_key(hi.env, hi.identity))
             # a claim STOPS a warm build in flight (its sandbox killed, the half-built workspace wiped) — never waits it out
