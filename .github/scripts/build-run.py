@@ -288,8 +288,11 @@ class OutputParser:
 
     LANE_STATE = ("suite", "pending", "pending_state", "pending_lines")
 
-    def __init__(self, workdir: str, stage: str) -> None:
+    def __init__(self, workdir: str, stage: str, inside: str = "") -> None:
         self.workdir = os.path.realpath(workdir).rstrip("/") + "/" if workdir else ""
+        # where the stage SAW its checkout (SANDBOX_CHECKOUT): a path under it is made relative exactly like one under
+        # the host's own path, so a diagnostic names the repository file whichever side printed it
+        self.inside = inside.rstrip("/") + "/" if inside else ""
         self.stage = stage
         self.suite = stage
         self.pending: Optional[dict] = None
@@ -308,6 +311,8 @@ class OutputParser:
     # -- helpers ---------------------------------------------------------------------------
     def rel(self, path: str) -> str:
         p = path.strip().replace("\\", "/")
+        if self.inside and p.startswith(self.inside):
+            return p[len(self.inside):]
         if self.workdir and p.startswith(self.workdir):
             return p[len(self.workdir):]
         if self.workdir:
@@ -2769,6 +2774,11 @@ ENV_ALLOW = ("PATH", "LANG", "LC_ALL", "TZ", "DOTNET_ROOT", "DOTNET_CLI_TELEMETR
              # browser on the machine; a stage gets the same three facts the image declares.
              "MESHWEAVER_CHROMIUM_PATH", "CHROME_BIN", "PLAYWRIGHT_BROWSERS_PATH")
 SCRATCH = "/scratch"
+# Where a RUN's checkout and the warm main tree appear inside the sandbox: ONE fixed path, so every absolute path MSBuild
+# records in obj/ (project.assets.json, the reference caches, nuget.g.props) is the same in the warm build and in every
+# run that copies its obj/ and bin/. At the host's per-run path (`<work>/<repo>-<sha>-<random>/src`) each run would
+# restore and rebuild everything the warm tree had built (Plugins Hosting/BuildQueue.md §7.2).
+SANDBOX_CHECKOUT = "/workspace/src"
 
 # THE COMPILE REFERENCE SET, PREPARED ONCE PER ROLL (the `portal` init container of
 # deploy/helm/templates/build-host/build-host.yaml): the portal's /app plus the image's SHARED
@@ -2926,10 +2936,12 @@ class Sandbox:
         self.readonly = tuple(readonly)
 
     def argv(self, command: str, checkout: str, outputs: str, env: dict,
-             readonly: Iterable[str] = (), writable: Iterable[str] = ()) -> list[str]:
+             readonly: Iterable[str] = (), writable: Iterable[str] = (), mount: Optional[str] = None) -> list[str]:
         """`readonly` are the cache entries THIS stage may read (its own repository's mirror and the
         dependency artifacts it declares) — never the cache root; `writable` the run's extra output
-        directories (artifacts) beside the checkout and the outputs."""
+        directories (artifacts) beside the checkout and the outputs. `mount` is where the checkout appears
+        inside the sandbox (SANDBOX_CHECKOUT for a run's stages and the warm build); absent, its own path."""
+        inside = mount or checkout
         a = [self.bwrap, "--die-with-parent", "--new-session",
              "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try",
              "--clearenv"]
@@ -2943,10 +2955,10 @@ class Sandbox:
         for p in self.SYSTEM_RO + self.readonly + tuple(readonly):
             a += ["--ro-bind-try", p, p]
         a += ["--proc", "/proc", "--dev", "/dev",
-              "--bind", checkout, checkout, "--bind", outputs, outputs]
+              "--bind", checkout, inside, "--bind", outputs, outputs]
         for w in writable:
             a += ["--bind", w, w]
-        a += ["--chdir", checkout, "--", "/bin/bash", "-c", command]
+        a += ["--chdir", inside, "--", "/bin/bash", "-c", command]
         return a
 
     def probe(self, run: Callable[[list[str]], tuple[int, str]]) -> None:
@@ -4170,7 +4182,7 @@ class Host:
                 write_warm_state(warm, {"key": key, "tip": tip, "built": "building"})
                 rc, text = self._sandboxed_capture(decl["command"], warm, out_dir, scratch, extra,
                                                    [mirror, os.path.join(self.cache, "nuget")], writable, decl["timeoutMinutes"] * 60,
-                                                   cancel=self.warm_cancel)
+                                                   cancel=self.warm_cancel, mount=SANDBOX_CHECKOUT)
                 if rc == 0:
                     write_warm_state(warm, {"key": key, "tip": tip, "built": tip})
                     self.warm_failed.pop(repo, None)
@@ -4822,14 +4834,15 @@ class Host:
         self.deliver(sink)
 
     def _sandboxed_capture(self, command: str, tree: str, out: str, workdir: str, extra: dict, readonly: list,
-                           writable: list, timeout: float, cancel: Optional[threading.Event] = None) -> tuple[int, str]:
+                           writable: list, timeout: float, cancel: Optional[threading.Event] = None,
+                           mount: Optional[str] = None) -> tuple[int, str]:
         """Run a host-chosen, repository-declared command in the sandbox on `tree`. Its output goes to host-owned FILES
         (outside the sandbox's writable binds) and only a bounded tail of each is read back, so a noisy command can never
         exhaust the host's memory and end the worker without a verdict. Returns (exit code, stderr tail + stdout tail).
         `cancel` set (the heartbeat met the 409 — the run is not this host's claim any more) kills the sandbox's whole
         tree at once and raises Lost: a build for a run another host now owns is never waited out (Deploy#49)."""
         argv = self.sandbox.argv(command, tree, out, sandbox_env(self.env, extra, self.cache),
-                                 readonly=readonly, writable=writable)
+                                 readonly=readonly, writable=writable, mount=mount)
         logs = tempfile.mkdtemp(prefix=".prep-log-", dir=workdir)
         try:
             with open(os.path.join(logs, "out"), "w+b") as so, open(os.path.join(logs, "err"), "w+b") as se:
@@ -5067,12 +5080,13 @@ class Host:
 
         # Never START a sandbox for a run already abandoned (a sibling may have met the 409 since this stage was picked).
         abandoned()
-        parser = OutputParser(checkout, name)
+        # the stage sees its checkout at SANDBOX_CHECKOUT, so that is the prefix its diagnostics carry
+        parser = OutputParser(checkout, name, inside=SANDBOX_CHECKOUT)
         sink.add([{"kind": "line", "text": f"[00:00:00] {st['kind']}/{name} on build-{self.lane} "
                                            f"({self.platform_version}, plugins {(self.plugins_digest or '-')[:19]})"}])
         try:
             argv = self.sandbox.argv(st["command"], checkout, outputs, sandbox_env(self.env, extra, self.cache),
-                                     readonly=readonly, writable=writable)
+                                     readonly=readonly, writable=writable, mount=SANDBOX_CHECKOUT)
             proc = subprocess.Popen(argv, cwd=checkout, env={"PATH": self.env.get("PATH", "/usr/bin:/bin")},
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     start_new_session=True, text=True, errors="replace", bufsize=1)
@@ -5530,9 +5544,11 @@ class _EnvSandbox:
     clear-env + allow-list semantics, so what a stage SEES is still what the host chose."""
 
     last_readonly: list = []
+    last_mount: Optional[str] = None
 
-    def argv(self, command, checkout, outputs, env, readonly=(), writable=()):
+    def argv(self, command, checkout, outputs, env, readonly=(), writable=(), mount=None):
         _EnvSandbox.last_readonly = list(readonly)
+        _EnvSandbox.last_mount = mount
         return ["/usr/bin/env", "-i", *[f"{k}={v}" for k, v in sorted(env.items())], "/bin/bash", "-c", command]
 
 
@@ -5556,6 +5572,10 @@ def self_test() -> int:
 
     # ── 1. compiler diagnostics ─────────────────────────────────────────────────────────────
     p = OutputParser("/work/run1/src", "compile-check")
+    pin = OutputParser("/work/run1/src", "compile-check", inside=SANDBOX_CHECKOUT)
+    check("parse/a diagnostic under the in-sandbox checkout names the repository file",
+          pin.rel(SANDBOX_CHECKOUT + "/Hosting/Build/Source/BuildApi.cs") == "Hosting/Build/Source/BuildApi.cs"
+          and pin.rel("/work/run1/src/Hosting/x.cs") == "Hosting/x.cs")
     ev = p.feed("/work/run1/src/Hosting/Build/Source/BuildApi.cs(41,13): error CS0246: The type or "
                 "namespace name 'X' could not be found [/work/run1/src/Hosting/Hosting.csproj]\n")
     check("msbuild/error", ev == [{"kind": "diagnostic", "severity": "error", "file": "Hosting/Build/Source/BuildApi.cs",
@@ -5774,6 +5794,12 @@ def self_test() -> int:
     # The host's OWN sandbox binds every staged image root read-only — /core-tests included: core's
     # shard and doc-gate stages run `python3 /core-tests/core-tests.py …` (core .github/build-stages.json).
     hav = " ".join(Host({}, None, log=lambda s: None).sandbox.argv("true", "/w/s", "/w/o", {}))
+    mav = Host({}, None, log=lambda s: None).sandbox.argv("true", "/w/run-7/src", "/w/o", {}, mount=SANDBOX_CHECKOUT)
+    check("bwrap/a run's checkout appears at ONE fixed path inside the sandbox (the same for every run and the warm build)",
+          mav[mav.index("/w/run-7/src") + 1] == SANDBOX_CHECKOUT and mav[mav.index("--chdir") + 1] == SANDBOX_CHECKOUT
+          and mav.count("/w/run-7/src") == 1, mav)
+    check("bwrap/without a mount the checkout keeps its own path (prepare and probe sandboxes)",
+          "--bind /w/s /w/s" in hav and "--chdir /w/s" in hav, hav)
     for root in ("/portal", "/tester", "/tools", "/core-tests"):
         check(f"bwrap/the staged image root {root} is visible READ-ONLY in a stage",
               f"--ro-bind-try {root} {root}" in hav and f"--bind {root} " not in hav, hav)
@@ -6584,6 +6610,8 @@ def self_test() -> int:
                 hi.warm_thread.join(60)
             iw = os.path.join(idle_work, WARM_DIR, "R")
             st_i = warm_state(iw) or {}
+            check("warm-idle/the warm build sees its tree at the SAME in-sandbox path a run's stages see theirs",
+                  _EnvSandbox.last_mount == SANDBOX_CHECKOUT, _EnvSandbox.last_mount)
             check("warm-idle/with nothing claimable the host builds main's tip with the TIP's warmBuild, in the warm workspace",
                   st_i.get("tip") == c3 and st_i.get("built") == c3
                   and open(os.path.join(iw, "src", "obj", "warm.txt")).read().strip() == "built-by-tip", st_i)
@@ -7068,6 +7096,8 @@ def self_test() -> int:
             hl.run(dict(claim) if lbl is None else dict(claim, labels=lbl))
             got = open(seen_l).read().strip() if os.path.exists(seen_l) else "<stage did not run>"
             check(f"run/claim labels {lbl!r} reach the stage as MW_BUILD_LABELS={want!r}", got == f"[{want}]", got)
+            check(f"run/the stage ran with its checkout mounted at {SANDBOX_CHECKOUT} ({lbl!r})", _EnvSandbox.last_mount == SANDBOX_CHECKOUT,
+                  _EnvSandbox.last_mount)
         posted[:] = posted_h6   # the checks below read h6's own events
         rf_ = [e for _, evs in posted for e in evs if e["kind"] == "run-finished"]
         check("run/green run-finished", rf_ == [{"kind": "run-finished", "succeeded": True, "error": None}], rf_)
@@ -7502,9 +7532,9 @@ def self_test() -> int:
         seen_ro: list = []
 
         class _RecordingSandbox(_EnvSandbox):
-            def argv(self, command, checkout, outputs, env, readonly=(), writable=()):
+            def argv(self, command, checkout, outputs, env, readonly=(), writable=(), mount=None):
                 seen_ro.append((env.get("MW_BUILD_STAGE"), list(readonly), env.get("NUGET_FALLBACK_PACKAGES")))
-                return super().argv(command, checkout, outputs, env, readonly, writable)
+                return super().argv(command, checkout, outputs, env, readonly, writable, mount)
         posted.clear()
         h_fb = Host(dict(keyed_env, MW_BUILD_CACHE=fresh_nuget), api_ev(), log=lambda s: None, sandbox=_RecordingSandbox(),
                     leftovers=lambda: [], sleep=lambda s: None, pull=pull,
@@ -8592,9 +8622,9 @@ def self_test() -> int:
         fired: list = []
 
         class _RecordingSandbox(_EnvSandbox):
-            def argv(self, command, checkout, outputs, env, readonly=(), writable=()):
+            def argv(self, command, checkout, outputs, env, readonly=(), writable=(), mount=None):
                 started_stages.append(env.get("MW_BUILD_STAGE"))
-                return super().argv(command, checkout, outputs, env, readonly, writable)
+                return super().argv(command, checkout, outputs, env, readonly, writable, mount)
 
         def staged_clock() -> float:
             if (threading.current_thread() is sched_thread and not fired and "s0" in started_stages
