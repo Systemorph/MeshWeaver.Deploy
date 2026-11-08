@@ -1020,7 +1020,9 @@ class ModuleHubBroker:
                 except Refusal as e:
                     body["error"] = str(e)
                 else:
-                    status, answer = self.api.upload(self._path(module, f"/outputs/{hexd}"), {}, tar, os.path.getsize(tar),
+                    # the upload names its LEASE: control accepts an output only from the live granted holder (§7.3)
+                    status, answer = self.api.upload(self._path(module, f"/outputs/{hexd}"),
+                                                     {"holder": self.host, "seq": str(seq), "fingerprint": fp}, tar, os.path.getsize(tar),
                                                      timeout=1800, cancel=self.cancel)
                     if status in (200, 201):
                         self._cache_put(module, hexd, tar)
@@ -6211,6 +6213,9 @@ def self_test() -> int:
               ack_["accepted"] and comp_ and comp_[0]["seq"] == 4 and comp_[0]["fingerprint"] == fp4["B"] and comp_[0]["holder"] == br.host
               and comp_[0]["outputHash"] == "sha256:" + put_path.rsplit("/", 1)[-1]
               and hashlib.sha256(uploaded[put_path]).hexdigest() == put_path.rsplit("/", 1)[-1], (ack_, comp_))
+        puts_ = [c[3] for c in api_g.calls if c[0] == "PUT"]
+        check("modhub/the output upload names its LEASE (holder, granted seq, fingerprint) — control accepts it only from the live holder",
+              puts_ == [{"holder": br.host, "seq": "4", "fingerprint": fp4["B"]}], puts_)
         out_bytes = uploaded[put_path]
         out_hex = put_path.rsplit("/", 1)[-1]
         br2, api_h = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Hit", "step": {"seq": 4, "outputHash": "sha256:" + out_hex}})],
