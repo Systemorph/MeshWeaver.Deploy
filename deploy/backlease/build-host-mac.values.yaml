@@ -28,12 +28,11 @@ buildHosts:
     requests: { cpu: "3500m", memory: 20Gi }
     limits: { cpu: "4", memory: 24Gi }
   # A modules stage writes past 12 GiB (measured on the first Mac, 2026-11-07: "Usage of EmptyDir volume work exceeds the
-  # limit 12Gi" evicted the replica mid-run). With the SHARED warm tree (sharedTree, below) a run starts by copying the
-  # published generation into its work volume — 18 GiB for MeshWeaver.Plugins (measured 2026-11-08) — so 40 GiB left a
-  # wide pull request (#5174: 19 modules + the full compile-check) 22 GiB to build in, and both replicas were evicted mid
-  # modules ("Usage of EmptyDir volume work exceeds the limit 40Gi"; probe 01fcb9311f3c, lease lapsed twice, no verdict).
-  # 52 GiB each: 4 replicas (208) + the cache (29 measured, +18 while a generation is staged) + the images fit the 295 GiB
-  # data disk the VM mounts at /var/lib/rancher (230 free at 52 used, measured 2026-11-08).
+  # limit 12Gi" evicted the replica mid-run). Until §7.3b a run started by COPYING the shared warm tree into its work volume —
+  # 18 GiB for MeshWeaver.Plugins — and 40 GiB evicted both replicas of a wide pull request mid modules (probe 01fcb9311f3c).
+  # Since §7.3b nothing is copied (an overlay's upper holds only the run's delta, a cold worktree only the sources), so the
+  # work volume holds a run's own outputs; 52 GiB each is kept as the measured envelope: 4 replicas (208) + the cache (29
+  # measured) + the images fit the 295 GiB data disk the VM mounts at /var/lib/rancher (230 free at 52 used, 2026-11-08).
   workSizeLimit: 52Gi
   # Fan-out within a replica: 4 stages of a `parallel` run at once within its 4 CPU / 24 GiB limit; the chart default (8)
   # would exceed the replica's cgroup, and the runner refuses to start on that.
