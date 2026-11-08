@@ -186,6 +186,14 @@ overlay already records, and on a terminal a question that suggests your login n
 owner fails**: an instance never comes up without an administrator. An `update` of an older, ownerless install warns
 loudly instead, so an auto-update never halts.
 
+**On an Intune-managed Mac the work account is the default owner.** Before anyone is asked, the Mac's **work
+identity** answers: the managed preference `UserPrincipalName` (Intune token `{{userprincipalname}}`, profile
+`deploy/macos/intune/profiles/com.memex.local.mobileconfig`) or, on a Platform-SSO-registered Mac, `app-sso
+platform -s`. Its prefix is the owner id and the UPN the e-mail; the overlay then also gets
+`Authentication__Microsoft__LoginHint` / `__DomainHint`, so Microsoft sign-in offers that work account first and
+never silently picks a personal one. Every source above it still wins. Details: `deploy/macos/intune/README.md`,
+"Microsoft sign-in".
+
 Change the owner later with `memex-local owner --id <user-id> --email <e-mail>`, then `memex-local update --skip-image`.
 Never edit the YAML by hand. `memex-local owner status` shows the owner. Re-running any of these is idempotent.
 The same owner answers the fleet opt-in questions (`backlease accept`).
@@ -244,7 +252,21 @@ NO token requests until its owner says yes and names the instances it takes each
 tokens from `*.meshweaver.cloud`, and the models `qwen3.8:27b-mlx qwen3.6`. The residency defaults to the
 install's declaration (`memex-local residency`, above); with none declared, type where the machine is. A headless run passes `--accept-jobs=<patterns>` / `--no-accept-jobs` and
 `--accept-tokens=<patterns>` / `--no-accept-tokens` (with `--token-models`, `--residency`), and with no answer
-both stay off. Change an answer later with `memex-local backlease accept jobs|tokens [--from …] [--off] …`,
+both stay off. **Token slots.** How many requests the machine serves at once is the machine's capacity, not an owner choice.
+A Mac Studio is 2. It is measured: Ollama 0.40's MLX runner decodes one request at a time, and one stream saturates
+an M5 Max at about 65 tok/s. memex-local writes `Tokens__Slots` whenever tokens are on. `--token-slots <n>` is a
+calibrated override (1–32), and `--token-max-concurrency <n>` is the owner's optional ceiling below it. When the
+ceiling is unset the Mac serves at its full slot count. `--token-yield-at <pct>` sets the owner-CPU threshold
+(percent of one core; the code's default is 200) and is written only when given. `none` clears either. The host
+sampler reports `host.ownerCpuPercent`: the owner's CPU over the interval, excluding Ollama, the build VM, the
+portal VM and `kernel_task` (which can take whole cores under thermal pressure). That is what the Mac yields to.
+
+**Upgrading a Mac enrolled before token slots existed.** `memex-local update` adds the measured `Tokens__Slots`. A
+recorded `Tokens__MaxConcurrency` is kept as the owner's ceiling. That includes the `1` the first opt-in release
+wrote by default, because it cannot be told apart from a chosen 1. Lift it with
+`memex-local backlease accept tokens --max-concurrency none`.
+
+Change an answer later with `memex-local backlease accept jobs|tokens [--from …] [--off] …`,
 then `memex-local update`. `backlease status` prints the answers. They are written as
 `Hosting__BackLease__Accept__*` into `~/.memex-local/backlease.yaml`. The heartbeat carries them to control,
 which enforces them and can never switch them on.
@@ -454,6 +476,7 @@ log, ollama log, grafana password) — exactly the paths the doc uses.
 | `MEMEX_OLLAMA_MODEL` | `qwen3.8:27b-mlx` / `qwen3:8b` by host memory (or the profile's) | the default chat model `up`/`update` pull and the portal names; `none` skips it |
 | `MEMEX_RESIDENCY` | unset (none declared) | where this install processes prompts (`Eu`, `Global`, ISO code such as `CH`); `up` persists it (above) |
 | `MEMEX_LLM_SMOKE` | `1` | `0` skips the post-install chat smoke (loudly) |
+| `MEMEX_OCR` | unset | `none` turns the local OCR engine off. Unset: when the chat model reports the `vision` capability, `llm.auto.yaml` declares `Ocr__Engine=OllamaVision` on the same host-safe endpoint and model, so every instance on the Mac reads and describes pictures and scanned pages (MeshWeaver.Plugins `Indexing/DocumentEnrichment`); a chat model without vision is said loudly by `up`/`update` and reported red by `status`/`doctor` |
 | `MEMEX_PROFILE` | unset | Mac host profile, `mac-studio` or `mac-mini` (below) |
 | `MEMEX_CHANNEL` | unset (`main`) | release-channel label `up`/`update`/`autoroll` follow (below) |
 | `MEMEX_PORT` | `8443` | host port for the forward (§6/§7) |

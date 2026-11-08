@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS: the managed preference com.memex.local UserPrincipalName, filled by Intune with the device's
+  primary user ({{userprincipalname}} — Intune substitutes it on a user-affinity device). memex-local's
+  work_identity reads it without admin rights; a Mac whose local login is not the work account then
+  installs its instance with that work account as the OWNER (id = the UPN prefix, e-mail = the UPN) and
+  offers it first at Microsoft sign-in (login_hint / domain_hint). An explicit owner still wins.
+  Only this one key: the fleet keys (ControlUrl, DeploymentId, OwnerId, …) are the Mac Studio profile's
+  (deploy/macos/profiles/com.memex.local.mobileconfig.example), never a person's Mac.
+  Doc: deploy/macos/intune/README.md "Microsoft sign-in".
+-->
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadType</key>
+            <string>com.memex.local</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.systemorph.intune.macos.memex-local-work-identity.settings</string>
+            <key>PayloadUUID</key>
+            <string>62C0D4B9-B69B-445B-A7EA-53AB932935FD</string>
+            <key>PayloadDisplayName</key>
+            <string>Memex Local — work identity</string>
+            <key>UserPrincipalName</key>
+            <string>{{userprincipalname}}</string>
+        </dict>
+    </array>
+    <key>PayloadDisplayName</key>
+    <string>Memex Local — work identity</string>
+    <key>PayloadIdentifier</key>
+    <string>com.systemorph.intune.macos.memex-local-work-identity</string>
+    <key>PayloadOrganization</key>
+    <string>Systemorph</string>
+    <key>PayloadRemovalDisallowed</key>
+    <false/>
+    <key>PayloadScope</key>
+    <string>System</string>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>3D80D4F1-8AF7-42FC-A52C-C3F117B0CB1B</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+</dict>
+</plist>
