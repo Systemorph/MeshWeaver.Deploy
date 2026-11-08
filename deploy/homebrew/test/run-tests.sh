@@ -823,7 +823,7 @@ lm env MEMEX_OLLAMA_MODEL= bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/n
 grep -q 'ContextWindowTokens' "$AUTO" && bad "a model Ollama cannot load still got a window declared (a guess)" "$(cat "$AUTO")" \
   || ok "a model Ollama cannot load gets NO window (undeclared and logged, never guessed)"
 : > "$OVL"
-lm env MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+lm env MEMEX_OLLAMA_MODEL=none MEMEX_EMBED_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
 grep -q 'Models__0\|AI__Tiers' "$AUTO" && bad "MEMEX_OLLAMA_MODEL=none still names a model" "$(cat "$AUTO")" || ok "MEMEX_OLLAMA_MODEL=none names no model"
 # …and writes no empty `memex_portal:` (a YAML null that helm merges by DELETING every tracked default).
 if command -v helm >/dev/null 2>&1; then
@@ -1011,6 +1011,76 @@ grep -q '<key>OLLAMA_FLASH_ATTENTION</key><string>1</string><key>OLLAMA_KV_CACHE
   && ok "memex-local's own Ollama agent carries the tuning env (flash attention, q8_0 KV cache)" || bad "agent tuning env" ""
 lm bash -c '. "$0"; version_ge 0.40.14 0.32.12 && ! version_ge 0.31.9 0.32.12 && version_ge 0.32.12 0.32.12' "$CLI" \
   && ok "version_ge orders Ollama releases numerically" || bad "version_ge" ""
+echo "── local embeddings: bge-m3 on this Mac's Ollama, never a cloud provider (2026-11-08) ──"
+# REGRESSION for "Content indexing is not active on this deployment": no install configured Embedding__*,
+# so free-text search fell back to ILIKE and an agent searching by meaning searched until its round ran out.
+: > "$OVL"
+lm env MEMEX_OLLAMA_MODEL=qwen3:8b FAKE_TAGS='{"name":"qwen3:8b"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+EB="$(awk '/^  memex_portal:/,/^  memex_migration:/' "$AUTO")"; EM="$(awk '/^  memex_migration:/,/^ollama:/' "$AUTO")"
+grep -qx '    Embedding__Provider: "Ollama"' <<<"$EB" && grep -qx "    Embedding__Endpoint: \"$EP\"" <<<"$EB" && grep -qx '    Embedding__Model: "bge-m3"' <<<"$EB" \
+  && ok "llm.auto.yaml points the PORTAL's embeddings at bge-m3 on this Mac's Ollama (host-safe endpoint)" || bad "portal embedding keys" "$(cat "$AUTO")"
+grep -qx '    Embedding__Provider: "Ollama"' <<<"$EM" && grep -qx "    Embedding__Endpoint: \"$EP\"" <<<"$EM" && grep -qx '    Embedding__Model: "bge-m3"' <<<"$EM" \
+  && ok "…and the MIGRATION Job names the same model (it sizes the vector columns and runs the backfill)" || bad "migration embedding keys" "$(cat "$AUTO")"
+lm env MEMEX_OLLAMA_MODEL=none MEMEX_EMBED_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+grep -q 'Embedding__\|memex_portal:' "$AUTO" && bad "MEMEX_EMBED_MODEL=none still configures embeddings" "$(cat "$AUTO")" || ok "MEMEX_EMBED_MODEL=none configures no embeddings (and writes no empty memex_portal map)"
+lm env MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+if ! grep -q 'Models__0' "$AUTO" && grep -qx '    Embedding__Model: "bge-m3"' "$AUTO"; then ok "no chat model still keeps local embeddings"; else bad "no-chat layer names a chat model or lost embeddings" "$(cat "$AUTO")"; fi
+if command -v helm >/dev/null 2>&1; then
+  lm env MEMEX_OLLAMA_MODEL=qwen3:8b FAKE_TAGS='{"name":"qwen3:8b"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+  R="$(helm template memex "$HERE/../../helm" -f "$HERE/../../helm/values.yaml" -f "$DEF" -f "$AUTO" 2>&1)"
+  [ "$(grep -c 'Embedding__Model: "bge-m3"' <<<"$R")" -ge 2 ] && grep -q 'InstanceSetup__TokenCommand: "memex-local setup"' <<<"$R" \
+    && ok "the render carries Embedding__Model=bge-m3 in BOTH the portal and migration ConfigMaps, defaults intact" || bad "render embedding" "$(grep -n Embedding__ <<<"$R")"
+fi
+for m in bge-m3 nomic-embed-text mxbai-embed-large; do
+  d="$(lm bash -c '. "$0"; embed_model_dimensions "$1"' "$CLI" "$m")"; [ -n "$d" ] && ok "the platform sizes $m (${d}-dim)" || bad "unsized $m" ""
+done
+OUT="$(lm env MEMEX_EMBED_MODEL=all-minilm bash -c '. "$0"; ensure_embed_model; echo SURVIVED' "$CLI" 2>&1)"; RC=$?
+[ "$RC" != 0 ] && ! grep -q SURVIVED <<<"$OUT" && grep -q "not an embedding model the platform sizes" <<<"$OUT" \
+  && ok "an embedding model the platform cannot size is REFUSED (never a 1536-dim schema every insert then fails)" || bad "unsized model accepted" "$OUT"
+grep -q '^  ensure_embed_model$' <<<"$(fn_body setup_ollama)" && ok "setup_ollama (up, update, fleet join) pulls the embedding model" || bad "no embed pull" ""
+grep -q 'memex_migration:' <<<"$(fn_body cmd_llm)" && bad "'llm use' still writes a provider-less migration endpoint" "" || ok "'llm use' leaves embeddings to the per-install layer (no provider-less migration endpoint)"
+
+# The embedding smoke: a real vector of the platform's width, from inside the pod.
+cat > "$LMH/stubs/kubectl" <<'STUB'
+#!/bin/bash
+case "$*" in
+  *"-- env") [ -n "${FAKE_EXEC_FAILS:-}" ] && exit 1
+             printf 'Embedding__Provider=%s\nEmbedding__Endpoint=%s\nEmbedding__Model=%s\n' "${FAKE_EPROV-Ollama}" "${FAKE_EP-http://ollama.memex.svc.cluster.local:11434/v1}" "${FAKE_EMODEL-bge-m3}" ;;
+  *"sh -c"*) printf '%s\n%s\n' "${FAKE_SMOKE_CODE:-200}" "${FAKE_SMOKE_BODY-{\"data\":[{\"embedding\":[$(seq -s, 1 ${FAKE_DIM:-1024})]}]}}" ;;
+esac
+exit 0
+STUB
+chmod +x "$LMH/stubs/kubectl"
+OUT="$(lm bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && grep -q "1024-dim vector from bge-m3" <<<"$OUT" && ok "embedding smoke: a 1024-dim bge-m3 vector from inside the pod passes" || bad "embed smoke 200" "rc=$RC $OUT"
+OUT="$(lm env FAKE_DIM=768 bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && grep -q "sizes its vector columns 1024" <<<"$OUT" && ok "embedding smoke: a vector of the WRONG width FAILS" || bad "embed width" "rc=$RC $OUT"
+for c in 403 404 500 000; do
+  OUT="$(lm env FAKE_SMOKE_CODE=$c bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+  [ "$RC" = 1 ] && ok "embedding smoke: HTTP $c fails" || bad "embed smoke $c passed" "$OUT"
+done
+OUT="$(lm env FAKE_SMOKE_BODY='{"error":"x"}' bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && ok "embedding smoke: a 200 with no vector FAILS" || bad "embed body ignored" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EPROV=AzureFoundry bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && grep -q "embeds on this Mac" <<<"$OUT" && ok "embedding smoke: a CLOUD embedding provider on a Mac install FAILS" || bad "cloud provider passed" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EPROV=OpenAICompatible FAKE_EP=https://api.openai.com/v1 bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && grep -q "is not on this Mac" <<<"$OUT" && ok "embedding smoke: an OpenAI-compatible provider pointed at a CLOUD host FAILS (the endpoint decides, not the name)" || bad "cloud endpoint passed" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EP=http://192.168.5.2:11434/v1 bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "embedding smoke: the VM's gateway to the Mac is on this Mac" || bad "gateway endpoint refused" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EMODEL=custom-embed FAKE_DIM=1024 bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && grep -q "sizes its vector columns 1536" <<<"$OUT" && ok "embedding smoke: an overlay model the table does not size is held to the platform's 1536 default (never a skipped width check)" || bad "unsized overlay model passed" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EMODEL=custom-embed FAKE_DIM=1536 bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "embedding smoke: …and passes when it returns 1536" || bad "unsized 1536 refused" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EP= bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && grep -q "carries no Embedding__Endpoint" <<<"$OUT" && ok "embedding smoke: configured here but invisible in the pod FAILS" || bad "invisible embed skipped" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EP= MEMEX_EMBED_MODEL=none bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && grep -q "OFF" <<<"$OUT" && ok "embedding smoke: skips (loudly) only on MEMEX_EMBED_MODEL=none" || bad "embed none skip" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EXEC_FAILS=1 bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && ok "embedding smoke: a pod whose environment cannot be read FAILS" || bad "embed exec failure passed" "rc=$RC $OUT"
+for c in cmd_up cmd_update; do
+  grep -q '^  embed_smoke_or_die$' <<<"$(fn_body "$c")" && ok "$c runs the embedding smoke gate" || bad "$c has no embedding gate" ""
+done
+grep -q 'embed_smoke' <<<"$(fn_body cmd_doctor)" && grep -q 'embed_smoke' <<<"$(fn_body cmd_status)" && ok "doctor and status run the embedding smoke" || bad "doctor/status embed" ""
 rm -rf "$LMH"
 
 echo "── the OWNER: collected at onboarding, the instance's global administrator (2026-11-08) ──"
@@ -1770,6 +1840,15 @@ OUT="$(env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/h
 OUT="$(env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/home/.memex-local" MEMEX_HEADLESS=1 FAKE_LAUNCHCTL_LOG="$HL/launchctl.log" MEMEX_PF_BIND_BUDGET=2 MEMEX_LOCAL_LIB=1 bash -c '. "$1"; install_launchd' _ "$CLI" 2>&1)"
 [ ! -f "$HL/home/.memex-local/daemon.stopped" ] && ok "an explicit 'up' (install_launchd) removes the stop marker" || bad "up removes daemon.stopped" "$OUT"
 case "$(cat "$DAEMON")" in *'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/memex/bin"'*) ok "memex-daemon.sh lists /opt/memex/bin LAST (existing installations first)" ;; *) bad "daemon PATH order" "$(grep -n 'export PATH' "$DAEMON")" ;; esac
+# The 'up' above started a REAL forward loop (nohup … &). Stop it the way 'down' does — removing the
+# directory does not end a process — or every run leaves one behind (measured: 16 on one build host).
+env PATH="$HL/stubs:$STUBS:$PATH" HOME="$HL/home" MEMEX_LOCAL_HOME="$HL/home/.memex-local" MEMEX_HEADLESS=1 MEMEX_LOCAL_LIB=1 \
+  bash -c '. "$1"; uninstall_launchd' _ "$CLI" >/dev/null 2>&1
+pgrep -f "$HL/home/.memex-local/port-forward.sh" >/dev/null 2>&1 && pkill -f "$HL/home/.memex-local/port-forward.sh" 2>/dev/null
+sleep 1
+pgrep -f "$HL/home/.memex-local/port-forward.sh" >/dev/null 2>&1 \
+  && bad "the headless tests leave a port-forward process running" "$(pgrep -fl "$HL/home/.memex-local/port-forward.sh")" \
+  || ok "the headless tests leave no port-forward process behind"
 rm -rf "$HL"
 
 echo "── auto-update: a Homebrew install follows the tap by default ────"
