@@ -185,6 +185,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import datetime
 import concurrent.futures
 import gzip
@@ -3379,6 +3380,131 @@ def warm_enabled(env: dict) -> bool:
     return (env.get("MW_BUILD_WARM_WORKSPACE") or "").strip().lower() in ("1", "true", "yes")
 
 
+def shared_tree_enabled(env: dict) -> bool:
+    """The warm main tree lives ONCE per repository on the host's SHARED cache volume (`<cache>/shared/<repo>`), read by
+    every replica, instead of once per replica in its work volume (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3)."""
+    return warm_enabled(env) and (env.get("MW_BUILD_SHARED_TREE") or "").strip().lower() in ("1", "true", "yes")
+
+
+SHARED_DIR = "shared"
+
+
+class SharedTree:
+    """ONE warm main tree per repository on the shared cache volume, as GENERATIONS: `gens/<id>/` holds a tree
+    (`.warm/<repo>`) and its host-private git directory and state (`.warm-host/<repo>`, the warm_private layout), and the
+    `current` symlink names the published one. Exactly one WRITER at a time (an exclusive, non-blocking flock on
+    `.writer.lock`, across every replica that mounts the volume) stages a new generation as a copy of the current one,
+    advances and builds it, and PUBLISHES it by an atomic symlink replace — so a reader never sees a tree being written.
+    A READER (a run seeding its checkout) holds a SHARED flock on the generation it copies; a generation is deleted only
+    when an exclusive, non-blocking flock on it succeeds, i.e. when no reader holds it. Runs never write the shared tree:
+    they copy it (seed_run_from_warm)."""
+
+    def __init__(self, cache: str, repo: str) -> None:
+        self.repo = repo
+        self.root = os.path.join(cache, SHARED_DIR, repo)
+        self.gens = os.path.join(self.root, "gens")
+
+    def warm_of(self, gen: str) -> str:
+        return os.path.join(gen, WARM_DIR, self.repo)
+
+    def current(self) -> Optional[str]:
+        link = os.path.join(self.root, "current")
+        try:
+            target = os.readlink(link)
+        except OSError:
+            return None
+        gen = os.path.normpath(os.path.join(self.root, target))
+        return gen if os.path.dirname(gen) == self.gens and os.path.isdir(gen) else None
+
+    @staticmethod
+    def _lock(path: str, mode: int) -> Optional[object]:
+        import fcntl
+        fh = open(path, "a+")
+        try:
+            fcntl.flock(fh.fileno(), mode)
+            return fh
+        except OSError:
+            fh.close()
+            return None
+
+    @contextlib.contextmanager
+    def reader(self):
+        """The current generation's warm tree, held against deletion while the block runs; None when none is published."""
+        import fcntl
+        gen = self.current()
+        if gen is None:
+            yield None
+            return
+        fh = self._lock(os.path.join(gen, ".readers.lock"), fcntl.LOCK_SH)
+        try:
+            # re-read after the lock: a generation retired between the readlink and the lock is never handed out
+            yield self.warm_of(gen) if fh is not None and os.path.isdir(gen) else None
+        finally:
+            if fh is not None:
+                fh.close()
+
+    @contextlib.contextmanager
+    def writer(self):
+        """This replica as the ONE writer, or None when another replica holds the lock (it warms; this one does not)."""
+        import fcntl
+        os.makedirs(self.gens, exist_ok=True)
+        fh = self._lock(os.path.join(self.root, ".writer.lock"), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            yield self if fh is not None else None
+        finally:
+            if fh is not None:
+                fh.close()
+
+    def stage(self) -> str:
+        """A new generation directory: a copy of the current one (its obj/, bin/ and git index carried), or empty."""
+        gen = os.path.join(self.gens, f"{time.time_ns():020d}-{os.getpid()}")
+        cur = self.current()
+        if cur is not None:
+            r = subprocess.run(["cp", "-a", cur, gen], capture_output=True, text=True)
+            if r.returncode != 0:
+                shutil.rmtree(gen, ignore_errors=True)
+                raise Refusal(f"the shared tree's current generation could not be copied (exit {r.returncode}): {r.stderr.strip()[-200:]}")
+            for name in (".readers.lock",):
+                try:
+                    os.remove(os.path.join(gen, name))
+                except OSError:
+                    pass
+        else:
+            os.makedirs(gen)
+        return gen
+
+    def publish(self, gen: str) -> None:
+        tmp = os.path.join(self.root, f".current-{os.getpid()}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        os.symlink(os.path.relpath(gen, self.root), tmp)
+        os.replace(tmp, os.path.join(self.root, "current"))
+        self.collect()
+
+    def discard(self, gen: str) -> None:
+        shutil.rmtree(gen, ignore_errors=True)
+
+    def collect(self) -> list:
+        """Delete every generation but the current one that no reader holds; returns what was deleted."""
+        import fcntl
+        cur, gone = self.current(), []
+        for name in sorted(os.listdir(self.gens)) if os.path.isdir(self.gens) else []:
+            gen = os.path.join(self.gens, name)
+            if gen == cur or not os.path.isdir(gen):
+                continue
+            fh = self._lock(os.path.join(gen, ".readers.lock"), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if fh is None:
+                continue                        # a reader is copying it: kept until the next collect
+            try:
+                shutil.rmtree(gen, ignore_errors=True)
+                gone.append(name)
+            finally:
+                fh.close()
+        return gone
+
+
 def warm_private(warm: str) -> str:
     """The host-only directory beside the warm tree: its git directory and its state live there, where the tip's
     warmBuild (which runs with the warm TREE writable) cannot reach — so nothing it writes can configure a host git step
@@ -4140,10 +4266,55 @@ class Host:
         default branch's tip and run the TIP's declared `warmBuild` in it, in the sandbox, once per (tip, key). Never raises:
         warming is optional, so a failure is said, the workspace is wiped, and the next idle cycle retries."""
         key = warm_key(self.env, self.identity)
-        for repo in sorted(self.warm_repos):
+        shared = shared_tree_enabled(self.env)
+        repos = set(self.warm_repos)
+        if shared and os.path.isdir(os.path.join(self.cache, SHARED_DIR)):
+            # every repository the SHARED tree already holds is kept warm by whichever replica is idle, not only by one
+            # that ran it since its own start
+            repos |= {r for r in os.listdir(os.path.join(self.cache, SHARED_DIR)) if REPO.match(r) and not r.startswith(".")}
+        for repo in sorted(repos):
             if self.stopping:
                 return
-            warm = os.path.join(self.work, WARM_DIR, repo)
+            if shared:
+                self._warm_shared(repo, key)
+                continue
+            self._warm_one(repo, key, os.path.join(self.work, WARM_DIR, repo))
+
+    def _warm_shared(self, repo: str, key: str) -> None:
+        """The SHARED tree's writer half: only the replica holding the writer lock advances and builds, in a STAGED
+        generation (a copy of the current one) that is published only when it built — a reader never sees it before."""
+        tree = SharedTree(self.cache, repo)
+        cur = tree.current()
+        st = warm_state(tree.warm_of(cur)) if cur else None
+        tip_now = self._mirror_tip(repo)
+        if tip_now and st is not None and st.get("key") == key and st.get("tip") == tip_now and st.get("built") in (tip_now, "none"):
+            return
+        with tree.writer() as w:
+            if w is None:
+                return                                     # another replica is the writer: it warms, this one does not
+            gen = w.stage()
+            outcome = self._warm_one(repo, key, w.warm_of(gen))
+            if outcome == "built":
+                w.publish(gen)
+                self.log(f"shared tree: {repo} generation {os.path.basename(gen)} published")
+            else:
+                w.discard(gen)
+                w.collect()
+
+    def _mirror_tip(self, repo: str) -> str:
+        mirror = os.path.join(self.cache, "git", f"{repo}.git")
+        genv = {**{k: self.env[k] for k in ("PATH", "LANG") if self.env.get(k)}, "HOME": self.work, "GIT_TERMINAL_PROMPT": "0"}
+        try:
+            rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", "HEAD^{commit}"], genv)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        tip = out.strip().splitlines()[-1].strip().lower() if rc == 0 and out.strip() else ""
+        return tip if SHA.match(tip) else ""
+
+    def _warm_one(self, repo: str, key: str, warm: str) -> str:
+        """Advance `warm` to the default branch's tip and run the tip's warmBuild in it. Returns "built" (the tip's build
+        or a sources-only tree are in place), "skipped" (already warm, or cooling down) or "failed"/"stopped"."""
+        if True:
             scratch = tempfile.mkdtemp(prefix=".warm-", dir=self.work)
             tip = ""
             try:
@@ -4153,20 +4324,20 @@ class Host:
                 rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", "HEAD^{commit}"], genv)
                 tip = out.strip().splitlines()[-1].strip().lower() if rc == 0 and out.strip() else ""
                 if not SHA.match(tip):
-                    continue
+                    return "skipped"
                 st = warm_state(warm)
                 if st is not None and st.get("key") == key and st.get("tip") == tip and st.get("built") in (tip, "none"):
-                    continue
+                    return "skipped"
                 failed = self.warm_failed.get(repo)
                 if failed is not None and failed[:2] == (tip, key) and time.monotonic() - failed[2] < WARM_RETRY_SECONDS:
-                    continue
+                    return "skipped"
                 self.log(advance_warm_main(repo, tip, warm, self.env, self.log, key, deadline=time.monotonic() + 600))
                 moved = warm_state(warm)
                 if moved is None or moved.get("key") != key or moved.get("tip") != tip:
                     # the advancement did not produce this tip under this key (it wiped and said why): nothing is read from
                     # the tree and the tip is NOT marked handled — it is retried after a pause, so a run is not left cloning
                     self.warm_failed[repo] = (tip, key, time.monotonic())
-                    continue
+                    return "failed"
                 try:
                     with open(os.path.join(warm, ".github", "build-stages.json")) as fh:
                         decl = validate_warm_build(json.load(fh))
@@ -4176,7 +4347,7 @@ class Host:
                 if decl is None:
                     write_warm_state(warm, {"key": key, "tip": tip, "built": "none"})
                     self.warm_failed.pop(repo, None)
-                    continue
+                    return "built"
                 # the image's PREPARED inputs, resolved for THIS build: `run_env` is the run's, and it is empty while idle
                 prepared = prepared_env()
                 extra = {**self.platform_env(), **prepared, "MW_BUILD_REPO": repo}
@@ -4209,23 +4380,27 @@ class Host:
                     write_warm_state(warm, {"key": key, "tip": tip, "built": tip})
                     self.warm_failed.pop(repo, None)
                     self.log(f"warm main workspace: built main@{tip[:12]} with the tip's warmBuild in {int(self.clock() - started)} s")
+                    return "built"
                 else:
                     wipe_warm(warm)
                     # the cooldown covers a failed BUILD too: an unchanged failing tip is not prepared and rebuilt every pass
                     self.warm_failed[repo] = (tip, key, time.monotonic())
                     self.log(f"warm main workspace: the tip's warmBuild failed (exit {rc}) — wiped, retried when idle: {text.strip()[-300:]}")
+                    return "failed"
             except Lost:
                 # a claim (or SIGTERM) needs the host: the half-built workspace is wiped, never copied by a run
                 wipe_warm(warm)
                 self.log(f"warm main workspace for {repo}: the warm build was stopped for a claim — wiped, retried when idle")
-                return
+                return "stopped"
             except (Refusal, subprocess.SubprocessError, OSError, ValueError) as e:
                 wipe_warm(warm)
                 if SHA.match(tip):
                     self.warm_failed[repo] = (tip, key, time.monotonic())
                 self.log(f"warm main workspace for {repo}: not warmed ({type(e).__name__}: {str(e)[:200]}) — wiped, retried when idle")
+                return "failed"
             finally:
                 shutil.rmtree(scratch, ignore_errors=True)
+        return "failed"
 
     # -- step 3/4: run ----------------------------------------------------------------------
     def run(self, claim: dict) -> str:
@@ -4305,9 +4480,19 @@ class Host:
                 co_deadline = time.monotonic() + max(1.0, self.run_deadline - (self.clock() - started))
                 if warm_enabled(self.env) and self.checkout is default_checkout:
                     self.warm_repos.add(repo)
-                    self.workspace_line = seed_run_from_warm(repo, sha, claim.get("refs") or [], os.path.join(self.work, WARM_DIR, repo),
-                                                             checkout_dir, token, self.env, self.log, warm_key(self.env, self.identity),
-                                                             deadline=co_deadline)
+                    if shared_tree_enabled(self.env):
+                        # the SHARED tree's published generation, held against deletion while it is copied; the run writes
+                        # only its own copy, never the shared tree
+                        with SharedTree(self.cache, repo).reader() as shared_warm:
+                            self.workspace_line = seed_run_from_warm(
+                                repo, sha, claim.get("refs") or [],
+                                shared_warm or os.path.join(self.cache, SHARED_DIR, repo, "none", WARM_DIR, repo),
+                                checkout_dir, token, self.env, self.log, warm_key(self.env, self.identity), deadline=co_deadline)
+                        os.makedirs(os.path.join(self.cache, SHARED_DIR, repo), exist_ok=True)
+                    else:
+                        self.workspace_line = seed_run_from_warm(repo, sha, claim.get("refs") or [], os.path.join(self.work, WARM_DIR, repo),
+                                                                 checkout_dir, token, self.env, self.log, warm_key(self.env, self.identity),
+                                                                 deadline=co_deadline)
                     self.log(self.workspace_line)
                 else:
                     self.workspace_line = "workspace: clean (a fresh clone per run — MW_BUILD_WARM_WORKSPACE is not set)"
@@ -6011,6 +6196,95 @@ def self_test() -> int:
               and any(c[:4] == ("-C", mirror, "fetch", "--quiet") and "--prune" in c for c in calls), calls)
         check("mirror/the checkout is detached at the sha", calls[-1][-2:] == ("--detach", "d" * 40), calls[-1])
 
+        # ── 5a''. the SHARED tree (§7.3): one tree per repository on the shared cache, generations, one writer ──────
+        import threading as _thr
+        sroot = os.path.join(tmp, "shared-cache")
+        st_ = SharedTree(sroot, "R")
+
+        def fill(gen, label):
+            w_ = st_.warm_of(gen)
+            os.makedirs(os.path.join(w_, "src", "obj"), exist_ok=True)
+            for i in range(40):
+                open(os.path.join(w_, "src", f"f{i}.cs"), "w").write(label)
+            open(os.path.join(w_, "src", "obj", "state.cache"), "w").write(label)
+            write_warm_state(w_, {"key": "k", "tip": label, "built": label})
+        with st_.writer() as w1:
+            check("shared/the first replica is the ONE writer", w1 is not None)
+            with st_.writer() as w2:
+                check("shared/a second replica cannot be a writer while the first holds the lock (it does not warm)", w2 is None)
+            g1 = w1.stage()
+            fill(g1, "gen1")
+            check("shared/nothing is published while a generation is staged", st_.current() is None)
+            w1.publish(g1)
+        check("shared/a published generation is current, its state readable", st_.current() == g1
+              and (warm_state(st_.warm_of(g1)) or {}).get("built") == "gen1")
+        # a reader holds gen1 while the writer publishes gen2: gen1 survives the collect, then goes once released
+        with st_.reader() as held:
+            check("shared/a reader is handed the current generation's tree", held == st_.warm_of(g1))
+            with st_.writer() as w3:
+                g2 = w3.stage()
+                check("shared/a staged generation starts as a COPY of the current one (obj/ carried)",
+                      open(os.path.join(st_.warm_of(g2), "src", "obj", "state.cache")).read() == "gen1")
+                fill(g2, "gen2")
+                w3.publish(g2)
+            check("shared/the generation a reader holds is NEVER deleted under it", os.path.isdir(g1) and st_.current() == g2)
+        check("shared/once released, the old generation is collected", SharedTree(sroot, "R").collect() == [os.path.basename(g1)]
+              and not os.path.exists(g1))
+        # NO TORN READS: readers copying while a writer publishes generation after generation see ONE generation, whole
+        torn: list = []
+
+        def read_many():
+            for _ in range(150):
+                with SharedTree(sroot, "R").reader() as w_:
+                    if w_ is None:
+                        continue
+                    labels = {open(os.path.join(w_, "src", f"f{i}.cs")).read() for i in range(40)}
+                    labels.add(open(os.path.join(w_, "src", "obj", "state.cache")).read())
+                    if len(labels) != 1:
+                        torn.append(labels)
+
+        def write_many():
+            for n in range(3, 40):
+                with SharedTree(sroot, "R").writer() as w_:
+                    if w_ is None:
+                        continue
+                    g_ = w_.stage()
+                    fill(g_, f"gen{n}")
+                    w_.publish(g_)
+        ths = [_thr.Thread(target=read_many) for _ in range(3)] + [_thr.Thread(target=write_many)]
+        for th_ in ths:
+            th_.start()
+        for th_ in ths:
+            th_.join(120)
+        check("shared/readers copying during publishes never see a torn tree (every file from ONE generation)", torn == [], torn[:2])
+        check("shared/after the storm one current generation remains, older ones collected once free",
+              len([g for g in os.listdir(st_.gens)]) <= 2 and st_.current() is not None, os.listdir(st_.gens))
+        # REDO FORWARD: a failed staged build is discarded, the last good generation stays current, the next stage starts there
+        last_good = st_.current()
+        with st_.writer() as w4:
+            bad = w4.stage()
+            open(os.path.join(st_.warm_of(bad), "src", "obj", "state.cache"), "w").write("half-built")
+            w4.discard(bad)
+        check("shared/a failed build is never published — the last good generation stays current", st_.current() == last_good and not os.path.exists(bad))
+        with st_.writer() as w5:
+            nxt = w5.stage()
+            check("shared/the next writer redoes FORWARD from the last good generation (never from the failed one)",
+                  open(os.path.join(st_.warm_of(nxt), "src", "obj", "state.cache")).read()
+                  == open(os.path.join(st_.warm_of(last_good), "src", "obj", "state.cache")).read())
+            w5.discard(nxt)
+        # a run's copy never writes back
+        before = {f: open(os.path.join(st_.warm_of(last_good), "src", f)).read() for f in os.listdir(os.path.join(st_.warm_of(last_good), "src")) if f.endswith(".cs")}
+        run_copy = os.path.join(tmp, "shared-run")
+        with st_.reader() as w_:
+            _copy_tree(w_, run_copy)
+        open(os.path.join(run_copy, "src", "f0.cs"), "w").write("PR CHANGE")
+        open(os.path.join(run_copy, "src", "obj", "state.cache"), "w").write("PR BUILD")
+        after = {f: open(os.path.join(st_.warm_of(last_good), "src", f)).read() for f in before}
+        check("shared/a PR run's writes stay in its copy — the shared tree is unchanged",
+              before == after and open(os.path.join(st_.warm_of(last_good), "src", "obj", "state.cache")).read() != "PR BUILD")
+        check("shared/opt-in only, and only with the warm workspace", shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true", "MW_BUILD_SHARED_TREE": "true"})
+              and not shared_tree_enabled({"MW_BUILD_SHARED_TREE": "true"}) and not shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}))
+
         # ── 5b'. the warm workspace (§7.2), against REAL git: a local origin, the real mirror path ───────────
         if shutil.which("git"):
             wroot = os.path.join(tmp, "warm-git")
@@ -6703,6 +6977,35 @@ def self_test() -> int:
             check("warm-idle/a successful build after the pause clears the failure",
                   len(builds) == 2 and "R" not in hf.warm_failed
                   and (warm_state(os.path.join(fail_work, WARM_DIR, "R")) or {}).get("built") == c3, (builds, hf.warm_failed))
+            # two HOSTS on one shared cache: only the writer warms; the other neither builds nor waits, and seeds from the
+            # published generation
+            hcache = os.path.join(tmp, "shared-hosts")
+            warmed: list = []
+
+            def warm_stub(h_, name_):
+                def stub(repo_, key_, warm_):
+                    warmed.append(name_)
+                    with SharedTree(hcache, repo_).writer() as again:
+                        check(f"shared/{name_} warms only while it IS the writer (a second lock attempt fails)", again is None)
+                    os.makedirs(os.path.join(warm_, "src"), exist_ok=True)
+                    open(os.path.join(warm_, "src", "a.cs"), "w").write(name_)
+                    write_warm_state(warm_, {"key": key_, "tip": "t" * 40, "built": "t" * 40})
+                    return "built"
+                return stub
+            ha = host(_FakeApi({}), env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_SHARED_TREE="true", MW_BUILD_CACHE=hcache))
+            hb = host(_FakeApi({}), env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_SHARED_TREE="true", MW_BUILD_CACHE=hcache))
+            ha._warm_one, hb._warm_one = warm_stub(ha, "A"), warm_stub(hb, "B")
+            ha._mirror_tip = hb._mirror_tip = lambda repo_: "t" * 40
+            with SharedTree(hcache, "R").writer() as held_by_a:
+                hb._warm_shared("R", warm_key(hb.env, hb.identity))
+            check("shared/a host that is not the writer does not warm (nothing built, nothing waited for)", warmed == [], warmed)
+            ha._warm_shared("R", warm_key(ha.env, ha.identity))
+            hb._warm_shared("R", warm_key(hb.env, hb.identity))
+            check("shared/the writer builds and publishes; the other host then finds the tip warm and builds nothing",
+                  warmed == ["A"] and SharedTree(hcache, "R").current() is not None, warmed)
+            with SharedTree(hcache, "R").reader() as seen:
+                check("shared/the other host's run reads the published generation", seen is not None
+                      and open(os.path.join(seen, "src", "a.cs")).read() == "A")
             # the warm build's platform copy appears at the prepared tree's own path, never at its scratch path
             plat = os.path.join(wroot, "prepared-platform")
             os.makedirs(plat, exist_ok=True)
