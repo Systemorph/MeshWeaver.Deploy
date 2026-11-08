@@ -477,7 +477,6 @@ ensure_overlay_file() {
   sed -e "s|__PG_PASSWORD__|${pg_pw}|g" \
       -e "s|__AI_MASTER_KEY__|${ai_key}|g" \
       "$share/values.local.yaml" > "$OVERLAY"
-  OVERLAY_CREATED=1
   chmod 600 "$OVERLAY"
   # 🚨 Nothing to hand-edit any more. This template used to ship an identity DECISION —
   # dev login on, `<your-username>` as the sole administrator, and a commented Entra block
@@ -2041,6 +2040,13 @@ llm_host_probe() {
 # `memex-local owner --id <id> --email <e-mail>`, never by editing YAML. The same owner answers the
 # opt-in questions (`backlease accept`: which instance's jobs, which instances' token requests).
 readonly OWNER_KEY="Auth__GlobalAdmins__0"
+# Written by every successful helm_deploy: this install HAS been deployed. Only such an install may come up
+# without an owner (with a loud warning) — the unattended daemon re-runs `up` on it at every start, and a
+# running Mac must never be halted by its own restart. A Mac that was never deployed has no marker, so a
+# failed ownerless `up` stays failed on every re-run. Installs deployed before the marker existed are
+# recognised by the port-forward script `up` installs only after a deploy.
+readonly DEPLOYED_MARKER="$LOCAL_HOME/deployed"
+install_deployed() { [ -f "$DEPLOYED_MARKER" ] || [ -f "$PF_SCRIPT" ]; }
 readonly OWNER_ID_KEY="Instance__Owner__Id"
 readonly OWNER_EMAIL_KEY="Instance__Owner__Email"
 
@@ -2110,9 +2116,9 @@ ensure_owner_admin() {
   [ -n "$id" ] || id="$(overlay_value "$OWNER_KEY")"   # an install that recorded only the admin key (before Instance__Owner__*)
   if [ -z "$id" ]; then
     # "require": an onboarding (fleet join) — always. "require-fresh": `up`, which the unattended daemon also
-    # re-runs at every start — required for a FRESH install (this run generated the overlay), a loud warning
-    # for an existing ownerless one, so a running fleet Mac is never halted by its own restart.
-    if [ "${3:-}" = "require" ] || { [ "${3:-}" = "require-fresh" ] && [ "${OVERLAY_CREATED:-}" = "1" ]; }; then
+    # re-runs at every start — required until the install has been DEPLOYED (install_deployed), a loud
+    # warning for a deployed ownerless one, so a running fleet Mac is never halted by its own restart.
+    if [ "${3:-}" = "require" ] || { [ "${3:-}" = "require-fresh" ] && ! install_deployed; }; then
       die "no OWNER for this instance — an install never comes up without its administrator. Give one: memex-local owner --id <user-id> --email <e-mail> (or MEMEX_OWNER / MEMEX_OWNER_EMAIL, or the managed preferences OwnerId / OwnerEmail), then re-run"
     fi
     warn "this instance has NO OWNER, so no global administrator — memex-local owner --id <user-id> --email <e-mail>"
@@ -2122,9 +2128,12 @@ ensure_owner_admin() {
   have_id="$(overlay_value "$OWNER_KEY")"; have_email="$(overlay_value "$OWNER_EMAIL_KEY")"
   # A DIFFERENT owner never inherits the previous owner's recorded e-mail: the overlay's e-mail is read only
   # for the owner it was recorded with. An id change without an e-mail removes the old one.
-  local email_key="$OWNER_EMAIL_KEY"
+  local email_key="$OWNER_EMAIL_KEY" email_pref="OwnerEmail" pref_id
   if [ -n "$have_id" ] && [ "$have_id" != "$id" ]; then email_key="__no_such_key__"; fi
-  email="$(owner_field "${2:-}" "${MEMEX_OWNER_EMAIL:-}" OwnerEmail "$email_key" "The owner's e-mail (the account they sign in with)" "")"
+  # …and the same for the managed preference: its OwnerEmail belongs to ITS OwnerId only.
+  pref_id="$(managed_pref OwnerId)"
+  if [ -n "$pref_id" ] && [ "$pref_id" != "$id" ]; then email_pref="__no_such_pref__"; fi
+  email="$(owner_field "${2:-}" "${MEMEX_OWNER_EMAIL:-}" "$email_pref" "$email_key" "The owner's e-mail (the account they sign in with)" "")"
   if [ -n "$email" ] && ! valid_owner_email "$email"; then die "owner: '$email' is not an e-mail address"; fi
   [ -n "$email" ] || [ -z "${3:-}" ] || owner_can_ask \
     || warn "owner '$id' has no e-mail recorded — the portal cannot match it against the signed-in account (memex-local owner --email <e-mail>)"
@@ -2797,6 +2806,7 @@ helm_deploy() {
     warn "could not make $PORTAL_DATA_DIR writable on the node — portal may crashloop on DataProtection keys${perms_err:+: $perms_err}"
   fi
   if [ -f "$INTERNAL_FILE" ]; then internal_serve_when_signed_in || true; fi
+  : > "$DEPLOYED_MARKER" 2>/dev/null || true   # this install has been deployed (install_deployed)
 }
 
 # ---------------------------------------------------------------------------

@@ -958,13 +958,24 @@ grep -q SURVIVED <<<"$OUT" && bad "a malformed e-mail accepted" "$OUT" || ok "a 
 grep -q 'Auth__GlobalAdmins\|Instance__Owner' "$HERE/../share/"*.yaml && bad "a SHARED values file names the owner (it belongs to each install's own overlay)" "$(grep -n 'Auth__GlobalAdmins\|Instance__Owner' "$HERE/../share/"*.yaml)" \
   || ok "no shared values file (defaults, template, mode layers) names an owner or an admin"
 B="$(fn_body cmd_up)"; grep -B1 '^  ensure_overlay$' <<<"$B" | grep -q '^  OWNER_REQUIRED=require-fresh$' && ok "up REQUIRES an owner on a fresh install before anything is deployed" || bad "up owner requirement" ""
-# require-fresh: a FRESH install (this run generated the overlay) fails; an existing ownerless one — which the
-# unattended daemon re-runs `up` on at every start — warns, so a running Mac is never halted by its restart.
-seed_overlay
-OUT="$(ow env OVERLAY_CREATED=1 bash -c '. "$0"; ensure_owner_admin "" "" require-fresh; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
-grep -q SURVIVED <<<"$OUT" && bad "a fresh ownerless install came up" "$OUT" || ok "up on a FRESH install with no owner fails"
+# require-fresh: an install never DEPLOYED fails on EVERY ownerless `up` (a re-run of a failed first `up` too —
+# an existing overlay is not a deployed install); a deployed ownerless one — which the unattended daemon re-runs
+# `up` on at every start — warns, so a running Mac is never halted by its own restart.
+seed_overlay; rm -f "$OWH/home/.memex-local/deployed" "$OWH/home/.memex-local/port-forward.sh"
+for attempt in first re-run; do
+  OUT="$(ow bash -c '. "$0"; ensure_owner_admin "" "" require-fresh; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+  grep -q SURVIVED <<<"$OUT" && bad "an ownerless never-deployed install came up on the $attempt" "$OUT" || ok "up on a never-deployed install with no owner fails (the $attempt, overlay present)"
+done
+: > "$OWH/home/.memex-local/deployed"
 OUT="$(ow bash -c '. "$0"; ensure_owner_admin "" "" require-fresh; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
-grep -q SURVIVED <<<"$OUT" && grep -q "NO OWNER" <<<"$OUT" && ok "up on an EXISTING ownerless install (the daemon's restart) warns loudly and carries on" || bad "existing ownerless up" "$OUT"
+grep -q SURVIVED <<<"$OUT" && grep -q "NO OWNER" <<<"$OUT" && ok "up on a DEPLOYED ownerless install (the daemon's restart) warns loudly and carries on" || bad "deployed ownerless up" "$OUT"
+rm -f "$OWH/home/.memex-local/deployed"
+grep -q ': > "$DEPLOYED_MARKER"' <<<"$(fn_body helm_deploy)" && ok "helm_deploy marks the install deployed" || bad "deployed marker" ""
+# A managed preference's OwnerEmail belongs to its OwnerId: a different explicit owner never inherits it.
+seed_overlay
+OUT="$(ow env FAKE_PREF_OwnerId=carol FAKE_PREF_OwnerEmail=carol@example.com bash -c '. "$0"; cmd_owner --id bob' "$CLI" 2>&1 </dev/null)"
+grep -qx '    Auth__GlobalAdmins__0: "bob"' "$OOV" && ! grep -q 'carol@example.com' "$OOV" \
+  && ok "an MDM's OwnerEmail (for carol) is never written for a different owner (bob)" || bad "pref email inherited" "$(cat "$OOV")"
 # The config section without a memex_portal map, and NOT last in the file: the map goes INSIDE config.
 printf 'secrets:\n  memex_portal:\n    X: "1"\nconfig:\n  other: "y"\ningress:\n  host: "memex.localhost"\n' > "$OOV"
 ow bash -c '. "$0"; overlay_set_portal_config Auth__GlobalAdmins__0 dave' "$CLI" >/dev/null 2>&1
