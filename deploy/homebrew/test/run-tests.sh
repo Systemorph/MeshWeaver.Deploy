@@ -828,6 +828,78 @@ if command -v helm >/dev/null 2>&1; then
 else
   grep -q 'memex_portal:' "$AUTO" && bad "a no-model layer writes memex_portal:" "$(cat "$AUTO")" || ok "a no-model llm.auto.yaml writes no memex_portal map"
 fi
+# RESIDENCY: the install's declared processing location lands on the local models; undeclared writes none.
+RESF="$LMH/home/.memex-local/residency"; : > "$OVL"; rm -f "$RESF"
+lm env MEMEX_OLLAMA_MODEL= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=arm64 FAKE_TAGS='{"name":"qwen3.8:27b-mlx"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+grep -q 'DataResidency' "$AUTO" && bad "an undeclared install writes a residency (a guess)" "$(cat "$AUTO")" \
+  || ok "an undeclared install writes NO residency line (the models read as Unknown, never a guessed Eu)"
+OUT="$(lm env MEMEX_ACCEPT_NONINTERACTIVE=1 bash -c 'set -euo pipefail; . "$0"; residency_onboard ""' "$CLI" 2>&1 </dev/null)"
+[ ! -f "$RESF" ] && ok "a headless up with no --residency declares nothing and records nothing (the next interactive up asks)" || bad "headless onboarding wrote a residency" "$(cat "$RESF" 2>/dev/null) $OUT"
+lm bash -c 'set -euo pipefail; . "$0"; cmd_residency ch' "$CLI" >/dev/null 2>&1
+[ "$(cat "$RESF" 2>/dev/null)" = "CH" ] && ok "memex-local residency ch persists the declaration as CH" || bad "residency CH not persisted" "$(cat "$RESF" 2>/dev/null)"
+lm env MEMEX_OLLAMA_MODEL= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=arm64 FAKE_TAGS='{"name":"qwen3.8:27b-mlx"}' bash -c 'set -euo pipefail; . "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+grep -qx '    OpenAICompatible__DataResidency: "CH"' "$AUTO" && ok "a declared CH lands in llm.auto.yaml as OpenAICompatible__DataResidency" || bad "declared CH missing from llm.auto.yaml" "$(cat "$AUTO")"
+if command -v helm >/dev/null 2>&1; then
+  printf 'config:\n  memex_portal:\n    OpenAICompatible__DataResidency: "Eu"\n' > "$OVL"
+  R="$(helm template memex "$HERE/../../helm" -f "$HERE/../../helm/values.yaml" -f "$DEF" -f "$AUTO" -f "$OVL" 2>&1)"
+  grep -q 'OpenAICompatible__DataResidency: "Eu"' <<<"$R" && ! grep -q 'OpenAICompatible__DataResidency: "CH"' <<<"$R" \
+    && ok "the overlay's own residency still wins over the declaration in the render" || bad "overlay residency did not win" "$(grep -n DataResidency <<<"$R")"
+  : > "$OVL"
+fi
+lm env MEMEX_RESIDENCY=eu MEMEX_OLLAMA_MODEL= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=arm64 FAKE_TAGS='{"name":"qwen3.8:27b-mlx"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+grep -qx '    OpenAICompatible__DataResidency: "Eu"' "$AUTO" && ok "MEMEX_RESIDENCY=eu wins for the run and is spelled Eu (the one EU-only value)" || bad "MEMEX_RESIDENCY" "$(cat "$AUTO")"
+for v in 'C1' 'Switzerland-x' 'Switzerland' 'C H'; do
+  lm bash -c 'set -euo pipefail; . "$0"; cmd_residency "$1"' "$CLI" "$v" >/dev/null 2>&1 && bad "residency '$v' accepted" "" || ok "residency '$v' is refused"
+done
+[ "$(cat "$RESF")" = "CH" ] && ok "a refused value leaves the declaration as it was" || bad "refused value changed the declaration" "$(cat "$RESF")"
+lm env MEMEX_ACCEPT_NONINTERACTIVE=1 bash -c 'set -euo pipefail; . "$0"; residency_onboard ""' "$CLI" >/dev/null 2>&1 </dev/null
+[ "$(cat "$RESF")" = "CH" ] && ok "a later headless up keeps the declaration" || bad "headless up lost the declaration" "$(cat "$RESF")"
+lm bash -c 'set -euo pipefail; . "$0"; residency_onboard none' "$CLI" >/dev/null 2>&1
+[ -f "$RESF" ] && [ -z "$(tr -d '[:space:]' < "$RESF")" ] && ok "--residency none records 'asked, none declared'" || bad "residency none" "$(cat "$RESF" 2>/dev/null)"
+printf 'CH\n' > "$RESF"
+# The macOS region SUGGESTS (never applies): an EU member state → Eu, CH → CH, else the ISO code.
+mkdir -p "$LMH/defstub"
+for pair in 'de_CH:CH' 'en_CH@currency=CHF:CH' 'de_DE:Eu' 'fr_FR:Eu' 'zh_Hans_CN:CN' 'en_US_POSIX:US' 'en:'; do
+  loc="${pair%%:*}"; want="${pair#*:}"
+  printf '#!/bin/bash\necho "%s"\n' "$loc" > "$LMH/defstub/defaults"; chmod +x "$LMH/defstub/defaults"
+  got="$(env PATH="$LMH/defstub:$PATH" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$LMH/home/.memex-local" bash -c '. "$0"; residency_suggest' "$CLI" 2>/dev/null)"
+  [ "$got" = "$want" ] && ok "region $loc suggests '${want:-<nothing>}'" || bad "region $loc suggests '$got', want '$want'" ""
+done
+# An interactive first up ASKS, the region's suggestion as the default; Enter takes it.
+rm -f "$RESF"; printf '#!/bin/bash\necho "de_CH"\n' > "$LMH/defstub/defaults"
+OUT="$(printf '\n' | env PATH="$LMH/defstub:$PATH" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$LMH/home/.memex-local" HOME="$LMH/home" \
+  bash -c '. "$0"; accept_interactive() { return 0; }; residency_onboard ""' "$CLI" 2>&1)"
+grep -q 'Where is this machine? (residency, e.g. CH, Eu' <<<"$OUT" && grep -q '\[CH\]' <<<"$OUT" && [ "$(cat "$RESF" 2>/dev/null)" = "CH" ] \
+  && ok "the first interactive up asks 'Where is this machine?' with the region's CH as the default" || bad "interactive onboarding" "$OUT / $(cat "$RESF" 2>/dev/null)"
+OUT="$(printf 'Global\n' | env PATH="$LMH/defstub:$PATH" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$LMH/home/.memex-local" HOME="$LMH/home" \
+  bash -c '. "$0"; accept_interactive() { return 0; }; residency_onboard ""' "$CLI" 2>&1)"
+[ "$(cat "$RESF")" = "CH" ] && ok "an install that already answered is not asked again" || bad "asked again" "$OUT"
+# llm use --residency: any residency accept_check_residency accepts; an invalid one refused; default = the declaration.
+mkdir -p "$LMH/llmstub"
+cat > "$LMH/llmstub/curl" <<'STUB'
+#!/bin/bash
+case "$*" in *v1/models*) echo '{"data":[{"id":"qwen3.8:27b-mlx"}]}' ;; *) exit 0 ;; esac
+STUB
+chmod +x "$LMH/llmstub/curl"
+lmu() { env HOME="$LMH/home" MEMEX_LOCAL_HOME="$LMH/home/.memex-local" MEMEX_LOCAL_LIB=1 MEMEX_OLLAMA_MODEL=qwen3.8:27b-mlx PATH="$LMH/llmstub:$LMH/stubs:$STUBS:$PATH" "$@"; }
+LLMF="$LMH/home/.memex-local/llm.yaml"
+lmu bash -c 'set -euo pipefail; . "$0"; cmd_llm use --residency CH' "$CLI" >/dev/null 2>&1 \
+  && grep -qx '    OpenAICompatible__DataResidency: "CH"' "$LLMF" && ok "llm use --residency CH is accepted and written" || bad "llm use --residency CH" "$(cat "$LLMF" 2>/dev/null)"
+rm -f "$LLMF"
+lmu bash -c 'set -euo pipefail; . "$0"; cmd_llm use --residency C1' "$CLI" >/dev/null 2>&1 \
+  && bad "llm use --residency C1 accepted" "" || { [ ! -f "$LLMF" ] && ok "llm use --residency C1 is refused and writes nothing"; } || bad "refused but wrote" ""
+OUT="$(lmu bash -c 'set -euo pipefail; . "$0"; cmd_llm use' "$CLI" 2>&1)"
+! grep -q '^    OpenAICompatible__DataResidency:' "$LLMF" && grep -q 'residency CH' <<<"$OUT" \
+  && ok "llm use without --residency defaults to the install declaration (CH) and copies none into llm.yaml (the auto layer carries it)" || bad "llm use default" "$OUT / $(cat "$LLMF")"
+rm -f "$LLMF"
+# backlease accept tokens: the residency defaults to the install declaration.
+G="$(lm bash -c 'set -euo pipefail; . "$0"; accept_load; printf %s "$ACC_TOK_RES"' "$CLI" 2>/dev/null)"
+[ "$G" = "CH" ] && ok "backlease accept tokens: the residency defaults to the install declaration (CH)" || bad "backlease residency default" "'$G'"
+OUT="$(lm bash -c '. "$0"; cmd_residency' "$CLI" 2>&1)"
+grep -q 'residency: CH' <<<"$OUT" && ok "memex-local residency prints the declaration" || bad "residency print" "$OUT"
+B="$(fn_body cmd_status)"; grep -q 'cmd_residency' <<<"$B" && ok "status prints the declared residency" || bad "status residency" ""
+B="$(fn_body cmd_up)"; grep -q 'residency_onboard "$residency"' <<<"$B" && ok "up runs the residency onboarding" || bad "up onboarding" ""
+rm -f "$RESF"
 # The default is not in Ollama (pull failed / Ollama too old): name a model Ollama HAS, never a 404.
 lm env MEMEX_OLLAMA_MODEL= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=arm64 FAKE_TAGS='{"name":"qwen3.6-code:latest"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
 grep -qx '    OpenAICompatible__Models__0: "qwen3.6-code"' "$AUTO" && ok "a failed qwen3.8 pull keeps the model the install already ran (qwen3.6-code), never one that answers 404" || bad "auto layer names a missing model" "$(cat "$AUTO")"
@@ -2025,7 +2097,7 @@ rm -rf "$BL"
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
-for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease buildhost fleet llm relay publish autoupdate; do
+for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease buildhost fleet llm residency relay publish autoupdate; do
   case "$help_out" in
     *"$cmd"*) ;;
     *) bad "help documents '$cmd'" "not in the usage text"; continue ;;

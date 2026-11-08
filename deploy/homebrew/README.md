@@ -194,11 +194,32 @@ platform image in Colima's VM, sized for the host
 A Mac Studio's chat model is `qwen3.8:27b-mlx` itself. Any further model to offer is listed in `MEMEX_OLLAMA_EXTRA_MODELS`
 (`none` pulls none). Pulling a model does not offer it. A Mac serves the fleet only when its owner opts in.
 
+**Where the local models process prompts — the install's residency.** Every install declares ONE processing
+location, and the portal stamps it on each local (Ollama) model as its data residency
+(`OpenAICompatible__DataResidency` — `Eu`, `Global`, or a two-letter ISO code such as `CH`; only `Eu` counts as
+EU-only). Without it a local model reads as Unknown, and the model picker shows only its maker's flag: a Swiss
+Mac's `qwen` looks as if its prompts went to China, and a model whose residency is Unknown is never used for mail
+triage.
+
+- The first interactive `up` asks *"Where is this machine?"*. The macOS region (`AppleLocale`) only suggests the
+  default: an EU member state suggests `Eu`, Switzerland `CH`, anywhere else its ISO code. Type `none` to declare
+  nothing. Once answered, `up` does not ask again.
+- A headless install passes `up --residency CH` (or `MEMEX_RESIDENCY=CH`). With neither, nothing is declared and
+  the models stay Unknown. Nothing is ever guessed, and `Eu` is never applied silently.
+- On an existing install: `memex-local residency CH`, then `memex-local update --skip-image`
+  (`update --residency CH` does both). `memex-local residency` prints the declaration, `residency --clear` removes it,
+  and `status` and `llm status` print it.
+- It is kept in `~/.memex-local/residency` and written into the per-install layer `llm.auto.yaml`. An
+  `OpenAICompatible__DataResidency` line in the overlay `values.local.yaml` still wins.
+- `llm use --residency X` (any residency: `Eu`, `Global`, an ISO code) overrides it for the `llm` layer alone.
+  Without the flag, the layer copies nothing and the declaration applies. `backlease accept tokens` and
+  `fleet join` offer the declaration as the token residency when `--residency` is not given.
+
 **The owner's opt-in** (MeshWeaver.Plugins `Hosting/BackLease` §13). An enrolled Mac takes NO fleet jobs and serves
 NO token requests until its owner says yes and names the instances it takes each from. `fleet join` and
 `backlease enroll` ask both questions. The defaults are offered, not applied: jobs from `control.systemorph.com`,
-tokens from `*.meshweaver.cloud`, and the models `qwen3.8:27b-mlx qwen3.6`. The residency has no default; type
-where the machine is. A headless run passes `--accept-jobs=<patterns>` / `--no-accept-jobs` and
+tokens from `*.meshweaver.cloud`, and the models `qwen3.8:27b-mlx qwen3.6`. The residency defaults to the
+install's declaration (`memex-local residency`, above); with none declared, type where the machine is. A headless run passes `--accept-jobs=<patterns>` / `--no-accept-jobs` and
 `--accept-tokens=<patterns>` / `--no-accept-tokens` (with `--token-models`, `--residency`), and with no answer
 both stay off. Change an answer later with `memex-local backlease accept jobs|tokens [--from …] [--off] …`,
 then `memex-local update`. `backlease status` prints the answers. They are written as
@@ -408,6 +429,7 @@ log, ollama log, grafana password) — exactly the paths the doc uses.
 | `MEMEX_LOG_LEVEL` | `Debug` | verbose log level (`Trace` for max) |
 | `MEMEX_COLIMA_CPU` / `MEMEX_COLIMA_MEM` | `8` / `16` (or the profile's) | VM sizing (§2) |
 | `MEMEX_OLLAMA_MODEL` | `qwen3.8:27b-mlx` / `qwen3:8b` by host memory (or the profile's) | the default chat model `up`/`update` pull and the portal names; `none` skips it |
+| `MEMEX_RESIDENCY` | unset (none declared) | where this install processes prompts (`Eu`, `Global`, ISO code such as `CH`); `up` persists it (above) |
 | `MEMEX_LLM_SMOKE` | `1` | `0` skips the post-install chat smoke (loudly) |
 | `MEMEX_PROFILE` | unset | Mac host profile, `mac-studio` or `mac-mini` (below) |
 | `MEMEX_CHANNEL` | unset (`main`) | release-channel label `up`/`update`/`autoroll` follow (below) |

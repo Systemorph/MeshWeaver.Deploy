@@ -186,6 +186,16 @@ readonly STALE_OLLAMA_HOST_LINE='    host: "192.168.5.2"'
 # guard stays unarmed without it), the default chat tier, and the VM's gateway as the Service's endpoint.
 # Layered right after the tracked defaults, so every later layer and the owner's overlay still win.
 readonly LLM_AUTO_FILE="$LOCAL_HOME/llm.auto.yaml"
+# ── RESIDENCY — WHERE this install processes prompts (`memex-local residency`, `up --residency`) ──────────
+# ONE per-install declaration: the processing location of everything this Mac's own models answer. The
+# portal stamps it on every Provider/OpenAICompatible model node (OpenAICompatible__DataResidency, open
+# vocabulary: `Eu`, `Global`, or a two-letter ISO code such as `CH`; only `Eu` counts as EU-only). Without
+# it a local model reads as Unknown and the picker shows only its MAKER's flag — a Swiss Mac's qwen then
+# looks like "your prompts go to China". The file holds the one value; an EMPTY file records that the owner
+# was asked and declared none (Unknown), so `up` does not ask again. Nothing is ever guessed: the macOS
+# region only SUGGESTS the prompt's default, and a run with nobody to ask declares nothing.
+# MEMEX_RESIDENCY (env) and --residency (up/update) declare it for a headless run and are persisted.
+readonly RESIDENCY_FILE="$LOCAL_HOME/residency"
 # ── CERTIFICATES for the machine's private-network name (Let's Encrypt over DNS-01; `memex-local cert`) ──
 # dns01.env names the DNS zone and the identity allowed to write its challenge records (nothing secret);
 # dns01.secret is that identity's client secret (0600) — delivered by the enrolment channel, never typed into
@@ -681,6 +691,8 @@ accept_list() {
 # Loads the CURRENT answers from the layer (a fresh machine: both off).
 accept_load() {
   local p="Hosting__BackLease__Accept"
+  # the residency a token answer states defaults to the INSTALL declaration (memex-local residency)
+  ACC_TOK_RES="$(install_residency)"
   # a fresh machine has no layer yet: both off (the readers below are only run against a file that exists)
   [ -f "$BACKLEASE_FILE" ] || return 0
   [ "$(backlease_value "${p}__Jobs__Enabled")" = "true" ] && ACC_JOBS_ENABLED=true || ACC_JOBS_ENABLED=false
@@ -688,7 +700,8 @@ accept_load() {
   [ "$(backlease_value "${p}__Tokens__Enabled")" = "true" ] && ACC_TOK_ENABLED=true || ACC_TOK_ENABLED=false
   ACC_TOK_FROM="$(accept_list "${p}__Tokens__From")"; ACC_TOK_MODELS="$(accept_list "${p}__Tokens__Models")"
   ACC_TOK_MAXC="$(backlease_value "${p}__Tokens__MaxConcurrency")"; ACC_TOK_MAXC="${ACC_TOK_MAXC:-1}"
-  ACC_TOK_RES="$(backlease_value "${p}__Tokens__Residency")"
+  local r; r="$(backlease_value "${p}__Tokens__Residency")"
+  [ -z "$r" ] || ACC_TOK_RES="$r"
 }
 
 # Normalises a comma/space list to single spaces; lower-cases when $2 = lower.
@@ -1885,11 +1898,90 @@ effective_chat_model() {
   printf '%s' "$m"
 }
 
+# ── RESIDENCY (see RESIDENCY_FILE) ────────────────────────────────────────────────────────────────────
+# The canonical spelling of a residency answer: eu → Eu, global → Global, a two-letter code upper-cased;
+# anything else as typed (accept_check_residency decides whether it is a residency at all).
+residency_norm() {
+  local v="$1"
+  case "$(printf '%s' "$v" | tr 'A-Z' 'a-z')" in
+    eu) printf 'Eu' ;;
+    global) printf 'Global' ;;
+    *) if printf '%s' "$v" | grep -Eq '^[A-Za-z]{2}$'; then printf '%s' "$v" | tr 'a-z' 'A-Z'; else printf '%s' "$v"; fi ;;
+  esac
+}
+
+# The install's declared residency, or nothing (Unknown). MEMEX_RESIDENCY wins over the file for this run.
+install_residency() {
+  local v="${MEMEX_RESIDENCY:-}"
+  if [ -n "$v" ]; then accept_check_residency "$v" "MEMEX_RESIDENCY"; residency_norm "$v"; return 0; fi
+  [ -f "$RESIDENCY_FILE" ] || return 0
+  v="$(head -1 "$RESIDENCY_FILE" | tr -d '[:space:]')"
+  [ -n "$v" ] || return 0
+  accept_check_residency "$v" "$RESIDENCY_FILE"; residency_norm "$v"
+}
+
+# Persists a declaration ("" = asked, none declared). Validated before anything is written.
+residency_write() {
+  local v="$1"
+  [ -z "$v" ] || { accept_check_residency "$v" "residency"; v="$(residency_norm "$v")"; }
+  mkdir -p "$LOCAL_HOME"
+  printf '%s\n' "$v" > "$RESIDENCY_FILE"
+  if [ -n "$v" ]; then ok "residency declared: $v ($RESIDENCY_FILE) — the local models carry it from the next 'memex-local update'"
+  else info "residency: none declared — the local models read as Unknown ($RESIDENCY_FILE)"; fi
+}
+
+# The macOS region's SUGGESTION (never applied by itself): an EU member state → Eu, else the ISO code.
+residency_suggest() {
+  local loc cc
+  loc="$(defaults read -g AppleLocale 2>/dev/null || true)"
+  cc="$(printf '%s' "$loc" | sed -n 's/^[a-z]*\(_[A-Za-z]*\)\{0,1\}_\([A-Z][A-Z]\)\([@_].*\)\{0,1\}$/\2/p')"
+  [ -n "$cc" ] || return 0
+  case "$cc" in
+    AT|BE|BG|HR|CY|CZ|DK|EE|FI|FR|DE|GR|HU|IE|IT|LV|LT|LU|MT|NL|PL|PT|RO|SK|SI|ES|SE) printf 'Eu' ;;
+    *) printf '%s' "$cc" ;;
+  esac
+}
+
+# Onboarding (`up`, and `update --residency`): an explicit answer ($1, the flag; else MEMEX_RESIDENCY) is
+# persisted; an install that has never answered is ASKED when a person is there, the region's suggestion
+# as the default ('none' declines); with nobody to ask nothing is declared and nothing is recorded, so the
+# next interactive `up` asks.
+residency_onboard() {
+  local v="${1:-${MEMEX_RESIDENCY:-}}" a sug
+  if [ -n "$v" ]; then
+    case "$v" in none|None|NONE|-) residency_write ""; return 0 ;; esac
+    residency_write "$v"; return 0
+  fi
+  [ -f "$RESIDENCY_FILE" ] && return 0
+  if ! accept_interactive; then
+    info "residency: none declared — the local models read as Unknown (declare it: memex-local residency CH|Eu|… )"
+    return 0
+  fi
+  sug="$(residency_suggest)"
+  a="$(accept_read "Where is this machine? (residency, e.g. CH, Eu; 'none' to declare nothing)" "${sug:-none}")"
+  case "$a" in ''|none|None|NONE|-) residency_write "" ;; *) residency_write "$a" ;; esac
+}
+
+cmd_residency() {
+  case "${1:-}" in
+    "")
+      local v; v="$(install_residency)"
+      if [ -n "$v" ]; then ok "residency: $v — the local models process prompts here (OpenAICompatible__DataResidency)"
+      else info "residency: none declared — the local models read as Unknown (memex-local residency CH|Eu|Global|<ISO code>)"; fi
+      ;;
+    --clear) [ $# -eq 1 ] || die "residency: --clear takes nothing more"; residency_write ""; info "Apply it: memex-local update --skip-image" ;;
+    -*) die "usage: memex-local residency [<Eu|Global|ISO code, e.g. CH> | --clear]" ;;
+    *)  [ $# -eq 1 ] || die "usage: memex-local residency [<Eu|Global|ISO code, e.g. CH> | --clear]"
+        residency_write "$1"; info "Apply it: memex-local update --skip-image" ;;
+  esac
+}
+
 # Writes $LLM_AUTO_FILE (see its constant). Models__1 keeps the old default alias (qwen3.6-code) when this
 # Ollama still has it, so an upgrade loses no model a thread may already name.
 write_llm_auto_layer() {
-  local model gw second="" w0="" w1=""
+  local model gw second="" w0="" w1="" residency
   model="$(effective_chat_model)"
+  residency="$(install_residency)"
   gw="$(llm_host_ip)"
   mkdir -p "$LOCAL_HOME"
   if [ -n "$model" ] && [ "$model" != "$STALE_OLLAMA_MODEL" ] && ollama_has_model "$STALE_OLLAMA_MODEL"; then
@@ -1907,6 +1999,7 @@ write_llm_auto_layer() {
       echo "  memex_portal:"
       echo "    OpenAICompatible__Models__0: \"$model\""
       echo "    AI__Tiers__chat: \"Provider/OpenAICompatible/$model\""
+      [ -z "$residency" ] || echo "    OpenAICompatible__DataResidency: \"$residency\""
       if [ -n "$w0" ]; then
         echo "    OpenAICompatible__ContextWindowTokens__0__Model: \"$model\""
         echo "    OpenAICompatible__ContextWindowTokens__0__Tokens: \"$w0\""
@@ -1926,7 +2019,7 @@ write_llm_auto_layer() {
   if [ -z "$model" ]; then
     info "LOCAL MODEL: none chosen (MEMEX_OLLAMA_MODEL=none) — the portal names no Ollama chat model"
   elif [ -n "$w0" ]; then
-    info "LOCAL MODEL: default chat model $model (context window ${w0} tokens, as Ollama serves it)${second:+, plus $second}; Ollama at $gw via $OLLAMA_ENDPOINT"
+    info "LOCAL MODEL: default chat model $model (context window ${w0} tokens, as Ollama serves it)${second:+, plus $second}; Ollama at $gw via $OLLAMA_ENDPOINT; residency ${residency:-Unknown (none declared)}"
   else
     warn "LOCAL MODEL: Ollama did not load $model, so its context window stays undeclared until the next update (ollama pull $model; is Ollama running?)"
   fi
@@ -2014,18 +2107,22 @@ cmd_llm() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
     use)
-      local model; model="$(effective_chat_model)"; local residency="Eu" host="" port="11434"
+      # The residency defaults to the INSTALL declaration (memex-local residency), which llm.auto.yaml already
+      # carries — so only an explicit --residency is written here (a value copied in would outlive a later
+      # change of the declaration, since this layer wins over the auto layer).
+      local model; model="$(effective_chat_model)"; local residency="" host="" port="11434"
       while [ $# -gt 0 ]; do
         case "$1" in
           --model)     shift; model="${1:?--model needs an Ollama model name}" ;;
-          --residency) shift; residency="${1:?--residency needs Eu|Global}" ;;
+          --residency) shift; residency="${1:?--residency needs Eu, Global or an ISO code such as CH}" ;;
           --host)      shift; host="${1:?--host needs the host IP as the VM sees it}" ;;
           --port)      shift; port="${1:?--port needs a number}" ;;
           *) die "llm use: unknown flag '$1'" ;;
         esac
         shift
       done
-      case "$residency" in Eu|Global) ;; *) die "llm use: --residency must be Eu or Global (this Mac's own model never leaves it; Eu is right for a Mac in the EU)" ;; esac
+      if [ -n "$residency" ]; then accept_check_residency "$residency" "llm use: --residency"; residency="$(residency_norm "$residency")"; fi
+      local effective_res="${residency:-$(install_residency)}"
       case "$model" in ''|*[!A-Za-z0-9._:/-]*) die "llm use: --model '$model' is not a valid Ollama model name" ;; esac
       curl -fsS -m 5 "http://127.0.0.1:${port}/v1/models" 2>/dev/null | grep -q -E "\"id\":\"${model}(:[^\"]*)?\"" \
         || die "llm use: Ollama on this Mac does not list '$model' (ollama pull $model; is 'ollama serve' running on :${port}?)"
@@ -2034,6 +2131,8 @@ cmd_llm() {
       if [ -n "$host" ] && ! ollama_host_admitted "${host}:${port}"; then
         die "llm use: Ollama on loopback answers 403 to Host '${host}' — give an IP or a name ending in .local/.internal, or leave --host out"
       fi
+      local res_line="    # OpenAICompatible__DataResidency: the install declaration (llm.auto.yaml)"
+      [ -z "$residency" ] || res_line="    OpenAICompatible__DataResidency: \"${residency}\""
       mkdir -p "$LOCAL_HOME"
       ( umask 077; cat > "$LLM_FILE" ) <<YAML
 # memex-local LOCAL MODEL -- managed by \`memex-local llm\`; re-run \`use\` to change, \`off\` to delete.
@@ -2045,13 +2144,14 @@ config:
     OpenAICompatible__Endpoint: "${endpoint}"
     OpenAICompatible__DiscoverModels: "false"
     OpenAICompatible__Models__0: "${model}"
-    OpenAICompatible__DataResidency: "${residency}"
+${res_line}
     ModelTier__Utility: "Provider/OpenAICompatible/${model}"
   memex_migration:
     Embedding__Endpoint: "${endpoint}"
 YAML
       chmod 600 "$LLM_FILE"
-      ok "local model layer written: $LLM_FILE (utility tier -> ${model}, residency ${residency}, ${endpoint})"
+      ok "local model layer written: $LLM_FILE (utility tier -> ${model}, residency ${effective_res:-Unknown — none declared}, ${endpoint})"
+      [ -n "$effective_res" ] || warn "no residency declared: a model whose residency is Unknown is never used for mail triage — declare it: memex-local residency CH|Eu|… (or llm use --residency …)"
       info "the provider key is the placeholder OpenAICompatible__ApiKey in the overlay secrets (Ollama reads none, the factory refuses an empty one)"
       info "Apply it: memex-local update"
       ;;
@@ -2059,21 +2159,26 @@ YAML
       [ $# -eq 0 ] || die "llm status: unknown flag '$1'"
       if [ -f "$LLM_FILE" ]; then
         local endpoint; endpoint="$(llm_value OpenAICompatible__Endpoint)"
-        ok "LOCAL MODEL ON -- utility tier -> $(llm_value ModelTier__Utility), ${endpoint}, residency $(llm_value OpenAICompatible__DataResidency)"
+        local lres; lres="$(llm_value OpenAICompatible__DataResidency)"
+        ok "LOCAL MODEL ON -- utility tier -> $(llm_value ModelTier__Utility), ${endpoint}, residency ${lres:-$(install_residency)}${lres:+ (llm use --residency)}"
         if kubectl -n "$NAMESPACE" exec deploy/memex-portal-deployment -c memex-portal -- curl -fsS -m 5 -o /dev/null "${endpoint%/}/models" 2>/dev/null; then
           ok "the portal pod reaches the model endpoint"
         else
           warn "the portal pod does NOT reach ${endpoint} (Ollama down, or bound to loopback only? it must listen on *:11434)"
         fi
       else
-        info "the llm layer is OFF -- the default local chat model still serves (llm.auto.yaml); map the utility tier too with:  memex-local llm use [--model qwen3.8:27b-mlx] [--residency Eu]"
+        info "the llm layer is OFF -- the default local chat model still serves (llm.auto.yaml); map the utility tier too with:  memex-local llm use [--model qwen3.8:27b-mlx] [--residency CH]"
+      fi
+      local ires; ires="$(install_residency)"
+      if [ -n "$ires" ]; then ok "install residency: $ires (memex-local residency)"
+      else info "install residency: none declared — the local models read as Unknown (memex-local residency CH|Eu|…)"
       fi
       ;;
     off)
       [ $# -eq 0 ] || die "llm off: unknown flag '$1'"
       if [ -f "$LLM_FILE" ]; then rm -f "$LLM_FILE"; ok "local model OFF -- the next 'memex-local update' drops the layer"; else info "local model was not on"; fi
       ;;
-    *) die "usage: memex-local llm {use [--model <ollama-model>] [--residency Eu|Global] [--host <ip>] [--port <n>] | status | off}" ;;
+    *) die "usage: memex-local llm {use [--model <ollama-model>] [--residency Eu|Global|<ISO code>] [--host <ip>] [--port <n>] | status | off}" ;;
   esac
 }
 
@@ -4057,7 +4162,7 @@ cmd_e2e() {
 cmd_up() {
   # Registry mode runs the CI-built image — the whole point is consuming what the registry bakes
   # against — so ACR is the default there; a source build stays one flag away (--build).
-  local image_source="build" acr_tag="$ACR_DEFAULT_TAG" with_obs="no" rebuild_base="" channel="$CHANNEL" verdict
+  local image_source="build" acr_tag="$ACR_DEFAULT_TAG" with_obs="no" rebuild_base="" channel="$CHANNEL" verdict residency=""
   # Registry mode runs the CI-built image from the PUBLIC GHCR, anonymously (MacStudioFleet §2b gap 5):
   # a fleet Mac updates without Azure credentials. ACR stays one flag away (--from-acr, --channel).
   registry_mode && image_source="ghcr"
@@ -4072,13 +4177,17 @@ cmd_up() {
       --tag) shift; acr_tag="${1:?--tag needs a value}"; channel="" ;;
       --with-observability) with_obs="yes" ;;
       --rebuild-base) rebuild_base="--rebuild-base" ;;
+      --residency) shift; residency="${1:?--residency needs Eu, Global, an ISO code such as CH, or none}" ;;
       *) die "up: unknown flag '$1'" ;;
     esac
     shift
   done
 
+  # Validated BEFORE anything is installed: a typo must not cost a half-done install.
+  case "$residency" in ''|none|None|NONE|-) ;; *) accept_check_residency "$residency" "up: --residency" ;; esac
   preflight
   ensure_overlay
+  residency_onboard "$residency"                 # WHERE this machine processes prompts (asked once)
   start_colima                                   # §2
 
   case "$image_source" in                        # §3
@@ -4188,6 +4297,8 @@ cmd_status() {
   else
     warn "agent '$PLIST_LABEL' not loaded"
   fi
+  step "Residency (where the local models process prompts)"
+  cmd_residency || true
   step "Health"
   # Diagnostic: report every check, never abort the rest of `status` on a red one.
   verify_usable || true
@@ -4355,7 +4466,7 @@ autoupdate_image_source() {
 }
 
 cmd_update() {
-  local image_source="build" acr_tag="$ACR_DEFAULT_TAG" rebuild_base="" channel="$CHANNEL" verdict
+  local image_source="build" acr_tag="$ACR_DEFAULT_TAG" rebuild_base="" channel="$CHANNEL" verdict residency=""
   registry_mode && image_source="ghcr"             # §17 — same default as `up`: the public GHCR, anonymously
   [ -n "$channel" ] && image_source="acr"
   while [ $# -gt 0 ]; do
@@ -4375,6 +4486,7 @@ cmd_update() {
       # into hand-patching the live Deployment, which the next helm upgrade silently reverts.
       --skip-image) image_source="skip" ;;
       --tag) shift; acr_tag="${1:?--tag needs a value}"; channel="" ;;
+      --residency) shift; residency="${1:?--residency needs Eu, Global, an ISO code such as CH, or none}" ;;
       *) die "update: unknown flag '$1'" ;;
     esac
     shift
@@ -4393,6 +4505,8 @@ cmd_update() {
   preflight
   colima_running || die "Colima is not running — run 'memex-local up' first"
   ensure_overlay                                 # reuse the existing overlay/secrets (idempotent)
+  # update never ASKS (the autoupdate agent runs it headless); an explicit --residency is declared here.
+  [ -z "$residency" ] || residency_onboard "$residency"
   # The local model follows the product on update too: Ollama started/tuned, the default chat model pulled
   # once (an existing install gets qwen3.8 here), before helm_deploy names it.
   if [ "${MEMEX_SKIP_OLLAMA:-}" != "1" ]; then setup_ollama; fi
@@ -4828,7 +4942,7 @@ USAGE:
   memex-local <command> [flags]
 
 COMMANDS:
-  up [--build|--from-acr|--skip-image] [--tag T] [--with-observability] [--rebuild-base]
+  up [--build|--from-acr|--skip-image] [--tag T] [--with-observability] [--rebuild-base] [--residency X]
                   Bring the whole stack up (idempotent). Default image source:
                   --from-ghcr in registry mode (the public CI-built multi-arch image,
                   pulled anonymously — no Azure sign-in; --from-acr still works), --build otherwise (Option B, source → Colima's
@@ -4845,7 +4959,13 @@ COMMANDS:
                   at all (MeshWeaver#2417). Then run \`memex-local update\`. Raising
                   the plan is the registry admin's edit of this instance's grant.
                   \`off\` returns to serving a checkout (§16).
-  llm use [--model qwen3.8:27b-mlx] [--residency Eu|Global] | status | off
+  residency [<Eu|Global|ISO code, e.g. CH> | --clear]
+                  WHERE this install processes prompts: stamped on every local (Ollama) model as
+                  its data residency (OpenAICompatible__DataResidency, via llm.auto.yaml). 'up'
+                  asks once (the macOS region suggests the default); headless: up/update
+                  --residency X or MEMEX_RESIDENCY. Undeclared = Unknown, never guessed.
+                  Apply with: memex-local update --skip-image
+  llm use [--model qwen3.8:27b-mlx] [--residency Eu|Global|<ISO code>] | status | off
                   LOCAL MODEL: the Mac own Ollama also serves the portal utility tier (inbox
                   triage, reply drafts, calendar suggestions); apply with update. The default
                   chat model is the local one on every install (llm.auto.yaml, no command needed).
@@ -4937,7 +5057,7 @@ COMMANDS:
   status          colima / pods / ingress / port-forward / health.
   logs [--migration|--postgres] [--tail N] [--no-follow]
                   Tail logs (portal by default). Log level: $LOG_LEVEL.
-  update [--build|--from-acr|--skip-image] [--tag T|--channel L] [--rebuild-base]
+  update [--build|--from-acr|--skip-image] [--tag T|--channel L] [--rebuild-base] [--residency X]
                   Roll portal+migration to a newer image, then refresh forward.
                   --channel L follows a release-channel LABEL (3-latest, or 3-mac
                   once written): it is resolved to the VERSION the image reports
@@ -4994,6 +5114,8 @@ ENV OVERRIDES:
   MEMEX_COLIMA_CPU / MEMEX_COLIMA_MEM   VM sizing (default 8 / 16). Host RAM needed: the VM
                        size plus ~6 GB for macOS, plus the local model (qwen3.8 ~18 GB) —
                        about 48 GB with the defaults. See LocalColimaMac §2 "Host sizing".
+  MEMEX_RESIDENCY      Where this install processes prompts (Eu, Global, ISO code such as CH);
+                       persisted by 'up'. Unset and nobody to ask = none declared (Unknown).
   MEMEX_OLLAMA_MODEL   The default chat model 'up'/'update' pull and the portal names
                        (default qwen3.8:27b-mlx on Apple Silicon with >= 32 GB beside the
                        VM, else qwen3:8b); 'none' skips the pull on a small host.
@@ -5471,6 +5593,7 @@ main() {
     fleet)         cmd_fleet "$@" ;;
     buildhost)     cmd_buildhost "$@" ;;
     llm)           cmd_llm "$@" ;;
+    residency)     cmd_residency "$@" ;;
     publish)       cmd_publish "$@" ;;
     cert)          cmd_cert "$@" ;;
     internal)      cmd_internal "$@" ;;
