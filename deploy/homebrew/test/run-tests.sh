@@ -2039,6 +2039,20 @@ printf '  0 9:00.00 kernel_task\n  10 0:40.00 /Applications/Safari\n  11 0:15.00
 [ "$(oc 1030)" = 150 ] && ok "ownerCpuPercent = the owner's CPU-time delta over the interval, excluding Ollama (serve + llama-server), both VMs and kernel_task" || bad "ownerCpuPercent value" "$(oc 1030)"
 [ -z "$(oc 1200)" ] && ok "a gap longer than three intervals reports nothing (a stale window is not a reading)" || bad "stale gap" "$(oc 1200)"
 [ -z "$(OC_GOV="$OC/missing.sh" oc 1230)" ] && ok "no governor library to measure with → the field is absent" || bad "no governor" ""
+# the splice: only into a JSON object — a degraded host reading stays valid JSON
+osp() { env HOSTJSON="$1" MEMEX_BACKLEASE_DIR="$OC/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "%s" "$HOSTJSON"; }; owner_cpu() { printf 150; }
+  sample_models() { printf "[]"; }; sample_vm() { printf null; }; colima() { return 1; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }
+  OUT="$1"; write_sample; cat "$OUT"' "$SAMPLER" "$OC/out.json"; }
+osp '{"cores":2}' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"]=={"cores":2,"ownerCpuPercent":150}' 2>/dev/null \
+  && ok "ownerCpuPercent is spliced into the host object" || bad "splice into object" "$(osp '{"cores":2}')"
+osp 'null' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"] is None' 2>/dev/null \
+  && ok "a degraded (non-object) host reading stays valid JSON — nothing is spliced into it" || bad "splice into null" "$(osp null)"
+# a baseline that cannot be rotated is no reading, and the stamp never runs ahead of the baseline it measures from
+rm -f "$OC/dir/owner-cpu."*; printf '  10 0:50.00 /Applications/Safari\n' > "$OC/ps.now"
+oc 2000 >/dev/null; chmod 555 "$OC/dir"; r1="$(oc 2030)"; chmod 755 "$OC/dir"
+printf '  10 1:50.00 /Applications/Safari\n' > "$OC/ps.now"
+r2="$(oc 2060)"
+[ -z "$r1" ] && [ "$r2" = 100 ] && ok "a failed baseline rotation reports nothing, and the next reading divides by the baseline's own age (100 %, never doubled)" || bad "rotation failure" "r1=$r1 r2=$r2"
 rm -rf "$OC"
 
 echo "── token slots: the machine's capacity; the owner's ceiling is optional (Hosting/BackLease §14.5) ──"

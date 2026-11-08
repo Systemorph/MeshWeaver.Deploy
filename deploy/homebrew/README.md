@@ -206,8 +206,8 @@ an M5 Max at about 65 tok/s. memex-local writes `Tokens__Slots` whenever tokens 
 calibrated override (1–32), and `--token-max-concurrency <n>` is the owner's optional ceiling below it. When the
 ceiling is unset the Mac serves at its full slot count. `--token-yield-at <pct>` sets the owner-CPU threshold
 (percent of one core; the code's default is 200) and is written only when given. `none` clears either. The host
-sampler reports `host.ownerCpuPercent`: the owner's CPU over the interval, excluding Ollama, the build VM and the
-portal VM. That is what the Mac yields to.
+sampler reports `host.ownerCpuPercent`: the owner's CPU over the interval, excluding Ollama, the build VM, the
+portal VM and `kernel_task` (which can take whole cores under thermal pressure). That is what the Mac yields to.
 
 Change an answer later with `memex-local backlease accept jobs|tokens [--from …] [--off] …`,
 then `memex-local update`. `backlease status` prints the answers. They are written as

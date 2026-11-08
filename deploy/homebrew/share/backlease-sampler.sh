@@ -150,8 +150,12 @@ owner_cpu() {
       MEMEX_BUILD_PRIO_LIB=1 . "$GOVERNOR" >/dev/null 2>&1 || exit 1
       # vm_pids reads the governor's PROFILE: the build VM, then the portal's VM
       excl="$(PROFILE=build vm_pids) $(PROFILE=default vm_pids)"
-      sample_cpu "$([ "$had_prev" = yes ] && printf '%s' "$prev" || printf '/dev/null')" "$cur" "$excl"))" || return 0
-  mv -f "$cur" "$prev" 2>/dev/null; printf '%s' "$now" > "$stamp"
+      sample_cpu "$([ "$had_prev" = yes ] && printf '%s' "$prev" || printf '/dev/null')" "$cur" "$excl") 2>/dev/null)" || return 0
+  # a baseline that cannot be rotated is NO reading — the next sample starts over (never a stale baseline divided
+  # by one interval, which would report about twice the owner's CPU)
+  if ! mv -f "$cur" "$prev" 2>/dev/null || ! printf '%s' "$now" > "$stamp" 2>/dev/null; then
+    rm -f "$prev" "$stamp" 2>/dev/null; return 0
+  fi
   [ "$had_prev" = yes ] || return 0
   case "$t0" in ''|*[!0-9]*) return 0 ;; esac
   dt=$(( now - t0 ))
@@ -169,7 +173,8 @@ write_sample() {
   local host models vm m_rc v_rc colima_rc portal_rc tmp
   host="$(sample_host)"
   local owner; owner="$(owner_cpu)"
-  case "$owner" in ''|*[!0-9]*) ;; *) host="${host%\}},\"ownerCpuPercent\":$owner}" ;; esac
+  # spliced only into a JSON OBJECT: a degraded host reading (anything not ending in `}`) is written as it was
+  case "$owner" in ''|*[!0-9]*) ;; *) case "$host" in '{'*'}') host="${host%\}},\"ownerCpuPercent\":$owner}" ;; esac ;; esac
   models="$(sample_models)"; m_rc=$?
   vm="$(sample_vm)"; v_rc=$?
   colima status >/dev/null 2>&1; colima_rc=$?
