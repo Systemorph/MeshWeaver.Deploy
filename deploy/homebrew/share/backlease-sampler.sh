@@ -149,8 +149,7 @@ owner_cpu() {
       # shellcheck source=buildhost-priority.sh
       MEMEX_BUILD_PRIO_LIB=1 . "$GOVERNOR" >/dev/null 2>&1 || exit 1
       # vm_pids reads the governor's PROFILE: the build VM, then the portal's VM
-      # shellcheck disable=SC2034
-      PROFILE=build; excl="$(vm_pids)"; PROFILE=default; excl="$excl $(vm_pids)"
+      excl="$(PROFILE=build vm_pids) $(PROFILE=default vm_pids)"
       sample_cpu "$([ "$had_prev" = yes ] && printf '%s' "$prev" || printf '/dev/null')" "$cur" "$excl"))" || return 0
   mv -f "$cur" "$prev" 2>/dev/null; printf '%s' "$now" > "$stamp"
   [ "$had_prev" = yes ] || return 0
