@@ -908,6 +908,15 @@ cat > "$OWH/stubs/defaults" <<'STUB'
 k="${!#}"; v="FAKE_PREF_$k"; [ -n "${!v:-}" ] && { echo "${!v}"; exit 0; }; exit 1
 STUB
 chmod +x "$OWH/stubs/defaults"
+# Stubbed from the FIRST owner test on: a developer's own Platform SSO registration must never become a test's owner.
+# `app-sso platform -s` answers from FAKE_PSSO (a file holding its output) or fails with FAKE_PSSO_FAILS.
+cat > "$OWH/stubs/app-sso" <<'STUB'
+#!/bin/bash
+[ -n "${FAKE_PSSO_FAILS:-}" ] && { echo "app-sso: error" >&2; exit 1; }
+[ -n "${FAKE_PSSO:-}" ] && { cat "$FAKE_PSSO"; exit 0; }
+printf 'Device Configuration:\n (null)\n\nLogin Configuration:\n (null)\n\nUser Configuration:\n (null)\n'
+STUB
+chmod +x "$OWH/stubs/app-sso"
 ow() { env HOME="$OWH/home" MEMEX_LOCAL_HOME="$OWH/home/.memex-local" MEMEX_LOCAL_LIB=1 PATH="$OWH/stubs:$STUBS:$PATH" "$@"; }
 OOV="$OWH/home/.memex-local/values.local.yaml"
 seed_overlay() { cat > "$OOV" <<'YAML'
@@ -993,6 +1002,71 @@ seed_overlay
 OUT="$(ow env FAKE_PREF_OwnerId=carol FAKE_PREF_OwnerEmail=carol@example.com bash -c '. "$0"; cmd_owner --id bob' "$CLI" 2>&1 </dev/null)"
 grep -qx '    Auth__GlobalAdmins__0: "bob"' "$OOV" && ! grep -q 'carol@example.com' "$OOV" \
   && ok "an MDM's OwnerEmail (for carol) is never written for a different owner (bob)" || bad "pref email inherited" "$(cat "$OOV")"
+echo "── the DEVICE'S WORK IDENTITY: an Intune-managed Mac's Entra account is its owner and sign-in default ──"
+cat > "$OWH/psso-registered.txt" <<'TXT'
+Time: 2026-11-08 10:23:19 +0000
+
+Device Configuration:
+ {
+    accountDisplayName = "Example";
+    loginUserName = "device-not-a-user@example.com";
+}
+
+Login Configuration:
+ (null)
+
+User Configuration:
+ {
+    created = "2026-11-01 08:00:00 +0000";
+    loginUserName = "jane.roe@example.com";
+    uniqueIdentifier = "00000000-0000-0000-0000-000000000000";
+}
+
+SSO Tokens:
+ (null)
+TXT
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; work_identity' "$CLI" 2>&1)"
+[ "$OUT" = "$(printf 'jane.roe@example.com\tmanaged preference UserPrincipalName (com.memex.local)')" ] \
+  && ok "work identity: the Intune managed preference UserPrincipalName is read first" || bad "work identity (pref)" "$OUT"
+OUT="$(ow env FAKE_PSSO="$OWH/psso-registered.txt" bash -c '. "$0"; work_identity' "$CLI" 2>&1)"
+[ "$OUT" = "$(printf 'jane.roe@example.com\tPlatform SSO (app-sso platform -s)')" ] \
+  && ok "work identity: a Platform SSO registration's USER loginUserName (never the device block's)" || bad "work identity (PSSO)" "$OUT"
+OUT="$(ow env FAKE_PREF_UserPrincipalName=max.muster@example.com FAKE_PSSO="$OWH/psso-registered.txt" bash -c '. "$0"; work_identity' "$CLI" 2>&1)"
+[ "${OUT%%$'\t'*}" = "max.muster@example.com" ] && ok "work identity: the managed preference wins over Platform SSO" || bad "work identity order" "$OUT"
+OUT="$(ow bash -c '. "$0"; work_identity; echo "[end]"' "$CLI" 2>&1)"
+[ "$OUT" = "[end]" ] && ok "work identity: an unregistered Mac (no preference, PSSO all (null)) has none" || bad "work identity (absent)" "$OUT"
+OUT="$(ow env FAKE_PSSO_FAILS=1 bash -c 'set -euo pipefail; . "$0"; work_identity; echo "[end]"' "$CLI" 2>&1)"
+[ "$OUT" = "[end]" ] && ok "work identity: a failing app-sso is no identity, never an error" || bad "work identity (failure)" "$OUT"
+OUT="$(ow env FAKE_PREF_UserPrincipalName='{{userprincipalname}}' bash -c '. "$0"; work_identity; echo "[end]"' "$CLI" 2>&1)"
+[ "$OUT" = "[end]" ] && ok "work identity: an Intune token left unsubstituted is no identity" || bad "work identity (raw token)" "$OUT"
+seed_overlay
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c 'set -euo pipefail; . "$0"; ensure_owner_admin "" "" require; echo DONE' "$CLI" 2>&1 </dev/null)"
+grep -q DONE <<<"$OUT" && grep -qx '    Auth__GlobalAdmins__0: "jane.roe"' "$OOV" && grep -qx '    Instance__Owner__Email: "jane.roe@example.com"' "$OOV" \
+  && grep -qx '    Authentication__Microsoft__LoginHint: "jane.roe@example.com"' "$OOV" && grep -qx '    Authentication__Microsoft__DomainHint: "example.com"' "$OOV" \
+  && ! awk '/^secrets:/{c=1} /^config:/{c=0} c' "$OOV" | grep -q 'Hint' \
+  && ok "an unattended install on a managed Mac: the work identity is the owner (id = UPN prefix) and the Microsoft sign-in hint" || bad "work identity owner" "$OUT
+$(cat "$OOV")"
+cp "$OOV" "$OWH/before"
+ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" >/dev/null 2>&1 </dev/null
+cmp -s "$OOV" "$OWH/before" && ok "the work-identity owner and hint are idempotent" || bad "work identity re-run" "$(diff "$OWH/before" "$OOV")"
+seed_overlay
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com MEMEX_OWNER=bob MEMEX_OWNER_EMAIL=bob@example.com bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" 2>&1 </dev/null)"
+grep -qx '    Auth__GlobalAdmins__0: "bob"' "$OOV" && ! grep -q 'jane.roe' "$OOV" && ! grep -q 'LoginHint' "$OOV" \
+  && ok "an explicit owner wins over the work identity, and no hint names a different person" || bad "explicit owner vs work identity" "$OUT
+$(cat "$OOV")"
+seed_overlay
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; cmd_owner --id bob --email bob@example.com' "$CLI" 2>&1 </dev/null)"
+! grep -q 'jane.roe' "$OOV" && ok "'owner --id bob' on a Mac managed for jane: jane's e-mail is never attributed to bob" || bad "work email inherited" "$(cat "$OOV")"
+seed_overlay
+OUT="$(ow bash -c '. "$0"; ensure_owner_admin "" "" require; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+! grep -q SURVIVED <<<"$OUT" && ! grep -q 'Hint' "$OOV" && ok "no work identity: the owner rule is unchanged (an unattended install without one fails)" || bad "no identity changed the rule" "$OUT"
+seed_overlay
+ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" >/dev/null 2>&1 </dev/null
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; cmd_owner status' "$CLI" 2>&1 </dev/null)"
+grep -q "work identity: jane.roe@example.com (from managed preference UserPrincipalName" <<<"$OUT" && grep -q "sign-in hint: jane.roe@example.com" <<<"$OUT" \
+  && ok "'owner status' names the work identity, its source and the sign-in hint" || bad "owner status work identity" "$OUT"
+OUT="$(ow bash -c '. "$0"; cmd_owner status' "$CLI" 2>&1 </dev/null)"
+grep -q "work identity: none" <<<"$OUT" && ok "'owner status' says when the Mac has no work identity" || bad "owner status none" "$OUT"
 # The config section without a memex_portal map, and NOT last in the file: the map goes INSIDE config.
 printf 'secrets:\n  memex_portal:\n    X: "1"\nconfig:\n  other: "y"\ningress:\n  host: "memex.localhost"\n' > "$OOV"
 ow bash -c '. "$0"; overlay_set_portal_config Auth__GlobalAdmins__0 dave' "$CLI" >/dev/null 2>&1

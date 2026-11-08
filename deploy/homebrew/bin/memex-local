@@ -385,6 +385,42 @@ managed_pref() {
   return 0
 }
 
+# THE DEVICE'S WORK IDENTITY — the Entra account this Mac is managed for (deploy/macos/intune/README.md,
+# "Microsoft sign-in"). A Mac enrolled in Intune through Company Portal is signed in to macOS with a
+# LOCAL account; the work account it was registered with is what its instance should treat as its owner and
+# offer at sign-in. Prints "<upn><TAB><source>" or nothing; never fails, never needs admin rights. Sources,
+# first that answers:
+#   1. the managed preference UserPrincipalName in com.memex.local — an Intune profile filled with the token
+#      {{userprincipalname}} (deploy/macos/intune/profiles/com.memex.local.mobileconfig). Read from the device
+#      store, the user's managed store (/Library/Managed Preferences/<user>/), then the user domain.
+#   2. Platform SSO — `app-sso platform -s`, its "User Configuration" loginUserName, when the Mac is registered.
+# Deliberately NOT read: Company Portal's defaults (no UPN in them) and its logs (measured 2026-11-08: a
+# person's Mac logs carried a DIFFERENT person's UPN), the MDM device certificates in the keychain (they name
+# the device id only), and `profiles show -type enrollment` (root only). A token Intune did not substitute
+# ("{{userprincipalname}}") or anything that is not an address answers nothing.
+valid_work_upn() { case "$1" in *[!A-Za-z0-9._%+@-]*|*@*@*) return 1 ;; ?*@?*.?*) return 0 ;; esac; return 1; }
+# The loginUserName of the "User Configuration" block of `app-sso platform -s` on stdin, or nothing.
+platform_sso_user() {
+  awk '
+    /^[A-Za-z][A-Za-z ]*:[[:space:]]*$/ || /^[A-Za-z][A-Za-z ]*:[[:space:]]*\(null\)/ { inuser = ($0 ~ /^User Configuration:/); next }
+    inuser && /loginUserName[[:space:]]*=/ {
+      v = $0; sub(/.*loginUserName[[:space:]]*=[[:space:]]*/, "", v); gsub(/[";[:space:]]/, "", v); print v; exit
+    }'
+}
+work_identity() {
+  local v user
+  v="$(managed_pref UserPrincipalName)"
+  if [ -z "$v" ] && command -v defaults >/dev/null 2>&1; then
+    user="$(id -un 2>/dev/null)"
+    [ -n "$user" ] && v="$(defaults read "/Library/Managed Preferences/${user}/${MANAGED_PREF_DOMAIN}" UserPrincipalName 2>/dev/null)" || true
+  fi
+  if valid_work_upn "$v"; then printf '%s\tmanaged preference UserPrincipalName (%s)' "$v" "$MANAGED_PREF_DOMAIN"; return 0; fi
+  command -v app-sso >/dev/null 2>&1 || return 0
+  v="$(app-sso platform -s 2>/dev/null | platform_sso_user)" || v=""
+  if valid_work_upn "$v"; then printf '%s\tPlatform SSO (app-sso platform -s)' "$v"; fi
+  return 0
+}
+
 # The host profile must be one this file knows. An unknown one is refused here rather than read as
 # the default: a Mac mini told it is a `mac-studo` would otherwise size a 32 GiB VM it cannot hold.
 check_profile() {
@@ -2101,11 +2137,13 @@ overlay_set_portal_config() {   # $3 = "delete": remove the key instead of setti
 owner_can_ask() { [ -t 0 ] && [ -t 1 ] && [ "${HEADLESS:-}" != "1" ] && [ "${MEMEX_NO_PROMPT:-}" != "1" ]; }
 
 # One owner field: $1 explicit value, $2 env value, $3 managed-pref key, $4 overlay key, $5 question,
-# $6 suggested answer. Prints the value or nothing.
+# $6 suggested answer, $7 the value derived from the device's work identity (work_identity), used when
+# nothing above answered and before anyone is asked. Prints the value or nothing.
 owner_field() {
   local v="${1:-${2:-}}"
   [ -n "$v" ] || v="$(managed_pref "$3")"
   [ -n "$v" ] || v="$(overlay_value "$4")"
+  [ -n "$v" ] || v="${7:-}"
   if [ -z "$v" ] && owner_can_ask; then
     printf '%s%s: ' "$5" "${6:+ [$6]}" >&2
     read -r v || v=""
@@ -2117,10 +2155,18 @@ owner_field() {
 # Records the owner in the overlay (idempotent; quiet when unchanged). $1 = id, $2 = e-mail (explicit).
 # $3 = "require": an install path — no owner is a FAILURE, never an instance without an administrator.
 ensure_owner_admin() {
-  local id email have_id have_email changed=""
+  local id email have_id have_email changed="" wi wi_upn="" wi_source="" wi_id=""
+  # The device's work identity (work_identity) is the owner's default when no source above it names one: the
+  # id is the UPN's local part ({{partialupn}}), the e-mail the UPN — and only paired, as the managed
+  # preferences are: its e-mail is used only for the id it gave.
+  wi="$(work_identity)"
+  if [ -n "$wi" ]; then
+    wi_upn="${wi%%$'\t'*}"; wi_source="${wi#*$'\t'}"; wi_id="${wi_upn%%@*}"
+    valid_owner_id "$wi_id" || wi_id=""
+  fi
   id="$(owner_field "${1:-}" "${MEMEX_OWNER:-}" OwnerId "$OWNER_ID_KEY" \
         "The instance's OWNER becomes its global administrator. Your MeshWeaver user id (the id you sign in as, not your e-mail)" \
-        "$(id -un 2>/dev/null)")"
+        "$(id -un 2>/dev/null)" "$wi_id")"
   [ -n "$id" ] || id="$(overlay_value "$OWNER_KEY")"   # an install that recorded only the admin key (before Instance__Owner__*)
   if [ -z "$id" ]; then
     # "require": an onboarding (fleet join) — always. "require-fresh": `up`, which the unattended daemon also
@@ -2142,7 +2188,9 @@ ensure_owner_admin() {
   pref_id="$(managed_pref OwnerId)"
   # A lone OwnerEmail (no OwnerId beside it) was recorded for nobody, so it is ignored as well.
   if [ "$pref_id" != "$id" ]; then email_pref="__no_such_pref__"; fi
-  email="$(owner_field "${2:-}" "${MEMEX_OWNER_EMAIL:-}" "$email_pref" "$email_key" "The owner's e-mail (the account they sign in with)" "")"
+  local wi_email=""
+  [ -n "$wi_id" ] && [ "$wi_id" = "$id" ] && wi_email="$wi_upn"
+  email="$(owner_field "${2:-}" "${MEMEX_OWNER_EMAIL:-}" "$email_pref" "$email_key" "The owner's e-mail (the account they sign in with)" "" "$wi_email")"
   if [ -n "$email" ] && ! valid_owner_email "$email"; then die "owner: '$email' is not an e-mail address"; fi
   # The owner is an id AND an e-mail (the e-mail is what the portal matches the signed-in account against).
   # Where an owner is required, so is the e-mail; elsewhere a missing one is a warning.
@@ -2163,6 +2211,28 @@ ensure_owner_admin() {
   else
     info "instance owner (global administrator): $id${email:+ <$email>}"
   fi
+  ensure_work_sign_in_hint "$wi_upn" "$wi_source" "$email"
+}
+
+# The Microsoft sign-in hint for this Mac's work account: Authentication__Microsoft__LoginHint (the UPN) and
+# __DomainHint (its domain), which the portal sends as login_hint / domain_hint so Microsoft offers that
+# account and never silently picks a personal one. Written only when the device HAS a work identity and it IS
+# the owner's e-mail — a hint for anyone else would pre-fill the wrong account on the owner's instance.
+# $1 = UPN, $2 = its source, $3 = the owner's e-mail. Idempotent, in place, this install's own overlay only.
+readonly LOGIN_HINT_KEY="Authentication__Microsoft__LoginHint"
+readonly DOMAIN_HINT_KEY="Authentication__Microsoft__DomainHint"
+ensure_work_sign_in_hint() {
+  local upn="${1:-}" source="${2:-}" owner_email="${3:-}" domain
+  [ -n "$upn" ] || return 0
+  if [ "$(printf '%s' "$owner_email" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$upn" | tr '[:upper:]' '[:lower:]')" ]; then
+    info "this Mac's work account ${upn} (${source}) is not the owner's e-mail — no Microsoft sign-in hint written"
+    return 0
+  fi
+  domain="${upn#*@}"
+  if [ "$(overlay_value "$LOGIN_HINT_KEY")" = "$upn" ] && [ "$(overlay_value "$DOMAIN_HINT_KEY")" = "$domain" ]; then return 0; fi
+  overlay_set_portal_config "$LOGIN_HINT_KEY" "$upn"
+  overlay_set_portal_config "$DOMAIN_HINT_KEY" "$domain"
+  ok "Microsoft sign-in offers this Mac's work account ${upn} (from ${source}) — applied by the next deploy"
 }
 
 cmd_owner() {
@@ -2172,6 +2242,11 @@ cmd_owner() {
       local have; have="$(overlay_value "$OWNER_KEY")"
       if [ -n "$have" ]; then ok "instance OWNER (global administrator): $have${have:+ $(e="$(overlay_value "$OWNER_EMAIL_KEY")"; [ -n "$e" ] && printf '<%s>' "$e")}"
       else warn "no OWNER — memex-local owner --id <user-id> --email <e-mail>"; fi
+      local wi; wi="$(work_identity)"
+      if [ -n "$wi" ]; then info "this Mac's work identity: ${wi%%$'\t'*} (from ${wi#*$'\t'})"
+      else info "this Mac's work identity: none (no managed preference UserPrincipalName, no Platform SSO registration)"; fi
+      local hint; hint="$(overlay_value "$LOGIN_HINT_KEY")"
+      [ -n "$hint" ] && info "Microsoft sign-in hint: $hint"
       return 0 ;;
   esac
   while [ $# -gt 0 ]; do
@@ -5179,7 +5254,9 @@ COMMANDS:
                   Auth__GlobalAdmins__0 + Instance__Owner__Id/Email in this install's own overlay
                   (idempotent; this command is how it changes later). up / fleet join take
                   --owner/--owner-email, MEMEX_OWNER / MEMEX_OWNER_EMAIL or the managed preferences
-                  OwnerId / OwnerEmail, and ask on a terminal; an unattended install without one FAILS.
+                  OwnerId / OwnerEmail, then the Mac's WORK IDENTITY (managed preference
+                  UserPrincipalName or Platform SSO: id = its prefix, e-mail = the UPN, plus the Microsoft
+                  sign-in hint), and ask on a terminal; an unattended install without one FAILS.
   profile         The effective host profile: VM size, model, channel, running version.
   channel <L>     Resolve a channel label to the version it names now (no deploy).
   help | version

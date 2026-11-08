@@ -1,0 +1,36 @@
+{
+  "@odata.type": "#microsoft.graph.macOSDeviceFeaturesConfiguration",
+  "displayName": "Fleet — Microsoft Enterprise SSO (macOS)",
+  "description": "Microsoft Enterprise SSO plug-in, Redirect type (Company Portal). Source: MeshWeaver.Deploy deploy/macos/intune/profiles/microsoft-enterprise-sso.mobileconfig",
+  "macOSSingleSignOnExtension": {
+    "@odata.type": "#microsoft.graph.macOSRedirectSingleSignOnExtension",
+    "extensionIdentifier": "com.microsoft.CompanyPortalMac.ssoextension",
+    "teamIdentifier": "UBF8T346G9",
+    "urlPrefixes": [
+      "https://login.microsoftonline.com",
+      "https://login.microsoft.com",
+      "https://sts.windows.net",
+      "https://login.partner.microsoftonline.cn",
+      "https://login.chinacloudapi.cn",
+      "https://login.microsoftonline.us",
+      "https://login-us.microsoftonline.com"
+    ],
+    "configurations": [
+      {
+        "@odata.type": "#microsoft.graph.keyIntegerValuePair",
+        "key": "browser_sso_interaction_enabled",
+        "value": 1
+      },
+      {
+        "@odata.type": "#microsoft.graph.keyIntegerValuePair",
+        "key": "disable_explicit_app_prompt",
+        "value": 1
+      },
+      {
+        "@odata.type": "#microsoft.graph.keyStringValuePair",
+        "key": "AppPrefixAllowList",
+        "value": "com.apple.,com.microsoft.,cloud.meshweaver."
+      }
+    ]
+  }
+}

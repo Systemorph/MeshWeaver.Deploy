@@ -33,6 +33,7 @@ on:
   pull_request:
     paths:
       - deploy/macos/**
+      - deploy/ios/**
       - deploy/homebrew/**
       - deploy/helm/**
       - .github/workflows/macos-pkg.yml
@@ -40,6 +41,7 @@ on:
     branches: [main]
     paths:
       - deploy/macos/**
+      - deploy/ios/**
       - deploy/homebrew/**
       - deploy/helm/**
       - .github/workflows/macos-pkg.yml
