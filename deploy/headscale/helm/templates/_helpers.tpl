@@ -56,6 +56,47 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- if or (eq (toString .Values.host) (toString .Values.dns.baseDomain)) (hasSuffix (printf ".%s" .Values.dns.baseDomain) (toString .Values.host)) }}
 {{- fail (printf "dns.baseDomain %q contains host %q — MagicDNS would shadow the control server's own name" .Values.dns.baseDomain .Values.host) }}
 {{- end }}
+{{- /* dns.extraRecords — one record per name, served by MagicDNS to every member (Headscale dns.extra_records).
+       A Tailscale client matches MagicDNS names EXACTLY (no wildcards), so a name a machine serves beside its
+       own (another instance on the same Mac) needs its own record. Inside dns.baseDomain only: that zone is
+       the one MagicDNS answers authoritatively; a record outside it would shadow a public name. */}}
+{{- $seen := dict }}
+{{- range $i, $r := (.Values.dns.extraRecords | default list) }}
+{{- if not (kindIs "map" $r) }}
+{{- fail (printf "dns.extraRecords[%d] is not a {name, type, value} map" $i) }}
+{{- end }}
+{{- $n := toString ($r.name | default "") }}
+{{- $t := toString ($r.type | default "") }}
+{{- $v := toString ($r.value | default "") }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+$" $n) }}
+{{- fail (printf "dns.extraRecords[%d]: name %q is not a lower-case DNS name (no wildcards — Tailscale clients match MagicDNS names exactly)" $i $n) }}
+{{- end }}
+{{- if not (hasSuffix (printf ".%s" $.Values.dns.baseDomain) $n) }}
+{{- fail (printf "dns.extraRecords[%d]: name %q is not inside dns.baseDomain %q — MagicDNS answers that zone only, and a record outside it would shadow a public name" $i $n (toString $.Values.dns.baseDomain)) }}
+{{- end }}
+{{- if eq $n (toString $.Values.host) }}
+{{- fail (printf "dns.extraRecords[%d]: name %q is the control server's own host" $i $n) }}
+{{- end }}
+{{- if eq $t "A" }}
+{{- if not (regexMatch "^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$" $v) }}
+{{- fail (printf "dns.extraRecords[%d] (%s): value %q is not an IPv4 address" $i $n $v) }}
+{{- end }}
+{{- else if eq $t "AAAA" }}
+{{- if not (regexMatch "^[0-9a-fA-F:]+$" $v) }}
+{{- fail (printf "dns.extraRecords[%d] (%s): value %q is not an IPv6 address" $i $n $v) }}
+{{- end }}
+{{- if not (contains ":" $v) }}
+{{- fail (printf "dns.extraRecords[%d] (%s): value %q is not an IPv6 address" $i $n $v) }}
+{{- end }}
+{{- else }}
+{{- fail (printf "dns.extraRecords[%d] (%s): type %q — only A and AAAA are served" $i $n $t) }}
+{{- end }}
+{{- $key := printf "%s/%s" $n $t }}
+{{- if hasKey $seen $key }}
+{{- fail (printf "dns.extraRecords: %s %s is declared twice" $n $t) }}
+{{- end }}
+{{- $_ := set $seen $key true }}
+{{- end }}
 {{- if .Values.ingress.enabled }}
 {{- if not .Values.ingress.className }}
 {{- fail "ingress.className is required when ingress.enabled" }}
