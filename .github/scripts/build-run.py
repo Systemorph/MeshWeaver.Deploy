@@ -4332,9 +4332,20 @@ class Host:
                 if w is not None:
                     w.collect()
             return
+        if not tip_now:
+            return                                         # the mirror names no tip: nothing to warm, no generation copied
         failed = self.warm_failed.get(repo)
         if failed is not None and failed[:2] == (tip_now, key) and time.monotonic() - failed[2] < WARM_RETRY_SECONDS:
             return                                         # cooling down: no generation is copied for a build that won't run
+        try:
+            self._warm_shared_as_writer(tree, repo, key, tip_now)
+        except (Refusal, subprocess.SubprocessError, OSError, ValueError) as e:
+            # warming never raises (warm_main_when_idle): a full or read-only shared volume during a stage or a publish is
+            # said, cooled down, and retried after the pause
+            self.warm_failed[repo] = (tip_now, key, time.monotonic())
+            self.log(f"shared tree: {repo} not warmed ({type(e).__name__}: {str(e)[:200]}) — retried when idle")
+
+    def _warm_shared_as_writer(self, tree: "SharedTree", repo: str, key: str, tip_now: str) -> None:
         with tree.writer() as w:
             if w is None:
                 return                                     # another replica is the writer: it warms, this one does not
@@ -4347,13 +4358,17 @@ class Host:
                 self.warm_failed[repo] = (tip_now, key, time.monotonic())
                 self.log(f"shared tree: {repo} not staged ({e})")
                 return
-            outcome = self._warm_one(repo, key, w.warm_of(gen))
-            if outcome == "built":
-                w.publish(gen)
-                self.log(f"shared tree: {repo} generation {os.path.basename(gen)} published")
-            else:
-                w.discard(gen)
-                w.collect()
+            try:
+                outcome = self._warm_one(repo, key, w.warm_of(gen))
+                if outcome == "built":
+                    w.publish(gen)
+                    self.log(f"shared tree: {repo} generation {os.path.basename(gen)} published")
+                    return
+            except BaseException:
+                w.discard(gen)                             # never leave a staged generation behind a failure
+                raise
+            w.discard(gen)
+            w.collect()
 
     def _mirror_tip(self, repo: str) -> str:
         mirror = os.path.join(self.cache, "git", f"{repo}.git")
@@ -4368,93 +4383,91 @@ class Host:
     def _warm_one(self, repo: str, key: str, warm: str) -> str:
         """Advance `warm` to the default branch's tip and run the tip's warmBuild in it. Returns "built" (the tip's build
         or a sources-only tree are in place), "skipped" (already warm, or cooling down) or "failed"/"stopped"."""
-        if True:
-            scratch = tempfile.mkdtemp(prefix=".warm-", dir=self.work)
-            tip = ""
-            try:
-                mirror = os.path.join(self.cache, "git", f"{repo}.git")
-                # the tip as the runs last fetched it into the mirror (with their token): the idle path uses no network
-                genv = {**{k: self.env[k] for k in ("PATH", "LANG") if self.env.get(k)}, "HOME": scratch, "GIT_TERMINAL_PROMPT": "0"}
-                rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", "HEAD^{commit}"], genv)
-                tip = out.strip().splitlines()[-1].strip().lower() if rc == 0 and out.strip() else ""
-                if not SHA.match(tip):
-                    return "skipped"
-                st = warm_state(warm)
-                if st is not None and st.get("key") == key and st.get("tip") == tip and st.get("built") in (tip, "none"):
-                    return "skipped"
-                failed = self.warm_failed.get(repo)
-                if failed is not None and failed[:2] == (tip, key) and time.monotonic() - failed[2] < WARM_RETRY_SECONDS:
-                    return "skipped"
-                self.log(advance_warm_main(repo, tip, warm, self.env, self.log, key, deadline=time.monotonic() + 600))
-                moved = warm_state(warm)
-                if moved is None or moved.get("key") != key or moved.get("tip") != tip:
-                    # the advancement did not produce this tip under this key (it wiped and said why): nothing is read from
-                    # the tree and the tip is NOT marked handled — it is retried after a pause, so a run is not left cloning
-                    self.warm_failed[repo] = (tip, key, time.monotonic())
-                    return "failed"
-                try:
-                    with open(os.path.join(warm, ".github", "build-stages.json")) as fh:
-                        decl = validate_warm_build(json.load(fh))
-                except (OSError, ValueError, Refusal) as e:
-                    self.log(f"warm main workspace: the tip {tip[:12]} declares no usable warmBuild ({e}) — sources only")
-                    decl = None
-                if decl is None:
-                    write_warm_state(warm, {"key": key, "tip": tip, "built": "none"})
-                    self.warm_failed.pop(repo, None)
-                    return "built"
-                # the image's PREPARED inputs, resolved for THIS build: `run_env` is the run's, and it is empty while idle
-                prepared = prepared_env()
-                extra = {**self.platform_env(), **prepared, "MW_BUILD_REPO": repo}
-                extra.pop("MW_PLATFORM_SOURCE", None)
-                writable = []
-                warm_binds = []
-                platform_src = self.env.get("MW_PLATFORM_SOURCE", "") or prepared.get("MW_PLATFORM_SOURCE", "")
-                if platform_src and os.path.isdir(platform_src):
-                    psrc = os.path.join(scratch, "platform")
-                    writable_platform_source(platform_src, psrc)
-                    # the writable copy appears AT the prepared tree's own path — the path a run's stages are handed — so a
-                    # warm build that names the platform by MW_PLATFORM_SOURCE records the same platform paths in obj/ as
-                    # a run does (a later bind hides the read-only one beneath it). The copy and its outputs are the warm
-                    # build's and are discarded with its scratch: a repository that wants platform OUTPUTS reused clones
-                    # the platform into its checkout, under the warm tree (MeshWeaver.Plugins scripts/host-warm-build.sh).
-                    extra["MW_PLATFORM_SOURCE"] = platform_src
-                    warm_binds.append((psrc, platform_src))
-                out_dir = os.path.join(scratch, "out")
-                os.makedirs(out_dir)
-                started = self.clock()
-                write_warm_state(warm, {"key": key, "tip": tip, "built": "building"})
-                warm_nuget_dir = os.path.join(scratch, "nuget")
-                os.makedirs(warm_nuget_dir, exist_ok=True)
-                extra["NUGET_PACKAGES"] = SANDBOX_NUGET
-                rc, text = self._sandboxed_capture(decl["command"], warm, out_dir, scratch, extra,
-                                                   [mirror, os.path.join(self.cache, "nuget")], writable, decl["timeoutMinutes"] * 60,
-                                                   cancel=self.warm_cancel, mount=SANDBOX_CHECKOUT,
-                                                   binds=[(warm_nuget_dir, SANDBOX_NUGET), *warm_binds])
-                if rc == 0:
-                    write_warm_state(warm, {"key": key, "tip": tip, "built": tip})
-                    self.warm_failed.pop(repo, None)
-                    self.log(f"warm main workspace: built main@{tip[:12]} with the tip's warmBuild in {int(self.clock() - started)} s")
-                    return "built"
-                else:
-                    wipe_warm(warm)
-                    # the cooldown covers a failed BUILD too: an unchanged failing tip is not prepared and rebuilt every pass
-                    self.warm_failed[repo] = (tip, key, time.monotonic())
-                    self.log(f"warm main workspace: the tip's warmBuild failed (exit {rc}) — wiped, retried when idle: {text.strip()[-300:]}")
-                    return "failed"
-            except Lost:
-                # a claim (or SIGTERM) needs the host: the half-built workspace is wiped, never copied by a run
-                wipe_warm(warm)
-                self.log(f"warm main workspace for {repo}: the warm build was stopped for a claim — wiped, retried when idle")
-                return "stopped"
-            except (Refusal, subprocess.SubprocessError, OSError, ValueError) as e:
-                wipe_warm(warm)
-                if SHA.match(tip):
-                    self.warm_failed[repo] = (tip, key, time.monotonic())
-                self.log(f"warm main workspace for {repo}: not warmed ({type(e).__name__}: {str(e)[:200]}) — wiped, retried when idle")
+        scratch = tempfile.mkdtemp(prefix=".warm-", dir=self.work)
+        tip = ""
+        try:
+            mirror = os.path.join(self.cache, "git", f"{repo}.git")
+            # the tip as the runs last fetched it into the mirror (with their token): the idle path uses no network
+            genv = {**{k: self.env[k] for k in ("PATH", "LANG") if self.env.get(k)}, "HOME": scratch, "GIT_TERMINAL_PROMPT": "0"}
+            rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", "HEAD^{commit}"], genv)
+            tip = out.strip().splitlines()[-1].strip().lower() if rc == 0 and out.strip() else ""
+            if not SHA.match(tip):
+                return "skipped"
+            st = warm_state(warm)
+            if st is not None and st.get("key") == key and st.get("tip") == tip and st.get("built") in (tip, "none"):
+                return "skipped"
+            failed = self.warm_failed.get(repo)
+            if failed is not None and failed[:2] == (tip, key) and time.monotonic() - failed[2] < WARM_RETRY_SECONDS:
+                return "skipped"
+            self.log(advance_warm_main(repo, tip, warm, self.env, self.log, key, deadline=time.monotonic() + 600))
+            moved = warm_state(warm)
+            if moved is None or moved.get("key") != key or moved.get("tip") != tip:
+                # the advancement did not produce this tip under this key (it wiped and said why): nothing is read from
+                # the tree and the tip is NOT marked handled — it is retried after a pause, so a run is not left cloning
+                self.warm_failed[repo] = (tip, key, time.monotonic())
                 return "failed"
-            finally:
-                shutil.rmtree(scratch, ignore_errors=True)
-        return "failed"
+            try:
+                with open(os.path.join(warm, ".github", "build-stages.json")) as fh:
+                    decl = validate_warm_build(json.load(fh))
+            except (OSError, ValueError, Refusal) as e:
+                self.log(f"warm main workspace: the tip {tip[:12]} declares no usable warmBuild ({e}) — sources only")
+                decl = None
+            if decl is None:
+                write_warm_state(warm, {"key": key, "tip": tip, "built": "none"})
+                self.warm_failed.pop(repo, None)
+                return "built"
+            # the image's PREPARED inputs, resolved for THIS build: `run_env` is the run's, and it is empty while idle
+            prepared = prepared_env()
+            extra = {**self.platform_env(), **prepared, "MW_BUILD_REPO": repo}
+            extra.pop("MW_PLATFORM_SOURCE", None)
+            writable = []
+            warm_binds = []
+            platform_src = self.env.get("MW_PLATFORM_SOURCE", "") or prepared.get("MW_PLATFORM_SOURCE", "")
+            if platform_src and os.path.isdir(platform_src):
+                psrc = os.path.join(scratch, "platform")
+                writable_platform_source(platform_src, psrc)
+                # the writable copy appears AT the prepared tree's own path — the path a run's stages are handed — so a
+                # warm build that names the platform by MW_PLATFORM_SOURCE records the same platform paths in obj/ as
+                # a run does (a later bind hides the read-only one beneath it). The copy and its outputs are the warm
+                # build's and are discarded with its scratch: a repository that wants platform OUTPUTS reused clones
+                # the platform into its checkout, under the warm tree (MeshWeaver.Plugins scripts/host-warm-build.sh).
+                extra["MW_PLATFORM_SOURCE"] = platform_src
+                warm_binds.append((psrc, platform_src))
+            out_dir = os.path.join(scratch, "out")
+            os.makedirs(out_dir)
+            started = self.clock()
+            write_warm_state(warm, {"key": key, "tip": tip, "built": "building"})
+            warm_nuget_dir = os.path.join(scratch, "nuget")
+            os.makedirs(warm_nuget_dir, exist_ok=True)
+            extra["NUGET_PACKAGES"] = SANDBOX_NUGET
+            rc, text = self._sandboxed_capture(decl["command"], warm, out_dir, scratch, extra,
+                                               [mirror, os.path.join(self.cache, "nuget")], writable, decl["timeoutMinutes"] * 60,
+                                               cancel=self.warm_cancel, mount=SANDBOX_CHECKOUT,
+                                               binds=[(warm_nuget_dir, SANDBOX_NUGET), *warm_binds])
+            if rc == 0:
+                write_warm_state(warm, {"key": key, "tip": tip, "built": tip})
+                self.warm_failed.pop(repo, None)
+                self.log(f"warm main workspace: built main@{tip[:12]} with the tip's warmBuild in {int(self.clock() - started)} s")
+                return "built"
+            else:
+                wipe_warm(warm)
+                # the cooldown covers a failed BUILD too: an unchanged failing tip is not prepared and rebuilt every pass
+                self.warm_failed[repo] = (tip, key, time.monotonic())
+                self.log(f"warm main workspace: the tip's warmBuild failed (exit {rc}) — wiped, retried when idle: {text.strip()[-300:]}")
+                return "failed"
+        except Lost:
+            # a claim (or SIGTERM) needs the host: the half-built workspace is wiped, never copied by a run
+            wipe_warm(warm)
+            self.log(f"warm main workspace for {repo}: the warm build was stopped for a claim — wiped, retried when idle")
+            return "stopped"
+        except (Refusal, subprocess.SubprocessError, OSError, ValueError) as e:
+            wipe_warm(warm)
+            if SHA.match(tip):
+                self.warm_failed[repo] = (tip, key, time.monotonic())
+            self.log(f"warm main workspace for {repo}: not warmed ({type(e).__name__}: {str(e)[:200]}) — wiped, retried when idle")
+            return "failed"
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
 
     # -- step 3/4: run ----------------------------------------------------------------------
     def run(self, claim: dict) -> str:
@@ -7070,7 +7083,7 @@ def self_test() -> int:
             def warm_stub(h_, name_):
                 def stub(repo_, key_, warm_):
                     warmed.append(name_)
-                    with SharedTree(hcache, repo_).writer() as again:
+                    with SharedTree(h_.cache, repo_).writer() as again:
                         check(f"shared/{name_} warms only while it IS the writer (a second lock attempt fails)", again is None)
                     os.makedirs(os.path.join(warm_, "src"), exist_ok=True)
                     open(os.path.join(warm_, "src", "a.cs"), "w").write(name_)
@@ -7091,6 +7104,29 @@ def self_test() -> int:
             with SharedTree(hcache, "R").reader() as seen:
                 check("shared/the other host's run reads the published generation", seen is not None
                       and open(os.path.join(seen, "src", "a.cs")).read() == "A")
+            # a full / read-only shared volume during the publish: said, cooled down, the staged generation removed — never raised
+            hcache2 = os.path.join(tmp, "shared-hosts-enospc")
+            hc = host(_FakeApi({}), env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_SHARED_TREE="true", MW_BUILD_CACHE=hcache2))
+            hc._warm_one = warm_stub(hc, "C")
+            hc._mirror_tip = lambda repo_: "u" * 40
+            real_publish = SharedTree.publish
+            SharedTree.publish = lambda self_, gen_: (_ for _ in ()).throw(OSError(28, "No space left on device"))
+            try:
+                hc._warm_shared("R", warm_key(hc.env, hc.identity))
+                raised = None
+            except BaseException as e_:
+                raised = e_
+            finally:
+                SharedTree.publish = real_publish
+            check("shared/a publish that fails (ENOSPC) never raises, cools down and leaves no staged generation",
+                  raised is None and hc.warm_failed.get("R", ("",))[0] == "u" * 40
+                  and os.listdir(SharedTree(hcache2, "R").gens) == [], (raised, hc.warm_failed, os.listdir(SharedTree(hcache2, "R").gens)))
+            hd = host(_FakeApi({}), env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_SHARED_TREE="true", MW_BUILD_CACHE=hcache2))
+            staged_: list = []
+            hd._warm_one = lambda *a_: staged_.append(1) or "built"
+            hd._mirror_tip = lambda repo_: ""
+            hd._warm_shared("R", warm_key(hd.env, hd.identity))
+            check("shared/a mirror that names no tip stages nothing", staged_ == [] and os.listdir(SharedTree(hcache2, "R").gens) == [], staged_)
             # the warm build's platform copy appears at the prepared tree's own path, never at its scratch path
             plat = os.path.join(wroot, "prepared-platform")
             os.makedirs(plat, exist_ok=True)
