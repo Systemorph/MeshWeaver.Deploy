@@ -821,7 +821,7 @@ lm env MEMEX_OLLAMA_MODEL= bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/n
 grep -q 'ContextWindowTokens' "$AUTO" && bad "a model Ollama cannot load still got a window declared (a guess)" "$(cat "$AUTO")" \
   || ok "a model Ollama cannot load gets NO window (undeclared and logged, never guessed)"
 : > "$OVL"
-lm env MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+lm env MEMEX_OLLAMA_MODEL=none MEMEX_EMBED_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
 grep -q 'Models__0\|AI__Tiers' "$AUTO" && bad "MEMEX_OLLAMA_MODEL=none still names a model" "$(cat "$AUTO")" || ok "MEMEX_OLLAMA_MODEL=none names no model"
 # …and writes no empty `memex_portal:` (a YAML null that helm merges by DELETING every tracked default).
 if command -v helm >/dev/null 2>&1; then
