@@ -33,19 +33,19 @@ buildHosts:
   # Fan-out within a replica: 4 stages of a `parallel` run at once within its 4 CPU / 24 GiB limit; the chart default (8)
   # would exceed the replica's cgroup, and the runner refuses to start on that.
   stageSlots: 4
-  # The warm workspace (Hosting/BuildQueue.md §7.2): the Mac measures it first, before any cluster host turns it on. Each
-  # replica's warm copy lives under its work volume (the 40 GiB above), beside the run's disposable copy.
+  # The warm workspace (Hosting/BuildQueue.md §7.3b): one master per host (the cache's bare mirrors) and one persistent
+  # worktree per repository for this host's deployment, advanced in place by its single writer — nothing is ever copied.
   warmWorkspace: true
   # The module-hub broker (Hosting/BuildQueue.md §7.4): the host asks control's per-module build hubs for each module a
   # `modules` stage names — a Hit is fetched and verified instead of built, a Grant is built once and handed back by its
   # hash. The Mac measures it first, with the warm workspace; inert until a repository's default branch declares `moduleHub`.
   moduleHub: true
-  # The shared tree (Hosting/BuildQueue.md §7.3): ONE warm main tree per repository on the cache volume every replica on
-  # this node mounts, so every replica starts warm and a roll keeps it (a per-replica tree lived in the pod's work volume
-  # and was lost on every roll — measured 2026-11-08).
+  # The shared tree switch (§7.3b): the deployment trees live on the cache volume every replica on this node mounts, so every
+  # replica starts warm and a roll keeps them (a per-replica tree in the pod's work volume was lost on every roll).
   sharedTree: true
-  # The run overlay (Hosting/BuildQueue.md §7.3b): each run mounts the shared generation read-only and writes only its
-  # delta — no 18 GiB copy per run, and no run can write the shared tree (measured 2026-11-08: 32 s → 3 s, 18 GiB → 20 KiB).
+  # The run overlay (Hosting/BuildQueue.md §7.3b): each run mounts its deployment tree read-only and writes only its delta;
+  # a busy, unbuilt or refused tree gives a cold worktree off the master, said — never a copy (measured 2026-11-08: 32 s → 3 s,
+  # 18 GiB → 20 KiB).
   runOverlay: true
   cacheClaimName: "build-cache-mac"
   # The Mac's only class is node-local; the replicas share it on the one node (ReadWriteOnce is per node).

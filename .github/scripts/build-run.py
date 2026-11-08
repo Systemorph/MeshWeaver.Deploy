@@ -2913,16 +2913,6 @@ def prepared_env(root: str = PREPARED_ROOT, tester: str = TESTER_APP) -> dict:
     return env
 
 
-def writable_platform_source(platform_src: str, dest: str) -> str:
-    """A WRITABLE copy of the host's platform source (MW_PLATFORM_SOURCE, read-only in the image) at `dest`, for a
-    repository-declared command that builds or restores projects referencing the platform: MSBuild writes their obj/
-    (project.assets.json, the restore graph) and bin/ into that tree, and the image's copy is read-only. Replaces
-    whatever `dest` held; the caller binds it writable and removes it afterwards. Raises OSError (shutil.Error is one)."""
-    shutil.rmtree(dest, ignore_errors=True)
-    shutil.copytree(platform_src, dest, symlinks=True)
-    return dest
-
-
 ARTIFACT_UNIT_MAX = 200   # the store's receipt locator holds 512 characters; the repo, sha, run, stage and hash take ~200
 
 
@@ -3367,9 +3357,7 @@ def default_checkout(repo: str, sha: str, refs: list, dest: str, token: Optional
 def _update_mirror(repo: str, url: str, mirror_root: str, mirror: str, wanted: list, git: Callable[..., None],
                    log: Callable[[str], None]) -> None:
     """Create or fetch the shared mirror under its exclusive lock, then fetch the wanted refs into it."""
-    os.makedirs(mirror_root, exist_ok=True)
-    with open(os.path.join(mirror_root, f".{repo}.lock"), "w") as lock:
-        _flock(lock)
+    with master_lock(mirror_root, repo):
         if not os.path.isfile(os.path.join(mirror, "HEAD")):
             tmp = tempfile.mkdtemp(prefix=f".{repo}-", dir=mirror_root)
             try:
@@ -3384,30 +3372,34 @@ def _update_mirror(repo: str, url: str, mirror_root: str, mirror: str, wanted: l
         git("-C", mirror, "fetch", "--quiet", "origin", *wanted)
 
 
-# ───────────────────────────────── the warm workspace (Plugins Hosting/BuildQueue.md §7.2) ─────────────────────
+# ───────────────────── one master, a worktree per deployment — nothing is ever copied (Plugins Hosting/BuildQueue.md §7.3b) ─────
 #
-# Owner, 2026-11-07: "a consistently checked out state on the file system of the pod … keep updating the parts of the
-# git repos and use dotnet build with correct caching". With MW_BUILD_WARM_WORKSPACE=true:
-#   * ONE warm MAIN workspace per repository per replica, `<work>/.warm/<repo>`, written ONLY by the host and ONLY from the
-#     default branch: while the host is idle it moves the workspace to the mirror's tip (fetch, checkout --force --detach,
-#     reset --hard, `git clean -ffdx` except obj/ and bin/) and runs the TIP's own declared `warmBuild` command in it, in
-#     the sandbox, once per (tip, key) — as the warm NuGet cache is filled from the tip, never from a run's content
-#     (StandingBuildHosts §4: a pull request never writes a shared cache);
-#   * EVERY run gets a disposable COPY of it in its own workdir (`cp -a --reflink=auto`), moves the copy to its exact sha
-#     the same way and builds incrementally in the copy; the copy goes with the workdir, so no run can poison, or even see,
-#     what a later run reads. A run's compiler servers end with its stage sandbox (the pid-namespace leftover check).
-# The warm workspace is WIPED whenever its key (the platform set, the framework identity and the images the host runs)
-# changes; any failure of the warm path falls back to a fresh clone, said. Every run states what it got:
-# `workspace: incremental copy of main@<tip> (…) moved to <sha>` or `workspace: clean (why)`.
-WARM_DIR = ".warm"
-WARM_PRIVATE = ".warm-host"
-WARM_RETRY_SECONDS = 600.0   # a failed warm advancement is retried after this, never on every idle pass     # under <work>: host-only git directories and state; never bound into any sandbox
+# Maintainer, 2026-11-08: "we must see that we keep on file share without any copying" · "only git fetch / worktrees / etc"
+# · "we can even have one master checkout" · "and then worktree per deployment". With MW_BUILD_WARM_WORKSPACE=true:
+#   * the MASTER is the host's bare mirror per repository, `<cache>/git/<repo>.git` (`_update_mirror`), written only by
+#     `git fetch`; ONE master lock (`master_lock`, the mirror's flock) serialises fetch, `git worktree add`, `remove`, `prune`;
+#   * ONE persistent worktree per repository per DEPLOYMENT (the host's lane plus its `warm_key`):
+#     `<cache>/deploy/<deployment>/<repo>`, a `git worktree add --detach` of the master. Its single WRITER (an exclusive,
+#     NON-blocking flock on the tree's lock — taken only while no reader holds it) advances it IN PLACE while idle:
+#     `checkout --detach -f <tip>` (only changed files are rewritten), `clean` keeping obj/ and bin/, the tip's `warmBuild`,
+#     then the integrity manifest and the state, before the lock is released. A failed build leaves it "not built";
+#   * a RUN takes a SHARED non-blocking flock on that tree for its WHOLE life, verifies state and manifest and mounts the tree
+#     as the read-only LOWER of an overlay (its own upper takes every write); its `.git` is made by git (`init`, alternates
+#     to the master, `read-tree`), never copied — not even the index;
+#   * the ONLY fallback (lock busy, nothing built, integrity refused, a host that cannot overlay) is a COLD `git worktree
+#     add --detach` off the master, said loudly, removed and pruned under the master lock when the run ends.
+# No byte of a source or build tree is ever copied (`no_copy_violations` is the self-test's gate); every run's plan line
+# states `bytes copied = N`, measured (`copied_bytes`).
+WARM_RETRY_SECONDS = 600.0   # a failed warm advancement is retried after this, never on every idle pass
 WARM_KEEP = ("obj/", "bin/")
 WARM_BUILD_MAX_MINUTES = 60
+DEPLOY_DIR = "deploy"
+TREE_SAMPLE = 32
+PLATFORM_REPO = "MeshWeaver"
 
 
 def warm_key(env: dict, identity: str) -> str:
-    """What invalidates a warm workspace: the platform set, the framework identity and the images the host runs. Pure."""
+    """What invalidates a warm tree: the platform set, the framework identity and the images the host runs. Pure."""
     parts = [f"platform={env.get('MW_BUILD_PLATFORM_VERSION', '')}", f"identity={identity}"]
     parts += [f"{k}={env.get(k, '')}" for k in ("MW_BUILD_TESTER_DIGEST", "MW_BUILD_PORTAL_DIGEST", "MW_BUILD_RUNNER_DIGEST")]
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:32]
@@ -3418,15 +3410,30 @@ def warm_enabled(env: dict) -> bool:
 
 
 def shared_tree_enabled(env: dict) -> bool:
-    """The warm main tree lives ONCE per repository on the host's SHARED cache volume (`<cache>/shared/<repo>`), read by
-    every replica, instead of once per replica in its work volume (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3)."""
+    """The chart's `sharedTree` switch. Since §7.3b it selects the SAME master + deployment-tree path as the warm workspace
+    alone (the deployment trees always live on the cache volume); kept as a switch, never a route to a copy."""
     return warm_enabled(env) and (env.get("MW_BUILD_SHARED_TREE") or "").strip().lower() in ("1", "true", "yes")
 
 
-SHARED_DIR = "shared"
+def deployment_name(lane: Optional[str], key: str) -> str:
+    """The deployment a host builds for: its lane (channel or version) and the warm key. A path segment overlayfs can parse
+    (no `,`, `:` or `\\`). Pure."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", (lane or "").strip()) or "default"
+    return f"{safe[:48]}-{key[:16]}"
 
 
-GENERATION_SAMPLE = 32
+def master_path(cache: str, repo: str) -> str:
+    return os.path.join(cache, "git", f"{repo}.git")
+
+
+@contextlib.contextmanager
+def master_lock(mirror_root: str, repo: str):
+    """The ONE master lock of `repo`'s mirror: fetch, `worktree add`, `worktree remove` and `prune` all take it, so concurrent
+    runs (and replicas sharing the cache) never race on the packs or `.git/worktrees`. Blocking; never nested."""
+    os.makedirs(mirror_root, exist_ok=True)
+    with open(os.path.join(mirror_root, f".{repo}.lock"), "w") as lock:
+        _flock(lock)
+        yield
 
 
 def _file_sha256(path: str) -> str:
@@ -3437,16 +3444,16 @@ def _file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def generation_manifest(gen: str) -> dict:
-    """What a published generation IS: every file's content hash, and the stat fingerprint (size, mtime, ctime, inode) it
-    had once hashed. An unprivileged process cannot set a ctime back, so a later write to any file of the generation —
-    content, mode or a rewrite that restores the mtime — no longer matches; `digest` covers the whole list."""
+def tree_manifest(tree: str, ident: str) -> dict:
+    """What a built deployment tree IS: every file's content hash, and the stat fingerprint (size, mtime, ctime, inode) it had
+    once hashed. An unprivileged process cannot set a ctime back, so a later write to any file of the tree — content, mode or
+    a rewrite that restores the mtime — no longer matches; `digest` covers the whole list, `tree` names what it describes."""
     entries = []
-    for d, dirs, files in os.walk(gen):
+    for d, dirs, files in os.walk(tree):
         dirs.sort()
         for n in sorted(files):
             full = os.path.join(d, n)
-            rel = os.path.relpath(full, gen)
+            rel = os.path.relpath(full, tree)
             st_ = os.lstat(full)
             if stat.S_ISLNK(st_.st_mode):
                 entries.append([rel, "link", 0, st_.st_mtime_ns, st_.st_ctime_ns, st_.st_ino, os.readlink(full)])
@@ -3456,312 +3463,317 @@ def generation_manifest(gen: str) -> dict:
             if os.path.islink(os.path.join(d, n)):   # a symlinked directory: recorded as a link, never followed
                 full = os.path.join(d, n)
                 st_ = os.lstat(full)
-                entries.append([os.path.relpath(full, gen), "link", 0, st_.st_mtime_ns, st_.st_ctime_ns, st_.st_ino, os.readlink(full)])
+                entries.append([os.path.relpath(full, tree), "link", 0, st_.st_mtime_ns, st_.st_ctime_ns, st_.st_ino, os.readlink(full)])
                 dirs.remove(n)
     entries.sort(key=lambda e: e[0])
-    return {"generation": os.path.basename(gen), "entries": entries,
+    return {"tree": ident, "entries": entries,
             "digest": hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode()).hexdigest()}
 
 
-def verify_generation(gen: str, manifest_path: str, sample: int = GENERATION_SAMPLE,
-                      rnd: Optional[random.Random] = None) -> Optional[str]:
-    """None when `gen` is exactly what its publisher hashed, else WHY not: no manifest, a manifest whose digest does not
-    cover its entries, another generation's manifest, a file added, missing or changed since (stat fingerprint), or — for
-    a random sample of files — content that no longer hashes as recorded. Reads stat for every file, content for `sample`."""
+def verify_tree(tree: str, manifest_path: str, ident: str, sample: int = TREE_SAMPLE,
+                rnd: Optional[random.Random] = None) -> Optional[str]:
+    """None when `tree` is exactly what its writer hashed, else WHY not: no manifest, a manifest whose digest does not cover
+    its entries, another tree's (or another tip's) manifest, a file added, missing or changed since (stat fingerprint), or —
+    for a random sample of files — content that no longer hashes as recorded. Reads stat for every file, content for
+    `sample`."""
     try:
         with open(manifest_path, encoding="utf-8") as fh:
             m = json.load(fh)
     except (OSError, ValueError):
-        return "no integrity manifest (published before the check, or removed)"
+        return "no integrity manifest (never built, or removed)"
     entries = m.get("entries") if isinstance(m, dict) else None
     if not isinstance(entries, list):
         return "the integrity manifest is malformed"
     if hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode()).hexdigest() != m.get("digest"):
         return "the integrity manifest's digest does not cover its entries"
-    if m.get("generation") != os.path.basename(gen):
-        return f"the manifest is generation {m.get('generation')!r}'s, not {os.path.basename(gen)!r}'s"
+    if m.get("tree") != ident:
+        return f"the manifest describes {m.get('tree')!r}, not {ident!r}"
     want = {e[0]: e for e in entries if isinstance(e, list) and len(e) == 7}
     seen = set()
-    for d, dirs, files in os.walk(gen):
+    for d, dirs, files in os.walk(tree):
         names = list(files) + [n for n in dirs if os.path.islink(os.path.join(d, n))]
         dirs[:] = [n for n in dirs if not os.path.islink(os.path.join(d, n))]
         for n in names:
             full = os.path.join(d, n)
-            rel = os.path.relpath(full, gen)
+            rel = os.path.relpath(full, tree)
             e = want.get(rel)
             if e is None:
-                return f"{rel} was added after the generation was published"
+                return f"{rel} was added after the tree was built"
             try:
                 st_ = os.lstat(full)
             except OSError:
                 return f"{rel} cannot be read"
             if [st_.st_size if e[1] == "file" else 0, st_.st_mtime_ns, st_.st_ctime_ns, st_.st_ino] != e[2:6]:
-                return f"{rel} changed after the generation was published"
+                return f"{rel} changed after the tree was built"
             seen.add(rel)
     missing = sorted(set(want) - seen)
     if missing:
-        return f"{missing[0]} was removed after the generation was published"
+        return f"{missing[0]} was removed after the tree was built"
     files = [e for e in want.values() if e[1] == "file"]
     for e in (rnd or random.Random()).sample(files, min(sample, len(files))):
         try:
-            if _file_sha256(os.path.join(gen, e[0])) != e[6]:
-                return f"{e[0]}'s content no longer hashes as published"
+            if _file_sha256(os.path.join(tree, e[0])) != e[6]:
+                return f"{e[0]}'s content no longer hashes as built"
         except OSError:
             return f"{e[0]} cannot be read"
     return None
 
 
-class SharedTree:
-    """ONE warm main tree per repository on the shared cache volume, as GENERATIONS: `gens/<id>/` holds a tree
-    (`.warm/<repo>`) and its host-private git directory and state (`.warm-host/<repo>`, the warm_private layout), and the
-    `current` symlink names the published one. Exactly one WRITER at a time (an exclusive, non-blocking flock on
-    `.writer.lock`, across every replica that mounts the volume) stages a new generation as a copy of the current one,
-    advances and builds it, and PUBLISHES it by an atomic symlink replace — so a reader never sees a tree being written.
-    A READER (a run seeding its checkout) holds a SHARED flock on the generation it copies; a generation is deleted only
-    when an exclusive, non-blocking flock on it succeeds, i.e. when no reader holds it. Runs never write the shared tree:
-    they copy it (seed_run_from_warm)."""
+def _try_lock(path: str, mode: int) -> Optional[object]:
+    """`path` opened and flock'ed with `mode` (NON-blocking when it carries LOCK_NB); None when the lock is held elsewhere
+    or cannot be set up at all (a full or read-only cache) — never an aborted run."""
+    import fcntl
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fh = open(path, "a+")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fh.fileno(), mode)
+        return fh
+    except OSError:
+        fh.close()
+        return None
 
-    def __init__(self, cache: str, repo: str) -> None:
-        self.repo = repo
-        self.root = os.path.join(cache, SHARED_DIR, repo)
-        self.gens = os.path.join(self.root, "gens")
-        # a generation's reader lock lives OUTSIDE the directory a collector deletes: an open of a lock inside it could
-        # recreate the file on a new inode mid-delete and admit a reader the collector's lock no longer excludes
-        self.locks = os.path.join(self.root, "locks")
-        # a generation's integrity manifest, beside it and never inside it (a run's overlay sees only the generation)
-        self.manifests = os.path.join(self.root, "manifests")
+
+class DeploymentTree:
+    """ONE persistent worktree of `repo` for a deployment: `<cache>/deploy/<deployment>/<repo>`, a `git worktree add
+    --detach` of the master. Its state, integrity manifest and recorded admin directory live in the host-private
+    `<cache>/deploy/<deployment>/.host/<repo>/` (never inside the tree, so neither a warmBuild nor a run's overlay sees
+    them); its lock in `.locks/<repo>.lock`. One WRITER (exclusive, non-blocking — only while no reader holds it), any
+    number of READERS (shared, non-blocking, held for a run's whole life)."""
+
+    def __init__(self, cache: str, deployment: str, repo: str) -> None:
+        self.cache, self.deployment, self.repo = cache, deployment, repo
+        self.root = os.path.join(cache, DEPLOY_DIR, deployment)
+        self.tree = os.path.join(self.root, repo)
+        self.host = os.path.join(self.root, ".host", repo)
+        self.lock_path = os.path.join(self.root, ".locks", f"{repo}.lock")
+        self.mirror = master_path(cache, repo)
+        self.manifest_path = os.path.join(self.host, "manifest.json")
         self.last_refusal: Optional[str] = None
 
-    def manifest_of(self, gen: str) -> str:
-        return os.path.join(self.manifests, os.path.basename(gen) + ".json")
+    def ident(self, tip: str) -> str:
+        return f"{self.deployment}/{self.repo}@{tip}"
 
-    def _lock_of(self, gen: str) -> str:
-        os.makedirs(self.locks, exist_ok=True)
-        return os.path.join(self.locks, os.path.basename(gen) + ".lock")
-
-    def warm_of(self, gen: str) -> str:
-        return os.path.join(gen, WARM_DIR, self.repo)
-
-    def current(self) -> Optional[str]:
-        link = os.path.join(self.root, "current")
+    def state(self) -> Optional[dict]:
         try:
-            target = os.readlink(link)
-        except OSError:
-            return None
-        gen = os.path.normpath(os.path.join(self.root, target))
-        return gen if os.path.dirname(gen) == self.gens and os.path.isdir(gen) else None
-
-    @staticmethod
-    def _lock(path: str, mode: int) -> Optional[object]:
-        import fcntl
-        fh = open(path, "a+")
-        try:
-            fcntl.flock(fh.fileno(), mode)
-            return fh
-        except OSError:
-            fh.close()
+            fd = os.open(os.path.join(self.host, "state.json"), os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd) as fh:
+                st = json.load(fh)
+            return st if isinstance(st, dict) else None
+        except (OSError, ValueError):
             return None
 
-    @contextlib.contextmanager
-    def reader(self):
-        """The current generation's warm tree, held against deletion while the block runs; None when none is published —
-        or when it fails its integrity check (`verify_generation`; why in `last_refusal`)."""
-        import fcntl
-        fh, held = None, None
-        for attempt in range(6):                 # a generation collected between the readlink and the lock: read again
-            gen = self.current()
-            if gen is None:
-                break
-            # NON-blocking: a collector holding a retired generation's lock is deleting it — never wait out a deletion; a
-            # lock that cannot even be set up (a full or read-only cache) is no warm tree, never an aborted run
-            try:
-                fh = self._lock(self._lock_of(gen), fcntl.LOCK_SH | fcntl.LOCK_NB)
-            except OSError:
-                fh = None
-                break
-            if fh is None:
-                time.sleep(0.05 * (attempt + 1))
-                continue
-            # only the generation that is STILL current after the lock is handed out: a retired one (even one a failed
-            # collect left half-deleted) is never copied — `current` is the one name a collector never deletes
-            if self.current() == gen and os.path.isdir(self.warm_of(gen)):
-                # INTEGRITY before use: the generation must be exactly what its publisher hashed — else it is no warm tree
-                why = verify_generation(gen, self.manifest_of(gen))
-                if why is not None:
-                    self.last_refusal = f"generation {os.path.basename(gen)} refused: {why}"
-                    fh.close()
-                    fh = None
-                    break
-                held = gen
-                break
-            fh.close()                           # retired between the readlink and the lock: read `current` again
-            fh = None
+    def write_state(self, state: dict) -> None:
+        os.makedirs(self.host, exist_ok=True)
+        tmp = os.path.join(self.host, f".state-{os.getpid()}")
+        with open(tmp, "w") as fh:
+            json.dump(state, fh)
+        os.replace(tmp, os.path.join(self.host, "state.json"))
+
+    def admin(self) -> Optional[str]:
+        """The worktree's git admin directory as recorded when the HOST added it — never read back from the tree's own
+        `.git` file, which a warmBuild could rewrite."""
         try:
-            yield self.warm_of(held) if held else None
-        finally:
-            if fh is not None:
-                fh.close()
+            with open(os.path.join(self.host, "admin")) as fh:
+                a = fh.read().strip()
+        except OSError:
+            return None
+        return a if a and os.path.isfile(os.path.join(a, "HEAD")) else None
+
+    def publish(self, tip: str, key: str) -> None:
+        """The writer's last step, still under its lock: the manifest FIRST, then the state that names the tip built — a
+        reader verifies the tree against the manifest before it mounts it."""
+        os.makedirs(self.host, exist_ok=True)
+        part = self.manifest_path + f".{os.getpid()}.part"
+        with open(part, "w", encoding="utf-8") as fh:
+            json.dump(tree_manifest(self.tree, self.ident(tip)), fh, separators=(",", ":"))
+        os.replace(part, self.manifest_path)
+        self.write_state({"key": key, "tip": tip, "built": tip})
+
+    def unbuild(self, key: str, tip: str) -> None:
+        """Not built: readers go cold until the writer's next successful build (the manifest goes first)."""
+        try:
+            os.remove(self.manifest_path)
+        except OSError:
+            pass
+        self.write_state({"key": key, "tip": tip, "built": None})
 
     @contextlib.contextmanager
     def writer(self):
-        """This replica as the ONE writer, or None when another replica holds the lock (it warms; this one does not)."""
+        """This process as the tree's ONE writer, or None when another writer or ANY reader holds the tree."""
         import fcntl
-        os.makedirs(self.gens, exist_ok=True)
-        fh = self._lock(os.path.join(self.root, ".writer.lock"), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fh = _try_lock(self.lock_path, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             yield self if fh is not None else None
         finally:
             if fh is not None:
                 fh.close()
 
-    def stage(self, cancel: Optional[threading.Event] = None, deadline: Optional[float] = None, fresh: bool = False) -> str:
-        """A new generation directory: a copy of the current one (its obj/, bin/ and git index carried), or empty. The
-        copy is bounded by `deadline` and stopped at once by `cancel` (a claim needs the host): the partial generation is
-        removed and Lost (cancel) or Refusal (deadline) raised — never a copy the claimed run has to wait out."""
-        gen = os.path.join(self.gens, f"{time.time_ns():020d}-{os.getpid()}")
-        cur = self.current()
-        if cur is None or fresh:
-            # `fresh`: the published generation was built under another key (platform set, images) — its outputs would be
-            # wiped at once, so nothing is copied; the published one stays current until this replacement publishes
-            os.makedirs(gen)
-            return gen
-        # stderr to a FILE, read as a bounded tail afterwards: a pipe nobody drains blocks `cp` once it fills (a full
-        # volume makes cp print one error per file) and would hold the writer lock to the deadline
-        errf = tempfile.TemporaryFile()
-        proc = subprocess.Popen(["cp", "-a", cur, gen], stdout=subprocess.DEVNULL, stderr=errf, start_new_session=True)
-        try:
-            while True:
-                try:
-                    rc = proc.wait(timeout=0.2)
-                    break
-                except subprocess.TimeoutExpired:
-                    if cancel is not None and cancel.is_set():
-                        raise Lost("the shared tree's staging copy was stopped for a claim")
-                    if deadline is not None and time.monotonic() > deadline:
-                        raise Refusal("the shared tree's staging copy did not finish inside its deadline — stopped")
-        except BaseException:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            proc.wait()
-            errf.close()
-            shutil.rmtree(gen, ignore_errors=True)
-            raise
-        if rc != 0:
-            size = errf.seek(0, os.SEEK_END)
-            errf.seek(max(0, size - 4096))
-            err = errf.read().decode(errors="replace")
-            errf.close()
-            shutil.rmtree(gen, ignore_errors=True)
-            raise Refusal(f"the shared tree's current generation could not be copied (exit {rc}): {err.strip()[-200:]}")
-        errf.close()
-        return gen
-
-    def publish(self, gen: str) -> None:
-        # the generation's integrity manifest FIRST: a reader verifies against it before it uses the generation, so a
-        # generation is never current without one
-        os.makedirs(self.manifests, exist_ok=True)
-        man = self.manifest_of(gen)
-        part = man + f".{os.getpid()}.part"
-        with open(part, "w", encoding="utf-8") as fh:
-            json.dump(generation_manifest(gen), fh, separators=(",", ":"))
-        os.replace(part, man)
-        tmp = os.path.join(self.root, f".current-{os.getpid()}")
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        os.symlink(os.path.relpath(gen, self.root), tmp)
-        os.replace(tmp, os.path.join(self.root, "current"))
-        self.collect()
-
-    def discard(self, gen: str) -> None:
-        shutil.rmtree(gen, ignore_errors=True)
-
-    def collect(self) -> list:
-        """Delete every generation but the current one that no reader holds; returns what was deleted."""
+    @contextlib.contextmanager
+    def reader(self, key: str):
+        """The built tree and its tip, held (shared lock) while the block runs; None — with WHY in `last_refusal` — when the
+        writer holds it, nothing is built for this key, or it fails its integrity check."""
         import fcntl
-        cur, gone = self.current(), []
-        for name in sorted(os.listdir(self.gens)) if os.path.isdir(self.gens) else []:
-            gen = os.path.join(self.gens, name)
-            if gen == cur or not os.path.isdir(gen):
-                continue
-            lock = self._lock_of(gen)
-            fh = self._lock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if fh is None:
-                continue                        # a reader is copying it: kept until the next collect
-            try:
-                shutil.rmtree(gen, ignore_errors=True)
-                if not os.path.exists(gen):
-                    gone.append(name)
-                    try:
-                        os.remove(self.manifest_of(gen))
-                    except OSError:
-                        pass
-                    try:
-                        os.remove(lock)         # a reader that opens it after this finds the generation gone and re-reads
-                    except OSError:
-                        pass
-                # a deletion that failed partway keeps its lock file: the next collector excludes readers through the SAME
-                # inode, and readers never take a retired generation anyway (reader(): it must still be `current`)
-            finally:
+        self.last_refusal = None
+        fh = _try_lock(self.lock_path, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        held = None
+        if fh is None:
+            self.last_refusal = "the deployment tree is locked (its writer is advancing it)"
+        else:
+            st = self.state()
+            tip = str((st or {}).get("tip") or "")
+            if st is None or not os.path.isdir(self.tree):
+                self.last_refusal = "no deployment tree yet (the host builds it from main's tip while idle)"
+            elif st.get("key") != key:
+                self.last_refusal = "the deployment tree is for another platform set or images"
+            elif not SHA.match(tip) or st.get("built") != tip:
+                self.last_refusal = "the deployment tree is not built (its last build failed, or was interrupted)"
+            else:
+                why = verify_tree(self.tree, self.manifest_path, self.ident(tip))
+                if why is not None:
+                    self.last_refusal = f"the deployment tree's integrity check refused it: {why}"
+                else:
+                    held = (self.tree, tip)
+            if held is None:
                 fh.close()
-        # a reader that opened a lock in the window after its generation was deleted recreates the file (`a+`) on a
-        # new inode, finds the generation retired and closes it: sweep those orphans, each only while nobody holds it
-        cur_lock = os.path.basename(cur) + ".lock" if cur else None
-        for name in sorted(os.listdir(self.locks)) if os.path.isdir(self.locks) else []:
-            if not name.endswith(".lock") or name == cur_lock or os.path.isdir(os.path.join(self.gens, name[:-5])):
-                continue
-            lock = os.path.join(self.locks, name)
-            fh = self._lock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if fh is None:
-                continue                        # a reader is mid re-check: it closes and the next collect sweeps it
-            try:
-                os.remove(lock)
-            except OSError:
-                pass
-            finally:
+                fh = None
+        try:
+            yield held
+        finally:
+            if fh is not None:
                 fh.close()
-        return gone
 
 
-def warm_private(warm: str) -> str:
-    """The host-only directory beside the warm tree: its git directory and its state live there, where the tip's
-    warmBuild (which runs with the warm TREE writable) cannot reach — so nothing it writes can configure a host git step
-    (hooks, fsmonitor, clean/smudge filters, merge drivers) or redirect a host write."""
-    work, repo = os.path.dirname(os.path.dirname(warm)), os.path.basename(warm)
-    return os.path.join(work, WARM_PRIVATE, repo)
+def _restore_git_link(tree: str, admin: str) -> None:
+    """The tree's `.git` exactly as `git worktree add` wrote it: a planted directory, link or rewritten file is replaced
+    without following it, so no host git step ever discovers a configuration a warmBuild wrote."""
+    dotgit = os.path.join(tree, ".git")
+    if os.path.isdir(dotgit) and not os.path.islink(dotgit):
+        shutil.rmtree(dotgit)
+    elif os.path.lexists(dotgit):
+        os.remove(dotgit)
+    with open(dotgit, "w") as fh:
+        fh.write(f"gitdir: {admin}\n")
 
 
-def warm_state(warm: str) -> Optional[dict]:
-    path = os.path.join(warm_private(warm), "state.json")
+def advance_deployment_tree(dt: DeploymentTree, tip: str, key: str, git: Callable[..., None]) -> str:
+    """The WRITER's move of its deployment tree to `tip` (call it holding `dt.writer()`), from the LOCAL master only:
+    first use → `git worktree add --detach` under the master lock; afterwards IN PLACE — `checkout --detach -f`, which
+    rewrites only the files that differ (unchanged sources keep their mtimes, so MSBuild's incremental checks hold), then
+    `clean` keeping obj/ and bin/. Every git step names the host-recorded admin directory explicitly. The tree is "not
+    built" from the first step until `publish`. Returns what happened; raises Refusal/OSError."""
+    dt.unbuild(key, tip)
+    admin = dt.admin()
+    if admin is None or not os.path.isdir(dt.tree):
+        with master_lock(os.path.dirname(dt.mirror), dt.repo):
+            if os.path.lexists(dt.tree):
+                shutil.rmtree(dt.tree)                     # a half-added tree: removed, never adopted
+            git("--git-dir", dt.mirror, "worktree", "prune")
+            os.makedirs(dt.root, exist_ok=True)
+            git("--git-dir", dt.mirror, "worktree", "add", "--detach", "--quiet", dt.tree, tip)
+            with open(os.path.join(dt.tree, ".git")) as fh:
+                line = fh.read().strip()
+            admin = os.path.normpath(os.path.join(dt.tree, line[len("gitdir:"):].strip())) if line.startswith("gitdir:") else ""
+            if not os.path.isfile(os.path.join(admin, "HEAD")):
+                raise Refusal(f"git worktree add left no admin directory ({line[:120]!r})")
+            os.makedirs(dt.host, exist_ok=True)
+            with open(os.path.join(dt.host, "admin"), "w") as fh:
+                fh.write(admin + "\n")
+        dt.write_state({"key": key, "tip": tip, "built": None})
+        return f"deployment tree: added at main@{tip[:12]} ({dt.tree})"
+    _restore_git_link(dt.tree, admin)
+    g = ("--git-dir", admin, "--work-tree", dt.tree)
+    # a stat-dirty entry (a touched but unchanged file) is re-hashed first, so `checkout -f` rewrites only what differs
+    git(*g, "update-index", "-q", "--refresh")
+    git(*g, "checkout", "--quiet", "--detach", "-f", tip)
+    git(*g, "clean", "-ffdxq", *[a for k in WARM_KEEP for a in ("-e", k)])
+    dt.write_state({"key": key, "tip": tip, "built": None})
+    return f"deployment tree: moved to main@{tip[:12]} in place (obj/ and bin/ kept)"
+
+
+def cold_worktree(cache: str, repo: str, sha: str, dest: str, git: Callable[..., None]) -> None:
+    """The ONE fallback: a cold `git worktree add --detach` of the master at `sha` (fetched beforehand), under the master
+    lock. Never a copy."""
+    mirror = master_path(cache, repo)
+    with master_lock(os.path.dirname(mirror), repo):
+        git("--git-dir", mirror, "worktree", "prune")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        git("--git-dir", mirror, "worktree", "add", "--detach", "--quiet", dest, sha)
+
+
+def remove_cold_worktree(cache: str, repo: str, dest: str, git: Callable[..., None]) -> None:
+    """`git worktree remove --force` and `prune`, under the master lock — so nothing stays registered. Never raises."""
+    mirror = master_path(cache, repo)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd) as fh:
-            st = json.load(fh)
-        return st if isinstance(st, dict) else None
-    except (OSError, ValueError):
-        return None
+        with master_lock(os.path.dirname(mirror), repo):
+            try:
+                git("--git-dir", mirror, "worktree", "remove", "--force", dest)
+            except (Refusal, OSError):
+                shutil.rmtree(dest, ignore_errors=True)    # a tree a stage left unremovable to git: gone either way
+            git("--git-dir", mirror, "worktree", "prune")
+    except (Refusal, OSError):
+        pass
 
 
-def write_warm_state(warm: str, state: dict) -> None:
-    priv = warm_private(warm)
-    os.makedirs(priv, exist_ok=True)
-    tmp = os.path.join(priv, f".state-{os.getpid()}")
-    with open(tmp, "w") as fh:
-        json.dump(state, fh)
-    os.replace(tmp, os.path.join(priv, "state.json"))
+def copied_bytes(private: str, lower: Optional[str]) -> int:
+    """MEASURED, never a constant: the bytes of the run's own layer (`private`, an overlay's upper) that duplicate the file
+    at the same path of the tree it is layered on — exactly what a copy (or an overlay copy-up of an unchanged file) would
+    have put there. `.git` (git's own, made by git) is skipped. A run with no lower copied nothing from one: 0."""
+    if not lower or not os.path.isdir(private):
+        return 0
+    total = 0
+    for d, dirs, files in os.walk(private):
+        if d == private and ".git" in dirs:
+            dirs.remove(".git")
+        for n in files:
+            full = os.path.join(d, n)
+            rel = os.path.relpath(full, private)
+            other = os.path.join(lower, rel)
+            try:
+                a, b = os.lstat(full), os.lstat(other)
+            except OSError:
+                continue
+            if stat.S_ISREG(a.st_mode) and stat.S_ISREG(b.st_mode) and a.st_size == b.st_size:
+                try:
+                    if _file_sha256(full) == _file_sha256(other):
+                        total += a.st_size
+                except OSError:
+                    continue
+    return total
 
 
-def wipe_warm(warm: str) -> None:
-    shutil.rmtree(warm, ignore_errors=True)
-    shutil.rmtree(warm_private(warm), ignore_errors=True)
+def overlay_run_tree(repo: str, sha: str, refs: list, lower: str, lower_tip: str, dest: str, token: Optional[str], env: dict,
+                     log: Callable[[str], None], git: Optional[Callable[..., None]] = None, deadline: Optional[float] = None,
+                     mount: Optional[Callable[[str, str], None]] = None) -> None:
+    """A run's tree `dest` as an OVERLAY of the built deployment tree `lower` (at `lower_tip`), with a `.git` made by git:
+    `init`, objects borrowed from the master through `alternates`, `read-tree <lower_tip>` (no -u: the index only), a
+    refresh that re-hashes what the overlay shows without touching a file, then the one-way `read-tree --reset -u <sha>` —
+    so only the files `sha` changes are written (into the run's upper), and every unchanged source keeps the timestamp it
+    has beneath the carried obj/ and bin/. Nothing is copied, not even the index. Raises Refusal/OSError."""
+    g = git or _git_runner(env, os.path.dirname(dest), token, deadline)
+    base = env.get("MW_BUILD_GIT_BASE", "https://github.com/Systemorph").rstrip("/")
+    cache = env.get("MW_BUILD_CACHE", "/cache")
+    mirror = master_path(cache, repo)
+    wanted = [sha] + [r for r in (refs or []) if isinstance(r, str) and r]
+    _update_mirror(repo, f"{base}/{repo}.git", os.path.dirname(mirror), mirror, wanted, g, log)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    (mount or _overlay_tree)(lower, dest)
+    g("init", "--quiet", dest)
+    with open(os.path.join(dest, ".git", "objects", "info", "alternates"), "w") as fh:
+        fh.write(os.path.join(mirror, "objects") + "\n")
+    g("-C", dest, "remote", "add", "origin", f"{base}/{repo}.git")
+    g("-C", dest, "read-tree", lower_tip)
+    g("-C", dest, "update-index", "-q", "--refresh")
+    g("-C", dest, "read-tree", "--reset", "-u", sha)
+    g("-C", dest, "clean", "-ffdxq", *[a for k in WARM_KEEP for a in ("-e", k)])
+    g("-C", dest, "update-ref", "--no-deref", "HEAD", sha)
 
 
 def validate_warm_build(doc: object) -> Optional[dict]:
     """`"warmBuild": {"command": …, "timeoutMinutes": N}` beside `stages` (the DEFAULT BRANCH tip's): what builds the warm
-    main workspace. Absent → None (the workspace then carries sources only). Malformed → Refusal."""
+    deployment tree. Absent → None (the tree then carries sources only). Malformed → Refusal."""
     if not isinstance(doc, dict) or "warmBuild" not in doc:
         return None
     w = doc["warmBuild"]
@@ -3792,34 +3804,6 @@ def _git_runner(env: dict, home: str, token: Optional[str], deadline: Optional[f
     return run_git
 
 
-def _trusted_tree(git: Callable[..., None], gitdir: str, tree: str, sha: str, mirror: str) -> None:
-    """Make `tree` exactly `sha` through the host-owned git directory `gitdir` (created here when absent: its objects are
-    borrowed from the mirror through `alternates`, its config is the host's alone), named EXPLICITLY on every call — a
-    `.git` the tree itself carries is never discovered, and `clean` removes it with every other untracked file except
-    obj/ and bin/."""
-    if not os.path.isfile(os.path.join(gitdir, "HEAD")):
-        shutil.rmtree(gitdir, ignore_errors=True)
-        git("init", "--quiet", "--bare", gitdir)
-        os.makedirs(os.path.join(gitdir, "objects", "info"), exist_ok=True)
-        with open(os.path.join(gitdir, "objects", "info", "alternates"), "w") as fh:
-            fh.write(os.path.join(mirror, "objects") + "\n")
-    # git never touches a `.git` entry inside a work tree, so one a warmBuild planted is removed here — as a link or a
-    # file without following it, as a directory without following anything in it
-    planted = os.path.join(tree, ".git")
-    if os.path.islink(planted) or os.path.isfile(planted):
-        os.remove(planted)
-    elif os.path.isdir(planted):
-        shutil.rmtree(planted)
-    g = ("--git-dir", gitdir, "--work-tree", tree)
-    # a COPIED tree (a staged shared generation) carries an index whose cached inodes and ctimes are stale: refreshed
-    # first, so the one-way read-tree rewrites only files that differ from `sha` and unchanged sources keep their mtimes
-    if os.path.isfile(os.path.join(gitdir, "index")):
-        git(*g, "update-index", "-q", "--refresh")
-    git(*g, "read-tree", "--reset", "-u", sha)
-    git(*g, "clean", "-ffdxq", *[a for k in WARM_KEEP for a in ("-e", k)])
-    git("--git-dir", gitdir, "update-ref", "--no-deref", "HEAD", sha)
-
-
 RUN_OVERLAY_ENV = "MW_BUILD_RUN_OVERLAY"
 IN_NS_ENV = "MW_BUILD_IN_NS"
 _OVERLAY_PROBE = ("d=$(mktemp -d) && mkdir \"$d/l\" \"$d/u\" \"$d/w\" \"$d/m\" && echo x > \"$d/l/f\" && "
@@ -3829,11 +3813,10 @@ _OVERLAY_PROBE = ("d=$(mktemp -d) && mkdir \"$d/l\" \"$d/u\" \"$d/w\" \"$d/m\" &
 
 
 def run_overlay_enabled(env: dict) -> bool:
-    """A run's tree is an OVERLAY of the shared generation (read-only lower, per-run upper) — asked for by the chart
+    """A run's tree is an OVERLAY of its deployment tree (read-only lower, per-run upper) — asked for by the chart
     (`buildHosts.runOverlay` → MW_BUILD_RUN_OVERLAY) AND this process living in its own user+mount namespace, where it may
-    mount one (`enter_run_namespace`). Only with the shared tree: its published generations never change in place."""
-    return (str(env.get(RUN_OVERLAY_ENV, "")).lower() == "true" and env.get(IN_NS_ENV) == "1"
-            and shared_tree_enabled(env))
+    mount one (`enter_run_namespace`). Only with the warm workspace: there is no deployment tree without it."""
+    return str(env.get(RUN_OVERLAY_ENV, "")).lower() == "true" and env.get(IN_NS_ENV) == "1" and warm_enabled(env)
 
 
 def enter_run_namespace(argv: list, env: dict, log: Callable[[str], None],
@@ -3844,12 +3827,13 @@ def enter_run_namespace(argv: list, env: dict, log: Callable[[str], None],
     is asked for, so a run's tree can be an overlay mount that every host git step and every stage sandbox (bwrap, nested)
     of this process sees. An exec, no fork: the same pid keeps receiving SIGTERM. Returns only when NOT re-executed — the
     overlay is not asked for, this process already is in its namespace, or the host cannot make one (no `unshare`, or the
-    probe — a real overlay mount, a write through it, the lower untouched — fails), which is said; runs then COPY the tree."""
+    probe — a real overlay mount, a write through it, the lower untouched — fails), which is said; every run then takes a
+    COLD worktree off the master (never a copy)."""
     if str(env.get(RUN_OVERLAY_ENV, "")).lower() != "true" or env.get(IN_NS_ENV) == "1":
         return
     u = which("unshare")
     if not u:
-        log("run overlay: no `unshare` on this host — every run copies the warm tree")
+        log("run overlay: no `unshare` on this host — every run takes a cold worktree off the master")
         return
     cmd = [u, "-Urm", "--propagation", "private", "sh", "-c", _OVERLAY_PROBE]
     try:
@@ -3857,10 +3841,10 @@ def enter_run_namespace(argv: list, env: dict, log: Callable[[str], None],
     except (OSError, subprocess.SubprocessError) as e:
         rc = f"{type(e).__name__}"
     if rc != 0:
-        log(f"run overlay: this host cannot mount an overlay in its own user namespace (probe: {rc}) — every run copies the warm tree")
+        log(f"run overlay: this host cannot mount an overlay in its own user namespace (probe: {rc}) — every run takes a cold worktree off the master")
         return
     new = dict(env, **{IN_NS_ENV: "1", "MW_BUILD_OUTER_UID": str(os.getuid()), "MW_BUILD_OUTER_GID": str(os.getgid())})
-    log("run overlay: re-entering this runner in its own user + mount namespace — a run's tree is an overlay of the shared generation")
+    log("run overlay: re-entering this runner in its own user + mount namespace — a run's tree is an overlay of its deployment tree")
     execvpe(u, [u, "-Urm", "--propagation", "private", sys.executable, os.path.abspath(__file__), *argv], new)
 
 
@@ -3873,11 +3857,11 @@ def _mount_runner(cmd: list) -> "tuple[int, str]":
 
 
 def _overlay_tree(lower: str, dest: str, sh: Callable[[list], "tuple[int, str]"] = _mount_runner) -> None:
-    """A run's tree as an OVERLAY: `lower` (the shared generation's warm tree) read-only beneath, `dest.upper` taking every
-    write the run makes — so the run writes only its DELTA and can never change the shared tree. `.git` of the lower is
-    hidden (the run gets a fresh one). Raises Refusal when the mount is refused; the caller copies instead."""
+    """A tree as an OVERLAY: `lower` (a deployment tree, or the image's platform source) read-only beneath, `dest.upper`
+    taking every write — so the user writes only its DELTA and can never change the lower. `.git` of the lower is hidden
+    (a run gets a fresh one). Raises Refusal when the mount is refused; the caller takes a cold worktree instead."""
     if any(c in lower for c in ",:\\") or not os.path.isdir(lower):
-        raise Refusal(f"the generation's path cannot be an overlay lower ({lower!r})")
+        raise Refusal(f"the path cannot be an overlay lower ({lower!r})")
     up, wk = dest + ".upper", dest + ".ovlwork"
     for d in (up, wk, dest):
         os.makedirs(d, exist_ok=True)
@@ -3922,116 +3906,113 @@ def remove_workspace(path: str, release: Callable[[str], None] = release_run_tre
     shutil.rmtree(path, ignore_errors=True)
 
 
-def _copy_tree(src: str, dest: str, deadline: Optional[float] = None) -> None:
-    """A run's private copy of the warm tree (no `.git` travels: the run gets a fresh one): a reflink copy where the
-    filesystem offers one, a plain `cp -a` otherwise — both bounded by the run's checkout deadline."""
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    for argv in (["cp", "-a", "--reflink=auto", src, dest], ["cp", "-a", src, dest]):
-        left = None if deadline is None else deadline - time.monotonic()
-        if left is not None and left <= 0:
-            raise Refusal("the run's deadline passed during the warm copy")
-        shutil.rmtree(dest, ignore_errors=True)
+@contextlib.contextmanager
+def platform_source_view(platform_src: str, dest: str, env: dict, log: Callable[[str], None],
+                         git: Optional[Callable[..., None]] = None, mount: Optional[Callable[[str, str], None]] = None,
+                         can_overlay: Optional[bool] = None):
+    """A WRITABLE view of the host's platform source (MW_PLATFORM_SOURCE, read-only in the image) at `dest`, for a
+    repository-declared command that builds or restores projects referencing the platform (MSBuild writes their obj/ and
+    bin/ into that tree) — and NOT A COPY: an overlay with the image's tree as the read-only lower where this runner may
+    mount one, else a cold `git worktree add` of the platform's master at the tree's `.source-commit` (the image's tree IS
+    that commit's `git archive`), said. Removed when the block ends. Raises Refusal when neither is possible."""
+    can = env.get(IN_NS_ENV) == "1" if can_overlay is None else can_overlay
+    layered, cold = False, False
+    if can:
         try:
-            if subprocess.run(argv, capture_output=True, text=True, timeout=left).returncode == 0:
-                shutil.rmtree(os.path.join(dest, ".git"), ignore_errors=True)
-                if os.path.lexists(os.path.join(dest, ".git")):
-                    os.remove(os.path.join(dest, ".git"))
-                return
-        except subprocess.TimeoutExpired:
-            shutil.rmtree(dest, ignore_errors=True)
-            raise Refusal("the warm copy did not finish inside the run's deadline — killed")
-    raise Refusal("cp could not copy the warm workspace")
-
-
-def advance_warm_main(repo: str, tip: str, warm: str, env: dict, log: Callable[[str], None], key: str,
-                      git: Optional[Callable[..., None]] = None, fresh: Optional[Callable[..., None]] = None,
-                      deadline: Optional[float] = None) -> str:
-    """Move the warm MAIN tree to the default branch's `tip` (host-only; never a run's content) through its HOST-PRIVATE
-    git directory, from the LOCAL mirror only (no network, no credential), every step bounded by `deadline`. Wiped on a
-    key change, an INTERRUPTED build (state `building` — a restart mid-build) or any failure. Returns what happened."""
-    mirror = os.path.join(env.get("MW_BUILD_CACHE", "/cache"), "git", f"{repo}.git")
-    g = git or _git_runner(env, os.path.dirname(warm), None, deadline)
-    st = warm_state(warm)
-    reason = ("no warm main workspace yet" if st is None
-              else "the platform set or images changed — wiped" if st.get("key") != key
-              else "a warm build was interrupted — wiped" if st.get("built") == "building"
-              else None)
-    if reason is None and st is not None and st.get("tip") == tip:
-        return f"warm main workspace: already at main@{tip[:12]}"
-    if reason is not None:
-        # a MISSING, unreadable or non-object state proves nothing about the key the tree's obj/ and bin/ were built
-        # under, so it is wiped exactly like a known mismatch — outputs are kept only when valid state says the key matches
-        wipe_warm(warm)
-    try:
-        os.makedirs(warm, exist_ok=True)
-        _trusted_tree(g, os.path.join(warm_private(warm), "git"), warm, tip, mirror)
-        write_warm_state(warm, {"key": key, "tip": tip, "built": None})
-        return (f"warm main workspace: moved to main@{tip[:12]} (obj/ and bin/ kept)" if reason is None
-                else f"warm main workspace: set up at main@{tip[:12]} ({reason})")
-    except (Refusal, OSError) as e:
-        wipe_warm(warm)
-        return f"warm main workspace: not advanced ({str(e)[:160]}) — wiped, retried when idle"
-
-
-def seed_run_from_warm(repo: str, sha: str, refs: list, warm: str, dest: str, token: Optional[str], env: dict,
-                       log: Callable[[str], None], key: str, deadline: Optional[float] = None,
-                       git: Optional[Callable[..., None]] = None, fresh: Optional[Callable[..., None]] = None,
-                       overlay: bool = False, mount: Optional[Callable[[str, str], None]] = None) -> str:
-    """A run's checkout `dest`: a disposable COPY of the warm tree with a FRESH, host-made `.git` (objects borrowed from the
-    mirror), moved to `sha` — or a fresh clone. The warm workspace is only READ, and an interrupted build is never used.
-    Returns the plan line naming how the run's tree was seeded."""
-    fresh = fresh or default_checkout
-    st = warm_state(warm)
-    reason = ("no warm main workspace yet (the host builds it from main's tip while idle)" if st is None
-              else "the warm workspace is for another platform set or images" if st.get("key") != key
-              else "the warm workspace's last build was interrupted" if st.get("built") == "building"
-              else None)
-    if reason is None and st is not None:
-        g = git or _git_runner(env, os.path.dirname(dest), token, deadline)
+            (mount or _overlay_tree)(platform_src, dest)
+            layered = True
+        except (Refusal, OSError) as e:
+            log(f"platform source: the overlay was refused ({e}) — a cold worktree of the platform's master instead")
+    if not layered:
+        try:
+            with open(os.path.join(platform_src, ".source-commit")) as fh:
+                commit = fh.read().strip().lower()
+        except OSError:
+            commit = ""
+        if not SHA.match(commit):
+            raise Refusal("the platform source cannot be made writable without a copy: this runner cannot overlay it and "
+                          "the image's tree names no .source-commit to check out from the master")
+        cache = env.get("MW_BUILD_CACHE", "/cache")
+        repo = env.get("MW_BUILD_PLATFORM_REPO", PLATFORM_REPO)
         base = env.get("MW_BUILD_GIT_BASE", "https://github.com/Systemorph").rstrip("/")
-        mirror_root = os.path.join(env.get("MW_BUILD_CACHE", "/cache"), "git")
-        mirror = os.path.join(mirror_root, f"{repo}.git")
-        wanted = [sha] + [r for r in (refs or []) if isinstance(r, str) and r]
-        try:
-            layered = None
-            if overlay:
-                try:
-                    (mount or _overlay_tree)(warm, dest)
-                    layered = True
-                except (Refusal, OSError) as e:
-                    log(f"run overlay: {e} — this run copies the warm tree")
-            if not layered:
-                _copy_tree(warm, dest, deadline)
-            _update_mirror(repo, f"{base}/{repo}.git", mirror_root, mirror, wanted, g, log)
-            # the run's own .git, made by the host: a normal repository (the PR merge runs in it), objects from the mirror
-            g("init", "--quiet", dest)
-            with open(os.path.join(dest, ".git", "objects", "info", "alternates"), "w") as fh:
-                fh.write(os.path.join(mirror, "objects") + "\n")
-            g("-C", dest, "remote", "add", "origin", f"{base}/{repo}.git")
-            # start from the warm tree's OWN index (host-private, written by _trusted_tree), refreshed against the copied
-            # files: an empty index would make `read-tree -u` rewrite EVERY tracked file, giving sources newer timestamps
-            # than the carried obj/ and bin/ and defeating MSBuild's incremental checks. The refresh re-hashes a stat-dirty
-            # entry (the copy changed its inode and ctime) without touching the file, so the one-way `read-tree --reset -u`
-            # below rewrites only what differs from `sha` — a file the run's commit changed, or a tracked file the warmBuild
-            # modified (restored) — and leaves every unchanged file with the timestamp it had in the warm tree.
-            warm_index = os.path.join(warm_private(warm), "git", "index")
-            if os.path.isfile(warm_index) and not os.path.islink(warm_index):
-                shutil.copyfile(warm_index, os.path.join(dest, ".git", "index"))
-                g("-C", dest, "update-index", "-q", "--refresh")
-            g("-C", dest, "read-tree", "--reset", "-u", sha)
-            g("-C", dest, "clean", "-ffdxq", *[a for k in WARM_KEEP for a in ("-e", k)])
-            g("-C", dest, "update-ref", "--no-deref", "HEAD", sha)
-            built = st.get("built")
-            how = "built by the tip's warmBuild" if built == st.get("tip") else "sources only — not built yet"
-            kind = "overlay (the run writes only its delta)" if layered else "incremental copy"
-            return f"workspace: {kind} of main@{str(st.get('tip', '?'))[:12]} ({how}), moved to {sha[:12]} (obj/ and bin/ kept)"
-        except (Refusal, OSError, shutil.Error) as e:
-            reason = f"the warm copy failed ({str(e)[:160]})"
-    release_run_tree(dest)
-    shutil.rmtree(dest, ignore_errors=True)
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    fresh(repo, sha, refs, dest, token, env, log, deadline=deadline)
-    return f"workspace: clean ({reason})"
+        g = git or _git_runner(env, os.path.dirname(dest), None, None)
+        mirror = master_path(cache, repo)
+        log(f"platform source: COLD worktree of the {repo} master at {commit[:12]} (this runner cannot overlay the image's tree) — nothing copied")
+        _update_mirror(repo, f"{base}/{repo}.git", os.path.dirname(mirror), mirror, [commit], g, log)
+        shutil.rmtree(dest, ignore_errors=True)
+        cold_worktree(cache, repo, commit, dest, g)
+        cold = True
+    try:
+        yield dest
+    finally:
+        if layered:
+            release_run_tree(dest)
+            for d in (dest, dest + ".upper", dest + ".ovlwork"):
+                shutil.rmtree(d, ignore_errors=True)
+        if cold:
+            remove_cold_worktree(env.get("MW_BUILD_CACHE", "/cache"), env.get("MW_BUILD_PLATFORM_REPO", PLATFORM_REPO), dest,
+                                 git or _git_runner(env, os.path.dirname(dest), None, None))
+
+
+# ─── the no-copy gate: build-run.py reads its own source; any tree copy outside the named allow-list fails the self-test ───
+# Each allowed site copies something that is NOT a source or build tree, and says what.
+NO_COPY_ALLOWED = {
+    "ModuleHubBroker._fetch":
+        "materialises ONE verified module output (a content-addressed slice from the host's slice cache) where the stage "
+        "reads it — an artifact of the module store (§7.3), not a source or build tree",
+    "promote_outputs":
+        "promotes a content-keyed, verified OUTPUT directory into the content-addressed cache — an artifact, not a tree",
+    "Host.stage_refset":
+        "stages the IMAGE's reference set (compiled reference assemblies) once per image digest pair — image content, not a "
+        "source or build tree",
+    "Host.prepare_inputs.install":
+        "installs a prepared input's built OUTPUT into its keyed store — an artifact, not a source or build tree",
+}
+_COPY_CALLS = {"copytree", "copyfile", "copy", "copy2"}
+_COPY_TOOLS = {"cp", "rsync", "tar"}
+_COPY_SHELL = re.compile(r"(?:^|[\s;&|(`])(?:cp|rsync|tar)(?:\s|$)")
+
+
+def no_copy_violations(source: str, allowed: Optional[dict] = None) -> list[str]:
+    """Every place `source` copies a tree: a `shutil.copytree/copyfile/copy/copy2` call, an argv literal running `cp`,
+    `rsync` or `tar`, or a shell string doing so — outside `self_test` and outside the named, reasoned allow-list
+    (`NO_COPY_ALLOWED`, keyed by the enclosing function's qualified name). An allow-list entry that no longer matches any
+    site is a violation too (the list may only shrink honestly). Pure."""
+    import ast
+    allowed = NO_COPY_ALLOWED if allowed is None else allowed
+    out: list[str] = []
+    used: set = set()
+
+    def visit(node, scope: list[str]) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if isinstance(node, ast.FunctionDef) and node.name == "self_test" and not scope:
+                return
+            scope = scope + [node.name]
+        where = ".".join(scope) or "<module>"
+        hit = None
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Attribute) and f.attr in _COPY_CALLS and isinstance(f.value, ast.Name) and f.value.id == "shutil":
+                hit = f"shutil.{f.attr}"
+            else:
+                for a in list(node.args) + [k.value for k in node.keywords]:
+                    for c in ast.walk(a):
+                        if isinstance(c, ast.Constant) and isinstance(c.value, str) and _COPY_SHELL.search(c.value):
+                            hit = f"a shell `{c.value.strip()[:40]}`"
+        elif isinstance(node, (ast.List, ast.Tuple)) and node.elts:
+            e0 = node.elts[0]
+            if isinstance(e0, ast.Constant) and isinstance(e0.value, str) and os.path.basename(e0.value) in _COPY_TOOLS:
+                hit = f"an argv running `{e0.value}`"
+        if hit:
+            if where in allowed:
+                used.add(where)
+            else:
+                out.append(f"line {getattr(node, 'lineno', '?')} in {where}: {hit}")
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+    visit(ast.parse(source), [])
+    out += [f"allow-list entry {k} matches no copy site (remove it)" for k in sorted(set(allowed) - used)]
+    return out
 
 
 def _flock(fh) -> bool:
@@ -4118,7 +4099,7 @@ def _post_form(url: str, form: dict) -> dict:
 
 def _git_run(args: list[str], env: dict) -> tuple[int, str]:
     # No hook and no fsmonitor ever run from a checkout's own .git: every host git step runs OUTSIDE the sandbox, and a
-    # run's tree is a copy of a workspace a repository command (`warmBuild`) wrote (review of Deploy#183).
+    # run's tree is layered on a deployment tree a repository command (`warmBuild`) wrote (review of Deploy#183).
     r = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
                        env={**env, "GIT_CONFIG_NOSYSTEM": "1"}, capture_output=True, text=True, timeout=900)
     return r.returncode, (r.stdout or "") + (r.stderr or "")
@@ -4181,6 +4162,8 @@ class Host:
         # doc-gate stages run `python3 /core-tests/core-tests.py …` from it.
         self.sandbox = sandbox or Sandbox(env.get("BWRAP", "bwrap"), sandbox_readonly_roots(env), outer_ids(env))
         self.run_holds = contextlib.ExitStack()
+        self.cold_tree: Optional[tuple] = None
+        self.run_mount: Optional[Callable[[str, str], None]] = None   # the run overlay's mount (injectable for the self-test)
         self.leftovers = leftovers or pid_namespace_leftovers
         self.reap = reap or reap_children
         self.registry_get = registry_get or _registry_get
@@ -4589,9 +4572,9 @@ class Host:
 
     def stop_warming(self) -> None:
         """A claim (or SIGTERM) needs the host: stop the warm build in flight and wait for its sandbox to be gone, so no
-        run ever copies a half-built warm workspace. FAIL-CLOSED: a warm worker still alive after the bound (a git step or the
+        run ever reads a half-built deployment tree. FAIL-CLOSED: a warm worker still alive after the bound (a git step or the
         platform-source copy that does not observe the cancel) keeps the cancel SET and ends this host — never a run that
-        copies a workspace the worker can still change or wipe."""
+        reads a tree the worker can still change."""
         if self.warm_thread and self.warm_thread.is_alive():
             self.warm_cancel.set()
             self.warm_thread.join(timeout=self.warm_stop_seconds)
@@ -4600,93 +4583,54 @@ class Host:
                             "released by the lease), and Kubernetes replaces the container")
         self.warm_cancel.clear()
 
+    def deployment(self, key: Optional[str] = None) -> str:
+        """This host's deployment: its lane plus the warm key (§7.3b)."""
+        return deployment_name(self.lane, key or warm_key(self.env, self.identity))
+
     def warm_main_when_idle(self) -> None:
-        """§7.2, the HOST's half: while nothing is claimable, move each known repository's warm main workspace to the
-        default branch's tip and run the TIP's declared `warmBuild` in it, in the sandbox, once per (tip, key). Never raises:
-        warming is optional, so a failure is said, the workspace is wiped, and the next idle cycle retries."""
+        """§7.3b, the WRITER's half: while nothing is claimable, advance each known repository's deployment tree to the
+        default branch's tip IN PLACE and run the TIP's declared `warmBuild` in it, in the sandbox, once per (tip, key).
+        Never raises: warming is optional, so a failure is said, the tree is left "not built", and the next idle cycle
+        retries after a pause."""
         key = warm_key(self.env, self.identity)
-        shared = shared_tree_enabled(self.env)
         repos = set(self.warm_repos)
-        if shared:
-            # every repository the SHARED tree already holds is kept warm by whichever replica is idle, not only by one
-            # that ran it since its own start (warming never raises: an unreadable listing only narrows this pass)
-            try:
-                repos |= {r for r in os.listdir(os.path.join(self.cache, SHARED_DIR)) if REPO.match(r) and not r.startswith(".")}
-            except OSError:
-                pass
+        # every repository this deployment already holds a tree of is kept warm by whichever replica is idle, not only by
+        # one that ran it since its own start (an unreadable listing only narrows this pass)
+        try:
+            root = os.path.join(self.cache, DEPLOY_DIR, self.deployment(key))
+            repos |= {r for r in os.listdir(root) if REPO.match(r) and not r.startswith(".")}
+        except OSError:
+            pass
         for repo in sorted(repos):
             if self.stopping or self.warm_cancel.is_set():
                 return                                     # a claim needs the host: no further repository is started
-            if shared:
-                self._warm_shared(repo, key)
-                continue
-            self._warm_one(repo, key, os.path.join(self.work, WARM_DIR, repo))
+            self._warm_deployment(repo, key)
 
-    def _warm_shared(self, repo: str, key: str) -> None:
-        """The SHARED tree's writer half: only the replica holding the writer lock advances and builds, in a STAGED
-        generation (a copy of the current one) that is published only when it built — a reader never sees it before."""
-        tree = SharedTree(self.cache, repo)
-        cur = tree.current()
-        st = warm_state(tree.warm_of(cur)) if cur else None
-        tip_now = self._mirror_tip(repo)
-        if tip_now and st is not None and st.get("key") == key and st.get("tip") == tip_now and st.get("built") in (tip_now, "none"):
-            # already warm — still collect generations whose readers have let go since the last publish (best effort: cache
-            # maintenance never aborts warming)
-            try:
-                with tree.writer() as w:
-                    if w is not None:
-                        w.collect()
-            except OSError as e:
-                self.log(f"shared tree: {repo} not collected ({e})")
-            return
-        if not tip_now:
-            return                                         # the mirror names no tip: nothing to warm, no generation copied
+    def _warm_deployment(self, repo: str, key: str) -> str:
+        """Advance and build `repo`'s deployment tree as its ONE writer. Returns "built", "skipped" (already warm, cooling
+        down, no tip, or another writer / a reader holds the tree), "failed" or "stopped"."""
+        dt = DeploymentTree(self.cache, self.deployment(key), repo)
+        tip = self._mirror_tip(repo)
+        if not tip:
+            return "skipped"                               # the master names no tip: nothing to warm
+        st = dt.state()
+        if st is not None and st.get("key") == key and st.get("tip") == tip and st.get("built") in (tip, "none"):
+            return "skipped"
         failed = self.warm_failed.get(repo)
-        if failed is not None and failed[:2] == (tip_now, key) and time.monotonic() - failed[2] < WARM_RETRY_SECONDS:
-            return                                         # cooling down: no generation is copied for a build that won't run
+        if failed is not None and failed[:2] == (tip, key) and time.monotonic() - failed[2] < WARM_RETRY_SECONDS:
+            return "skipped"                               # cooling down: a failing tip is not rebuilt every pass
         try:
-            self._warm_shared_as_writer(tree, repo, key, tip_now)
+            with dt.writer() as w:
+                if w is None:
+                    return "skipped"                       # another writer, or a run reading the tree: never changed under it
+                return self._warm_one(repo, key, w, tip)
         except (Refusal, subprocess.SubprocessError, OSError, ValueError) as e:
-            # warming never raises (warm_main_when_idle): a full or read-only shared volume during a stage or a publish is
-            # said, cooled down, and retried after the pause
-            self.warm_failed[repo] = (tip_now, key, time.monotonic())
-            self.log(f"shared tree: {repo} not warmed ({type(e).__name__}: {str(e)[:200]}) — retried when idle")
-
-    def _warm_shared_as_writer(self, tree: "SharedTree", repo: str, key: str, tip_now: str) -> None:
-        with tree.writer() as w:
-            if w is None:
-                return                                     # another replica is the writer: it warms, this one does not
-            # generations a replica killed mid-stage or mid-build left behind are reclaimed BEFORE another full copy
-            w.collect()
-            cur = w.current()
-            st_cur = warm_state(w.warm_of(cur)) if cur else None
-            try:
-                gen = w.stage(cancel=self.warm_cancel, deadline=time.monotonic() + 1800,
-                              fresh=st_cur is None or st_cur.get("key") != key)
-            except Lost:
-                self.log(f"shared tree: {repo} staging stopped for a claim")
-                return
-            except Refusal as e:
-                self.warm_failed[repo] = (tip_now, key, time.monotonic())
-                self.log(f"shared tree: {repo} not staged ({e})")
-                return
-            published = False
-            try:
-                outcome = self._warm_one(repo, key, w.warm_of(gen))
-                if outcome == "built":
-                    w.publish(gen)                         # replaces `current`, then collects
-                    published = True
-                    self.log(f"shared tree: {repo} generation {os.path.basename(gen)} published")
-                    return
-            except BaseException:
-                if not published and w.current() != gen:
-                    w.discard(gen)                         # an UNPUBLISHED generation never stays behind a failure
-                raise                                      # a published one is never deleted (a collect error after it)
-            w.discard(gen)
-            w.collect()
+            self.warm_failed[repo] = (tip, key, time.monotonic())
+            self.log(f"deployment tree: {repo} not warmed ({type(e).__name__}: {str(e)[:200]}) — retried when idle")
+            return "failed"
 
     def _mirror_tip(self, repo: str) -> str:
-        mirror = os.path.join(self.cache, "git", f"{repo}.git")
+        mirror = master_path(self.cache, repo)
         genv = {**{k: self.env[k] for k in ("PATH", "LANG") if self.env.get(k)}, "HOME": self.work, "GIT_TERMINAL_PROMPT": "0"}
         try:
             rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", "HEAD^{commit}"], genv)
@@ -4695,94 +4639,117 @@ class Host:
         tip = out.strip().splitlines()[-1].strip().lower() if rc == 0 and out.strip() else ""
         return tip if SHA.match(tip) else ""
 
-    def _warm_one(self, repo: str, key: str, warm: str) -> str:
-        """Advance `warm` to the default branch's tip and run the tip's warmBuild in it. Returns "built" (the tip's build
-        or a sources-only tree are in place), "skipped" (already warm, or cooling down) or "failed"/"stopped"."""
+    def _warm_one(self, repo: str, key: str, dt: DeploymentTree, tip: str) -> str:
+        """Holding `dt`'s writer lock: move the tree to `tip` in place and run the tip's warmBuild in it, then the manifest
+        and the state (`publish`) before the lock is released. Returns "built" (the tip's build, or a sources-only tree),
+        "failed" or "stopped" — either of the last two leaves the tree "not built", so every reader goes cold."""
         scratch = tempfile.mkdtemp(prefix=".warm-", dir=self.work)
-        tip = ""
         try:
-            mirror = os.path.join(self.cache, "git", f"{repo}.git")
-            # the tip as the runs last fetched it into the mirror (with their token): the idle path uses no network
-            genv = {**{k: self.env[k] for k in ("PATH", "LANG") if self.env.get(k)}, "HOME": scratch, "GIT_TERMINAL_PROMPT": "0"}
-            rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", "HEAD^{commit}"], genv)
-            tip = out.strip().splitlines()[-1].strip().lower() if rc == 0 and out.strip() else ""
-            if not SHA.match(tip):
-                return "skipped"
-            st = warm_state(warm)
-            if st is not None and st.get("key") == key and st.get("tip") == tip and st.get("built") in (tip, "none"):
-                return "skipped"
-            failed = self.warm_failed.get(repo)
-            if failed is not None and failed[:2] == (tip, key) and time.monotonic() - failed[2] < WARM_RETRY_SECONDS:
-                return "skipped"
-            self.log(advance_warm_main(repo, tip, warm, self.env, self.log, key, deadline=time.monotonic() + 600))
-            moved = warm_state(warm)
-            if moved is None or moved.get("key") != key or moved.get("tip") != tip:
-                # the advancement did not produce this tip under this key (it wiped and said why): nothing is read from
-                # the tree and the tip is NOT marked handled — it is retried after a pause, so a run is not left cloning
-                self.warm_failed[repo] = (tip, key, time.monotonic())
-                return "failed"
+            g = _git_runner(self.env, scratch, None, time.monotonic() + 600)
+            self.log(advance_deployment_tree(dt, tip, key, g))
             try:
-                with open(os.path.join(warm, ".github", "build-stages.json")) as fh:
+                with open(os.path.join(dt.tree, ".github", "build-stages.json")) as fh:
                     decl = validate_warm_build(json.load(fh))
             except (OSError, ValueError, Refusal) as e:
-                self.log(f"warm main workspace: the tip {tip[:12]} declares no usable warmBuild ({e}) — sources only")
+                self.log(f"deployment tree: the tip {tip[:12]} declares no usable warmBuild ({e}) — sources only")
                 decl = None
             if decl is None:
-                write_warm_state(warm, {"key": key, "tip": tip, "built": "none"})
+                dt.publish(tip, key)
                 self.warm_failed.pop(repo, None)
                 return "built"
             # the image's PREPARED inputs, resolved for THIS build: `run_env` is the run's, and it is empty while idle
             prepared = prepared_env()
             extra = {**self.platform_env(), **prepared, "MW_BUILD_REPO": repo}
             extra.pop("MW_PLATFORM_SOURCE", None)
-            writable = []
-            warm_binds = []
-            platform_src = self.env.get("MW_PLATFORM_SOURCE", "") or prepared.get("MW_PLATFORM_SOURCE", "")
-            if platform_src and os.path.isdir(platform_src):
-                psrc = os.path.join(scratch, "platform")
-                writable_platform_source(platform_src, psrc)
-                # the writable copy appears AT the prepared tree's own path — the path a run's stages are handed — so a
-                # warm build that names the platform by MW_PLATFORM_SOURCE records the same platform paths in obj/ as
-                # a run does (a later bind hides the read-only one beneath it). The copy and its outputs are the warm
-                # build's and are discarded with its scratch: a repository that wants platform OUTPUTS reused clones
-                # the platform into its checkout, under the warm tree (MeshWeaver.Plugins scripts/host-warm-build.sh).
-                extra["MW_PLATFORM_SOURCE"] = platform_src
-                warm_binds.append((psrc, platform_src))
             out_dir = os.path.join(scratch, "out")
             os.makedirs(out_dir)
-            started = self.clock()
-            write_warm_state(warm, {"key": key, "tip": tip, "built": "building"})
             warm_nuget_dir = os.path.join(scratch, "nuget")
             os.makedirs(warm_nuget_dir, exist_ok=True)
             extra["NUGET_PACKAGES"] = SANDBOX_NUGET
-            rc, text = self._sandboxed_capture(decl["command"], warm, out_dir, scratch, extra,
-                                               [mirror, os.path.join(self.cache, "nuget")], writable, decl["timeoutMinutes"] * 60,
-                                               cancel=self.warm_cancel, mount=SANDBOX_CHECKOUT,
-                                               binds=[(warm_nuget_dir, SANDBOX_NUGET), *warm_binds])
+            dt.write_state({"key": key, "tip": tip, "built": "building"})
+            started = self.clock()
+            platform_src = self.env.get("MW_PLATFORM_SOURCE", "") or prepared.get("MW_PLATFORM_SOURCE", "")
+            with contextlib.ExitStack() as views:
+                warm_binds = []
+                if platform_src and os.path.isdir(platform_src):
+                    # a WRITABLE VIEW of the platform source (an overlay, or a cold worktree of its master — never a copy),
+                    # appearing AT the prepared tree's own path — the path a run's stages are handed — so a warm build that
+                    # names the platform by MW_PLATFORM_SOURCE records the same platform paths in obj/ as a run does
+                    psrc = views.enter_context(platform_source_view(platform_src, os.path.join(scratch, "platform"), self.env, self.log))
+                    extra["MW_PLATFORM_SOURCE"] = platform_src
+                    warm_binds.append((psrc, platform_src))
+                rc, text = self._sandboxed_capture(decl["command"], dt.tree, out_dir, scratch, extra,
+                                                   [dt.mirror, os.path.join(self.cache, "nuget")], [], decl["timeoutMinutes"] * 60,
+                                                   cancel=self.warm_cancel, mount=SANDBOX_CHECKOUT,
+                                                   binds=[(warm_nuget_dir, SANDBOX_NUGET), *warm_binds])
             if rc == 0:
-                write_warm_state(warm, {"key": key, "tip": tip, "built": tip})
+                dt.publish(tip, key)                       # manifest, then state — still under the writer lock
                 self.warm_failed.pop(repo, None)
-                self.log(f"warm main workspace: built main@{tip[:12]} with the tip's warmBuild in {int(self.clock() - started)} s")
+                self.log(f"deployment tree: built main@{tip[:12]} with the tip's warmBuild in {int(self.clock() - started)} s "
+                         f"({dt.tree}; integrity manifest written)")
                 return "built"
-            else:
-                wipe_warm(warm)
-                # the cooldown covers a failed BUILD too: an unchanged failing tip is not prepared and rebuilt every pass
-                self.warm_failed[repo] = (tip, key, time.monotonic())
-                self.log(f"warm main workspace: the tip's warmBuild failed (exit {rc}) — wiped, retried when idle: {text.strip()[-300:]}")
-                return "failed"
+            dt.unbuild(key, tip)
+            # the cooldown covers a failed BUILD too: an unchanged failing tip is not rebuilt every pass
+            self.warm_failed[repo] = (tip, key, time.monotonic())
+            self.log(f"deployment tree: the tip's warmBuild failed (exit {rc}) — not built (runs go cold), retried when idle: {text.strip()[-300:]}")
+            return "failed"
         except Lost:
-            # a claim (or SIGTERM) needs the host: the half-built workspace is wiped, never copied by a run
-            wipe_warm(warm)
-            self.log(f"warm main workspace for {repo}: the warm build was stopped for a claim — wiped, retried when idle")
+            # a claim (or SIGTERM) needs the host: the half-built tree is left NOT BUILT, never read by a run
+            dt.unbuild(key, tip)
+            self.log(f"deployment tree for {repo}: the warm build was stopped for a claim — not built, retried when idle")
             return "stopped"
         except (Refusal, subprocess.SubprocessError, OSError, ValueError) as e:
-            wipe_warm(warm)
-            if SHA.match(tip):
-                self.warm_failed[repo] = (tip, key, time.monotonic())
-            self.log(f"warm main workspace for {repo}: not warmed ({type(e).__name__}: {str(e)[:200]}) — wiped, retried when idle")
+            try:
+                dt.unbuild(key, tip)
+            except OSError:
+                pass
+            self.warm_failed[repo] = (tip, key, time.monotonic())
+            self.log(f"deployment tree for {repo}: not warmed ({type(e).__name__}: {str(e)[:200]}) — not built, retried when idle")
             return "failed"
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
+
+    def seed_run_tree(self, repo: str, sha: str, refs: list, dest: str, token: Optional[str], deadline: Optional[float]) -> str:
+        """A run's tree (§7.3b): its deployment tree as the read-only LOWER of an overlay — the tree held by a SHARED lock in
+        `self.run_holds` until run() has unmounted it — or, as the ONE fallback, a COLD worktree off the master, said.
+        Nothing is ever copied. Returns the plan line, `bytes copied = N` measured."""
+        key = warm_key(self.env, self.identity)
+        dt = DeploymentTree(self.cache, self.deployment(key), repo)
+        why = None
+        if not run_overlay_enabled(self.env):
+            why = ("this host cannot overlay (no user + mount namespace for the runner)" if str(self.env.get(RUN_OVERLAY_ENV, "")).lower() == "true"
+                   else "the run overlay is not on for this host (buildHosts.runOverlay)")
+        else:
+            with contextlib.ExitStack() as hold:
+                held = hold.enter_context(dt.reader(key))
+                if held is None:
+                    why = dt.last_refusal
+                else:
+                    lower, tip = held
+                    started = time.monotonic()
+                    try:
+                        overlay_run_tree(repo, sha, refs, lower, tip, dest, token, self.env, self.log, deadline=deadline,
+                                         mount=self.run_mount)
+                        self.run_holds.enter_context(hold.pop_all())   # held until run() released the overlay
+                        n = copied_bytes(dest + ".upper", lower)
+                        return (f"workspace: overlay of the deployment tree main@{tip[:12]} (built by the tip's warmBuild), "
+                                f"moved to {sha[:12]} in {time.monotonic() - started:.1f} s — the run writes only its delta "
+                                f"(obj/ and bin/ kept); bytes copied = {n}")
+                    except (Refusal, OSError) as e:
+                        why = f"the overlay failed ({str(e)[:160]})"
+                        release_run_tree(dest)
+                        for d in (dest, dest + ".upper", dest + ".ovlwork"):
+                            shutil.rmtree(d, ignore_errors=True)
+        self.log(f"COLD WORKTREE: {repo}@{sha[:12]} — {why}; this run takes a cold `git worktree add` off the master "
+                 f"(no warm obj/ or bin/; nothing copied)")
+        g = _git_runner(self.env, os.path.dirname(dest), token, deadline)
+        base = self.env.get("MW_BUILD_GIT_BASE", "https://github.com/Systemorph").rstrip("/")
+        mirror = master_path(self.cache, repo)
+        wanted = [sha] + [r for r in (refs or []) if isinstance(r, str) and r]
+        _update_mirror(repo, f"{base}/{repo}.git", os.path.dirname(mirror), mirror, wanted, g, self.log)
+        cold_worktree(self.cache, repo, sha, dest, g)
+        self.cold_tree = (repo, dest)
+        return f"workspace: COLD worktree of the master at {sha[:12]} ({why}); bytes copied = {copied_bytes(dest, None)}"
 
     # -- step 3/4: run ----------------------------------------------------------------------
     def run(self, claim: dict) -> str:
@@ -4797,7 +4764,7 @@ class Host:
         started = self.clock()
         self.sweep_workspaces()
         workdir = tempfile.mkdtemp(prefix=f"{repo}-{sha[:12]}-", dir=self.work)
-        # the run's tree is always its OWN (a copy of the warm main workspace when that is on, §7.2), gone with the workdir
+        # the run's tree is always its OWN (an overlay of its deployment tree, or a cold worktree — §7.3b), gone with the workdir
         checkout_dir = os.path.join(workdir, "src")
         outputs_dir = os.path.join(workdir, "out")
         self.artifacts_dir = os.path.join(workdir, "artifacts")
@@ -4813,7 +4780,8 @@ class Host:
         if claim.get("claimId"):
             self.claim_id = str(claim["claimId"])
         self.run_env = prepared_env()
-        self.run_holds = contextlib.ExitStack()        # what the run holds until its tree is released (the generation's lock)
+        self.run_holds = contextlib.ExitStack()        # what the run holds until its tree is released (the deployment tree's shared lock)
+        self.cold_tree = None                           # (repo, path) of a cold worktree this run took off the master
         with Heartbeat() as hb:
             self.heartbeat = hb
             outcome = "lost"
@@ -4834,8 +4802,13 @@ class Host:
                     self.log(f"{path}: receipts not acknowledged — keeping the workspace {workdir}")
                     release_run_tree(checkout_dir)
                 else:
+                    if self.cold_tree is not None:
+                        # the cold worktree is removed AND pruned under the master lock: nothing stays registered
+                        remove_cold_worktree(self.cache, self.cold_tree[0], self.cold_tree[1],
+                                             _git_runner(self.env, workdir, None, None))
                     remove_workspace(workdir)
-                # the overlay is gone: only now may the generation beneath it be collected
+                self.cold_tree = None
+                # the overlay is gone: only now may the deployment tree beneath it be advanced by its writer
                 self.run_holds.close()
 
     def _sink_for(self, repo: str, sha: str, stage: str) -> EventSink:
@@ -4866,38 +4839,9 @@ class Host:
                 co_deadline = time.monotonic() + max(1.0, self.run_deadline - (self.clock() - started))
                 if warm_enabled(self.env) and self.checkout is default_checkout:
                     self.warm_repos.add(repo)
-                    if shared_tree_enabled(self.env) and run_overlay_enabled(self.env):
-                        # the SHARED tree's published generation as the run's read-only LOWER layer: held against deletion
-                        # for the WHOLE run (released in run() after the unmount), so a collect never removes it under the
-                        # overlay; the run writes only its upper layer, never the shared tree
-                        tree_ = SharedTree(self.cache, repo)
-                        shared_warm = self.run_holds.enter_context(tree_.reader())
-                        if tree_.last_refusal:
-                            self.log(f"shared tree: {repo} {tree_.last_refusal} — this run starts from a clean checkout")
-                        self.workspace_line = seed_run_from_warm(
-                            repo, sha, claim.get("refs") or [],
-                            shared_warm or os.path.join(self.cache, SHARED_DIR, repo, "none", WARM_DIR, repo),
-                            checkout_dir, token, self.env, self.log, warm_key(self.env, self.identity), deadline=co_deadline,
-                            overlay=shared_warm is not None)
-                    elif shared_tree_enabled(self.env):
-                        # the SHARED tree's published generation, held against deletion while it is copied; the run writes
-                        # only its own copy, never the shared tree
-                        tree_ = SharedTree(self.cache, repo)
-                        with tree_.reader() as shared_warm:
-                            if tree_.last_refusal:
-                                self.log(f"shared tree: {repo} {tree_.last_refusal} — this run starts from a clean checkout")
-                            self.workspace_line = seed_run_from_warm(
-                                repo, sha, claim.get("refs") or [],
-                                shared_warm or os.path.join(self.cache, SHARED_DIR, repo, "none", WARM_DIR, repo),
-                                checkout_dir, token, self.env, self.log, warm_key(self.env, self.identity), deadline=co_deadline)
-                        try:
-                            os.makedirs(os.path.join(self.cache, SHARED_DIR, repo), exist_ok=True)
-                        except OSError as e:
-                            self.log(f"shared tree: {repo} not registered on the cache ({e}) — warmed from this replica's own record")
-                    else:
-                        self.workspace_line = seed_run_from_warm(repo, sha, claim.get("refs") or [], os.path.join(self.work, WARM_DIR, repo),
-                                                                 checkout_dir, token, self.env, self.log, warm_key(self.env, self.identity),
-                                                                 deadline=co_deadline)
+                    # §7.3b: the deployment tree as the read-only lower of an overlay (held for the WHOLE run, released in
+                    # run() after the unmount), or a cold worktree off the master — never a copy
+                    self.workspace_line = self.seed_run_tree(repo, sha, claim.get("refs") or [], checkout_dir, token, co_deadline)
                     self.log(self.workspace_line)
                 else:
                     self.workspace_line = "workspace: clean (a fresh clone per run — MW_BUILD_WARM_WORKSPACE is not set)"
@@ -5318,8 +5262,6 @@ class Host:
         except OSError:
             return gone
         for n in names:
-            if n in (WARM_DIR, WARM_PRIVATE):
-                continue    # the replica's warm workspaces live across runs (§7.2); a key change or a failure wipes them
             full = os.path.join(self.work, n)
             try:
                 if os.path.isdir(full) and not os.path.islink(full) and now - os.path.getmtime(full) > 2 * self.run_deadline:
@@ -5327,6 +5269,21 @@ class Host:
                     gone.append(n)
             except OSError:
                 continue
+        cache = getattr(self, "cache", None)
+        if gone and cache:
+            # a kept run that took a COLD worktree is gone now: prune its registration from the master, under the master lock
+            git_root = os.path.join(cache, "git")
+            try:
+                masters = [m[:-4] for m in os.listdir(git_root) if m.endswith(".git") and REPO.match(m[:-4])]
+            except OSError:
+                masters = []
+            g = _git_runner(getattr(self, "env", {}) or {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}, self.work, None, None)
+            for repo in masters:
+                try:
+                    with master_lock(git_root, repo):
+                        g("--git-dir", master_path(cache, repo), "worktree", "prune")
+                except (Refusal, OSError):
+                    continue
         return gone
 
     def nuget_warm_plan(self, repo: str, workdir: str) -> dict:
@@ -5389,7 +5346,7 @@ class Host:
     def warm_nuget(self, repo: str, workdir: str, plan: dict, sink: "EventSink", run_end: float) -> None:
         """Fill `<cache>/nuget` from the DEFAULT BRANCH's tip per `plan` (`nuget_warm_plan`): the tip's OWN restore
         command, on a host-made checkout of the tip, handed the installed platform as a stage is (`platform_env`, the
-        reference set) and its OWN writable copy of the platform source (`writable_platform_source`, as a prepared
+        reference set) and its OWN writable view of the platform source (`platform_source_view`, as a prepared
         input's build gets one — MeshWeaver.Plugins' projects reference the platform, so a bare checkout cannot restore
         them), writing into a fresh host-owned folder; every package it fetched is
         verified and rebuilt into the cache (`promote_nuget`), and the key is marked once it restored cleanly. A failure
@@ -5419,11 +5376,13 @@ class Host:
         # A FRESH folder, written only by this restore: nothing a stage or a per-run prepared build restored can reach it.
         fetched = os.path.join(workdir, "warm-nuget")
         # The restore gets what a stage gets of the installed platform (`platform_env`), and — like a prepared input's
-        # build — its OWN writable copy of the platform source: a repository whose projects reference the platform
+        # build — its OWN writable VIEW of the platform source (`platform_source_view`: an overlay, or a cold worktree of the
+        # platform's master — never a copy): a repository whose projects reference the platform
         # (MeshWeaver.Plugins: -p:MeshWeaverRoot="$MW_PLATFORM_SOURCE/") restores those projects too, and restore writes
         # their obj/ into that tree. A host whose image carries no platform source hands none (said by the restore).
         platform_src = self.env.get("MW_PLATFORM_SOURCE", "")
         psrc = os.path.join(workdir, "warm-platform")
+        views = contextlib.ExitStack()
         try:
             shutil.rmtree(fetched, ignore_errors=True)
             os.makedirs(fetched)
@@ -5434,7 +5393,7 @@ class Host:
             extra.pop("MW_PLATFORM_SOURCE", None)
             writable = [fetched]
             if platform_src and os.path.isdir(platform_src):
-                extra["MW_PLATFORM_SOURCE"] = writable_platform_source(platform_src, psrc)
+                extra["MW_PLATFORM_SOURCE"] = views.enter_context(platform_source_view(platform_src, psrc, self.env, self.log))
                 writable.append(psrc)
             rc, text = self._sandboxed_capture(plan["command"], tree, out, workdir, extra,
                                                [os.path.join(self.cache, "git", f"{repo}.git"), os.path.join(self.cache, "nuget")],
@@ -5443,12 +5402,12 @@ class Host:
             # complete packages may be promoted; each is verified against what NuGet recorded AND against the hash its
             # source feed publishes, and rebuilt from its archive.
             np_, nk, nr = promote_nuget(fetched, self.cache, self.log, self.nuget_feeds, budget=run_end - self.clock())
-        except (subprocess.SubprocessError, OSError) as e:
+        except (subprocess.SubprocessError, OSError, Refusal) as e:
             warn(f"the warm NuGet cache was not filled: a host-side failure while warming ({type(e).__name__}: {str(e)[:200]})")
             return
         finally:
             shutil.rmtree(fetched, ignore_errors=True)
-            shutil.rmtree(psrc, ignore_errors=True)
+            views.close()                                  # the platform view: unmounted or its cold worktree removed + pruned
         secs = int(self.clock() - started)
         if rc != 0 or nr:
             warn(f"the warm NuGet cache was not filled from the default branch's tip {tip[:12]} (restore exit {rc}"
@@ -5577,19 +5536,19 @@ class Host:
             # let a pull request's command plant packages into what the default branch's build installs for every run.
             nuget = os.path.join(workdir, "prepared-nuget", label)
             os.makedirs(nuget, exist_ok=True)
-            # The build gets its OWN writable copy of the platform source: a `dotnet publish` that references
-            # platform projects writes their obj/ and bin/ into that tree, and the image's copy is read-only.
-            # A miss is rare (once per platform and key), so the copy is paid once per prepared build.
-            psrc = writable_platform_source(platform_src, os.path.join(workdir, "prepared-platform", label, name))
+            # The build gets its OWN writable VIEW of the platform source (`platform_source_view`: an overlay of the
+            # image's read-only tree, or a cold worktree of the platform's master — never a copy): a `dotnet publish` that
+            # references platform projects writes their obj/ and bin/ into that tree, and the image's tree is read-only.
             left = run_end - self.clock()
             if left <= 0:
                 raise Refusal(f"{name}: the run deadline passed before it was built")
             started = self.clock()
-            rc, text = sandboxed(p["build"], tree, out, {**base_extra, "MW_PREPARE_OUT": out, "MW_PLATFORM_SOURCE": psrc,
-                                                         "NUGET_PACKAGES": nuget},
-                                 [mirror, os.path.join(self.cache, "nuget")], [nuget, psrc],
-                                 min(left, p["timeoutMinutes"] * 60))
-            shutil.rmtree(psrc, ignore_errors=True)
+            with platform_source_view(platform_src, os.path.join(workdir, "prepared-platform", label, name),
+                                      self.env, self.log) as psrc:
+                rc, text = sandboxed(p["build"], tree, out, {**base_extra, "MW_PREPARE_OUT": out, "MW_PLATFORM_SOURCE": psrc,
+                                                             "NUGET_PACKAGES": nuget},
+                                     [mirror, os.path.join(self.cache, "nuget")], [nuget, psrc],
+                                     min(left, p["timeoutMinutes"] * 60))
             # The build controls `out` (it may leave it unreadable): every host-side I/O on it is a Refusal NAMING
             # the input, never an exception that leaves the run without a verdict.
             try:
@@ -6631,142 +6590,49 @@ def self_test() -> int:
               and any(c[:4] == ("-C", mirror, "fetch", "--quiet") and "--prune" in c for c in calls), calls)
         check("mirror/the checkout is detached at the sha", calls[-1][-2:] == ("--detach", "d" * 40), calls[-1])
 
-        # ── 5a''. the SHARED tree (§7.3): one tree per repository on the shared cache, generations, one writer ──────
-        import threading as _thr
-        sroot = os.path.join(tmp, "shared-cache")
-        st_ = SharedTree(sroot, "R")
+        # ── 5a''. NOTHING IS EVER COPIED (§7.3b): the gate reads this file's own source ─────────────────────────────────
+        own_src = open(os.path.abspath(__file__), encoding="utf-8").read()
+        nc = no_copy_violations(own_src)
+        check("no-copy/build-run.py copies no source or build tree anywhere (cp, rsync, tar, shutil.copytree/copyfile/copy/copy2)",
+              nc == [], nc)
+        check("no-copy/every allow-listed copy site is named with a reason", all(isinstance(v, str) and len(v) > 40 for v in NO_COPY_ALLOWED.values()))
+        # NEGATIVE CONTROLS: a planted copy of each kind is caught — in a new function, and in an allow-listed one under
+        # another name; an allow-list entry whose site is gone is caught too
+        plants = {
+            "shutil.copytree": "def _planted(a, b):\n    shutil.copytree(a, b)\n",
+            "shutil.copyfile": "def _planted(a, b):\n    shutil.copyfile(a, b)\n",
+            "shutil.copy2": "def _planted(a, b):\n    shutil.copy2(a, b)\n",
+            "cp argv": "def _planted(a, b):\n    subprocess.run([\"cp\", \"-a\", a, b])\n",
+            "cp argv in a loop": "def _planted(a, b):\n    for argv in ([\"cp\", \"-a\", \"--reflink=auto\", a, b],):\n        subprocess.run(argv)\n",
+            "rsync argv": "def _planted(a, b):\n    subprocess.Popen([\"rsync\", \"-a\", a, b])\n",
+            "tar argv": "def _planted(a, b):\n    subprocess.run([\"/usr/bin/tar\", \"-cf\", \"-\", a])\n",
+            "a shell cp": "def _planted(a, b):\n    subprocess.run(f\"cp -a {a} {b}\", shell=True)\n",
+            "a shell tar pipe": "def _planted(a, b):\n    subprocess.run([\"sh\", \"-c\", f\"tar -C {a} -cf - . | tar -C {b} -xf -\"])\n",
+        }
+        for name_, code_ in plants.items():
+            got_ = no_copy_violations(own_src + "\n\n" + code_)
+            check(f"no-copy/negative control: a planted {name_} FAILS the gate, named by its function", any("_planted" in v for v in got_), got_)
+        check("no-copy/negative control: an allow-list entry that matches no site fails the gate",
+              any("Nowhere.at_all" in v for v in no_copy_violations(own_src, dict(NO_COPY_ALLOWED, **{"Nowhere.at_all": "x" * 50}))))
+        check("no-copy/negative control: the same copy outside its allow-listed function fails",
+              no_copy_violations(own_src, {k: v for k, v in NO_COPY_ALLOWED.items() if k != "promote_outputs"}) != [])
+        check("no-copy/the self-test's own fixtures are not the product (self_test is skipped)",
+              no_copy_violations("def self_test():\n    shutil.copytree('a', 'b')\n", {}) == [])
+        # bytes copied is MEASURED: a run layer holding a duplicate of the lower's file counts it, git's own .git and a changed
+        # file do not
+        bc = os.path.join(tmp, "bytes-copied")
+        os.makedirs(os.path.join(bc, "lower", "s")); os.makedirs(os.path.join(bc, "up", "s")); os.makedirs(os.path.join(bc, "up", ".git"))
+        open(os.path.join(bc, "lower", "s", "a.cs"), "w").write("same-bytes")
+        open(os.path.join(bc, "lower", "s", "b.cs"), "w").write("old")
+        open(os.path.join(bc, "up", "s", "b.cs"), "w").write("new")
+        open(os.path.join(bc, "up", ".git", "index"), "w").write("x" * 99)
+        check("no-copy/a layer with only changed files and git's own .git copied 0 bytes", copied_bytes(os.path.join(bc, "up"), os.path.join(bc, "lower")) == 0)
+        open(os.path.join(bc, "up", "s", "a.cs"), "w").write("same-bytes")
+        check("no-copy/negative control: a duplicate of the lower's file in the run's layer IS counted (10 bytes)",
+              copied_bytes(os.path.join(bc, "up"), os.path.join(bc, "lower")) == 10)
+        check("no-copy/no lower: nothing copied from one", copied_bytes(os.path.join(bc, "up"), None) == 0)
 
-        def fill(gen, label):
-            w_ = st_.warm_of(gen)
-            os.makedirs(os.path.join(w_, "src", "obj"), exist_ok=True)
-            for i in range(40):
-                open(os.path.join(w_, "src", f"f{i}.cs"), "w").write(label)
-            open(os.path.join(w_, "src", "obj", "state.cache"), "w").write(label)
-            write_warm_state(w_, {"key": "k", "tip": label, "built": label})
-        with st_.writer() as w1:
-            check("shared/the first replica is the ONE writer", w1 is not None)
-            with st_.writer() as w2:
-                check("shared/a second replica cannot be a writer while the first holds the lock (it does not warm)", w2 is None)
-            g1 = w1.stage()
-            fill(g1, "gen1")
-            check("shared/nothing is published while a generation is staged", st_.current() is None)
-            w1.publish(g1)
-        check("shared/a published generation is current, its state readable", st_.current() == g1
-              and (warm_state(st_.warm_of(g1)) or {}).get("built") == "gen1")
-        # a reader holds gen1 while the writer publishes gen2: gen1 survives the collect, then goes once released
-        with st_.reader() as held:
-            check("shared/a reader is handed the current generation's tree", held == st_.warm_of(g1))
-            with st_.writer() as w3:
-                g2 = w3.stage()
-                check("shared/a staged generation starts as a COPY of the current one (obj/ carried)",
-                      open(os.path.join(st_.warm_of(g2), "src", "obj", "state.cache")).read() == "gen1")
-                fill(g2, "gen2")
-                w3.publish(g2)
-            check("shared/the generation a reader holds is NEVER deleted under it", os.path.isdir(g1) and st_.current() == g2)
-        check("shared/once released, the old generation is collected", SharedTree(sroot, "R").collect() == [os.path.basename(g1)]
-              and not os.path.exists(g1))
-        # a reader that re-opened a lock after its generation was deleted leaves an orphan lock file: the next collect
-        # sweeps it, but never one a reader still holds, and never the current generation's lock
-        import fcntl as _fc
-        st_o = SharedTree(sroot, "R")
-        orphan_a, orphan_b = os.path.join(st_o.locks, "gen-orphan-a.lock"), os.path.join(st_o.locks, "gen-orphan-b.lock")
-        for o in (orphan_a, orphan_b):
-            open(o, "a").close()
-        cur_lock_ = st_o._lock_of(st_o.current())
-        open(cur_lock_, "a").close()
-        held_o = SharedTree._lock(orphan_b, _fc.LOCK_SH | _fc.LOCK_NB)
-        st_o.collect()
-        check("shared/an orphan lock (its generation gone) is swept by collect", not os.path.exists(orphan_a))
-        check("shared/an orphan lock a reader still holds is kept (negative control)", os.path.exists(orphan_b))
-        check("shared/the current generation's lock is never swept", os.path.exists(cur_lock_))
-        if held_o is not None:
-            held_o.close()
-        st_o.collect()
-        check("shared/once released, the held orphan is swept too", not os.path.exists(orphan_b))
-        # a RETIRED generation (here: one a failed collect left behind) is never handed to a reader, only the current one
-        with st_.writer() as w_r:
-            g_old = st_.current(); g_new = w_r.stage(); fill(g_new, "gen2b")
-            os.makedirs(st_.manifests, exist_ok=True)       # what publish writes first: the generation's manifest
-            with open(st_.manifest_of(g_new), "w") as mfh:
-                json.dump(generation_manifest(g_new), mfh)
-            os.symlink(os.path.relpath(g_new, st_.root), os.path.join(st_.root, ".tmp-cur")); os.replace(os.path.join(st_.root, ".tmp-cur"), os.path.join(st_.root, "current"))
-        with st_.reader() as w_cur:
-            check("shared/a reader is only ever handed the CURRENT generation, never a retired one",
-                  w_cur == st_.warm_of(g_new) and w_cur != st_.warm_of(g_old))
-        # NO TORN READS: readers copying while a writer publishes generation after generation see ONE generation, whole
-        torn: list = []
-        worker_errors: list = []
-
-        def guarded(fn):
-            def run_():
-                try:
-                    fn()
-                except BaseException as e_:          # a worker's failure must fail the case, never vanish in a thread
-                    worker_errors.append(repr(e_))
-            return run_
-
-        def read_many():
-            for _ in range(150):
-                with SharedTree(sroot, "R").reader() as w_:
-                    if w_ is None:
-                        continue
-                    labels = {open(os.path.join(w_, "src", f"f{i}.cs")).read() for i in range(40)}
-                    labels.add(open(os.path.join(w_, "src", "obj", "state.cache")).read())
-                    if len(labels) != 1:
-                        torn.append(labels)
-
-        def write_many():
-            for n in range(3, 40):
-                with SharedTree(sroot, "R").writer() as w_:
-                    if w_ is None:
-                        continue
-                    g_ = w_.stage()
-                    fill(g_, f"gen{n}")
-                    w_.publish(g_)
-        ths = [_thr.Thread(target=guarded(read_many)) for _ in range(3)] + [_thr.Thread(target=guarded(write_many))]
-        for th_ in ths:
-            th_.start()
-        for th_ in ths:
-            th_.join(300)
-        check("shared/every reader and the writer FINISHED, without an exception",
-              not any(th_.is_alive() for th_ in ths) and worker_errors == [], worker_errors)
-        check("shared/readers copying during publishes never see a torn tree (every file from ONE generation)", torn == [], torn[:2])
-        check("shared/after the storm one current generation remains, older ones collected once free",
-              len([g for g in os.listdir(st_.gens)]) <= 2 and st_.current() is not None, os.listdir(st_.gens))
-        # REDO FORWARD: a failed staged build is discarded, the last good generation stays current, the next stage starts there
-        last_good = st_.current()
-        with st_.writer() as w4:
-            bad = w4.stage()
-            open(os.path.join(st_.warm_of(bad), "src", "obj", "state.cache"), "w").write("half-built")
-            w4.discard(bad)
-        check("shared/a failed build is never published — the last good generation stays current", st_.current() == last_good and not os.path.exists(bad))
-        with st_.writer() as w5:
-            nxt = w5.stage()
-            check("shared/the next writer redoes FORWARD from the last good generation (never from the failed one)",
-                  open(os.path.join(st_.warm_of(nxt), "src", "obj", "state.cache")).read()
-                  == open(os.path.join(st_.warm_of(last_good), "src", "obj", "state.cache")).read())
-            w5.discard(nxt)
-        # a run's copy never writes back
-        before = {f: open(os.path.join(st_.warm_of(last_good), "src", f)).read() for f in os.listdir(os.path.join(st_.warm_of(last_good), "src")) if f.endswith(".cs")}
-        run_copy = os.path.join(tmp, "shared-run")
-        with st_.reader() as w_:
-            _copy_tree(w_, run_copy)
-        open(os.path.join(run_copy, "src", "f0.cs"), "w").write("PR CHANGE")
-        open(os.path.join(run_copy, "src", "obj", "state.cache"), "w").write("PR BUILD")
-        after = {f: open(os.path.join(st_.warm_of(last_good), "src", f)).read() for f in before}
-        check("shared/a PR run's writes stay in its copy — the shared tree is unchanged",
-              before == after and open(os.path.join(st_.warm_of(last_good), "src", "obj", "state.cache")).read() != "PR BUILD")
-        with st_.writer() as w_k:
-            fresh_gen = w_k.stage(fresh=True)
-            check("shared/a generation staged for another key starts EMPTY (no multi-gigabyte copy wiped at once), the old one stays current",
-                  os.listdir(fresh_gen) == [] and st_.current() != fresh_gen)
-            w_k.discard(fresh_gen)
-        with SharedTree(os.path.join(tmp, "ro-cache"), "R").reader() as none_:
-            check("shared/no published generation reads as no warm tree (a clean checkout follows)", none_ is None)
-        check("shared/opt-in only, and only with the warm workspace", shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true", "MW_BUILD_SHARED_TREE": "true"})
-              and not shared_tree_enabled({"MW_BUILD_SHARED_TREE": "true"}) and not shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}))
-
-        # ── the RUN OVERLAY: a run's tree is the shared generation (read-only lower) + its own upper ──────────────
+        # ── the RUN OVERLAY: a run's tree is its deployment tree (read-only lower) + its own upper ──────────────
         ns_log, execd = [], []
         def _exec(*a):
             execd.append(a)
@@ -6779,7 +6645,7 @@ def self_test() -> int:
         enter_run_namespace(["--host"], ov_env, ns_log.append, which=lambda n: None, probe=lambda c: 0, execvpe=_exec)
         check("overlay/no unshare: not re-executed, and said", execd == [] and "no `unshare`" in ns_log[-1], ns_log)
         enter_run_namespace(["--host"], ov_env, ns_log.append, which=lambda n: "/usr/bin/unshare", probe=lambda c: 1, execvpe=_exec)
-        check("overlay/a host that cannot mount an overlay in a user namespace: not re-executed, and said (runs copy)",
+        check("overlay/a host that cannot mount an overlay in a user namespace: not re-executed, and said (runs take a cold worktree)",
               execd == [] and "cannot mount an overlay" in ns_log[-1], ns_log)
         probed = []
         enter_run_namespace(["--host"], ov_env, ns_log.append, which=lambda n: "/usr/bin/unshare",
@@ -6791,10 +6657,10 @@ def self_test() -> int:
               len(execd) == 1 and execd[0][1][:4] == ["/usr/bin/unshare", "-Urm", "--propagation", "private"]
               and execd[0][1][-1] == "--host" and execd[0][2].get("MW_BUILD_IN_NS") == "1"
               and execd[0][2].get("MW_BUILD_OUTER_UID") == str(os.getuid()), execd)
-        check("overlay/enabled only with the marker AND the shared tree",
-              run_overlay_enabled({"MW_BUILD_RUN_OVERLAY": "true", "MW_BUILD_IN_NS": "1", "MW_BUILD_WARM_WORKSPACE": "true", "MW_BUILD_SHARED_TREE": "true"})
-              and not run_overlay_enabled({"MW_BUILD_RUN_OVERLAY": "true", "MW_BUILD_WARM_WORKSPACE": "true", "MW_BUILD_SHARED_TREE": "true"})
-              and not run_overlay_enabled({"MW_BUILD_RUN_OVERLAY": "true", "MW_BUILD_IN_NS": "1", "MW_BUILD_WARM_WORKSPACE": "true"}))
+        check("overlay/enabled only with the marker AND the warm workspace (there is no deployment tree without it)",
+              run_overlay_enabled({"MW_BUILD_RUN_OVERLAY": "true", "MW_BUILD_IN_NS": "1", "MW_BUILD_WARM_WORKSPACE": "true"})
+              and not run_overlay_enabled({"MW_BUILD_RUN_OVERLAY": "true", "MW_BUILD_WARM_WORKSPACE": "true"})
+              and not run_overlay_enabled({"MW_BUILD_RUN_OVERLAY": "true", "MW_BUILD_IN_NS": "1"}))
         ids_av = Sandbox("bwrap", [], ("1654", "1654")).argv("true", "/w/s", "/w/o", {})
         plain_av = Sandbox("bwrap", []).argv("true", "/w/s", "/w/o", {})
         check("overlay/in the runner's namespace a stage keeps the pod's uid/gid (--uid/--gid right after --unshare-user)",
@@ -6807,11 +6673,12 @@ def self_test() -> int:
         def _sh_ok(cmd):
             calls.append(cmd)
             return 0, ""
-        low = st_.warm_of(last_good)
+        low = os.path.join(tmp, "ovl-lower")
+        os.makedirs(low, exist_ok=True)
         ovl_dest = os.path.join(tmp, "ovl-run", "src")
         os.makedirs(os.path.dirname(ovl_dest), exist_ok=True)
         _overlay_tree(low, ovl_dest, _sh_ok)
-        check("overlay/the run's tree is mounted with the generation as the read-only lower and the run's own upper",
+        check("overlay/the run's tree is mounted with the deployment tree as the read-only lower and the run's own upper",
               calls and calls[0][:4] == ["mount", "-t", "overlay", "overlay"]
               and calls[0][5] == f"lowerdir={low},upperdir={ovl_dest}.upper,workdir={ovl_dest}.ovlwork" and calls[0][6] == ovl_dest, calls)
         refused = None
@@ -6819,7 +6686,7 @@ def self_test() -> int:
             _overlay_tree(low, os.path.join(tmp, "ovl-run2", "src"), lambda c: (1, "permission denied"))
         except Refusal as e:
             refused = str(e)
-        check("overlay/a refused mount is a Refusal naming why (the caller copies instead)", refused and "permission denied" in refused, refused)
+        check("overlay/a refused mount is a Refusal naming why (the caller takes a cold worktree instead)", refused and "permission denied" in refused, refused)
         for bad in ("/a,b", "/a:b"):
             try:
                 _overlay_tree(bad, os.path.join(tmp, "ovl-run3", "src"), _sh_ok)
@@ -6836,48 +6703,6 @@ def self_test() -> int:
         remove_workspace(os.path.join(tmp, "ovl-rel"), release=lambda d: release_run_tree(d, lambda c: (0, ""), ismount=lambda p: False))
         check("overlay/the kernel's mode-000 work directory is made removable and the workspace is gone",
               not os.path.exists(os.path.join(tmp, "ovl-rel")))
-        # seeding through an overlay, through a refused overlay (copy), and the plan line naming which
-        if shutil.which("git"):
-            sg = os.path.join(tmp, "ovl-seed-origin")
-            subprocess.run(["git", "init", "-q", sg], check=True)
-            open(os.path.join(sg, "a.txt"), "w").write("a")
-            subprocess.run(["git", "-C", sg, "add", "."], check=True)
-            subprocess.run(["git", "-C", sg, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "c"], check=True)
-            sha_ = subprocess.run(["git", "-C", sg, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-            lower_ = os.path.join(tmp, "ovl-seed-lower", WARM_DIR, "R")
-            os.makedirs(os.path.join(lower_, "obj"), exist_ok=True)
-            open(os.path.join(lower_, "a.txt"), "w").write("a")
-            open(os.path.join(lower_, "obj", "x"), "w").write("built")
-            os.makedirs(os.path.join(warm_private(lower_)), exist_ok=True)
-            with open(os.path.join(warm_private(lower_), "state.json"), "w") as fh:
-                json.dump({"key": "k", "tip": sha_, "built": sha_}, fh)
-            senv = {"MW_BUILD_GIT_BASE": os.path.dirname(sg), "MW_BUILD_CACHE": os.path.join(tmp, "ovl-seed-cache"), "PATH": os.environ.get("PATH", "")}
-            os.makedirs(os.path.join(tmp, "ovl-seed-cache", "git"), exist_ok=True)
-            subprocess.run(["git", "clone", "-q", "--bare", sg, os.path.join(tmp, "ovl-seed-cache", "git", "R.git")], check=True)
-            mounted = []
-            def _fake_mount(lower, dest):         # the overlay's VIEW, emulated: the lower's files under dest
-                mounted.append((lower, dest))
-                shutil.copytree(lower, dest, dirs_exist_ok=True)
-            def _g(*a):
-                r = subprocess.run(["git", *a], capture_output=True, text=True, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
-                if r.returncode != 0:
-                    raise Refusal(r.stderr.strip()[:200])
-            d1 = os.path.join(tmp, "ovl-seed-run1", "src")
-            ln = seed_run_from_warm("R", sha_, [], lower_, d1, None, senv, lambda m: None, "k", git=_g, overlay=True, mount=_fake_mount)
-            check("overlay/a run seeded through the overlay names it in its plan line, and mounts the generation",
-                  ln.startswith("workspace: overlay (the run writes only its delta) of main@") and mounted == [(lower_, d1)], (ln, mounted))
-            seen_log = []
-            def _refuse(lower, dest):
-                raise Refusal("the overlay mount was refused (permission denied)")
-            d2 = os.path.join(tmp, "ovl-seed-run2", "src")
-            ln2 = seed_run_from_warm("R", sha_, [], lower_, d2, None, senv, seen_log.append, "k", git=_g, overlay=True, mount=_refuse)
-            check("overlay/a refused overlay falls back to the COPY, said in the log, never to a clean clone",
-                  ln2.startswith("workspace: incremental copy of main@") and any("this run copies the warm tree" in m for m in seen_log)
-                  and open(os.path.join(d2, "obj", "x")).read() == "built", (ln2, seen_log))
-            d3 = os.path.join(tmp, "ovl-seed-run3", "src")
-            ln3 = seed_run_from_warm("R", sha_, [], lower_, d3, None, senv, lambda m: None, "k", git=_g)
-            check("overlay/without it the run copies, exactly as before (negative control)",
-                  ln3.startswith("workspace: incremental copy of main@"), ln3)
         # the REAL kernel path where this host can show it: an unprivileged overlay in a user+mount namespace
         # (on a real filesystem: overlayfs takes no upper on overlayfs, and a container's /tmp often IS one — a host runs
         # its trees on /work and /cache; MW_BUILD_SELFTEST_REAL_DIR points the case there)
@@ -6907,69 +6732,59 @@ def self_test() -> int:
             check("overlay/REAL: the workspace (upper, kernel work dir) is removed", not os.path.exists(os.path.join(real, "run")))
             shutil.rmtree(real, ignore_errors=True)
 
-        # ── GENERATION INTEGRITY: a reader uses a generation only while it is exactly what its publisher hashed ───
-        def _published(name: str) -> "tuple[SharedTree, str]":
-            t_ = SharedTree(os.path.join(tmp, f"integ-{name}"), "R")
-            with t_.writer() as w_i:
-                g_i = w_i.stage()
-                os.makedirs(os.path.join(t_.warm_of(g_i), "src", "obj"), exist_ok=True)
-                for i_ in range(5):
-                    open(os.path.join(t_.warm_of(g_i), "src", f"f{i_}.cs"), "w").write(f"class C{i_} {{}}")
-                open(os.path.join(t_.warm_of(g_i), "src", "obj", "out.dll"), "wb").write(b"\0" * 4096)
-                os.symlink("f0.cs", os.path.join(t_.warm_of(g_i), "src", "link.cs"))
-                w_i.publish(g_i)
-            return t_, g_i
-        t0, g0 = _published("clean")
-        check("integrity/publish writes the generation's manifest beside it (never inside it)",
-              os.path.isfile(t0.manifest_of(g0)) and not os.path.commonpath([t0.manifest_of(g0), g0]) == g0)
-        with t0.reader() as r0:
-            check("integrity/an untampered generation is handed to a reader (negative control)", r0 == t0.warm_of(g0) and t0.last_refusal is None,
-                  t0.last_refusal)
-        check("integrity/verify reads every file's stat and a full sample's content (here: all)",
-              verify_generation(g0, t0.manifest_of(g0), sample=1000) is None)
+
+        # ── TREE INTEGRITY: a reader uses a deployment tree only while it is exactly what its writer hashed ─────────────
+        def _hashed(name: str) -> "tuple[str, str]":
+            t_ = os.path.join(tmp, f"integ-{name}", "tree")
+            os.makedirs(os.path.join(t_, "src", "obj"), exist_ok=True)
+            for i_ in range(5):
+                open(os.path.join(t_, "src", f"f{i_}.cs"), "w").write(f"class C{i_} {{}}")
+            open(os.path.join(t_, "src", "obj", "out.dll"), "wb").write(b"\0" * 4096)
+            os.symlink("f0.cs", os.path.join(t_, "src", "link.cs"))
+            m_ = os.path.join(tmp, f"integ-{name}", "manifest.json")
+            with open(m_, "w") as fh:
+                json.dump(tree_manifest(t_, "d/R@" + "1" * 40), fh)
+            return t_, m_
+        t0, m0 = _hashed("clean")
+        check("integrity/an untampered tree verifies, every file's stat and (here) every file's content",
+              verify_tree(t0, m0, "d/R@" + "1" * 40, sample=1000) is None)
         tampers = {
-            "content": lambda t_, g_: open(os.path.join(t_.warm_of(g_), "src", "f1.cs"), "w").write("class Evil {}"),
-            "content-mtime-restored": lambda t_, g_: (lambda pth, st0: (open(pth, "w").write("class C2 {X}"),
+            "content": lambda t_, m_: open(os.path.join(t_, "src", "f1.cs"), "w").write("class Evil {}"),
+            "content-mtime-restored": lambda t_, m_: (lambda pth, st0: (open(pth, "w").write("class C2 {X}"),
                                                                          os.utime(pth, ns=(st0.st_atime_ns, st0.st_mtime_ns))))(
-                os.path.join(t_.warm_of(g_), "src", "f2.cs"), os.stat(os.path.join(t_.warm_of(g_), "src", "f2.cs"))),
-            "added": lambda t_, g_: open(os.path.join(t_.warm_of(g_), "src", "obj", "planted.dll"), "wb").write(b"x"),
-            "removed": lambda t_, g_: os.remove(os.path.join(t_.warm_of(g_), "src", "f3.cs")),
-            "relinked": lambda t_, g_: (os.remove(os.path.join(t_.warm_of(g_), "src", "link.cs")),
-                                        os.symlink("/etc/passwd", os.path.join(t_.warm_of(g_), "src", "link.cs"))),
-            "mode": lambda t_, g_: os.chmod(os.path.join(t_.warm_of(g_), "src", "f4.cs"), 0o777),
-            "manifest-forged": lambda t_, g_: (lambda m_: (m_["entries"].pop(), open(t_.manifest_of(g_), "w").write(json.dumps(m_))))(
-                json.load(open(t_.manifest_of(g_)))),
-            "manifest-removed": lambda t_, g_: os.remove(t_.manifest_of(g_)),
+                os.path.join(t_, "src", "f2.cs"), os.stat(os.path.join(t_, "src", "f2.cs"))),
+            "added": lambda t_, m_: open(os.path.join(t_, "src", "obj", "planted.dll"), "wb").write(b"x"),
+            "removed": lambda t_, m_: os.remove(os.path.join(t_, "src", "f3.cs")),
+            "relinked": lambda t_, m_: (os.remove(os.path.join(t_, "src", "link.cs")), os.symlink("/etc/passwd", os.path.join(t_, "src", "link.cs"))),
+            "mode": lambda t_, m_: os.chmod(os.path.join(t_, "src", "f4.cs"), 0o777),
+            "manifest-forged": lambda t_, m_: (lambda mm: (mm["entries"].pop(), open(m_, "w").write(json.dumps(mm))))(json.load(open(m_))),
+            "manifest-removed": lambda t_, m_: os.remove(m_),
         }
         expect = {"content": "changed", "content-mtime-restored": "changed", "added": "added", "removed": "removed",
                   "relinked": "changed", "mode": "changed", "manifest-forged": "digest", "manifest-removed": "no integrity manifest"}
         for name_, tamper in tampers.items():
-            t_, g_ = _published(name_)
+            t_, m_ = _hashed(name_)
             time.sleep(0.05)                                  # a later write gets a later ctime even at coarse granularity
-            tamper(t_, g_)
-            with t_.reader() as r_:
-                check(f"integrity/a generation {name_} after publish is refused, never handed to a run ({expect[name_]})",
-                      r_ is None and t_.last_refusal and expect[name_] in t_.last_refusal, t_.last_refusal)
-        # the content sample catches what stat cannot: a manifest whose recorded hash no longer matches the bytes
-        t5, g5 = _published("sample")
-        m5 = json.load(open(t5.manifest_of(g5)))
+            tamper(t_, m_)
+            why_ = verify_tree(t_, m_, "d/R@" + "1" * 40, sample=1000)
+            check(f"integrity/a tree {name_} after it was built is refused ({expect[name_]})", why_ and expect[name_] in why_, why_)
+        t5, m5p = _hashed("sample")
+        m5 = json.load(open(m5p))
         for e_ in m5["entries"]:
             if e_[0].endswith("f0.cs"):
                 e_[6] = "0" * 64
         m5["digest"] = hashlib.sha256(json.dumps(m5["entries"], separators=(",", ":")).encode()).hexdigest()
-        open(t5.manifest_of(g5), "w").write(json.dumps(m5))
+        open(m5p, "w").write(json.dumps(m5))
         check("integrity/a content hash that no longer matches is refused when sampled",
-              "no longer hashes" in (verify_generation(g5, t5.manifest_of(g5), sample=1000) or ""))
-        check("integrity/another generation's manifest is refused",
-              "not" in (verify_generation(g5, t0.manifest_of(g0), sample=0) or ""))
-        t0.collect()
-        with t0.writer() as w_c:
-            g_next = w_c.stage()
-            w_c.publish(g_next)
-        check("integrity/a collected generation's manifest goes with it", not os.path.exists(t0.manifest_of(g0))
-              and os.path.isfile(t0.manifest_of(g_next)))
+              "no longer hashes" in (verify_tree(t5, m5p, "d/R@" + "1" * 40, sample=1000) or ""))
+        check("integrity/another tip's (or tree's) manifest is refused",
+              "not" in (verify_tree(t0, m0, "d/R@" + "2" * 40, sample=0) or ""))
+        check("deploy/the deployment is the lane plus the key, a path overlayfs can parse",
+              deployment_name("stable", "a" * 32) == "stable-" + "a" * 16 and deployment_name(None, "b" * 32) == "default-" + "b" * 16
+              and not any(c in deployment_name("3.1,x:y\\z", "c" * 32) for c in ",:\\"))
 
-        # ── 5b'. the warm workspace (§7.2), against REAL git: a local origin, the real mirror path ───────────
+        plat_commit, plat_base = "0" * 40, "file:///nonexistent"      # the platform's master, set below where git exists
+        # ── 5b'. THE MASTER AND THE DEPLOYMENT TREE (§7.3b), against REAL git: a local origin, the real master path ─────
         if shutil.which("git"):
             wroot = os.path.join(tmp, "warm-git")
             origin = os.path.join(wroot, "origin", "R.git")
@@ -6982,6 +6797,7 @@ def self_test() -> int:
                 return subprocess.run(list(a), cwd=cwd, env=genv_g, check=True, capture_output=True, text=True).stdout.strip()
             sh("git", "init", "-q", "-b", "main")
             open(os.path.join(seed, "a.cs"), "w").write("v1")
+            open(os.path.join(seed, "b.cs"), "w").write("unchanged")
             sh("git", "add", "-A"); sh("git", "commit", "-qm", "one")
             c1 = sh("git", "rev-parse", "HEAD")
             open(os.path.join(seed, "a.cs"), "w").write("v2")
@@ -6991,138 +6807,158 @@ def self_test() -> int:
             sh("git", "clone", "-q", "--bare", seed, origin, cwd=wroot)
             wenv = {"PATH": genv_g["PATH"], "MW_BUILD_GIT_BASE": "file://" + os.path.dirname(origin),
                     "MW_BUILD_CACHE": os.path.join(wroot, "cache")}
-            warm = os.path.join(wroot, "work", WARM_DIR, "R")
             log0 = lambda m: None
-            run1 = os.path.join(wroot, "work", "run1", "src")
-            line0 = seed_run_from_warm("R", c1, [], warm, run1, None, wenv, log0, key="k1")
-            check("warm/with no warm main workspace a run is a CLEAN clone, said",
-                  line0.startswith("workspace: clean (no warm main workspace yet") and open(os.path.join(run1, "a.cs")).read() == "v1", line0)
-            # a COPIED generation's stale index is refreshed before advancing: an unchanged file keeps its mtime
-            xroot = os.path.join(wroot, "refresh")
-            xseed = os.path.join(xroot, "seed"); os.makedirs(xseed)
-            sh("git", "init", "-q", "-b", "main", cwd=xseed)
-            open(os.path.join(xseed, "a.txt"), "w").write("a1"); open(os.path.join(xseed, "b.txt"), "w").write("same")
-            sh("git", "add", "-A", cwd=xseed); sh("git", "commit", "-qm", "x1", cwd=xseed)
-            x1 = sh("git", "rev-parse", "HEAD", cwd=xseed)
-            open(os.path.join(xseed, "a.txt"), "w").write("a2"); sh("git", "commit", "-qam", "x2", cwd=xseed)
-            x2 = sh("git", "rev-parse", "HEAD", cwd=xseed)
-            xmirror = os.path.join(xroot, "mirror.git"); sh("git", "clone", "-q", "--bare", xseed, xmirror, cwd=xroot)
-            xg = _git_runner(wenv, xroot, None, None)
-            gen_a = os.path.join(xroot, "genA"); os.makedirs(os.path.join(gen_a, "tree"))
-            _trusted_tree(xg, os.path.join(gen_a, "git"), os.path.join(gen_a, "tree"), x1, xmirror)
-            os.utime(os.path.join(gen_a, "tree", "b.txt"), (1_000_000_000, 1_000_000_000))
-            gen_b = os.path.join(xroot, "genB")
-            subprocess.run(["cp", "-a", gen_a, gen_b], check=True)
-            _trusted_tree(xg, os.path.join(gen_b, "git"), os.path.join(gen_b, "tree"), x2, xmirror)
-            check("warm/advancing a COPIED tree keeps an unchanged file's mtime (the stale index is refreshed first)",
-                  int(os.stat(os.path.join(gen_b, "tree", "b.txt")).st_mtime) == 1_000_000_000
-                  and open(os.path.join(gen_b, "tree", "a.txt")).read() == "a2", os.stat(os.path.join(gen_b, "tree", "b.txt")).st_mtime)
-            adv = advance_warm_main("R", c2, warm, wenv, log0, key="k1")
-            check("warm/the HOST clones the warm main workspace at main's tip", adv.startswith(f"warm main workspace: set up at main@{c2[:12]}")
-                  and open(os.path.join(warm, "a.cs")).read() == "v2", adv)
-            # the tip's warm build (stood in for here) leaves incremental state in obj/
-            os.makedirs(os.path.join(warm, "src", "obj")); open(os.path.join(warm, "src", "obj", "state.cache"), "w").write("main")
-            write_warm_state(warm, {"key": "k1", "tip": c2, "built": c2})
-            run2 = os.path.join(wroot, "work", "run2", "src")
-            line2 = seed_run_from_warm("R", c1, [], warm, run2, None, wenv, log0, key="k1")
-            check("warm/a run is an INCREMENTAL COPY of main's warm workspace, moved to its own sha, saying so",
-                  line2 == f"workspace: incremental copy of main@{c2[:12]} (built by the tip's warmBuild), moved to {c1[:12]} (obj/ and bin/ kept)", line2)
-            check("warm/the run's tree is exactly its commit, with main's obj/ carried for MSBuild",
-                  open(os.path.join(run2, "a.cs")).read() == "v1" and open(os.path.join(run2, "src", "obj", "state.cache")).read() == "main")
-            # a (pull-request) run writes into its copy: none of it reaches the warm workspace
-            open(os.path.join(run2, "src", "obj", "state.cache"), "w").write("POISON")
-            open(os.path.join(run2, "planted.dll"), "w").write("x")
-            check("warm/a run can NEVER write the warm workspace (its writes stay in its own copy)",
-                  open(os.path.join(warm, "src", "obj", "state.cache")).read() == "main" and not os.path.exists(os.path.join(warm, "planted.dll"))
-                  and open(os.path.join(warm, "a.cs")).read() == "v2")
-            # SAME tip: no unchanged tracked file is rewritten, so sources stay OLDER than the carried obj/ (MSBuild's
-            # incremental check), while a tracked file the warmBuild modified is restored (review of Deploy#183)
+            gw = _git_runner(wenv, wroot, None, None)
+            mirror_w = master_path(wenv["MW_BUILD_CACHE"], "R")
+            _update_mirror("R", wenv["MW_BUILD_GIT_BASE"] + "/R.git", os.path.dirname(mirror_w), mirror_w, [c2], gw, log0)
+
+            def worktrees() -> str:
+                return subprocess.run(["git", "--git-dir", mirror_w, "worktree", "list", "--porcelain"], capture_output=True, text=True).stdout
+
+            def wt_count(p_: str, gd: str = "") -> int:
+                lines_ = subprocess.run(["git", "--git-dir", gd or mirror_w, "worktree", "list", "--porcelain"],
+                                        capture_output=True, text=True).stdout.splitlines()
+                return sum(1 for l_ in lines_ if l_ in (f"worktree {p_}", f"worktree {os.path.realpath(p_)}"))
+
+            dt = DeploymentTree(wenv["MW_BUILD_CACHE"], "stable-k1", "R")
+            with dt.writer() as w1:
+                check("deploy/the first writer holds the tree", w1 is not None)
+                with dt.writer() as w2:
+                    check("deploy/a SECOND writer cannot advance the tree while the first holds it (single writer)", w2 is None)
+                line_a = advance_deployment_tree(w1, c1, "k1", gw)
+                check("deploy/the writer ADDS the tree from nothing: a `git worktree add --detach` of the master at the tip",
+                      line_a.startswith(f"deployment tree: added at main@{c1[:12]}") and open(os.path.join(dt.tree, "a.cs")).read() == "v1"
+                      and wt_count(dt.tree) == 1 and os.path.isfile(os.path.join(dt.tree, ".git")), (line_a, worktrees()))
+                check("deploy/state and admin live OUTSIDE the tree (host-private)", dt.admin() is not None
+                      and not os.path.commonpath([dt.host, dt.tree]) == dt.tree and (dt.state() or {}).get("built") is None)
+                with dt.reader("k1") as r_nb:
+                    check("deploy/while the writer holds it no reader gets the tree (the lock is busy)",
+                          r_nb is None and "locked" in (dt.last_refusal or ""), dt.last_refusal)
+                # the warm build (stood in for): obj/ and bin/, then the manifest and the state before the lock is released
+                os.makedirs(os.path.join(dt.tree, "obj")); os.makedirs(os.path.join(dt.tree, "bin"))
+                open(os.path.join(dt.tree, "obj", "state.cache"), "w").write("main")
+                open(os.path.join(dt.tree, "bin", "R.dll"), "w").write("built")
+                w1.publish(c1, "k1")
+            check("deploy/the integrity manifest is written beside the tree, never inside it",
+                  os.path.isfile(dt.manifest_path) and not os.path.commonpath([dt.manifest_path, dt.tree]) == dt.tree)
+            with dt.reader("k1") as held:
+                check("deploy/a reader VERIFIES and gets the built tree and its tip", held == (dt.tree, c1), dt.last_refusal)
+                with dt.writer() as w_r:
+                    check("deploy/the writer NEVER advances while a reader holds the tree", w_r is None)
+            with dt.reader("k2") as other_k:
+                check("deploy/a reader of another key gets nothing (another platform set or images), said",
+                      other_k is None and "another platform set" in (dt.last_refusal or ""), dt.last_refusal)
+            # advancing from an OLDER tip, in place: only changed files are rewritten, unchanged ones keep their mtime and
+            # inode, obj/ and bin/ are kept, anything else untracked is cleaned
             old_t = 1_000_000_000
-            os.utime(os.path.join(warm, "a.cs"), (old_t, old_t))
-            run_s = os.path.join(wroot, "work", "run-same", "src")
-            seed_run_from_warm("R", c2, [], warm, run_s, None, wenv, log0, key="k1")
-            check("warm/a run at the warm tip keeps every unchanged tracked file's timestamp (nothing is rewritten)",
-                  int(os.stat(os.path.join(run_s, "a.cs")).st_mtime) == old_t and open(os.path.join(run_s, "a.cs")).read() == "v2",
-                  os.stat(os.path.join(run_s, "a.cs")).st_mtime)
-            open(os.path.join(warm, "a.cs"), "w").write("modified by warmBuild")
-            run_r = os.path.join(wroot, "work", "run-restore", "src")
-            seed_run_from_warm("R", c2, [], warm, run_r, None, wenv, log0, key="k1")
-            check("warm/a tracked file the warmBuild modified is restored to the commit in the run's copy",
-                  open(os.path.join(run_r, "a.cs")).read() == "v2")
-            run_c = os.path.join(wroot, "work", "run-changed", "src")
-            os.utime(os.path.join(warm, "a.cs"), (old_t, old_t))
-            seed_run_from_warm("R", c1, [], warm, run_c, None, wenv, log0, key="k1")
-            check("warm/a file the run's commit changes IS rewritten (newer than the carried outputs)",
-                  open(os.path.join(run_c, "a.cs")).read() == "v1" and int(os.stat(os.path.join(run_c, "a.cs")).st_mtime) > old_t)
-            open(os.path.join(warm, "a.cs"), "w").write("v2")
-            adv2 = advance_warm_main("R", c2, warm, wenv, log0, key="k1")
-            check("warm/the host does nothing when the warm workspace is already at the tip", adv2.startswith("warm main workspace: already at"), adv2)
-            write_warm_state(warm, {"key": "k1", "tip": c1, "built": c1})
-            open(os.path.join(warm, "stray.txt"), "w").write("x")
-            adv3 = advance_warm_main("R", c2, warm, wenv, log0, key="k1")
-            check("warm/the host MOVES it to a new tip, keeping obj/ and cleaning the rest",
-                  adv3.startswith(f"warm main workspace: moved to main@{c2[:12]}") and os.path.isfile(os.path.join(warm, "src", "obj", "state.cache"))
-                  and not os.path.exists(os.path.join(warm, "stray.txt")), adv3)
-            run3 = os.path.join(wroot, "work", "run3", "src")
-            line3 = seed_run_from_warm("R", c1, [], warm, run3, None, wenv, log0, key="k2")
-            check("warm/a run on another platform set or image never uses the warm workspace (clean, said)",
-                  line3.startswith("workspace: clean (the warm workspace is for another platform set") and not os.path.exists(os.path.join(run3, "src", "obj")), line3)
-            adv4 = advance_warm_main("R", c2, warm, wenv, log0, key="k2")
-            check("warm/the host WIPES the warm workspace on a key change", adv4.startswith("warm main workspace: set up at") and "changed" in adv4
-                  and not os.path.exists(os.path.join(warm, "src", "obj")), adv4)
-            run4 = os.path.join(wroot, "work", "run4", "src")
-            line4 = seed_run_from_warm("R", "f" * 40, [], warm, run4, None, wenv, log0, key="k2",
-                                       fresh=lambda *a, **k: default_checkout("R", c1, [], run4, None, wenv, log0))
-            check("warm/a failed warm copy falls back to a fresh clone, said",
-                  line4.startswith("workspace: clean (the warm copy failed") and open(os.path.join(run4, "a.cs")).read() == "v1", line4)
-            # what a warmBuild could plant in the tree it writes: a .git with a hook, a clean/smudge filter and a merge driver
-            check("warm/the warm tree keeps NO git directory of its own (the host's lives outside every sandbox)",
-                  not os.path.exists(os.path.join(warm, ".git")) and os.path.isfile(os.path.join(warm_private(warm), "git", "HEAD")))
-            planted = os.path.join(warm, ".git"); os.makedirs(os.path.join(planted, "hooks"), exist_ok=True)
+            os.utime(os.path.join(dt.tree, "b.cs"), (old_t, old_t))
+            ino_b = os.stat(os.path.join(dt.tree, "b.cs")).st_ino
+            open(os.path.join(dt.tree, "stray.txt"), "w").write("x")
+            with dt.writer() as w3:
+                line_m = advance_deployment_tree(w3, c2, "k1", gw)
+                w3.publish(c2, "k1")
+            check("deploy/the writer MOVES the tree in place (checkout --detach -f), saying so",
+                  line_m.startswith(f"deployment tree: moved to main@{c2[:12]} in place") and open(os.path.join(dt.tree, "a.cs")).read() == "v2", line_m)
+            check("deploy/an unchanged file keeps its mtime and inode (never rewritten: MSBuild stays incremental)",
+                  int(os.stat(os.path.join(dt.tree, "b.cs")).st_mtime) == old_t and os.stat(os.path.join(dt.tree, "b.cs")).st_ino == ino_b,
+                  os.stat(os.path.join(dt.tree, "b.cs")).st_mtime)
+            check("deploy/obj/ and bin/ are kept, any other untracked file is cleaned",
+                  open(os.path.join(dt.tree, "obj", "state.cache")).read() == "main" and os.path.isfile(os.path.join(dt.tree, "bin", "R.dll"))
+                  and not os.path.exists(os.path.join(dt.tree, "stray.txt")))
+            check("deploy/the tree is still ONE registered worktree (moved, never re-added)", wt_count(dt.tree) == 1)
+            # a tracked file the warmBuild modified is restored; a planted .git (hooks, filters, merge drivers) never runs
+            open(os.path.join(dt.tree, "b.cs"), "w").write("modified by warmBuild")
+            os.remove(os.path.join(dt.tree, ".git"))
+            planted = os.path.join(dt.tree, ".git")
+            os.makedirs(os.path.join(planted, "hooks"))
             marker_h = os.path.join(wroot, "hook-ran")
             with open(os.path.join(planted, "hooks", "post-checkout"), "w") as fh:
                 fh.write(f"#!/bin/sh\ntouch {marker_h}\n")
             os.chmod(os.path.join(planted, "hooks", "post-checkout"), 0o755)
             with open(os.path.join(planted, "config"), "w") as fh:
-                fh.write(f"[filter \"evil\"]\n\tsmudge = touch {marker_h}-filter; cat\n\tclean = cat\n"
-                         f"[merge \"evil\"]\n\tdriver = touch {marker_h}-merge\n")
-            with open(os.path.join(warm, ".gitattributes"), "w") as fh:
-                fh.write("* filter=evil merge=evil\n")
-            write_warm_state(warm, {"key": "k2", "tip": c2, "built": c2})
-            run6 = os.path.join(wroot, "work", "run6", "src")
-            seed_run_from_warm("R", c1, [], warm, run6, None, wenv, log0, key="k2")
-            check("warm/nothing a warmBuild plants in the tree's .git runs on a host step — no hook, no filter, no merge driver",
-                  not any(os.path.exists(marker_h + x) for x in ("", "-filter", "-merge")))
-            check("warm/a run's .git is the HOST's (a fresh one), never the planted config",
-                  "evil" not in open(os.path.join(run6, ".git", "config")).read())
-            advance_warm_main("R", c1, warm, wenv, log0, key="k2")
-            check("warm/advancing the warm tree removes a planted .git (clean) and runs nothing from it",
-                  not os.path.exists(planted) and not any(os.path.exists(marker_h + x) for x in ("", "-filter", "-merge")))
-            # an INTERRUPTED warm build (a restart mid-build leaves `building`) is never copied, and is wiped before a rebuild
-            write_warm_state(warm, {"key": "k2", "tip": c1, "built": "building"})
-            line_i = seed_run_from_warm("R", c1, [], warm, os.path.join(wroot, "work", "run8", "src"), None, wenv, log0, key="k2")
-            check("warm/a run never copies a workspace whose build was interrupted", line_i.startswith("workspace: clean (the warm workspace's last build was interrupted"), line_i)
-            os.makedirs(os.path.join(warm, "src", "obj"), exist_ok=True); open(os.path.join(warm, "src", "obj", "half.cache"), "w").write("half")
-            adv_i = advance_warm_main("R", c1, warm, wenv, log0, key="k2")
-            check("warm/an interrupted build is wiped before the warm workspace is set up again",
-                  "interrupted" in adv_i and not os.path.exists(os.path.join(warm, "src", "obj", "half.cache")), adv_i)
-            with open(os.path.join(warm_private(warm), "state.json"), "w") as fh:
-                fh.write("[]")
-            line7 = seed_run_from_warm("R", c1, [], warm, os.path.join(wroot, "work", "run7", "src"), None, wenv, log0, key="k2")
-            check("warm/a state that is not an object is no warm workspace (a clean clone, never a crash)", line7.startswith("workspace: clean (no warm main"), line7)
-            # an existing tree with a MISSING / non-object state: its obj/ and bin/ were built under an UNKNOWN key — wiped,
-            # never carried forward under the current one (review of Deploy#183)
-            os.makedirs(os.path.join(warm, "src", "obj"), exist_ok=True)
-            open(os.path.join(warm, "src", "obj", "unknown.cache"), "w").write("built under ?")
-            adv_u = advance_warm_main("R", c2, warm, wenv, log0, key="k2")
-            check("warm/a tree whose state is not an object is WIPED before it is advanced (outputs of an unknown key are not kept)",
-                  not os.path.exists(os.path.join(warm, "src", "obj", "unknown.cache")) and warm_state(warm) == {"key": "k2", "tip": c2, "built": None}, adv_u)
-            os.makedirs(os.path.join(warm, "src", "obj"), exist_ok=True)
-            open(os.path.join(warm, "src", "obj", "unknown.cache"), "w").write("built under ?")
-            os.remove(os.path.join(warm_private(warm), "state.json"))
-            adv_m = advance_warm_main("R", c1, warm, wenv, log0, key="k2")
-            check("warm/a tree with NO state is wiped before it is advanced",
-                  not os.path.exists(os.path.join(warm, "src", "obj", "unknown.cache")) and warm_state(warm) == {"key": "k2", "tip": c1, "built": None}, adv_m)
+                fh.write(f"[filter \"evil\"]\n\tsmudge = touch {marker_h}-filter; cat\n\tclean = cat\n")
+            with open(os.path.join(dt.tree, ".gitattributes"), "w") as fh:
+                fh.write("* filter=evil\n")
+            with dt.writer() as w4:
+                advance_deployment_tree(w4, c1, "k1", gw)
+            check("deploy/a tracked file the warmBuild modified is restored to the commit", open(os.path.join(dt.tree, "b.cs")).read() == "unchanged")
+            check("deploy/a planted .git is replaced by the host's link before any git step; no hook or filter ran",
+                  os.path.isfile(os.path.join(dt.tree, ".git")) and open(os.path.join(dt.tree, ".git")).read().strip() == f"gitdir: {dt.admin()}"
+                  and not any(os.path.exists(marker_h + x) for x in ("", "-filter")))
+            with dt.reader("k1") as r_nb2:
+                check("deploy/an advance that was not followed by a build leaves the tree NOT BUILT (readers go cold)",
+                      r_nb2 is None and "not built" in (dt.last_refusal or ""), dt.last_refusal)
+            with dt.writer() as w5:
+                w5.publish(c1, "k1")
+            time.sleep(0.05)
+            open(os.path.join(dt.tree, "obj", "state.cache"), "a").write("POISON")
+            with dt.reader("k1") as r_t:
+                check("deploy/a tree changed after its build is refused by the integrity check, said",
+                      r_t is None and "integrity check refused" in (dt.last_refusal or ""), dt.last_refusal)
+            # the master lock serialises worktree add/remove: a cold add waits while another holder has the lock
+            cold_a = os.path.join(wroot, "work", "cold-a", "src")
+            done_a = threading.Event()
+            with master_lock(os.path.dirname(mirror_w), "R"):
+                th_ = threading.Thread(target=lambda: (cold_worktree(wenv["MW_BUILD_CACHE"], "R", c1, cold_a, gw), done_a.set()), daemon=True)
+                th_.start()
+                time.sleep(0.5)
+                check("deploy/the master lock serialises `worktree add`: it waits while another holder has the lock",
+                      not done_a.is_set() and not os.path.exists(cold_a))
+            th_.join(30)
+            check("deploy/...and proceeds once the lock is released: a COLD worktree off the master at the sha",
+                  done_a.is_set() and open(os.path.join(cold_a, "a.cs")).read() == "v1" and wt_count(cold_a) == 1)
+            done_r = threading.Event()
+            with master_lock(os.path.dirname(mirror_w), "R"):
+                th_ = threading.Thread(target=lambda: (remove_cold_worktree(wenv["MW_BUILD_CACHE"], "R", cold_a, gw), done_r.set()), daemon=True)
+                th_.start()
+                time.sleep(0.5)
+                check("deploy/the master lock serialises `worktree remove`: it waits while another holder has the lock",
+                      not done_r.is_set() and os.path.isdir(cold_a))
+            th_.join(30)
+            check("deploy/a cold worktree is removed AND pruned (nothing stays registered)",
+                  done_r.is_set() and not os.path.exists(cold_a) and wt_count(cold_a) == 0, worktrees())
+            # a cold worktree whose directory is already gone (a swept workspace) is pruned from the master
+            cold_b = os.path.join(wroot, "work", "cold-b", "src")
+            cold_worktree(wenv["MW_BUILD_CACHE"], "R", c2, cold_b, gw)
+            shutil.rmtree(os.path.dirname(cold_b))
+            remove_cold_worktree(wenv["MW_BUILD_CACHE"], "R", cold_b, gw)
+            check("deploy/a cold worktree whose directory is already gone is pruned", wt_count(cold_b) == 0, worktrees())
+            # the platform source as a writable VIEW: a cold worktree of the platform's master at the image tree's
+            # .source-commit where this runner cannot overlay — and NOT A COPY; gone afterwards
+            porigin = os.path.join(os.path.dirname(origin), "MeshWeaver.git")
+            pseed = os.path.join(wroot, "pseed"); os.makedirs(pseed)
+            sh("git", "init", "-q", "-b", "main", cwd=pseed)
+            open(os.path.join(pseed, "Directory.Build.props"), "w").write("<Project/>")
+            sh("git", "add", "-A", cwd=pseed); sh("git", "commit", "-qm", "platform", cwd=pseed)
+            pc = sh("git", "rev-parse", "HEAD", cwd=pseed)
+            sh("git", "clone", "-q", "--bare", pseed, porigin, cwd=wroot)
+            plat_commit, plat_base = pc, "file://" + os.path.dirname(origin)
+            image_src = os.path.join(wroot, "image-platform-src"); os.makedirs(image_src)
+            open(os.path.join(image_src, "Directory.Build.props"), "w").write("<Project/>")
+            open(os.path.join(image_src, ".source-commit"), "w").write(pc + "\n")
+            pv_log: list = []
+            pview = os.path.join(wroot, "work", "pv", "platform")
+            with platform_source_view(image_src, pview, wenv, pv_log.append, can_overlay=False) as pv:
+                open(os.path.join(pv, "obj.txt"), "w").write("restore output")
+                check("platform-view/without an overlay: a cold worktree of the platform's master at .source-commit, said",
+                      pv == pview and open(os.path.join(pv, "Directory.Build.props")).read() == "<Project/>"
+                      and any("COLD worktree" in m and pc[:12] in m for m in pv_log)
+                      and wt_count(pview, master_path(wenv["MW_BUILD_CACHE"], "MeshWeaver")) == 1, pv_log)
+            check("platform-view/the image's tree is never written and the view is gone (removed + pruned) afterwards",
+                  not os.path.exists(os.path.join(image_src, "obj.txt")) and not os.path.exists(pview)
+                  and wt_count(pview, master_path(wenv["MW_BUILD_CACHE"], "MeshWeaver")) == 0)
+            pv_mounts: list = []
+            with platform_source_view(image_src, os.path.join(wroot, "work", "pv2", "platform"), wenv, pv_log.append, can_overlay=True,
+                                      mount=lambda lo, de: (pv_mounts.append((lo, de)), os.makedirs(de, exist_ok=True))) as pv2:
+                check("platform-view/inside the runner's namespace: an OVERLAY with the image's tree as the read-only lower",
+                      pv_mounts == [(image_src, pv2)], pv_mounts)
+            no_commit = os.path.join(wroot, "image-no-commit"); os.makedirs(no_commit)
+            try:
+                with platform_source_view(no_commit, os.path.join(wroot, "work", "pv3", "platform"), wenv, log0, can_overlay=False):
+                    pass
+                check("platform-view/neither an overlay nor a .source-commit is a Refusal, never a copy", False, "yielded")
+            except Refusal as e:
+                check("platform-view/neither an overlay nor a .source-commit is a Refusal, never a copy", "without a copy" in str(e), str(e))
             check("warm/the warmBuild declaration is validated",
                   validate_warm_build({"stages": []}) is None
                   and validate_warm_build({"warmBuild": {"command": "dotnet build", "timeoutMinutes": 20}}) == {"command": "dotnet build", "timeoutMinutes": 20.0})
@@ -7132,18 +6968,21 @@ def self_test() -> int:
                     check(f"warm/{bad_w} is refused", False, "accepted")
                 except Refusal:
                     pass
-            ws = warm
             check("warm/the key rides on the platform set, the identity and the images",
                   warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.1"}, "c003") != warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.2"}, "c003")
                   and warm_key({}, "a") != warm_key({}, "b") and warm_key({"MW_BUILD_RUNNER_DIGEST": "x"}, "a") != warm_key({}, "a"))
             check("warm/opt-in only", warm_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}) and not warm_enabled({}))
+            check("warm/sharedTree stays a switch, only with the warm workspace", shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true", "MW_BUILD_SHARED_TREE": "true"})
+                  and not shared_tree_enabled({"MW_BUILD_SHARED_TREE": "true"}) and not shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}))
             import types as _types
-            os.makedirs(os.path.join(wroot, "work", "R-old-run"))
-            for d in (os.path.join(wroot, "work", WARM_DIR), os.path.join(wroot, "work", "R-old-run")):
-                os.utime(d, (0, 0))
-            swept = Host.sweep_workspaces(_types.SimpleNamespace(work=os.path.join(wroot, "work"), run_deadline=60.0))
-            check("warm/the workspace sweep removes an old run's workspace but never the warm workspaces",
-                  swept == ["R-old-run"] and os.path.isdir(ws), swept)
+            old_run = os.path.join(wroot, "sweep-work", "R-old-run", "src")
+            cold_worktree(wenv["MW_BUILD_CACHE"], "R", c1, old_run, gw)
+            os.utime(os.path.dirname(old_run), (0, 0))
+            swept = Host.sweep_workspaces(_types.SimpleNamespace(work=os.path.join(wroot, "sweep-work"), run_deadline=60.0,
+                                                                 cache=wenv["MW_BUILD_CACHE"], env=wenv))
+            check("warm/the workspace sweep removes an old kept run's workspace AND prunes its cold worktree from the master",
+                  swept == ["R-old-run"] and wt_count(old_run) == 0, (swept, worktrees()))
+
         # ── 5b''. the module-hub broker (§7.4 wiring): identity is the HOST's, the stage only names a module ─────────
         mh_doc = {"moduleHub": {"modules": {"A": {"paths": ["src/A"]}, "B": {"paths": ["src/B"], "deps": ["A"]}},
                                 "recipe": ["src/Directory.Build.props"]}}
@@ -7599,215 +7438,239 @@ def self_test() -> int:
             return Host(env if "env" not in kw else kw.pop("env"), api, log=lambda s: None, sandbox=_EnvSandbox(),
                         leftovers=lambda: [], sleep=lambda s: None, **kw)
 
-        # ── the warm main workspace's IDLE half (§7.2), on a real host loop over real git: nothing claimable → the host moves
-        #    the warm workspace to main's tip and runs the TIP's declared warmBuild in the sandbox, once per tip ───────────
+        # ── the deployment tree's WRITER and its READERS (§7.3b), on a real host loop over real git: nothing claimable → the host
+        #    advances the deployment tree to main's tip IN PLACE and runs the TIP's declared warmBuild in the sandbox, once per
+        #    tip; a run then overlays it, verified, or takes a cold worktree off the master — never a copy ─────────────────
         if shutil.which("git"):
-            open(os.path.join(seed, ".github-stages.tmp"), "w").close()
             os.makedirs(os.path.join(seed, ".github"), exist_ok=True)
             with open(os.path.join(seed, ".github", "build-stages.json"), "w") as fh:
                 json.dump({"stages": [], "warmBuild": {"command": "mkdir -p src/obj && echo built-by-tip > src/obj/warm.txt && pwd > src/obj/where.txt",
                                                        "timeoutMinutes": 5}}, fh)
-            os.remove(os.path.join(seed, ".github-stages.tmp"))
             sh("git", "add", "-A"); sh("git", "commit", "-qm", "declare warmBuild")
             c3 = sh("git", "rev-parse", "HEAD")
             sh("git", "--git-dir", origin, "fetch", "-q", seed, "+main:main", cwd=wroot)
-            # the RUNS keep the mirror fetched (with their token); the idle path only reads it
-            sh("git", "--git-dir", os.path.join(wenv["MW_BUILD_CACHE"], "git", "R.git"), "fetch", "-q", "--prune", "origin", cwd=wroot)
+            # the RUNS keep the master fetched (with their token); the idle path only reads it
+            sh("git", "--git-dir", mirror_w, "fetch", "-q", "--prune", "origin", cwd=wroot)
             idle_work = os.path.join(wroot, "idle-work")
             os.makedirs(idle_work)
+            ienv = dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_RUN_OVERLAY="true", MW_BUILD_IN_NS="1", MW_BUILD_WORK=idle_work,
+                        MW_BUILD_CACHE=wenv["MW_BUILD_CACHE"], MW_BUILD_GIT_BASE=wenv["MW_BUILD_GIT_BASE"])
+            ienv.pop("MW_PLATFORM_SOURCE", None)
             hi = host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})] * 3, ("POST", "/claim"): [(204, None)] * 3}),
-                      env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_WORK=idle_work, MW_BUILD_CACHE=wenv["MW_BUILD_CACHE"],
-                               MW_BUILD_GIT_BASE=wenv["MW_BUILD_GIT_BASE"]),
-                      git_runner=_git_run)
+                      env=ienv, git_runner=_git_run)
             hi.warm_repos.add("R")
             hi.cycle()
             if hi.warm_thread:
                 hi.warm_thread.join(60)
-            iw = os.path.join(idle_work, WARM_DIR, "R")
-            st_i = warm_state(iw) or {}
+            idt = DeploymentTree(wenv["MW_BUILD_CACHE"], hi.deployment(), "R")
+            st_i = idt.state() or {}
             check("warm-idle/the warm build sees its tree at the SAME in-sandbox path a run's stages see theirs",
                   _EnvSandbox.last_mount == SANDBOX_CHECKOUT, _EnvSandbox.last_mount)
             check("warm-idle/the warm build's package folder is bound at the SAME in-sandbox path a run's stages restore into",
                   _EnvSandbox.last_binds and _EnvSandbox.last_binds[0][1] == SANDBOX_NUGET, _EnvSandbox.last_binds)
-            check("warm-idle/the warm build's writable platform copy (when the host has one) appears at the prepared tree's own path",
-                  all(b[1] == (hi.env.get("MW_PLATFORM_SOURCE") or prepared_env().get("MW_PLATFORM_SOURCE"))
-                      and b[0].endswith("/platform") for b in _EnvSandbox.last_binds[1:]), _EnvSandbox.last_binds)
-            check("warm-idle/with nothing claimable the host builds main's tip with the TIP's warmBuild, in the warm workspace",
-                  st_i.get("tip") == c3 and st_i.get("built") == c3
-                  and open(os.path.join(iw, "src", "obj", "warm.txt")).read().strip() == "built-by-tip", st_i)
-            open(os.path.join(iw, "src", "obj", "warm.txt"), "w").write("untouched")
+            check("warm-idle/with nothing claimable the host builds main's tip with the TIP's warmBuild IN the deployment tree "
+                  "(a worktree of the master), then writes its manifest",
+                  st_i.get("tip") == c3 and st_i.get("built") == c3 and os.path.isfile(idt.manifest_path)
+                  and open(os.path.join(idt.tree, "src", "obj", "warm.txt")).read().strip() == "built-by-tip"
+                  and os.path.realpath(open(os.path.join(idt.tree, "src", "obj", "where.txt")).read().strip()) == os.path.realpath(idt.tree), st_i)
+            check("warm-idle/the deployment is the host's lane plus its warm key", os.path.basename(idt.root) == deployment_name(hi.lane, warm_key(hi.env, hi.identity)))
             hi.cycle()
             if hi.warm_thread:
                 hi.warm_thread.join(60)
-            check("warm-idle/a tip already built is not built again", open(os.path.join(iw, "src", "obj", "warm.txt")).read() == "untouched")
-            # an advancement that FAILS (it wipes and says so, returning normally) must not mark the tip handled as "sources
-            # only": the next idle pass would skip that tip and every run would clone (review of Deploy#183)
+            check("warm-idle/a tip already built is not built again (and its manifest still verifies)",
+                  verify_tree(idt.tree, idt.manifest_path, idt.ident(c3), sample=1000) is None)
+
+            # a READER: the overlay, emulated (the overlay's VIEW as hard links — nothing copied — and the lower's .git hidden,
+            # exactly as _overlay_tree hides it)
+            mounted: list = []
+
+            def link_mount(lower, dest):
+                mounted.append((lower, dest))
+                for d_, dirs_, files_ in os.walk(lower):
+                    rel_ = os.path.relpath(d_, lower)
+                    if rel_ == ".":
+                        dirs_[:] = [x for x in dirs_ if x != ".git"]
+                    os.makedirs(os.path.join(dest, rel_), exist_ok=True)
+                    for f_ in files_:
+                        if rel_ == "." and f_ == ".git":
+                            continue
+                        os.link(os.path.join(d_, f_), os.path.join(dest, rel_, f_))
+            seen_log: list = []
+            hi.log = seen_log.append
+            hi.run_mount = link_mount
+            hi.run_holds = contextlib.ExitStack()
+            hi.cold_tree = None
+            rd1 = os.path.join(idle_work, "run-ovl", "src")
+            line1 = hi.seed_run_tree("R", c1, [], rd1, None, None)
+            check("reader/a run VERIFIES and overlays the built deployment tree, moved to its own sha, saying so with bytes copied = 0",
+                  line1.startswith(f"workspace: overlay of the deployment tree main@{c3[:12]} (built by the tip's warmBuild), moved to {c1[:12]}")
+                  and line1.endswith("bytes copied = 0") and mounted == [(idt.tree, rd1)], line1)
+            check("reader/the run's tree is exactly its commit, with main's obj/ carried for MSBuild",
+                  open(os.path.join(rd1, "a.cs")).read() == "v1" and not os.path.exists(os.path.join(rd1, ".github"))
+                  and open(os.path.join(rd1, "src", "obj", "warm.txt")).read().strip() == "built-by-tip")
+            check("reader/the deployment tree beneath is untouched", open(os.path.join(idt.tree, "a.cs")).read() == "v2"
+                  and os.path.isfile(os.path.join(idt.tree, ".github", "build-stages.json")))
+            check("reader/the run's .git is made by git (init, alternates to the master) — nothing copied, not even the index",
+                  os.path.isdir(os.path.join(rd1, ".git"))
+                  and open(os.path.join(rd1, ".git", "objects", "info", "alternates")).read().strip() == os.path.join(mirror_w, "objects")
+                  and not os.path.samefile(os.path.join(rd1, ".git", "index"), os.path.join(idt.admin(), "index")))
+            with idt.writer() as w_held:
+                check("reader/the run holds the tree for its WHOLE life: the writer cannot advance it meanwhile", w_held is None)
+            hi.run_holds.close()
+            with idt.writer() as w_free:
+                check("reader/once the run released it, the writer can advance it again", w_free is not None)
+            # integrity refused → COLD worktree, said
+            time.sleep(0.05)
+            open(os.path.join(idt.tree, "src", "obj", "warm.txt"), "a").write("POISON")
+            hi.run_holds = contextlib.ExitStack()
+            rd2 = os.path.join(idle_work, "run-integ", "src")
+            line2 = hi.seed_run_tree("R", c1, [], rd2, None, None)
+            check("reader/a tree that fails its integrity check is never mounted: a COLD worktree off the master, said",
+                  line2.startswith(f"workspace: COLD worktree of the master at {c1[:12]}") and "integrity check refused" in line2
+                  and line2.endswith("bytes copied = 0") and any(m.startswith("COLD WORKTREE") for m in seen_log)
+                  and len(mounted) == 1 and open(os.path.join(rd2, "a.cs")).read() == "v1"
+                  and hi.cold_tree == ("R", rd2) and wt_count(rd2) == 1, (line2, seen_log[-2:]))
+            remove_cold_worktree(wenv["MW_BUILD_CACHE"], "R", rd2, gw)
+            hi.run_holds.close()
+            check("reader/the cold worktree is removed and pruned when the run ends", not os.path.exists(rd2) and wt_count(rd2) == 0)
+            # the writer rebuilds it (not built → advance in place → warmBuild → manifest)
+            idt.unbuild(warm_key(hi.env, hi.identity), c3)
+            check("warm-idle/a tree marked not built is rebuilt by the writer", hi._warm_deployment("R", warm_key(hi.env, hi.identity)) == "built"
+                  and verify_tree(idt.tree, idt.manifest_path, idt.ident(c3), sample=1000) is None)
+            # lock busy → COLD worktree, said
+            hi.run_holds = contextlib.ExitStack()
+            hi.cold_tree = None
+            rd3 = os.path.join(idle_work, "run-busy", "src")
+            with idt.writer() as w_busy:
+                line3 = hi.seed_run_tree("R", c1, [], rd3, None, None)
+            check("reader/a tree its writer is advancing (lock busy) is never mounted: a COLD worktree, said",
+                  line3.startswith("workspace: COLD worktree") and "locked" in line3 and len(mounted) == 1 and hi.cold_tree == ("R", rd3), line3)
+            remove_cold_worktree(wenv["MW_BUILD_CACHE"], "R", rd3, gw)
+            hi.run_holds.close()
+            # a host that cannot overlay → COLD worktree, said
+            hi.env.pop("MW_BUILD_IN_NS")
+            hi.run_holds = contextlib.ExitStack()
+            rd4 = os.path.join(idle_work, "run-noovl", "src")
+            line4 = hi.seed_run_tree("R", c1, [], rd4, None, None)
+            check("reader/a host that cannot overlay takes a COLD worktree off the master, said (never a copy)",
+                  line4.startswith("workspace: COLD worktree") and "cannot overlay" in line4 and len(mounted) == 1, line4)
+            remove_cold_worktree(wenv["MW_BUILD_CACHE"], "R", rd4, gw)
+            hi.run_holds.close()
+            hi.env["MW_BUILD_IN_NS"] = "1"
+            # an overlay refused by the kernel → COLD worktree, said, and the shared lock released at once
+            hi.run_holds = contextlib.ExitStack()
+            hi.run_mount = lambda lo, de: (_ for _ in ()).throw(Refusal("the overlay mount was refused (permission denied)"))
+            rd5 = os.path.join(idle_work, "run-refused", "src")
+            line5 = hi.seed_run_tree("R", c1, [], rd5, None, None)
+            with idt.writer() as w_after:
+                check("reader/a refused overlay falls back to a COLD worktree, said, and holds no lock on the tree",
+                      line5.startswith("workspace: COLD worktree") and "permission denied" in line5 and w_after is not None, line5)
+            remove_cold_worktree(wenv["MW_BUILD_CACHE"], "R", rd5, gw)
+            hi.run_holds.close()
+            hi.run_mount = link_mount
+
+            # a SECOND host on the same cache cannot write the tree while the first holds it (one writer per deployment)
+            hb = host(_FakeApi({}), env=dict(ienv), git_runner=_git_run)
+            hb_builds: list = []
+            hb._sandboxed_capture = lambda *a_, **k_: (hb_builds.append(1), (0, ""))[1]
+            idt.unbuild(warm_key(hb.env, hb.identity), c3)
+            with idt.writer() as w_a:
+                out_b = hb._warm_deployment("R", warm_key(hb.env, hb.identity))
+            check("warm-idle/another host is NOT a writer while one holds the tree: it neither builds nor waits",
+                  out_b == "skipped" and hb_builds == [], (out_b, hb_builds))
+            check("warm-idle/once free, that host is the writer", hb._warm_deployment("R", warm_key(hb.env, hb.identity)) == "built" and hb_builds == [1])
+
+            # an advancement that FAILS leaves the tree NOT BUILT and the tip cooled down, never marked handled
             fail_work = os.path.join(wroot, "idle-fail")
             os.makedirs(fail_work)
-            hf = host(_FakeApi({}), env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_WORK=fail_work, MW_BUILD_CACHE=wenv["MW_BUILD_CACHE"],
-                                             MW_BUILD_GIT_BASE=wenv["MW_BUILD_GIT_BASE"]), git_runner=_git_run)
+            hf = host(_FakeApi({}), env=dict(ienv, MW_BUILD_WORK=fail_work, MW_BUILD_CHANNEL="failing"), git_runner=_git_run)
             hf.warm_repos.add("R")
             adv_calls: list = []
-            real_adv = globals()["advance_warm_main"]
+            real_adv = globals()["advance_deployment_tree"]
 
-            def failing_adv(repo_, tip_, warm_, *a_, **k_):
+            def failing_adv(dt_, tip_, key_, git_):
                 adv_calls.append(tip_)
-                wipe_warm(warm_)
-                return "warm main workspace: not advanced (git failed) — wiped, retried when idle"
-            globals()["advance_warm_main"] = failing_adv
+                dt_.unbuild(key_, tip_)
+                raise Refusal("git worktree add failed (exit 128)")
+            globals()["advance_deployment_tree"] = failing_adv
+            fdt = DeploymentTree(wenv["MW_BUILD_CACHE"], hf.deployment(), "R")
             try:
                 hf.warm_main_when_idle()
-                fw = os.path.join(fail_work, WARM_DIR, "R")
-                check("warm-idle/a FAILED advancement records no state (the tip is not marked handled) and reads no declaration",
-                      warm_state(fw) is None and len(adv_calls) == 1 and hf.warm_failed.get("R", ("",))[0] == c3, (warm_state(fw), adv_calls))
+                check("warm-idle/a FAILED advancement leaves the tree not built and the tip cooled down",
+                      (fdt.state() or {}).get("built") is None and len(adv_calls) == 1 and hf.warm_failed.get("R", ("",))[0] == c3,
+                      (fdt.state(), adv_calls))
                 hf.warm_main_when_idle()
                 check("warm-idle/the failed tip is retried after a pause, not on every idle pass", len(adv_calls) == 1, adv_calls)
                 hf.warm_failed["R"] = (c3, warm_key(hf.env, hf.identity), time.monotonic() - WARM_RETRY_SECONDS - 1)
                 hf.warm_main_when_idle()
                 check("warm-idle/after the pause the failed tip is tried again", len(adv_calls) == 2, adv_calls)
             finally:
-                globals()["advance_warm_main"] = real_adv
-            # a failing warmBuild (advancement fine) observes the same cooldown: not re-prepared and rebuilt every pass
+                globals()["advance_deployment_tree"] = real_adv
+            # a failing warmBuild (advancement fine): not built (readers go cold), cooled down, not rebuilt every pass
             hf.warm_failed.clear()
             builds: list = []
             hf._sandboxed_capture = lambda *a_, **k_: (builds.append(1), (1, "boom"))[1]
             hf.warm_main_when_idle()
             hf.warm_main_when_idle()
-            check("warm-idle/a FAILED warmBuild is recorded and its tip is not rebuilt on the next idle pass",
-                  len(builds) == 1 and hf.warm_failed.get("R", ("",))[0] == c3, (builds, hf.warm_failed))
+            with fdt.reader(warm_key(hf.env, hf.identity)) as r_f:
+                check("warm-idle/a FAILED warmBuild leaves the tree NOT BUILT (readers go cold), and is not rebuilt on the next pass",
+                      r_f is None and "not built" in (fdt.last_refusal or "") and len(builds) == 1
+                      and hf.warm_failed.get("R", ("",))[0] == c3 and not os.path.exists(fdt.manifest_path), (builds, fdt.last_refusal))
             hf._sandboxed_capture = lambda *a_, **k_: (builds.append(1), (0, ""))[1]
             hf.warm_failed["R"] = (c3, warm_key(hf.env, hf.identity), time.monotonic() - WARM_RETRY_SECONDS - 1)
             hf.warm_main_when_idle()
             check("warm-idle/a successful build after the pause clears the failure",
-                  len(builds) == 2 and "R" not in hf.warm_failed
-                  and (warm_state(os.path.join(fail_work, WARM_DIR, "R")) or {}).get("built") == c3, (builds, hf.warm_failed))
-            # two HOSTS on one shared cache: only the writer warms; the other neither builds nor waits, and seeds from the
-            # published generation
-            hcache = os.path.join(tmp, "shared-hosts")
-            warmed: list = []
-
-            def warm_stub(h_, name_):
-                def stub(repo_, key_, warm_):
-                    warmed.append(name_)
-                    with SharedTree(h_.cache, repo_).writer() as again:
-                        check(f"shared/{name_} warms only while it IS the writer (a second lock attempt fails)", again is None)
-                    os.makedirs(os.path.join(warm_, "src"), exist_ok=True)
-                    open(os.path.join(warm_, "src", "a.cs"), "w").write(name_)
-                    write_warm_state(warm_, {"key": key_, "tip": "t" * 40, "built": "t" * 40})
-                    return "built"
-                return stub
-            ha = host(_FakeApi({}), env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_SHARED_TREE="true", MW_BUILD_CACHE=hcache))
-            hb = host(_FakeApi({}), env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_SHARED_TREE="true", MW_BUILD_CACHE=hcache))
-            ha._warm_one, hb._warm_one = warm_stub(ha, "A"), warm_stub(hb, "B")
-            ha._mirror_tip = hb._mirror_tip = lambda repo_: "t" * 40
-            with SharedTree(hcache, "R").writer() as held_by_a:
-                hb._warm_shared("R", warm_key(hb.env, hb.identity))
-            check("shared/a host that is not the writer does not warm (nothing built, nothing waited for)", warmed == [], warmed)
-            ha._warm_shared("R", warm_key(ha.env, ha.identity))
-            hb._warm_shared("R", warm_key(hb.env, hb.identity))
-            check("shared/the writer builds and publishes; the other host then finds the tip warm and builds nothing",
-                  warmed == ["A"] and SharedTree(hcache, "R").current() is not None, warmed)
-            with SharedTree(hcache, "R").reader() as seen:
-                check("shared/the other host's run reads the published generation", seen is not None
-                      and open(os.path.join(seen, "src", "a.cs")).read() == "A")
-            # a full / read-only shared volume during the publish: said, cooled down, the staged generation removed — never raised
-            hcache2 = os.path.join(tmp, "shared-hosts-enospc")
-            hc = host(_FakeApi({}), env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_SHARED_TREE="true", MW_BUILD_CACHE=hcache2))
-            hc._warm_one = warm_stub(hc, "C")
-            hc._mirror_tip = lambda repo_: "u" * 40
-            real_publish = SharedTree.publish
-            SharedTree.publish = lambda self_, gen_: (_ for _ in ()).throw(OSError(28, "No space left on device"))
-            try:
-                hc._warm_shared("R", warm_key(hc.env, hc.identity))
-                raised = None
-            except BaseException as e_:
-                raised = e_
-            finally:
-                SharedTree.publish = real_publish
-            check("shared/a publish that fails (ENOSPC) never raises, cools down and leaves no staged generation",
-                  raised is None and hc.warm_failed.get("R", ("",))[0] == "u" * 40
-                  and os.listdir(SharedTree(hcache2, "R").gens) == [], (raised, hc.warm_failed, os.listdir(SharedTree(hcache2, "R").gens)))
-            # a collect that fails AFTER the publish committed never deletes the published generation
-            he = host(_FakeApi({}), env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_SHARED_TREE="true", MW_BUILD_CACHE=hcache2))
-            he._warm_one = warm_stub(he, "E")
-            he._mirror_tip = lambda repo_: "v" * 40
-            real_collect = SharedTree.collect
-            calls_ = {"n": 0}
-
-            def failing_collect(self_):
-                calls_["n"] += 1
-                if calls_["n"] >= 2:                       # the pre-stage collect passes, the post-publish one fails
-                    raise OSError(5, "I/O error")
-                return real_collect(self_)
-            SharedTree.collect = failing_collect
-            try:
-                he._warm_shared("R", warm_key(he.env, he.identity))
-            finally:
-                SharedTree.collect = real_collect
-            cur_e = SharedTree(hcache2, "R").current()
-            check("shared/a collect failing AFTER the publish leaves the published generation current and intact",
-                  cur_e is not None and os.path.isdir(SharedTree(hcache2, "R").warm_of(cur_e)), cur_e)
-            # a generation a killed replica left behind is reclaimed before the next staging copy
-            orphan = os.path.join(SharedTree(hcache2, "R").gens, "00000000000000000001-1")
-            os.makedirs(os.path.join(orphan, WARM_DIR, "R"))
-            he.warm_failed.clear()
-            he._mirror_tip = lambda repo_: "w" * 40
-            he._warm_shared("R", warm_key(he.env, he.identity))
-            check("shared/an abandoned unpublished generation is reclaimed before another full copy is staged", not os.path.exists(orphan))
-            hd = host(_FakeApi({}), env=dict(env, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_SHARED_TREE="true", MW_BUILD_CACHE=hcache2))
-            staged_: list = []
-            hd._warm_one = lambda *a_: staged_.append(1) or "built"
-            hd._mirror_tip = lambda repo_: ""
-            gens_before = sorted(os.listdir(SharedTree(hcache2, "R").gens))
-            hd._warm_shared("R", warm_key(hd.env, hd.identity))
-            check("shared/a mirror that names no tip stages nothing",
-                  staged_ == [] and sorted(os.listdir(SharedTree(hcache2, "R").gens)) == gens_before, staged_)
-            # the warm build's platform copy appears at the prepared tree's own path, never at its scratch path
-            plat = os.path.join(wroot, "prepared-platform")
-            os.makedirs(plat, exist_ok=True)
-            open(os.path.join(plat, "Directory.Build.props"), "w").write("<Project />")
+                  len(builds) == 2 and "R" not in hf.warm_failed and (fdt.state() or {}).get("built") == c3, (builds, hf.warm_failed))
+            # the warm build's platform source: a writable VIEW (here a cold worktree of the platform's master — this host
+            # cannot overlay), bound at the PREPARED path and named by it — the path a run's stages see; never a copy
             seen_b: list = []
-            hf.env["MW_PLATFORM_SOURCE"] = plat
+            hf.env["MW_PLATFORM_SOURCE"] = image_src
+            hf.env.pop("MW_BUILD_IN_NS")
             hf.warm_failed.clear()
-            write_warm_state(os.path.join(fail_work, WARM_DIR, "R"), {"key": "other", "tip": "x", "built": None})
-            hf._sandboxed_capture = lambda *a_, **k_: (seen_b.append((dict(a_[4]), list(k_.get("binds") or []))), (0, ""))[1]
+            fdt.unbuild(warm_key(hf.env, hf.identity), c3)
+
+            def capture_view(*a_, **k_):
+                binds_ = list(k_.get("binds") or [])
+                seen_b.append((dict(a_[4]), binds_, [os.path.isfile(os.path.join(b_[0], "Directory.Build.props")) for b_ in binds_]))
+                return 0, ""
+            hf._sandboxed_capture = capture_view
             hf.warm_main_when_idle()
-            check("warm-idle/the platform copy is bound at the PREPARED path and named by it (the path a run's stages see)",
-                  seen_b and seen_b[0][0].get("MW_PLATFORM_SOURCE") == plat
-                  and any(b[1] == plat and b[0] != plat and b[0].endswith("/platform") for b in seen_b[0][1])
+            check("warm-idle/the platform VIEW is bound at the PREPARED path and named by it, populated while the build runs",
+                  seen_b and seen_b[0][0].get("MW_PLATFORM_SOURCE") == image_src
+                  and any(b[1] == image_src and b[0] != image_src and b[0].endswith("/platform") and ok_
+                          for b, ok_ in zip(seen_b[0][1], seen_b[0][2]))
                   and any(b[1] == SANDBOX_NUGET for b in seen_b[0][1]), seen_b)
-            run5 = os.path.join(idle_work, "run5", "src")
-            line5 = seed_run_from_warm("R", c1, [], iw, run5, None, wenv, lambda m: None, key=warm_key(hi.env, hi.identity))
-            # a claim STOPS a warm build in flight (its sandbox killed, the half-built workspace wiped) — never waits it out
+            pv_bound = [b[0] for b in (seen_b[0][1] if seen_b else []) if b[1] == image_src]
+            check("warm-idle/...and the view is removed and pruned afterwards (nothing registered on the platform's master)",
+                  pv_bound and not os.path.exists(pv_bound[0])
+                  and wt_count(pv_bound[0], master_path(wenv["MW_BUILD_CACHE"], "MeshWeaver")) == 0, pv_bound)
+
+            # a claim STOPS a warm build in flight (its sandbox killed) and leaves the tree NOT BUILT — never waits it out
             with open(os.path.join(seed, ".github", "build-stages.json"), "w") as fh:
                 json.dump({"stages": [], "warmBuild": {"command": "sleep 30", "timeoutMinutes": 5}}, fh)
             sh("git", "commit", "-qam", "slow warmBuild")
             sh("git", "--git-dir", origin, "fetch", "-q", seed, "+main:main", cwd=wroot)
-            sh("git", "--git-dir", os.path.join(wenv["MW_BUILD_CACHE"], "git", "R.git"), "fetch", "-q", "--prune", "origin", cwd=wroot)
+            sh("git", "--git-dir", mirror_w, "fetch", "-q", "--prune", "origin", cwd=wroot)
             hi.cycle()
             started_w = time.monotonic()
-            for _ in range(100):
-                if (warm_state(iw) or {}).get("built") == "building":
+            for _ in range(200):
+                if (idt.state() or {}).get("built") == "building":
                     break
                 time.sleep(0.05)
             hi.stop_warming()
-            check("warm-idle/a claim stops a warm build in flight at once and the half-built workspace is wiped",
-                  time.monotonic() - started_w < 20 and not (hi.warm_thread and hi.warm_thread.is_alive()) and warm_state(iw) is None,
-                  (time.monotonic() - started_w, warm_state(iw)))
-            # rebuild the warm workspace (restore the quick warmBuild) for the next check
+            with idt.reader(warm_key(hi.env, hi.identity)) as r_s:
+                check("warm-idle/a claim stops a warm build in flight at once; the half-built tree is NOT BUILT, never read",
+                      time.monotonic() - started_w < 20 and not (hi.warm_thread and hi.warm_thread.is_alive())
+                      and (idt.state() or {}).get("built") is None and r_s is None,
+                      (time.monotonic() - started_w, idt.state()))
+            # restore a quick warmBuild for what follows
             with open(os.path.join(seed, ".github", "build-stages.json"), "w") as fh:
-                json.dump({"stages": [], "warmBuild": {"command": "mkdir -p src/obj && echo built-by-tip > src/obj/warm.txt", "timeoutMinutes": 5}}, fh)
-            sh("git", "commit", "-qam", "quick warmBuild")
+                json.dump({"stages": [{"name": "s", "kind": "build", "command": "true"}],
+                           "warmBuild": {"command": "mkdir -p src/obj && echo built-by-tip > src/obj/warm.txt", "timeoutMinutes": 5}}, fh)
+            sh("git", "commit", "-qam", "quick warmBuild, one stage")
+            c5 = sh("git", "rev-parse", "HEAD")
             sh("git", "--git-dir", origin, "fetch", "-q", seed, "+main:main", cwd=wroot)
-            sh("git", "--git-dir", os.path.join(wenv["MW_BUILD_CACHE"], "git", "R.git"), "fetch", "-q", "--prune", "origin", cwd=wroot)
-            hi.cycle()
-            if hi.warm_thread:
-                hi.warm_thread.join(60)
-            line_dl = seed_run_from_warm("R", c1, [], iw, os.path.join(idle_work, "run-dl", "src"), None, wenv, lambda m: None,
-                                         key=warm_key(hi.env, hi.identity), deadline=time.monotonic() - 1,
-                                         fresh=lambda *a, **k: default_checkout("R", c1, [], os.path.join(idle_work, "run-dl", "src"), None, wenv, lambda m: None))
-            check("warm/the warm copy is bounded by the run's deadline (past it: a fresh clone, said)",
-                  line_dl.startswith("workspace: clean (the warm copy failed") and "deadline" in line_dl, line_dl)
+            sh("git", "--git-dir", mirror_w, "fetch", "-q", "--prune", "origin", cwd=wroot)
             hook_repo = os.path.join(idle_work, "hooked")
             sh("git", "clone", "-q", seed, hook_repo, cwd=wroot)
             with open(os.path.join(hook_repo, ".git", "hooks", "post-checkout"), "w") as fh:
@@ -7829,9 +7692,6 @@ def self_test() -> int:
                       "did not stop" in str(e) and hs.warm_cancel.is_set(), str(e))
             finally:
                 stuck_release.set()
-            check("warm-idle/the next run starts from that built state",
-                  line5.startswith(f"workspace: incremental copy of main@{c3[:12]} (built by the tip's warmBuild)")
-                  and os.path.isfile(os.path.join(run5, "src", "obj", "warm.txt")), line5)
 
         h = host(_FakeApi({("GET", "/hosts/inputs"): on_inputs, ("POST", "/claim"): on_claim}))
         h.preflight()
@@ -8141,6 +8001,54 @@ def self_test() -> int:
         check("run/gate not run and said so", any("/gate/" in pth and e["state"] == "failed"
                                                   and "not run" in e["summary"] for pth, e in fin), fin)
         check("run/fail-fast: the second stage never started", not os.path.exists(os.path.join(tmp, "ran2")))
+        # §7.3b end to end: a REAL run with the warm workspace on — its plan names how the tree was made and `bytes copied = 0`;
+        # an overlay holds the deployment tree for the whole run and lets go after; a cold worktree is removed and pruned
+        if shutil.which("git"):
+            rw = os.path.join(tmp, "run-73b")
+            renv = dict(env_s, MW_BUILD_WARM_WORKSPACE="true", MW_BUILD_RUN_OVERLAY="true", MW_BUILD_WORK=os.path.join(rw, "work"),
+                        MW_BUILD_CACHE=os.path.join(wroot, "cache"), MW_BUILD_GIT_BASE="file://" + os.path.dirname(origin))
+            renv.pop("MW_PLATFORM_SOURCE", None)
+            os.makedirs(renv["MW_BUILD_WORK"])
+            rclaim = {"path": f"Hosting/Builds/R/{c5}-stable", "repo": "R", "sha": c5, "refs": [], "isTrunk": True,
+                      "publish": False, "stages": []}
+
+            def rv73():
+                return [e for _, evs in posted for e in evs if e["kind"] == "run-finished"][-1:]
+
+            def plan_lines():
+                return [e.get("text", "") for _, evs in posted for e in evs if e.get("kind") == "line" and "workspace:" in e.get("text", "")]
+            posted.clear()
+            rlog: list = []
+            hr = host(api_ev((("POST", "/R/"), on_events)), env=dict(renv))
+            hr.log = rlog.append
+            check("run-73b/a cold run (no namespace to overlay in) is green", hr.run(rclaim) == "ran" and rv73()
+                  and rv73()[0]["succeeded"] is True, rv73())
+            check("run-73b/its plan line names the COLD worktree off the master, and states bytes copied = 0",
+                  any(l_.startswith(f"workspace: COLD worktree of the master at {c5[:12]}") and l_.endswith("bytes copied = 0")
+                      for l_ in plan_lines()) and any(m.startswith("COLD WORKTREE") for m in rlog), (plan_lines(), rlog[-3:]))
+            check("run-73b/the cold worktree is removed AND pruned when the run ends (nothing stays registered on the master)",
+                  os.listdir(renv["MW_BUILD_WORK"]) == [] and f"{os.sep}work{os.sep}R-" not in worktrees(), worktrees())
+            # the overlay path: the host's own deployment tree, built by its writer, then a run through the (emulated) overlay
+            renv_o = dict(renv, MW_BUILD_IN_NS="1")
+            ho = host(api_ev((("POST", "/R/"), on_events)), env=dict(renv_o), git_runner=_git_run)
+            ho._sandboxed_capture = hi._sandboxed_capture
+            check("run-73b/the host's writer builds its deployment tree", ho._warm_deployment("R", warm_key(ho.env, ho.identity)) == "built")
+            odt = DeploymentTree(renv["MW_BUILD_CACHE"], ho.deployment(), "R")
+            held_during: list = []
+
+            def mount_and_probe(lower, dest):
+                link_mount(lower, dest)
+                with odt.writer() as w_:
+                    held_during.append(w_ is None)
+            ho.run_mount = mount_and_probe
+            posted.clear()
+            check("run-73b/an overlay run is green", ho.run(rclaim) == "ran" and rv73()[0]["succeeded"] is True, rv73())
+            check("run-73b/its plan line names the overlay of the deployment tree and states bytes copied = 0",
+                  any(l_.startswith(f"workspace: overlay of the deployment tree main@{c5[:12]}") and l_.endswith("bytes copied = 0")
+                      for l_ in plan_lines()), plan_lines())
+            with odt.writer() as w_end:
+                check("run-73b/the run held the tree while mounted and released it after the unmount",
+                      held_during == [True] and w_end is not None and os.listdir(renv["MW_BUILD_WORK"]) == [], (held_during, os.listdir(renv["MW_BUILD_WORK"])))
         rf_ = [e for _, e in allev if e["kind"] == "run-finished"]
         check("run/run-finished false, once", len(rf_) == 1 and rf_[0]["succeeded"] is False, rf_)
 
@@ -8853,7 +8761,10 @@ def self_test() -> int:
             "test -f \"$MW_PLATFORM_SOURCE/Directory.Build.props\"; test -d \"$MeshWeaverRefs\"; test -d \"$MW_BUILD_COMPILE_REFS\"; "
             "mkdir -p \"$MW_PLATFORM_SOURCE/src/obj\"; echo assets > \"$MW_PLATFORM_SOURCE/src/obj/project.assets.json\"; "
             + pkg_good)}}
-        wp_env = dict(wenv, MW_PLATFORM_SOURCE=wp_src, MeshWeaverRefs=wp_refs, MW_BUILD_COMPILE_REFS=wp_crefs)
+        # the image's platform tree names its commit; this runner cannot overlay it here, so its writable VIEW is a cold
+        # worktree of the platform's master (the local origin of the §7.3b fixtures) — never a copy
+        open(os.path.join(wp_src, ".source-commit"), "w").write(plat_commit + "\n")
+        wp_env = dict(wenv, MW_PLATFORM_SOURCE=wp_src, MeshWeaverRefs=wp_refs, MW_BUILD_COMPILE_REFS=wp_crefs, MW_BUILD_GIT_BASE=plat_base)
         wp_cache = os.path.join(tmp, "warm-platform-cache")
         posted.clear()
         host(api_ev(), env=dict(wp_env, MW_BUILD_CACHE=wp_cache), git_runner=tip_git(plugins_like),
@@ -8864,8 +8775,8 @@ def self_test() -> int:
               not codes("MWPREP003") and nuget_packages(os.path.join(wp_cache, "nuget")) == {"demo.pkg/1.0.0"}
               and marks(wp_cache) == 1 and seen_wp[1:4] == [wp_refs, wp_crefs, keyed_env["MW_BUILD_TESTER_DIGEST"]],
               (codes("MWPREP003"), seen_wp))
-        check("warm/... the platform source it gets is a WRITABLE COPY: restore's obj/ never lands in the image's tree, "
-              "and the copy is gone afterwards",
+        check("warm/... the platform source it gets is a WRITABLE VIEW (never a copy): restore's obj/ never lands in the "
+              "image's tree, and the view is gone afterwards",
               bool(seen_wp) and seen_wp[0] not in ("", wp_src) and not os.path.exists(os.path.join(wp_src, "src"))
               and not os.path.exists(seen_wp[0]), seen_wp)
         # NEGATIVE CONTROL: the same restore on a host whose image carries no platform source cannot restore — so the
@@ -8905,7 +8816,8 @@ def self_test() -> int:
                     "stages": [{"name": "a", "kind": "build",
                                 "command": f"cat \"$MW_BUILD_MODULE_LIBS/.source-key\" > {seen_in}; echo \"$MW_BUILD_MODULE_LIBS\" >> {seen_in}; "
                                            "test -f \"$MW_BUILD_MODULE_LIBS/Shelf.dll\""}]}
-        penv = dict(keyed_env, MW_PLATFORM_SOURCE=psrc)
+        open(os.path.join(psrc, ".source-commit"), "w").write(plat_commit + "\n")
+        penv = dict(keyed_env, MW_PLATFORM_SOURCE=psrc, MW_BUILD_GIT_BASE=plat_base)
 
         def n_builds():
             return len(open(builds).read().splitlines()) if os.path.exists(builds) else 0
@@ -8918,7 +8830,7 @@ def self_test() -> int:
         seen_ = open(seen_in).read().split()
         check("prepared-inputs/main moved: a TRUNK run builds it ONCE and installs it persistently",
               n_builds() == 1 and os.path.isfile(os.path.join(store1, ".complete")) and seen_ == [k1, store1], (n_builds(), seen_))
-        check("prepared-inputs/the build writes obj/ into its OWN copy of the platform source, never the image's",
+        check("prepared-inputs/the build writes obj/ into its OWN view of the platform source (never a copy), never the image's",
               not os.path.exists(os.path.join(psrc, "src")))
         check("prepared-inputs/the run is green on the installed input", last_verdict() == [{"kind": "run-finished", "succeeded": True, "error": None}], last_verdict())
         posted.clear()
