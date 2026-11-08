@@ -1306,6 +1306,11 @@ buildHosts:
   # host uploads it by its hash). Identity is the host's: fingerprints from the pristine tree under the DEFAULT BRANCH's
   # `moduleHub` declaration, lane and commit from the run. Inert unless a repository declares `moduleHub`. Off by default.
   moduleHub: false
+  # The SHARED TREE (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3): with the warm workspace on, the warm main tree lives
+  # ONCE per repository on the shared cache volume (`<cache>/shared/<repo>`, generations published by an atomic symlink,
+  # one writer at a time by a file lock, readers hold the generation they copy) instead of once per replica in its work
+  # volume — every replica starts warm, and a roll keeps it. Needs a cache volume every replica mounts. Off by default.
+  sharedTree: false
   # KEDA: polling, the scale-to-zero calm window, and the scale-down stabilization window (longer
   # than a claim's round trip, so a replica is not removed between two runs).
   pollingInterval: 15

@@ -88,9 +88,12 @@ ml0="$(command -v memex-local || printf '%s' "$here/../homebrew/bin/memex-local"
 if [ -n "$owner_id$owner_email" ]; then
   "$ml0" owner ${owner_id:+--id "$owner_id"} ${owner_email:+--email "$owner_email"} >&2 || { echo "ERROR: the owner was not recorded (above). Nothing was changed." >&2; exit 2; }
 fi
-"$ml0" owner status 2>&1 | grep -q 'instance OWNER' \
+# capture first: `cmd | grep -q` under pipefail is red whenever grep exits on its match before cmd finishes writing (141,
+# SIGPIPE) — which read a Mac WITH an owner as ownerless
+owner_status="$("$ml0" owner status 2>&1 || true)"
+grep -q 'instance OWNER' <<<"$owner_status" \
   || { echo "ERROR: this Mac has no OWNER — give --owner <user-id> --owner-email <e-mail> (or run 'memex-local owner --id … --email …'). Nothing was changed." >&2; exit 2; }
-echo "owner: $("$ml0" owner status 2>&1 | sed 's/.*global administrator): //') — answers the opt-in below" >&2
+echo "owner: $(grep 'instance OWNER' <<<"$owner_status" | sed 's/.*global administrator): //') — answers the opt-in below" >&2
 
 # ── the owner's opt-in: asked FIRST, VALIDATED before anything changes, applied LAST (Hosting/BackLease §13.3) ──
 # An enrolled Mac's SAVED answers are the defaults, and a class nobody answers keeps its saved answer: re-running this

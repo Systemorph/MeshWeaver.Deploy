@@ -326,6 +326,82 @@ with no hand on the machine. What the registry serves the instance is still its 
  On the control instance,
 `Hosting/Heartbeats/Enrolments` lists every join with the first step not yet measured done.
 
+## Further instances on this Mac (`memex-local instances`)
+
+A Mac's FIRST instance (release `memex`) is its local control instance; further private instances are created
+from it (MeshWeaver.Plugins `Hosting/MacStudioFleet` §3). Each is its own helm release `memex-<name>` of the same
+chart in its own namespace `memex-<name>`, with its own Postgres (the chart's), its own data volume (a `local-path`
+claim, `persistence.data.create` — never the first instance's `/var/lib/memex-portal-data` hostPath) and its own
+generated `Ai__KeyProtection__MasterKey`.
+
+```bash
+memex-local instances create proof --host proof.<machine>.net.<domain> --owner-id <id> --owner-email <e-mail> \
+    [--display-name "Proof"] [--cpu 2] [--memory-gi 6] [--storage-gi 20] [--package Plugins/Notes]… \
+    [--chat-model <model>] [--no-embeddings]
+memex-local instances list [--json]          # the inventory (below)
+memex-local instances stop proof             # portal + database scaled to 0, data kept
+memex-local instances start proof            # capacity-checked, scaled back to 1
+memex-local instances update proof [--cpu 3] # re-layers, onto the image the first instance runs now
+memex-local instances remove proof --confirm proof   # helm uninstall + the namespace, database and data volumes
+```
+
+**The layers**, in order: the chart's defaults, the shared local defaults, the Mac's model layer (`llm.auto.yaml`,
+`llm.yaml`), registry mode, the fleet-host template, then the instance's own two layers in
+`~/.memex-local/instance-state/<name>/` — `values.json` (registry id `<machine>-<name>` at the SAME registry as
+the first instance, OPEN registration; `PluginCatalog__InstallByDefault__N` = `Plugins/Hosting` then the spec's
+packages, with `InstallPreInstalledPackages`; the owner as `Auth__GlobalAdmins__0` + `Instance__Owner__Id/Email`;
+`Portal__InstanceName`; the resources as requests and limits; the Ingress for the host with its TLS Secret; the
+first instance's Microsoft sign-in, invitation-only, development sign-in off; the model endpoints pointed at the
+instance's OWN namespace) and `secret-values.json` (0600: its Postgres password, master key, the sign-in secret).
+The sign-in and the inherited model keys are read from the first instance's RENDERED configuration (its
+ConfigMap and Secret), so they are what it actually runs, whichever layer set them. **Excluded:** the back-lease,
+fleet, build-host, publish, internal and bridge layers and the first instance's overlay — those are the first
+instance's own (its heartbeat, its keys, its names).
+
+**Refused** (nothing changed, exit 3): a name not `^[a-z][a-z0-9-]{1,22}[a-z0-9]$`, a reserved one (`memex
+control build e2e www api default monitoring ingress-nginx kube-system`, `kube-*`), a package not
+`<Source>/<Package>` or more than 40, a remove without `--confirm <name>`, and a create/start whose CPU or memory
+exceeds what the Colima VM has left (allocatable minus the running pods' REQUESTS — the numbers are named).
+
+**Certificate.** Through the Mac's `cert` configuration (lego, DNS-01): the host must lie inside its zone; the
+certificate becomes the instance's TLS Secret and `cert issue` (the daily renewal agent) renews every instance's
+too. Without a configuration the instance is still created and the result says which step is missing.
+
+**What the owner does** (printed as `actionsForOwner`, never done here): register
+`https://<host>/signin-microsoft`, `/auth/callback/Microsoft` and `/auth/ea/callback` on the sign-in app (and
+remove them after a remove); declare the private-network name — MagicDNS is authoritative for the network's zone, so
+a public DNS record does nothing: one Headscale `dns.extraRecords` entry per instance, `<host>` → this Mac's
+network address (`deploy/headscale/README.md`). A remove does NOT release the registry claim `<machine>-<name>`
+(the registry has no unregister API): re-creating the same name needs a registry administrator.
+
+### The executor — the bridge to the first instance's GUI (schema 1)
+
+In registry mode `up`/`update` (1) layer `~/.memex-local/instances-host.yaml` on the FIRST instance only — a
+read-write hostPath mount of `~/.memex-local/instances` at `/host-instances` and `Hosting__LocalInstances__Root:
+"/host-instances"`, `…__Machine` (the fleet deployment id, else the short host name), `…__NetworkName` (the Mac's
+private-network name, or empty) — and (2) load the launchd agent `com.memex.local.instances`
+(`memex-local instances agent run`, KeepAlive). `instances agent off` removes it and keeps it off across updates;
+`agent on|status|run-once` do what they say. `MEMEX_LOCAL_INSTANCES=0` opts the Mac out of both.
+
+| File (under `~/.memex-local/instances`) | Written by | Shape |
+|---|---|---|
+| `jobs/<jobId>.json` | the portal, atomically (tmp + rename) | `{schema:1, jobId, operation: create\|start\|stop\|update\|remove, name, requestedBy, requestedAt, confirm (remove), spec (create, update)}`; `spec = {hostName, displayName, owner{id,email}, resources{cpu,memoryGi,storageGi}, packages[], ai{chatModel, embeddings}}`; `jobId` `^[a-z0-9-]{1,100}$` = the file name |
+| `running/<jobId>.json` | the executor: the claim (a rename — a job runs once) | the job, deleted at a terminal status |
+| `results/<jobId>.json` | the executor, atomically, rewritten as it progresses | `{schema, jobId, operation, name, status: Running\|Succeeded\|Failed\|Refused, message, startedAt, updatedAt, finishedAt, steps[{name, status: Done\|Running\|Failed\|Skipped\|Pending, detail}], log[≤200], url, actionsForOwner[]}` — the PORTAL deletes it after recording the terminal result |
+| `inventory.json` | the executor, every 30 s and after each job | `{schema, sampledAt, machine, networkName, agentVersion, capacity{vmCpu, vmMemoryGi, requestedCpu, requestedMemoryGi}, instances[{name, namespace, release, hostName, url, state: Running\|Stopped\|Starting\|Failed\|Removing, ready, health: Healthy\|Degraded\|Unreachable\|Unknown, healthDetail, nameResolves, certificateExpires, image, owner, resources, packages, createdAt, registeredAs}]}` — the first instance is not listed |
+
+A job file that is not valid JSON, fails validation, or whose name is not a job id gets a `Refused` result naming
+why (`invalid-<name>` for the last). A job whose id already has a terminal result is not re-run. A job left in
+`running/` by an executor that died is ended `Failed` at its restart, never re-run behind the requester's back.
+Health is the instance's own `/health` read THROUGH THE CLUSTER (the API server's service proxy), not the private
+network; `nameResolves` asks MagicDNS (100.100.100.100); `registeredAs` is the id the instance's own database
+holds a registry credential for.
+
+🚨 **The instances' state and secrets are NOT in the mounted directory** (`~/.memex-local/instance-state/<name>/`).
+Colima mounts the home directory with virtiofs, where every uid in the VM reads and writes as the Mac's user —
+measured on a Mac Studio (2026-11-08): `nobody` inside the VM created a file in a `0755` directory. A `0600` file
+inside the mount would therefore be readable by the first instance's pod.
+
 ## Auto-update of the CLI and its chart — on by default
 
 A Homebrew install keeps **itself** current: `memex-local up` and `memex-local update` arm a
@@ -461,6 +537,8 @@ strings from it).
 | `share/com.memex.local.plist` | the §7 launchd login-agent template |
 | `share/tools.manifest` | the ONE toolchain declaration: per tool its formula, version floor, vendored pin and probe; per vendored tool the sha256-pinned release asset (read by the CLI, the `.pkg` build and its postinstall; drift against the formula's `depends_on` is a red test) |
 | `share/tools.sh` | the resolver: existing installation first (floor met), the `.pkg`'s vendored copy second — `need`, `preflight`, `doctor` |
+| `share/instances.py` | further instances on this Mac (`memex-local instances`) and the executor of the first instance's "new instance" GUI — see *Further instances on this Mac* |
+| `share/com.memex.local.instances.plist` | the executor's launchd login-agent template |
 
 State lives in `~/.memex-local/` (overlay, mkcert cert/key, port-forward script +
 log, ollama log, grafana password) — exactly the paths the doc uses.

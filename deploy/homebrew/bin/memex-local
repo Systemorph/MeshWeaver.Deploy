@@ -257,6 +257,19 @@ readonly RELAY_BIN="$RELAY_DIR/memex-relay"
 readonly RELAY_PLIST_LABEL="com.memex.local.relay"
 readonly RELAY_PLIST_DST="$HOME/Library/LaunchAgents/${RELAY_PLIST_LABEL}.plist"
 readonly RELAY_LOG="$LOCAL_HOME/relay.log"
+# ── FURTHER INSTANCES (`memex-local instances`; MeshWeaver.Plugins Hosting/MacStudioFleet §3) ─────────────────
+# The first instance (this release) is the Mac's local control instance; further private instances are created
+# from it, each its own release memex-<name> in its own namespace (share/instances.py). The BRIDGE between the
+# first instance's GUI and this Mac is $INSTANCES_DIR, mounted read-write into the first instance's pod at
+# $INSTANCES_MOUNT (jobs/ → running/ → results/, inventory.json); the launchd agent $INSTANCES_PLIST_LABEL is the
+# executor. Each instance's state and secrets live in $LOCAL_HOME/instance-state/<name>, OUTSIDE the mount.
+readonly INSTANCES_DIR="$LOCAL_HOME/instances"
+readonly INSTANCES_MOUNT="/host-instances"
+readonly INSTANCES_FILE="$LOCAL_HOME/instances-host.yaml"
+readonly INSTANCES_AGENT_OFF="$LOCAL_HOME/instances-agent.off"
+readonly INSTANCES_PLIST_LABEL="com.memex.local.instances"
+readonly INSTANCES_PLIST_DST="$HOME/Library/LaunchAgents/${INSTANCES_PLIST_LABEL}.plist"
+readonly INSTANCES_LOG="$LOCAL_HOME/instances-agent.log"
 readonly DEFAULT_REGISTRY_URL="https://memex.meshweaver.cloud"
 readonly CERT_FILE="$LOCAL_HOME/${HOSTNAME_LOCAL}.pem"
 readonly KEY_FILE="$LOCAL_HOME/${HOSTNAME_LOCAL}-key.pem"
@@ -1344,6 +1357,8 @@ ENV
           lego ${args[@]+"${args[@]}"} || die "cert issue: lego could not obtain or renew the certificate for $domain (its output is above)"
       ok "certificate for $domain valid until $(cert_expiry "$domain")"
       cert_install
+      # every further instance's certificate too (memex-local instances; renews only within 30 days)
+      if [ -d "$LOCAL_HOME/instance-state" ]; then instances_exec renew-certs || warn "cert issue: an instance certificate could not be renewed (above)"; fi
       [ "$agent" = "yes" ] && install_cert_agent
       ;;
     status)
@@ -3039,6 +3054,15 @@ helm_deploy() {
     mode_args+=(-f "$FLEET_FILE")
     info "FLEET: joined as '$(fleet_value Hosting__Deployment)' — keys from the enrolment code (never printed)"
   fi
+  # INSTANCES BRIDGE layer (`memex-local instances`): the first instance's GUI reaches this Mac through a RW mount
+  # of $INSTANCES_DIR and three Hosting__LocalInstances__* keys. FIRST INSTANCE ONLY — share/instances.py never
+  # layers this file. After back-lease: a later -f REPLACES extraVolumes, so this layer restates the back-lease
+  # readings volume beside its own (write_instances_layer).
+  if instances_enabled; then
+    write_instances_layer
+    mode_args+=(-f "$INSTANCES_FILE")
+    info "INSTANCES: further instances on this Mac are created from this one ($INSTANCES_DIR mounted at $INSTANCES_MOUNT)"
+  fi
   # FLEET HOST template (MacStudioFleet §3a): a joined or back-leased Mac in registry mode carries the
   # Hosting app on its first instance — the heartbeat and the self-update patcher ship in it. Named in
   # InstallByDefault with the baseline kept; nobody installs anything by hand. MEMEX_FLEET_HOST=0 opts out.
@@ -4477,6 +4501,142 @@ EOF
   esac
 }
 
+# ---------------------------------------------------------------------------
+# FURTHER INSTANCES (`memex-local instances`) — production instances beside the first one (share/instances.py).
+# Not `instance` (singular, above): that is the e2e ramp's hand-written dev portal.
+# ---------------------------------------------------------------------------
+# On unless MEMEX_LOCAL_INSTANCES=0: a registry-mode Mac — the same moment the fleet-host template is layered.
+instances_enabled() { [ "${MEMEX_LOCAL_INSTANCES:-}" != "0" ] && registry_mode; }
+
+# This Mac's id for its instances' registry ids (<machine>-<name>): the fleet deployment id when it has one, else
+# the short host name. Lower-cased, the registry's id alphabet.
+instances_machine() {
+  local id=""
+  [ -f "$BACKLEASE_FILE" ] && id="$(backlease_deployment)"
+  [ -z "$id" ] && [ -f "$FLEET_FILE" ] && id="$(fleet_value Hosting__Deployment)"
+  [ -n "$id" ] || id="$(hostname -s 2>/dev/null || hostname)"
+  printf '%s' "$id" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-\n' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//'
+}
+
+# The executor's version: the Homebrew keg's (…/Cellar/memex-local/<version>/libexec/share), else this file's.
+instances_agent_version() {
+  local share v; share="$(resolve_share)"
+  case "$share" in
+    */memex-local/*/libexec/share) v="${share%/libexec/share}"; printf '%s' "${v##*/}" ;;
+    *) printf '%s' "$MEMEX_LOCAL_VERSION" ;;
+  esac
+}
+
+# The first instance's bridge layer. Pure over the environment: writes $INSTANCES_FILE.
+write_instances_layer() {
+  local net; net="$(tailnet_name 2>/dev/null || true)"
+  mkdir -p "$LOCAL_HOME" "$INSTANCES_DIR/jobs" "$INSTANCES_DIR/running" "$INSTANCES_DIR/results"
+  {
+    echo "# memex-local INSTANCES BRIDGE — regenerated by every 'memex-local up/update' in registry mode; do not edit."
+    echo "# The first instance's GUI writes jobs into $INSTANCES_DIR (mounted at $INSTANCES_MOUNT) and the launchd agent"
+    echo "# $INSTANCES_PLIST_LABEL runs them. First instance ONLY. Restates the back-lease readings volume: a later -f"
+    echo "# replaces extraVolumes, it does not append."
+    echo "config:"
+    echo "  memex_portal:"
+    echo "    Hosting__LocalInstances__Root: \"$INSTANCES_MOUNT\""
+    echo "    Hosting__LocalInstances__Machine: \"$(instances_machine)\""
+    echo "    Hosting__LocalInstances__NetworkName: \"$net\""
+    echo "extraVolumes:"
+    if [ -f "$BACKLEASE_FILE" ]; then
+      echo "  - name: backlease-readings"
+      echo "    hostPath: { path: \"$BACKLEASE_DIR\", type: DirectoryOrCreate }"
+    fi
+    echo "  - name: host-instances"
+    echo "    hostPath: { path: \"$INSTANCES_DIR\", type: DirectoryOrCreate }"
+    echo "extraVolumeMounts:"
+    if [ -f "$BACKLEASE_FILE" ]; then
+      echo "  - { name: backlease-readings, mountPath: /host-readings, readOnly: true }"
+    fi
+    echo "  - { name: host-instances, mountPath: \"$INSTANCES_MOUNT\" }"
+  } > "$INSTANCES_FILE"
+}
+
+# Runs share/instances.py with this Mac's context. The program never re-derives what this file knows.
+instances_exec() {
+  local share net ip=""; share="$(resolve_share)"
+  tools_activate
+  command -v python3 >/dev/null 2>&1 || die "instances: python3 is required (the Xcode command line tools carry it: xcode-select --install)"
+  net="$(tailnet_name 2>/dev/null || true)"
+  [ -n "$net" ] && ip="$(publish_tailscale ip -4 2>/dev/null | head -1 || true)"
+  env MEMEX_LOCAL_HOME="$LOCAL_HOME" MEMEX_LOCAL_SHARE="$share" MEMEX_INSTANCES_CHART="$(resolve_chart)" \
+      MEMEX_KUBE_CONTEXT="${MEMEX_KUBE_CONTEXT:-colima}" MEMEX_NAMESPACE="$NAMESPACE" \
+      MEMEX_INSTANCES_MACHINE="$(instances_machine)" MEMEX_INSTANCES_NETWORK_NAME="$net" MEMEX_INSTANCES_NETWORK_IP="$ip" \
+      MEMEX_INSTANCES_REGISTRY_URL="$(registry_url)" MEMEX_INSTANCES_LLM_AUTO_FILE="$LLM_AUTO_FILE" \
+      MEMEX_INSTANCES_LLM_FILE="$LLM_FILE" MEMEX_INSTANCES_AGENT_VERSION="$(instances_agent_version)" \
+      python3 -I "$share/instances.py" "$@"
+}
+
+install_instances_agent() {
+  local share self; share="$(resolve_share)"
+  self="$(command -v memex-local 2>/dev/null || printf '%s' "$0")"
+  mkdir -p "$HOME/Library/LaunchAgents" "$INSTANCES_DIR/jobs" "$INSTANCES_DIR/running" "$INSTANCES_DIR/results"
+  sed -e "s|__MEMEX_LOCAL__|${self}|g" -e "s|__HOME__|${LOCAL_HOME}|g" -e "s|__LOG__|${INSTANCES_LOG}|g" \
+      "$share/com.memex.local.instances.plist" > "$INSTANCES_PLIST_DST"
+  launchctl bootout "gui/$(id -u)" "$INSTANCES_PLIST_DST" >/dev/null 2>&1 || true
+  if launchctl bootstrap "gui/$(id -u)" "$INSTANCES_PLIST_DST" >/dev/null 2>&1; then
+    ok "launchd agent '$INSTANCES_PLIST_LABEL' loaded — the executor of new instances (logs: $INSTANCES_LOG)"
+  else
+    warn "could not load the launchd agent '$INSTANCES_PLIST_LABEL' (no GUI session?) — the first instance's 'new instance' jobs wait in $INSTANCES_DIR/jobs"
+    return 1
+  fi
+}
+
+uninstall_instances_agent() {
+  if [ -f "$INSTANCES_PLIST_DST" ]; then
+    launchctl bootout "gui/$(id -u)" "$INSTANCES_PLIST_DST" >/dev/null 2>&1 || true
+    rm -f "$INSTANCES_PLIST_DST"
+    ok "launchd agent '$INSTANCES_PLIST_LABEL' removed"
+  fi
+}
+
+# Installed by up/update with nothing manual, unless the owner turned it off (`instances agent off`).
+ensure_instances_agent() {
+  instances_enabled || return 0
+  if [ -f "$INSTANCES_AGENT_OFF" ]; then info "INSTANCES: the executor is off ('memex-local instances agent on' to start it)"; return 0; fi
+  if [ "$HEADLESS" = "1" ]; then warn "INSTANCES: a headless host has no login session for the executor's agent — not installed"; return 0; fi
+  install_instances_agent || true
+}
+
+cmd_instances() {
+  local sub="${1:-list}"
+  if [ "$sub" = "agent" ]; then
+    shift
+    local verb="${1:-status}"; shift || true
+    [ $# -eq 0 ] || die "instances agent $verb: unexpected '$1'"
+    case "$verb" in
+      on)  rm -f "$INSTANCES_AGENT_OFF"; install_instances_agent ;;
+      off) mkdir -p "$LOCAL_HOME"; : > "$INSTANCES_AGENT_OFF"; uninstall_instances_agent; ok "the executor stays off across up/update ('instances agent on' re-enables it)" ;;
+      run) instances_exec agent-run ;;
+      run-once) instances_exec agent-run --once ;;
+      status)
+        if launchctl print "gui/$(id -u)/${INSTANCES_PLIST_LABEL}" >/dev/null 2>&1; then ok "launchd agent '$INSTANCES_PLIST_LABEL' loaded (logs: $INSTANCES_LOG)"
+        elif [ -f "$INSTANCES_AGENT_OFF" ]; then warn "launchd agent '$INSTANCES_PLIST_LABEL' is turned off — memex-local instances agent on"
+        else warn "launchd agent '$INSTANCES_PLIST_LABEL' NOT loaded — memex-local instances agent on"; fi
+        local d n
+        for d in jobs running results; do
+          n="$(find "$INSTANCES_DIR/$d" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+          info "$d: ${n:-0}"
+        done
+        if [ -f "$INSTANCES_DIR/inventory.json" ]; then
+          info "inventory: $(awk -F'"' '/"sampledAt"/ { print $4; exit }' "$INSTANCES_DIR/inventory.json") ($INSTANCES_DIR/inventory.json)"
+        else
+          info "inventory: none written yet"
+        fi
+        [ -f "$INSTANCES_FILE" ] && info "bridge layer: $INSTANCES_FILE (the first instance mounts $INSTANCES_DIR at $INSTANCES_MOUNT)"
+        ;;
+      *) die "usage: memex-local instances agent {on|off|status|run|run-once}" ;;
+    esac
+    return
+  fi
+  [ $# -gt 0 ] || set -- list
+  instances_exec "$@"
+}
+
 cmd_e2e() {
   local sub="${1:-help}"; shift || true
   case "$sub" in
@@ -4622,6 +4782,7 @@ cmd_up() {
   llm_chat_smoke_or_die
 
   install_launchd                                 # §7
+  ensure_instances_agent                          # the executor of the first instance's "new instance" GUI
   autoupdate_default                              # the CLI + chart follow the tap (default on a brew install)
   [ "$with_obs" = "yes" ] && cmd_observability    # §11 (opt-in)
   # §14 — and it can FAIL. `up` used to end green on a portal with no sign-in page and no view
@@ -4991,6 +5152,7 @@ cmd_update() {
   fi
   info "A rollout invalidates the old port-forward binding — refreshing it (§8/§14)"
   install_launchd
+  ensure_instances_agent                          # the executor of the first instance's "new instance" GUI
   autoupdate_default                              # the CLI + chart follow the tap (default on a brew install)
   # An enrolled Mac's host sampler is a COPY under ~/.memex-local taken at enrolment: refresh it with this release's,
   # so a new reading (host.ownerCpuPercent, Hosting/BackLease §14.5) reaches the heartbeat without a re-enrolment.
@@ -5483,6 +5645,19 @@ COMMANDS:
                     e2e up [--skip-build]   build working tree → migrate → deploy → forward
                     e2e test [Filter]       run the Playwright E2E against it (DevLogin)
                     e2e down [--keep-db]    delete e2e objects + drop the e2e DB
+  instances create <name> --host <name>.<machine>.<domain> --owner-id <id> --owner-email <e>
+            [--display-name <t>] [--cpu 2] [--memory-gi 6] [--storage-gi 20] [--package <Src>/<Pkg>]...
+            [--chat-model <m>] [--no-embeddings]
+          | update <name> [same resource/package/ai flags] | start <name> | stop <name>
+          | remove <name> --confirm <name> | list [--json] | agent {on|off|status|run|run-once}
+                  FURTHER PRIVATE INSTANCES on this Mac (Hosting/MacStudioFleet §3): each its own
+                  release memex-<name> in its own namespace, own Postgres, data volume and key-protection
+                  master key; registered OPEN at the first instance's registry as <machine>-<name>; the
+                  Mac's model, sign-in and the Hosting app; a Let's Encrypt certificate through 'cert'.
+                  Refused when the Colima VM has no room for its CPU/memory. 'stop' keeps the data;
+                  'remove' deletes it (the registry claim stays). The first instance's GUI runs the same
+                  operations through the launchd executor (agent), installed by up/update in registry
+                  mode. Owner steps (redirect URIs, the private-network name) are printed, never done.
   instance <up|status|down> [--id NAME]
                   Ramp a NEW portal that REGISTERS ITSELF with the local one (which
                   acts as the plugin registry) and installs the plugins it is
@@ -6028,6 +6203,7 @@ main() {
     up)            cmd_up "$@" ;;
     e2e)           cmd_e2e "$@" ;;
     instance)      cmd_instance "$@" ;;
+    instances)     cmd_instances "$@" ;;
     down)          cmd_down "$@" ;;
     status)        cmd_status "$@" ;;
     setup)         cmd_setup "$@" ;;

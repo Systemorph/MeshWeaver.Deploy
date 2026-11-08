@@ -1213,6 +1213,17 @@ OUT="$(PATH="$FAO/bin:$PATH" MEMEX_HEADLESS=1 bash "$FA" "${FA_ARGS[@]}" --owner
 grep -qx 'owner --id bob --email bob@example.com' "$FAO/calls" && grep -q "owner: bob" <<<"$OUT" \
   && ok "first-attach --owner/--owner-email (executed) records the owner through memex-local and names who answers the opt-in" || bad "first-attach --owner" "$OUT
 $(cat "$FAO/calls")"
+# an owner line FOLLOWED by more output (the real CLI names the work identity next): `status | grep -q` under pipefail
+# reads that as 141 (SIGPIPE) and refused an owned Mac as ownerless (eiger, 2026-11-08)
+cat > "$FAO/bin/memex-local" <<STUB
+#!/bin/bash
+case "\$*" in "owner status") echo " ok  instance OWNER (global administrator): bob <bob@example.com>"; sleep 0.2
+  for i in \$(seq 2000); do echo "    this Mac's work identity: bob@example.com (line \$i)"; done; exit 0 ;; esac
+exit 0
+STUB
+OUT="$(PATH="$FAO/bin:$PATH" MEMEX_HEADLESS=1 bash "$FA" "${FA_ARGS[@]}" </dev/null 2>&1)"
+! grep -q "has no OWNER" <<<"$OUT" && grep -q "owner: bob" <<<"$OUT" \
+  && ok "first-attach reads an owner the CLI reports before further output (no SIGPIPE under pipefail)" || bad "first-attach owner SIGPIPE" "$OUT"
 rm -rf "$FAO"
 B="$(fn_body cmd_fleet)"; grep -A1 'OWNER_REQUIRED=require' <<<"$B" | grep -q 'ensure_overlay' \
   && [ "$(grep -n 'OWNER_REQUIRED=require' <<<"$B" | head -1 | cut -d: -f1)" -lt "$(grep -n 'cmd_backlease enroll' <<<"$B" | head -1 | cut -d: -f1)" ] \
@@ -2347,6 +2358,180 @@ grep -q 'Hosting__BackLease__HostLoadMax: "85%"' "$BL/backlease.yaml" && grep -q
   && ok "the back-lease layer declares the host load/memory and VM CPU/memory ceilings for the heartbeat" || bad "backlease thresholds" "$(ls "$BL"; cat "$BL"/backlease.yaml 2>/dev/null)"
 rm -rf "$BL"
 
+echo "── further instances: the executor, its contract, the layers ─────"
+# share/instances.py against stub kubectl/helm/dig (the cluster this runner does not have). What it proves: the
+# job contract (claim once, Refused with a reason, result + inventory shape), the per-instance layers (none of the
+# first instance's back-lease/fleet/publish/bridge keys), the bridge layer on the first instance only, and the
+# capacity refusal. What it cannot: a real helm release on a real VM — that is the live proof on a Mac.
+IX="$(mktemp -d)"; mkdir -p "$IX/stubs" "$IX/home/.memex-local"
+cat > "$IX/stubs/kubectl" <<'EOF'
+#!/usr/bin/env bash
+# answers the reads share/instances.py makes; logs every call
+[ "${1:-}" = version ] && { echo "Client Version: v1.37.1"; exit 0; }
+printf '%s\n' "$*" >> "$IX_LOG/kubectl.log"
+a=" $* "
+case "$a" in
+  *" get nodes "*) printf '{"items":[{"status":{"allocatable":{"cpu":"%s","memory":"%s"}}}]}' "${FAKE_ALLOC_CPU:-8}" "${FAKE_ALLOC_MEM:-16341600Ki}" ;;
+  *" get pods -A "*) printf '{"items":[{"status":{"phase":"Running"},"spec":{"containers":[{"resources":{"requests":{"cpu":"%s","memory":"%s"}}}]}}]}' "${FAKE_REQ_CPU:-300m}" "${FAKE_REQ_MEM:-240Mi}" ;;
+  *" -n memex get configmap memex-portal-config "*) printf '{"data":{"Authentication__Microsoft__ClientId":"00000000-client","Authentication__Microsoft__TenantId":"00000000-tenant","Hosting__Deployment":"mac-1","Hosting__BackLease__Enabled":"true","Embedding__Provider":"OpenAICompatible","Embedding__Endpoint":"http://ollama.memex.svc.cluster.local:11434/v1","Embedding__Model":"bge-m3","OpenAICompatible__DataResidency":"CH"}}' ;;
+  *" -n memex get secret memex-portal-secrets "*) printf '{"data":{"Authentication__Microsoft__ClientSecret":"%s"}}' "$(printf 'sign-in-secret-value-0123' | base64)" ;;
+  *" -n memex get deployment memex-portal-deployment "*) printf '{"spec":{"template":{"spec":{"containers":[{"name":"memex-portal","image":"ghcr.io/systemorph/memex-portal-ai:latest"}]}}}}' ;;
+  *" -n memex get jobs "*) printf '{"items":[{"metadata":{"creationTimestamp":"2026-11-08T00:00:00Z"},"spec":{"template":{"spec":{"containers":[{"image":"ghcr.io/systemorph/memex-migration:latest"}]}}}}]}' ;;
+  *" get namespace "*) [ -e "$IX_LOG/ns-exists" ] && printf '{}' || exit 1 ;;
+  *" create namespace "*) printf 'apiVersion: v1\nkind: Namespace\n' ;;
+  *" get deployment memex-portal-deployment "*) printf '{"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"memex-portal","image":"ghcr.io/systemorph/memex-portal-ai:latest"}]}}},"status":{"readyReplicas":1}}' ;;
+  *" get --raw "*) printf 'Healthy\ntiming: 3ms\n' ;;
+  *" exec "*) printf 'mac-1-proof\n' ;;
+  *" get pods "*) printf '{"items":[]}' ;;
+  *" get pv "*) printf '{"items":[]}' ;;
+  *" apply "*) cat >/dev/null ;;
+  *) : ;;
+esac
+exit 0
+EOF
+printf '#!/usr/bin/env bash\n[ "${1:-}" = version ] && { echo v4.3.1; exit 0; }\nprintf "%%s\\n" "$*" >> "$IX_LOG/helm.log"\nexit 0\n' > "$IX/stubs/helm"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$IX/stubs/dig"
+chmod +x "$IX/stubs/"*
+cat > "$IX/home/.memex-local/registry.yaml" <<'EOF'
+pluginCatalog:
+  registryUrl: "https://registry.example.com"
+  instanceId: "mac-1"
+EOF
+cat > "$IX/home/.memex-local/backlease.yaml" <<'EOF'
+config:
+  memex_portal:
+    Hosting__Deployment: "mac-1"
+    Hosting__ReportTo: "https://control.example.com"
+EOF
+IXB="$IX/home/.memex-local/instances"
+ix() { env PATH="$IX/stubs:$STUBS:$PATH" HOME="$IX/home" MEMEX_LOCAL_HOME="$IX/home/.memex-local" IX_LOG="$IX" MEMEX_LOCAL_SHARE="$HERE/../share" "$@"; }
+job() {  # job <jobId> <json>
+  mkdir -p "$IXB/jobs"; printf '%s' "$2" > "$IXB/jobs/.$1.tmp" && mv "$IXB/jobs/.$1.tmp" "$IXB/jobs/$1.json"; }
+res() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["status"]+"|"+d["message"])' "$IXB/results/$1.json" 2>/dev/null; }
+runonce() { ix "$CLI" instances agent run-once >"$IX/agent.out" 2>&1; }
+SPEC='{"hostName":"proof.mac-1.net.example.com","displayName":"Proof","owner":{"id":"owner1","email":"owner1@example.com"},"resources":{"cpu":2,"memoryGi":6,"storageGi":20},"packages":["Plugins/Hosting","Plugins/Notes"],"ai":{"chatModel":"","embeddings":true}}'
+J() { printf '{"schema":1,"jobId":"%s","operation":"%s","name":"%s","requestedBy":"owner1","requestedAt":"2026-11-08T12:00:00Z"%s}' "$1" "$2" "$3" "${4:-}"; }
+
+# Refusals — each a Refused result naming why, never a silent drop.
+job local-instance-bad-name-create-a "$(J local-instance-bad-name-create-a create Bad_Name ",\"spec\":$SPEC")"
+job local-instance-memex-create-a "$(J local-instance-memex-create-a create memex ",\"spec\":$SPEC")"
+job local-instance-kube-x-create-a "$(J local-instance-kube-x-create-a create kube-x ",\"spec\":$SPEC")"
+job local-instance-pkg-create-a "$(J local-instance-pkg-create-a create proof ",\"spec\":${SPEC/Plugins\/Notes/not a package}")"
+job local-instance-proof-remove-a "$(J local-instance-proof-remove-a remove proof)"
+job local-instance-proof-wipe-a "$(J local-instance-proof-wipe-a wipe proof)"
+job local-instance-json-a '{"schema":1, "jobId": '
+job 'Bad Name' "$(J x stop proof)"
+runonce
+for c in "local-instance-bad-name-create-a|is not ^[a-z]" "local-instance-memex-create-a|reserved" "local-instance-kube-x-create-a|reserved" \
+         "local-instance-pkg-create-a|is not <Source>/<Package>" "local-instance-proof-remove-a|confirm equal to the name" \
+         "local-instance-proof-wipe-a|is not one of create" "local-instance-json-a|not valid JSON"; do
+  id="${c%%|*}"; want="${c#*|}"; r="$(res "$id")"
+  case "$r" in "Refused|"*"$want"*) ok "a job is Refused with its reason: $id ($want)" ;; *) bad "refusal $id" "got '$r' — $(cat "$IX/agent.out")" ;; esac
+done
+# The bridge is writable by the first instance's pod: a planted symlink is never followed.
+printf 'secret-on-the-mac' > "$IX/outside.txt"; ln -s "$IX/outside.txt" "$IXB/jobs/local-instance-link-stop-a.json"; runonce
+case "$(res local-instance-link-stop-a)" in "Refused|"*"symbolic link is never followed"*) ok "a job that is a symbolic link is Refused, never read" ;; *) bad "symlink job" "$(res local-instance-link-stop-a)" ;; esac
+grep -rq 'secret-on-the-mac' "$IXB" && bad "a symlinked job's target leaked into the bridge" "" || ok "the symlink's target never reaches a result"
+mv "$IXB/results" "$IX/results-real"; ln -s "$IX" "$IXB/results"; job local-instance-x-stop-a "$(J local-instance-x-stop-a stop proof)"
+ix "$CLI" instances agent run-once >"$IX/agent.out" 2>&1
+grep -q 'symbolic link' "$IX/agent.out" && [ ! -e "$IX/local-instance-x-stop-a.json" ] && ok "a results/ replaced by a symlink stops the executor (nothing written through it)" || bad "results symlink" "$(cat "$IX/agent.out")"
+rm "$IXB/results" "$IXB/jobs/local-instance-x-stop-a.json"; mv "$IX/results-real" "$IXB/results"
+[ -f "$IXB/results/invalid-bad-name.json" ] && ok "a job file whose name is not a job id is answered Refused too (invalid-<name>)" || bad "invalid file name" "$(ls "$IXB/results")"
+[ -z "$(find "$IXB/jobs" "$IXB/running" -name '*.json' 2>/dev/null)" ] && ok "every refused job left jobs/ and running/" || bad "leftovers" "$(ls -R "$IXB")"
+
+# A create that succeeds against the stubs — result shape, claim-once, the layers.
+rm -f "$IXB"/results/*
+job local-instance-proof-create-a "$(J local-instance-proof-create-a create proof ",\"spec\":$SPEC")"
+runonce
+R="$IXB/results/local-instance-proof-create-a.json"
+python3 - "$R" <<'PY2' && ok "a create ends Succeeded with the contract's result shape (steps, log, url, actionsForOwner, finishedAt)" || bad "result shape" "$(cat "$R" 2>/dev/null; cat "$IX/agent.out")"
+import json, sys
+d = json.load(open(sys.argv[1]))
+want = {"schema", "jobId", "operation", "name", "status", "message", "startedAt", "updatedAt", "finishedAt", "steps", "log", "url", "actionsForOwner"}
+assert want <= set(d), set(d) ^ want
+assert d["schema"] == 1 and d["status"] == "Succeeded" and d["finishedAt"], d
+assert d["url"] == "https://proof.mac-1.net.example.com", d["url"]
+assert all(set(s) == {"name", "status", "detail"} and s["status"] in ("Done", "Running", "Failed", "Skipped", "Pending") for s in d["steps"]), d["steps"]
+assert any("signin-microsoft" in a and "00000000-client" in a for a in d["actionsForOwner"]), d["actionsForOwner"]
+assert any("dns.extraRecords" in a for a in d["actionsForOwner"]), d["actionsForOwner"]
+assert len(d["log"]) <= 200
+PY2
+grep -rq 'sign-in-secret-value-0123' "$IXB" && bad "a secret reached the bridge" "$(grep -rl 'sign-in-secret-value-0123' "$IXB")" || ok "no secret reaches the bridge (results, inventory)"
+[ ! -e "$IXB/running/local-instance-proof-create-a.json" ] && ok "a terminal job leaves running/" || bad "running left" ""
+before="$(cat "$R")"; job local-instance-proof-create-a "$(J local-instance-proof-create-a create proof ",\"spec\":$SPEC")"; runonce
+[ "$(cat "$R")" = "$before" ] && [ ! -e "$IXB/jobs/local-instance-proof-create-a.json" ] && [ "$(grep -c '^upgrade' "$IX/helm.log")" = 1 ] \
+  && ok "a job whose id already has a terminal result is not re-run (one helm upgrade, result untouched)" || bad "re-run" "$(grep -c '^upgrade' "$IX/helm.log") helm runs"
+ST="$IX/home/.memex-local/instance-state/proof"
+python3 - "$ST/values.json" "$ST/secret-values.json" <<'PY2' && ok "the instance's own layers: owner keys, registry id <machine>-<name>, its host + TLS, Hosting first then the spec's packages, resources, a local data volume — and none of the first instance's back-lease/fleet/bridge keys" || bad "instance layers" "$(cat "$ST/values.json")"
+import json, sys
+v = json.load(open(sys.argv[1])); s = json.load(open(sys.argv[2]))
+c = v["config"]["memex_portal"]
+assert c["Auth__GlobalAdmins__0"] == "owner1" and c["Instance__Owner__Id"] == "owner1" and c["Instance__Owner__Email"] == "owner1@example.com"
+assert v["pluginCatalog"]["instanceId"] == "mac-1-proof" and v["pluginCatalog"]["homeUrl"] == "https://proof.mac-1.net.example.com"
+assert v["pluginCatalog"]["registryUrl"] == "https://registry.example.com"
+assert v["ingress"]["host"] == "proof.mac-1.net.example.com" and v["ingress"]["tlsSecret"] == "memex-proof-tls"
+assert [c["PluginCatalog__InstallByDefault__%d" % i] for i in range(2)] == ["Plugins/Hosting", "Plugins/Notes"]
+assert c["PluginCatalog__InstallPreInstalledPackages"] == "true"
+assert v["resources"]["portal"]["requests"] == {"cpu": "2", "memory": "6Gi"}
+assert v["persistDataVolume"] is False and v["persistence"]["data"]["create"] is True and v["persistence"]["data"]["size"] == "20Gi"
+assert c["Authentication__Microsoft__ClientId"] == "00000000-client" and c["Authentication__EnableDevLogin"] == "false"
+assert c["Embedding__Endpoint"] == "http://ollama.memex-proof.svc.cluster.local:11434/v1", c["Embedding__Endpoint"]
+assert c["OpenAICompatible__Endpoint"].startswith("http://ollama.memex-proof.svc.cluster.local"), c["OpenAICompatible__Endpoint"]
+text = json.dumps(v)
+for banned in ("Hosting__BackLease", "Hosting__Deployment", "Hosting__ReportTo", "Hosting__Fleet", "Hosting__LocalInstances", "host-instances", "backlease", "extraVolumes", "Bootstrap"):
+    assert banned not in text, banned
+p = s["secrets"]["memex_portal"]
+assert p["Ai__KeyProtection__MasterKey"] and p["memex_postgres_password"] and p["Authentication__Microsoft__ClientSecret"]
+PY2
+[ "$(stat -c %a "$ST/secrets.json" 2>/dev/null || stat -f %Lp "$ST/secrets.json")" = 600 ] && [ "$(stat -c %a "$ST/secret-values.json" 2>/dev/null || stat -f %Lp "$ST/secret-values.json")" = 600 ] \
+  && ok "the instance's secrets are 0600 and live outside the mounted bridge" || bad "secret modes" "$(ls -l "$ST")"
+H="$(grep '^upgrade' "$IX/helm.log" | head -1)"
+case "$H" in
+  *backlease.yaml*|*fleet.yaml*|*publish.yaml*|*internal.yaml*|*instances-host.yaml*|*values.local.yaml\ *|*self-registry*) bad "a first-instance layer reached the instance's helm call" "$H" ;;
+  *"--install memex-proof "*"-n memex-proof"*"values.local.defaults.yaml"*"registry-mode.yaml"*"fleet-host.yaml"*"instance-state/proof/values.json"*"secret-values.json"*) ok "helm: release + namespace memex-proof, layers defaults → model → registry mode → fleet host → the instance's own (no back-lease, fleet, publish, internal, bridge or overlay)" ;;
+  *) bad "helm layering" "$H" ;;
+esac
+python3 - "$IXB/inventory.json" <<'PY2' && ok "inventory.json: the contract's shape, the instance listed with its health and registry id, the first instance not listed" || bad "inventory" "$(cat "$IXB/inventory.json" 2>/dev/null)"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert {"schema", "sampledAt", "machine", "networkName", "agentVersion", "capacity", "instances"} <= set(d), set(d)
+assert d["machine"] == "mac-1" and set(d["capacity"]) == {"vmCpu", "vmMemoryGi", "requestedCpu", "requestedMemoryGi"}
+assert [i["name"] for i in d["instances"]] == ["proof"], d["instances"]
+i = d["instances"][0]
+want = {"name", "namespace", "release", "hostName", "url", "state", "ready", "health", "healthDetail", "nameResolves", "certificateExpires", "image", "owner", "resources", "packages", "createdAt", "registeredAs"}
+assert want <= set(i), set(i) ^ want
+assert i["state"] == "Running" and i["health"] == "Healthy" and i["nameResolves"] is False and i["registeredAs"] == "mac-1-proof", i
+PY2
+touch "$IX/ns-exists"
+job local-instance-proof2-create-a "$(J local-instance-proof2-create-a create proof ",\"spec\":$SPEC")"; runonce
+case "$(res local-instance-proof2-create-a)" in "Refused|"*"already exists"*) ok "creating a name that exists is Refused" ;; *) bad "duplicate create" "$(res local-instance-proof2-create-a)" ;; esac
+job local-instance-proof-remove-b "$(J local-instance-proof-remove-b remove proof ',"confirm":"proof"')"; runonce
+case "$(res local-instance-proof-remove-b)" in "Succeeded|"*) ;; *) bad "remove" "$(res local-instance-proof-remove-b)" ;; esac
+grep -q 'registry claim' "$IXB/results/local-instance-proof-remove-b.json" && grep -q 'delete namespace memex-proof' "$IX/kubectl.log" && [ ! -d "$ST" ] \
+  && ok "remove deletes the namespace and the instance's state, and says the registry claim is not released" || bad "remove effects" "$(cat "$IXB/results/local-instance-proof-remove-b.json")"
+rm -f "$IX/ns-exists"
+# Capacity: a VM with 1.5 CPU left refuses a 2-CPU instance, naming the numbers.
+job local-instance-big-create-a "$(J local-instance-big-create-a create big ",\"spec\":${SPEC/proof.mac/big.mac}")"
+ix FAKE_ALLOC_CPU=2 FAKE_REQ_CPU=500m "$CLI" instances agent run-once >/dev/null 2>&1
+case "$(res local-instance-big-create-a)" in "Refused|not enough room"*"free 1.50 CPU"*"needs 2 CPU"*) ok "capacity: a create the VM has no room for is Refused, naming the numbers" ;; *) bad "capacity" "$(res local-instance-big-create-a)" ;; esac
+[ ! -d "$IX/home/.memex-local/instance-state/big" ] && ok "a refused create leaves no state behind" || bad "refused create left state" ""
+# The CLI refuses the same things directly.
+OUT="$(ix "$CLI" instances remove proof 2>&1)"; RC=$?
+[ "$RC" = 3 ] && ok "the CLI refuses a remove with no --confirm (exit 3)" || bad "cli remove" "rc=$RC $OUT"
+# The bridge layer: the first instance only.
+ix MEMEX_LOCAL_LIB=1 bash -c '. "$0"; write_instances_layer' "$CLI" 2>/dev/null
+IF="$IX/home/.memex-local/instances-host.yaml"
+grep -q 'Hosting__LocalInstances__Root: "/host-instances"' "$IF" && grep -q 'Hosting__LocalInstances__Machine: "mac-1"' "$IF" \
+  && grep -q 'name: host-instances' "$IF" && grep -q "path: \"$IXB\"" "$IF" && grep -q 'mountPath: "/host-instances"' "$IF" \
+  && grep -q 'name: backlease-readings' "$IF" && grep -q 'mountPath: /host-readings, readOnly: true' "$IF" \
+  && ok "the first instance's bridge layer: the RW mount at /host-instances, the three keys, and the back-lease readings volume restated (a later -f replaces extraVolumes)" || bad "bridge layer" "$(cat "$IF")"
+HD="$(awk '/^helm_deploy\(\) \{/,/^}$/' "$CLI")"
+grep -q 'mode_args+=(-f "$INSTANCES_FILE")' <<<"$HD" && [ "$(grep -n 'mode_args+=(-f "$BACKLEASE_FILE")' <<<"$HD" | cut -d: -f1)" -lt "$(grep -n 'mode_args+=(-f "$INSTANCES_FILE")' <<<"$HD" | cut -d: -f1)" ] \
+  && ok "helm_deploy layers the bridge on the first instance, after back-lease" || bad "bridge in helm_deploy" ""
+grep -q 'instances-host' "$HERE/../share/instances.py" && bad "instances.py names the bridge layer" "" || ok "a created instance never gets the bridge layer (instances.py does not know it)"
+grep -c 'ensure_instances_agent  ' "$CLI" | grep -qx 2 && ok "up and update install the executor agent (registry mode)" || bad "agent install" "$(grep -n ensure_instances_agent "$CLI")"
+rm -rf "$IX"
+
 echo "── back-lease sampler: host.ownerCpuPercent is the owner's CPU over the interval (Hosting/BackLease §14.5) ──"
 OC="$(mktemp -d)"; mkdir -p "$OC/stubs" "$OC/dir" "$OC/home/.colima/_lima/colima-build" "$OC/home/.colima/_lima/colima"
 : > "$OC/home/.colima/_lima/colima-build/disk"; : > "$OC/home/.colima/_lima/colima/disk"
@@ -2415,7 +2600,7 @@ rm -rf "$TS"
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
-for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease buildhost fleet llm residency relay publish autoupdate; do
+for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease buildhost fleet llm residency relay publish autoupdate instances; do
   case "$help_out" in
     *"$cmd"*) ;;
     *) bad "help documents '$cmd'" "not in the usage text"; continue ;;

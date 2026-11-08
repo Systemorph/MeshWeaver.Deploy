@@ -236,6 +236,9 @@ spec:
             # The module-hub broker (MeshWeaver.Plugins Hosting/BuildQueue.md §7.4): the host asks the per-module build hubs on a
             # stage's behalf, with fingerprints IT computes from a default-branch declaration (`moduleHub`).
             - { name: MW_BUILD_MODULE_HUB_ENABLED, value: {{ ternary "true" "false" $b.moduleHub | quote }} }
+            # The shared tree (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3): the warm main tree once per repository on the
+            # shared cache volume, not once per replica.
+            - { name: MW_BUILD_SHARED_TREE, value: {{ ternary "true" "false" $b.sharedTree | quote }} }
             {{- if eq $c.kind "channel" }}
             - { name: MW_BUILD_CHANNEL, value: {{ $c.name | quote }} }
             {{- else }}
