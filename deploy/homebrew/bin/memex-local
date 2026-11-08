@@ -709,7 +709,26 @@ readonly ACCEPT_DEFAULT_JOBS_FROM="control.systemorph.com"
 readonly ACCEPT_DEFAULT_TOKENS_FROM="*.meshweaver.cloud"
 readonly ACCEPT_DEFAULT_TOKEN_MODELS="qwen3.8:27b-mlx qwen3.6"
 ACC_JOBS_ENABLED=false; ACC_JOBS_FROM=""; ACC_JOBS_CHANNELS=""; ACC_JOBS_REPOS=""
-ACC_TOK_ENABLED=false; ACC_TOK_FROM=""; ACC_TOK_MODELS=""; ACC_TOK_MAXC=1; ACC_TOK_RES=""
+ACC_TOK_ENABLED=false; ACC_TOK_FROM=""; ACC_TOK_MODELS=""; ACC_TOK_MAXC=""; ACC_TOK_RES=""; ACC_TOK_SLOTS=""; ACC_TOK_YIELD=""
+
+# TOKEN SLOTS — how many requests the machine itself serves at once (MeshWeaver.Plugins Hosting/BackLease §14.5):
+# a property of the hardware and the model runner, not an owner choice. Measured on a Mac Studio (M5 Max, 2026-11-08):
+# Ollama 0.40's MLX runner decodes ONE request at a time and one stream saturates the GPU at ~65 tok/s — 4–8 concurrent
+# requests, OLLAMA_NUM_PARALLEL=4 and 2–3 Ollama processes all stayed at 64–70 tok/s aggregate — so a Mac Studio
+# offers 2 slots (one decoding, one prefilling/queued behind it). Written whenever tokens are enabled; `--token-slots`
+# is a calibrated override (1–32). `--token-max-concurrency` is the OWNER's optional ceiling below that: unset means
+# the whole machine. Other hosts write no Slots unless calibrated (the code's default applies).
+# MEMEX_HOST_MODEL_NAME overrides the hardware probe (tests).
+token_slots_default() {
+  case "$HOST_PROFILE" in
+    mac-studio) printf '2'; return 0 ;;
+    '') ;;
+    *) return 0 ;;
+  esac
+  local model="${MEMEX_HOST_MODEL_NAME-$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Model Name/ {print $2; exit}')}"
+  [ "$model" = "Mac Studio" ] && printf '2'
+  return 0
+}
 ACC_JOBS_ANSWERED=no; ACC_TOK_ANSWERED=no
 
 # The values of an indexed list key (<prefix>__0, __1, …) in the back-lease layer, space-separated, in index order.
@@ -730,7 +749,9 @@ accept_load() {
   ACC_JOBS_FROM="$(accept_list "${p}__Jobs__From")"; ACC_JOBS_CHANNELS="$(accept_list "${p}__Jobs__Channels")"; ACC_JOBS_REPOS="$(accept_list "${p}__Jobs__Repos")"
   [ "$(backlease_value "${p}__Tokens__Enabled")" = "true" ] && ACC_TOK_ENABLED=true || ACC_TOK_ENABLED=false
   ACC_TOK_FROM="$(accept_list "${p}__Tokens__From")"; ACC_TOK_MODELS="$(accept_list "${p}__Tokens__Models")"
-  ACC_TOK_MAXC="$(backlease_value "${p}__Tokens__MaxConcurrency")"; ACC_TOK_MAXC="${ACC_TOK_MAXC:-1}"
+  ACC_TOK_MAXC="$(backlease_value "${p}__Tokens__MaxConcurrency")"
+  ACC_TOK_SLOTS="$(backlease_value "${p}__Tokens__Slots")"
+  ACC_TOK_YIELD="$(backlease_value "${p}__Tokens__YieldAtPercent")"
   ACC_TOK_RES="$(backlease_value "${p}__Tokens__Residency")"
 }
 
@@ -751,7 +772,10 @@ accept_check_patterns() {
 accept_check_models()   { local x; set -f; for x in $1; do printf '%s' "$x" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:/-]*$' || { set +f; die "$2: '$x' is not a model name"; }; done; set +f; }
 accept_check_channels() { local x; set -f; for x in $1; do printf '%s' "$x" | grep -Eq '^[a-z0-9][a-z0-9-]*$' || { set +f; die "$2: '$x' is not a channel"; }; done; set +f; }
 accept_check_repos()    { local x; set -f; for x in $1; do printf '%s' "$x" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || { set +f; die "$2: '$x' is not owner/repo"; }; done; set +f; }
-accept_check_maxc()     { case "$1" in [1-8]) ;; *) die "$2: must be 1–8 (got '$1')" ;; esac; }
+# a request count — the owner's ceiling or the machine's slots: 1–32 (or `none` to clear, handled by the caller)
+accept_check_count()    { case "$1" in ''|*[!0-9]*) die "$2: must be a whole number 1–32, or none (got '$1')" ;; esac; [ "$1" -ge 1 ] && [ "$1" -le 32 ] || die "$2: must be 1–32 (got '$1')"; }
+# the owner-activity threshold, percent of ONE core (200 = two cores busy): 10–3200
+accept_check_yield()    { case "$1" in ''|*[!0-9]*) die "$2: must be a whole percent of one core, 10–3200 (got '$1')" ;; esac; [ "$1" -ge 10 ] && [ "$1" -le 3200 ] || die "$2: must be 10–3200 (got '$1')"; }
 accept_check_residency() { [ -z "$1" ] || printf '%s' "$1" | grep -Eq '^[A-Za-z]{2,8}$' || die "$2: '$1' is not a residency (e.g. CH, Eu)"; }
 
 # One opt-in flag (`--x=v` or `--x v`); sets ACC_USED to how many arguments it consumed (0 = not an opt-in flag).
@@ -761,7 +785,7 @@ accept_flag() {
   local flag="${1%%=*}" val="" used=1
   case "$1" in *=*) val="${1#*=}" ;; esac
   case "$flag" in
-    --accept-jobs|--accept-tokens|--job-channels|--job-repos|--token-models|--token-max-concurrency|--residency)
+    --accept-jobs|--accept-tokens|--job-channels|--job-repos|--token-models|--token-max-concurrency|--token-slots|--token-yield-at|--residency)
       if [ "$1" = "$flag" ]; then val="${2-}"; used=2; [ -n "$val" ] || die "$flag needs a value"; fi ;;
   esac
   case "$flag" in
@@ -772,7 +796,9 @@ accept_flag() {
     --accept-tokens) ACC_TOK_FROM="$(accept_norm "$val" lower)"; accept_check_patterns "$ACC_TOK_FROM" "$flag"; ACC_TOK_ENABLED=true; ACC_TOK_ANSWERED=yes ;;
     --no-accept-tokens) ACC_TOK_ENABLED=false; ACC_TOK_ANSWERED=yes ;;
     --token-models)  ACC_TOK_MODELS="$(accept_norm "$val")"; accept_check_models "$ACC_TOK_MODELS" "$flag" ;;
-    --token-max-concurrency) ACC_TOK_MAXC="$val"; accept_check_maxc "$val" "$flag" ;;
+    --token-max-concurrency) if [ "$val" = none ]; then ACC_TOK_MAXC=""; else ACC_TOK_MAXC="$val"; accept_check_count "$val" "$flag"; fi ;;
+    --token-slots)   if [ "$val" = none ]; then ACC_TOK_SLOTS=""; else ACC_TOK_SLOTS="$val"; accept_check_count "$val" "$flag"; fi ;;
+    --token-yield-at) if [ "$val" = none ]; then ACC_TOK_YIELD=""; else ACC_TOK_YIELD="$val"; accept_check_yield "$val" "$flag"; fi ;;
     --residency)     ACC_TOK_RES="$val"; accept_check_residency "$val" "$flag" ;;
     *) used=0 ;;
   esac
@@ -814,6 +840,8 @@ accept_validate() {
   if [ "$ACC_TOK_ENABLED" = true ]; then
     accept_check_patterns "$ACC_TOK_FROM" "tokens: --accept-tokens"
     [ -n "$ACC_TOK_MODELS" ] || die "tokens: name the models this Mac serves (--token-models qwen3.8:27b-mlx)"
+    # the machine's slots: a calibrated or saved value stands; otherwise the hardware's measured default
+    [ -n "$ACC_TOK_SLOTS" ] || ACC_TOK_SLOTS="$(token_slots_default)"
   fi
 }
 
@@ -828,9 +856,27 @@ accept_block() {
   printf '%s__Tokens__Enabled: "%s"\n' "$p" "$ACC_TOK_ENABLED"
   i=0; for x in $ACC_TOK_FROM;   do printf '%s__Tokens__From__%d: "%s"\n' "$p" "$i" "$x"; i=$((i+1)); done
   i=0; for x in $ACC_TOK_MODELS; do printf '%s__Tokens__Models__%d: "%s"\n' "$p" "$i" "$x"; i=$((i+1)); done
-  printf '%s__Tokens__MaxConcurrency: "%s"\n' "$p" "$ACC_TOK_MAXC"
+  [ -z "$ACC_TOK_MAXC" ] || printf '%s__Tokens__MaxConcurrency: "%s"\n' "$p" "$ACC_TOK_MAXC"
+  [ -z "$ACC_TOK_SLOTS" ] || printf '%s__Tokens__Slots: "%s"\n' "$p" "$ACC_TOK_SLOTS"
+  [ -z "$ACC_TOK_YIELD" ] || printf '%s__Tokens__YieldAtPercent: "%s"\n' "$p" "$ACC_TOK_YIELD"
   [ -z "$ACC_TOK_RES" ] || printf '%s__Tokens__Residency: "%s"\n' "$p" "$ACC_TOK_RES"
   set +f
+}
+
+# A layer written before token slots existed has tokens on and no Slots: give it the machine's measured slots, so the
+# heartbeat advertises them on this update without a re-answer. It NEVER widens what the owner limited: a recorded
+# MaxConcurrency is kept as the owner's ceiling — including the "1" that the first opt-in release wrote by default,
+# which cannot be told apart from a chosen 1 (`memex-local backlease accept tokens --max-concurrency none` lifts it).
+backlease_migrate_accept() {
+  [ -f "$BACKLEASE_FILE" ] || return 0
+  accept_load
+  [ "$ACC_TOK_ENABLED" = true ] && [ -z "$ACC_TOK_SLOTS" ] || return 0
+  ACC_TOK_SLOTS="$(token_slots_default)"
+  [ -n "$ACC_TOK_SLOTS" ] || return 0
+  write_backlease_file "$(backlease_control)" "$(backlease_deployment)" "$(backlease_interval)" "$(backlease_value Hosting__BackLease__Repository || true)" \
+    "$(backlease_ceiling Hosting__BackLease__HostLoadMax)" "$(backlease_ceiling Hosting__BackLease__HostMemoryMax)" \
+    "$(backlease_ceiling Hosting__BackLease__VmCpuMax)" "$(backlease_ceiling Hosting__BackLease__VmMemoryMax)"
+  info "back-lease: this Mac now advertises ${ACC_TOK_SLOTS} token slot(s)${ACC_TOK_MAXC:+ under the owner ceiling of $ACC_TOK_MAXC (lift it: memex-local backlease accept tokens --max-concurrency none)}"
 }
 
 # One line per switch, for enroll, accept and status.
@@ -839,7 +885,8 @@ accept_summary() {
     ok "accepts JOBS from: $ACC_JOBS_FROM${ACC_JOBS_CHANNELS:+ · channels: $ACC_JOBS_CHANNELS}${ACC_JOBS_REPOS:+ · repos: $ACC_JOBS_REPOS}"
   else info "accepts NO jobs (memex-local backlease accept jobs --from $ACCEPT_DEFAULT_JOBS_FROM to opt in)"; fi
   if [ "$ACC_TOK_ENABLED" = true ]; then
-    ok "accepts TOKEN requests from: $ACC_TOK_FROM · models: $ACC_TOK_MODELS · at most $ACC_TOK_MAXC at once · residency: ${ACC_TOK_RES:-<none stated — serves only requests that require none>}"
+    local cap="the whole machine"; [ -z "$ACC_TOK_MAXC" ] || cap="owner ceiling $ACC_TOK_MAXC at once"
+    ok "accepts TOKEN requests from: $ACC_TOK_FROM · models: $ACC_TOK_MODELS · ${ACC_TOK_SLOTS:-default} slot(s), $cap${ACC_TOK_YIELD:+ · yields at ${ACC_TOK_YIELD}% owner CPU} · residency: ${ACC_TOK_RES:-<none stated — serves only requests that require none>}"
   else info "serves NO token requests (memex-local backlease accept tokens --from '$ACCEPT_DEFAULT_TOKENS_FROM' --models … --residency … to opt in)"; fi
 }
 
@@ -1015,13 +1062,15 @@ cmd_backlease() {
           done ;;
         tokens)
           ACC_JOBS_ANSWERED=yes
-          [ $# -gt 0 ] || accept_interactive || die "backlease accept tokens: give --from <patterns> --models <m> [--max-concurrency n] [--residency X] or --off"
+          [ $# -gt 0 ] || accept_interactive || die "backlease accept tokens: give --from <patterns> --models <m> [--max-concurrency n|none] [--slots n|none] [--yield-at pct|none] [--residency X] or --off"
           while [ $# -gt 0 ]; do
             case "$1" in
               --off) accept_flag --no-accept-tokens ;;
               --from|--from=*) accept_flag "--accept-tokens${1#--from}" "${2-}" ;;
               --models|--models=*) accept_flag "--token-models${1#--models}" "${2-}" ;;
               --max-concurrency|--max-concurrency=*) accept_flag "--token-max-concurrency${1#--max-concurrency}" "${2-}" ;;
+              --slots|--slots=*) accept_flag "--token-slots${1#--slots}" "${2-}" ;;
+              --yield-at|--yield-at=*) accept_flag "--token-yield-at${1#--yield-at}" "${2-}" ;;
               --residency|--residency=*) accept_flag "--residency${1#--residency}" "${2-}" ;;
               *) die "backlease accept tokens: unknown flag '$1'" ;;
             esac
@@ -1050,7 +1099,7 @@ cmd_backlease() {
         info "back-lease was not on"
       fi
       ;;
-    *) die "usage: memex-local backlease {enroll --control <url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>] [--accept-jobs=<patterns> | --no-accept-jobs] [--job-channels <c>] [--job-repos <owner/repo>] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--token-max-concurrency <n>] [--residency <X>] | accept {jobs [--from <patterns>] [--channels <c>] [--repos <r>] [--off] | tokens [--from <patterns>] [--models <m>] [--max-concurrency <n>] [--residency <X>] [--off]} | status | off}" ;;
+    *) die "usage: memex-local backlease {enroll --control <url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>] [--accept-jobs=<patterns> | --no-accept-jobs] [--job-channels <c>] [--job-repos <owner/repo>] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--token-max-concurrency <n>|none] [--token-slots <n>|none] [--token-yield-at <pct>|none] [--residency <X>] | accept {jobs [--from <patterns>] [--channels <c>] [--repos <r>] [--off] | tokens [--from <patterns>] [--models <m>] [--max-concurrency <n>|none] [--slots <n>|none] [--yield-at <pct>|none] [--residency <X>] [--off]} | status | off}" ;;
   esac
 }
 
@@ -4622,6 +4671,7 @@ autoupdate_image_source() {
 
 cmd_update() {
   local image_source="build" acr_tag="$ACR_DEFAULT_TAG" rebuild_base="" channel="$CHANNEL" verdict
+  backlease_migrate_accept
   registry_mode && image_source="ghcr"             # §17 — same default as `up`: the public GHCR, anonymously
   [ -n "$channel" ] && image_source="acr"
   while [ $# -gt 0 ]; do
@@ -4715,6 +4765,9 @@ cmd_update() {
   info "A rollout invalidates the old port-forward binding — refreshing it (§8/§14)"
   install_launchd
   autoupdate_default                              # the CLI + chart follow the tap (default on a brew install)
+  # An enrolled Mac's host sampler is a COPY under ~/.memex-local taken at enrolment: refresh it with this release's,
+  # so a new reading (host.ownerCpuPercent, Hosting/BackLease §14.5) reaches the heartbeat without a re-enrolment.
+  if [ -f "$BACKLEASE_FILE" ]; then install_backlease_sampler "$(backlease_interval)" || warn "the back-lease host sampler was not refreshed — re-run 'memex-local backlease enroll …'"; fi
   # §14 — `update` verified NOTHING before this: it printed "update complete" straight after the
   # rollout, which is exactly how MeshWeaver#2367's portal reported success while unusable.
   verify_usable --wait 600 --repair; verdict=$?
@@ -5138,9 +5191,11 @@ COMMANDS:
                   want the cores, and gives it every idle core otherwise ('priority off' removes it).
   backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>]
             [--accept-jobs=<patterns> | --no-accept-jobs] [--job-channels <c>] [--job-repos <owner/repo>]
-            [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--token-max-concurrency <n>] [--residency <X>]
+            [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--token-max-concurrency <n>|none]
+            [--token-slots <n>|none] [--token-yield-at <pct>|none] [--residency <X>]
             | accept jobs [--from <patterns>] [--channels <c>] [--repos <owner/repo>] [--off]
-            | accept tokens [--from <patterns>] [--models <m>] [--max-concurrency <n>] [--residency <X>] [--off]
+            | accept tokens [--from <patterns>] [--models <m>] [--max-concurrency <n>|none] [--slots <n>|none]
+                            [--yield-at <pct>|none] [--residency <X>] [--off]
             | status | off
                        OPT-IN (Hosting/BackLease §13): the Mac takes NO jobs and serves NO tokens until its owner says
                        which instances it takes each from. Enrolment asks (defaults offered: jobs from
