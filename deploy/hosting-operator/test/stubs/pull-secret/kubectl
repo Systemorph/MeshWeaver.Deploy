@@ -46,7 +46,7 @@ case "${1:-}" in
     # Record what was applied; keep a Secret manifest for the read-backs.
     manifest="$(cat)"
     printf '  <stdin> %s\n' "$(printf '%s' "$manifest" | tr '\n' ' ')" >> "$log"
-    if printf '%s' "$manifest" | grep -q '^kind: Secret'; then
+    if grep -q '^kind: Secret' <<< "$manifest"; then
       printf '%s\n' "$manifest" > "$dir/applied-secret.yaml"
     fi
     echo "applied" ;;

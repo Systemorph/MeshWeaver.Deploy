@@ -386,7 +386,13 @@ hosting::inline_setters() {
 hosting::kv_exists() {
   local vault="$1" name="$2" names
   names="$(az keyvault secret list --vault-name "$vault" --query "[].name" -o tsv 2>/dev/null)" || return 2
-  printf '%s\n' "$names" | grep -qx -- "$name"
+  # 🚨 A HERE-STRING, never `printf … | grep -q` (MeshWeaver.Plugins hosting-operator lane, run
+  # 42454937015): under `pipefail` a `grep -q` that matches exits while the writer may still be
+  # writing, the writer dies of SIGPIPE (141) and the pipeline reads FALSE — a present object
+  # reported absent. Intermittent with a short listing, certain with one over the pipe buffer, and
+  # for the master key "absent" means "mint a new one" — over the key that seals every enc: value.
+  # The suite's static guard refuses the pipe form anywhere in bin/ (policy below it).
+  grep -qx -- "$name" <<< "$names"
 }
 
 # SHA-256 hex of STDIN — how two keys are compared without either being shown.

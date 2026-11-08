@@ -31,6 +31,14 @@ does the publishing lane, which also checks that every command the plan emits sh
 - **Build context.** The image is built from a staged layout, not this directory (see the
   Dockerfile header): `deploy/helm` → `helm`, `deploy/helm-db` → `helm-db`, `deploy/aks/scripts` →
   `aks/scripts`, `bin` → `aks/operator/bin`.
+- **Never `grep -q` behind a pipe.** Every script runs under `pipefail`. In `producer | grep -q`,
+  grep exits on its match, a producer still writing dies of SIGPIPE (141), and the condition reads
+  FALSE: an object the vault lists comes back "absent". With a short listing on a loaded runner
+  this happens only now and then. With a listing larger than the 64 KiB pipe buffer it happens
+  every time, and for the master key "absent" means minting a new one over the key that seals
+  every `enc:` value. Match a value instead: a here-string (`grep -qx -- "$name" <<< "$names"`), or
+  a bash pattern when the text is a secret. In the suite, use `grep_in <text> <grep args…>`. The
+  suite's `no grep -q behind a pipe` guard holds `bin/`, the stubs and the suite to this rule.
 - **Gates.** `.github/workflows/hosting-operator.yml` here runs on every pull request touching this
   tree, the charts or the cluster manifests: tracked and executable, every script parses,
   shellcheck, the Key Vault gate, the image builds and carries exactly `bin/`'s command set, and the

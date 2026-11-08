@@ -9,6 +9,9 @@
 #   HOSTING_KVE_PASSWORD         a sentinel the test greps for (default: an obviously fake one)
 #   HOSTING_KVE_SET_FAIL=1       every `keyvault secret set` refuses
 #   HOSTING_KVE_VERSIONS         what `keyvault secret list-versions --query length(@)` answers (default 1)
+#   HOSTING_KVE_LIST_PAD         N filler names `keyvault secret list` answers AFTER the real ones — a
+#                                vault whose listing outgrows the pipe buffer (64 KiB), where a reader
+#                                that stops at its match leaves the writer to die of SIGPIPE
 #
 # Not a mock of az: nothing here asserts az's own behaviour. What is under test is which objects
 # the script reads, which it writes, with what content, and what it never prints.
@@ -20,6 +23,7 @@ case "${1:-} ${2:-} ${3:-}" in
     [ "${HOSTING_KVE_LIST_FAIL:-0}" = "1" ] && { echo "ERROR: (Forbidden) secrets list permission" >&2; exit 1; }
     for existing in ${HOSTING_KVE_EXISTING:-}; do printf '%s\n' "$existing"; done
     for f in "$state"/set.*; do [ -e "$f" ] && printf '%s\n' "${f##*/set.}"; done
+    for ((pad = 0; pad < ${HOSTING_KVE_LIST_PAD:-0}; pad++)); do printf 'unrelated-object-padding-the-listing-%06d\n' "$pad"; done
     exit 0 ;;
   "keyvault secret show")
     name="" query=""

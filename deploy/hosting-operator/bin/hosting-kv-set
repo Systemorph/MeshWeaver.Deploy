@@ -176,7 +176,8 @@ for object in "${objects[@]}"; do
     || hosting::die "set ${object} in vault ${vault}, but the vault returned no version id — refusing to report a write the vault does not confirm"
   # Confirm BY VERSION through a METADATA read (list-versions), never a value read: a write az
   # reported and the vault did not keep is a failure here, not a pod that cannot start later.
-  if ! az keyvault secret list-versions --vault-name "$vault" --name "$object" --query "[?id=='${version_id}'].id" -o tsv 2>/dev/null | grep -qx "$version_id"; then
+  listed="$(az keyvault secret list-versions --vault-name "$vault" --name "$object" --query "[?id=='${version_id}'].id" -o tsv 2>/dev/null)"
+  if ! grep -qx -- "$version_id" <<< "$listed"; then
     hosting::die "set ${object} in vault ${vault} (${version_id##*/}), but that version is not listed — refusing to report a write the vault does not confirm"
   fi
   hosting::log "set       ${object} in vault ${vault} (${version_id##*/}; ${fp}; ${source_tag} by ${set_by})"
