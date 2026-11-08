@@ -170,6 +170,7 @@ jobs:
           refuse "the ingress has no TLS source"        -f ci-values.yaml --set ingress.clusterIssuer=
           rec=(--set 'dns.extraRecords[0].type=A' --set 'dns.extraRecords[0].value=100.64.0.7')
           refuse "an extra record is a wildcard"        -f ci-values.yaml "${rec[@]}" --set 'dns.extraRecords[0].name=*.mac.tailnet.internal'
+          refuse "an extra record has a label over 63 characters" -f ci-values.yaml "${rec[@]}" --set "dns.extraRecords[0].name=$(printf 'a%.0s' $(seq 1 64)).tailnet.internal"
           refuse "an extra record is outside baseDomain" -f ci-values.yaml "${rec[@]}" --set 'dns.extraRecords[0].name=proof.example.com'
           refuse "an extra record is not an IPv4 address" -f ci-values.yaml --set 'dns.extraRecords[0].name=a.tailnet.internal' --set 'dns.extraRecords[0].type=A' --set 'dns.extraRecords[0].value=300.1.1.1'
           for v6 in 12345:: ::1::2 :::::: fd7a:115c:a1e0:0:0:0:0:0:1 FD7A::1; do

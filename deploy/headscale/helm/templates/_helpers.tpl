@@ -68,8 +68,8 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- $n := toString ($r.name | default "") }}
 {{- $t := toString ($r.type | default "") }}
 {{- $v := toString ($r.value | default "") }}
-{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+$" $n) }}
-{{- fail (printf "dns.extraRecords[%d]: name %q is not a lower-case DNS name (no wildcards — Tailscale clients match MagicDNS names exactly)" $i $n) }}
+{{- if or (gt (len $n) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)+$" $n)) }}
+{{- fail (printf "dns.extraRecords[%d]: name %q is not a lower-case DNS name of labels up to 63 characters, 253 in all (no wildcards — Tailscale clients match MagicDNS names exactly)" $i $n) }}
 {{- end }}
 {{- if not (hasSuffix (printf ".%s" $.Values.dns.baseDomain) $n) }}
 {{- fail (printf "dns.extraRecords[%d]: name %q is not inside dns.baseDomain %q — MagicDNS answers that zone only, and a record outside it would shadow a public name" $i $n (toString $.Values.dns.baseDomain)) }}
