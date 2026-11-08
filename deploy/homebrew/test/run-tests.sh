@@ -961,7 +961,7 @@ B="$(fn_body cmd_up)"; grep -B1 '^  ensure_overlay$' <<<"$B" | grep -q '^  OWNER
 # require-fresh: an install never DEPLOYED fails on EVERY ownerless `up` (a re-run of a failed first `up` too —
 # an existing overlay is not a deployed install); a deployed ownerless one — which the unattended daemon re-runs
 # `up` on at every start — warns, so a running Mac is never halted by its own restart.
-seed_overlay; rm -f "$OWH/home/.memex-local/deployed" "$OWH/home/.memex-local/port-forward.sh"
+seed_overlay; rm -f "$OWH/home/.memex-local/deployed"; : > "$OWH/home/.memex-local/port-forward.sh"   # a standalone port-forward does not count
 for attempt in first re-run; do
   OUT="$(ow bash -c '. "$0"; ensure_owner_admin "" "" require-fresh; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
   grep -q SURVIVED <<<"$OUT" && bad "an ownerless never-deployed install came up on the $attempt" "$OUT" || ok "up on a never-deployed install with no owner fails (the $attempt, overlay present)"
@@ -971,6 +971,14 @@ OUT="$(ow bash -c '. "$0"; ensure_owner_admin "" "" require-fresh; echo SURVIVED
 grep -q SURVIVED <<<"$OUT" && grep -q "NO OWNER" <<<"$OUT" && ok "up on a DEPLOYED ownerless install (the daemon's restart) warns loudly and carries on" || bad "deployed ownerless up" "$OUT"
 rm -f "$OWH/home/.memex-local/deployed"
 grep -q ': > "$DEPLOYED_MARKER"' <<<"$(fn_body helm_deploy)" && ok "helm_deploy marks the install deployed" || bad "deployed marker" ""
+# The owner is id AND e-mail where one is required: an id without an e-mail fails the install.
+seed_overlay
+OUT="$(ow env MEMEX_OWNER=erin bash -c '. "$0"; ensure_owner_admin "" "" require; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+grep -q SURVIVED <<<"$OUT" && bad "an install with an owner id but no e-mail came up" "$OUT" || ok "an install whose owner has no e-mail fails (id AND e-mail are the owner)"
+# A lone managed OwnerEmail (no OwnerId) was recorded for nobody: never attributed.
+seed_overlay
+ow env FAKE_PREF_OwnerEmail=nobody@example.com bash -c '. "$0"; cmd_owner --id frank' "$CLI" >/dev/null 2>&1 </dev/null
+! grep -q 'nobody@example.com' "$OOV" && ok "a lone managed OwnerEmail without OwnerId is ignored" || bad "lone pref email used" "$(cat "$OOV")"
 # A managed preference's OwnerEmail belongs to its OwnerId: a different explicit owner never inherits it.
 seed_overlay
 OUT="$(ow env FAKE_PREF_OwnerId=carol FAKE_PREF_OwnerEmail=carol@example.com bash -c '. "$0"; cmd_owner --id bob' "$CLI" 2>&1 </dev/null)"

@@ -2043,10 +2043,15 @@ readonly OWNER_KEY="Auth__GlobalAdmins__0"
 # Written by every successful helm_deploy: this install HAS been deployed. Only such an install may come up
 # without an owner (with a loud warning) — the unattended daemon re-runs `up` on it at every start, and a
 # running Mac must never be halted by its own restart. A Mac that was never deployed has no marker, so a
-# failed ownerless `up` stays failed on every re-run. Installs deployed before the marker existed are
-# recognised by the port-forward script `up` installs only after a deploy.
+# failed ownerless `up` stays failed on every re-run. An install deployed before the marker existed is
+# recognised by its Helm release (when the cluster answers) — and gets the marker on its next update, which
+# the autoupdate agent runs. Nothing else counts: the port-forward script, for one, `memex-local port-forward`
+# writes at any time.
 readonly DEPLOYED_MARKER="$LOCAL_HOME/deployed"
-install_deployed() { [ -f "$DEPLOYED_MARKER" ] || [ -f "$PF_SCRIPT" ]; }
+install_deployed() {
+  [ -f "$DEPLOYED_MARKER" ] && return 0
+  colima_running 2>/dev/null && helm status "$RELEASE" -n "$NAMESPACE" >/dev/null 2>&1
+}
 readonly OWNER_ID_KEY="Instance__Owner__Id"
 readonly OWNER_EMAIL_KEY="Instance__Owner__Email"
 
@@ -2132,11 +2137,18 @@ ensure_owner_admin() {
   if [ -n "$have_id" ] && [ "$have_id" != "$id" ]; then email_key="__no_such_key__"; fi
   # …and the same for the managed preference: its OwnerEmail belongs to ITS OwnerId only.
   pref_id="$(managed_pref OwnerId)"
-  if [ -n "$pref_id" ] && [ "$pref_id" != "$id" ]; then email_pref="__no_such_pref__"; fi
+  # A lone OwnerEmail (no OwnerId beside it) was recorded for nobody, so it is ignored as well.
+  if [ "$pref_id" != "$id" ]; then email_pref="__no_such_pref__"; fi
   email="$(owner_field "${2:-}" "${MEMEX_OWNER_EMAIL:-}" "$email_pref" "$email_key" "The owner's e-mail (the account they sign in with)" "")"
   if [ -n "$email" ] && ! valid_owner_email "$email"; then die "owner: '$email' is not an e-mail address"; fi
-  [ -n "$email" ] || [ -z "${3:-}" ] || owner_can_ask \
-    || warn "owner '$id' has no e-mail recorded — the portal cannot match it against the signed-in account (memex-local owner --email <e-mail>)"
+  # The owner is an id AND an e-mail (the e-mail is what the portal matches the signed-in account against).
+  # Where an owner is required, so is the e-mail; elsewhere a missing one is a warning.
+  if [ -z "$email" ]; then
+    if [ "${3:-}" = "require" ] || { [ "${3:-}" = "require-fresh" ] && ! install_deployed; }; then
+      die "the owner '$id' has no e-mail — give --owner-email <e-mail> (or MEMEX_OWNER_EMAIL, or the managed preference OwnerEmail beside OwnerId), then re-run"
+    fi
+    warn "owner '$id' has no e-mail recorded — the portal cannot match it against the signed-in account (memex-local owner --email <e-mail>)"
+  fi
   [ "$have_id" = "$id" ] || { overlay_set_portal_config "$OWNER_KEY" "$id"; changed=1; }
   if [ -z "$email" ] && [ -n "$have_email" ] && [ -n "$have_id" ] && [ "$have_id" != "$id" ]; then
     overlay_set_portal_config "$OWNER_EMAIL_KEY" "" delete; changed=1
