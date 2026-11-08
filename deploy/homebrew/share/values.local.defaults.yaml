@@ -77,6 +77,16 @@ config:
     # This install runs on a Mac: the wizard's package step pre-checks the Mac-only packages
     # (Google, iMessage, WhatsApp) from InstanceSetup:HostPlatform; bound the same way.
     InstanceSetup__HostPlatform: "mac"
+    # ---- Local LLM: the Mac's own Ollama, at a Host Ollama ADMITS (LocalColimaMac.md §10) ----------
+    # 🚨 The in-cluster Service by its CLUSTER FQDN, never its short name. Ollama bound to the Mac's
+    # loopback answers 403 to any Host header that is not an IP, localhost, or a name ending in
+    # .localhost/.local/.internal — and `ollama:11434` is none of those, so every chat round on every
+    # install was refused until 2026-11-08. `…svc.cluster.local` ends in .local and is admitted; Ollama
+    # stays on loopback. The MODEL, its context window, the default chat tier and the Service's endpoint
+    # IP are per host — memex-local writes them into ~/.memex-local/llm.auto.yaml (layered next).
+    # memex-local's own constant OLLAMA_ENDPOINT carries the same value; its test pins the two together.
+    OpenAICompatible__Endpoint: "http://ollama.memex.svc.cluster.local:11434/v1"
+    OpenAICompatible__DiscoverModels: "false"
 
 # ---- Portal Ingress: the TLS Secret is minted by `memex-local up`, not issued -------------------
 # The chart refuses an ingress that names a `tlsSecret` with no issuer reaching it (an ingress
@@ -96,3 +106,13 @@ ingress:
   # (maintainer, 2026-10-30: "we must bring spinner and stuff while it is booting").
   bootPage:
     enabled: true
+
+# ---- External Ollama, fronted by an in-cluster Service (LocalColimaMac.md §10) -------------------
+# The Endpoints IP (`host`) is the Colima VM's gateway to the Mac, resolved per install by memex-local
+# (llm_host_ip → llm.auto.yaml, which wins over this line): Colima's gateway can differ between installs.
+# The value here is only Colima's usual gateway, for a render that has no per-install layer.
+ollama:
+  external:
+    enabled: true
+    host: "192.168.5.2"
+    port: 11434

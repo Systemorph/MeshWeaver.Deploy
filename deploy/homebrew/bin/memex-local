@@ -43,24 +43,46 @@ readonly HOST_PORT="${MEMEX_PORT:-8443}"        # unprivileged host port (§6/§
 # explicit MEMEX_COLIMA_CPU / MEMEX_COLIMA_MEM / MEMEX_OLLAMA_MODEL always wins. Unset = the
 # developer-laptop defaults this file always had. An unknown profile is refused by check_profile
 # (preflight), never silently read as the default.
-#   mac-studio  VM 12 CPU / 32 GiB, qwen3.6 (~23 GB) + qwen3.8:27b-mlx (~18 GB) — a host with >= 64 GB unified memory
-#   mac-mini    VM  6 CPU / 12 GiB, qwen3:8b (~5 GB)   — a host with >= 24 GB unified memory
-# The EXTRA models are pulled beside the chat model, unaliased: they are what a Mac Studio can OFFER the fleet's
-# token queue (MeshWeaver.Plugins Hosting/BackLease §14) — pulled is not offered; the owner opts in (§13,
-# `memex-local backlease accept tokens`). MEMEX_OLLAMA_EXTRA_MODELS overrides the list; `none` pulls none.
+#   mac-studio  VM 12 CPU / 32 GiB, qwen3.8:27b-mlx (~18 GB) — a host with >= 64 GB unified memory
+#   mac-mini    VM  6 CPU / 12 GiB, qwen3:8b (~5 GB)          — a host with >= 24 GB unified memory
+#   (unset)     VM  8 CPU / 16 GiB, the model is chosen from the host's memory (host_default_model)
+# EXTRA models are pulled beside the chat model, unaliased: what a Mac can OFFER the fleet's token queue
+# (MeshWeaver.Plugins Hosting/BackLease §14) — pulled is not offered; the owner opts in (§13, `memex-local
+# backlease accept tokens`). A Mac Studio's chat model IS qwen3.8 since 2026-11-08, so it needs none extra.
+# MEMEX_OLLAMA_EXTRA_MODELS sets the list; `none` pulls none.
 case "${MEMEX_PROFILE:-}" in
-  mac-studio) _PROFILE_CPU=12; _PROFILE_MEM=32; _PROFILE_MODEL="qwen3.6"; _PROFILE_EXTRA_MODELS="qwen3.8:27b-mlx" ;;
+  mac-studio) _PROFILE_CPU=12; _PROFILE_MEM=32; _PROFILE_MODEL="qwen3.8:27b-mlx"; _PROFILE_EXTRA_MODELS="" ;;
   mac-mini)   _PROFILE_CPU=6;  _PROFILE_MEM=12; _PROFILE_MODEL="qwen3:8b"; _PROFILE_EXTRA_MODELS="" ;;
-  *)          _PROFILE_CPU=8;  _PROFILE_MEM=16; _PROFILE_MODEL="qwen3.6"; _PROFILE_EXTRA_MODELS="" ;;
+  *)          _PROFILE_CPU=8;  _PROFILE_MEM=16; _PROFILE_MODEL=""; _PROFILE_EXTRA_MODELS="" ;;
 esac
 readonly HOST_PROFILE="${MEMEX_PROFILE:-}"
 readonly COLIMA_CPU="${MEMEX_COLIMA_CPU:-$_PROFILE_CPU}"    # VM sizing (§2)
 readonly COLIMA_MEM="${MEMEX_COLIMA_MEM:-$_PROFILE_MEM}"    # VM sizing (§2)
-# The model `up` pulls and aliases as `qwen3.6-code` — the id the portal's OpenAICompatible__Models__0
-# names (share/values.local.yaml). qwen3.6 is ~23 GB and needs a host with RAM to spare beside the VM
-# (§2 "Host sizing"); a smaller host sets a smaller tool-capable model, or `none` to skip the pull
-# entirely (#6024). The small e2e model (qwen-small) is always pulled — it is ~400 MB.
-readonly OLLAMA_MODEL="${MEMEX_OLLAMA_MODEL:-$_PROFILE_MODEL}"
+# THE DEFAULT CHAT MODEL (maintainer, 2026-11-08: "by default configure to their own ollama and qwen 3.8").
+# qwen3.8:27b-mlx is ~18 GB of weights and runs on Ollama's MLX engine, so it needs Apple Silicon and room
+# beside the VM: at least DEFAULT_MODEL_HEADROOM_GIB of unified memory left after the VM's share (weights +
+# KV cache + macOS). Measured on a 128 GB Mac Studio. Below that, or on an Intel Mac, the fallback is
+# qwen3:8b (~5 GB, tool-capable). With the default 16 GiB VM that puts the line at a 48 GB Mac.
+# MEMEX_HOST_MEM_GIB overrides the probe (tests; a host that must reserve memory for something else).
+readonly DEFAULT_CHAT_MODEL="qwen3.8:27b-mlx"
+readonly FALLBACK_CHAT_MODEL="qwen3:8b"
+readonly DEFAULT_MODEL_HEADROOM_GIB=32
+# The Ollama release that first runs qwen3.8's MLX build (`ollama show qwen3.8:27b-mlx` → requires 0.32.12).
+readonly DEFAULT_MODEL_MIN_OLLAMA="0.32.12"
+host_default_model() {
+  local gib="${MEMEX_HOST_MEM_GIB:-}" arch="${MEMEX_HOST_ARCH:-$(uname -m 2>/dev/null)}"
+  [ -n "$gib" ] || gib=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
+  if [ "$arch" = "arm64" ] && [ $(( gib - COLIMA_MEM )) -ge "$DEFAULT_MODEL_HEADROOM_GIB" ]; then
+    printf '%s' "$DEFAULT_CHAT_MODEL"
+  else
+    printf '%s' "$FALLBACK_CHAT_MODEL"
+  fi
+}
+# The model `up` pulls and the portal names as OpenAICompatible__Models__0 and its default chat model
+# (the per-install layer $LLM_AUTO_FILE, written by write_llm_auto_layer). An explicit MEMEX_OLLAMA_MODEL
+# wins over the profile and the host probe; `none` skips the pull entirely (#6024). The small e2e model
+# (qwen-small) is always pulled — it is ~400 MB.
+readonly OLLAMA_MODEL="${MEMEX_OLLAMA_MODEL:-${_PROFILE_MODEL:-$(host_default_model)}}"
 readonly OLLAMA_EXTRA_MODELS="${MEMEX_OLLAMA_EXTRA_MODELS-$_PROFILE_EXTRA_MODELS}"
 # The chart's portal/migration containers hardcode these image refs with
 # imagePullPolicy: IfNotPresent (deploy/helm/.../deployment.yaml). Both the
@@ -138,11 +160,32 @@ readonly REGISTRY_FILE="$LOCAL_HOME/registry.yaml"
 readonly BACKLEASE_FILE="$LOCAL_HOME/backlease.yaml"
 # -- LOCAL MODEL: the Mac's own Ollama serves the portal's AI (`memex-local llm use|status|off`) --
 # One values layer, after back-lease and before the overlay: the OpenAICompatible provider pointed at
-# the host's Ollama BY IP (Ollama answers 403 to an in-cluster Service name: its Host-header allowlist
-# admits only loopback/IP/.local/.internal names for a non-loopback caller), the model named, its data
-# residency declared (a model whose residency is Unknown is never used for mail triage), and the
-# utility tier mapped to it (the tier the inbox triage, reply drafting and calendar suggestions ask).
+# the host's Ollama (OLLAMA_ENDPOINT, below), the model named, its data residency declared (a model whose
+# residency is Unknown is never used for mail triage), and the utility tier mapped to it (the tier the
+# inbox triage, reply drafting and calendar suggestions ask).
 readonly LLM_FILE="$LOCAL_HOME/llm.yaml"
+# ── THE HOST-SAFE OLLAMA ENDPOINT — why chat answered 403 on every install until 2026-11-08 ─────────────
+# Ollama bound to the Mac's loopback (the safe default: it has no authentication) checks the HOST header
+# of every request and answers 403 unless that host is an IP that is loopback/private, `localhost`, the
+# machine's own hostname, or a name ending in `.localhost`, `.local` or `.internal`. The portal used to call
+# http://ollama:11434/v1 — the in-cluster Service by its SHORT name — so every chat round reached Ollama
+# and was refused (`[OpenAIWire] HTTP 403 … endpoint=ollama`, then PROVIDER_KEY_FAILING … Forbidden).
+# The same Service by its cluster FQDN ends in `.local` and is admitted, with nothing about Ollama changed:
+# it stays on loopback, unreachable from the LAN or the private network. Measured on a Mac Studio (Ollama
+# 0.40.14): Host ollama:11434 → 403; Host ollama.memex.svc.cluster.local:11434 → 200. ollama_host_admitted
+# below states the rule; `memex-local doctor` re-measures it against the live Ollama, negative control
+# included, and llm_chat_smoke proves a real completion from inside the portal pod.
+readonly OLLAMA_ENDPOINT="http://ollama.${NAMESPACE}.svc.cluster.local:11434/v1"
+# What the overlay template shipped before that fix. An overlay line carrying EXACTLY one of these is
+# the old template, not an owner's choice, and migrate_overlay_llm removes it so the layers below rule.
+readonly STALE_OLLAMA_ENDPOINT="http://ollama:11434/v1"
+readonly STALE_OLLAMA_MODEL="qwen3.6-code"
+readonly STALE_OLLAMA_HOST_LINE='    host: "192.168.5.2"'
+# The PER-INSTALL local-model layer, regenerated by every helm_deploy (write_llm_auto_layer): the model
+# this host runs (Models__0), the window Ollama serves it with (ContextWindowTokens — the context-window
+# guard stays unarmed without it), the default chat tier, and the VM's gateway as the Service's endpoint.
+# Layered right after the tracked defaults, so every later layer and the owner's overlay still win.
+readonly LLM_AUTO_FILE="$LOCAL_HOME/llm.auto.yaml"
 # ── CERTIFICATES for the machine's private-network name (Let's Encrypt over DNS-01; `memex-local cert`) ──
 # dns01.env names the DNS zone and the identity allowed to write its challenge records (nothing secret);
 # dns01.secret is that identity's client secret (0600) — delivered by the enrolment channel, never typed into
@@ -1708,7 +1751,7 @@ cmd_fleet() {
       fi
       if [ "$do_update" = "yes" ] && colima_running; then
         setup_ollama
-        cmd_update
+        MEMEX_SKIP_OLLAMA=1 cmd_update
         if [ "$with_obs" = "yes" ]; then
           step "Observability (Grafana, Loki, Promtail, Prometheus — sized for the VM)"
           # A subshell: a die inside (preflight, helm) fails THIS step, loudly, and the join carries on.
@@ -1741,12 +1784,227 @@ cmd_fleet() {
   esac
 }
 
-llm_value() { awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$LLM_FILE" 2>/dev/null; }
+llm_value() { [ -f "$LLM_FILE" ] || return 0; awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$LLM_FILE" 2>/dev/null || true; }
 
 # The Colima VM's gateway to the host: where the Mac's own services answer (Ollama on :11434).
 llm_host_ip() {
   local ip; ip="$(colima ssh -- ip route 2>/dev/null | awk '$1 == "default" { print $3; exit }')"
   printf '%s' "${ip:-192.168.5.2}"
+}
+
+# Ollama's allowed-host rule for a listener on loopback (server/routes.go allowedHostsMiddleware), stated
+# so the endpoint memex-local configures is checked against it in CI: 0 when Ollama admits a request whose
+# Host header is $1 (host[:port]), 1 when it answers 403. `memex-local doctor` re-measures the live Ollama.
+ollama_host_admitted() {
+  local host
+  case "$1" in
+    \[*\]*) host="${1#[}"; host="${host%%]*}" ;;   # [v6]:port
+    *:*:*)  host="$1" ;;                          # a bare IPv6 literal carries no port
+    *)      host="${1%:*}" ;;                     # host[:port]
+  esac
+  host="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
+  case "$host" in
+    ''|localhost|*.localhost|*.local|*.internal) return 0 ;;
+    127.*|10.*|192.168.*|0.0.0.0|::1|::) return 0 ;;
+  esac
+  if printf '%s' "$host" | grep -Eq '^172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+$'; then return 0; fi
+  local me; me="$(hostname 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  [ -n "$me" ] && [ "$host" = "$me" ] && return 0
+  return 1
+}
+
+# host[:port] of an http(s) URL.
+url_hostport() { local u="${1#*://}"; printf '%s' "${u%%/*}"; }
+
+# The context window Ollama SERVES model $1 with, or nothing when it cannot be measured. Not the window the
+# weights were trained for (`ollama show` → 262144 for qwen3.8): Ollama loads a model at ITS default context,
+# which it sizes from the GPU memory it sees (measured on a 128 GB Mac Studio: "vram-based default context"
+# total_vram=107.5 GiB → 262144; a smaller Mac gets less) or from OLLAMA_CONTEXT_LENGTH. Declaring the
+# trained window on a Mac that serves less would arm the portal's guard ABOVE what the server accepts. So
+# the model is loaded (an empty generate loads it without generating) and the loaded context is read back
+# from /api/ps — the server's own answer. Never a table here.
+ollama_context_window() {
+  curl -fsS -m "${MEMEX_OLLAMA_LOAD_TIMEOUT:-300}" "http://127.0.0.1:11434/api/generate" \
+    -d "{\"model\":\"$1\",\"prompt\":\"\",\"keep_alive\":\"10m\"}" >/dev/null 2>&1 || return 0
+  local m="$1"; case "$m" in *:*) ;; *) m="$m:latest" ;; esac
+  # Tokens in document order (a model's nested `details` object carries no `name`), then the
+  # context_length that follows this model's name.
+  curl -fsS -m 10 "http://127.0.0.1:11434/api/ps" 2>/dev/null \
+    | grep -Eo '"name":"[^"]*"|"context_length":[0-9]+' \
+    | awk -v n="\"name\":\"$m\"" '$0 == n { hit = 1; next } /^"name"/ { hit = 0 } hit && /^"context_length"/ { sub(/.*:/, ""); print; exit }' || true
+}
+
+# 0 when Ollama on this Mac lists model $1 (a bare name matches its :latest tag).
+ollama_has_model() {
+  local m="$1"; case "$m" in *:*) ;; *) m="$m:latest" ;; esac
+  curl -fsS -m 10 "http://127.0.0.1:11434/api/tags" 2>/dev/null | grep -Fq "\"name\":\"$m\""
+}
+
+# The value of config key $1 in the owner's overlay (first match, quotes stripped), or nothing.
+overlay_value() { [ -f "$OVERLAY" ] || return 0; awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$OVERLAY" 2>/dev/null || true; }
+
+# The overlay lines the template shipped before the host-safe endpoint (see OLLAMA_ENDPOINT). An overlay is
+# generated ONCE and always wins, so without this an existing install keeps the 403 endpoint forever, the
+# tracked defaults notwithstanding. Only an EXACT stale line is removed — an endpoint, model or host the
+# owner wrote stays and wins. A copy is kept beside the overlay.
+migrate_overlay_llm() {
+  [ -f "$OVERLAY" ] || return 0
+  local tmp; tmp="$(mktemp "${OVERLAY}.XXXXXX")" || return 0
+  awk -v e="    OpenAICompatible__Endpoint: \"$STALE_OLLAMA_ENDPOINT\"" \
+      -v m="    OpenAICompatible__Models__0: \"$STALE_OLLAMA_MODEL\"" \
+      -v h="$STALE_OLLAMA_HOST_LINE" \
+      '$0 == e || $0 == m || $0 == h { next } { print }' "$OVERLAY" > "$tmp" \
+    || { rm -f "$tmp"; warn "overlay: could not rewrite $OVERLAY (left unchanged) — remove a stale 'OpenAICompatible__Endpoint: \"$STALE_OLLAMA_ENDPOINT\"' line by hand"; return 0; }
+  # A rewrite that lost more than the three stale lines is not a migration: keep the overlay as it was.
+  if [ $(( $(wc -l < "$OVERLAY") - $(wc -l < "$tmp") )) -gt 3 ] || [ ! -s "$tmp" ]; then
+    rm -f "$tmp"; warn "overlay: the rewrite of $OVERLAY came out short — left unchanged"; return 0
+  fi
+  if cmp -s "$OVERLAY" "$tmp"; then rm -f "$tmp"; return 0; fi
+  cp -p "$OVERLAY" "${OVERLAY}.bak-llm"
+  chmod 600 "$tmp"; mv "$tmp" "$OVERLAY"
+  ok "overlay: removed the pre-2026-11-08 local-model lines (the 403 endpoint http://ollama:11434/v1, the old default model, the fixed gateway) — the tracked defaults and $LLM_AUTO_FILE answer them now (copy: ${OVERLAY}.bak-llm)"
+}
+
+# The chat model this install runs: the owner's explicit choice first (the overlay, then `llm use`), else
+# the host default (OLLAMA_MODEL). Never empty unless OLLAMA_MODEL is `none` and nobody chose one.
+effective_chat_model() {
+  local m; m="$(overlay_value OpenAICompatible__Models__0)"
+  [ -n "$m" ] || m="$(llm_value OpenAICompatible__Models__0)"
+  if [ -z "$m" ] && [ "$OLLAMA_MODEL" != "none" ]; then
+    m="$OLLAMA_MODEL"
+    # ensure_chat_model fell back (an Ollama too old for the MLX default): name what this host can run.
+    # The default is not in Ollama (an Ollama too old for the MLX build, or a pull that failed): name a
+    # model this Ollama HAS rather than one every chat would answer 404 for — the fallback, else the
+    # model an older install already ran (qwen3.6-code). ensure_chat_model said why, loudly.
+    if [ -z "${MEMEX_OLLAMA_MODEL:-}" ] && ! ollama_has_model "$m" \
+        && curl -fsS -m 5 "http://127.0.0.1:11434/api/version" >/dev/null 2>&1; then
+      if ollama_has_model "$FALLBACK_CHAT_MODEL"; then m="$FALLBACK_CHAT_MODEL"
+      elif ollama_has_model "$STALE_OLLAMA_MODEL"; then m="$STALE_OLLAMA_MODEL"; fi
+    fi
+  fi
+  printf '%s' "$m"
+}
+
+# Writes $LLM_AUTO_FILE (see its constant). Models__1 keeps the old default alias (qwen3.6-code) when this
+# Ollama still has it, so an upgrade loses no model a thread may already name.
+write_llm_auto_layer() {
+  local model gw second="" w0="" w1=""
+  model="$(effective_chat_model)"
+  gw="$(llm_host_ip)"
+  mkdir -p "$LOCAL_HOME"
+  if [ -n "$model" ] && [ "$model" != "$STALE_OLLAMA_MODEL" ] && ollama_has_model "$STALE_OLLAMA_MODEL"; then
+    second="$STALE_OLLAMA_MODEL"
+  fi
+  [ -n "$model" ] && w0="$(ollama_context_window "$model")"
+  [ -n "$second" ] && w1="$(ollama_context_window "$second")"
+  {
+    echo "# memex-local PER-INSTALL local-model layer -- regenerated by every 'memex-local up/update'; do not edit."
+    echo "# Override any key in $OVERLAY (it wins). Endpoint: share/values.local.defaults.yaml (OLLAMA_ENDPOINT)."
+    # 🚨 `config.memex_portal:` is written ONLY with keys under it: an empty one is a YAML null, and
+    # helm merges a null over a map by DELETING it — every tracked default would vanish from the render.
+    if [ -n "$model" ]; then
+      echo "config:"
+      echo "  memex_portal:"
+      echo "    OpenAICompatible__Models__0: \"$model\""
+      echo "    AI__Tiers__chat: \"Provider/OpenAICompatible/$model\""
+      if [ -n "$w0" ]; then
+        echo "    OpenAICompatible__ContextWindowTokens__0__Model: \"$model\""
+        echo "    OpenAICompatible__ContextWindowTokens__0__Tokens: \"$w0\""
+      fi
+    fi
+    if [ -n "$second" ]; then
+      echo "    OpenAICompatible__Models__1: \"$second\""
+      if [ -n "$w1" ]; then
+        echo "    OpenAICompatible__ContextWindowTokens__1__Model: \"$second\""
+        echo "    OpenAICompatible__ContextWindowTokens__1__Tokens: \"$w1\""
+      fi
+    fi
+    echo "ollama:"
+    echo "  external:"
+    echo "    host: \"$gw\""
+  } > "$LLM_AUTO_FILE"
+  if [ -z "$model" ]; then
+    info "LOCAL MODEL: none chosen (MEMEX_OLLAMA_MODEL=none) — the portal names no Ollama chat model"
+  elif [ -n "$w0" ]; then
+    info "LOCAL MODEL: default chat model $model (context window ${w0} tokens, as Ollama serves it)${second:+, plus $second}; Ollama at $gw via $OLLAMA_ENDPOINT"
+  else
+    warn "LOCAL MODEL: Ollama did not load $model, so its context window stays undeclared until the next update (ollama pull $model; is Ollama running?)"
+  fi
+}
+
+# A REAL chat completion from INSIDE the portal pod, through the endpoint, model and key the portal itself
+# was configured with (read from the pod's environment — the key never leaves the pod). 0 on HTTP 200;
+# otherwise names the status and its cause and returns 1. A 403 is Ollama's Host-header check
+# (see OLLAMA_ENDPOINT). `up`, `update` and `fleet join` fail on it; `status`/`doctor` report it.
+llm_chat_smoke() {
+  local envs endpoint model out code
+  # One read of the pod's environment. An exec that FAILS (no ready pod) is not "nothing configured":
+  # it is a smoke that could not run, and it fails — a skipped check must never read as a pass.
+  if ! envs="$(kubectl -n "$NAMESPACE" exec deploy/memex-portal-deployment -c memex-portal -- env 2>/dev/null)"; then
+    warn "chat smoke: could not read the portal pod's environment (is the portal running? 'memex-local status')"
+    return 1
+  fi
+  endpoint="$(printf '%s\n' "$envs" | sed -n 's/^OpenAICompatible__Endpoint=//p' | head -1)"
+  model="$(printf '%s\n' "$envs" | sed -n 's/^OpenAICompatible__Models__0=//p' | head -1)"
+  if [ -z "$endpoint" ] || [ -z "$model" ]; then
+    # A fair skip ONLY when this install chose no model. Configured here but invisible in the pod (a
+    # chart that stopped mapping the key, an overlay that blanks it) is a failure, never a vacuous pass.
+    local want; want="$(effective_chat_model)"
+    if [ -n "$want" ]; then
+      warn "chat smoke: this install configures the local model '$want', but the portal pod carries no OpenAICompatible__Endpoint/__Models__0 (endpoint='${endpoint}', model='${model}') — check the ConfigMap memex-portal-config and $OVERLAY"
+      return 1
+    fi
+    warn "local model: none chosen (MEMEX_OLLAMA_MODEL=none) and the portal names none — chat smoke skipped"
+    return 0
+  fi
+  step "Chat smoke: a real completion from inside the portal pod ($model at $endpoint)"
+  out="$(kubectl -n "$NAMESPACE" exec deploy/memex-portal-deployment -c memex-portal -- sh -c '
+    m="$1"
+    code="$(curl -sS -o /tmp/memex-llm-smoke.json -w "%{http_code}" -m "${2:-600}" \
+      -H "Authorization: Bearer ${OpenAICompatible__ApiKey:-ollama}" -H "Content-Type: application/json" \
+      -d "{\"model\":\"$m\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word OK.\"}],\"max_tokens\":256,\"stream\":false}" \
+      "${OpenAICompatible__Endpoint%/}/chat/completions" 2>/dev/null)"; rc=$?
+    printf "%s %s\n" "${code:-000}" "$rc"; head -c 300 /tmp/memex-llm-smoke.json 2>/dev/null; rm -f /tmp/memex-llm-smoke.json' \
+    _ "$model" "${MEMEX_LLM_SMOKE_TIMEOUT:-600}" 2>&1)" || true
+  local first rc body
+  first="$(printf '%s\n' "$out" | head -1)"
+  code="${first%% *}"; rc="${first#* }"; [ "$rc" = "$first" ] && rc=""
+  body="$(printf '%s\n' "$out" | sed -n '2,$p')"
+  # 200 is not enough on its own: curl must have finished the transfer (a timeout mid-body still
+  # reports the status line it got) and the answer must be a chat completion.
+  if [ "$code" = "200" ] && { [ "$rc" != "0" ] || ! grep -q '"choices"' <<<"$body"; }; then
+    warn "chat smoke: HTTP 200 but the answer is incomplete (curl exit ${rc:-?}; no \"choices\" in: $(printf '%s' "$body" | tr '\n' ' ' | cut -c1-160))"
+    return 1
+  fi
+  case "$code" in
+    200) ok "chat smoke: HTTP 200 from $model through $endpoint (inside the portal pod)"; return 0 ;;
+    403) warn "chat smoke: HTTP 403 from $endpoint — Ollama refused the Host header '$(url_hostport "$endpoint")'. Ollama on loopback admits only IP/localhost/*.local/*.internal hosts; the portal must use $OLLAMA_ENDPOINT. Remove the OpenAICompatible__Endpoint line from $OVERLAY (or fix it) and run 'memex-local update --skip-image'" ;;
+    404) warn "chat smoke: HTTP 404 — Ollama does not have model '$model' (ollama pull $model on this Mac, then 'memex-local update --skip-image')" ;;
+    000) warn "chat smoke: no answer from $endpoint inside the pod (Ollama down? 'ollama serve' / 'brew services start ollama'; the VM reaches it at $(llm_host_ip):11434)" ;;
+    *)   warn "chat smoke: HTTP $code from $endpoint for $model: $(printf '%s' "$body" | tr '\n' ' ' | cut -c1-200)" ;;
+  esac
+  return 1
+}
+
+# `up`/`update`/`fleet join`: the smoke is a GATE. MEMEX_LLM_SMOKE=0 skips it (a host deliberately without
+# a local model), loudly.
+llm_chat_smoke_or_die() {
+  if [ "${MEMEX_LLM_SMOKE:-1}" = "0" ]; then warn "MEMEX_LLM_SMOKE=0 — the chat smoke is SKIPPED; nothing proves the portal's chat answers"; return 0; fi
+  llm_chat_smoke || die "the portal's chat does NOT answer through its local model — see the line above (it names the cause and the fix); re-check with 'memex-local doctor'"
+}
+
+# `doctor`: re-measure Ollama's Host-header rule on THIS Mac — the configured endpoint's host must be
+# admitted and, as the negative control that proves the probe can fail, the bare Service name refused.
+llm_host_probe() {
+  curl -fsS -m 5 "http://127.0.0.1:11434/api/version" >/dev/null 2>&1 || { warn "Ollama is not answering on 127.0.0.1:11434"; return 1; }
+  local good bad cg cb
+  good="$(url_hostport "$OLLAMA_ENDPOINT")"; bad="ollama:11434"
+  cg="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -H "Host: $good" http://127.0.0.1:11434/v1/models 2>/dev/null)"
+  cb="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -H "Host: $bad" http://127.0.0.1:11434/v1/models 2>/dev/null)"
+  if [ "$cg" = "200" ]; then ok "Ollama admits Host '$good' (HTTP 200) — the portal's endpoint"
+  else warn "Ollama answers HTTP $cg to Host '$good' — the portal's chat will fail"; return 1; fi
+  if [ "$cb" = "403" ]; then ok "negative control: Ollama refuses Host '$bad' (HTTP 403), as its loopback rule says"
+  else info "negative control: Ollama answered HTTP $cb to Host '$bad' (403 expected on a loopback-bound Ollama; a LAN-wide bind admits every host)"; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1756,7 +2014,7 @@ cmd_llm() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
     use)
-      local model="qwen3.6" residency="Eu" host="" port="11434"
+      local model; model="$(effective_chat_model)"; local residency="Eu" host="" port="11434"
       while [ $# -gt 0 ]; do
         case "$1" in
           --model)     shift; model="${1:?--model needs an Ollama model name}" ;;
@@ -1769,27 +2027,31 @@ cmd_llm() {
       done
       case "$residency" in Eu|Global) ;; *) die "llm use: --residency must be Eu or Global (this Mac's own model never leaves it; Eu is right for a Mac in the EU)" ;; esac
       case "$model" in ''|*[!A-Za-z0-9._:/-]*) die "llm use: --model '$model' is not a valid Ollama model name" ;; esac
-      [ -n "$host" ] || host="$(llm_host_ip)"
       curl -fsS -m 5 "http://127.0.0.1:${port}/v1/models" 2>/dev/null | grep -q -E "\"id\":\"${model}(:[^\"]*)?\"" \
         || die "llm use: Ollama on this Mac does not list '$model' (ollama pull $model; is 'ollama serve' running on :${port}?)"
+      local endpoint="$OLLAMA_ENDPOINT"
+      [ -n "$host" ] && endpoint="http://${host}:${port}/v1"
+      if [ -n "$host" ] && ! ollama_host_admitted "${host}:${port}"; then
+        die "llm use: Ollama on loopback answers 403 to Host '${host}' — give an IP or a name ending in .local/.internal, or leave --host out"
+      fi
       mkdir -p "$LOCAL_HOME"
       ( umask 077; cat > "$LLM_FILE" ) <<YAML
 # memex-local LOCAL MODEL -- managed by \`memex-local llm\`; re-run \`use\` to change, \`off\` to delete.
-# Layered by helm_deploy after the back-lease file and before the overlay. The host is addressed BY IP:
-# Ollama answers 403 to a Host header it does not know ("ollama:11434" from the in-cluster Service).
+# Layered by helm_deploy after the back-lease file and before the overlay. The endpoint is the host-safe
+# one: Ollama answers 403 to a Host header it does not admit ("ollama:11434", the Service's short name).
 config:
   memex_portal:
     Features__Ai__Providers__OpenAICompatible: "true"
-    OpenAICompatible__Endpoint: "http://${host}:${port}/v1"
+    OpenAICompatible__Endpoint: "${endpoint}"
     OpenAICompatible__DiscoverModels: "false"
     OpenAICompatible__Models__0: "${model}"
     OpenAICompatible__DataResidency: "${residency}"
     ModelTier__Utility: "Provider/OpenAICompatible/${model}"
   memex_migration:
-    Embedding__Endpoint: "http://${host}:${port}/v1"
+    Embedding__Endpoint: "${endpoint}"
 YAML
       chmod 600 "$LLM_FILE"
-      ok "local model layer written: $LLM_FILE (utility tier -> ${model}, residency ${residency}, http://${host}:${port}/v1)"
+      ok "local model layer written: $LLM_FILE (utility tier -> ${model}, residency ${residency}, ${endpoint})"
       info "the provider key is the placeholder OpenAICompatible__ApiKey in the overlay secrets (Ollama reads none, the factory refuses an empty one)"
       info "Apply it: memex-local update"
       ;;
@@ -1804,7 +2066,7 @@ YAML
           warn "the portal pod does NOT reach ${endpoint} (Ollama down, or bound to loopback only? it must listen on *:11434)"
         fi
       else
-        info "local model is OFF -- enable it with:  memex-local llm use [--model qwen3.6] [--residency Eu]"
+        info "the llm layer is OFF -- the default local chat model still serves (llm.auto.yaml); map the utility tier too with:  memex-local llm use [--model qwen3.8:27b-mlx] [--residency Eu]"
       fi
       ;;
     off)
@@ -2340,9 +2602,15 @@ helm_deploy() {
   # wins). That last layer is also the supported escape hatch: someone AUTHORING NodeTypes
   # locally, who therefore has no CI bake to adopt, sets PreWarm__DynamicTypes: "true" in the
   # overlay and gets the compiling startup bake back.
+  # The LOCAL MODEL, before anything is rendered: the stale template lines leave the overlay (they would
+  # outrank the host-safe endpoint), then the per-install layer names this host's model, its window, the
+  # default chat tier and the VM's gateway — right after the tracked defaults, so every later layer wins.
+  migrate_overlay_llm
+  write_llm_auto_layer
   helm upgrade --install "$RELEASE" "$chart" \
     -f "$chart/values.yaml" \
     -f "$share_dir/values.local.defaults.yaml" \
+    -f "$LLM_AUTO_FILE" \
     ${mode_args[@]+"${mode_args[@]}"} \
     -f "$OVERLAY" \
     ${internal_args[@]+"${internal_args[@]}"} \
@@ -2395,10 +2663,14 @@ apply_logging() {
 }
 
 # ---------------------------------------------------------------------------
-# §10 — host-native Ollama wired into the cluster by name (ollama:11434)
+# §10 — host-native Ollama wired into the cluster by its host-safe name (OLLAMA_ENDPOINT)
 # ---------------------------------------------------------------------------
-# A launchd login agent running `ollama serve` with OLLAMA_HOST=0.0.0.0:11434: it starts at login and
-# restarts on exit, which the nohup'd process it replaces never did (a rebooted Mac had no model).
+# Ollama's tuning for the Mac's unified memory, the same two settings Homebrew's own `ollama` service
+# carries: flash attention, and an 8-bit KV cache (half the memory of f16 per token of context).
+readonly OLLAMA_TUNING_ENV=(OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0)
+# A launchd login agent running `ollama serve` (bound to loopback unless it must not be): it starts at
+# login and restarts on exit, which the nohup'd process it replaces never did (a rebooted Mac had no model).
+# The FALLBACK — `brew services start ollama` is preferred (start_ollama).
 install_ollama_agent() {                 # $1 = bind address (default 127.0.0.1 — never LAN-wide unless it must be)
   local bin; bin="$(command -v ollama)" || die "ollama is not on PATH — brew install ollama"
   mkdir -p "$HOME/Library/LaunchAgents" "$LOCAL_HOME"
@@ -2409,7 +2681,7 @@ install_ollama_agent() {                 # $1 = bind address (default 127.0.0.1 
 <dict>
   <key>Label</key><string>${OLLAMA_PLIST_LABEL}</string>
   <key>ProgramArguments</key><array><string>${bin}</string><string>serve</string></array>
-  <key>EnvironmentVariables</key><dict><key>OLLAMA_HOST</key><string>${1:-127.0.0.1}:11434</string></dict>
+  <key>EnvironmentVariables</key><dict><key>OLLAMA_HOST</key><string>${1:-127.0.0.1}:11434</string><key>OLLAMA_FLASH_ATTENTION</key><string>1</string><key>OLLAMA_KV_CACHE_TYPE</key><string>q8_0</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>${LOCAL_HOME}/ollama.log</string>
@@ -2457,14 +2729,54 @@ ollama_listens_lan() {
   grep -Eqv '^(127\.0\.0\.1|\[::1\]|localhost):11434$' <<<"$names"
 }
 
+# Starts Ollama on the Mac's loopback: Homebrew's service first (it binds 127.0.0.1 and carries the tuning
+# env), memex-local's own agent when that is not available (no brew, or no GUI session for brew services).
+start_ollama() {
+  if command -v brew >/dev/null 2>&1 && brew list --formula ollama >/dev/null 2>&1 \
+      && brew services start ollama >/dev/null 2>&1 && ollama_wait_ready; then
+    ok "Ollama started as Homebrew's service (loopback 127.0.0.1:11434, ${OLLAMA_TUNING_ENV[*]})"
+    return 0
+  fi
+  info "Starting 'ollama serve' under launchd ($OLLAMA_PLIST_LABEL), bound to the Mac's loopback (127.0.0.1:11434), ${OLLAMA_TUNING_ENV[*]}"
+  install_ollama_agent 127.0.0.1
+  ollama_wait_ready || die "ollama did not become ready on :11434"
+}
+
+# 0 when version $1 >= version $2 (dotted numerics).
+version_ge() {
+  [ "$(printf '%s\n%s\n' "$2" "$1" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)" = "$2" ]
+}
+
+# The running Ollama's version (the server's own answer), or nothing.
+ollama_server_version() {
+  curl -fsS -m 5 "http://127.0.0.1:11434/api/version" 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+}
+
+# Reports whether the RUNNING server carries the tuning env (read from the process, not from a plist).
+ollama_tuning_report() {
+  local pid envs e missing=""
+  pid="$(lsof -nP -t -iTCP:11434 -sTCP:LISTEN 2>/dev/null | head -1)" || pid=""
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  envs="$(ps -E -o command= -p "$pid" 2>/dev/null | tr ' ' '\n')" || envs=""
+  [ -n "$envs" ] || return 0
+  for e in ${OLLAMA_TUNING_ENV[@]+"${OLLAMA_TUNING_ENV[@]}"}; do grep -qx "$e" <<<"$envs" || missing="$missing $e"; done
+  if [ -z "$missing" ]; then ok "Ollama runs with ${OLLAMA_TUNING_ENV[*]}"
+  else info "Ollama runs WITHOUT${missing} — 'brew services restart ollama' (Homebrew's service sets them) or restart memex-local's agent with 'memex-local up --skip-image'"; fi
+}
+
 setup_ollama() {
-  step "Wiring host-native Ollama (Metal GPU) — model ${OLLAMA_MODEL} as qwen3.6-code (§10)"
+  step "Wiring host-native Ollama (Metal GPU) — default chat model ${OLLAMA_MODEL} (§10)"
   if ! curl -fsS "http://127.0.0.1:11434/api/version" >/dev/null 2>&1; then
-    info "Starting 'ollama serve' under launchd ($OLLAMA_PLIST_LABEL), bound to the Mac's loopback (127.0.0.1:11434)"
-    install_ollama_agent 127.0.0.1
-    ollama_wait_ready || die "ollama did not become ready on :11434"
+    start_ollama
   else
     info "ollama already serving on :11434"
+    # memex-local's own agent written before the tuning env existed: rewrite it (same bind) and restart.
+    if [ -f "$OLLAMA_PLIST_DST" ] && ! grep -q 'OLLAMA_KV_CACHE_TYPE' "$OLLAMA_PLIST_DST" 2>/dev/null; then
+      local bind; bind="$(grep -Eo '<string>[0-9.]+:11434</string>' "$OLLAMA_PLIST_DST" | head -1 | sed -E 's#<string>([0-9.]+):11434</string>#\1#')" || bind=""
+      info "memex-local's Ollama agent predates the tuning (${OLLAMA_TUNING_ENV[*]}) — rewriting it and restarting Ollama"
+      install_ollama_agent "${bind:-127.0.0.1}"
+      ollama_wait_ready || warn "ollama did not come back on :11434 after the tuning restart"
+    fi
     # An Ollama that is ALREADY running is not trusted to be on loopback: an earlier memex-local bound
     # every interface, and a hand-started or brew-services Ollama may carry OLLAMA_HOST=0.0.0.0.
     if ollama_listens_lan; then
@@ -2481,25 +2793,60 @@ setup_ollama() {
     fi
   fi
   ollama_vm_reach || true
-  if [ "$OLLAMA_MODEL" = "none" ]; then
-    info "MEMEX_OLLAMA_MODEL=none — not pulling a chat model; the portal's qwen3.6-code will not answer until you alias one"
-  else
-    ollama pull "$OLLAMA_MODEL"
-    ollama cp "$OLLAMA_MODEL" qwen3.6-code 2>/dev/null || info "model alias qwen3.6-code already exists"
-  fi
-  # The profile's EXTRA models (a Mac Studio: qwen3.8:27b-mlx) — what the machine CAN offer the fleet's token
-  # queue. Pulled, never offered: serving them is the owner's opt-in (`memex-local backlease accept tokens`).
+  ollama_tuning_report
+  ensure_chat_model
+  # EXTRA models (MEMEX_OLLAMA_EXTRA_MODELS) — what the machine CAN offer the fleet's token queue. Pulled,
+  # never offered: serving them is the owner's opt-in (`memex-local backlease accept tokens`).
   local extra
   if [ "$OLLAMA_EXTRA_MODELS" != "none" ]; then
     for extra in $OLLAMA_EXTRA_MODELS; do
+      ollama_has_model "$extra" && continue
       ollama pull "$extra" || warn "could not pull '$extra' — re-run 'memex-local up --skip-image' (or 'ollama pull $extra')"
     done
   fi
   # Small CPU-friendly model (~400MB) the e2e portal selects ('qwen-small' — see e2e_deploy), so
-  # a real chat round runs on any host/CI without the 23GB GPU qwen3.6.
-  ollama pull qwen2.5:0.5b
-  ollama cp qwen2.5:0.5b qwen-small 2>/dev/null || info "model alias qwen-small already exists"
-  ok "Ollama ready; portal addresses it as http://ollama:11434/v1"
+  # a real chat round runs on any host/CI without the GPU-sized default model.
+  # Pulled only when missing, and a failed pull is a warning: `update` runs this too, and an update on a
+  # Mac that is offline (or whose registry is down) must not abort over a model it already has.
+  if ! ollama_has_model qwen-small; then
+    if ollama pull qwen2.5:0.5b; then
+      ollama cp qwen2.5:0.5b qwen-small 2>/dev/null || info "model alias qwen-small already exists"
+    else
+      warn "ollama pull qwen2.5:0.5b failed — the e2e model is missing until the next update"
+    fi
+  fi
+  ok "Ollama ready; the portal addresses it as $OLLAMA_ENDPOINT (admitted by Ollama's Host check)"
+}
+
+# Pull the chat model this install runs (effective_chat_model: the owner's choice, else the host default)
+# when Ollama does not have it yet. Called by `up`, `fleet join` AND `update`, so an existing install gets
+# the new default on its next update — never re-pulled once present. An Ollama too old for the MLX
+# default is upgraded through Homebrew when it can be, else this host falls back to FALLBACK_CHAT_MODEL.
+ensure_chat_model() {
+  local model; model="$(effective_chat_model)"
+  if [ -z "$model" ]; then
+    info "MEMEX_OLLAMA_MODEL=none — not pulling a chat model; the portal names none until you choose one (memex-local llm use --model …)"
+    return 0
+  fi
+  if ollama_has_model "$model"; then info "chat model $model is already in Ollama"; return 0; fi
+  if [ "$model" = "$DEFAULT_CHAT_MODEL" ]; then
+    local v; v="$(ollama_server_version)"
+    if [ -n "$v" ] && ! version_ge "$v" "$DEFAULT_MODEL_MIN_OLLAMA"; then
+      warn "Ollama $v is older than $DEFAULT_CHAT_MODEL needs ($DEFAULT_MODEL_MIN_OLLAMA)"
+      if command -v brew >/dev/null 2>&1 && brew upgrade ollama >/dev/null 2>&1; then
+        brew services restart ollama >/dev/null 2>&1 || launchctl kickstart -k "gui/$(id -u)/${OLLAMA_PLIST_LABEL}" >/dev/null 2>&1 || true
+        ollama_wait_ready || true
+        v="$(ollama_server_version)"
+      fi
+      if [ -z "$v" ] || ! version_ge "$v" "$DEFAULT_MODEL_MIN_OLLAMA"; then
+        warn "Ollama is still ${v:-not answering} — this host runs $FALLBACK_CHAT_MODEL instead (set MEMEX_OLLAMA_MODEL to pin one)"
+        model="$FALLBACK_CHAT_MODEL"
+        ollama_has_model "$model" && return 0
+      fi
+    fi
+  fi
+  step "Pulling the chat model $model into Ollama (once; it stays in ~/.ollama)"
+  ollama pull "$model" || warn "ollama pull $model failed — the portal's chat model will not answer until it is pulled (ollama pull $model)"
 }
 
 # ---------------------------------------------------------------------------
@@ -3743,13 +4090,17 @@ cmd_up() {
 
   install_ingress_nginx                           # §5
   setup_tls                                       # §5
+  # §10 BEFORE the deploy: the chat model is pulled first, so the deploy names it with the context window
+  # Ollama reports for it (write_llm_auto_layer reads it from the model) and the smoke below can answer.
+  setup_ollama                                    # §10
   helm_deploy                                     # §4
   apply_logging                                   # full logging override
-  setup_ollama                                    # §10
 
   step "Waiting for the portal rollout (§4)"
   kubectl rollout status deploy/memex-portal-deployment -n "$NAMESPACE" --timeout=300s || \
     warn "portal rollout not complete — check 'memex-local logs' / 'memex-local status'"
+  # "Never 403": a real completion from inside the portal pod, through what the portal was configured with.
+  llm_chat_smoke_or_die
 
   install_launchd                                 # §7
   autoupdate_default                              # the CLI + chart follow the tap (default on a brew install)
@@ -3840,6 +4191,7 @@ cmd_status() {
   step "Health"
   # Diagnostic: report every check, never abort the rest of `status` on a red one.
   verify_usable || true
+  if colima_running; then llm_chat_smoke || true; fi
 }
 
 # The ONE calm line `up` and `update` print when verify_usable answered 2 ("still installing").
@@ -3948,7 +4300,7 @@ cmd_setup() {
     warn "  (could not read the generated Postgres password from $OVERLAY)"
   fi
   echo
-  info "Ollama is already running for you — for Embeddings paste http://ollama:11434/v1"
+  info "Ollama is already running for you — for Embeddings paste $OLLAMA_ENDPOINT"
   info "for semantic search. Without embeddings, SQLite can still find parts of stored text;"
   info "PostgreSQL matches node names, paths, descriptions and types. Page text also needs a content index."
 
@@ -4041,6 +4393,9 @@ cmd_update() {
   preflight
   colima_running || die "Colima is not running — run 'memex-local up' first"
   ensure_overlay                                 # reuse the existing overlay/secrets (idempotent)
+  # The local model follows the product on update too: Ollama started/tuned, the default chat model pulled
+  # once (an existing install gets qwen3.8 here), before helm_deploy names it.
+  if [ "${MEMEX_SKIP_OLLAMA:-}" != "1" ]; then setup_ollama; fi
 
   step "Rolling memex to a newer image ($image_source)"
   case "$image_source" in
@@ -4079,6 +4434,7 @@ cmd_update() {
   kubectl rollout restart deploy/memex-portal-deployment -n "$NAMESPACE"
   apply_logging
   kubectl rollout status deploy/memex-portal-deployment -n "$NAMESPACE" --timeout=300s
+  llm_chat_smoke_or_die
 
   # portal-next has the SAME unchanged-tag problem (:local + IfNotPresent): a rebuilt image never
   # reaches the running pod without a restart. Without this, /next silently serves the previous
@@ -4449,6 +4805,12 @@ cmd_doctor() {
   else
     warn "colima not running (run 'memex-local up')"
   fi
+  step "Local model (Ollama on this Mac — §10)"
+  llm_host_probe || true
+  ollama_tuning_report
+  if colima_running && kubectl -n "$NAMESPACE" get deploy/memex-portal-deployment >/dev/null 2>&1; then
+    llm_chat_smoke || warn "the portal's chat does NOT answer through its local model"
+  fi
 }
 
 cmd_help() {
@@ -4483,9 +4845,10 @@ COMMANDS:
                   at all (MeshWeaver#2417). Then run \`memex-local update\`. Raising
                   the plan is the registry admin's edit of this instance's grant.
                   \`off\` returns to serving a checkout (§16).
-  llm use [--model qwen3.6] [--residency Eu|Global] | status | off
-                  LOCAL MODEL: the Mac own Ollama serves the portal utility tier (inbox
-                  triage, reply drafts, calendar suggestions). Addressed by IP; apply with update.
+  llm use [--model qwen3.8:27b-mlx] [--residency Eu|Global] | status | off
+                  LOCAL MODEL: the Mac own Ollama also serves the portal utility tier (inbox
+                  triage, reply drafts, calendar suggestions); apply with update. The default
+                  chat model is the local one on every install (llm.auto.yaml, no command needed).
   fleet join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] | status
                   JOIN THIS MAC TO THE FLEET in one command (MeshWeaver.Plugins Hosting/MacStudioFleet
                   §2b): prints a link to the control instance's approval page with this Mac's key
@@ -4629,11 +4992,14 @@ ENV OVERRIDES:
   MEMEX_CHART_DIR      Explicit chart dir (defaults to \$MEMEX_REPO/deploy/helm).
   MEMEX_LOG_LEVEL      Verbose log level (default: Debug; use Trace for max).
   MEMEX_COLIMA_CPU / MEMEX_COLIMA_MEM   VM sizing (default 8 / 16). Host RAM needed: the VM
-                       size plus ~6 GB for macOS, plus the local model (qwen3.6 ~23 GB) —
+                       size plus ~6 GB for macOS, plus the local model (qwen3.8 ~18 GB) —
                        about 48 GB with the defaults. See LocalColimaMac §2 "Host sizing".
-  MEMEX_OLLAMA_MODEL   Ollama model 'up' pulls and aliases as qwen3.6-code (default
-                       qwen3.6, ~23 GB); 'none' skips the pull on a small host.
-  MEMEX_PROFILE        Mac host profile: mac-studio (VM 12/32, qwen3.6; >= 64 GB host) or
+  MEMEX_OLLAMA_MODEL   The default chat model 'up'/'update' pull and the portal names
+                       (default qwen3.8:27b-mlx on Apple Silicon with >= 32 GB beside the
+                       VM, else qwen3:8b); 'none' skips the pull on a small host.
+  MEMEX_LLM_SMOKE      0 skips the post-install chat smoke (a real completion from inside
+                       the portal pod; up/update fail on a 403 or any non-200 without it).
+  MEMEX_PROFILE        Mac host profile: mac-studio (VM 12/32, qwen3.8; >= 64 GB host) or
                        mac-mini (VM 6/12, qwen3:8b; >= 24 GB host). Sets defaults only;
                        the variables above still win. Doc/Architecture/ReleaseEditions.
   MEMEX_CHANNEL        Follow a release-channel label by default (up/update/autoroll),
