@@ -3403,6 +3403,13 @@ class SharedTree:
         self.repo = repo
         self.root = os.path.join(cache, SHARED_DIR, repo)
         self.gens = os.path.join(self.root, "gens")
+        # a generation's reader lock lives OUTSIDE the directory a collector deletes: an open of a lock inside it could
+        # recreate the file on a new inode mid-delete and admit a reader the collector's lock no longer excludes
+        self.locks = os.path.join(self.root, "locks")
+
+    def _lock_of(self, gen: str) -> str:
+        os.makedirs(self.locks, exist_ok=True)
+        return os.path.join(self.locks, os.path.basename(gen) + ".lock")
 
     def warm_of(self, gen: str) -> str:
         return os.path.join(gen, WARM_DIR, self.repo)
@@ -3431,14 +3438,20 @@ class SharedTree:
     def reader(self):
         """The current generation's warm tree, held against deletion while the block runs; None when none is published."""
         import fcntl
-        gen = self.current()
-        if gen is None:
-            yield None
-            return
-        fh = self._lock(os.path.join(gen, ".readers.lock"), fcntl.LOCK_SH)
+        fh, held = None, None
+        for _ in range(3):                       # a generation collected between the readlink and the lock: read again
+            gen = self.current()
+            if gen is None:
+                break
+            fh = self._lock(self._lock_of(gen), fcntl.LOCK_SH)
+            if fh is not None and os.path.isdir(gen) and os.path.isdir(self.warm_of(gen)):
+                held = gen
+                break
+            if fh is not None:
+                fh.close()
+                fh = None
         try:
-            # re-read after the lock: a generation retired between the readlink and the lock is never handed out
-            yield self.warm_of(gen) if fh is not None and os.path.isdir(gen) else None
+            yield self.warm_of(held) if held else None
         finally:
             if fh is not None:
                 fh.close()
@@ -3455,22 +3468,39 @@ class SharedTree:
             if fh is not None:
                 fh.close()
 
-    def stage(self) -> str:
-        """A new generation directory: a copy of the current one (its obj/, bin/ and git index carried), or empty."""
+    def stage(self, cancel: Optional[threading.Event] = None, deadline: Optional[float] = None) -> str:
+        """A new generation directory: a copy of the current one (its obj/, bin/ and git index carried), or empty. The
+        copy is bounded by `deadline` and stopped at once by `cancel` (a claim needs the host): the partial generation is
+        removed and Lost (cancel) or Refusal (deadline) raised — never a copy the claimed run has to wait out."""
         gen = os.path.join(self.gens, f"{time.time_ns():020d}-{os.getpid()}")
         cur = self.current()
-        if cur is not None:
-            r = subprocess.run(["cp", "-a", cur, gen], capture_output=True, text=True)
-            if r.returncode != 0:
-                shutil.rmtree(gen, ignore_errors=True)
-                raise Refusal(f"the shared tree's current generation could not be copied (exit {r.returncode}): {r.stderr.strip()[-200:]}")
-            for name in (".readers.lock",):
-                try:
-                    os.remove(os.path.join(gen, name))
-                except OSError:
-                    pass
-        else:
+        if cur is None:
             os.makedirs(gen)
+            return gen
+        proc = subprocess.Popen(["cp", "-a", cur, gen], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                start_new_session=True)
+        try:
+            while True:
+                try:
+                    rc = proc.wait(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    if cancel is not None and cancel.is_set():
+                        raise Lost("the shared tree's staging copy was stopped for a claim")
+                    if deadline is not None and time.monotonic() > deadline:
+                        raise Refusal("the shared tree's staging copy did not finish inside its deadline — stopped")
+        except BaseException:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+            shutil.rmtree(gen, ignore_errors=True)
+            raise
+        if rc != 0:
+            err = (proc.stderr.read() if proc.stderr else b"").decode(errors="replace")
+            shutil.rmtree(gen, ignore_errors=True)
+            raise Refusal(f"the shared tree's current generation could not be copied (exit {rc}): {err.strip()[-200:]}")
         return gen
 
     def publish(self, gen: str) -> None:
@@ -3494,12 +3524,17 @@ class SharedTree:
             gen = os.path.join(self.gens, name)
             if gen == cur or not os.path.isdir(gen):
                 continue
-            fh = self._lock(os.path.join(gen, ".readers.lock"), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock = self._lock_of(gen)
+            fh = self._lock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if fh is None:
                 continue                        # a reader is copying it: kept until the next collect
             try:
                 shutil.rmtree(gen, ignore_errors=True)
                 gone.append(name)
+                try:
+                    os.remove(lock)             # a reader that opens it after this finds the generation gone and re-reads
+                except OSError:
+                    pass
             finally:
                 fh.close()
         return gone
@@ -3590,6 +3625,10 @@ def _trusted_tree(git: Callable[..., None], gitdir: str, tree: str, sha: str, mi
     elif os.path.isdir(planted):
         shutil.rmtree(planted)
     g = ("--git-dir", gitdir, "--work-tree", tree)
+    # a COPIED tree (a staged shared generation) carries an index whose cached inodes and ctimes are stale: refreshed
+    # first, so the one-way read-tree rewrites only files that differ from `sha` and unchanged sources keep their mtimes
+    if os.path.isfile(os.path.join(gitdir, "index")):
+        git(*g, "update-index", "-q", "--refresh")
     git(*g, "read-tree", "--reset", "-u", sha)
     git(*g, "clean", "-ffdxq", *[a for k in WARM_KEEP for a in ("-e", k)])
     git("--git-dir", gitdir, "update-ref", "--no-deref", "HEAD", sha)
@@ -4273,8 +4312,8 @@ class Host:
             # that ran it since its own start
             repos |= {r for r in os.listdir(os.path.join(self.cache, SHARED_DIR)) if REPO.match(r) and not r.startswith(".")}
         for repo in sorted(repos):
-            if self.stopping:
-                return
+            if self.stopping or self.warm_cancel.is_set():
+                return                                     # a claim needs the host: no further repository is started
             if shared:
                 self._warm_shared(repo, key)
                 continue
@@ -4288,11 +4327,26 @@ class Host:
         st = warm_state(tree.warm_of(cur)) if cur else None
         tip_now = self._mirror_tip(repo)
         if tip_now and st is not None and st.get("key") == key and st.get("tip") == tip_now and st.get("built") in (tip_now, "none"):
+            # already warm — still collect generations whose readers have let go since the last publish
+            with tree.writer() as w:
+                if w is not None:
+                    w.collect()
             return
+        failed = self.warm_failed.get(repo)
+        if failed is not None and failed[:2] == (tip_now, key) and time.monotonic() - failed[2] < WARM_RETRY_SECONDS:
+            return                                         # cooling down: no generation is copied for a build that won't run
         with tree.writer() as w:
             if w is None:
                 return                                     # another replica is the writer: it warms, this one does not
-            gen = w.stage()
+            try:
+                gen = w.stage(cancel=self.warm_cancel, deadline=time.monotonic() + 1800)
+            except Lost:
+                self.log(f"shared tree: {repo} staging stopped for a claim")
+                return
+            except Refusal as e:
+                self.warm_failed[repo] = (tip_now, key, time.monotonic())
+                self.log(f"shared tree: {repo} not staged ({e})")
+                return
             outcome = self._warm_one(repo, key, w.warm_of(gen))
             if outcome == "built":
                 w.publish(gen)
@@ -6232,6 +6286,15 @@ def self_test() -> int:
               and not os.path.exists(g1))
         # NO TORN READS: readers copying while a writer publishes generation after generation see ONE generation, whole
         torn: list = []
+        worker_errors: list = []
+
+        def guarded(fn):
+            def run_():
+                try:
+                    fn()
+                except BaseException as e_:          # a worker's failure must fail the case, never vanish in a thread
+                    worker_errors.append(repr(e_))
+            return run_
 
         def read_many():
             for _ in range(150):
@@ -6251,11 +6314,13 @@ def self_test() -> int:
                     g_ = w_.stage()
                     fill(g_, f"gen{n}")
                     w_.publish(g_)
-        ths = [_thr.Thread(target=read_many) for _ in range(3)] + [_thr.Thread(target=write_many)]
+        ths = [_thr.Thread(target=guarded(read_many)) for _ in range(3)] + [_thr.Thread(target=guarded(write_many))]
         for th_ in ths:
             th_.start()
         for th_ in ths:
-            th_.join(120)
+            th_.join(300)
+        check("shared/every reader and the writer FINISHED, without an exception",
+              not any(th_.is_alive() for th_ in ths) and worker_errors == [], worker_errors)
         check("shared/readers copying during publishes never see a torn tree (every file from ONE generation)", torn == [], torn[:2])
         check("shared/after the storm one current generation remains, older ones collected once free",
               len([g for g in os.listdir(st_.gens)]) <= 2 and st_.current() is not None, os.listdir(st_.gens))
@@ -6313,6 +6378,26 @@ def self_test() -> int:
             line0 = seed_run_from_warm("R", c1, [], warm, run1, None, wenv, log0, key="k1")
             check("warm/with no warm main workspace a run is a CLEAN clone, said",
                   line0.startswith("workspace: clean (no warm main workspace yet") and open(os.path.join(run1, "a.cs")).read() == "v1", line0)
+            # a COPIED generation's stale index is refreshed before advancing: an unchanged file keeps its mtime
+            xroot = os.path.join(wroot, "refresh")
+            xseed = os.path.join(xroot, "seed"); os.makedirs(xseed)
+            sh("git", "init", "-q", "-b", "main", cwd=xseed)
+            open(os.path.join(xseed, "a.txt"), "w").write("a1"); open(os.path.join(xseed, "b.txt"), "w").write("same")
+            sh("git", "add", "-A", cwd=xseed); sh("git", "commit", "-qm", "x1", cwd=xseed)
+            x1 = sh("git", "rev-parse", "HEAD", cwd=xseed)
+            open(os.path.join(xseed, "a.txt"), "w").write("a2"); sh("git", "commit", "-qam", "x2", cwd=xseed)
+            x2 = sh("git", "rev-parse", "HEAD", cwd=xseed)
+            xmirror = os.path.join(xroot, "mirror.git"); sh("git", "clone", "-q", "--bare", xseed, xmirror, cwd=xroot)
+            xg = _git_runner(wenv, xroot, None, None)
+            gen_a = os.path.join(xroot, "genA"); os.makedirs(os.path.join(gen_a, "tree"))
+            _trusted_tree(xg, os.path.join(gen_a, "git"), os.path.join(gen_a, "tree"), x1, xmirror)
+            os.utime(os.path.join(gen_a, "tree", "b.txt"), (1_000_000_000, 1_000_000_000))
+            gen_b = os.path.join(xroot, "genB")
+            subprocess.run(["cp", "-a", gen_a, gen_b], check=True)
+            _trusted_tree(xg, os.path.join(gen_b, "git"), os.path.join(gen_b, "tree"), x2, xmirror)
+            check("warm/advancing a COPIED tree keeps an unchanged file's mtime (the stale index is refreshed first)",
+                  int(os.stat(os.path.join(gen_b, "tree", "b.txt")).st_mtime) == 1_000_000_000
+                  and open(os.path.join(gen_b, "tree", "a.txt")).read() == "a2", os.stat(os.path.join(gen_b, "tree", "b.txt")).st_mtime)
             adv = advance_warm_main("R", c2, warm, wenv, log0, key="k1")
             check("warm/the HOST clones the warm main workspace at main's tip", adv.startswith(f"warm main workspace: set up at main@{c2[:12]}")
                   and open(os.path.join(warm, "a.cs")).read() == "v2", adv)
