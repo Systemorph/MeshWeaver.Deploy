@@ -4323,10 +4323,13 @@ class Host:
         key = warm_key(self.env, self.identity)
         shared = shared_tree_enabled(self.env)
         repos = set(self.warm_repos)
-        if shared and os.path.isdir(os.path.join(self.cache, SHARED_DIR)):
+        if shared:
             # every repository the SHARED tree already holds is kept warm by whichever replica is idle, not only by one
-            # that ran it since its own start
-            repos |= {r for r in os.listdir(os.path.join(self.cache, SHARED_DIR)) if REPO.match(r) and not r.startswith(".")}
+            # that ran it since its own start (warming never raises: an unreadable listing only narrows this pass)
+            try:
+                repos |= {r for r in os.listdir(os.path.join(self.cache, SHARED_DIR)) if REPO.match(r) and not r.startswith(".")}
+            except OSError:
+                pass
         for repo in sorted(repos):
             if self.stopping or self.warm_cancel.is_set():
                 return                                     # a claim needs the host: no further repository is started
