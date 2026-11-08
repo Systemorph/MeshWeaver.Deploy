@@ -9,6 +9,14 @@
 #     --pull-user <registry token name> \
 #     [--profile build] [--plugins-registry <https URL> --instance-key-secret <vault object of a READ-ONLY mwi_ key>] \
 #     --version <x.y.z> --tester sha256:… --portal sha256:… --runner sha256:…
+#     [--accept-jobs <patterns> | --no-accept-jobs] [--accept-tokens <patterns> | --no-accept-tokens]
+#     [--token-models <m>] [--residency <X>]
+#
+# THE OWNER'S OPT-IN (MeshWeaver.Plugins Hosting/BackLease §13). Before anything is changed it ASKS — in a terminal —
+# whether this Mac accepts fleet jobs and from which instances (offered: control.systemorph.com), and whether it serves
+# token requests and from which instances (offered: *.meshweaver.cloud). A headless run takes the flags; with no answer
+# both stay OFF. The answers are written with `memex-local backlease accept` into the Mac's back-lease layer (the
+# heartbeat carries them; control enforces them and can never switch them on). Attaching the runners is not an opt-in.
 #
 # What it does, in order, and nothing else:
 #   0. pins EVERY kubectl and helm call to the build profile's context (`colima-<profile>`, never the mutable current one) —
@@ -33,8 +41,13 @@ set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 chart="$here/../helm"
 profile=build api= registry= vault= worker= pull= pulluser= version= tester= portal= runner= pluginsreg= instkey=
+acc_jobs='' acc_tokens='' acc_models='' acc_res=''   # empty = not answered by a flag; "off" = declined
 while [ $# -gt 0 ]; do
   case "$1" in
+    --no-accept-jobs) acc_jobs=off; shift; continue;;
+    --no-accept-tokens) acc_tokens=off; shift; continue;;
+    --accept-jobs) acc_jobs="${2:?--accept-jobs needs instance patterns}";; --accept-tokens) acc_tokens="${2:?--accept-tokens needs instance patterns}";;
+    --token-models) acc_models="$2";; --residency) acc_res="$2";;
     --profile) profile="$2";; --api) api="$2";; --registry) registry="$2";; --vault) vault="$2";;
     --worker-secret) worker="$2";; --pull-secret) pull="$2";; --pull-user) pulluser="$2";;
     --plugins-registry) pluginsreg="$2";; --instance-key-secret) instkey="$2";;
@@ -56,6 +69,27 @@ if [ -n "$pluginsreg$instkey" ]; then
 fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: --version must be x.y.z" >&2; exit 2; }
 for d in "$tester" "$portal" "$runner"; do [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "ERROR: $d is not sha256:<64 hex>" >&2; exit 2; }; done
+
+# ── the owner's opt-in: asked FIRST, applied LAST (Hosting/BackLease §13.3) ───────────────────────────────────
+ask() { local a; printf '%s [%s] ' "$1" "$2" >&2; IFS= read -r a || a=""; printf '%s' "${a:-$2}"; }
+if [ -t 0 ] && [ "${MEMEX_HEADLESS:-0}" != 1 ]; then
+  if [ -z "$acc_jobs" ]; then
+    case "$(ask "Accept fleet jobs (builds and other queue work) on this Mac?" "y/N")" in
+      [Yy]|[Yy][Ee][Ss]) acc_jobs="$(ask "  From which instances?" "control.systemorph.com")" ;; *) acc_jobs=off ;;
+    esac
+  fi
+  if [ -z "$acc_tokens" ]; then
+    case "$(ask "Accept token requests (serve local models to other instances)?" "y/N")" in
+      [Yy]|[Yy][Ee][Ss]) acc_tokens="$(ask "  From which instances?" "*.meshweaver.cloud")"
+                         acc_models="$(ask "  Which models?" "${acc_models:-qwen3.8:27b-mlx qwen3.6}")"
+                         acc_res="$(ask "  Where is this machine (residency, e.g. CH or Eu)?" "$acc_res")" ;;
+      *) acc_tokens=off ;;
+    esac
+  fi
+fi
+# nobody asked and no flag: OFF — a default is offered, never applied
+acc_jobs="${acc_jobs:-off}"; acc_tokens="${acc_tokens:-off}"
+if [ "$acc_tokens" != off ] && [ -z "$acc_models" ]; then echo "ERROR: --accept-tokens needs --token-models (the models this Mac serves)" >&2; exit 2; fi
 
 # The build host runs in its OWN Colima profile (default `build`), never in the profile memex-local's portal uses: that one
 # runs the docker runtime, which cannot start a pod with hostUsers: false, and bwrap needs that pod's Unmasked /proc.
@@ -178,3 +212,17 @@ echo "== 5/5 fleet jobs at the lowest priority (launchd governor for profile $pr
 # The runners are deployed by now: a governor that cannot load is reported, never a failed attach.
 bash "$here/../homebrew/share/buildhost-priority.sh" --install --profile "$profile" \
   || echo "WARN: the priority governor did not load — the build VM competes at the default band; re-run: bash deploy/homebrew/share/buildhost-priority.sh --install --profile $profile" >&2
+
+echo "== the owner's opt-in (jobs: $acc_jobs · tokens: $acc_tokens)"
+# The answers live in the back-lease layer the portal's heartbeat reads; the runners alone carry no heartbeat.
+ml="$(command -v memex-local || printf '%s' "$here/../homebrew/bin/memex-local")"
+if [ -x "$ml" ] && [ -f "${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/backlease.yaml" ]; then
+  if [ "$acc_jobs" = off ]; then MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept jobs --off
+  else MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept jobs --from "$acc_jobs" --channels mac; fi
+  if [ "$acc_tokens" = off ]; then MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept tokens --off
+  else MEMEX_ACCEPT_NONINTERACTIVE=1 "$ml" backlease accept tokens --from "$acc_tokens" --models "$acc_models" ${acc_res:+--residency "$acc_res"}; fi
+  echo "   written to the back-lease layer — 'memex-local update' applies it (the next heartbeat carries it to control)"
+else
+  echo "WARN: this Mac has no back-lease layer (memex-local backlease enroll) — the answers above are NOT recorded, and control" >&2
+  echo "      treats an unenrolled machine as accepting nothing. Enrol it; enrolment asks both questions again." >&2
+fi

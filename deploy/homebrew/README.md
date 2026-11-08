@@ -187,9 +187,23 @@ platform image in Colima's VM, sized for the host
 
 | Profile | VM | Host-native model | Host memory |
 |---|---|---|---|
-| `mac-studio` | 12 CPU / 32 GiB | `qwen3.6` (~23 GB) | 64 GB or more |
+| `mac-studio` | 12 CPU / 32 GiB | `qwen3.6` (~23 GB), plus `qwen3.8:27b-mlx` (~18 GB) to offer the fleet's token queue | 64 GB or more |
 | `mac-mini` | 6 CPU / 12 GiB | `qwen3:8b` (~5 GB) | 24 GB or more |
 | (unset) | 8 CPU / 16 GiB | `qwen3.6` | the developer-laptop defaults |
+
+A Mac Studio pulls `qwen3.8:27b-mlx` beside its chat model (`MEMEX_OLLAMA_EXTRA_MODELS` overrides the list;
+`none` pulls none). Pulling a model does not offer it. A Mac serves the fleet only when its owner opts in.
+
+**The owner's opt-in** (MeshWeaver.Plugins `Hosting/BackLease` §13). An enrolled Mac takes NO fleet jobs and serves
+NO token requests until its owner says yes and names the instances it takes each from. `fleet join` and
+`backlease enroll` ask both questions. The defaults are offered, not applied: jobs from `control.systemorph.com`,
+tokens from `*.meshweaver.cloud`, and the models `qwen3.8:27b-mlx qwen3.6`. The residency has no default; type
+where the machine is. A headless run passes `--accept-jobs=<patterns>` / `--no-accept-jobs` and
+`--accept-tokens=<patterns>` / `--no-accept-tokens` (with `--token-models`, `--residency`), and with no answer
+both stay off. Change an answer later with `memex-local backlease accept jobs|tokens [--from …] [--off] …`,
+then `memex-local update`. `backlease status` prints the answers. They are written as
+`Hosting__BackLease__Accept__*` into `~/.memex-local/backlease.yaml`. The heartbeat carries them to control,
+which enforces them and can never switch them on.
 
 **Channels** (`--channel <label>` on `up`/`update`, or `MEMEX_CHANNEL`) follow a declared
 release-channel label instead of `main`. `main` is the promoted set before it is armed. `3-latest` is

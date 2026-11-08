@@ -43,12 +43,15 @@ readonly HOST_PORT="${MEMEX_PORT:-8443}"        # unprivileged host port (§6/§
 # explicit MEMEX_COLIMA_CPU / MEMEX_COLIMA_MEM / MEMEX_OLLAMA_MODEL always wins. Unset = the
 # developer-laptop defaults this file always had. An unknown profile is refused by check_profile
 # (preflight), never silently read as the default.
-#   mac-studio  VM 12 CPU / 32 GiB, qwen3.6 (~23 GB)   — a host with >= 64 GB unified memory
+#   mac-studio  VM 12 CPU / 32 GiB, qwen3.6 (~23 GB) + qwen3.8:27b-mlx (~18 GB) — a host with >= 64 GB unified memory
 #   mac-mini    VM  6 CPU / 12 GiB, qwen3:8b (~5 GB)   — a host with >= 24 GB unified memory
+# The EXTRA models are pulled beside the chat model, unaliased: they are what a Mac Studio can OFFER the fleet's
+# token queue (MeshWeaver.Plugins Hosting/BackLease §14) — pulled is not offered; the owner opts in (§13,
+# `memex-local backlease accept tokens`). MEMEX_OLLAMA_EXTRA_MODELS overrides the list; `none` pulls none.
 case "${MEMEX_PROFILE:-}" in
-  mac-studio) _PROFILE_CPU=12; _PROFILE_MEM=32; _PROFILE_MODEL="qwen3.6" ;;
-  mac-mini)   _PROFILE_CPU=6;  _PROFILE_MEM=12; _PROFILE_MODEL="qwen3:8b" ;;
-  *)          _PROFILE_CPU=8;  _PROFILE_MEM=16; _PROFILE_MODEL="qwen3.6" ;;
+  mac-studio) _PROFILE_CPU=12; _PROFILE_MEM=32; _PROFILE_MODEL="qwen3.6"; _PROFILE_EXTRA_MODELS="qwen3.8:27b-mlx" ;;
+  mac-mini)   _PROFILE_CPU=6;  _PROFILE_MEM=12; _PROFILE_MODEL="qwen3:8b"; _PROFILE_EXTRA_MODELS="" ;;
+  *)          _PROFILE_CPU=8;  _PROFILE_MEM=16; _PROFILE_MODEL="qwen3.6"; _PROFILE_EXTRA_MODELS="" ;;
 esac
 readonly HOST_PROFILE="${MEMEX_PROFILE:-}"
 readonly COLIMA_CPU="${MEMEX_COLIMA_CPU:-$_PROFILE_CPU}"    # VM sizing (§2)
@@ -58,6 +61,7 @@ readonly COLIMA_MEM="${MEMEX_COLIMA_MEM:-$_PROFILE_MEM}"    # VM sizing (§2)
 # (§2 "Host sizing"); a smaller host sets a smaller tool-capable model, or `none` to skip the pull
 # entirely (#6024). The small e2e model (qwen-small) is always pulled — it is ~400 MB.
 readonly OLLAMA_MODEL="${MEMEX_OLLAMA_MODEL:-$_PROFILE_MODEL}"
+readonly OLLAMA_EXTRA_MODELS="${MEMEX_OLLAMA_EXTRA_MODELS-$_PROFILE_EXTRA_MODELS}"
 # The chart's portal/migration containers hardcode these image refs with
 # imagePullPolicy: IfNotPresent (deploy/helm/.../deployment.yaml). Both the
 # local-build and ACR-pull paths retag onto these names so k3s finds them (§3).
@@ -606,6 +610,151 @@ percent_arg() {
   printf '%s' "$v"
 }
 
+# ---------------------------------------------------------------------------
+# The owner's OPT-IN — what this Mac accepts, and from whom (MeshWeaver.Plugins Hosting/BackLease §13)
+# ---------------------------------------------------------------------------
+# Two independent switches, each with the instances it takes that work FROM (host patterns, matched on control
+# against the requester's VERIFIED identity): JOBS (builds and every other queue job class) and TOKENS (serving
+# local models to the fleet's token queue). OFF unless the owner says yes: enrolment asks, showing the defaults
+# below; a headless run needs the explicit flags; a missing answer is never the default. Written as
+# Hosting__BackLease__Accept__* into the back-lease layer; the heartbeat carries them to control, which re-checks
+# them and can never switch them on. `memex-local backlease accept …` changes them later.
+readonly ACCEPT_DEFAULT_JOBS_FROM="control.systemorph.com"
+readonly ACCEPT_DEFAULT_TOKENS_FROM="*.meshweaver.cloud"
+readonly ACCEPT_DEFAULT_TOKEN_MODELS="qwen3.8:27b-mlx qwen3.6"
+ACC_JOBS_ENABLED=false; ACC_JOBS_FROM=""; ACC_JOBS_CHANNELS=""; ACC_JOBS_REPOS=""
+ACC_TOK_ENABLED=false; ACC_TOK_FROM=""; ACC_TOK_MODELS=""; ACC_TOK_MAXC=1; ACC_TOK_RES=""
+ACC_JOBS_ANSWERED=no; ACC_TOK_ANSWERED=no
+
+# The values of an indexed list key (<prefix>__0, __1, …) in the back-lease layer, space-separated, in index order.
+accept_list() {
+  awk -v p="$1__" 'index($1, p) == 1 {
+      k = $1; sub(/:$/, "", k); i = substr(k, length(p) + 1)
+      if (i ~ /^[0-9]+$/) { v = $0; sub(/^[^:]*:[ ]*/, "", v); gsub(/"/, "", v); a[i + 0] = v; if (i + 0 > m) m = i + 0 }
+    }
+    END { for (j = 0; j <= m; j++) if (j in a) printf "%s%s", (c++ ? " " : ""), a[j] }' "$BACKLEASE_FILE" 2>/dev/null
+}
+
+# Loads the CURRENT answers from the layer (a fresh machine: both off).
+accept_load() {
+  local p="Hosting__BackLease__Accept"
+  # a fresh machine has no layer yet: both off (the readers below are only run against a file that exists)
+  [ -f "$BACKLEASE_FILE" ] || return 0
+  [ "$(backlease_value "${p}__Jobs__Enabled")" = "true" ] && ACC_JOBS_ENABLED=true || ACC_JOBS_ENABLED=false
+  ACC_JOBS_FROM="$(accept_list "${p}__Jobs__From")"; ACC_JOBS_CHANNELS="$(accept_list "${p}__Jobs__Channels")"; ACC_JOBS_REPOS="$(accept_list "${p}__Jobs__Repos")"
+  [ "$(backlease_value "${p}__Tokens__Enabled")" = "true" ] && ACC_TOK_ENABLED=true || ACC_TOK_ENABLED=false
+  ACC_TOK_FROM="$(accept_list "${p}__Tokens__From")"; ACC_TOK_MODELS="$(accept_list "${p}__Tokens__Models")"
+  ACC_TOK_MAXC="$(backlease_value "${p}__Tokens__MaxConcurrency")"; ACC_TOK_MAXC="${ACC_TOK_MAXC:-1}"
+  ACC_TOK_RES="$(backlease_value "${p}__Tokens__Residency")"
+}
+
+# Normalises a comma/space list to single spaces; lower-cases when $2 = lower.
+accept_norm() { local v; v="$(printf '%s' "$1" | tr ',' ' ' | xargs 2>/dev/null || true)"; [ "${2:-}" = lower ] && v="$(printf '%s' "$v" | tr 'A-Z' 'a-z')"; printf '%s' "$v"; }
+
+# Validators — each dies naming the value. A pattern: a host, `*.` + a host (one label or more below it), or `*`.
+accept_check_patterns() {
+  local x; [ -n "$1" ] || die "$2: name at least one instance (a host, *.domain, or *)"
+  for x in $1; do
+    printf '%s' "$x" | grep -Eq '^(\*|(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+)$' \
+      || die "$2: '$x' is not an instance pattern (a host such as control.systemorph.com, *.meshweaver.cloud, or *)"
+  done
+}
+accept_check_models()   { local x; for x in $1; do printf '%s' "$x" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:/-]*$' || die "$2: '$x' is not a model name"; done; }
+accept_check_channels() { local x; for x in $1; do printf '%s' "$x" | grep -Eq '^[a-z0-9][a-z0-9-]*$' || die "$2: '$x' is not a channel"; done; }
+accept_check_repos()    { local x; for x in $1; do printf '%s' "$x" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || die "$2: '$x' is not owner/repo"; done; }
+accept_check_maxc()     { case "$1" in [1-8]) ;; *) die "$2: must be 1–8 (got '$1')" ;; esac; }
+accept_check_residency() { [ -z "$1" ] || printf '%s' "$1" | grep -Eq '^[A-Za-z]{2,8}$' || die "$2: '$1' is not a residency (e.g. CH, Eu)"; }
+
+# One opt-in flag (`--x=v` or `--x v`); sets ACC_USED to how many arguments it consumed (0 = not an opt-in flag).
+# Sets globals, so it is called directly — never inside $(…).
+ACC_USED=0
+accept_flag() {
+  local flag="${1%%=*}" val="" used=1
+  case "$1" in *=*) val="${1#*=}" ;; esac
+  case "$flag" in
+    --accept-jobs|--accept-tokens|--job-channels|--job-repos|--token-models|--token-max-concurrency|--residency)
+      if [ "$1" = "$flag" ]; then val="${2-}"; used=2; [ -n "$val" ] || die "$flag needs a value"; fi ;;
+  esac
+  case "$flag" in
+    --accept-jobs)   ACC_JOBS_FROM="$(accept_norm "$val" lower)"; accept_check_patterns "$ACC_JOBS_FROM" "$flag"; ACC_JOBS_ENABLED=true; ACC_JOBS_ANSWERED=yes ;;
+    --no-accept-jobs) ACC_JOBS_ENABLED=false; ACC_JOBS_ANSWERED=yes ;;
+    --job-channels)  ACC_JOBS_CHANNELS="$(accept_norm "$val" lower)"; accept_check_channels "$ACC_JOBS_CHANNELS" "$flag" ;;
+    --job-repos)     ACC_JOBS_REPOS="$(accept_norm "$val")"; accept_check_repos "$ACC_JOBS_REPOS" "$flag" ;;
+    --accept-tokens) ACC_TOK_FROM="$(accept_norm "$val" lower)"; accept_check_patterns "$ACC_TOK_FROM" "$flag"; ACC_TOK_ENABLED=true; ACC_TOK_ANSWERED=yes ;;
+    --no-accept-tokens) ACC_TOK_ENABLED=false; ACC_TOK_ANSWERED=yes ;;
+    --token-models)  ACC_TOK_MODELS="$(accept_norm "$val")"; accept_check_models "$ACC_TOK_MODELS" "$flag" ;;
+    --token-max-concurrency) ACC_TOK_MAXC="$val"; accept_check_maxc "$val" "$flag" ;;
+    --residency)     ACC_TOK_RES="$val"; accept_check_residency "$val" "$flag" ;;
+    *) used=0 ;;
+  esac
+  ACC_USED="$used"
+}
+
+# Interactive: is there a person to ask? (a terminal on stdin, not headless)
+accept_interactive() { [ -t 0 ] && [ "${MEMEX_HEADLESS:-0}" != "1" ] && [ "${MEMEX_ACCEPT_NONINTERACTIVE:-0}" != "1" ]; }
+
+# Asks `question` with default $2 (shown in brackets); prints the answer.
+accept_read() { local a; printf '%s [%s] ' "$1" "$2" >&2; IFS= read -r a || a=""; printf '%s' "${a:-$2}"; }
+accept_yn() { local d="$2" a; [ "$d" = true ] && a="$(accept_read "$1" "Y/n")" || a="$(accept_read "$1" "y/N")"
+  case "$a" in [Yy]|[Yy][Ee][Ss]) printf true ;; [Nn]|[Nn][Oo]) printf false ;; Y/n) printf true ;; *) printf false ;; esac; }
+
+# Asks every switch the flags did not answer — only when a person is there. With nobody to ask the current answer
+# stands (a fresh machine: OFF): a default is OFFERED, never applied.
+accept_ask() {
+  accept_interactive || return 0
+  local v
+  if [ "$ACC_JOBS_ANSWERED" = no ]; then
+    ACC_JOBS_ENABLED="$(accept_yn "Accept fleet jobs (builds and other queue work) on this Mac?" "$ACC_JOBS_ENABLED")"
+    if [ "$ACC_JOBS_ENABLED" = true ]; then
+      v="$(accept_norm "$(accept_read "  From which instances?" "${ACC_JOBS_FROM:-$ACCEPT_DEFAULT_JOBS_FROM}")" lower)"; accept_check_patterns "$v" "jobs from"; ACC_JOBS_FROM="$v"
+    fi
+  fi
+  if [ "$ACC_TOK_ANSWERED" = no ]; then
+    ACC_TOK_ENABLED="$(accept_yn "Accept token requests (serve local models to other instances)?" "$ACC_TOK_ENABLED")"
+    if [ "$ACC_TOK_ENABLED" = true ]; then
+      v="$(accept_norm "$(accept_read "  From which instances?" "${ACC_TOK_FROM:-$ACCEPT_DEFAULT_TOKENS_FROM}")" lower)"; accept_check_patterns "$v" "tokens from"; ACC_TOK_FROM="$v"
+      v="$(accept_norm "$(accept_read "  Which models?" "${ACC_TOK_MODELS:-$ACCEPT_DEFAULT_TOKEN_MODELS}")")"; accept_check_models "$v" "token models"; ACC_TOK_MODELS="$v"
+      v="$(accept_read "  Where is this machine (residency, e.g. CH or Eu)?" "${ACC_TOK_RES}")"; accept_check_residency "$v" "residency"; ACC_TOK_RES="$v"
+    fi
+  fi
+}
+
+# A switch that is ON must say from whom (and, for tokens, which models) — else it is refused, never widened.
+accept_validate() {
+  if [ "$ACC_JOBS_ENABLED" = true ]; then accept_check_patterns "$ACC_JOBS_FROM" "jobs: --accept-jobs"; fi
+  if [ "$ACC_TOK_ENABLED" = true ]; then
+    accept_check_patterns "$ACC_TOK_FROM" "tokens: --accept-tokens"
+    [ -n "$ACC_TOK_MODELS" ] || die "tokens: name the models this Mac serves (--token-models qwen3.8:27b-mlx)"
+  fi
+}
+
+# The YAML lines of the layer's opt-in block (under config.memex_portal). Enabled is always written, so OFF is declared.
+accept_block() {
+  local p="    Hosting__BackLease__Accept" i x
+  printf '%s__Jobs__Enabled: "%s"\n' "$p" "$ACC_JOBS_ENABLED"
+  i=0; for x in $ACC_JOBS_FROM;     do printf '%s__Jobs__From__%d: "%s"\n' "$p" "$i" "$x"; i=$((i+1)); done
+  i=0; for x in $ACC_JOBS_CHANNELS; do printf '%s__Jobs__Channels__%d: "%s"\n' "$p" "$i" "$x"; i=$((i+1)); done
+  i=0; for x in $ACC_JOBS_REPOS;    do printf '%s__Jobs__Repos__%d: "%s"\n' "$p" "$i" "$x"; i=$((i+1)); done
+  printf '%s__Tokens__Enabled: "%s"\n' "$p" "$ACC_TOK_ENABLED"
+  i=0; for x in $ACC_TOK_FROM;   do printf '%s__Tokens__From__%d: "%s"\n' "$p" "$i" "$x"; i=$((i+1)); done
+  i=0; for x in $ACC_TOK_MODELS; do printf '%s__Tokens__Models__%d: "%s"\n' "$p" "$i" "$x"; i=$((i+1)); done
+  printf '%s__Tokens__MaxConcurrency: "%s"\n' "$p" "$ACC_TOK_MAXC"
+  [ -z "$ACC_TOK_RES" ] || printf '%s__Tokens__Residency: "%s"\n' "$p" "$ACC_TOK_RES"
+}
+
+# One line per switch, for enroll, accept and status.
+accept_summary() {
+  if [ "$ACC_JOBS_ENABLED" = true ]; then
+    ok "accepts JOBS from: $ACC_JOBS_FROM${ACC_JOBS_CHANNELS:+ · channels: $ACC_JOBS_CHANNELS}${ACC_JOBS_REPOS:+ · repos: $ACC_JOBS_REPOS}"
+  else info "accepts NO jobs (memex-local backlease accept jobs --from $ACCEPT_DEFAULT_JOBS_FROM to opt in)"; fi
+  if [ "$ACC_TOK_ENABLED" = true ]; then
+    ok "accepts TOKEN requests from: $ACC_TOK_FROM · models: $ACC_TOK_MODELS · at most $ACC_TOK_MAXC at once · residency: ${ACC_TOK_RES:-<none stated — serves only requests that require none>}"
+  else info "serves NO token requests (memex-local backlease accept tokens --from '$ACCEPT_DEFAULT_TOKENS_FROM' --models … --residency … to opt in)"; fi
+}
+
+# The ceiling written in the layer as "85%" → 85 (a fresh layer: the enrol default).
+backlease_ceiling() { local v; v="$(backlease_value "$1" || true)"; v="${v%\%}"; printf '%s' "${v:-70}"; }
+
 write_backlease_file() {
   local control="$1" deployment="$2" interval="$3" repo="$4" load_max="${5:-70}" mem_max="${6:-70}" vm_cpu_max="${7:-70}" vm_mem_max="${8:-70}"
   mkdir -p "$LOCAL_HOME" "$BACKLEASE_DIR"
@@ -629,6 +778,7 @@ config:
     Hosting__BackLease__HostMemoryMax: "${mem_max}%"
     Hosting__BackLease__VmCpuMax: "${vm_cpu_max}%"
     Hosting__BackLease__VmMemoryMax: "${vm_mem_max}%"
+$(accept_block)
 ${repo:+    Hosting__BackLease__Repository: "${repo}"
 }extraVolumes:
   - name: backlease-readings
@@ -687,6 +837,8 @@ cmd_backlease() {
   case "$sub" in
     enroll)
       local control="" deployment="" interval="30" repo="" load_max="70" mem_max="70" vm_cpu_max="70" vm_mem_max="70"
+      # the CURRENT opt-in answers are the defaults; a flag below replaces one (Hosting/BackLease §13.3)
+      accept_load
       while [ $# -gt 0 ]; do
         case "$1" in
           --host-load-max)   shift; load_max="$(percent_arg "${1:?--host-load-max needs a percentage}" --host-load-max)" || exit 1 ;;
@@ -697,7 +849,9 @@ cmd_backlease() {
           --deployment) shift; deployment="${1:?--deployment needs an id}" ;;
           --interval)   shift; interval="${1:?--interval needs seconds}" ;;
           --repo)       shift; repo="${1:?--repo needs github.com/OWNER/REPO}" ;;
-          *) die "backlease enroll: unknown flag '$1'" ;;
+          *) accept_flag "$@"
+             [ "$ACC_USED" != 0 ] || die "backlease enroll: unknown flag '$1'"
+             [ "$ACC_USED" = 2 ] && shift ;;
         esac
         shift
       done
@@ -713,8 +867,11 @@ cmd_backlease() {
       # Preconditions the design names (Hosting/BackLease §2): registry mode, Colima up, the portal reachable.
       registry_mode || die "backlease enroll: this install is not in REGISTRY MODE — run 'memex-local registry <url>' first (a leased machine consumes the registry's bundles, it cannot be its own registry)"
       colima_running || die "backlease enroll: Colima is not running — 'memex-local up' first"
+      accept_ask
+      accept_validate
       write_backlease_file "${control%/}" "$deployment" "$interval" "$repo" "$load_max" "$mem_max" "$vm_cpu_max" "$vm_mem_max"
       ok "back-lease layer written: $BACKLEASE_FILE (reports to ${control%/} as '$deployment', heartbeat every ${interval}s; leased work only while host load < ${load_max}%, host memory < ${mem_max}%, VM CPU < ${vm_cpu_max}%, VM memory < ${vm_mem_max}%)"
+      accept_summary
       install_backlease_sampler "$interval"
       backlease_declarations "${control%/}" "$deployment"
       info "Apply it: memex-local update   (re-renders the chart with the back-lease layer; the portal's heartbeat arms on its next activation)"
@@ -732,12 +889,59 @@ cmd_backlease() {
         else
           warn "no readings yet at $BACKLEASE_DIR/readings.json"
         fi
+        accept_load; accept_summary
         if grep -q 'Hosting__ModuleReportSecret' "$OVERLAY" 2>/dev/null; then ok "pairing secret present in the overlay (never printed)"; else warn "pairing secret MISSING — the portal does not beat until secrets.memex_portal.Hosting__ModuleReportSecret is in $OVERLAY"; fi
         backlease_declarations "$(backlease_control)" "$(backlease_deployment)"
       else
         info "back-lease is OFF — offer this Mac with:"
         info "  memex-local backlease enroll --control https://<control> --deployment <id> [--interval 30] [--repo github.com/OWNER/REPO]"
       fi
+      ;;
+    accept)
+      # Changes the owner's opt-in after enrolment (Hosting/BackLease §13.3). Re-writes the layer with every other
+      # value as it stands; `memex-local update` applies it (the portal re-renders; the next heartbeat carries it).
+      [ -f "$BACKLEASE_FILE" ] || die "backlease accept: this Mac is not enrolled — 'memex-local backlease enroll …' first (it asks both questions)"
+      accept_load
+      local class="${1:-}"; [ $# -gt 0 ] && shift
+      case "$class" in
+        jobs)
+          ACC_TOK_ANSWERED=yes
+          [ $# -gt 0 ] || accept_interactive || die "backlease accept jobs: give --from <patterns> [--channels …] [--repos …] or --off"
+          while [ $# -gt 0 ]; do
+            case "$1" in
+              --off) accept_flag --no-accept-jobs ;;
+              --from|--from=*) accept_flag "--accept-jobs${1#--from}" "${2-}" ;;
+              --channels|--channels=*) accept_flag "--job-channels${1#--channels}" "${2-}" ;;
+              --repos|--repos=*) accept_flag "--job-repos${1#--repos}" "${2-}" ;;
+              *) die "backlease accept jobs: unknown flag '$1'" ;;
+            esac
+            [ "$ACC_USED" = 2 ] && shift; shift
+          done ;;
+        tokens)
+          ACC_JOBS_ANSWERED=yes
+          [ $# -gt 0 ] || accept_interactive || die "backlease accept tokens: give --from <patterns> --models <m> [--max-concurrency n] [--residency X] or --off"
+          while [ $# -gt 0 ]; do
+            case "$1" in
+              --off) accept_flag --no-accept-tokens ;;
+              --from|--from=*) accept_flag "--accept-tokens${1#--from}" "${2-}" ;;
+              --models|--models=*) accept_flag "--token-models${1#--models}" "${2-}" ;;
+              --max-concurrency|--max-concurrency=*) accept_flag "--token-max-concurrency${1#--max-concurrency}" "${2-}" ;;
+              --residency|--residency=*) accept_flag "--residency${1#--residency}" "${2-}" ;;
+              *) die "backlease accept tokens: unknown flag '$1'" ;;
+            esac
+            [ "$ACC_USED" = 2 ] && shift; shift
+          done ;;
+        "") accept_interactive || die "backlease accept: usage: memex-local backlease accept {jobs|tokens} … (or run it in a terminal to be asked)" ;;
+        *) die "backlease accept: '$class' is not a class — jobs or tokens" ;;
+      esac
+      accept_ask
+      accept_validate
+      write_backlease_file "$(backlease_control)" "$(backlease_deployment)" "$(backlease_interval)" "$(backlease_value Hosting__BackLease__Repository)" \
+        "$(backlease_ceiling Hosting__BackLease__HostLoadMax)" "$(backlease_ceiling Hosting__BackLease__HostMemoryMax)" \
+        "$(backlease_ceiling Hosting__BackLease__VmCpuMax)" "$(backlease_ceiling Hosting__BackLease__VmMemoryMax)"
+      ok "opt-in written: $BACKLEASE_FILE"
+      accept_summary
+      info "Apply it: memex-local update   (the portal re-renders and restarts; the next heartbeat carries the change — work already running finishes)"
       ;;
     off)
       [ $# -eq 0 ] || die "backlease off: unknown flag '$1'"
@@ -749,7 +953,7 @@ cmd_backlease() {
         info "back-lease was not on"
       fi
       ;;
-    *) die "usage: memex-local backlease {enroll --control <url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>] | status | off}" ;;
+    *) die "usage: memex-local backlease {enroll --control <url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>] [--accept-jobs=<patterns> | --no-accept-jobs] [--job-channels <c>] [--job-repos <owner/repo>] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--token-max-concurrency <n>] [--residency <X>] | accept {jobs [--from <patterns>] [--channels <c>] [--repos <r>] [--off] | tokens [--from <patterns>] [--models <m>] [--max-concurrency <n>] [--residency <X>] [--off]} | status | off}" ;;
   esac
 }
 
@@ -1410,6 +1614,7 @@ cmd_fleet() {
   case "$sub" in
     join)
       local control="" id="" open_link="yes" code_file="" do_update="yes" with_obs="yes" with_build="yes"
+      local accept_args=()
       while [ $# -gt 0 ]; do
         case "$1" in
           --control)   shift; control="${1:?--control needs the control instance URL}" ;;
@@ -1419,7 +1624,10 @@ cmd_fleet() {
           --no-update) do_update="no" ;;
           --no-observability) with_obs="no" ;;
           --no-buildhost) with_build="no" ;;
-          *) die "fleet join: unknown flag '$1'" ;;
+          *) accept_flag "$@"
+             [ "$ACC_USED" != 0 ] || die "fleet join: unknown flag '$1'"
+             # the opt-in flags pass through to backlease enroll, which asks what they leave unanswered
+             accept_args+=("$1"); [ "$ACC_USED" = 2 ] && { accept_args+=("$2"); shift; } ;;
         esac
         shift
       done
@@ -1480,7 +1688,7 @@ cmd_fleet() {
 
       step "Back-lease, local models and the image (steps 5)"
       if registry_mode; then
-        cmd_backlease enroll --control "$control" --deployment "$id"
+        cmd_backlease enroll --control "$control" --deployment "$id" ${accept_args[@]+"${accept_args[@]}"}
       else
         warn "not in REGISTRY MODE — run 'memex-local registry <url>' and then 'memex-local backlease enroll --control $control --deployment $id'"
       fi
@@ -1518,7 +1726,7 @@ cmd_fleet() {
         info "not joined — memex-local fleet join --control https://<control-instance> --id <id>"
       fi
       ;;
-    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] | status}" ;;
+    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] [--accept-jobs=<patterns> | --no-accept-jobs] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--residency <X>] | status}" ;;
   esac
 }
 
@@ -2267,6 +2475,14 @@ setup_ollama() {
   else
     ollama pull "$OLLAMA_MODEL"
     ollama cp "$OLLAMA_MODEL" qwen3.6-code 2>/dev/null || info "model alias qwen3.6-code already exists"
+  fi
+  # The profile's EXTRA models (a Mac Studio: qwen3.8:27b-mlx) — what the machine CAN offer the fleet's token
+  # queue. Pulled, never offered: serving them is the owner's opt-in (`memex-local backlease accept tokens`).
+  local extra
+  if [ "$OLLAMA_EXTRA_MODELS" != "none" ]; then
+    for extra in $OLLAMA_EXTRA_MODELS; do
+      ollama pull "$extra" || warn "could not pull '$extra' — re-run 'memex-local up --skip-image' (or 'ollama pull $extra')"
+    done
   fi
   # Small CPU-friendly model (~400MB) the e2e portal selects ('qwen-small' — see e2e_deploy), so
   # a real chat round runs on any host/CI without the 23GB GPU qwen3.6.
@@ -4169,6 +4385,7 @@ cmd_profile() {
   info "profile:   ${HOST_PROFILE:-<none — laptop defaults>}"
   info "vm:        ${COLIMA_CPU} CPU / ${COLIMA_MEM} GiB"
   info "model:     ${OLLAMA_MODEL}"
+  info "extra:     ${OLLAMA_EXTRA_MODELS:-<none>}"
   info "channel:   ${CHANNEL:-<none — main, or --tag>}"
   if [ -f "$CHANNEL_STATE" ]; then info "running:   $(cat "$CHANNEL_STATE")"; fi
 }
@@ -4278,7 +4495,16 @@ COMMANDS:
                   Fleet jobs run at the LOWEST priority: 'apply' also loads a launchd governor that
                   puts the build VM in the background band while the owner, the portal VM or Ollama
                   want the cores, and gives it every idle core otherwise ('priority off' removes it).
-  backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>] | status | off
+  backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>]
+            [--accept-jobs=<patterns> | --no-accept-jobs] [--job-channels <c>] [--job-repos <owner/repo>]
+            [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--token-max-concurrency <n>] [--residency <X>]
+            | accept jobs [--from <patterns>] [--channels <c>] [--repos <owner/repo>] [--off]
+            | accept tokens [--from <patterns>] [--models <m>] [--max-concurrency <n>] [--residency <X>] [--off]
+            | status | off
+                       OPT-IN (Hosting/BackLease §13): the Mac takes NO jobs and serves NO tokens until its owner says
+                       which instances it takes each from. Enrolment asks (defaults offered: jobs from
+                       control.systemorph.com, tokens from *.meshweaver.cloud); headless runs need the flags;
+                       with no answer both stay OFF.
   internal on --tenant <id> --client-id <id> < secret | status | off
                   INTERNAL ONLY — the fleet default: the portal answers at this Mac's private-network
                   name (https://<machine>.net.<domain>) over the private network only, with its
