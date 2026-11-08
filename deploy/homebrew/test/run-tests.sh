@@ -2671,6 +2671,13 @@ ws '{"cores":2}' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d
   && ok "cpuPercent and the network rate are spliced into the host object" || bad "net/cpu splice" "$(ws '{"cores":2}')"
 ws 'null' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"] is None' 2>/dev/null \
   && ok "a degraded host reading stays valid JSON with the new fields too" || bad "net/cpu splice into null" "$(ws null)"
+wsj() { env HOSTJSON='{"cores":2}' NET="$1" MEMEX_BACKLEASE_DIR="$NR/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "%s" "$HOSTJSON"; }; owner_cpu() { :; }; host_cpu() { :; }; net_rate() { printf "%s" "$NET"; }
+  sample_models() { printf "[]"; }; sample_vm() { printf null; }; colima() { return 1; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }
+  OUT="$1"; write_sample; cat "$OUT"' "$SAMPLER" "$NR/out.json"; }
+bad_net=0; for v in '1 2junk' 'x 2' '1 ' ' 2' '12'; do
+  wsj "$v" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"]=={"cores":2}' 2>/dev/null || bad_net=1
+done
+[ "$bad_net" = 0 ] && ok "a malformed network reading (non-numeric, half-empty, one token) splices nothing and the JSON stays valid" || bad "net guard" "$(wsj '1 2junk')"
 rm -rf "$NR"
 
 echo "── token slots: the machine's capacity; the owner's ceiling is optional (Hosting/BackLease §14.5) ──"

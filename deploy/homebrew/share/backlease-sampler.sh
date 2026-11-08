@@ -169,7 +169,8 @@ owner_cpu() {
 
 # host.cpuPercent — the host's CPU busy, in percent of ALL cores (0–100): 100 minus the idle share of a one-second `top`
 # sample (the second of two, so it is a delta, never the since-boot average). Prints nothing — the field is ABSENT —
-# when `top` gives no parseable line. Recorded into the fleet's metric history (MeshWeaver.Plugins Hosting/FleetMetricHistory).
+# when `top` gives no parseable line. MEMEX_SAMPLER_TOP (and MEMEX_SAMPLER_NETSTAT below) are test seams expanded
+# UNQUOTED on purpose, so the override is word-split: give a command whose words contain no spaces. Recorded into the fleet's metric history (MeshWeaver.Plugins Hosting/FleetMetricHistory).
 host_cpu() {
   ${MEMEX_SAMPLER_TOP:-top -l 2 -n 0 -s 1} 2>/dev/null | awk '/^CPU usage:/ {
       for (i = 1; i <= NF; i++) if ($(i+1) ~ /^idle/) { v = $i; gsub(/%/, "", v); idle = v } }
@@ -208,8 +209,13 @@ write_sample() {
   case "$owner" in ''|*[!0-9]*) ;; *) case "$host" in '{'*'}') host="${host%\}},\"ownerCpuPercent\":$owner}" ;; esac ;; esac
   local cpu; cpu="$(host_cpu)"
   case "$cpu" in ''|*[!0-9.]*) ;; *) case "$host" in '{'*'}') host="${host%\}},\"cpuPercent\":$cpu}" ;; esac ;; esac
-  local net; net="$(net_rate)"
-  case "$net" in [0-9]*' '[0-9]*) case "$host" in '{'*'}') host="${host%\}},\"netInBytesPerSec\":${net% *},\"netOutBytesPerSec\":${net#* }}" ;; esac ;; esac
+  local net net_in net_out; net="$(net_rate)"; net_in="${net% *}"; net_out="${net#* }"
+  # each token on its own: two whole numbers or nothing is spliced (never `2junk` into the JSON)
+  case "$net" in *' '*)
+    case "$net_in$net_out" in ''|*[!0-9]*) ;; *)
+      [ -n "$net_in" ] && [ -n "$net_out" ] && case "$host" in '{'*'}') host="${host%\}},\"netInBytesPerSec\":$net_in,\"netOutBytesPerSec\":$net_out}" ;; esac ;;
+    esac ;;
+  esac
   models="$(sample_models)"; m_rc=$?
   vm="$(sample_vm)"; v_rc=$?
   colima status >/dev/null 2>&1; colima_rc=$?
