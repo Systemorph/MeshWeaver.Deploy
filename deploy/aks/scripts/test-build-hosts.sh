@@ -219,6 +219,8 @@ for ch, (tester, portal, runner, mx, pv, mn) in want.items():
     if skip != {"tester", "portal", "oras"}:
         problems.append(f"{ch}: the identity token is not restricted to the build container (skip-containers {sorted(skip)})")
     env = {e["name"]: e for e in build.get("env", [])}
+    if env.get("MW_BUILD_MODULE_HUB_ENABLED", {}).get("value") != "false":
+        problems.append(f"{ch}: the module-hub broker is not OFF by default (MW_BUILD_MODULE_HUB_ENABLED={env.get('MW_BUILD_MODULE_HUB_ENABLED')})")
     if "BUILD_TOKEN" in env:
         problems.append(f"{ch}: BUILD_TOKEN is an environment variable — the worker token must be a mounted file")
     if env.get("BUILD_TOKEN_FILE", {}).get("value") != "/run/build-worker/token":

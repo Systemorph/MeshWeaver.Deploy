@@ -1295,6 +1295,11 @@ buildHosts:
   # cgroup, and the runner REFUSES TO START when the declared slots exceed that (MW_BUILD_STAGE_SLOTS, build-run.py
   # `stage_slots_refusal`) — so lowering `resources` means lowering this too. 1 = every run serial.
   stageSlots: 8
+  # The MODULE-HUB BROKER (MeshWeaver.Plugins Hosting/BuildQueue.md §7.4): a stage names a module and the HOST asks that
+  # module's build hub on the control instance (Hit → the output is fetched and verified; Grant → the stage builds it and the
+  # host uploads it by its hash). Identity is the host's: fingerprints from the pristine tree under the DEFAULT BRANCH's
+  # `moduleHub` declaration, lane and commit from the run. Inert unless a repository declares `moduleHub`. Off by default.
+  moduleHub: false
   # KEDA: polling, the scale-to-zero calm window, and the scale-down stabilization window (longer
   # than a claim's round trip, so a replica is not removed between two runs).
   pollingInterval: 15
