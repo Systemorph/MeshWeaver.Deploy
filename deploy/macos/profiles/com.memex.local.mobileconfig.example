@@ -3,7 +3,7 @@
 <!--
   EXAMPLE managed-preferences profile for a fleet rollout (deploy/macos/README.md §3). An MDM pushes
   this beside the .pkg; the keys land in the com.memex.local domain, which memex-local reads when a flag
-  is not given (`backlease enroll` → ControlUrl, DeploymentId; the daemon postinstall → ServiceUser,
+  is not given (`backlease enroll` → ControlUrl, DeploymentId; `up`/`fleet join` → OwnerId, OwnerEmail; the daemon postinstall → ServiceUser,
   Unattended). Every value below is a PLACEHOLDER — replace the hosts and ids, and regenerate the UUIDs.
 -->
 <plist version="1.0">
@@ -30,6 +30,15 @@
             <!-- The plugin registry the portal consumes (memex-local registry <url>). -->
             <key>RegistryUrl</key>
             <string>https://registry.example.com</string>
+            <!-- REQUIRED: the machine's OWNER — its instance's global administrator, and the person whose
+                 answers the fleet opt-in records. The MeshWeaver user id they sign in as (not the e-mail), and
+                 their e-mail. An unattended install with no owner FAILS rather than run without an administrator.
+                 In Intune, a user-affinity device can fill these from the primary user: {{partialupn}} when the
+                 user id is the UPN prefix, and {{mail}}. -->
+            <key>OwnerId</key>
+            <string>jane.roe</string>
+            <key>OwnerEmail</key>
+            <string>jane.roe@example.com</string>
             <!-- Optional: a release-channel label and a host profile (mac-studio | mac-mini). -->
             <key>Channel</key>
             <string>3-latest</string>
