@@ -874,6 +874,8 @@ OUT="$(lm env FAKE_EP= MEMEX_OLLAMA_MODEL=qwen3:8b bash -c '. "$0"; llm_chat_smo
 OUT="$(lm env FAKE_EP= MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; llm_chat_smoke' "$CLI" 2>&1)"; RC=$?
 [ "$RC" = 0 ] && grep -q "skipped" <<<"$OUT" && ok "chat smoke: skips (loudly) only when no model was chosen" || bad "none skip" "rc=$RC $OUT"
 SO="$(fn_body setup_ollama)"
+grep -q '^  if ! ollama_has_model qwen-small; then' <<<"$SO" && ! grep -q '^  ollama pull' <<<"$SO" \
+  && ok "setup_ollama (which update runs) never pulls unconditionally: a model already present is not fetched, a failed pull warns" || bad "unconditional pull in setup_ollama" "$(grep -n 'ollama pull' <<<"$SO")"
 grep -q "grep -q 'OLLAMA_KV_CACHE_TYPE' \"\$OLLAMA_PLIST_DST\"" <<<"$SO" && ok "an older memex-local Ollama agent without the tuning is rewritten and restarted" || bad "stale agent tuning" ""
 OUT="$(lm env FAKE_EXEC_FAILS=1 bash -c '. "$0"; llm_chat_smoke' "$CLI" 2>&1)"; RC=$?
 [ "$RC" = 1 ] && ok "chat smoke: a pod whose environment cannot be read FAILS (never a skipped pass)" || bad "smoke exec failure passed" "rc=$RC $OUT"

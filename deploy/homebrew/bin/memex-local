@@ -2577,8 +2577,15 @@ setup_ollama() {
   ensure_chat_model
   # Small CPU-friendly model (~400MB) the e2e portal selects ('qwen-small' — see e2e_deploy), so
   # a real chat round runs on any host/CI without the GPU-sized default model.
-  ollama pull qwen2.5:0.5b
-  ollama cp qwen2.5:0.5b qwen-small 2>/dev/null || info "model alias qwen-small already exists"
+  # Pulled only when missing, and a failed pull is a warning: `update` runs this too, and an update on a
+  # Mac that is offline (or whose registry is down) must not abort over a model it already has.
+  if ! ollama_has_model qwen-small; then
+    if ollama pull qwen2.5:0.5b; then
+      ollama cp qwen2.5:0.5b qwen-small 2>/dev/null || info "model alias qwen-small already exists"
+    else
+      warn "ollama pull qwen2.5:0.5b failed — the e2e model is missing until the next update"
+    fi
+  fi
   ok "Ollama ready; the portal addresses it as $OLLAMA_ENDPOINT (admitted by Ollama's Host check)"
 }
 
