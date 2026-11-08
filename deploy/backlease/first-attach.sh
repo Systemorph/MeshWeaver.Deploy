@@ -40,6 +40,10 @@
 #   5. fleet jobs at the LOWEST priority on this Mac: loads the launchd governor (deploy/homebrew/share/buildhost-priority.sh
 #      --install) that puts the build VM's process in the background band while the owner, the portal VM or Ollama want
 #      the cores, and gives it every idle core otherwise (nice/renice do nothing on macOS — see the script's header).
+#   6. FOLLOWS the sealed set from then on (follow-set.py, launchd com.memex.local.buildhost-follow.<profile>): every 5 min
+#      it reads the complete set channel `--follow` (default latest) runs from control and, when the release runs another,
+#      re-applies THIS chart with that set (--reuse-values) — so the host never falls behind what main needs and nobody
+#      re-runs this script to move it. The runners drain their run in hand on the roll. `--follow off` attaches pinned.
 # The set (version + tester/portal/runner digests) is the one the operations record names for `latest`; it is passed,
 # never committed. The runner digest must be a multi-arch index carrying linux/arm64.
 set -euo pipefail
@@ -47,7 +51,7 @@ here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 chart="$here/../helm"
 profile=build api= registry= vault= worker= pull= pulluser= version= tester= portal= runner= pluginsreg= instkey=
 acc_jobs='' acc_tokens='' acc_models='' acc_res=''   # empty = not answered by a flag; "off" = declined
-owner_id='' owner_email=
+owner_id='' owner_email='' follow=latest
 while [ $# -gt 0 ]; do
   # `--flag=value` is the same as `--flag value` (the form memex-local documents for the opt-in flags)
   case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}";; esac
@@ -61,6 +65,7 @@ while [ $# -gt 0 ]; do
     --worker-secret) worker="$2";; --pull-secret) pull="$2";; --pull-user) pulluser="$2";;
     --plugins-registry) pluginsreg="$2";; --instance-key-secret) instkey="$2";;
     --version) version="$2";; --tester) tester="$2";; --portal) portal="$2";; --runner) runner="$2";;
+    --follow) follow="${2:?--follow needs a channel, or off}";;
     *) echo "unknown argument $1" >&2; exit 2;;
   esac; shift 2
 done
@@ -77,6 +82,7 @@ if [ -n "$pluginsreg$instkey" ]; then
   [[ "$pluginsreg" == https://* ]] || { echo "ERROR: --plugins-registry must be https (the instance key rides on it)" >&2; exit 2; }
 fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: --version must be x.y.z" >&2; exit 2; }
+[ "$follow" = off ] || [[ "$follow" =~ ^[a-z][a-z0-9-]{0,62}$ ]] || { echo "ERROR: --follow must be a channel name or off" >&2; exit 2; }
 for d in "$tester" "$portal" "$runner"; do [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "ERROR: $d is not sha256:<64 hex>" >&2; exit 2; }; done
 
 # ── THE OWNER (onboarding rule, 2026-11-08: "in onboarding we collect the owner. he will be global admin") ─────
@@ -157,7 +163,7 @@ runtime="$(k get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeV
   || { echo "ERROR: profile $profile runs '$runtime' — the build host needs containerd 2 or newer (a user-namespaced pod). Nothing was changed." >&2; exit 1; }
 
 # ── preconditions: everything is CHECKED before anything is changed ──────────────────────────────────────────
-echo "== 0/5 preconditions"
+echo "== 0/6 preconditions"
 k get crd scaledobjects.keda.sh -o name >/dev/null 2>&1 \
   || { echo "ERROR: KEDA is not installed in this cluster (no scaledobjects.keda.sh) — the host's scaler needs it; install KEDA first. Nothing was changed." >&2; exit 1; }
 k -n keda wait --for=condition=Available deployment --all --timeout=20s >/dev/null 2>&1 \
@@ -191,7 +197,7 @@ if [ -z "$pluginsreg" ]; then
   echo "   /hosts/inputs names no sealed publication for mac — the host claims with the cluster hosts' plugins contract"
 fi
 
-echo "== 1/5 AppArmor profile mw-build-host in the Colima VM"
+echo "== 1/6 AppArmor profile mw-build-host in the Colima VM"
 printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' '' 'profile mw-build-host flags=(unconfined) {' '  userns,' '}' \
   | vm sudo sh -c 'cat > /etc/apparmor.d/mw-build-host && apparmor_parser --replace /etc/apparmor.d/mw-build-host'
 # The probe runs as the VM's ordinary, UNPRIVILEGED user — as the build container does (uid 1654, no capabilities).
@@ -210,10 +216,10 @@ got="$(vm sysctl -n fs.inotify.max_user_instances)"
 [ "${got:-0}" -ge 8192 ] || { echo "ERROR: fs.inotify.max_user_instances is ${got:-unreadable} in the build VM after setting 8192" >&2; exit 1; }
 echo "   inotify: ${got} instances per user (persisted in /etc/sysctl.d/90-mw-build-host.conf)"
 
-echo "== 2/5 namespace build-mac"
+echo "== 2/6 namespace build-mac"
 k create namespace build-mac --dry-run=client -o yaml | k apply -f - >/dev/null
 
-echo "== 3/5 secrets (values on stdin only — never in a process argument, never printed)"
+echo "== 3/6 secrets (values on stdin only — never in a process argument, never printed)"
 printf '%s' "$worker_value" \
   | k -n build-mac create secret generic build-worker-mac --from-file=token=/dev/stdin --dry-run=client -o yaml \
   | k apply -f - >/dev/null
@@ -236,7 +242,7 @@ fi
 unset worker_value pull_value key_value
 echo "   build-worker-mac and build-pull (image pulls only) applied${instkey:+, and build-registry-key-mac}"
 
-echo "== 4/5 helm upgrade --install build-host-mac ($version)"
+echo "== 4/6 helm upgrade --install build-host-mac ($version)"
 helm upgrade --install build-host-mac "$chart" --kube-context "$ctx" -n build-mac \
   -f "$chart/values.yaml" -f "$here/build-host-mac.values.yaml" \
   --set-string buildHosts.apiUrl="$api" \
@@ -254,10 +260,24 @@ helm upgrade --install build-host-mac "$chart" --kube-context "$ctx" -n build-ma
   --wait=false
 k -n build-mac get deploy,scaledobject,pvc
 
-echo "== 5/5 fleet jobs at the lowest priority (launchd governor for profile $profile)"
+echo "== 5/6 fleet jobs at the lowest priority (launchd governor for profile $profile)"
 # The runners are deployed by now: a governor that cannot load is reported, never a failed attach.
 bash "$here/../homebrew/share/buildhost-priority.sh" --install --profile "$profile" \
   || echo "WARN: the priority governor did not load — the build VM competes at the default band; re-run: bash deploy/homebrew/share/buildhost-priority.sh --install --profile $profile" >&2
+
+echo "== 6/6 follow the sealed set of channel ${follow}"
+# Installed AFTER the runners exist; a follower that cannot load is reported, never a failed attach (the host still runs
+# the set given, and a re-attach installs it again).
+if [ "$follow" = off ]; then
+  if python3 "$here/follow-set.py" --uninstall --profile "$profile" >/dev/null; then
+    echo "   --follow off: this host stays on $version until it is attached again"
+  else
+    echo "WARN: the follow agent could not be removed — it may still move this host off $version; remove it: python3 deploy/backlease/follow-set.py --uninstall --profile $profile" >&2
+  fi
+else
+  python3 "$here/follow-set.py" --install --profile "$profile" --follow "$follow" --api "$api" --chart "$chart" \
+    || echo "WARN: the follow agent did not load — this host stays on $version until it is attached again; re-run: python3 deploy/backlease/follow-set.py --install --profile $profile --follow $follow --api $api" >&2
+fi
 
 echo "== the owner's opt-in (jobs: ${acc_jobs:-unchanged} · tokens: ${acc_tokens:-unchanged})"
 # The answers live in the back-lease layer the portal's heartbeat reads (the runners alone carry no heartbeat). Both were
