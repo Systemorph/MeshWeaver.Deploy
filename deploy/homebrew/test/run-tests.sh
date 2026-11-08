@@ -957,7 +957,48 @@ OUT="$(ow bash -c '. "$0"; ensure_owner_admin carol not-an-email require; echo S
 grep -q SURVIVED <<<"$OUT" && bad "a malformed e-mail accepted" "$OUT" || ok "a malformed owner e-mail is refused"
 grep -q 'Auth__GlobalAdmins\|Instance__Owner' "$HERE/../share/"*.yaml && bad "a SHARED values file names the owner (it belongs to each install's own overlay)" "$(grep -n 'Auth__GlobalAdmins\|Instance__Owner' "$HERE/../share/"*.yaml)" \
   || ok "no shared values file (defaults, template, mode layers) names an owner or an admin"
-B="$(fn_body cmd_up)"; grep -B1 '^  ensure_overlay$' <<<"$B" | grep -q '^  OWNER_REQUIRED=require$' && ok "up REQUIRES an owner before anything is deployed" || bad "up owner requirement" ""
+B="$(fn_body cmd_up)"; grep -B1 '^  ensure_overlay$' <<<"$B" | grep -q '^  OWNER_REQUIRED=require-fresh$' && ok "up REQUIRES an owner on a fresh install before anything is deployed" || bad "up owner requirement" ""
+# require-fresh: a FRESH install (this run generated the overlay) fails; an existing ownerless one — which the
+# unattended daemon re-runs `up` on at every start — warns, so a running Mac is never halted by its restart.
+seed_overlay
+OUT="$(ow env OVERLAY_CREATED=1 bash -c '. "$0"; ensure_owner_admin "" "" require-fresh; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+grep -q SURVIVED <<<"$OUT" && bad "a fresh ownerless install came up" "$OUT" || ok "up on a FRESH install with no owner fails"
+OUT="$(ow bash -c '. "$0"; ensure_owner_admin "" "" require-fresh; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+grep -q SURVIVED <<<"$OUT" && grep -q "NO OWNER" <<<"$OUT" && ok "up on an EXISTING ownerless install (the daemon's restart) warns loudly and carries on" || bad "existing ownerless up" "$OUT"
+# The config section without a memex_portal map, and NOT last in the file: the map goes INSIDE config.
+printf 'secrets:\n  memex_portal:\n    X: "1"\nconfig:\n  other: "y"\ningress:\n  host: "memex.localhost"\n' > "$OOV"
+ow bash -c '. "$0"; overlay_set_portal_config Auth__GlobalAdmins__0 dave' "$CLI" >/dev/null 2>&1
+EXP="$(printf 'secrets:\n  memex_portal:\n    X: "1"\nconfig:\n  other: "y"\n  memex_portal:\n    Auth__GlobalAdmins__0: "dave"\ningress:\n  host: "memex.localhost"')"
+[ "$(cat "$OOV")" = "$EXP" ] && ok "a config section with no memex_portal map gets one INSIDE it (never appended under the last section)" || bad "map insertion" "$(cat "$OOV")"
+printf 'ingress:\n  host: "memex.localhost"\n' > "$OOV"
+ow bash -c '. "$0"; overlay_set_portal_config Auth__GlobalAdmins__0 dave' "$CLI" >/dev/null 2>&1
+tail -3 "$OOV" | tr '\n' '|' | grep -q '^config:|  memex_portal:|    Auth__GlobalAdmins__0: "dave"|$' && ok "an overlay with no config section gets one" || bad "no config section" "$(cat "$OOV")"
+# A different owner never inherits the previous owner's e-mail.
+seed_overlay
+ow env MEMEX_OWNER=alice MEMEX_OWNER_EMAIL=alice@example.com bash -c '. "$0"; ensure_owner_admin' "$CLI" >/dev/null 2>&1
+ow bash -c '. "$0"; cmd_owner --id bob' "$CLI" >/dev/null 2>&1 </dev/null
+grep -qx '    Auth__GlobalAdmins__0: "bob"' "$OOV" && ! grep -q 'alice@example.com' "$OOV" \
+  && ok "changing the owner by id alone drops the previous owner's e-mail (never attributed to the new owner)" || bad "email inherited" "$(cat "$OOV")"
+# The flags themselves, executed: fleet join --owner/--owner-email, and first-attach --owner/--owner-email.
+FA="$HERE/../../backlease/first-attach.sh"
+FAO="$(mktemp -d)"; mkdir -p "$FAO/bin"
+cat > "$FAO/bin/memex-local" <<STUB
+#!/bin/bash
+echo "\$*" >> "$FAO/calls"
+case "\$*" in "owner status") [ -f "$FAO/has" ] && echo " ok  instance OWNER (global administrator): bob <bob@example.com>" || echo "warn no OWNER"; exit 0 ;; owner\ *) touch "$FAO/has"; exit 0 ;; esac
+exit 0
+STUB
+chmod +x "$FAO/bin/memex-local"
+FA_ARGS=(--api https://ops.example.test/api/builds --registry r.example.test --vault v --worker-secret w --pull-secret p --pull-user u --version 1.2.3
+  --tester "sha256:$(printf 'a%.0s' $(seq 64))" --portal "sha256:$(printf 'b%.0s' $(seq 64))" --runner "sha256:$(printf 'c%.0s' $(seq 64))")
+OUT="$(PATH="$FAO/bin:$PATH" bash "$FA" "${FA_ARGS[@]}" </dev/null 2>&1)"; RC=$?
+[ "$RC" = 2 ] && grep -q "this Mac has no OWNER" <<<"$OUT" && ! grep -q "^owner --" "$FAO/calls" \
+  && ok "first-attach (executed) refuses a Mac with no owner before any change" || bad "first-attach ownerless" "rc=$RC $OUT"
+OUT="$(PATH="$FAO/bin:$PATH" MEMEX_HEADLESS=1 bash "$FA" "${FA_ARGS[@]}" --owner bob --owner-email bob@example.com </dev/null 2>&1)"
+grep -qx 'owner --id bob --email bob@example.com' "$FAO/calls" && grep -q "owner: bob" <<<"$OUT" \
+  && ok "first-attach --owner/--owner-email (executed) records the owner through memex-local and names who answers the opt-in" || bad "first-attach --owner" "$OUT
+$(cat "$FAO/calls")"
+rm -rf "$FAO"
 B="$(fn_body cmd_fleet)"; grep -A1 'OWNER_REQUIRED=require' <<<"$B" | grep -q 'ensure_overlay' \
   && [ "$(grep -n 'OWNER_REQUIRED=require' <<<"$B" | head -1 | cut -d: -f1)" -lt "$(grep -n 'cmd_backlease enroll' <<<"$B" | head -1 | cut -d: -f1)" ] \
   && ok "fleet join collects the owner FIRST — before the opt-in questions that owner answers" || bad "fleet join owner order" ""
@@ -1308,7 +1349,8 @@ M="$(printf 'a%.0s' $(seq 64))"; C="$(printf 'b%.0s' $(seq 64))"
 # (payload built first: bash 3.2 splits escaped quotes nested inside "$(…)")
 P2='{"v":1,"d":"studio-2","m":"'"$M"'","c":"'"$C"'"}'; P9='{"v":1,"d":"studio-9","m":"'"$M"'","c":"'"$C"'"}'
 sealed="$(seal "$P2" "$KEY")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/code.txt"
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/code.txt" 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/code.txt" --owner owner1 --owner-email owner1@example.com 2>&1)"; RC=$?
+grep -qx '    Auth__GlobalAdmins__0: "owner1"' "$FJ/home/.memex-local/values.local.yaml" && ok "fleet join --owner/--owner-email (executed) records the owner in the overlay" || bad "fleet join --owner flag" "$(grep -n Owner "$FJ/home/.memex-local/values.local.yaml")"
 case "$RC:$OUT" in 0:*"joined as 'studio-2'"*) ok "fleet join opens a code sealed to its key and joins" ;; *) bad "fleet join with a good code" "rc=$RC: $OUT" ;; esac
 OUT2="$(env PATH="$STUBS:$PATH" HOME="$FJ/home2" MEMEX_LOCAL_HOME="$FJ/home2/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --code-file "$FJ/code.txt" 2>&1 </dev/null)"; RC2=$?
 case "$RC2:$OUT2" in 0:*) bad "an unattended fleet join without an owner joined" "$OUT2" ;; *"no OWNER"*) ok "an unattended fleet join without an owner FAILS before anything is joined" ;; *) bad "ownerless join" "rc=$RC2 $OUT2" ;; esac

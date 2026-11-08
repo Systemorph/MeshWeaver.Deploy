@@ -477,6 +477,7 @@ ensure_overlay_file() {
   sed -e "s|__PG_PASSWORD__|${pg_pw}|g" \
       -e "s|__AI_MASTER_KEY__|${ai_key}|g" \
       "$share/values.local.yaml" > "$OVERLAY"
+  OVERLAY_CREATED=1
   chmod 600 "$OVERLAY"
   # 🚨 Nothing to hand-edit any more. This template used to ship an identity DECISION —
   # dev login on, `<your-username>` as the sole administrator, and a commented Entra block
@@ -2049,20 +2050,33 @@ valid_owner_email() { case "$1" in *[!A-Za-z0-9._%+@-]*|*@*@*) return 1 ;; ?*@?*
 # Sets config.memex_portal.<key> in the overlay to <value>, idempotently: an existing line under
 # config → memex_portal is rewritten in place, otherwise the key goes in right after that map's header
 # (created when the overlay has none). The secrets → memex_portal map is never touched. 0600 kept.
-overlay_set_portal_config() {
+overlay_set_portal_config() {   # $3 = "delete": remove the key instead of setting it
   local key="$1" value="$2" tmp
   [ -f "$OVERLAY" ] || die "no overlay at $OVERLAY — run 'memex-local up' first"
   tmp="$(mktemp "${OVERLAY}.XXXXXX")" || die "cannot write beside $OVERLAY"
-  awk -v k="$key" -v v="$value" '
-    function emit() { print "    " k ": \"" v "\""; done = 1 }
-    /^[^ #][^:]*:/ { if (inp && !done) emit(); top = $1; inp = 0; if ($1 == "config:") sawconfig = 1 }
-    top == "config:" && $0 == "  memex_portal:" { print; inp = 1; next }
-    inp && /^  [^ #]/ { if (!done) emit(); inp = 0 }
-    inp && $1 == k ":" { if (!done) emit(); next }
+  # Three cases, all inside the TOP-LEVEL `config:` section: the key exists under its memex_portal map
+  # (rewritten in place); the map exists without it (inserted at the map's end); `config:` has no such map
+  # (one is added at the END of the config section — never at the end of the file, where it would land
+  # under whatever section happens to be last). No `config:` at all: both are appended.
+  awk -v k="$key" -v v="$value" -v del="${3:-}" '
+    function kv() { if (del == "") print "    " k ": \"" v "\""; done = 1 }
+    function close_config() {
+      if (incfg && !done && del == "") { if (!sawmap) print "  memex_portal:"; kv() }
+    }
+    /^[^ #][^:]*:/ {                       # a top-level key ends the previous section
+      if (inmap && !done) kv()
+      if (incfg) close_config()
+      inmap = 0; incfg = ($1 == "config:"); if (incfg) sawconfig = 1
+      print; next
+    }
+    incfg && $0 == "  memex_portal:" { sawmap = 1; inmap = 1; print; next }
+    inmap && /^  [^ #]/ { if (!done) kv(); inmap = 0 }
+    inmap && $1 == k ":" { if (!done) kv(); next }
     { print }
     END {
-      if (inp && !done) emit()
-      else if (!done) { if (!sawconfig) print "config:"; print "  memex_portal:"; print "    " k ": \"" v "\"" }
+      if (inmap && !done) kv()
+      if (incfg) close_config()
+      if (!sawconfig && del == "") { print "config:"; print "  memex_portal:"; kv() }
     }
   ' "$OVERLAY" > "$tmp" || { rm -f "$tmp"; die "could not rewrite $OVERLAY"; }
   [ -s "$tmp" ] || { rm -f "$tmp"; die "the rewrite of $OVERLAY came out empty — left unchanged"; }
@@ -2095,19 +2109,29 @@ ensure_owner_admin() {
         "$(id -un 2>/dev/null)")"
   [ -n "$id" ] || id="$(overlay_value "$OWNER_KEY")"   # an install that recorded only the admin key (before Instance__Owner__*)
   if [ -z "$id" ]; then
-    if [ "${3:-}" = "require" ]; then
+    # "require": an onboarding (fleet join) — always. "require-fresh": `up`, which the unattended daemon also
+    # re-runs at every start — required for a FRESH install (this run generated the overlay), a loud warning
+    # for an existing ownerless one, so a running fleet Mac is never halted by its own restart.
+    if [ "${3:-}" = "require" ] || { [ "${3:-}" = "require-fresh" ] && [ "${OVERLAY_CREATED:-}" = "1" ]; }; then
       die "no OWNER for this instance — an install never comes up without its administrator. Give one: memex-local owner --id <user-id> --email <e-mail> (or MEMEX_OWNER / MEMEX_OWNER_EMAIL, or the managed preferences OwnerId / OwnerEmail), then re-run"
     fi
     warn "this instance has NO OWNER, so no global administrator — memex-local owner --id <user-id> --email <e-mail>"
     return 0
   fi
   valid_owner_id "$id" || die "owner: '$id' is not a user id (letters, digits and . _ @ - only)"
-  email="$(owner_field "${2:-}" "${MEMEX_OWNER_EMAIL:-}" OwnerEmail "$OWNER_EMAIL_KEY" "The owner's e-mail (the account they sign in with)" "")"
-  if [ -n "$email" ] && ! valid_owner_email "$email"; then die "owner: '$email' is not an e-mail address"; fi
-  [ -n "$email" ] || [ "${3:-}" != "require" ] || owner_can_ask \
-    || warn "owner '$id' has no e-mail recorded — the portal cannot match it against the signed-in account (memex-local owner --email <e-mail>)"
   have_id="$(overlay_value "$OWNER_KEY")"; have_email="$(overlay_value "$OWNER_EMAIL_KEY")"
+  # A DIFFERENT owner never inherits the previous owner's recorded e-mail: the overlay's e-mail is read only
+  # for the owner it was recorded with. An id change without an e-mail removes the old one.
+  local email_key="$OWNER_EMAIL_KEY"
+  if [ -n "$have_id" ] && [ "$have_id" != "$id" ]; then email_key="__no_such_key__"; fi
+  email="$(owner_field "${2:-}" "${MEMEX_OWNER_EMAIL:-}" OwnerEmail "$email_key" "The owner's e-mail (the account they sign in with)" "")"
+  if [ -n "$email" ] && ! valid_owner_email "$email"; then die "owner: '$email' is not an e-mail address"; fi
+  [ -n "$email" ] || [ -z "${3:-}" ] || owner_can_ask \
+    || warn "owner '$id' has no e-mail recorded — the portal cannot match it against the signed-in account (memex-local owner --email <e-mail>)"
   [ "$have_id" = "$id" ] || { overlay_set_portal_config "$OWNER_KEY" "$id"; changed=1; }
+  if [ -z "$email" ] && [ -n "$have_email" ] && [ -n "$have_id" ] && [ "$have_id" != "$id" ]; then
+    overlay_set_portal_config "$OWNER_EMAIL_KEY" "" delete; changed=1
+  fi
   [ "$(overlay_value "$OWNER_ID_KEY")" = "$id" ] || { overlay_set_portal_config "$OWNER_ID_KEY" "$id"; changed=1; }
   if [ -n "$email" ] && [ "$have_email" != "$email" ]; then overlay_set_portal_config "$OWNER_EMAIL_KEY" "$email"; changed=1; fi
   if [ -n "$changed" ]; then
@@ -4217,8 +4241,9 @@ cmd_up() {
   done
 
   preflight
-  # An install collects its OWNER, the global administrator — and without one it FAILS (ensure_owner_admin).
-  OWNER_REQUIRED=require
+  # An install collects its OWNER, the global administrator — a FRESH one without an owner FAILS
+  # (ensure_owner_admin; an existing ownerless install, which the unattended daemon re-runs `up` on, warns).
+  OWNER_REQUIRED=require-fresh
   ensure_overlay
   start_colima                                   # §2
 
