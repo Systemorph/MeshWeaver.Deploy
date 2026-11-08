@@ -30,7 +30,7 @@ exactly the four set values (`--reuse-values`, the profile's own kube context).
 - **A chart change** still needs a re-attach, which re-copies the chart.
 
 Measured motivation, why the host pulls rather than control pushing, and how to operate it: MeshWeaver.Plugins
-`Hosting/MacStudioAttachRunbook.md` §7.
+`Hosting/MacStudioAttachRunbook.md` §8.
 
 ## Fleet jobs run at the lowest priority on a leased Mac
 
