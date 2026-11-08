@@ -1727,7 +1727,14 @@ llm_chat_smoke() {
   endpoint="$(printf '%s\n' "$envs" | sed -n 's/^OpenAICompatible__Endpoint=//p' | head -1)"
   model="$(printf '%s\n' "$envs" | sed -n 's/^OpenAICompatible__Models__0=//p' | head -1)"
   if [ -z "$endpoint" ] || [ -z "$model" ]; then
-    warn "local model: the portal names no OpenAI-compatible endpoint/model (MEMEX_OLLAMA_MODEL=none, or an overlay that blanks them) — chat smoke skipped"
+    # A fair skip ONLY when this install chose no model. Configured here but invisible in the pod (a
+    # chart that stopped mapping the key, an overlay that blanks it) is a failure, never a vacuous pass.
+    local want; want="$(effective_chat_model)"
+    if [ -n "$want" ]; then
+      warn "chat smoke: this install configures the local model '$want', but the portal pod carries no OpenAICompatible__Endpoint/__Models__0 (endpoint='${endpoint}', model='${model}') — check the ConfigMap memex-portal-config and $OVERLAY"
+      return 1
+    fi
+    warn "local model: none chosen (MEMEX_OLLAMA_MODEL=none) and the portal names none — chat smoke skipped"
     return 0
   fi
   step "Chat smoke: a real completion from inside the portal pod ($model at $endpoint)"
@@ -1736,16 +1743,25 @@ llm_chat_smoke() {
     code="$(curl -sS -o /tmp/memex-llm-smoke.json -w "%{http_code}" -m "${2:-600}" \
       -H "Authorization: Bearer ${OpenAICompatible__ApiKey:-ollama}" -H "Content-Type: application/json" \
       -d "{\"model\":\"$m\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word OK.\"}],\"max_tokens\":256,\"stream\":false}" \
-      "${OpenAICompatible__Endpoint%/}/chat/completions" 2>/dev/null)" || true
-    printf "%s\n" "${code:-000}"; head -c 300 /tmp/memex-llm-smoke.json 2>/dev/null; rm -f /tmp/memex-llm-smoke.json' \
+      "${OpenAICompatible__Endpoint%/}/chat/completions" 2>/dev/null)"; rc=$?
+    printf "%s %s\n" "${code:-000}" "$rc"; head -c 300 /tmp/memex-llm-smoke.json 2>/dev/null; rm -f /tmp/memex-llm-smoke.json' \
     _ "$model" "${MEMEX_LLM_SMOKE_TIMEOUT:-600}" 2>&1)" || true
-  code="$(printf '%s\n' "$out" | head -1)"
+  local first rc body
+  first="$(printf '%s\n' "$out" | head -1)"
+  code="${first%% *}"; rc="${first#* }"; [ "$rc" = "$first" ] && rc=""
+  body="$(printf '%s\n' "$out" | sed -n '2,$p')"
+  # 200 is not enough on its own: curl must have finished the transfer (a timeout mid-body still
+  # reports the status line it got) and the answer must be a chat completion.
+  if [ "$code" = "200" ] && { [ "$rc" != "0" ] || ! grep -q '"choices"' <<<"$body"; }; then
+    warn "chat smoke: HTTP 200 but the answer is incomplete (curl exit ${rc:-?}; no \"choices\" in: $(printf '%s' "$body" | tr '\n' ' ' | cut -c1-160))"
+    return 1
+  fi
   case "$code" in
     200) ok "chat smoke: HTTP 200 from $model through $endpoint (inside the portal pod)"; return 0 ;;
     403) warn "chat smoke: HTTP 403 from $endpoint — Ollama refused the Host header '$(url_hostport "$endpoint")'. Ollama on loopback admits only IP/localhost/*.local/*.internal hosts; the portal must use $OLLAMA_ENDPOINT. Remove the OpenAICompatible__Endpoint line from $OVERLAY (or fix it) and run 'memex-local update --skip-image'" ;;
     404) warn "chat smoke: HTTP 404 — Ollama does not have model '$model' (ollama pull $model on this Mac, then 'memex-local update --skip-image')" ;;
     000) warn "chat smoke: no answer from $endpoint inside the pod (Ollama down? 'ollama serve' / 'brew services start ollama'; the VM reaches it at $(llm_host_ip):11434)" ;;
-    *)   warn "chat smoke: HTTP $code from $endpoint for $model: $(printf '%s\n' "$out" | sed -n '2,$p' | tr '\n' ' ' | cut -c1-200)" ;;
+    *)   warn "chat smoke: HTTP $code from $endpoint for $model: $(printf '%s' "$body" | tr '\n' ' ' | cut -c1-200)" ;;
   esac
   return 1
 }
@@ -2534,6 +2550,13 @@ setup_ollama() {
     start_ollama
   else
     info "ollama already serving on :11434"
+    # memex-local's own agent written before the tuning env existed: rewrite it (same bind) and restart.
+    if [ -f "$OLLAMA_PLIST_DST" ] && ! grep -q 'OLLAMA_KV_CACHE_TYPE' "$OLLAMA_PLIST_DST" 2>/dev/null; then
+      local bind; bind="$(grep -Eo '<string>[0-9.]+:11434</string>' "$OLLAMA_PLIST_DST" | head -1 | sed -E 's#<string>([0-9.]+):11434</string>#\1#')" || bind=""
+      info "memex-local's Ollama agent predates the tuning (${OLLAMA_TUNING_ENV[*]}) — rewriting it and restarting Ollama"
+      install_ollama_agent "${bind:-127.0.0.1}"
+      ollama_wait_ready || warn "ollama did not come back on :11434 after the tuning restart"
+    fi
     # An Ollama that is ALREADY running is not trusted to be on loopback: an earlier memex-local bound
     # every interface, and a hand-started or brew-services Ollama may carry OLLAMA_HOST=0.0.0.0.
     if ollama_listens_lan; then

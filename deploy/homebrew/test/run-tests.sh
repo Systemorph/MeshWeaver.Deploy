@@ -851,7 +851,7 @@ cat > "$LMH/stubs/kubectl" <<'STUB'
 case "$*" in
   *"-- env") [ -n "${FAKE_EXEC_FAILS:-}" ] && exit 1
              printf 'OpenAICompatible__Endpoint=%s\nOpenAICompatible__Models__0=qwen3.8:27b-mlx\n' "${FAKE_EP-http://ollama.memex.svc.cluster.local:11434/v1}" ;;
-  *"sh -c"*) printf '%s\n%s\n' "${FAKE_SMOKE_CODE:-200}" '{"choices":[{"message":{"content":"OK"}}]}' ;;
+  *"sh -c"*) printf '%s %s\n%s\n' "${FAKE_SMOKE_CODE:-200}" "${FAKE_CURL_RC:-0}" "${FAKE_SMOKE_BODY-{\"choices\":[{\"message\":{\"content\":\"OK\"}}]}}" ;;
 esac
 exit 0
 STUB
@@ -865,6 +865,16 @@ for c in 404 500 000; do
   OUT="$(lm env FAKE_SMOKE_CODE=$c bash -c '. "$0"; llm_chat_smoke' "$CLI" 2>&1)"; RC=$?
   [ "$RC" = 1 ] && ok "chat smoke: HTTP $c fails" || bad "smoke $c passed" "$OUT"
 done
+OUT="$(lm env FAKE_SMOKE_CODE=200 FAKE_CURL_RC=28 bash -c '. "$0"; llm_chat_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && grep -q "incomplete" <<<"$OUT" && ok "chat smoke: a 200 whose transfer did not finish (curl exit 28) FAILS" || bad "smoke curl rc ignored" "rc=$RC $OUT"
+OUT="$(lm env FAKE_SMOKE_CODE=200 FAKE_SMOKE_BODY='{"error":"x"}' bash -c '. "$0"; llm_chat_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && ok "chat smoke: a 200 that is not a chat completion (no choices) FAILS" || bad "smoke body ignored" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EP= MEMEX_OLLAMA_MODEL=qwen3:8b bash -c '. "$0"; llm_chat_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && grep -q "carries no OpenAICompatible__Endpoint" <<<"$OUT" && ok "chat smoke: a model configured here but invisible in the pod FAILS (never a vacuous skip)" || bad "invisible config skipped" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EP= MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; llm_chat_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && grep -q "skipped" <<<"$OUT" && ok "chat smoke: skips (loudly) only when no model was chosen" || bad "none skip" "rc=$RC $OUT"
+SO="$(fn_body setup_ollama)"
+grep -q "grep -q 'OLLAMA_KV_CACHE_TYPE' \"\$OLLAMA_PLIST_DST\"" <<<"$SO" && ok "an older memex-local Ollama agent without the tuning is rewritten and restarted" || bad "stale agent tuning" ""
 OUT="$(lm env FAKE_EXEC_FAILS=1 bash -c '. "$0"; llm_chat_smoke' "$CLI" 2>&1)"; RC=$?
 [ "$RC" = 1 ] && ok "chat smoke: a pod whose environment cannot be read FAILS (never a skipped pass)" || bad "smoke exec failure passed" "rc=$RC $OUT"
 OUT="$(lm env FAKE_SMOKE_CODE=403 bash -c '. "$0"; llm_chat_smoke_or_die; echo SURVIVED' "$CLI" 2>&1)"; RC=$?
