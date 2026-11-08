@@ -3584,6 +3584,22 @@ class SharedTree:
                 # inode, and readers never take a retired generation anyway (reader(): it must still be `current`)
             finally:
                 fh.close()
+        # a reader that opened a lock in the window after its generation was deleted recreates the file (`a+`) on a
+        # new inode, finds the generation retired and closes it: sweep those orphans, each only while nobody holds it
+        cur_lock = os.path.basename(cur) + ".lock" if cur else None
+        for name in sorted(os.listdir(self.locks)) if os.path.isdir(self.locks) else []:
+            if not name.endswith(".lock") or name == cur_lock or os.path.isdir(os.path.join(self.gens, name[:-5])):
+                continue
+            lock = os.path.join(self.locks, name)
+            fh = self._lock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if fh is None:
+                continue                        # a reader is mid re-check: it closes and the next collect sweeps it
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
+            finally:
+                fh.close()
         return gone
 
 
@@ -6373,6 +6389,24 @@ def self_test() -> int:
             check("shared/the generation a reader holds is NEVER deleted under it", os.path.isdir(g1) and st_.current() == g2)
         check("shared/once released, the old generation is collected", SharedTree(sroot, "R").collect() == [os.path.basename(g1)]
               and not os.path.exists(g1))
+        # a reader that re-opened a lock after its generation was deleted leaves an orphan lock file: the next collect
+        # sweeps it, but never one a reader still holds, and never the current generation's lock
+        import fcntl as _fc
+        st_o = SharedTree(sroot, "R")
+        orphan_a, orphan_b = os.path.join(st_o.locks, "gen-orphan-a.lock"), os.path.join(st_o.locks, "gen-orphan-b.lock")
+        for o in (orphan_a, orphan_b):
+            open(o, "a").close()
+        cur_lock_ = st_o._lock_of(st_o.current())
+        open(cur_lock_, "a").close()
+        held_o = SharedTree._lock(orphan_b, _fc.LOCK_SH | _fc.LOCK_NB)
+        st_o.collect()
+        check("shared/an orphan lock (its generation gone) is swept by collect", not os.path.exists(orphan_a))
+        check("shared/an orphan lock a reader still holds is kept (negative control)", os.path.exists(orphan_b))
+        check("shared/the current generation's lock is never swept", os.path.exists(cur_lock_))
+        if held_o is not None:
+            held_o.close()
+        st_o.collect()
+        check("shared/once released, the held orphan is swept too", not os.path.exists(orphan_b))
         # a RETIRED generation (here: one a failed collect left behind) is never handed to a reader, only the current one
         with st_.writer() as w_r:
             g_old = st_.current(); g_new = w_r.stage(); fill(g_new, "gen2b")
