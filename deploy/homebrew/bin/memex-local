@@ -2217,6 +2217,19 @@ llm_chat_smoke() {
 # A REAL embedding from INSIDE the portal pod, through the provider, endpoint and model the portal was
 # configured with, and of the width the platform sized the vector columns for. 0 on success; otherwise
 # names the cause and returns 1. A configured-but-invisible embedding is a failure, never a vacuous pass.
+# Whether endpoint URL $1 stays on this Mac: an in-cluster or loopback name (the Ollama Service, localhost,
+# *.local, the VM's host aliases) or a private address (the VM's gateway to the Mac, 192.168.5.2 on Colima).
+# Anything else is a
+# request that leaves the machine — a cloud API reached under a local-sounding provider name.
+endpoint_on_this_mac() {
+  local h; h="$(url_hostport "$1")"; h="${h%:*}"; h="${h#[}"; h="${h%]}"
+  case "$h" in
+    localhost|*.localhost|*.local|*.internal|*.svc|ollama|::1|127.*|10.*|192.168.*|169.254.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 embed_smoke() {
   local envs endpoint model provider want_dim out code dim
   if ! envs="$(kubectl -n "$NAMESPACE" exec deploy/memex-portal-deployment -c memex-portal -- env 2>/dev/null)"; then
@@ -2236,7 +2249,16 @@ embed_smoke() {
   fi
   case "$provider" in Ollama|ollama|OpenAICompatible|openaicompatible) ;;
     *) warn "embedding smoke: the portal's Embedding__Provider is '${provider}', not the local Ollama — a Mac install embeds on this Mac"; return 1 ;; esac
+  # The provider NAME is not where the request goes: an OpenAI-compatible (or Ollama) provider pointed at a
+  # cloud host through the overlay would pass a name check and still embed off this Mac.
+  if ! endpoint_on_this_mac "$endpoint"; then
+    warn "embedding smoke: the portal's Embedding__Endpoint '$endpoint' is not on this Mac — a Mac install embeds on this Mac (the auto layer uses $OLLAMA_ENDPOINT; check $OVERLAY)"
+    return 1
+  fi
   want_dim="$(embed_model_dimensions "$model")"
+  # A model the table does not size (named through the owner's overlay, which never passes ensure_embed_model)
+  # is sized 1536 by the platform (EmbeddingOptions' unknown-model default), so that is the width to expect.
+  [ -n "$want_dim" ] || want_dim=1536
   step "Embedding smoke: a real embedding from inside the portal pod ($model at $endpoint)"
   out="$(kubectl -n "$NAMESPACE" exec deploy/memex-portal-deployment -c memex-portal -- sh -c '
     code="$(curl -sS -o /tmp/memex-embed-smoke.json -w "%{http_code}" -m 120 \
@@ -2252,7 +2274,7 @@ embed_smoke() {
       if [ -z "$dim" ] || [ "$dim" = "0" ]; then
         warn "embedding smoke: HTTP 200 but no embedding vector in the answer: $(printf '%s' "$out" | sed -n 2p | cut -c1-160)"; return 1
       fi
-      if [ -n "$want_dim" ] && [ "$dim" != "$want_dim" ]; then
+      if [ "$dim" != "$want_dim" ]; then
         warn "embedding smoke: $model returned a ${dim}-dim vector, but the platform sizes its vector columns ${want_dim} for it — every insert would fail"; return 1
       fi
       ok "embedding smoke: HTTP 200, a ${dim}-dim vector from $model through $endpoint (inside the portal pod)"; return 0 ;;
@@ -4837,7 +4859,11 @@ cmd_status() {
   step "Health"
   # Diagnostic: report every check, never abort the rest of `status` on a red one.
   verify_usable || true
-  if colima_running; then llm_chat_smoke || true; embed_smoke || true; fi
+  if colima_running; then
+    llm_chat_smoke || true
+    # Only once the portal exists (as doctor does): before that there is no pod environment to read.
+    if kubectl -n "$NAMESPACE" get deploy/memex-portal-deployment >/dev/null 2>&1; then embed_smoke || true; fi
+  fi
   ocr_vision_status || true
 }
 

@@ -916,7 +916,7 @@ grep -qx '    Embedding__Provider: "Ollama"' <<<"$EM" && grep -qx "    Embedding
 lm env MEMEX_OLLAMA_MODEL=none MEMEX_EMBED_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
 grep -q 'Embedding__\|memex_portal:' "$AUTO" && bad "MEMEX_EMBED_MODEL=none still configures embeddings" "$(cat "$AUTO")" || ok "MEMEX_EMBED_MODEL=none configures no embeddings (and writes no empty memex_portal map)"
 lm env MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
-grep -q 'Models__0' "$AUTO" || { grep -qx '    Embedding__Model: "bge-m3"' "$AUTO" && ok "no chat model still keeps local embeddings"; } || bad "no-chat layer lost embeddings" "$(cat "$AUTO")"
+if ! grep -q 'Models__0' "$AUTO" && grep -qx '    Embedding__Model: "bge-m3"' "$AUTO"; then ok "no chat model still keeps local embeddings"; else bad "no-chat layer names a chat model or lost embeddings" "$(cat "$AUTO")"; fi
 if command -v helm >/dev/null 2>&1; then
   lm env MEMEX_OLLAMA_MODEL=qwen3:8b FAKE_TAGS='{"name":"qwen3:8b"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
   R="$(helm template memex "$HERE/../../helm" -f "$HERE/../../helm/values.yaml" -f "$DEF" -f "$AUTO" 2>&1)"
@@ -955,6 +955,14 @@ OUT="$(lm env FAKE_SMOKE_BODY='{"error":"x"}' bash -c '. "$0"; embed_smoke' "$CL
 [ "$RC" = 1 ] && ok "embedding smoke: a 200 with no vector FAILS" || bad "embed body ignored" "rc=$RC $OUT"
 OUT="$(lm env FAKE_EPROV=AzureFoundry bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
 [ "$RC" = 1 ] && grep -q "embeds on this Mac" <<<"$OUT" && ok "embedding smoke: a CLOUD embedding provider on a Mac install FAILS" || bad "cloud provider passed" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EPROV=OpenAICompatible FAKE_EP=https://api.openai.com/v1 bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && grep -q "is not on this Mac" <<<"$OUT" && ok "embedding smoke: an OpenAI-compatible provider pointed at a CLOUD host FAILS (the endpoint decides, not the name)" || bad "cloud endpoint passed" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EP=http://192.168.5.2:11434/v1 bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "embedding smoke: the VM's gateway to the Mac is on this Mac" || bad "gateway endpoint refused" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EMODEL=custom-embed FAKE_DIM=1024 bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && grep -q "sizes its vector columns 1536" <<<"$OUT" && ok "embedding smoke: an overlay model the table does not size is held to the platform's 1536 default (never a skipped width check)" || bad "unsized overlay model passed" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EMODEL=custom-embed FAKE_DIM=1536 bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "embedding smoke: …and passes when it returns 1536" || bad "unsized 1536 refused" "rc=$RC $OUT"
 OUT="$(lm env FAKE_EP= bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
 [ "$RC" = 1 ] && grep -q "carries no Embedding__Endpoint" <<<"$OUT" && ok "embedding smoke: configured here but invisible in the pod FAILS" || bad "invisible embed skipped" "rc=$RC $OUT"
 OUT="$(lm env FAKE_EP= MEMEX_EMBED_MODEL=none bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
