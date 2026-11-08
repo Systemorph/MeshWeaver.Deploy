@@ -3455,12 +3455,11 @@ class SharedTree:
                 continue
             # only the generation that is STILL current after the lock is handed out: a retired one (even one a failed
             # collect left half-deleted) is never copied — `current` is the one name a collector never deletes
-            if fh is not None and self.current() == gen and os.path.isdir(self.warm_of(gen)):
+            if self.current() == gen and os.path.isdir(self.warm_of(gen)):
                 held = gen
                 break
-            if fh is not None:
-                fh.close()
-                fh = None
+            fh.close()                           # retired between the readlink and the lock: read `current` again
+            fh = None
         try:
             yield self.warm_of(held) if held else None
         finally:
