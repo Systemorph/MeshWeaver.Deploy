@@ -871,6 +871,11 @@ OUT="$(printf '\n' | env PATH="$LMH/defstub:$PATH" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL
   bash -c '. "$0"; accept_interactive() { return 0; }; residency_onboard ""' "$CLI" 2>&1)"
 grep -q 'Where is this machine? (residency, e.g. CH, Eu' <<<"$OUT" && grep -q '\[CH\]' <<<"$OUT" && [ "$(cat "$RESF" 2>/dev/null)" = "CH" ] \
   && ok "the first interactive up asks 'Where is this machine?' with the region's CH as the default" || bad "interactive onboarding" "$OUT / $(cat "$RESF" 2>/dev/null)"
+rm -f "$RESF"
+OUT="$(printf 'C1\nch\n' | env PATH="$LMH/defstub:$PATH" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$LMH/home/.memex-local" HOME="$LMH/home" \
+  bash -c 'set -euo pipefail; . "$0"; accept_interactive() { return 0; }; residency_onboard ""; echo ONBOARD_DONE' "$CLI" 2>&1)"
+grep -q 'ONBOARD_DONE' <<<"$OUT" && grep -q "'C1' is not a residency" <<<"$OUT" && [ "$(cat "$RESF")" = "CH" ] \
+  && ok "a typo at the prompt is asked again (never the end of the install); the next answer is declared" || bad "interactive typo" "$OUT / $(cat "$RESF" 2>/dev/null)"
 OUT="$(printf 'Global\n' | env PATH="$LMH/defstub:$PATH" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$LMH/home/.memex-local" HOME="$LMH/home" \
   bash -c '. "$0"; accept_interactive() { return 0; }; residency_onboard ""' "$CLI" 2>&1)"
 [ "$(cat "$RESF")" = "CH" ] && ok "an install that already answered is not asked again" || bad "asked again" "$OUT"
@@ -891,6 +896,13 @@ lmu bash -c 'set -euo pipefail; . "$0"; cmd_llm use --residency C1' "$CLI" >/dev
 OUT="$(lmu bash -c 'set -euo pipefail; . "$0"; cmd_llm use' "$CLI" 2>&1)"
 ! grep -q '^    OpenAICompatible__DataResidency:' "$LLMF" && grep -q 'residency CH' <<<"$OUT" \
   && ok "llm use without --residency defaults to the install declaration (CH) and copies none into llm.yaml (the auto layer carries it)" || bad "llm use default" "$OUT / $(cat "$LLMF")"
+# An llm layer from before this change (llm use wrote "Eu" without a flag) outranks the declaration: named.
+printf 'config:\n  memex_portal:\n    OpenAICompatible__DataResidency: "Eu"\n' > "$LLMF"
+OUT="$(lm env MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" 2>&1)"
+grep -q "stamps residency 'Eu', which WINS over the install declaration 'CH'" <<<"$OUT" && ok "a stale llm-layer residency that disagrees with the declaration is named on every up/update" || bad "stale llm residency not named" "$OUT"
+printf 'config:\n  memex_portal:\n    OpenAICompatible__DataResidency: "CH"\n' > "$LLMF"
+OUT="$(lm env MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" 2>&1)"
+grep -q 'WINS over' <<<"$OUT" && bad "an agreeing llm-layer residency is warned about" "$OUT" || ok "…and an agreeing one is not"
 rm -f "$LLMF"
 # backlease accept tokens: the residency defaults to the install declaration.
 G="$(lm bash -c 'set -euo pipefail; . "$0"; accept_load; printf %s "$ACC_TOK_RES"' "$CLI" 2>/dev/null)"

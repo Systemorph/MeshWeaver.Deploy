@@ -1958,8 +1958,22 @@ residency_onboard() {
     return 0
   fi
   sug="$(residency_suggest)"
-  a="$(accept_read "Where is this machine? (residency, e.g. CH, Eu; 'none' to declare nothing)" "${sug:-none}")"
-  case "$a" in ''|none|None|NONE|-) residency_write "" ;; *) residency_write "$a" ;; esac
+  # A typo is asked again, never the end of the install (accept_check_residency dies on it).
+  while :; do
+    a="$(accept_read "Where is this machine? (residency, e.g. CH, Eu; 'none' to declare nothing)" "${sug:-none}")"
+    case "$a" in ''|none|None|NONE|-) residency_write ""; return 0 ;; esac
+    if ( accept_check_residency "$a" "residency" ) 2>/dev/null; then residency_write "$a"; return 0; fi
+    warn "'$a' is not a residency — Eu, Global, or a two-letter ISO code such as CH (or 'none')"
+  done
+}
+
+# The llm layer (`llm use`) WINS over llm.auto.yaml, and before 2026-11-08 `llm use` wrote
+# OpenAICompatible__DataResidency: "Eu" into it even without --residency. Such a line silently outranks the
+# install declaration, so it is named whenever the two disagree (every up/update, and llm status).
+llm_residency_drift_warn() {
+  local lres ires; lres="$(llm_value OpenAICompatible__DataResidency)"; ires="$(install_residency)"
+  [ -n "$lres" ] && [ "$lres" != "$ires" ] || return 0
+  warn "the llm layer ($LLM_FILE) stamps residency '$lres', which WINS over the install declaration '${ires:-none}' — re-run 'memex-local llm use' (no --residency: the declaration applies) or 'llm use --residency ${ires:-<X>}', then 'memex-local update --skip-image'"
 }
 
 cmd_residency() {
@@ -2016,6 +2030,7 @@ write_llm_auto_layer() {
     echo "  external:"
     echo "    host: \"$gw\""
   } > "$LLM_AUTO_FILE"
+  llm_residency_drift_warn
   if [ -z "$model" ]; then
     info "LOCAL MODEL: none chosen (MEMEX_OLLAMA_MODEL=none) — the portal names no Ollama chat model"
   elif [ -n "$w0" ]; then
@@ -2160,7 +2175,9 @@ YAML
       if [ -f "$LLM_FILE" ]; then
         local endpoint; endpoint="$(llm_value OpenAICompatible__Endpoint)"
         local lres; lres="$(llm_value OpenAICompatible__DataResidency)"
-        ok "LOCAL MODEL ON -- utility tier -> $(llm_value ModelTier__Utility), ${endpoint}, residency ${lres:-$(install_residency)}${lres:+ (llm use --residency)}"
+        local shown="${lres:-$(install_residency)}"
+        ok "LOCAL MODEL ON -- utility tier -> $(llm_value ModelTier__Utility), ${endpoint}, residency ${shown:-Unknown (none declared)}${lres:+ (llm use --residency)}"
+        llm_residency_drift_warn
         if kubectl -n "$NAMESPACE" exec deploy/memex-portal-deployment -c memex-portal -- curl -fsS -m 5 -o /dev/null "${endpoint%/}/models" 2>/dev/null; then
           ok "the portal pod reaches the model endpoint"
         else
