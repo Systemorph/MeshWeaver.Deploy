@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  memex-local INSTANCES EXECUTOR — a launchd login agent: the host side of the first instance's
+  "install new instances" GUI (MeshWeaver.Plugins Hosting/MacStudioFleet §3).
+  Runs `memex-local instances agent run` at login (RunAtLoad) and restarts it whenever it exits
+  (KeepAlive — also how an upgraded executor takes over: the old one exits when its file changes).
+  Every 5 s it claims ~/.memex-local/instances/jobs/<jobId>.json and runs it, writing
+  results/<jobId>.json; every 30 s it rewrites inventory.json. Contract: deploy/homebrew/README.md.
+
+  `memex-local up` / `update` in registry mode write a copy with the __TOKENS__ substituted to
+  ~/Library/LaunchAgents/com.memex.local.instances.plist and bootstrap it; `instances agent off` boots it out.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memex.local.instances</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__MEMEX_LOCAL__</string>
+        <string>instances</string>
+        <string>agent</string>
+        <string>run</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/memex/bin</string>
+        <key>MEMEX_LOCAL_HOME</key>
+        <string>__HOME__</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- A crash loop is retried every 30 s, not hammered. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>__LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG__</string>
+</dict>
+</plist>
