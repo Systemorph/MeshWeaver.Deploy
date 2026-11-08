@@ -409,6 +409,7 @@ log, ollama log, grafana password) — exactly the paths the doc uses.
 | `MEMEX_COLIMA_CPU` / `MEMEX_COLIMA_MEM` | `8` / `16` (or the profile's) | VM sizing (§2) |
 | `MEMEX_OLLAMA_MODEL` | `qwen3.8:27b-mlx` / `qwen3:8b` by host memory (or the profile's) | the default chat model `up`/`update` pull and the portal names; `none` skips it |
 | `MEMEX_LLM_SMOKE` | `1` | `0` skips the post-install chat smoke (loudly) |
+| `MEMEX_OCR` | unset | `none` turns the local OCR engine off. Unset: when the chat model reports the `vision` capability, `llm.auto.yaml` declares `Ocr__Engine=OllamaVision` on the same host-safe endpoint and model, so every instance on the Mac reads and describes pictures and scanned pages (MeshWeaver.Plugins `Indexing/DocumentEnrichment`); a chat model without vision is said loudly by `up`/`update` and reported red by `status`/`doctor` |
 | `MEMEX_PROFILE` | unset | Mac host profile, `mac-studio` or `mac-mini` (below) |
 | `MEMEX_CHANNEL` | unset (`main`) | release-channel label `up`/`update`/`autoroll` follow (below) |
 | `MEMEX_PORT` | `8443` | host port for the forward (§6/§7) |
