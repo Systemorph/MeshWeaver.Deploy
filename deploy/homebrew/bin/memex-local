@@ -2043,13 +2043,16 @@ readonly OWNER_KEY="Auth__GlobalAdmins__0"
 # Written by every successful helm_deploy: this install HAS been deployed. Only such an install may come up
 # without an owner (with a loud warning) — the unattended daemon re-runs `up` on it at every start, and a
 # running Mac must never be halted by its own restart. A Mac that was never deployed has no marker, so a
-# failed ownerless `up` stays failed on every re-run. An install deployed before the marker existed is
-# recognised by its Helm release (when the cluster answers) — and gets the marker on its next update, which
-# the autoupdate agent runs. Nothing else counts: the port-forward script, for one, `memex-local port-forward`
-# writes at any time.
+# failed ownerless `up` stays failed on every re-run. An install deployed BEFORE the marker existed is
+# recognised WITHOUT the cluster (the daemon's boot-time `up` runs this gate before Colima is started): by
+# the ingress certificate, which only `up`'s setup_tls writes, after the owner gate and after Colima is up —
+# so a Mac that never got past this gate cannot have one, and every pre-marker deployed install does. Its
+# Helm release counts too, when the cluster answers. Either way the next deploy writes the marker. Nothing
+# else counts: the port-forward script, for one, `memex-local port-forward` writes at any time.
 readonly DEPLOYED_MARKER="$LOCAL_HOME/deployed"
 install_deployed() {
   [ -f "$DEPLOYED_MARKER" ] && return 0
+  [ -f "$CERT_FILE" ] && return 0
   colima_running 2>/dev/null && helm status "$RELEASE" -n "$NAMESPACE" >/dev/null 2>&1
 }
 readonly OWNER_ID_KEY="Instance__Owner__Id"

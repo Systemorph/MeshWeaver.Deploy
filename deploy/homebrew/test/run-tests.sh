@@ -970,7 +970,16 @@ done
 OUT="$(ow bash -c '. "$0"; ensure_owner_admin "" "" require-fresh; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
 grep -q SURVIVED <<<"$OUT" && grep -q "NO OWNER" <<<"$OUT" && ok "up on a DEPLOYED ownerless install (the daemon's restart) warns loudly and carries on" || bad "deployed ownerless up" "$OUT"
 rm -f "$OWH/home/.memex-local/deployed"
+# A deployed install from BEFORE the marker, on the daemon's boot-time `up` (no cluster yet): its ingress
+# certificate — written only past this gate — identifies it, so its restart is not halted.
+: > "$OWH/home/.memex-local/memex.localhost.pem"
+OUT="$(ow env PATH="$OWH/stubs:$PATH" bash -c 'colima_running() { return 1; }; . "$0"; colima_running() { return 1; }; ensure_owner_admin "" "" require-fresh; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+grep -q SURVIVED <<<"$OUT" && ok "a pre-marker deployed install (its certificate present, no cluster yet) warns at boot and is not halted" || bad "pre-marker deployed install halted" "$OUT"
+rm -f "$OWH/home/.memex-local/memex.localhost.pem"
 grep -q ': > "$DEPLOYED_MARKER"' <<<"$(fn_body helm_deploy)" && ok "helm_deploy marks the install deployed" || bad "deployed marker" ""
+B="$(fn_body cmd_up)"
+[ "$(grep -n '^  ensure_overlay$' <<<"$B" | cut -d: -f1)" -lt "$(grep -n 'setup_tls' <<<"$B" | head -1 | cut -d: -f1)" ] \
+  && ok "the certificate that marks a pre-marker install is written only AFTER the owner gate in up" || bad "cert before gate" ""
 # The owner is id AND e-mail where one is required: an id without an e-mail fails the install.
 seed_overlay
 OUT="$(ow env MEMEX_OWNER=erin bash -c '. "$0"; ensure_owner_admin "" "" require; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
