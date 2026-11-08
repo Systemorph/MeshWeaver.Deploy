@@ -18,7 +18,10 @@ MeshWeaver.Plugins `Hosting/MacStudioFleet.md` §2b and §2b.2.
 | memex | registry mode (once — never re-written); the local CA created without the keychain prompt; `memex-local up` until `memex-local verify` passes, `memex-local fleet join --code-file ~/.memex-local/enrol/<id>.code`, and a joined Mac's unfinished back-lease enrolment resumed from its stored credentials | no `ControlUrl` yet, or the approval and the enrolment code are pending (the link is in the log and in `~/.memex-local/enrol/<id>.link`) |
 
 **Configuration** comes from the managed-preference domain `com.memex.local`, deployed as a configuration
-profile. Its keys are `ControlUrl`, `DeploymentId`, `RegistryUrl` and `LoginServer`. The environment
+profile. Its keys are `ControlUrl`, `DeploymentId`, `RegistryUrl`, `LoginServer`, and the machine's OWNER,
+`OwnerId` + `OwnerEmail`. The owner is required: it becomes the instance's global administrator, and
+`memex-local up` refuses to run unattended without one. For a user-affinity device, set them to `{{partialupn}}`
+(when MeshWeaver user ids are UPN prefixes) and `{{mail}}`. The environment
 variables `FLEET_CONTROL_URL`, `FLEET_MACHINE_ID`, `FLEET_REGISTRY_URL` and `FLEET_LOGIN_SERVER` override
 them. Nothing secret is configured.
 
