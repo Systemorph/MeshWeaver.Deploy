@@ -3443,8 +3443,13 @@ class SharedTree:
             gen = self.current()
             if gen is None:
                 break
-            # NON-blocking: a collector holding a retired generation's lock is deleting it — never wait out a deletion
-            fh = self._lock(self._lock_of(gen), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            # NON-blocking: a collector holding a retired generation's lock is deleting it — never wait out a deletion; a
+            # lock that cannot even be set up (a full or read-only cache) is no warm tree, never an aborted run
+            try:
+                fh = self._lock(self._lock_of(gen), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                fh = None
+                break
             if fh is None:
                 time.sleep(0.05 * (attempt + 1))
                 continue
@@ -3474,13 +3479,15 @@ class SharedTree:
             if fh is not None:
                 fh.close()
 
-    def stage(self, cancel: Optional[threading.Event] = None, deadline: Optional[float] = None) -> str:
+    def stage(self, cancel: Optional[threading.Event] = None, deadline: Optional[float] = None, fresh: bool = False) -> str:
         """A new generation directory: a copy of the current one (its obj/, bin/ and git index carried), or empty. The
         copy is bounded by `deadline` and stopped at once by `cancel` (a claim needs the host): the partial generation is
         removed and Lost (cancel) or Refusal (deadline) raised — never a copy the claimed run has to wait out."""
         gen = os.path.join(self.gens, f"{time.time_ns():020d}-{os.getpid()}")
         cur = self.current()
-        if cur is None:
+        if cur is None or fresh:
+            # `fresh`: the published generation was built under another key (platform set, images) — its outputs would be
+            # wiped at once, so nothing is copied; the published one stays current until this replacement publishes
             os.makedirs(gen)
             return gen
         # stderr to a FILE, read as a bounded tail afterwards: a pipe nobody drains blocks `cp` once it fills (a full
@@ -4346,10 +4353,14 @@ class Host:
         st = warm_state(tree.warm_of(cur)) if cur else None
         tip_now = self._mirror_tip(repo)
         if tip_now and st is not None and st.get("key") == key and st.get("tip") == tip_now and st.get("built") in (tip_now, "none"):
-            # already warm — still collect generations whose readers have let go since the last publish
-            with tree.writer() as w:
-                if w is not None:
-                    w.collect()
+            # already warm — still collect generations whose readers have let go since the last publish (best effort: cache
+            # maintenance never aborts warming)
+            try:
+                with tree.writer() as w:
+                    if w is not None:
+                        w.collect()
+            except OSError as e:
+                self.log(f"shared tree: {repo} not collected ({e})")
             return
         if not tip_now:
             return                                         # the mirror names no tip: nothing to warm, no generation copied
@@ -4370,8 +4381,11 @@ class Host:
                 return                                     # another replica is the writer: it warms, this one does not
             # generations a replica killed mid-stage or mid-build left behind are reclaimed BEFORE another full copy
             w.collect()
+            cur = w.current()
+            st_cur = warm_state(w.warm_of(cur)) if cur else None
             try:
-                gen = w.stage(cancel=self.warm_cancel, deadline=time.monotonic() + 1800)
+                gen = w.stage(cancel=self.warm_cancel, deadline=time.monotonic() + 1800,
+                              fresh=st_cur is None or st_cur.get("key") != key)
             except Lost:
                 self.log(f"shared tree: {repo} staging stopped for a claim")
                 return
@@ -4579,7 +4593,10 @@ class Host:
                                 repo, sha, claim.get("refs") or [],
                                 shared_warm or os.path.join(self.cache, SHARED_DIR, repo, "none", WARM_DIR, repo),
                                 checkout_dir, token, self.env, self.log, warm_key(self.env, self.identity), deadline=co_deadline)
-                        os.makedirs(os.path.join(self.cache, SHARED_DIR, repo), exist_ok=True)
+                        try:
+                            os.makedirs(os.path.join(self.cache, SHARED_DIR, repo), exist_ok=True)
+                        except OSError as e:
+                            self.log(f"shared tree: {repo} not registered on the cache ({e}) — warmed from this replica's own record")
                     else:
                         self.workspace_line = seed_run_from_warm(repo, sha, claim.get("refs") or [], os.path.join(self.work, WARM_DIR, repo),
                                                                  checkout_dir, token, self.env, self.log, warm_key(self.env, self.identity),
@@ -6391,6 +6408,13 @@ def self_test() -> int:
         after = {f: open(os.path.join(st_.warm_of(last_good), "src", f)).read() for f in before}
         check("shared/a PR run's writes stay in its copy — the shared tree is unchanged",
               before == after and open(os.path.join(st_.warm_of(last_good), "src", "obj", "state.cache")).read() != "PR BUILD")
+        with st_.writer() as w_k:
+            fresh_gen = w_k.stage(fresh=True)
+            check("shared/a generation staged for another key starts EMPTY (no multi-gigabyte copy wiped at once), the old one stays current",
+                  os.listdir(fresh_gen) == [] and st_.current() != fresh_gen)
+            w_k.discard(fresh_gen)
+        with SharedTree(os.path.join(tmp, "ro-cache"), "R").reader() as none_:
+            check("shared/no published generation reads as no warm tree (a clean checkout follows)", none_ is None)
         check("shared/opt-in only, and only with the warm workspace", shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true", "MW_BUILD_SHARED_TREE": "true"})
               and not shared_tree_enabled({"MW_BUILD_SHARED_TREE": "true"}) and not shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}))
 
