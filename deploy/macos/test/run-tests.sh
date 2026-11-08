@@ -43,6 +43,41 @@ if xmllint --noout "$MACOS/Distribution.xml.in" 2>/dev/null; then ok "Distributi
 for f in "$BREW"/share/*.plist "$MACOS"/launchd/*.plist "$MACOS"/entitlements/*.plist "$MACOS"/profiles/*.mobileconfig.example; do
   if xmllint --noout --nonet "$f" 2>/dev/null; then ok "strict XML: $(basename "$f")"; else bad "strict XML: $(basename "$f")" "$(xmllint --noout --nonet "$f" 2>&1 | head -3)"; fi
 done
+echo "── Intune: the Microsoft sign-in profiles and their Graph bodies (deploy/macos/intune/README.md) ──"
+IOS="$REPO/deploy/ios"
+INTUNE_PROFILES=("$MACOS"/intune/profiles/*.mobileconfig "$IOS"/intune/profiles/*.mobileconfig)
+for f in "${INTUNE_PROFILES[@]}"; do
+  if plutil -lint "$f" >/dev/null 2>&1 && xmllint --noout --nonet "$f" 2>/dev/null; then ok "Intune profile lints (plutil + strict XML): ${f#"$REPO"/}"; else bad "Intune profile lint ${f#"$REPO"/}" "$(plutil -lint "$f" 2>&1)"; fi
+done
+for f in "$MACOS"/intune/graph/*.json "$IOS"/intune/graph/*.json; do
+  python3 -m json.tool "$f" >/dev/null 2>&1 && ok "Graph body parses: ${f#"$REPO"/}" || bad "Graph body ${f#"$REPO"/}" "$(python3 -m json.tool "$f" 2>&1 | head -2)"
+done
+# The UUIDs are stable (an MDM replaces a profile by identifier + UUID) and distinct across every profile.
+UUIDS="$(for f in "${INTUNE_PROFILES[@]}"; do xmllint --xpath '//key[.="PayloadUUID"]/following-sibling::string[1]/text()' "$f" 2>/dev/null; echo; done | tr -s ' \n' '\n' | grep -v '^$')"
+[ "$(sort <<<"$UUIDS" | uniq -d | wc -l | tr -d ' ')" = 0 ] && [ "$(wc -l <<<"$UUIDS" | tr -d ' ')" -ge 6 ] \
+  && ok "every Intune profile's PayloadUUIDs are distinct" || bad "duplicate PayloadUUID" "$UUIDS"
+# The Graph body for the com.memex.local custom profile carries exactly the committed file.
+PAY="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["payload"])' "$MACOS/intune/graph/com.memex.local.json")"
+[ "$PAY" = "$(base64 < "$MACOS/intune/profiles/com.memex.local.mobileconfig" | tr -d '\n')" ] \
+  && ok "graph/com.memex.local.json's payload is the committed profile (base64), never a stale copy" \
+  || bad "com.memex.local.json payload stale" "regenerate: base64 < deploy/macos/intune/profiles/com.memex.local.mobileconfig"
+[ "$(plutil -extract PayloadContent.0.UserPrincipalName raw "$MACOS/intune/profiles/com.memex.local.mobileconfig" 2>/dev/null)" = "{{userprincipalname}}" ] \
+  && ok "the com.memex.local profile fills UserPrincipalName with Intune's {{userprincipalname}} (what memex-local work_identity reads)" || bad "UserPrincipalName token" ""
+# Each SSO profile and its Graph body name the same extension, team and URLs, and the Redirect type.
+for pair in "macos:macOSSingleSignOnExtension:com.microsoft.CompanyPortalMac.ssoextension:UBF8T346G9" "ios:iosSingleSignOnExtension:com.microsoft.azureauthenticator.ssoextension:SGGM6D27TK"; do
+  IFS=: read -r os prop ext team <<<"$pair"
+  prof="$REPO/deploy/$os/intune/profiles/microsoft-enterprise-sso.mobileconfig"; body="$REPO/deploy/$os/intune/graph/microsoft-enterprise-sso.json"
+  P_URLS="$(plutil -extract PayloadContent.0.URLs json -o - "$prof" 2>/dev/null | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)))')"
+  G="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1]))[sys.argv[2]]; print(e["extensionIdentifier"]+"|"+e["teamIdentifier"]+"|"+",".join(e["urlPrefixes"])+"|"+e["@odata.type"])' "$body" "$prop")"
+  [ "$(plutil -extract PayloadContent.0.Type raw "$prof")" = Redirect ] && [ "$(plutil -extract PayloadContent.0.ExtensionIdentifier raw "$prof")" = "$ext" ] \
+    && [ "$(plutil -extract PayloadContent.0.TeamIdentifier raw "$prof")" = "$team" ] \
+    && [ "$G" = "$ext|$team|$P_URLS|#microsoft.graph.${prop/SingleSignOnExtension/RedirectSingleSignOnExtension}" ] \
+    && grep -q 'https://login.microsoftonline.com' <<<"$P_URLS" \
+    && [ "$(plutil -extract PayloadContent.0.ExtensionData.browser_sso_interaction_enabled raw "$prof")" = 1 ] \
+    && ok "$os SSO plug-in: Redirect, $ext / $team, profile and Graph body agree" || bad "$os SSO plug-in profile/Graph disagree" "$G vs $P_URLS"
+done
+grep -q 'b892bd0f-86ed-46ce-8593-3b9860f7a557' "$MACOS/intune/graph/assign-pilot.json" && ! grep -rqi 'allDevices\|allLicensedUsers' "$MACOS/intune/graph" "$IOS/intune/graph" \
+  && ok "the assignment bodies target the pilot group only (never all devices or all users)" || bad "assignment target" ""
 grep -q 'pair incomplete — replacing BOTH from this run' "$REPO/.github/workflows/macos-pkg.yml" && grep -q 'gh release upload "$tag" "$pkg" "$pkg.sha256" --clobber' "$REPO/.github/workflows/macos-pkg.yml" && ok "the release step reconciles each .pkg/.sha256 PAIR from the same bytes (either missing → both replaced)" || bad "release pair reconciliation" ""
 if grep -q 'if: ${{ always() }}' "$REPO/.github/workflows/macos-pkg.yml" && grep -q 'rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/app.p12" "$RUNNER_TEMP/inst.p12"' "$REPO/.github/workflows/macos-pkg.yml"; then ok "the workflow removes the keychain, the notary key and both decoded .p12 files under always()"; else bad "signing cleanup always()" ""; fi
 for tok in __VERSION__ __HOST_ARCH__; do

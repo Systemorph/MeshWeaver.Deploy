@@ -186,6 +186,14 @@ overlay already records, and on a terminal a question that suggests your login n
 owner fails**: an instance never comes up without an administrator. An `update` of an older, ownerless install warns
 loudly instead, so an auto-update never halts.
 
+**On an Intune-managed Mac the work account is the default owner.** Before anyone is asked, the Mac's **work
+identity** answers: the managed preference `UserPrincipalName` (Intune token `{{userprincipalname}}`, profile
+`deploy/macos/intune/profiles/com.memex.local.mobileconfig`) or, on a Platform-SSO-registered Mac, `app-sso
+platform -s`. Its prefix is the owner id and the UPN the e-mail; the overlay then also gets
+`Authentication__Microsoft__LoginHint` / `__DomainHint`, so Microsoft sign-in offers that work account first and
+never silently picks a personal one. Every source above it still wins. Details: `deploy/macos/intune/README.md`,
+"Microsoft sign-in".
+
 Change the owner later with `memex-local owner --id <user-id> --email <e-mail>`, then `memex-local update --skip-image`.
 Never edit the YAML by hand. `memex-local owner status` shows the owner. Re-running any of these is idempotent.
 The same owner answers the fleet opt-in questions (`backlease accept`).
