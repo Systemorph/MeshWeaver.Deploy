@@ -2779,6 +2779,10 @@ SCRATCH = "/scratch"
 # run that copies its obj/ and bin/. At the host's per-run path (`<work>/<repo>-<sha>-<random>/src`) each run would
 # restore and rebuild everything the warm tree had built (Plugins Hosting/BuildQueue.md §7.2).
 SANDBOX_CHECKOUT = "/workspace/src"
+# The writable NuGet package folder, at ONE fixed path inside the sandbox for the same reason: restore records the
+# package roots (NUGET_PACKAGES and the fallback folders) in project.assets.json and nuget.g.props, so a run whose
+# package folder sits at another path than the warm build's re-restores every project the warm tree had restored.
+SANDBOX_NUGET = "/workspace/nuget"
 
 # THE COMPILE REFERENCE SET, PREPARED ONCE PER ROLL (the `portal` init container of
 # deploy/helm/templates/build-host/build-host.yaml): the portal's /app plus the image's SHARED
@@ -2936,11 +2940,13 @@ class Sandbox:
         self.readonly = tuple(readonly)
 
     def argv(self, command: str, checkout: str, outputs: str, env: dict,
-             readonly: Iterable[str] = (), writable: Iterable[str] = (), mount: Optional[str] = None) -> list[str]:
+             readonly: Iterable[str] = (), writable: Iterable[str] = (), mount: Optional[str] = None,
+             binds: Iterable[tuple[str, str]] = ()) -> list[str]:
         """`readonly` are the cache entries THIS stage may read (its own repository's mirror and the
         dependency artifacts it declares) — never the cache root; `writable` the run's extra output
         directories (artifacts) beside the checkout and the outputs. `mount` is where the checkout appears
-        inside the sandbox (SANDBOX_CHECKOUT for a run's stages and the warm build); absent, its own path."""
+        inside the sandbox (SANDBOX_CHECKOUT for a run's stages and the warm build); absent, its own path. `binds` are
+        further WRITABLE (host path, path inside) pairs — the package folder at SANDBOX_NUGET."""
         inside = mount or checkout
         a = [self.bwrap, "--die-with-parent", "--new-session",
              "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try",
@@ -2958,6 +2964,8 @@ class Sandbox:
               "--bind", checkout, inside, "--bind", outputs, outputs]
         for w in writable:
             a += ["--bind", w, w]
+        for host_path, in_path in binds:
+            a += ["--bind", host_path, in_path]
         a += ["--chdir", inside, "--", "/bin/bash", "-c", command]
         return a
 
@@ -4180,9 +4188,13 @@ class Host:
                 os.makedirs(out_dir)
                 started = self.clock()
                 write_warm_state(warm, {"key": key, "tip": tip, "built": "building"})
+                warm_nuget_dir = os.path.join(scratch, "nuget")
+                os.makedirs(warm_nuget_dir, exist_ok=True)
+                extra["NUGET_PACKAGES"] = SANDBOX_NUGET
                 rc, text = self._sandboxed_capture(decl["command"], warm, out_dir, scratch, extra,
                                                    [mirror, os.path.join(self.cache, "nuget")], writable, decl["timeoutMinutes"] * 60,
-                                                   cancel=self.warm_cancel, mount=SANDBOX_CHECKOUT)
+                                                   cancel=self.warm_cancel, mount=SANDBOX_CHECKOUT,
+                                                   binds=[(warm_nuget_dir, SANDBOX_NUGET)])
                 if rc == 0:
                     write_warm_state(warm, {"key": key, "tip": tip, "built": tip})
                     self.warm_failed.pop(repo, None)
@@ -4434,7 +4446,8 @@ class Host:
                 art_before = artifact_snapshot(art)
                 remaining = run_end - self.clock()
                 spec = dict(st, timeoutMinutes=min(st["timeoutMinutes"], remaining / 60))
-                stage_env = {**extra, "MW_BUILD_STAGE": st["name"], "NUGET_PACKAGES": nuget_dir, "MW_BUILD_ARTIFACTS": art,
+                # the run's package folder is bound at SANDBOX_NUGET: the path restore records is the warm build's too
+                stage_env = {**extra, "MW_BUILD_STAGE": st["name"], "NUGET_PACKAGES": SANDBOX_NUGET, "MW_BUILD_ARTIFACTS": art,
                              **({"MW_BUILD_MODULE_HUB": self.module_broker.io, "MW_BUILD_MODULE_HUB_OUT": self.module_broker.out}
                                 if self.module_broker else {})}
                 readonly = self.stage_readonly(repo, st) + prepared_ro
@@ -4445,7 +4458,8 @@ class Host:
                          art_before=art_before) -> None:
                     try:
                         ok = self.run_stage(spec, checkout_dir, outputs_dir, sink, stage_env,
-                                            readonly=readonly, writable=[art, nuget_dir, *([self.module_broker.io] if self.module_broker else [])],
+                                            readonly=readonly, writable=[art, *([self.module_broker.io] if self.module_broker else [])],
+                                            binds=[(nuget_dir, SANDBOX_NUGET)],
                                             hand_over=lambda: self.hand_over_artifacts(repo, sha, name, art, deadline=run_end,
                                                                                        cancel=cancel),
                                             cancel=cancel,
@@ -4835,14 +4849,14 @@ class Host:
 
     def _sandboxed_capture(self, command: str, tree: str, out: str, workdir: str, extra: dict, readonly: list,
                            writable: list, timeout: float, cancel: Optional[threading.Event] = None,
-                           mount: Optional[str] = None) -> tuple[int, str]:
+                           mount: Optional[str] = None, binds: Iterable[tuple[str, str]] = ()) -> tuple[int, str]:
         """Run a host-chosen, repository-declared command in the sandbox on `tree`. Its output goes to host-owned FILES
         (outside the sandbox's writable binds) and only a bounded tail of each is read back, so a noisy command can never
         exhaust the host's memory and end the worker without a verdict. Returns (exit code, stderr tail + stdout tail).
         `cancel` set (the heartbeat met the 409 — the run is not this host's claim any more) kills the sandbox's whole
         tree at once and raises Lost: a build for a run another host now owns is never waited out (Deploy#49)."""
         argv = self.sandbox.argv(command, tree, out, sandbox_env(self.env, extra, self.cache),
-                                 readonly=readonly, writable=writable, mount=mount)
+                                 readonly=readonly, writable=writable, mount=mount, binds=binds)
         logs = tempfile.mkdtemp(prefix=".prep-log-", dir=workdir)
         try:
             with open(os.path.join(logs, "out"), "w+b") as so, open(os.path.join(logs, "err"), "w+b") as se:
@@ -5063,7 +5077,7 @@ class Host:
         return ro
 
     def run_stage(self, st: dict, checkout: str, outputs: str, sink: EventSink, extra: dict,
-                  readonly: Iterable[str] = (), writable: Iterable[str] = (),
+                  readonly: Iterable[str] = (), writable: Iterable[str] = (), binds: Iterable[tuple[str, str]] = (),
                   hand_over: Callable[[], tuple[list[dict], Optional[str]]] = None,
                   cancel: Optional[threading.Event] = None,
                   hand_over_failed: Callable[[], tuple[list[dict], Optional[str]]] = None) -> bool:
@@ -5086,7 +5100,7 @@ class Host:
                                            f"({self.platform_version}, plugins {(self.plugins_digest or '-')[:19]})"}])
         try:
             argv = self.sandbox.argv(st["command"], checkout, outputs, sandbox_env(self.env, extra, self.cache),
-                                     readonly=readonly, writable=writable, mount=SANDBOX_CHECKOUT)
+                                     readonly=readonly, writable=writable, mount=SANDBOX_CHECKOUT, binds=binds)
             proc = subprocess.Popen(argv, cwd=checkout, env={"PATH": self.env.get("PATH", "/usr/bin:/bin")},
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     start_new_session=True, text=True, errors="replace", bufsize=1)
@@ -5545,9 +5559,14 @@ class _EnvSandbox:
 
     last_readonly: list = []
     last_mount: Optional[str] = None
+    last_binds: list = []
 
-    def argv(self, command, checkout, outputs, env, readonly=(), writable=(), mount=None):
+    def argv(self, command, checkout, outputs, env, readonly=(), writable=(), mount=None, binds=()):
         _EnvSandbox.last_readonly = list(readonly)
+        _EnvSandbox.last_binds = list(binds)
+        # no mount namespace here: a bound in-sandbox path in the env is the host path it is bound from
+        for host_path, in_path in binds:
+            env = {k: (host_path + v[len(in_path):] if v == in_path or v.startswith(in_path + "/") else v) for k, v in env.items()}
         _EnvSandbox.last_mount = mount
         return ["/usr/bin/env", "-i", *[f"{k}={v}" for k, v in sorted(env.items())], "/bin/bash", "-c", command]
 
@@ -5800,6 +5819,10 @@ def self_test() -> int:
           and mav.count("/w/run-7/src") == 1, mav)
     check("bwrap/without a mount the checkout keeps its own path (prepare and probe sandboxes)",
           "--bind /w/s /w/s" in hav and "--chdir /w/s" in hav, hav)
+    bav = Host({}, None, log=lambda s: None).sandbox.argv("true", "/w/s", "/w/o", {}, mount=SANDBOX_CHECKOUT,
+                                                         binds=[("/w/run-7/nuget", SANDBOX_NUGET)])
+    check("bwrap/the package folder is bound WRITABLE at its fixed in-sandbox path",
+          " ".join(bav).count(f"--bind /w/run-7/nuget {SANDBOX_NUGET}") == 1, bav)
     for root in ("/portal", "/tester", "/tools", "/core-tests"):
         check(f"bwrap/the staged image root {root} is visible READ-ONLY in a stage",
               f"--ro-bind-try {root} {root}" in hav and f"--bind {root} " not in hav, hav)
@@ -6612,6 +6635,8 @@ def self_test() -> int:
             st_i = warm_state(iw) or {}
             check("warm-idle/the warm build sees its tree at the SAME in-sandbox path a run's stages see theirs",
                   _EnvSandbox.last_mount == SANDBOX_CHECKOUT, _EnvSandbox.last_mount)
+            check("warm-idle/the warm build's package folder is bound at the SAME in-sandbox path a run's stages restore into",
+                  len(_EnvSandbox.last_binds) == 1 and _EnvSandbox.last_binds[0][1] == SANDBOX_NUGET, _EnvSandbox.last_binds)
             check("warm-idle/with nothing claimable the host builds main's tip with the TIP's warmBuild, in the warm workspace",
                   st_i.get("tip") == c3 and st_i.get("built") == c3
                   and open(os.path.join(iw, "src", "obj", "warm.txt")).read().strip() == "built-by-tip", st_i)
@@ -7098,6 +7123,9 @@ def self_test() -> int:
             check(f"run/claim labels {lbl!r} reach the stage as MW_BUILD_LABELS={want!r}", got == f"[{want}]", got)
             check(f"run/the stage ran with its checkout mounted at {SANDBOX_CHECKOUT} ({lbl!r})", _EnvSandbox.last_mount == SANDBOX_CHECKOUT,
                   _EnvSandbox.last_mount)
+            check(f"run/the stage's package folder is the run's own, bound at {SANDBOX_NUGET} ({lbl!r})",
+                  len(_EnvSandbox.last_binds) == 1 and _EnvSandbox.last_binds[0][1] == SANDBOX_NUGET
+                  and _EnvSandbox.last_binds[0][0].endswith("/nuget"), _EnvSandbox.last_binds)
         posted[:] = posted_h6   # the checks below read h6's own events
         rf_ = [e for _, evs in posted for e in evs if e["kind"] == "run-finished"]
         check("run/green run-finished", rf_ == [{"kind": "run-finished", "succeeded": True, "error": None}], rf_)
@@ -7532,9 +7560,9 @@ def self_test() -> int:
         seen_ro: list = []
 
         class _RecordingSandbox(_EnvSandbox):
-            def argv(self, command, checkout, outputs, env, readonly=(), writable=(), mount=None):
+            def argv(self, command, checkout, outputs, env, readonly=(), writable=(), mount=None, binds=()):
                 seen_ro.append((env.get("MW_BUILD_STAGE"), list(readonly), env.get("NUGET_FALLBACK_PACKAGES")))
-                return super().argv(command, checkout, outputs, env, readonly, writable, mount)
+                return super().argv(command, checkout, outputs, env, readonly, writable, mount, binds)
         posted.clear()
         h_fb = Host(dict(keyed_env, MW_BUILD_CACHE=fresh_nuget), api_ev(), log=lambda s: None, sandbox=_RecordingSandbox(),
                     leftovers=lambda: [], sleep=lambda s: None, pull=pull,
@@ -8622,9 +8650,9 @@ def self_test() -> int:
         fired: list = []
 
         class _RecordingSandbox(_EnvSandbox):
-            def argv(self, command, checkout, outputs, env, readonly=(), writable=(), mount=None):
+            def argv(self, command, checkout, outputs, env, readonly=(), writable=(), mount=None, binds=()):
                 started_stages.append(env.get("MW_BUILD_STAGE"))
-                return super().argv(command, checkout, outputs, env, readonly, writable, mount)
+                return super().argv(command, checkout, outputs, env, readonly, writable, mount, binds)
 
         def staged_clock() -> float:
             if (threading.current_thread() is sched_thread and not fired and "s0" in started_stages
