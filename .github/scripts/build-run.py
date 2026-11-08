@@ -4287,7 +4287,10 @@ class Host:
                 # names another sha, or none.
                 merge_base = None
                 probe = claim.get("isProbe") is True or str(claim.get("kind") or "").lower() == "probe"
-                if not trunk and not probe:
+                # a probe that NAMES a pull request is measured on the tree that pull request's own run builds: merged once
+                # onto the same base (its narrowing reads HEAD^2...HEAD, its module hub the pull-request lane); a plain
+                # probe is not merged
+                if not trunk and (not probe or pull_request_number(claim.get("refs") or []) is not None):
                     merge_base = self.merge_onto_base(repo, checkout_dir, claim.get("mergeBaseSha"), token)
                 declared = load_stages(os.path.join(checkout_dir, ".github", "build-stages.json"))
                 prepared_inputs = load_prepared(os.path.join(checkout_dir, ".github", "build-stages.json"))
@@ -9215,6 +9218,11 @@ def self_test() -> int:
         gl = []
         merge_host(gl).run(dict(claim, isTrunk=False, isProbe=True, mergeBaseSha=None))
         check("merge/isProbe: no merge, no mergeBase", gl == [] and "mergeBase" not in plans()[0], (gl, plans()))
+        gl = []
+        merge_host(gl).run(dict(claim, isTrunk=False, isProbe=True, mergeBaseSha=None,
+                                refs=[{"kind": "PullRequest", "name": "probe/p-1", "number": 5105, "baseRef": "main"}]))
+        check("merge/a probe NAMING a pull request is merged once onto main's tip, and its plan names the base",
+              sum(1 for a in gl if "merge" in a) == 1 and plans() and plans()[0].get("mergeBase") == "e" * 40, (gl, plans()))
         # a probe run's id rides on every events POST (and the token request); a normal run's never
         pq: list = []
         hpq = host(_FakeApi({("POST", "/token"): lambda p_, b: (pq.append(("token", None)), (404, None))[1],
