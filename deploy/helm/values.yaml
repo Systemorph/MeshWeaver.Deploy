@@ -1307,9 +1307,15 @@ buildHosts:
   # host uploads it by its hash). Identity is the host's: fingerprints from the pristine tree under the DEFAULT BRANCH's
   # `moduleHub` declaration, lane and commit from the run. Inert unless a repository declares `moduleHub`. Off by default.
   moduleHub: false
-  # The SHARED TREE switch: since §7.3b the deployment trees always live on the cache volume (shared by every replica that
-  # mounts it), so this selects the SAME master + deployment-tree path as warmWorkspace alone — kept as a switch, never a
-  # route to a copy. Off by default.
+  # The SHARED TREE switch — INERT since §7.3b, kept only so existing values still render (retire it in a later chart change).
+  # The deployment trees always live on the cache volume, so the warm path is chosen by the two other switches alone:
+  #   warmWorkspace  runOverlay  →  a run's tree
+  #   false          (any)          a fresh clone per run; no master worktree, no deployment tree is built
+  #   true           false          the deployment tree is built while idle, but every run takes a COLD `git worktree add`
+  #                                 off the master (said in its log and plan) — measure the writer before turning runs on
+  #   true           true           an OVERLAY of the verified deployment tree; a busy, unbuilt or refused tree → cold, said
+  # sharedTree changes none of these rows. A host that ran §7.3 with sharedTree: true keeps its old generations under
+  # `<cache>/shared` only until the new runner's first idle pass, which deletes them (`retire_legacy_shared`).
   sharedTree: false
   # The RUN OVERLAY (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3b): with the warm workspace on, a run's tree is an OVERLAY —
   # its deployment tree read-only beneath (held by a shared lock for the whole run, verified against its integrity manifest

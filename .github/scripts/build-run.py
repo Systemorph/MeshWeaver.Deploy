@@ -3422,6 +3422,28 @@ def deployment_name(lane: Optional[str], key: str) -> str:
     return f"{safe[:48]}-{key[:16]}"
 
 
+LEGACY_SHARED_DIR = "shared"     # §7.3's copied generations (`<cache>/shared/<repo>/gens/…`), superseded by §7.3b
+
+
+def retire_legacy_shared(cache: str, log: Callable[[str], None]) -> bool:
+    """Delete the §7.3 generations a host left on its cache (`<cache>/shared`): nothing reads them since §7.3b, and on a
+    roll they would sit beside the new deployment trees (~18 GiB each for MeshWeaver.Plugins). A deletion, never a copy.
+    Returns whether anything was removed. Never raises."""
+    legacy = os.path.join(cache, LEGACY_SHARED_DIR)
+    if not os.path.isdir(legacy) or os.path.islink(legacy):
+        return False
+    for d, dirs, _files in os.walk(legacy, onerror=lambda e: None):
+        for n in dirs:
+            try:
+                os.chmod(os.path.join(d, n), 0o700)       # an overlay work dir the kernel made mode 000
+            except OSError:
+                pass
+    shutil.rmtree(legacy, ignore_errors=True)
+    gone = not os.path.exists(legacy)
+    log(f"legacy shared tree: {legacy} {'removed' if gone else 'NOT fully removed'} — §7.3b deployment trees replace it")
+    return gone
+
+
 def master_path(cache: str, repo: str) -> str:
     return os.path.join(cache, "git", f"{repo}.git")
 
@@ -4163,6 +4185,7 @@ class Host:
         self.sandbox = sandbox or Sandbox(env.get("BWRAP", "bwrap"), sandbox_readonly_roots(env), outer_ids(env))
         self.run_holds = contextlib.ExitStack()
         self.cold_tree: Optional[tuple] = None
+        self.legacy_retired = False                  # §7.3's <cache>/shared removed by this process's first idle pass
         self.run_mount: Optional[Callable[[str, str], None]] = None   # the run overlay's mount (injectable for the self-test)
         self.leftovers = leftovers or pid_namespace_leftovers
         self.reap = reap or reap_children
@@ -4593,6 +4616,9 @@ class Host:
         Never raises: warming is optional, so a failure is said, the tree is left "not built", and the next idle cycle
         retries after a pause."""
         key = warm_key(self.env, self.identity)
+        if not self.legacy_retired:
+            retire_legacy_shared(self.cache, self.log)     # §7.3's generations: removed once per process, before warming
+            self.legacy_retired = True
         repos = set(self.warm_repos)
         # every repository this deployment already holds a tree of is kept warm by whichever replica is idle, not only by
         # one that ran it since its own start (an unreadable listing only narrows this pass)
@@ -7458,8 +7484,15 @@ def self_test() -> int:
             # the platform source is the fixture's (its .source-commit is on the local platform master): a runner image's own
             # prepared tree names a commit no local origin holds
             ienv["MW_PLATFORM_SOURCE"] = image_src
+            # what a §7.3 host left on its cache: a copied generation (with a kernel overlay work dir, mode 000)
+            legacy_gen = os.path.join(wenv["MW_BUILD_CACHE"], "shared", "R", "gens", "00000000000000000001-1")
+            os.makedirs(os.path.join(legacy_gen, "w", "work"))
+            open(os.path.join(legacy_gen, "a.cs"), "w").write("old")
+            os.chmod(os.path.join(legacy_gen, "w", "work"), 0)
             hi = host(_FakeApi({("GET", "/hosts/inputs"): [(200, {"plugins": None})] * 3, ("POST", "/claim"): [(204, None)] * 3}),
                       env=ienv, git_runner=_git_run)
+            idle_log: list = []
+            hi.log = idle_log.append
             hi.warm_repos.add("R")
             hi.cycle()
             if hi.warm_thread:
@@ -7475,6 +7508,9 @@ def self_test() -> int:
                   st_i.get("tip") == c3 and st_i.get("built") == c3 and os.path.isfile(idt.manifest_path)
                   and open(os.path.join(idt.tree, "src", "obj", "warm.txt")).read().strip() == "built-by-tip"
                   and os.path.realpath(open(os.path.join(idt.tree, "src", "obj", "where.txt")).read().strip()) == os.path.realpath(idt.tree), st_i)
+            check("warm-idle/the first idle pass REMOVES the §7.3 generations left on the cache (no 18 GiB beside the new trees)",
+                  not os.path.exists(legacy_gen) and hi.legacy_retired
+                  and any(m.startswith("legacy shared tree:") and "removed" in m for m in idle_log), (legacy_gen, idle_log[:3]))
             check("warm-idle/the deployment is the host's lane plus its warm key", os.path.basename(idt.root) == deployment_name(hi.lane, warm_key(hi.env, hi.identity)))
             hi.cycle()
             if hi.warm_thread:

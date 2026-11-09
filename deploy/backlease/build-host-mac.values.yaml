@@ -44,8 +44,8 @@ buildHosts:
   # `modules` stage names — a Hit is fetched and verified instead of built, a Grant is built once and handed back by its
   # hash. The Mac measures it first, with the warm workspace; inert until a repository's default branch declares `moduleHub`.
   moduleHub: true
-  # The shared tree switch (§7.3b): the deployment trees live on the cache volume every replica on this node mounts, so every
-  # replica starts warm and a roll keeps them (a per-replica tree in the pod's work volume was lost on every roll).
+  # The shared tree switch: INERT since §7.3b (see the chart's matrix beside `sharedTree`); the deployment trees live on the
+  # cache volume every replica on this node mounts, so every replica starts warm and a roll keeps them.
   sharedTree: true
   # The run overlay (Hosting/BuildQueue.md §7.3b): each run mounts its deployment tree read-only and writes only its delta;
   # a busy, unbuilt or refused tree gives a cold worktree off the master, said — never a copy (measured 2026-11-08: 32 s → 3 s,
@@ -53,6 +53,12 @@ buildHosts:
   runOverlay: true
   cacheClaimName: "build-cache-mac"
   # The Mac's only class is node-local; the replicas share it on the one node (ReadWriteOnce is per node).
+  # The cache's real footprint under §7.3b (measured 29 GiB on 2026-11-08 before it): the bare mirrors (the master), the warm
+  # NuGet cache, and ONE built deployment worktree per repository (~18 GiB for MeshWeaver.Plugins, obj/ and bin/ included).
+  # During the roll to §7.3b the old §7.3 generations under <cache>/shared (~18 GiB) sit beside the first deployment tree
+  # until the new runner's first idle pass deletes them — a transient inside the 230 GiB free on the data disk. `size` is
+  # NOT raised here: local-path does not enforce a claim's capacity and cannot expand one, so editing it would only make
+  # the upgrade try (and fail) to resize a bound claim; the data disk is the real bound.
   cache: {create: true, storageClass: "local-path", size: "20Gi", accessMode: "ReadWriteOnce"}
   # bwrap needs a fresh /proc per stage, which only an Unmasked /proc allows, and Kubernetes grants that only to a pod in
   # its own user namespace (hostUsers: false) — hence the dedicated containerd profile first-attach.sh checks for.
