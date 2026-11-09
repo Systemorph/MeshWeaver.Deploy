@@ -3787,7 +3787,9 @@ def advance_platform_tree(dt: DeploymentTree, commit: str, git: Callable[..., No
         admin = None
     if admin is None or not os.path.isdir(dt.platform):
         with master_lock(os.path.dirname(mirror), PLATFORM_REPO):
-            if os.path.lexists(dt.platform):
+            if os.path.islink(dt.platform):
+                os.remove(dt.platform)                     # a planted link: removed, never followed
+            elif os.path.lexists(dt.platform):
                 shutil.rmtree(dt.platform)                 # a half-added tree: removed, never adopted
             git("--git-dir", mirror, "worktree", "prune")
             os.makedirs(os.path.dirname(dt.platform), exist_ok=True)
@@ -7945,6 +7947,17 @@ def self_test() -> int:
                   seen_b and wt_count(fdt.platform, master_path(wenv["MW_BUILD_CACHE"], "MeshWeaver")) == 1
                   and os.path.isfile(os.path.join(fdt.platform, "src", "obj", "kept.txt"))
                   and "planted" not in open(os.path.join(fdt.platform, "Directory.Build.props")).read(), seen_b)
+
+            # a LINK where the platform tree belongs (planted, or left by a crash) is removed, never followed nor fatal
+            shutil.rmtree(fdt.platform)
+            os.remove(os.path.join(fdt.host, "platform-admin"))
+            os.symlink(wroot, fdt.platform)
+            fdt.unbuild(warm_key(hf.env, hf.identity), c3)
+            seen_b.clear()
+            hf.warm_main_when_idle()
+            check("warm-idle/a symlink at the platform tree's path is removed (not followed) and the tree is re-added",
+                  seen_b and not os.path.islink(fdt.platform) and os.path.isdir(fdt.platform) and os.path.isdir(wroot)
+                  and any(b[0] == fdt.platform for b in seen_b[0][1]), seen_b)
 
             # a run STAGE's platform view (§7.3b step 2): its own, bound AT the MW_PLATFORM_SOURCE path, lower = the warm platform
             # tree the run holds, else the image's tree; a view that cannot be made binds nothing (the stage sees read-only)
