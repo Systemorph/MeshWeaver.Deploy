@@ -167,9 +167,13 @@ step_devtools() {
   touch "$flag"
   label="$(softwareupdate -l 2>/dev/null | sed -n 's/^[[:space:]]*\* Label: \(Command Line Tools.*\)$/\1/p' | sort -V | tail -1)"
   if [ -z "$label" ]; then rm -f "$flag"; log "developer tools: FAILED — softwareupdate offers no Command Line Tools (retried next run)"; return 1; fi
-  softwareupdate -i "$label" >/dev/null 2>&1
+  local out; out="$(softwareupdate -i "$label" 2>&1)"
   rm -f "$flag"
-  devtools_present || { log "developer tools: FAILED to install '$label' (retried next run)"; return 1; }
+  if ! devtools_present; then
+    log "developer tools: FAILED to install '$label' (retried next run) — softwareupdate said:"
+    printf '%s\n' "$out" | tail -5 | while IFS= read -r l; do log "developer tools:   $l"; done
+    return 1
+  fi
   log "developer tools: installed '$label'"
 }
 
@@ -241,21 +245,31 @@ step_tailscaled() {
   run launchctl bootstrap system "$TAILSCALED_PLIST" || { log "tailscaled: FAILED to load the daemon"; return 1; }
 }
 
-# The pre-auth key file: FLEET_PREAUTH_KEY_FILE, else the console user's enrol directory. A default-path file is
-# taken only when it is a REGULAR file owned by that user (never a symlink): root passes its content to the
-# login server, so it must never be steered at another file. Prints the path, or nothing.
-preauth_key_file() {
-  local user="$1" machine="$2" f
-  if [ -n "${FLEET_PREAUTH_KEY_FILE:-}" ]; then printf '%s' "$FLEET_PREAUTH_KEY_FILE"; return 0; fi
-  f="$(user_home "$user")/.memex-local/enrol/$machine.preauth"
-  [ -f "$f" ] && [ ! -L "$f" ] && [ "$(stat -f%Su "$f" 2>/dev/null)" = "$user" ] && printf '%s' "$f"
-  return 0
+# A default-path pre-auth key is taken into ROOT's hands before it is used: the directory entry is RENAMED into
+# the root-owned state directory (a rename moves a symlink as a symlink, never its target), validated THERE —
+# where the console user can no longer swap it — and made root's own. Only then is it read, by file reference.
+# Returns 1 (and removes it) when it is not a regular file the console user owned.
+take_preauth_key() {
+  local src="$1" held="$2" user="$3"
+  [ -e "$src" ] || [ -L "$src" ] || return 0
+  run mv -f "$src" "$held" || { log "network: FAILED to take the pre-auth key file"; return 1; }
+  [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] && return 0
+  if [ -L "$held" ] || [ ! -f "$held" ] || [ "$(stat -f%Su "$held" 2>/dev/null)" != "$user" ]; then
+    rm -f "$held"; log "network: REFUSED the pre-auth key file (not a regular file owned by $user) — removed"; return 1
+  fi
+  chown root:wheel "$held" 2>/dev/null || true; chmod 600 "$held"
 }
 
 step_network() {
   local machine="$1" user="${2:-}" ts=("$TS_DIR/bin/tailscale" --socket="$TAILSCALED_SOCKET")
   if "${ts[@]}" status >/dev/null 2>&1; then log "network: joined"; return 0; fi
-  local key_file login; key_file="$(preauth_key_file "$user" "$machine")"; login="$(setting FLEET_LOGIN_SERVER LoginServer)"
+  local held="$TAILSCALED_STATE_DIR/preauth.key" key_file="" login; login="$(setting FLEET_LOGIN_SERVER LoginServer)"
+  if [ -n "${FLEET_PREAUTH_KEY_FILE:-}" ]; then key_file="$FLEET_PREAUTH_KEY_FILE"
+  else
+    # Intune sets no environment: the key is dropped at ~<console user>/.memex-local/enrol/<machine>.preauth
+    [ -n "$user" ] && { take_preauth_key "$(user_home "$user")/.memex-local/enrol/$machine.preauth" "$held" "$user" || return 1; }
+    [ -f "$held" ] && key_file="$held"
+  fi
   if [ -z "$key_file" ] || [ ! -f "$key_file" ] || [ -z "$login" ]; then
     log "network: WAITING for a single-use pre-auth key and the login server (control mints the key at enrolment — Hosting/MacStudioFleet §2b.1 target 2)"
     return 0
