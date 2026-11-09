@@ -11,8 +11,10 @@
 #         spec: path/to/fleet.spec.json
 #         client-id: ${{ vars.INTUNE_CLIENT_ID }}
 #         tenant-id: ${{ vars.INTUNE_TENANT_ID }}
+#         runner: <the caller's self-hosted runner label>
 #
-# Credential: the Intune app identity, signed in by WORKLOAD IDENTITY FEDERATION (this job's GitHub OIDC
+# Credential: a READ-ONLY Intune identity (never the apply identity — a pull-request subject would hand every
+# branch a token that writes device management), signed in by WORKLOAD IDENTITY FEDERATION (this job's GitHub OIDC
 # token as the client assertion) — no secret exists anywhere. With no `client-id` the job does NOT go red and
 # does NOT skip in silence: it raises a NOTICE and writes the one owner action into the step summary
 # ("no credential configured"). It never runs --apply: writing to the tenant is a person's decision.
@@ -35,6 +37,11 @@ on:
         type: string
         required: false
         default: ''
+      runner:
+        description: the runner label (a private caller passes its own self-hosted set; GitHub-hosted bills it)
+        type: string
+        required: false
+        default: ubuntu-latest
       tool-ref:
         description: the MeshWeaver.Deploy ref the reconcile is read at
         type: string
@@ -48,7 +55,7 @@ permissions:
 jobs:
   check:
     name: Intune drift (--check, read-only)
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     steps:
       - name: The caller's spec
@@ -71,7 +78,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$INTUNE_CLIENT_ID" ]; then
-            msg="no credential configured: the Intune drift check did NOT read the tenant. Owner action: add a federated credential (issuer https://token.actions.githubusercontent.com, subject repo:${GITHUB_REPOSITORY}:ref:refs/heads/main, plus repo:${GITHUB_REPOSITORY}:pull_request) on the Intune app identity, then set the repository variables INTUNE_CLIENT_ID and INTUNE_TENANT_ID."
+            msg="no credential configured: the Intune drift check did NOT read the tenant. Owner action: a READ-ONLY Intune app identity (DeviceManagementConfiguration.Read.All, DeviceManagementScripts.Read.All, DeviceManagementManagedDevices.Read.All, Group.Read.All, Device.Read.All) with federated credentials for issuer https://token.actions.githubusercontent.com, subjects repo:${GITHUB_REPOSITORY}:ref:refs/heads/main and repo:${GITHUB_REPOSITORY}:pull_request; then the repository variables INTUNE_CLIENT_ID and INTUNE_TENANT_ID."
             echo "::notice title=Intune drift check::$msg"
             { echo "### Intune drift check — not run"; echo; echo "$msg"; } >> "$GITHUB_STEP_SUMMARY"
             exit 0

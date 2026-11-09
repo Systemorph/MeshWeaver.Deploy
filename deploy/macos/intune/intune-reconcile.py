@@ -703,7 +703,10 @@ class Reconcile:
         if "roles" in claims or claims.get("idtyp") == "app":
             have = set(claims.get("roles", []))
             if app.get("clientId") and claims.get("appid") not in (None, app["clientId"]):
-                self.line("INFO", what, f"the token is a different application ({short(claims.get('appid'))}); its roles are what is checked")
+                # A read-only drift identity (the scheduled check's) cannot vouch for the apply identity's grants.
+                self.line("INFO", what, f"signed in as a different application ({short(claims.get('appid'))}, roles: "
+                          + ", ".join(sorted(claims.get("roles", []))) + "); the apply identity's permissions are not verifiable from it")
+                return
             miss = sorted(need - have)
             if miss:
                 self.drift += 1
@@ -962,6 +965,17 @@ def self_test():
     rc, lines, g = run(st3, True, wrong)
     expect("a pinned source whose bytes do not match the declared sha256 is never uploaded",
            not st3["scripts"] and any(ln.startswith("ERROR") and "refusing to upload" in ln for ln in lines) and rc == 1, lines)
+
+    other = "x." + base64.urlsafe_b64encode(json.dumps({"idtyp": "app", "appid": "read-only-app", "roles": ["Group.Read.All"]}).encode()).decode().rstrip("=") + ".y"
+    lines = []
+    r = Reconcile({**spec, "appIdentity": {**spec["appIdentity"], "clientId": "apply-app"}}, ".", FakeGraph(tenant()), token=other, out=lines.append)
+    r.app_identity()
+    expect("a read-only drift identity is named as a different application, never counted as missing grants",
+           r.drift == 0 and any(ln.startswith("INFO") and "not verifiable" in ln for ln in lines), lines)
+    lines = []
+    r = Reconcile(spec, ".", FakeGraph(tenant()), token="x." + base64.urlsafe_b64encode(b'{"idtyp":"app","roles":[]}').decode().rstrip("=") + ".y", out=lines.append)
+    r.app_identity()
+    expect("the apply identity without a declared permission is drift", r.drift == 1 and any("Device.Read.All" in ln for ln in lines), lines)
 
     print(f"self-test: {'FAILED ' + str(len(fails)) if fails else 'passed'}")
     return 1 if fails else 0

@@ -79,9 +79,9 @@
       "plist": {
         "payloadType": "com.memex.local",
         "identifier": "com.example.intune.macos.memex-local-fleet-studio",
-        "uuid": "11111111-2222-4333-8444-555555555555",
+        "uuid": "00000000-0000-4000-8000-0000000000f1",
         "innerIdentifier": "com.example.intune.macos.memex-local-fleet-studio.settings",
-        "innerUuid": "66666666-7777-4888-8999-aaaaaaaaaaaa",
+        "innerUuid": "00000000-0000-4000-8000-0000000000f2",
         "displayName": "Memex Local — fleet Mac Studio",
         "organization": "Example"
       },

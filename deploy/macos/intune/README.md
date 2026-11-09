@@ -57,6 +57,12 @@ is written to a private log. `.github/workflows/intune-reconcile.yml` runs the s
 **Credential** (first that is present; the token is never printed): `INTUNE_CLIENT_ID` + `INTUNE_TENANT_ID` with
 `INTUNE_CLIENT_SECRET`, or with `AZURE_FEDERATED_TOKEN_FILE` (workload identity federation — what the drift check
 uses); otherwise `az account get-access-token --resource https://graph.microsoft.com --tenant <spec.tenant>`.
+🔐 The scheduled drift check must NOT sign in as the apply identity: its federated credential would have to trust the
+private repository's pull-request subject, and every pull-request branch could then mint a token that WRITES device
+management. It signs in as a separate READ-ONLY identity (`DeviceManagementConfiguration.Read.All`,
+`DeviceManagementScripts.Read.All`, `DeviceManagementManagedDevices.Read.All`, `Group.Read.All`, `Device.Read.All`),
+whose federated credentials name that repository's `main` and `pull_request` subjects; the `appIdentity` line then
+reads INFO (a different application), and the apply identity's grants are verified when a person runs `--apply`.
 ⚠️ The Azure CLI's own sign-in carries NO Intune scopes (measured 2026-11-09: every `deviceManagement` read →
 403), so a person's `az login` reads the groups and nothing else; the reconcile needs the app identity.
 
