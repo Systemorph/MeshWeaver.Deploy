@@ -200,7 +200,10 @@ net_rate() {
 }
 
 # A version string as the heartbeat may carry it: digits-led, no quotes or spaces (spliced into JSON verbatim).
-version_ok() { printf '%s' "$1" | grep -Eq '^[0-9]+(\.[0-9A-Za-z+-]+)+$'; }
+# The WHOLE string is matched (bash =~), never line by line: `grep` passes a value when ANY of its lines matches,
+# so a multi-line annotation with a version-shaped first line would reach the JSON with its later lines attached.
+VERSION_RE='^[0-9]+(\.[0-9A-Za-z+-]+)+$'
+version_ok() { [[ $1 =~ $VERSION_RE ]]; }
 
 # The memex-local CLI's version: the Homebrew keg this agent runs from (MEMEX_LOCAL_SHARE is
 # …/Cellar/memex-local/<version>/libexec/share). `memex-local version` is NOT read: it prints the series

@@ -2769,9 +2769,11 @@ rm -rf "$NR"
 echo "── back-lease sampler: versions — memex-local's keg and the build host's set (Hosting MachineReadings.Versions) ──"
 VR="$(mktemp -d)"; mkdir -p "$VR/stubs" "$VR/dir"
 SAMPLER="$HERE/../share/backlease-sampler.sh"
-# kubectl stub: answers only for the build profile's context, echoing the annotation value in $VR/bh
-printf '#!/bin/bash\ncase " $* " in *" --context colima-build "*) cat "%s/bh" 2>/dev/null ;; *) exit 1 ;; esac\n' "$VR" > "$VR/stubs/kubectl"; chmod +x "$VR/stubs/kubectl"
-sv() { env PATH="$VR/stubs:$PATH" MEMEX_LOCAL_SHARE="$1" MEMEX_BUILD_PROFILE= MEMEX_BACKLEASE_DIR="$VR/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_versions' "$SAMPLER"; }
+# kubectl stub: answers for the build profile's context (the value in $VR/bh) and for the bare `colima` context
+# of MEMEX_BUILD_PROFILE=default (the value in $VR/bh.default); any other context fails
+printf '#!/bin/bash\ncase " $* " in *" --context colima-build "*) cat "%s/bh" 2>/dev/null ;; *" --context colima "*) cat "%s/bh.default" 2>/dev/null ;; *) exit 1 ;; esac\n' "$VR" "$VR" > "$VR/stubs/kubectl"; chmod +x "$VR/stubs/kubectl"
+# sv SHARE [PROFILE] — PROFILE is MEMEX_BUILD_PROFILE, empty (→ build) unless given, never the ambient value
+sv() { env PATH="$VR/stubs:$PATH" MEMEX_LOCAL_SHARE="$1" MEMEX_BUILD_PROFILE="${2:-}" MEMEX_BACKLEASE_DIR="$VR/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_versions' "$SAMPLER"; }
 printf '3.1.12855' > "$VR/bh"
 [ "$(sv /opt/homebrew/Cellar/memex-local/0.3.440/libexec/share)" = '{"memex-local":"0.3.440","build-host":"3.1.12855"}' ] \
   && ok "versions carry the keg's memex-local version and the build host's platform-version annotation" || bad "versions" "$(sv /opt/homebrew/Cellar/memex-local/0.3.440/libexec/share)"
@@ -2781,7 +2783,14 @@ printf '3.1.12855' > "$VR/bh"
 [ "$(sv '')" = '{}' ] && ok "no keg and no build host → an empty versions object, still valid JSON" || bad "empty versions" "$(sv '')"
 printf '3.1.1"bad' > "$VR/bh"
 [ "$(sv '')" = '{}' ] && ok "a value that is not version-shaped is dropped, never spliced into the JSON" || bad "version guard" "$(sv '')"
-vw() { env PATH="$VR/stubs:$PATH" MEMEX_LOCAL_SHARE=/opt/homebrew/Cellar/memex-local/0.3.440/libexec/share MEMEX_BACKLEASE_DIR="$VR/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "{\"cores\":2}"; }; owner_cpu() { :; }; host_cpu() { :; }; net_rate() { :; }
+# a multi-line value whose FIRST line is version-shaped: a line-by-line match would pass it and splice the rest
+printf '3.1.12855\n","injected":"x' > "$VR/bh"
+[ "$(sv '')" = '{}' ] && ok "a multi-line value is dropped whole, even when its first line is version-shaped" || bad "multi-line version guard" "$(sv '')"
+# MEMEX_BUILD_PROFILE=default reads the bare `colima` context, the same rule as memex-local's build_ctx
+: > "$VR/bh"; printf '3.1.12900' > "$VR/bh.default"
+[ "$(sv '' default)" = '{"build-host":"3.1.12900"}' ] && ok "MEMEX_BUILD_PROFILE=default reads the build host from the bare colima context" || bad "default profile" "$(sv '' default)"
+rm -f "$VR/bh.default"
+vw() { env PATH="$VR/stubs:$PATH" MEMEX_BUILD_PROFILE= MEMEX_LOCAL_SHARE=/opt/homebrew/Cellar/memex-local/0.3.440/libexec/share MEMEX_BACKLEASE_DIR="$VR/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "{\"cores\":2}"; }; owner_cpu() { :; }; host_cpu() { :; }; net_rate() { :; }
   sample_models() { printf "[]"; }; sample_vm() { printf null; }; colima() { return 1; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }
   OUT="$1"; write_sample; cat "$OUT"' "$SAMPLER" "$VR/out.json"; }
 printf '3.1.12855' > "$VR/bh"
