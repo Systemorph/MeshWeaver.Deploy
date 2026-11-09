@@ -407,12 +407,17 @@ grep -q '"$(memex_libexec)/memex-local"' "$FB" && ok "the bootstrap sources the 
 grep -q 'TS_CHANGED:-0' "$FB" && grep -q 'TS_CHANGED=1' "$FB" && ok "an upgraded tailscaled is reloaded, not left running the old binary" || bad "reload after upgrade" "missing"
 grep -q 'fleet.finalized' "$FB" && ok "a join's finalisation is recorded by a marker written only after it completed" || bad "finalisation marker" "missing"
 grep -q 'TRUST_STORES=nss' "$FB" && grep -q 'WAITING for the local CA to be trusted' "$FB" && ok "the local CA is created without the keychain prompt, and up waits until it is trusted" || bad "CA trust wait" "missing"
+mkdir -p "$T/clt/usr/bin" && printf '#!/bin/sh\n' > "$T/clt/usr/bin/clang" && chmod +x "$T/clt/usr/bin/clang"
+env FLEET_BOOTSTRAP_LIB=1 FLEET_CLT_DIR="$T/clt" FLEET_LOG_DIR="$T/clog" bash -c '. "$0"; step_devtools' "$FB" | grep -q 'developer tools: present' \
+  && ok "installed Command Line Tools are detected and left alone" || bad "developer tools present" "$(env FLEET_BOOTSTRAP_LIB=1 FLEET_CLT_DIR="$T/clt" FLEET_LOG_DIR="$T/clog" bash -c '. "$0"; step_devtools' "$FB" 2>&1)"
+grep -q 'installondemand.in-progress' "$FB" && grep -q 'rm -f "$flag"' "$FB" && ok "the on-demand flag is set for the catalogue and always removed" || bad "on-demand flag" "missing"
 grep -q -- '--auth-key="file:$key_file"' "$FB" && ! grep -q -- '--auth-key "\$key"' "$FB" \
   && ok "the pre-auth key is passed by FILE reference (never an argument)" || bad "auth key by file" "missing"
 # A dry run on a bare Mac: every changing command is printed, nothing runs, and it waits (exit 0) for the key and the control URL.
 OUT="$(env FLEET_TS_FORMULA_API="file://$T/tailscale.json" FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_CONSOLE_USER=jroe FLEET_USER_HOME="$T/home" FLEET_BREW_PREFIX="$T/brew" FLEET_LOG_DIR="$T/logs" \
   FLEET_TS_DIR="$T/tsbin" FLEET_LAUNCHDAEMONS_DIR="$T/ld" FLEET_TAILSCALED_SOCKET="$T/no.sock" FLEET_TAILSCALED_STATE_DIR="$T/ts" FLEET_MANAGED_PREFS="$T/none" FLEET_MACHINE_ID=studio-2 \
-  bash "$FB" 2>&1)"; RC=$?
+  FLEET_CLT_DIR="$T/noclt" bash "$FB" 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*"homebrew: installing"*"developer tools: installing the Command Line Tools"*"DRY-RUN: softwareupdate -i"*"tools: installing"*) ok "a bare Mac gets the Command Line Tools (headless softwareupdate) BEFORE the tools: memex-local builds from source" ;; *) bad "bootstrap installs the developer tools first" "rc=$RC: $OUT" ;; esac
 case "$RC:$OUT" in 0:*"homebrew: installing"*"tools: installing"*"tailscale: installing 1.104.5 from the verified bottle"*"tailscaled: (re)loading the root LaunchDaemon"*"network: WAITING"*"memex: WAITING for ControlUrl"*"done"*) ok "a dry run on a bare Mac plans every step (tap trusted, binaries from the verified bottle) and waits, exit 0" ;; *) bad "bootstrap dry run" "rc=$RC: $OUT" ;; esac
 case "$OUT" in *"DRY-RUN: mkdir -p $T/brew"*"DRY-RUN: write $T/ld/com.meshweaver.fleet.tailscaled.plist"*) ok "the dry run prints the changing commands instead of running them" ;; *) bad "dry-run commands" "$OUT" ;; esac
 [ ! -e "$T/brew" ] && [ ! -e "$T/ld/com.meshweaver.fleet.tailscaled.plist" ] && ok "the dry run changed nothing" || bad "dry run changed the machine" "$(ls "$T")"

@@ -31,7 +31,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.3.1"
+readonly FLEET_BOOTSTRAP_VERSION="1.3.2"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -46,6 +46,9 @@ readonly BREW_TOOLS=(colima docker kubectl helm ollama)
 readonly TS_DIR="${FLEET_TS_DIR:-/Library/MeshWeaver/tailscale}"
 readonly TS_FORMULA_API="${FLEET_TS_FORMULA_API:-https://formulae.brew.sh/api/formula/tailscale.json}"
 readonly MEMEX_FORMULA="systemorph/memex/memex-local"
+# The Command Line Tools: memex-local is a source formula, so `brew install` refuses with "No developer tools
+# installed" on a fresh Mac (measured on the second Mac Studio, 2026-11-09). Installed headless, as root.
+readonly CLT_DIR="${FLEET_CLT_DIR:-/Library/Developer/CommandLineTools}"
 
 log() {
   local line; line="$(date -u +%Y-%m-%dT%H:%M:%SZ) fleet-bootstrap ${FLEET_BOOTSTRAP_VERSION}: $*"
@@ -142,6 +145,31 @@ step_homebrew() {
   run mkdir -p "$BREW_PREFIX" && run chown -R "$user:admin" "$BREW_PREFIX" \
     && as_user "$user" /bin/bash -c "curl -fsSL https://github.com/Homebrew/brew/tarball/main | tar xz --strip-components 1 -C '$BREW_PREFIX'" \
     || { log "homebrew: FAILED to install"; return 1; }
+}
+
+# Whether a compiler toolchain Homebrew accepts is present: the Command Line Tools, or (only when the CLT
+# directory is not overridden) a selected Xcode. Pure read.
+devtools_present() {
+  [ -x "$CLT_DIR/usr/bin/clang" ] && return 0
+  [ -z "${FLEET_CLT_DIR:-}" ] || return 1
+  local dev; dev="$(xcode-select -p 2>/dev/null || true)"
+  [ -n "$dev" ] && [ -x "$dev/usr/bin/clang" ]
+}
+
+# The Command Line Tools, installed with softwareupdate (no dialog, no person): the on-demand flag makes the
+# catalogue offer them, the newest label is installed, and the flag is removed whatever happened.
+step_devtools() {
+  if devtools_present; then log "developer tools: present"; return 0; fi
+  local flag="/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress" label
+  log "developer tools: installing the Command Line Tools (softwareupdate, headless — memex-local builds from source)"
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then printf 'DRY-RUN: softwareupdate -i "<newest Command Line Tools label>"\n'; return 0; fi
+  touch "$flag"
+  label="$(softwareupdate -l 2>/dev/null | sed -n 's/^[[:space:]]*\* Label: \(Command Line Tools.*\)$/\1/p' | sort -V | tail -1)"
+  if [ -z "$label" ]; then rm -f "$flag"; log "developer tools: FAILED — softwareupdate offers no Command Line Tools (retried next run)"; return 1; fi
+  softwareupdate -i "$label" >/dev/null 2>&1
+  rm -f "$flag"
+  devtools_present || { log "developer tools: FAILED to install '$label' (retried next run)"; return 1; }
+  log "developer tools: installed '$label'"
 }
 
 step_tools() {
@@ -304,6 +332,7 @@ main() {
   machine="$(machine_id)"
   log "run for console user $user, machine $machine"
   step_homebrew "$user" || failed=1
+  [ "$failed" = 0 ] && { step_devtools || failed=1; }
   [ "$failed" = 0 ] && { step_tools "$user" || failed=1; }
   [ "$failed" = 0 ] && { step_tailscale_binaries || failed=1; }
   [ "$failed" = 0 ] && { step_tailscaled || failed=1; }
