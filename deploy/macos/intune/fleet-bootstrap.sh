@@ -264,6 +264,12 @@ step_network() {
   local machine="$1" user="${2:-}" ts=("$TS_DIR/bin/tailscale" --socket="$TAILSCALED_SOCKET")
   if "${ts[@]}" status >/dev/null 2>&1; then log "network: joined"; return 0; fi
   local held="$TAILSCALED_STATE_DIR/preauth.key" key_file="" login; login="$(setting FLEET_LOGIN_SERVER LoginServer)"
+  # the login server the enrolment code named (`fleet join` leaves it beside the key) when the profile names none
+  if [ -z "$login" ] && [ -n "$user" ]; then
+    local named; named="$(user_home "$user")/.memex-local/enrol/$machine.login-server"
+    [ -f "$named" ] && [ ! -L "$named" ] && login="$(head -1 "$named" | tr -d '[:space:]')"
+    case "$login" in https://*) ;; *) login="" ;; esac
+  fi
   if [ -n "${FLEET_PREAUTH_KEY_FILE:-}" ]; then key_file="$FLEET_PREAUTH_KEY_FILE"
   else
     # Intune sets no environment: the key is dropped at ~<console user>/.memex-local/enrol/<machine>.preauth
@@ -339,14 +345,20 @@ step_memex() {
     log "memex: joined as $machine, finished"; return 0
   fi
   code_file="$home/.memex-local/enrol/$machine.code"
-  log "memex: fleet join as $machine (control $control); the code is read from $code_file once present"
-  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then log "memex: (dry run) would run 'memex-local fleet join' and wait for the code at $code_file"; return 0; fi
-  out="$(as_user "$user" "$mlocal" fleet join --control "$control" --id "$machine" --no-open --code-file "$code_file" 2>&1)"; rc=$?
+  # The POLLING join (enrolment v2): it asks control for its own code, signed with its throw-away key, for a bounded
+  # wait per run; the next run resumes with the same key. A code dropped at $code_file is the fallback.
+  local wait_min; wait_min="$(setting FLEET_JOIN_WAIT_MIN JoinWaitMinutes 10)"
+  case "$wait_min" in ''|*[!0-9]*) wait_min=10 ;; esac
+  log "memex: fleet join as $machine (control $control) — polling control for the code up to $wait_min min this run (fallback: $code_file)"
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then log "memex: (dry run) would run 'memex-local fleet join --wait $wait_min' and poll control for the code"; return 0; fi
+  out="$(as_user "$user" "$mlocal" fleet join --control "$control" --id "$machine" --no-open --wait "$wait_min" --code-file "$code_file" 2>&1)"; rc=$?
   # the approval link and the fingerprints only — never a token-bearing setup URL
-  printf '%s\n' "$out" | grep -E 'Hosting/Heartbeats/Enrol/|fingerprint|joined as|WAITING|waiting' | grep -v 'token=' | while IFS= read -r l; do log "memex: $l"; done
+  printf '%s\n' "$out" | grep -E 'Hosting/Heartbeats/Enrol/|fingerprint|joined as|WAITING|waiting|approved|REFUSED|network:|sign-in:|certificate:|build host:' | grep -v 'token=' | while IFS= read -r l; do log "memex: $l"; done
   case "$rc" in
-    0) as_user "$user" /usr/bin/touch "$home/.memex-local/fleet.finalized" || true; log "memex: joined as $machine" ;;
-    3) log "memex: WAITING for the approval on control and the enrolment code at $code_file" ;;
+    0) as_user "$user" /usr/bin/touch "$home/.memex-local/fleet.finalized" || true; log "memex: joined as $machine"
+       # the join handed the private-network key over by file: join the network now, not at the next run
+       step_network "$machine" "$user" || true ;;
+    3) log "memex: WAITING for the approval on control — the next run polls again" ;;
     *) log "memex: fleet join FAILED (exit $rc)"; return 1 ;;
   esac
 }

@@ -122,7 +122,7 @@ fi
 # ---------------------------------------------------------------------------------------------------
 # 1. The CLI component's root — 1:1 with Formula/memex-local.rb's `install`: libexec/memex-local,
 #    share/* (the formula's `(libexec/"share").install Dir["deploy/homebrew/share/*"]`), share/helm
-#    (the vendored chart), and a wrapper on PATH that sets MEMEX_LOCAL_SHARE + MEMEX_CHART_DIR exactly
+#    (the vendored chart), share/backlease (the build-host first attach `fleet join` runs), and a wrapper on PATH that sets MEMEX_LOCAL_SHARE + MEMEX_CHART_DIR exactly
 #    as the formula's write_env_script does. The drift test (deploy/macos/test) compares the two lists.
 # ---------------------------------------------------------------------------------------------------
 root="$work/root"; p="$root$prefix"
@@ -131,6 +131,7 @@ mkdir -p "$p/bin" "$p/libexec" "$p/share/helm" "$p/share/doc" "$root/etc/paths.d
 install -m 0755 "$brew_dir/bin/memex-local" "$p/libexec/memex-local"
 cp -R "$brew_dir/share/." "$p/share/"
 cp -R "$repo/deploy/helm/." "$p/share/helm/"
+mkdir -p "$p/share/backlease" && cp -R "$repo/deploy/backlease/." "$p/share/backlease/"   # the formula's share/backlease (first-attach)
 install -m 0755 "$here/libexec/uninstall.sh" "$p/libexec/uninstall.sh"
 cat > "$p/bin/memex-local" <<WRAP
 #!/bin/bash
