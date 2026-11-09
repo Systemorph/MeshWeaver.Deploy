@@ -2167,6 +2167,9 @@ fleet_apply_buildhost() {
   ( umask 077; cp "$dir/w" "$secrets/worker"; cp "$dir/p" "$secrets/pull"; if [ -s "$dir/k" ] && [ -n "$preg" ]; then cp "$dir/k" "$secrets/instance-key"; fi )
   local args=(--api "$api" --registry "$reg" --pull-user "$puser" --secrets-from "$secrets" --set-from latest)
   if [ -s "$dir/k" ] && [ -n "$preg" ]; then args+=(--plugins-registry "$preg"); fi
+  if [ -s "$dir/k" ] && [ -z "$preg" ]; then
+    warn "build host: the code carries a registry key but no pluginsRegistry fact — the key is left out and the host attaches with the plain plugins contract (declare Hosting:Enrolment:Facts:pluginsRegistry on control)"
+  fi
   fleet_accept_argv first-attach
   ( bash "$fa" ${args[@]+"${args[@]}"} ${FLEET_ACCEPT_ARGV[@]+"${FLEET_ACCEPT_ARGV[@]}"} ) && ok "build host attached (first-attach, values from the code)" \
     || warn "build host: first-attach failed — re-run 'memex-local fleet join' or first-attach.sh by hand"
