@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # hosting-tailnet-key --namespace <ns> --release <headscale release> --vault <vault> --object <vault object>
 #                     --tags <tag:a[,tag:b]> --expiration <N>m|<N>h [--set-by <principal>]
+# hosting-tailnet-key --namespace <ns> --release <headscale release> --tags <…> --expiration <N>m
+#                     --seal-to <base64 SPKI of an RSA-3072+ key> --item <x> [--set-by <principal>]
 #
 # MINT a one-time Headscale PRE-AUTH KEY for a server that joins the private network, and store it
 # straight into Key Vault without anyone seeing it (deploy/headscale/README.md → "Keys for servers").
@@ -32,12 +34,20 @@
 # volume afterwards, so an expired key costs nothing once it registered.
 #
 # It OVERWRITES the object: a fresh key replaces a spent one (Key Vault keeps the previous version).
+#
+# SEALED MODE (--seal-to/--item; Hosting/MacStudioFleet §2b, an enrolling Mac — enrolment v2): instead
+# of a vault object, the key is SEALED inside this job to the Mac's throw-away public key (RSA-OAEP-
+# SHA256, one block) and the ONLY trace of it is `::hosting:: sealed_item item=<x> fp=… b64=<ciphertext>`.
+# Nothing is written to a vault, so --vault/--object are refused beside it (one destination per key).
+# The recipient key is checked BEFORE anything is minted, and a key that could not be sealed is
+# EXPIRED in headscale before the step fails — exactly as a vault that refused the write. Every other
+# rule above (declared tags, single use, 10m–24h) is the same in both modes.
 # shellcheck source=_common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
 # shellcheck disable=SC2034  # read by hosting::die in _common.sh, which shellcheck does not follow here
 HOSTING_CMD="hosting-tailnet-key"
 
-namespace="" release="" vault="" object="" tags="" expiration="" set_by="hosting-operator"
+namespace="" release="" vault="" object="" tags="" expiration="" set_by="hosting-operator" seal_to="" item=""
 # A flag given LAST with no value must not spin (see hosting-registry-coupon).
 shift_value() { if [ $# -ge 2 ]; then shift_n=2; else shift_n=1; fi; }
 while [ $# -gt 0 ]; do
@@ -50,6 +60,8 @@ while [ $# -gt 0 ]; do
     --tags)       tags="${2:-}";       shift_value "$@" ;;
     --expiration) expiration="${2:-}"; shift_value "$@" ;;
     --set-by)     set_by="${2:-}";     shift_value "$@" ;;
+    --seal-to)    seal_to="${2:-}";    shift_value "$@" ;;
+    --item)       item="${2:-}";       shift_value "$@" ;;
     --reusable|--ephemeral)
       hosting::die "$1 is refused — a server joins with a SINGLE-USE, non-ephemeral key; a reusable key in the vault would let anything that reads it join the network again and again" ;;
     *) hosting::die "unknown argument '$1'" ;;
@@ -58,14 +70,24 @@ while [ $# -gt 0 ]; do
 done
 hosting::need_flag namespace "$namespace"
 hosting::need_flag release "$release"
-hosting::need_flag vault "$vault"
-hosting::need_flag object "$object"
+sealed=""
+if [ -n "$seal_to" ] || [ -n "$item" ]; then
+  sealed=1
+  hosting::need_flag seal-to "$seal_to"
+  hosting::need_flag item "$item"
+  hosting::safe_item "$item"
+  [ -z "$vault" ] && [ -z "$object" ] \
+    || hosting::die "--seal-to and --vault/--object name two destinations for ONE single-use key — a sealed key is never stored in a vault. Nothing was minted."
+else
+  hosting::need_flag vault "$vault"
+  hosting::need_flag object "$object"
+fi
 hosting::need_flag tags "$tags"
 hosting::need_flag expiration "$expiration"
 hosting::safe_name namespace "$namespace"
 hosting::safe_name release "$release"
-hosting::safe_name vault "$vault"
-hosting::safe_name object "$object"
+[ -n "$sealed" ] || hosting::safe_name vault "$vault"
+[ -n "$sealed" ] || hosting::safe_name object "$object"
 hosting::safe_actor set-by "$set_by"
 
 # ── the tags: 1–4 of `tag:<dns label>`, no duplicates ───────────────────────────────────────────
@@ -91,6 +113,18 @@ minutes=$(( 10#$amount ))
 
 command -v jq >/dev/null 2>&1 || hosting::die "jq is not installed in this image — headscale answers JSON"
 command -v python3 >/dev/null 2>&1 || hosting::die "python3 is not installed in this image — the policy is HuJSON"
+
+# Everything below may touch the key. umask first: every temporary this step creates is 0600.
+umask 077
+work="$(mktemp -d)" || hosting::die "could not create a private working directory. Nothing was minted."
+cleanup() { rm -rf "$work"; }
+trap 'hosting::on_exit; cleanup' EXIT
+
+# A sealed key's recipient is checked BEFORE anything is minted: a key nobody can open must never exist.
+if [ -n "$sealed" ]; then
+  hosting::seal_key "$seal_to" "$work"
+  hosting::log "seal-to   RSA-${HOSTING_SEAL_BITS} public key, sha256 $(hosting::sha256 < "$work/seal.der" | cut -c1-12)… (item ${item})"
+fi
 
 # ── 1. the headscale pod ──────────────────────────────────────────────────────────────────────────
 hosting::step "Find the headscale pod"
@@ -160,17 +194,15 @@ done
 hosting::log "tags      ${tags} — every one declared in tagOwners"
 
 if hosting::dry; then
-  hosting::log "(dry run) would mint a single-use key tagged ${tags}, expiring in ${expiration}, inside pod/${pod}, and store it under ${object} in vault ${vault} (never shown), tagged mw-set-by=${set_by}"
+  if [ -n "$sealed" ]; then
+    hosting::log "(dry run) would mint a single-use key tagged ${tags}, expiring in ${expiration}, inside pod/${pod}, and seal it to the given key as item ${item} (never shown, never stored)"
+  else
+    hosting::log "(dry run) would mint a single-use key tagged ${tags}, expiring in ${expiration}, inside pod/${pod}, and store it under ${object} in vault ${vault} (never shown), tagged mw-set-by=${set_by}"
+  fi
   hosting::say tailnet_key dry-run
   hosting::say tailnet_key_tags "$tags"
   exit 0
 fi
-
-# Everything below touches the key. umask first: every temporary this step creates is 0600.
-umask 077
-work="$(mktemp -d)" || hosting::die "could not create a private working directory. Nothing was minted."
-cleanup() { rm -rf "$work"; }
-trap 'hosting::on_exit; cleanup' EXIT
 
 # ── 3. mint, inside the pod ──────────────────────────────────────────────────────────────────────
 hosting::step "Mint the key inside headscale"
@@ -209,6 +241,24 @@ if [[ "$expires_at" =~ ^[0-9]+$ ]]; then
   expires_iso="$(date -u -d "@${expires_at}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$expires_at" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
 fi
 fp="$(hosting::fingerprint "$work/key")"
+
+# ── 4a. sealed: the key leaves this job as ciphertext for the enrolling Mac only ─────────────────
+if [ -n "$sealed" ]; then
+  hosting::step "Seal the key to the enrolling machine"
+  if ! hosting::seal_item "$item" "$work/key" "$work"; then
+    rm -f "$work/key"
+    expire_key
+    hosting::die "headscale minted key ${key_id} but it could not be sealed: ${HOSTING_SEAL_ERR}. The key was expired; nothing holds a live key."
+  fi
+  rm -f "$work/key"
+  hosting::log "minted    key ${key_id} (${tags}; single use; expires ${expires_iso}) → sealed as item ${item} (${fp}); never stored"
+  hosting::say tailnet_key sealed
+  hosting::say tailnet_key_id "$key_id"
+  hosting::say tailnet_key_tags "$tags"
+  hosting::say tailnet_key_expires "$expires_iso"
+  hosting::enrol_fact tailnetTags "$tags"
+  exit 0
+fi
 
 # ── 4. store it ───────────────────────────────────────────────────────────────────────────────────
 hosting::step "Store the key in Key Vault"

@@ -176,6 +176,24 @@ and a single-use key that outlives that window is a standing credential in the v
 keeps its identity on its own volume afterwards. It runs on the operations lane with that lane's cluster
 credential; the in-cluster operator ServiceAccount holds no `pods/exec` and is not widened for it.
 
+### Sealed for an enrolling Mac (enrolment v2)
+
+A Mac Studio enrolling in the fleet (MeshWeaver.Plugins `Hosting/MacStudioFleet.md` §2b) gets its key SEALED
+instead of stored: the same verb, with the Mac's throw-away public key in place of the vault object.
+
+```
+hosting-tailnet-key --namespace <ns> --release <headscale release> --tags tag:<a>[,…] --expiration <N>m
+                    --seal-to <base64 SubjectPublicKeyInfo of an RSA-3072+ key> --item t
+```
+
+Every rule above holds (declared tags, single use, 10m–24h). The recipient key is checked BEFORE anything is
+minted; the key is encrypted inside the job (`openssl pkeyutl -encrypt`, RSA-OAEP with SHA-256 and MGF1-SHA-256,
+one block) and the only trace of it is `::hosting:: sealed_item item=t fp=sha256:<12 hex> b64=<ciphertext>`;
+nothing is written to a vault (`--vault`/`--object` are refused beside `--seal-to`). A key that could not be
+sealed is expired in Headscale before the step fails. The two sibling verbs of an enrolment seal the same way:
+`hosting-signin-app --per-machine <id> --domain <domain> --seal-to … --item e` (the Mac's own Entra app) and
+`hosting-seal-secret --vault <v> --object <o> --seal-to … --item n|a|w|p|k` (an existing vault object).
+
 ## Joining a machine
 
 - **macOS:** `brew install --cask tailscale` (the app, with its network extension) or
