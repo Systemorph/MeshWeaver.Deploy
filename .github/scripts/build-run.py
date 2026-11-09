@@ -3499,9 +3499,12 @@ def retire_stale_deployments(cache: str, lane: Optional[str], current: str, log:
         return removed
     for name in names:
         dep = os.path.join(root, name)
-        if name == current or not name.startswith(f"{safe[:48]}-") or not os.path.isdir(dep) or os.path.islink(dep):
+        # exactly `deployment_name`'s shape for THIS lane: the lane prefix and a 16-character key, nothing longer or shorter
+        if name == current or not re.fullmatch(re.escape(safe[:48]) + r"-[0-9A-Za-z]{16}", name) or not os.path.isdir(dep) \
+                or os.path.islink(dep):
             continue
-        if now - _newest_mtime(dep) < stale:
+        age = now - _newest_mtime(dep)
+        if age < stale:
             continue
         locks_dir = os.path.join(dep, ".locks")
         held: list = []
@@ -3517,9 +3520,10 @@ def retire_stale_deployments(cache: str, lane: Optional[str], current: str, log:
                 log(f"deployment {name}: another key's trees are still in use (a lock is held) — kept, retried when idle")
                 continue
             repos = {d for d in os.listdir(dep) if REPO.match(d) and not d.startswith(".")}
-            platform_dir = os.path.join(dep, ".platform")
+            if os.path.lexists(os.path.join(dep, ".platform")):
+                repos.add(PLATFORM_REPO)                   # read BEFORE the removal: the platform tree's master is pruned too
             _rm_tree(dep)
-            for repo in sorted(repos | ({PLATFORM_REPO} if os.path.lexists(platform_dir) else set())):
+            for repo in sorted(repos):
                 mirror = master_path(cache, repo)
                 if os.path.isfile(os.path.join(mirror, "HEAD")):
                     try:
@@ -3529,7 +3533,7 @@ def retire_stale_deployments(cache: str, lane: Optional[str], current: str, log:
                         pass
             gone = not os.path.exists(dep)
             log(f"deployment {name}: another key's deployment {'retired' if gone else 'NOT fully removed'} (untouched "
-                f"{int((now - _newest_mtime(dep)) if not gone else stale)}+ s, no lock held) — the current one is {current}")
+                f"{int(age)} s, no lock held) — the current one is {current}")
             if gone:
                 removed.append(dep)
         except OSError as e:
@@ -8145,15 +8149,18 @@ def self_test() -> int:
 
             # STALE DEPLOYMENTS: a set change gives a new key; the lane's other keys are retired once unused and quiet
             rc_ = os.path.join(wroot, "retire-cache"); rdep = os.path.join(rc_, DEPLOY_DIR)
-            for nm in ("mac-current", "mac-old", "mac-young", "mac-busy", "latest-old"):
+            for nm in ("mac-currentcurrent00", "mac-0123456789abcdef", "mac-youngyoungyoung1", "mac-busybusybusybusy", "latest-oldoldoldoldold1", "mac-oldish-but-not-a-key"):
                 os.makedirs(os.path.join(rdep, nm, ".locks"), exist_ok=True)
                 open(os.path.join(rdep, nm, ".locks", "R.lock"), "w").close()
             # a REAL worktree of a master inside the stale deployment: it must be deregistered, not left as a dangling entry
             rmirror = master_path(rc_, "R"); os.makedirs(os.path.dirname(rmirror), exist_ok=True)
             sh("git", "clone", "-q", "--bare", seed, rmirror, cwd=wroot)
-            sh("git", "--git-dir", rmirror, "worktree", "add", "--detach", "-q", os.path.join(rdep, "mac-old", "R"), "HEAD", cwd=wroot)
+            sh("git", "--git-dir", rmirror, "worktree", "add", "--detach", "-q", os.path.join(rdep, "mac-0123456789abcdef", "R"), "HEAD", cwd=wroot)
+            pmirror_r = master_path(rc_, PLATFORM_REPO)
+            sh("git", "clone", "-q", "--bare", seed, pmirror_r, cwd=wroot)
+            sh("git", "--git-dir", pmirror_r, "worktree", "add", "--detach", "-q", os.path.join(rdep, "mac-0123456789abcdef", ".platform", "R"), "HEAD", cwd=wroot)
             old_t = time.time() - STALE_DEPLOYMENT_SECONDS - 60
-            for nm in ("mac-old", "mac-busy", "latest-old"):
+            for nm in ("mac-0123456789abcdef", "mac-busybusybusybusy", "latest-oldoldoldoldold1", "mac-oldish-but-not-a-key"):
                 for d_, ds_, fs_ in os.walk(os.path.join(rdep, nm)):
                     for x_ in ds_ + fs_ + [""]:
                         try:
@@ -8161,20 +8168,26 @@ def self_test() -> int:
                         except OSError:
                             pass
             import fcntl as _fcntl
-            busy_fh = open(os.path.join(rdep, "mac-busy", ".locks", "R.lock"))
+            busy_fh = open(os.path.join(rdep, "mac-busybusybusybusy", ".locks", "R.lock"))
             _fcntl.flock(busy_fh.fileno(), _fcntl.LOCK_SH)         # a run still reading the old key's tree
             r_log: list = []
-            gone_ = retire_stale_deployments(rc_, "mac", "mac-current", r_log.append,
+            gone_ = retire_stale_deployments(rc_, "mac", "mac-currentcurrent00", r_log.append,
                                              lambda *a_: subprocess.run(["git", *a_], check=True, capture_output=True))
             busy_fh.close()
             check("retire/the lane's OTHER key, unused and quiet, is retired — directory gone and its worktree deregistered",
-                  gone_ == [os.path.join(rdep, "mac-old")] and not os.path.exists(os.path.join(rdep, "mac-old"))
-                  and "mac-old" not in subprocess.run(["git", "--git-dir", rmirror, "worktree", "list"], capture_output=True, text=True).stdout,
+                  gone_ == [os.path.join(rdep, "mac-0123456789abcdef")] and not os.path.exists(os.path.join(rdep, "mac-0123456789abcdef"))
+                  and "mac-0123456789abcdef" not in subprocess.run(["git", "--git-dir", rmirror, "worktree", "list"], capture_output=True, text=True).stdout,
                   (gone_, r_log))
             check("retire/the CURRENT key, a recently touched old key (a draining replica), a key whose lock is held (a run "
                   "reading it) and another lane's deployment are all kept",
-                  all(os.path.isdir(os.path.join(rdep, n_)) for n_ in ("mac-current", "mac-young", "mac-busy", "latest-old"))
+                  all(os.path.isdir(os.path.join(rdep, n_)) for n_ in ("mac-currentcurrent00", "mac-youngyoungyoung1", "mac-busybusybusybusy", "latest-oldoldoldoldold1"))
                   and any("still in use" in m for m in r_log), (os.listdir(rdep), r_log))
+            check("retire/the stale deployment's PLATFORM tree is deregistered from the platform master too",
+                  "0123456789abcdef" not in subprocess.run(["git", "--git-dir", pmirror_r, "worktree", "list"], capture_output=True, text=True).stdout)
+            check("retire/a directory that is not exactly `<lane>-<16-char key>` is never touched (a longer lane sharing the prefix)",
+                  os.path.isdir(os.path.join(rdep, "mac-oldish-but-not-a-key")))
+            check("retire/the log names the MEASURED age, not the threshold",
+                  any("retired (untouched " in m and f"untouched {int(STALE_DEPLOYMENT_SECONDS)} s" not in m for m in r_log), r_log)
             check("retire/a cache with no deploy directory is no error", retire_stale_deployments(os.path.join(wroot, "nope"), "mac", "x", log0, lambda *a_: None) == [])
 
             # a run STAGE's platform view (§7.3b step 2): its own, bound AT the MW_PLATFORM_SOURCE path, lower = the warm platform
