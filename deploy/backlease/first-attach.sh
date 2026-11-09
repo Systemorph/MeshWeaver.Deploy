@@ -91,7 +91,10 @@ if [ -n "$set_from" ]; then
   [[ "$api" == https://* ]] || { echo "ERROR: --api must be https (the worker token rides on it)" >&2; exit 2; }
   set_json="$(curl -fsS -m 30 "${api%/}/channels/$set_from/set")" || { echo "ERROR: could not read ${api%/}/channels/$set_from/set. Nothing was changed." >&2; exit 1; }
   read -r version tester portal runner < <(python3 -c 'import json,sys
-d=json.loads(sys.argv[1]); print(d.get("platformVersion",""), d.get("testerDigest",""), d.get("portalDigest",""), d.get("runnerDigest",""))' "$set_json") \
+d=json.loads(sys.argv[1]); keys=("platformVersion","testerDigest","portalDigest","runnerDigest")
+missing=[k for k in keys if not str(d.get(k) or "").strip()]
+if missing: sys.exit("the set names no " + ", ".join(missing))
+print(*(d[k] for k in keys))' "$set_json") \
     || { echo "ERROR: ${api%/}/channels/$set_from/set is not a complete set. Nothing was changed." >&2; exit 1; }
 fi
 required=(api registry pulluser version tester portal runner)
