@@ -42,6 +42,26 @@
             <string>jane.roe</string>
             <key>OwnerEmail</key>
             <string>jane.roe@example.com</string>
+            <!-- REQUIRED for the fleet bootstrap: the owner's participation answers, never defaulted (a run
+                 without AcceptJobs or AcceptTokens fails). NO to jobs = no build host; NO to tokens = no token
+                 models beyond the chat model. A YES names from whom (and, for tokens, which models). -->
+            <key>AcceptJobs</key>
+            <false/>
+            <key>AcceptTokens</key>
+            <true/>
+            <key>AcceptTokensFrom</key>
+            <array>
+                <string>*.example.cloud</string>
+            </array>
+            <key>AcceptTokensModels</key>
+            <array>
+                <string>qwen3.8:27b-mlx</string>
+            </array>
+            <key>AcceptTokensResidency</key>
+            <string>CH</string>
+            <!-- The fleet local CA's certificate SHA-256 (its trusted-root profile is a separate payload). -->
+            <key>FleetCaSha256</key>
+            <string>0000000000000000000000000000000000000000000000000000000000000000</string>
             <!-- Optional: a release-channel label and a host profile (mac-studio | mac-mini). -->
             <key>Channel</key>
             <string>3-latest</string>
