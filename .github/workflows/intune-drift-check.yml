@@ -1,0 +1,109 @@
+# `Intune drift check` — the REUSABLE half: run `intune-reconcile.py --check` (read-only) against the live
+# tenant for a caller's spec. Called from the estate's PRIVATE configuration repository (where the real
+# spec lives) on a schedule and on pull requests that touch the spec, so the drift report — object ids,
+# device names — is written to a private log, never to this public repository's.
+#
+#   jobs:
+#     intune:
+#       uses: Systemorph/MeshWeaver.Deploy/.github/workflows/intune-drift-check.yml@main
+#       permissions: { contents: read, id-token: write }
+#       with:
+#         spec: path/to/fleet.spec.json
+#         client-id: ${{ vars.INTUNE_CLIENT_ID }}
+#         tenant-id: ${{ vars.INTUNE_TENANT_ID }}
+#         runner: <the caller's self-hosted runner label>
+#         require-credential: ${{ github.event_name != 'pull_request' }}
+#
+# Credential: a READ-ONLY Intune identity (never the apply identity — a pull-request subject would hand every
+# branch a token that writes device management), signed in by WORKLOAD IDENTITY FEDERATION (this job's GitHub OIDC
+# token as the client assertion) — no secret exists anywhere. With no `client-id` the job does NOT go red and
+# does NOT skip in silence: it raises a NOTICE and writes the one owner action into the step summary
+# ("no credential configured"). It never runs --apply: writing to the tenant is a person's decision.
+name: Intune drift check
+
+on:
+  workflow_call:
+    inputs:
+      spec:
+        description: the fleet spec in the CALLER's repository
+        type: string
+        required: true
+      client-id:
+        description: the Intune app identity's client id (empty = no credential configured)
+        type: string
+        required: false
+        default: ''
+      tenant-id:
+        description: the tenant id (empty = the spec's `tenant`)
+        type: string
+        required: false
+        default: ''
+      runner:
+        description: the runner label (a private caller passes its own self-hosted set; GitHub-hosted bills it)
+        type: string
+        required: false
+        default: ubuntu-latest
+      require-credential:
+        description: true = a missing client-id FAILS the job (a scheduled caller); false = a notice (pull requests)
+        type: boolean
+        required: false
+        default: false
+      tool-ref:
+        description: the MeshWeaver.Deploy ref the reconcile is read at
+        type: string
+        required: false
+        default: main
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  check:
+    name: Intune drift (--check, read-only)
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: The caller's spec
+        uses: actions/checkout@v7
+      - name: The reconcile, from MeshWeaver.Deploy
+        uses: actions/checkout@v7
+        with:
+          repository: Systemorph/MeshWeaver.Deploy
+          ref: ${{ inputs.tool-ref }}
+          path: .intune-reconcile
+      - name: The spec is valid (no credential needed)
+        env:
+          SPEC: ${{ inputs.spec }}
+        run: python3 .intune-reconcile/deploy/macos/intune/intune-reconcile.py --validate --spec "$SPEC"
+      - name: Live --check against the tenant (or say that no credential is configured)
+        env:
+          SPEC: ${{ inputs.spec }}
+          INTUNE_CLIENT_ID: ${{ inputs.client-id }}
+          INTUNE_TENANT_ID: ${{ inputs.tenant-id }}
+          REQUIRE_CREDENTIAL: ${{ inputs.require-credential }}
+        run: |
+          set -euo pipefail
+          if [ -z "$INTUNE_CLIENT_ID" ]; then
+            msg="no credential configured: the Intune drift check did NOT read the tenant. Owner action: a READ-ONLY Intune app identity (DeviceManagementConfiguration.Read.All, DeviceManagementScripts.Read.All, DeviceManagementManagedDevices.Read.All, Group.Read.All, Device.Read.All) with federated credentials for issuer https://token.actions.githubusercontent.com, subjects repo:${GITHUB_REPOSITORY}:ref:refs/heads/main and repo:${GITHUB_REPOSITORY}:pull_request; then the repository variables INTUNE_CLIENT_ID and INTUNE_TENANT_ID."
+            { echo "### Intune drift check — not run"; echo; echo "$msg"; } >> "$GITHUB_STEP_SUMMARY"
+            # A scheduled caller sets require-credential: a credential that was removed, renamed or expired must
+            # turn the standing check RED, not leave it green on a notice nobody reads.
+            if [ "$REQUIRE_CREDENTIAL" = true ]; then echo "::error title=Intune drift check::$msg"; exit 1; fi
+            echo "::notice title=Intune drift check::$msg"
+            exit 0
+          fi
+          # The job's OIDC token, exchanged by the reconcile for a Graph token (client assertion). Never printed.
+          # Created 0600 BEFORE the token is written, and removed on every exit path (self-hosted runners persist).
+          tok="$(umask 077; mktemp "$RUNNER_TEMP/oidc.XXXXXX")"
+          trap 'rm -f "$tok"' EXIT
+          curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" \
+            | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["value"])' > "$tok"
+          set +e
+          AZURE_FEDERATED_TOKEN_FILE="$tok" python3 .intune-reconcile/deploy/macos/intune/intune-reconcile.py --check --spec "$SPEC" | tee "$RUNNER_TEMP/drift.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+          rm -f "$tok"
+          { echo "### Intune drift check (exit $rc: 0 in sync · 2 drift · 1 error)"; echo; echo '```'; grep -Ev '^(OK|INFO) ' "$RUNNER_TEMP/drift.txt" || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
