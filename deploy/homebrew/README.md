@@ -260,6 +260,11 @@ ceiling is unset the Mac serves at its full slot count. `--token-yield-at <pct>`
 (percent of one core; the code's default is 200) and is written only when given. `none` clears either. The host
 sampler reports `host.ownerCpuPercent`: the owner's CPU over the interval, excluding Ollama, the build VM, the
 portal VM and `kernel_task` (which can take whole cores under thermal pressure). That is what the Mac yields to.
+It also reports `host.cpuPercent` (the host's CPU busy across all cores, from a one-second `top` delta) and
+`host.netInBytesPerSec` / `host.netOutBytesPerSec` (bytes over the physical `en*` interfaces, averaged since the previous
+sample). Control records them with the rest of the readings in the fleet's 30-day metric history (MeshWeaver.Plugins
+`Hosting/FleetMetricHistory`), so a home-network burst can be lined up with what the Mac was doing. A reading that cannot
+be taken (first sample, a gap, a counter reset) is left out, never sent as 0.
 
 **Upgrading a Mac enrolled before token slots existed.** `memex-local update` adds the measured `Tokens__Slots`. A
 recorded `Tokens__MaxConcurrency` is kept as the owner's ceiling. That includes the `1` the first opt-in release
