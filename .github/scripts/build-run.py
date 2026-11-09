@@ -3850,10 +3850,37 @@ IN_NS_ENV = "MW_BUILD_IN_NS"
 # live) and the upper + workdir on the work root (`$2`, where a run's `.upper` lives). Never on `mktemp -d`'s /tmp: that is
 # the container's own overlayfs root, which the kernel refuses as an upperdir ("not supported as upperdir"), so a probe
 # there read every host as unable to overlay — measured on eiger 2026-11-09, where /cache → /work mounts fine.
-_OVERLAY_PROBE = ("l=$(mktemp -d -p \"$1\") && d=$(mktemp -d -p \"$2\") && mkdir \"$d/u\" \"$d/w\" \"$d/m\" && echo x > \"$l/f\" && "
+_OVERLAY_PROBE = ("l=$(mktemp -d -p \"$1\" .overlay-probe.XXXXXX) && d=$(mktemp -d -p \"$2\" .overlay-probe.XXXXXX) && mkdir \"$d/u\" \"$d/w\" \"$d/m\" && echo x > \"$l/f\" && "
                   "mount -t overlay overlay -o \"lowerdir=$l,upperdir=$d/u,workdir=$d/w\" \"$d/m\" && "
                   "echo y > \"$d/m/f\" && umount \"$d/m\" && [ \"$(cat \"$l/f\")\" = x ] && [ \"$(cat \"$d/u/f\")\" = y ]; "
-                  "rc=$?; chmod -R u+rwx \"$d\" \"$l\"; rm -rf \"$d\" \"$l\"; exit $rc")
+                  "rc=$?; for x in \"$d\" \"$l\"; do [ -n \"$x\" ] && { chmod -R u+rwx \"$x\"; rm -rf \"$x\"; } 2>/dev/null; done; exit $rc")
+# A probe killed by its timeout leaves its directories behind on the SHARED cache and work roots (several pods mount them):
+# the next start sweeps those older than this, never a probe another pod may still be running.
+OVERLAY_PROBE_STALE_SECONDS = 600
+
+
+def sweep_stale_overlay_probes(roots: list, now: Optional[float] = None) -> list:
+    """Remove `.overlay-probe.*` directories older than OVERLAY_PROBE_STALE_SECONDS under each root; returns what it
+    removed. A younger one may be another pod's probe in flight and is left alone."""
+    now = time.time() if now is None else now
+    gone = []
+    for root in roots:
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(root, n)
+            try:
+                if n.startswith(".overlay-probe.") and os.path.isdir(p) and now - os.path.getmtime(p) > OVERLAY_PROBE_STALE_SECONDS:
+                    for dp, dn, _ in os.walk(p):
+                        for x in dn:
+                            os.chmod(os.path.join(dp, x), 0o700)
+                    shutil.rmtree(p, ignore_errors=True)
+                    gone.append(p)
+            except OSError:
+                continue
+    return gone
 
 
 def run_overlay_enabled(env: dict) -> bool:
@@ -3881,6 +3908,9 @@ def enter_run_namespace(argv: list, env: dict, log: Callable[[str], None],
         return
     cache, work = env.get("MW_BUILD_CACHE", "/cache"), env.get("MW_BUILD_WORK", "/work")
     cmd = [u, "-Urm", "--propagation", "private", "sh", "-c", _OVERLAY_PROBE, "overlay-probe", cache, work]
+    if not probe:
+        for g in sweep_stale_overlay_probes([cache, work]):
+            log(f"run overlay: removed a stale probe directory {g} (a probe killed by its timeout)")
     why = ""
     try:
         if probe:
@@ -6716,6 +6746,19 @@ def self_test() -> int:
         enter_run_namespace(["--host"], dict(ov_env, MW_BUILD_CACHE="/c", MW_BUILD_WORK="/w"), ns_log.append,
                             which=lambda n: "/usr/bin/unshare", probe=lambda c: (probed.append(c), 0)[1], execvpe=lambda *a: None)
         check("overlay/the probe follows MW_BUILD_CACHE / MW_BUILD_WORK", probed and probed[0][-2:] == ["/c", "/w"], probed)
+        check("overlay/the probe's cleanup is silent, so a failure's last stderr line is the CAUSE, not cleanup noise",
+              "2>/dev/null; done; exit $rc" in _OVERLAY_PROBE and ".overlay-probe.XXXXXX" in _OVERLAY_PROBE)
+        sw = os.path.join(tmp, "probe-sweep")
+        for n, age in ((".overlay-probe.old", 3600), (".overlay-probe.young", 30), ("keep.old", 3600)):
+            os.makedirs(os.path.join(sw, n, "u", "x"))
+            t0 = time.time() - age
+            os.utime(os.path.join(sw, n), (t0, t0))
+        os.chmod(os.path.join(sw, ".overlay-probe.old", "u", "x"), 0o000)
+        swept = sweep_stale_overlay_probes([sw, os.path.join(tmp, "no-such-root")])
+        check("overlay/a stale probe dir (killed by its timeout) is swept, even with an unreadable child; a young one (another "
+              "pod's probe in flight) and anything else are left; a missing root is no error",
+              swept == [os.path.join(sw, ".overlay-probe.old")] and sorted(os.listdir(sw)) == [".overlay-probe.young", "keep.old"],
+              (swept, os.listdir(sw)))
         check("overlay/a capable host re-executes this runner under unshare -Urm with the outer ids and the marker",
               len(execd) == 1 and execd[0][1][:4] == ["/usr/bin/unshare", "-Urm", "--propagation", "private"]
               and execd[0][1][-1] == "--host" and execd[0][2].get("MW_BUILD_IN_NS") == "1"
