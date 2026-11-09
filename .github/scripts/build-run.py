@@ -784,26 +784,39 @@ def module_fingerprints(decl: dict, ls_tree: Callable[[list], str], toolchain: s
     return fps
 
 
-def deterministic_tar(src_dir: str, dest_file: str) -> str:
+MODULE_OUTPUT_GZIP_LEVEL = 6
+
+
+def deterministic_tar(src_dir: str, dest_file: str, compress: bool = False) -> str:
     """Pack `src_dir` so equal content gives equal bytes (sorted entries, mtime 0, no owners, no links followed); return
-    the tar's sha256 (hex)."""
+    the file's sha256 (hex). `compress`: gzip it, deterministically too (a fixed level, header mtime 0 and no file name —
+    tarfile's own "w:gz" writes the clock and the name). A module output is handed over compressed: uncompressed, the
+    larger ones (MeshWeaver.AI and the modules that carry it, 81–94 MiB and more, measured 2026-11-08) crossed the build
+    API's ingress body limit (100 MiB) and were refused with a bare 413, so they were never retained for reuse."""
     import tarfile
+    import gzip
     entries = []
     for root, dirs, files in os.walk(src_dir):
         dirs.sort()
         for n in sorted(files):
             entries.append(os.path.join(root, n))
-    with tarfile.open(dest_file, "w", format=tarfile.PAX_FORMAT) as tar:
-        for full in entries:
-            rel = os.path.relpath(full, src_dir)
-            if os.path.islink(full):
-                raise Refusal(f"the module output carries a symbolic link ({rel}) — not handed over")
-            ti = tarfile.TarInfo(rel)
-            ti.size = os.path.getsize(full)
-            ti.mtime, ti.uid, ti.gid, ti.uname, ti.gname = 0, 0, 0, "", ""
-            ti.mode = 0o755 if os.access(full, os.X_OK) else 0o644
-            with open(full, "rb") as fh:
-                tar.addfile(ti, fh)
+    with open(dest_file, "wb") as raw:
+        stream = gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=MODULE_OUTPUT_GZIP_LEVEL) if compress else raw
+        try:
+            with tarfile.open(fileobj=stream, mode="w", format=tarfile.PAX_FORMAT) as tar:
+                for full in entries:
+                    rel = os.path.relpath(full, src_dir)
+                    if os.path.islink(full):
+                        raise Refusal(f"the module output carries a symbolic link ({rel}) — not handed over")
+                    ti = tarfile.TarInfo(rel)
+                    ti.size = os.path.getsize(full)
+                    ti.mtime, ti.uid, ti.gid, ti.uname, ti.gname = 0, 0, 0, "", ""
+                    ti.mode = 0o755 if os.access(full, os.X_OK) else 0o644
+                    with open(full, "rb") as fh:
+                        tar.addfile(ti, fh)
+        finally:
+            if compress:
+                stream.close()
     return _sha256_file(dest_file)
 
 
@@ -1025,7 +1038,7 @@ class ModuleHubBroker:
             else:
                 tar = os.path.join(self.priv, f"{module}-out.tar")
                 try:
-                    hexd = deterministic_tar(staged, tar)
+                    hexd = deterministic_tar(staged, tar, compress=True)
                 except Refusal as e:
                     body["error"] = str(e)
                 else:
@@ -1046,8 +1059,13 @@ class ModuleHubBroker:
         if status == 200 or status == 409:
             # the server ANSWERED (accepted, or refused as no longer this host's): the grant is settled either way
             self.granted.pop(module, None)
-        return {"accepted": accepted, "succeeded": accepted and body["succeeded"],
-                "why": (answer or {}).get("why") if isinstance(answer, dict) else f"{status}", "outputHash": body.get("outputHash")}
+        server_why = (answer or {}).get("why") if isinstance(answer, dict) else f"{status}"
+        # a hand-over that failed HERE (the upload refused, a link in the output, the tar) is named with the server's answer —
+        # the server records it as the step's error, but the stage's warning read only "failed — the head stays at the last
+        # good step" and twenty modules lost their reuse with no reason in the run's log (2026-11-08)
+        why = (server_why if body["succeeded"] or not done.get("succeeded")
+               else f"{body.get('error') or 'the hand-over failed with no local reason recorded'}; the hub recorded: {server_why}")
+        return {"accepted": accepted, "succeeded": accepted and body["succeeded"], "why": why, "outputHash": body.get("outputHash")}
 
     def release_open_grants(self, why: str) -> None:
         """Complete every grant the server has not acknowledged as FAILED (the run is ending). Never raises."""
@@ -6729,6 +6747,21 @@ def self_test() -> int:
         h1 = deterministic_tar(o1, os.path.join(tmp, "mh1.tar"))
         h2 = deterministic_tar(o2, os.path.join(tmp, "mh2.tar"))
         check("modhub/the output tar is deterministic (mtimes do not matter)", h1 == h2, (h1, h2))
+        g1 = deterministic_tar(o1, os.path.join(tmp, "mh1.tgz"), compress=True)
+        time.sleep(1.1)                                      # a gzip header carrying the clock would now differ
+        g2 = deterministic_tar(o2, os.path.join(tmp, "mh2.tgz"), compress=True)
+        check("modhub/the COMPRESSED output is deterministic too (no clock, no name in the gzip header)", g1 == g2 and g1 != h1, (g1, g2))
+        safe_extract(os.path.join(tmp, "mh1.tgz"), os.path.join(tmp, "mh-xz"))
+        check("modhub/a compressed output extracts as packed", open(os.path.join(tmp, "mh-xz", "lib", "A.dll"), "rb").read() == b"IL")
+        big = os.path.join(tmp, "mh-big")
+        os.makedirs(big)
+        with open(os.path.join(big, "A.dll"), "wb") as fh:
+            fh.write((b"MZ" + bytes(range(256)) * 8) * 4096)       # assembly-like: repetitive metadata and IL
+        deterministic_tar(big, os.path.join(tmp, "mh-big.tar"))
+        deterministic_tar(big, os.path.join(tmp, "mh-big.tgz"), compress=True)
+        check("modhub/compression shrinks an output (what keeps the larger modules under the ingress body limit)",
+              os.path.getsize(os.path.join(tmp, "mh-big.tgz")) * 3 < os.path.getsize(os.path.join(tmp, "mh-big.tar")),
+              (os.path.getsize(os.path.join(tmp, "mh-big.tgz")), os.path.getsize(os.path.join(tmp, "mh-big.tar"))))
         safe_extract(os.path.join(tmp, "mh1.tar"), os.path.join(tmp, "mh-x"))
         check("modhub/the output extracts as packed", open(os.path.join(tmp, "mh-x", "lib", "A.dll"), "rb").read() == b"IL")
         import tarfile as _tf
@@ -6791,6 +6824,24 @@ def self_test() -> int:
         puts_ = [c[3] for c in api_g.calls if c[0] == "PUT"]
         check("modhub/the output upload names its LEASE (holder, granted seq, fingerprint) — control accepts it only from the live holder",
               puts_ == [{"holder": br.host, "seq": "4", "fingerprint": fp4["B"]}], puts_)
+        check("modhub/the broker hands the output over gzip-compressed", uploaded[put_path][:2] == b"\x1f\x8b", uploaded[put_path][:4])
+        # an upload the ingress refuses (a bare 413, no body): the stage's warning names THAT, not only the hub's verdict
+        br413, _ = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Grant", "step": {"seq": 9}})],
+                                ("PUT", "/modules/MeshWeaver.Plugins/B/outputs/"): lambda p_, q_, d_, s_, t_: (413, None),
+                                ("POST", "/modules/MeshWeaver.Plugins/B/complete"): lambda p_, b_: (200, {"accepted": True, "why": "failed — the head stays at the last good step"})})
+        with open(os.path.join(br413.io, "req", "B.json"), "w") as fh:
+            json.dump({"module": "B"}, fh)
+        br413.poll_once()
+        os.makedirs(os.path.join(br413.io, "build", "B"), exist_ok=True)
+        with open(os.path.join(br413.io, "build", "B", "B.dll"), "wb") as fh:
+            fh.write(b"built B")
+        with open(os.path.join(br413.io, "done", "B.json"), "w") as fh:
+            json.dump({"succeeded": True}, fh)
+        br413.poll_once()
+        ack413 = json.load(open(os.path.join(br413.out, "ack", "B.json")))
+        check("modhub/a refused hand-over names its OWN reason in the ack (the 413), beside the hub's verdict",
+              ack413["succeeded"] is False and "upload was refused (413" in (ack413.get("why") or "")
+              and "the hub recorded: failed" in ack413["why"], ack413)
         out_bytes = uploaded[put_path]
         out_hex = put_path.rsplit("/", 1)[-1]
         br2, api_h = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Hit", "step": {"seq": 4, "outputHash": "sha256:" + out_hex}})],
