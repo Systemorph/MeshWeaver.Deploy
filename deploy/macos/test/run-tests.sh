@@ -600,6 +600,15 @@ rm -f "$T/sm/home/.memex-local/enrol/fleet-ca.key"
 smrun
 case "$OUT" in *"WAITING for the local CA to be trusted"*"rc=0"*) ok "no fleet CA and an untrusted mkcert CA: WAITING (unchanged), naming the fleet profile remedy" ;; *) bad "no fleet CA waits" "$OUT" ;; esac
 ! grep -q 'memex-local up' "$T/sm/calls" && ok "…and 'up' is not run while it waits" || bad "up while waiting" "$(cat "$T/sm/calls")"
+echo "── Intune objects as code: the reconcile (deploy/macos/intune/intune-reconcile.py) ──"
+RECON="$MACOS/intune/intune-reconcile.py"
+OUT="$(python3 "$RECON" --self-test 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "the reconcile's self-test against a fake Graph passes ($(grep -c '^  ok' <<<"$OUT") cases)" || bad "intune-reconcile --self-test" "$OUT"
+OUT="$(python3 "$RECON" --validate --spec "$MACOS/intune/fleet.spec.example.json" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "the example fleet spec validates" || bad "fleet.spec.example.json invalid" "$OUT"
+sed 's/"AcceptTokens": false,//; s/"AcceptTokens": true,//' "$MACOS/intune/fleet.spec.example.json" > "$T/no-answer.spec.json"
+OUT="$(python3 "$RECON" --validate --spec "$T/no-answer.spec.json" 2>&1)"; RC=$?
+case "$RC:$OUT" in 1:*"keys.AcceptTokens must be an explicit true/false"*) ok "a spec without the owner's token answer is refused (participation is never implied)" ;; *) bad "missing AcceptTokens accepted" "rc=$RC: $OUT" ;; esac
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
