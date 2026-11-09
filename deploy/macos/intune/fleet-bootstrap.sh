@@ -22,9 +22,10 @@
 #      code file is where it is delivered.
 #
 # Configuration — the managed preference domain com.memex.local (a configuration profile; memex-local reads
-# the same keys): ControlUrl, DeploymentId, RegistryUrl, FleetCaSha256 (the fleet local CA's certificate). Environment
-# variables of the same meaning win: FLEET_CONTROL_URL, FLEET_MACHINE_ID, FLEET_REGISTRY_URL, FLEET_CA_SHA256.
-# Nothing secret is configured here.
+# the same keys): ControlUrl, DeploymentId, RegistryUrl, FleetCaSha256 (the fleet local CA's certificate), and for the
+# unattended first-run setup Organisation, OwnerName, OwnerEmail and AcceptTerms (the organisation's acceptance of the
+# privacy statement and terms). Environment variables of the same meaning win: FLEET_CONTROL_URL, FLEET_MACHINE_ID,
+# FLEET_REGISTRY_URL, FLEET_CA_SHA256. Nothing secret is configured here.
 #
 # PARTICIPATION (the owner's answers — Mac onboarding contract §5), REQUIRED, never defaulted: AcceptJobs (bool —
 # does this Mac take the fleet's build-queue work), AcceptJobsFrom / AcceptJobsChannels / AcceptJobsRepos, and
@@ -62,7 +63,6 @@ readonly MEMEX_FORMULA="systemorph/memex/memex-local"
 readonly CLT_DIR="${FLEET_CLT_DIR:-/Library/Developer/CommandLineTools}"
 # Where a profile-deployed trusted root lives (the fleet local CA's certificate).
 readonly SYSTEM_KEYCHAIN="${FLEET_SYSTEM_KEYCHAIN:-/Library/Keychains/System.keychain}"
-readonly SHELLENV_MARK="# MeshWeaver fleet-bootstrap: Homebrew on PATH (brew shellenv)"
 
 log() {
   local line; line="$(date -u +%Y-%m-%dT%H:%M:%SZ) fleet-bootstrap ${FLEET_BOOTSTRAP_VERSION}: $*"
@@ -276,24 +276,27 @@ read_participation() {
   log "participation: jobs ${PART_JOBS}${jfrom:+ (from $jfrom)}$( [ "$PART_JOBS" = true ] || printf ' — no build host'), tokens ${PART_TOKENS}${tfrom:+ (from $tfrom; models $tmodels)}$( [ "$PART_TOKENS" = true ] || printf ' — no token models beyond the chat model')"
 }
 
-# ---------------------------------------------------------------------------------------------------------------
-# Homebrew in the PERSON's shell too: `brew shellenv` in ~/.zprofile (zsh, the macOS login shell), written once.
-# The second Mac Studio's shell had no Homebrew, so the person's own `memex-local setup` found no kubectl.
-step_shellenv() {
-  local user="$1" prof; prof="$(user_home "$user")/.zprofile"
-  if [ -f "$prof" ] && grep -Fq 'brew shellenv' "$prof"; then log "shell: Homebrew already in $user's login shell ($prof)"; return 0; fi
-  log "shell: adding Homebrew to $user's login shell ($prof)"
-  as_user "$user" /bin/sh -c 'printf "\n%s\n%s\n" "$1" "$2" >> "$HOME/.zprofile"' _ "$SHELLENV_MARK" "eval \"\$($BREW_PREFIX/bin/brew shellenv)\"" \
-    || { log "shell: FAILED to write $prof"; return 1; }
+# The person's login shell finds Homebrew: the documented `brew shellenv` line in ~/.zprofile, written ONCE
+# (idempotent), as that person. Without it a new Terminal has no $BREW_PREFIX/bin, and every tool the
+# bootstrap installed reads as missing to the person (measured on the second Mac Studio, 2026-11-09).
+ensure_shellenv() {
+  local user="$1" home line profile
+  home="$(user_home "$user")"; profile="$home/.zprofile"
+  line="eval \"\$($BREW_PREFIX/bin/brew shellenv)\""
+  if [ -f "$profile" ] && grep -qF "$BREW_PREFIX/bin/brew shellenv" "$profile"; then return 0; fi
+  log "homebrew: adding the shellenv line to $profile (a new Terminal finds the tools)"
+  as_user "$user" /bin/sh -c 'printf "\n%s\n" "$1" >> "$2"' sh "$line" "$profile" \
+    || { log "homebrew: FAILED to write $profile"; return 1; }
 }
 
 step_homebrew() {
   local user="$1"
-  if [ -x "$BREW_PREFIX/bin/brew" ]; then log "homebrew: present ($BREW_PREFIX)"; return 0; fi
+  if [ -x "$BREW_PREFIX/bin/brew" ]; then log "homebrew: present ($BREW_PREFIX)"; ensure_shellenv "$user"; return; fi
   log "homebrew: installing under $BREW_PREFIX for $user (untar install, no prompt)"
   run mkdir -p "$BREW_PREFIX" && run chown -R "$user:admin" "$BREW_PREFIX" \
     && as_user "$user" /bin/bash -c "curl -fsSL https://github.com/Homebrew/brew/tarball/main | tar xz --strip-components 1 -C '$BREW_PREFIX'" \
     || { log "homebrew: FAILED to install"; return 1; }
+  ensure_shellenv "$user"
 }
 
 # Whether a compiler toolchain Homebrew accepts is present: the Command Line Tools, or (only when the CLT
@@ -462,6 +465,30 @@ fleet_ca_trusted_by_profile() {
   rm -f "$pem"; return "$rc"
 }
 
+# The first-run setup, answered through the portal's setup API from the managed profile (no person at the
+# wizard). Waits (returns 0) when the profile lacks an answer; returns 1 when the API refused or failed.
+answer_setup() {
+  local user="$1" machine="$2" mlocal="$3"
+  # 🚨 No person at the wizard on a fleet Mac (owner, 2026-11-09: "pls get rid of this memex-local setup step"):
+  # the setup is answered through the portal's setup API from the managed profile — the instance name is the
+  # machine id, the owner and organisation are the profile's, the database is the one the wizard pre-selects,
+  # and the privacy statement and terms are accepted ONLY where the profile says so (AcceptTerms = true).
+  local org owner_name owner_email accept
+  org="$(setting FLEET_ORGANISATION Organisation)"; owner_name="$(setting FLEET_OWNER_NAME OwnerName)"
+  owner_email="$(setting FLEET_OWNER_EMAIL OwnerEmail)"; accept="$(setting FLEET_ACCEPT_TERMS AcceptTerms)"
+  case "$accept" in 1|true|TRUE|True|yes) accept=yes ;; *) accept=no ;; esac
+  if [ -z "$org" ] || [ -z "$owner_name" ] || [ -z "$owner_email" ] || [ "$accept" != "yes" ]; then
+    log "memex: WAITING for the first-run setup answers in the com.memex.local profile (Organisation, OwnerName, OwnerEmail, AcceptTerms=true) — nothing is answered without them"
+    return 0
+  fi
+  log "memex: answering the first-run setup through the setup API (instance $machine, organisation $org, owner $owner_email)"
+  as_user "$user" "$mlocal" setup --apply --name "$machine" --company "$org" --owner-name "$owner_name" \
+    --owner-email "$owner_email" --accept-terms 2>&1 | while IFS= read -r l; do log "memex:   $l"; done
+  [ "${PIPESTATUS[0]}" = "0" ] || { log "memex: the setup API refused or failed (above) — retried next run"; return 1; }
+  log "memex: setup answered — the portal restarts configured; the join follows on the next run"
+  return 0
+}
+
 step_memex() {
   local user="$1" machine="$2" control registry home code_file out rc mlocal
   control="$(setting FLEET_CONTROL_URL ControlUrl)"; registry="$(setting FLEET_REGISTRY_URL RegistryUrl)"
@@ -519,8 +546,7 @@ step_memex() {
   # finalised until the console user has configured it.
   if probe_as_user "$user" env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(memex_libexec)/share" MEMEX_CHART_DIR="$(memex_libexec)/share/helm" \
        /bin/bash -c '. "$0"; awaiting_setup' "$(memex_libexec)/memex-local"; then
-    log "memex: WAITING for the first-run setup — $user runs 'memex-local setup' (it prints the wizard's link) and completes it"
-    return 0
+    answer_setup "$user" "$machine" "$mlocal"; return
   fi
   if [ -f "$home/.memex-local/fleet.yaml" ]; then
     # joined: resume a finalisation an earlier run did not finish, from the stored credentials (no new code).
@@ -560,7 +586,6 @@ main() {
   step_homebrew "$user" || failed=1
   [ "$failed" = 0 ] && { step_devtools || failed=1; }
   [ "$failed" = 0 ] && { step_tools "$user" || failed=1; }
-  [ "$failed" = 0 ] && { step_shellenv "$user" || failed=1; }
   [ "$failed" = 0 ] && { step_tailscale_binaries || failed=1; }
   [ "$failed" = 0 ] && { step_tailscaled || failed=1; }
   [ "$failed" = 0 ] && { step_network "$machine" "$user" || failed=1; }

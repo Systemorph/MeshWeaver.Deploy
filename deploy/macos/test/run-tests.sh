@@ -421,6 +421,19 @@ ln -sf /etc/hosts "$T/kh/enrol/studio-3.preauth"
 env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; take_preauth_key "$1" "$2" "$(id -un)"' "$FB" "$T/kh/enrol/none.preauth" "$T/kh/held/c.key" && [ ! -e "$T/kh/held/c.key" ] \
   && ok "no dropped key: nothing taken, no failure" || bad "no key" "failed"
 grep -q 'softwareupdate said:' "$FB" && ok "a failed Command Line Tools install logs what softwareupdate said" || bad "softwareupdate output logged" "missing"
+mkdir -p "$T/shh"
+SO="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_USER_HOME="$T/shh" FLEET_BREW_PREFIX="$T/brewx" FLEET_LOG_DIR="$T/shlog" bash -c '. "$0"; ensure_shellenv jroe' "$FB" 2>&1)"
+case "$SO" in *"adding the shellenv line to $T/shh/.zprofile"*"DRY-RUN"*) ok "the bootstrap puts Homebrew's shellenv into the person's ~/.zprofile (a new Terminal finds the tools)" ;; *) bad "shellenv written" "$SO" ;; esac
+printf 'eval "$(%s/bin/brew shellenv)"\n' "$T/brewx" > "$T/shh/.zprofile"
+[ -z "$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_USER_HOME="$T/shh" FLEET_BREW_PREFIX="$T/brewx" FLEET_LOG_DIR="$T/shlog" bash -c '. "$0"; ensure_shellenv jroe' "$FB" 2>&1)" ] \
+  && ok "an existing shellenv line is left alone (idempotent)" || bad "shellenv idempotent" "rewritten"
+AS="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_LOG_DIR="$T/aslog" FLEET_MANAGED_PREFS="$T/none" FLEET_ORGANISATION=Acme FLEET_OWNER_NAME="Jane Roe" \
+  FLEET_OWNER_EMAIL=jane.roe@example.com FLEET_ACCEPT_TERMS=true bash -c '. "$0"; answer_setup jroe studio-2 /opt/x/memex-local' "$FB" 2>&1)"; RC=$?
+case "$RC:$OUT$AS" in 0:*"DRY-RUN: sudo -u jroe -H env"*"/opt/x/memex-local setup --apply --name studio-2 --company Acme --owner-name Jane\ Roe --owner-email jane.roe@example.com --accept-terms"*"setup answered"*) ok "a fleet Mac never waits for a person at the wizard: the bootstrap answers the setup API from the profile, as the console user (executed)" ;; *) bad "unattended setup executed" "rc=$RC: $AS" ;; esac
+AS2="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_LOG_DIR="$T/aslog" FLEET_MANAGED_PREFS="$T/none" FLEET_ORGANISATION=Acme FLEET_OWNER_NAME="Jane Roe" \
+  FLEET_OWNER_EMAIL=jane.roe@example.com bash -c '. "$0"; answer_setup jroe studio-2 /opt/x/memex-local' "$FB" 2>&1)"; RC=$?
+case "$RC:$AS2" in 0:*"WAITING for the first-run setup answers"*) case "$AS2" in *"setup --apply"*) bad "no AcceptTerms → nothing answered" "$AS2" ;; *) ok "without AcceptTerms=true nothing is answered, and the run says what it waits for" ;; esac ;; *) bad "no AcceptTerms → waits" "rc=$RC: $AS2" ;; esac
+! grep -q "runs 'memex-local setup'" "$FB" && ok "the bootstrap never asks a person to run memex-local setup" || bad "no person at the wizard" "still asks"
 grep -q 'installondemand.in-progress' "$FB" && grep -q 'rm -f "$flag"' "$FB" && ok "the on-demand flag is set for the catalogue and always removed" || bad "on-demand flag" "missing"
 grep -q -- '--auth-key="file:$key_file"' "$FB" && ! grep -q -- '--auth-key "\$key"' "$FB" \
   && ok "the pre-auth key is passed by FILE reference (never an argument)" || bad "auth key by file" "missing"
@@ -453,21 +466,11 @@ case "$OUT" in *"tools: REACHED"*) bad "a failed developer-tools install stops t
 awk '/^main\(\) \{/{on=1} on' "$FB" | grep -n 'step_devtools\|step_tools "\$user"' | awk -F: 'NR==1 && $0 ~ /devtools/ {d=1} END {exit !d}' \
   && ok "main runs step_devtools before step_tools (defect 2)" || bad "main order devtools → tools" "$(awk '/^main\(\) \{/{on=1} on' "$FB")"
 
-# Defect 5: Homebrew on every PATH the bootstrap hands the person's commands, and in the person's login shell.
+# Defect 5: Homebrew on every PATH the bootstrap hands the person's commands (the login shell: ensure_shellenv, #217).
 up="$(FB_EVAL='user_path' fb)"
 case ":$up:" in *":/opt/homebrew/bin:"*"/usr/local/bin:"*) ok "commands run as the console user get /opt/homebrew/bin and /usr/local/bin on PATH (defect 5)" ;; *) bad "user_path" "$up" ;; esac
 grep -q 'PATH="\$(user_path)"' "$FB" && [ "$(grep -c 'PATH="\$(user_path)"' "$FB")" = 2 ] && ! grep -q 'PATH="\$BREW_PREFIX/bin:\$TS_DIR' "$FB" \
   && ok "as_user and probe_as_user both use that PATH" || bad "as_user PATH" "$(grep -n 'PATH=' "$FB")"
-mkdir -p "$T/sh"
-SHE='as_user() { shift; HOME="$FLEET_USER_HOME" "$@"; }; step_shellenv someone; step_shellenv someone'
-OUT="$(FB_EVAL="$SHE" fb FLEET_USER_HOME="$T/sh" FLEET_LOG_DIR="$T/shlog" 2>&1)"
-[ "$(grep -c 'brew shellenv)"' "$T/sh/.zprofile")" = 1 ] && grep -qx 'eval "$(/opt/homebrew/bin/brew shellenv)"' "$T/sh/.zprofile" \
-  && case "$OUT" in *"adding Homebrew"*"already in"*) true ;; *) false ;; esac \
-  && ok "the person's ~/.zprofile gets brew shellenv ONCE (a second run finds it)" || bad "zprofile shellenv" "$OUT / $(cat "$T/sh/.zprofile" 2>/dev/null)"
-printf 'eval "$(/opt/homebrew/bin/brew shellenv)"\n' > "$T/sh2.zprofile"; mkdir -p "$T/sh2"; mv "$T/sh2.zprofile" "$T/sh2/.zprofile"
-FB_EVAL="$SHE" fb FLEET_USER_HOME="$T/sh2" FLEET_LOG_DIR="$T/shlog" >/dev/null 2>&1
-[ "$(wc -l < "$T/sh2/.zprofile" | tr -d ' ')" = 1 ] && ok "a .zprofile that already loads Homebrew is left alone" || bad "existing shellenv kept" "$(cat "$T/sh2/.zprofile")"
-
 # Defect 1: an expired console password is the FIRST line of the run, with the remedy.
 mkpol() { cat > "$1" <<PL
 <?xml version="1.0" encoding="UTF-8"?>

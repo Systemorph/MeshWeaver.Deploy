@@ -1526,7 +1526,7 @@ case "$RC:$OUT" in 0:*) bad "need still refuses a non-manifest tool that is abse
 # `doctor` prints the table: per tool, which copy, from where, which version, whether it met the floor.
 texisting_all; rm -f "$TEX/helm"; tvend helm helm "v4.3.1+gabc"; tstub "$TEX" kubectl "Client Version: v1.20.0"
 # doctor also probes the cluster: the fake colima exits 0 and kubectl answers anything, so it runs through.
-OUT="$(env PATH="$TEX:$STUBS:$TSYS" MEMEX_BREW_BIN_DIRS=none MEMEX_PREFIX="$TPRE" MEMEX_LOCAL_HOME="$TT/home" "$CLI" doctor 2>&1)"; RC=$?
+OUT="$(env PATH="$TEX:$STUBS:$TSYS" MEMEX_PREFIX="$TPRE" MEMEX_LOCAL_HOME="$TT/home" "$CLI" doctor 2>&1)"; RC=$?
 case "$OUT" in *"TOOL          USES      VERSION   FLOOR    VERDICT     FROM"*) ok "doctor prints the toolchain table header" ;; *) bad "doctor table header" "$OUT" ;; esac
 case "$OUT" in *"colima        existing  0.10.3    0.8.0    ok          $TEX/colima"*) ok "doctor: colima — existing, 0.10.3, floor 0.8.0, ok, from the existing path" ;; *) bad "doctor colima row" "$OUT" ;; esac
 case "$OUT" in *"helm          vendored  4.3.1     3.16.0   ok          $TPRE/libexec/vendor/helm/bin/helm  (nothing existing)"*) ok "doctor: helm — vendored, 4.3.1, from libexec/vendor, because nothing existing" ;; *) bad "doctor helm row" "$OUT" ;; esac
@@ -2729,7 +2729,7 @@ OB="$(mktemp -d)"; mkdir -p "$OB/stubs" "$OB/brewbin" "$OB/home/.memex-local" "$
 # a PATH with the system's tools but NO kubectl/colima (and none of Homebrew's): what the person's shell had
 for f in /usr/bin/* /bin/*; do b="$(basename "$f")"; case "$b" in kubectl|colima|helm|mkcert|security|open) continue ;; esac; [ -e "$OB/sys/$b" ] || ln -s "$f" "$OB/sys/$b"; done
 # kubectl that serves the setup banner; curl that says the portal answers
-printf '#!/usr/bin/env bash\ncase "$*" in *logs*) printf "info: Setup\\n  Token: tok-ob-123\\n" ;; esac\nexit 0\n' > "$OB/brewbin/kubectl"
+printf '#!/usr/bin/env bash\ncase "$*" in *logs*) printf "info: Setup\\n  Token: tok-ob-123\\n" ;; *version*) echo "Client Version: v1.37.1" ;; esac\nexit 0\n' > "$OB/brewbin/kubectl"
 printf '#!/usr/bin/env bash\nprintf 302\n' > "$OB/stubs/curl"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$FAKE_OPEN_LOG"\n' > "$OB/stubs/open"
 printf '#!/usr/bin/env bash\n[ "$1" = verify-cert ] && [ -z "${FAKE_UNTRUSTED:-}" ]\n' > "$OB/stubs/security"
@@ -2737,28 +2737,24 @@ chmod +x "$OB/stubs/"* "$OB/brewbin/"*
 PGPW="pgsecret-$(openssl rand -hex 12)"
 printf 'secrets:\n  memex_postgres_password: "%s"\n' "$PGPW" > "$OB/home/.memex-local/values.local.yaml"
 obrun() { OUT="$(env -i HOME="$OB/home" MEMEX_LOCAL_HOME="$OB/home/.memex-local" PATH="$OB/stubs:$OB/sys" FAKE_OPEN_LOG="$OB/open.log" "$@" bash "$CLI" setup 2>&1)"; RC=$?; : ; }
-# Defect 5: Homebrew's bin is not on the caller's PATH — memex-local adds it itself, and the token is printed.
-: > "$OB/open.log"
-obrun MEMEX_BREW_BIN_DIRS="$OB/brewbin" FAKE_UNTRUSTED=1
-case "$RC:$OUT" in 0:*"Token: tok-ob-123"*) ok "kubectl only in Homebrew's bin (not on the caller's PATH): memex-local adds it and prints the token (defect 5)" ;; *) bad "brew bin added" "rc=$RC $OUT" ;; esac
-grep -q 'dirs="${MEMEX_BREW_BIN_DIRS:-/opt/homebrew/bin /usr/local/bin}"' "$CLI" && ok "the default directories are /opt/homebrew/bin and /usr/local/bin" || bad "brew dirs default" ""
-P="$(env PATH="/first:/usr/bin:/bin" MEMEX_BREW_BIN_DIRS="$OB/brewbin" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; brew_path_ensure; brew_path_ensure; printf %s "$PATH"' "$CLI")"
-[ "$P" = "/first:/usr/bin:/bin:$OB/brewbin" ] && ok "Homebrew's bin is APPENDED once — never ahead of the caller's PATH" || bad "append order" "$P"
-# …and without it anywhere, the command FAILS naming the tool — never an empty answer.
-obrun MEMEX_BREW_BIN_DIRS=none
+# Defect 5 (the PATH half is memex_toolchain_path, #217): a command that needs kubectl/colima and finds none FAILS
+# naming it — never an empty answer. Sourced, so no toolchain directory is added: the PATH is exactly this one.
+obsrc() { OUT="$(env -i HOME="$OB/home" MEMEX_LOCAL_HOME="$OB/home/.memex-local" PATH="$OB/stubs:$OB/sys" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; '"$1" "$CLI" 2>&1)"; RC=$?; }
+obsrc 'cmd_setup --no-open'
 case "$RC:$OUT" in 0:*) bad "setup without kubectl fails" "$OUT" ;; *"required tool 'kubectl' not found"*"brew install kubernetes-cli"*) ok "setup without kubectl FAILS naming kubectl (defect 5: it used to print nothing)" ;; *) bad "setup names kubectl" "rc=$RC $OUT" ;; esac
 for c in verify status logs; do
-  OUT="$(env -i HOME="$OB/home" MEMEX_LOCAL_HOME="$OB/home/.memex-local" PATH="$OB/stubs:$OB/sys" MEMEX_BREW_BIN_DIRS=none bash "$CLI" "$c" 2>&1)"; RC=$?
+  obsrc "cmd_$c"
   case "$RC:$OUT" in 0:*) bad "$c without the tools fails" "$OUT" ;; *"required tool '"*"' not found"*) ok "$c without colima/kubectl FAILS naming the missing tool" ;; *) bad "$c names the tool" "rc=$RC $OUT" ;; esac
 done
+cp "$OB/brewbin/kubectl" "$OB/stubs/kubectl"
 # Defect 7: setup never prints the in-cluster Postgres password — only where it is and its fingerprint.
-obrun MEMEX_BREW_BIN_DIRS="$OB/brewbin" FAKE_UNTRUSTED=1
+obrun FAKE_UNTRUSTED=1
 case "$OUT" in *"$PGPW"*) bad "setup never prints the Postgres password" "the value is in the output" ;; *) ok "setup never prints the in-cluster Postgres password (defect 7)" ;; esac
-case "$OUT" in *"Password=<the generated password>"*"memex_postgres_password in $OB/home/.memex-local/values.local.yaml (fingerprint sha256:"*) ok "…it names where the password is, with its fingerprint" ;; *) bad "password pointer" "$OUT" ;; esac
+case "$OUT" in *"Password=<memex_postgres_password in $OB/home/.memex-local/values.local.yaml>"*"its fingerprint: sha256:"*) ok "…it names where the password is, with its fingerprint" ;; *) bad "password pointer" "$OUT" ;; esac
 # Defect 10: the browser is never opened into an untrusted certificate.
 [ ! -s "$OB/open.log" ] && case "$OUT" in *"not opening the browser"*"not trusted"*) true ;; *) false ;; esac \
   && ok "setup does NOT open the wizard while the served certificate is untrusted, and says what is missing (defect 10)" || bad "no open when untrusted" "open: $(cat "$OB/open.log") $OUT"
-: > "$OB/open.log"; obrun MEMEX_BREW_BIN_DIRS="$OB/brewbin"
+: > "$OB/open.log"; obrun
 [ "$(cat "$OB/open.log")" = "https://memex.localhost:8443/setup?token=tok-ob-123" ] && ok "…and opens it once the certificate is trusted" || bad "open when trusted" "$(cat "$OB/open.log") $OUT"
 ! grep -nE '(^|[^_])open "\$\{url\}\?token' "$CLI" && ok "no code path opens the token URL without the trust check" || bad "unguarded open" "$(grep -n 'open "${url}?token' "$CLI")"
 
@@ -2857,6 +2853,39 @@ for cmd in up down status setup logs update registry verify port-forward observa
   if grep -q "^    ${cmd})" "$CLI"; then ok "help documents '$cmd', and main dispatches it"
   else bad "help documents '$cmd'" "no dispatch arm in main()"; fi
 done
+
+echo "── the toolchain is found from the install, not the caller's PATH ──"
+KEG="$(mktemp -d)"; mkdir -p "$KEG/Cellar/memex-local/9.9.9/libexec" "$KEG/bin"; cp "$CLI" "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local"
+cp -R "$(dirname "$CLI")/../share" "$KEG/Cellar/memex-local/9.9.9/libexec/share" 2>/dev/null || true
+KB="$(cd "$KEG/bin" && pwd -P)"
+TP="$(env -i HOME="$HOME" PATH=/usr/bin:/bin MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(cd "$(dirname "$CLI")/../share" && pwd)" bash -c '. "$0"; memex_toolchain_path; printf "%s" "$PATH"' "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local" 2>/dev/null)"
+case ":$TP:" in *":$KB:"*) ok "an installed keg finds its Homebrew prefix's bin/ even from a shell without it on PATH (memex-local setup finds kubectl)" ;; *) bad "toolchain PATH from the keg" "$TP" ;; esac
+TP2="$(env -i HOME="$HOME" PATH="$KB:/usr/bin:/bin" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(cd "$(dirname "$CLI")/../share" && pwd)" bash -c '. "$0"; memex_toolchain_path; memex_toolchain_path; printf "%s" "$PATH"' "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local" 2>/dev/null)"
+[ "$(printf '%s' "$TP2" | tr ':' '\n' | grep -cx "$KB")" = "1" ] && ok "the prefix's bin/ is added once (idempotent), and a caller's PATH keeps its order" || bad "toolchain PATH idempotent" "$TP2"
+TP3="$(env -i HOME="$HOME" PATH=/usr/bin:/bin MEMEX_LOCAL_LIB=1 bash -c '. "$0"; memex_toolchain_path; printf "%s" "$PATH"' "$CLI" 2>/dev/null)"
+want="/usr/bin:/bin"; [ "$(uname -s)" = Darwin ] && [ -d /usr/local/bin ] && want="$want:/usr/local/bin"
+[ "$TP3" = "$want" ] && ok "a source checkout gets no prefix (only a Mac's /usr/local/bin): the test stubs and a Linux runner are untouched" || bad "checkout PATH unchanged" "$TP3"
+rm -rf "$KEG"
+grep -q 'need kubectl kubernetes-cli' <(sed -n '/^cmd_setup() {/,/^}/p' "$CLI") && grep -q 'could not read the portal log with kubectl' "$CLI" \
+  && ok "setup resolves kubectl and FAILS naming it — never an empty token" || bad "setup kubectl loud" "missing"
+! grep -q 'Password=\${pg_pw}' "$CLI" && grep -q 'Password=<memex_postgres_password in' "$CLI" \
+  && ok "setup never prints the in-cluster Postgres password" || bad "postgres password masked" "still printed"
+
+echo "── setup --apply: the first-run setup through its API, consent explicit ──"
+SAPY="$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; printf "%s" "$SETUP_ANSWERS_PY"' "$CLI")"
+SA="$(mktemp -d)"
+if env SETUP_NAME=studio-2 SETUP_COMPANY=Acme SETUP_OWNER_NAME="Jane Roe" SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=no \
+     SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/a.json" 2>"$SA/err"; then bad "no consent → nothing sent" "accepted"
+else grep -q 'identity.consent' "$SA/err" && [ ! -e "$SA/a.json" ] && ok "setup --apply without --accept-terms sends nothing and names identity.consent" || bad "consent named" "$(cat "$SA/err")"; fi
+env SETUP_NAME=studio-2 SETUP_COMPANY= SETUP_OWNER_NAME= SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=yes \
+  SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/b.json" 2>"$SA/err2" \
+  && bad "missing company/owner → refused" "accepted" || { grep -q 'identity.company' "$SA/err2" && grep -q 'identity.ownerName' "$SA/err2" && ok "every missing answer is named by its field" || bad "missing fields named" "$(cat "$SA/err2")"; }
+env SETUP_NAME=studio-2 SETUP_COMPANY=Acme SETUP_OWNER_NAME="Jane Roe" SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=yes SETUP_REGISTRY=https://registry.example.com \
+  SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/c.json" \
+  && python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); i=d["identity"]; assert i["consent"] is True and i["name"]=="studio-2" and i["company"]=="Acme" and i["registry"]=="https://registry.example.com"; assert d["embedding"]=={"endpoint":"http://e/v1","model":"m"}; assert "storage" not in d' "$SA/c.json" \
+  && ok "a complete answer carries identity + consent + this install's embeddings, and leaves storage to the wizard's pre-selected default" || bad "complete answers" "$(cat "$SA/c.json" 2>/dev/null)"
+grep -q 'X-Setup-Token: %s' "$CLI" && ! grep -qE 'curl[^\n]*X-Setup-Token: \$' "$CLI" && ok "the setup token travels in a 0600 header file, never on a command line" || bad "token header file" "missing"
+rm -rf "$SA"
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
