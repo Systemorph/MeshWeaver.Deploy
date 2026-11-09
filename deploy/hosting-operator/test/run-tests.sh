@@ -23,6 +23,8 @@ set -uo pipefail
 # hosting-operator lane, run 42454937015, where hosting::kv_exists did it in the script under test).
 # The "no grep -q behind a pipe" guard at the end of this suite holds bin/, the stubs and this file to it.
 grep_in() { local text="$1"; shift; grep "$@" <<< "$text"; }
+# SHA-256 hex of stdin, wherever the suite runs (sha256sum in the image, shasum on a bare macOS).
+hosting_sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -c1-64; else shasum -a 256 | cut -c1-64; fi; }
 BIN="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../bin" && pwd)"
 export PATH="$BIN:$PATH"
 
@@ -5821,6 +5823,181 @@ refuses_hard "tailnet key: five tags are refused" "1–4 tags" hosting-tailnet-k
 refuses_hard "tailnet key: a duplicate tag is refused" "named twice" hosting-tailnet-key "${TK_ARGS[@]/tag:observability/tag:a,tag:a}"
 refuses_hard "tailnet key: a namespace with a metacharacter is refused" "not a plain name" hosting-tailnet-key "${TK_ARGS[@]/control/con;trol}"
 unset _tk_out _tk_rc _tk_kube _tk_az _tk_st
+
+echo "── sealing for an enrolling Mac: tailnet key, per-machine sign-in app, vault objects — ciphertext only ──"
+# Hosting/MacStudioFleet §2b (enrolment v2): each value is sealed INSIDE the job to the Mac's throw-away RSA key
+# (OAEP-SHA256, one block) and only `::hosting:: sealed_item item=<x> fp=… b64=…` leaves. These cases DECRYPT what the
+# scripts emit with the private half and compare it byte for byte — a round trip, not a shape check — and hold that
+# no plaintext reaches stdout, stderr or any argv a stub recorded.
+if command -v openssl >/dev/null 2>&1; then
+  SEAL_DIR="$(mktemp -d)"
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$SEAL_DIR/k.pem" >/dev/null 2>&1
+  SEAL_SPKI="$(openssl pkey -in "$SEAL_DIR/k.pem" -pubout -outform DER 2>/dev/null | base64 | tr -d '\n')"
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$SEAL_DIR/small.pem" >/dev/null 2>&1
+  SEAL_SMALL="$(openssl pkey -in "$SEAL_DIR/small.pem" -pubout -outform DER 2>/dev/null | base64 | tr -d '\n')"
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$SEAL_DIR/ec.pem" >/dev/null 2>&1
+  SEAL_EC="$(openssl pkey -in "$SEAL_DIR/ec.pem" -pubout -outform DER 2>/dev/null | base64 | tr -d '\n')"
+  # An openssl that refuses to ENCRYPT (everything else passes through): the "minted but could not be sealed" branch.
+  mkdir -p "$SEAL_DIR/broken"
+  printf '#!/usr/bin/env bash\n[ "${1:-}" = pkeyutl ] && { echo "pkeyutl: refused" >&2; exit 1; }\nexec %q "$@"\n' "$(command -v openssl)" > "$SEAL_DIR/broken/openssl"
+  chmod +x "$SEAL_DIR/broken/openssl"
+  # seal_open <output> <item> — the plaintext of the item's sealed_item line, opened with the private key.
+  seal_open() {
+    local line b64
+    line="$(grep -E "^::hosting:: sealed_item item=$2 " <<< "$1" | tail -n1)"
+    b64="${line##* b64=}"
+    [ -n "$line" ] && [ -n "$b64" ] || return 1
+    printf '%s' "$b64" | base64 -d 2>/dev/null > "$SEAL_DIR/ct" || return 1
+    openssl pkeyutl -decrypt -inkey "$SEAL_DIR/k.pem" -in "$SEAL_DIR/ct" \
+      -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 2>/dev/null
+  }
+  seal_fp() { local line; line="$(grep -E "^::hosting:: sealed_item item=$2 " <<< "$1" | tail -n1)"; line="${line#* fp=}"; printf '%s' "${line%% *}"; }
+
+  # ── hosting-tailnet-key --seal-to ──
+  TK_SEAL=(--namespace control --release headscale --tags tag:observability --expiration 2h --seal-to "$SEAL_SPKI" --item t)
+  if command -v jq >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    tk -- "${TK_SEAL[@]}"
+    [ "$_tk_rc" -eq 0 ] && ok "sealed tailnet key: minted and sealed" || bad "sealed tailnet key" "exited ${_tk_rc}: ${_tk_out}"
+    [ "$(seal_open "$_tk_out" t)" = "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef" ] \
+      && ok "…the sealed_item opens with the Mac's private key to exactly the minted key (OAEP-SHA256 round trip)" \
+      || bad "sealed tailnet round trip" "said: ${_tk_out}"
+    [ "$(seal_fp "$_tk_out" t)" = "sha256:$(printf '%s' 'hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef' | hosting_sha | cut -c1-12)" ] \
+      && ok "…its fp is the sha256:<12 hex> of the plaintext, comparable on the Mac" || bad "sealed tailnet fp" "fp: $(seal_fp "$_tk_out" t)"
+    case "${_tk_out}${_tk_kube}${_tk_az}" in *NEVERPRINTED*|*hskey-auth-*) bad "sealed tailnet key: no plaintext on stdout, stderr or any argv" "seen: ${_tk_out}" ;; *) ok "sealed tailnet key: no plaintext on stdout, stderr or any argv" ;; esac
+    [ -z "$_tk_az" ] && ok "…and nothing is written to a vault" || bad "sealed key writes no vault" "az saw: ${_tk_az}"
+    case "$_tk_out" in *"::hosting:: tailnet_key=sealed"*"::hosting:: tailnet_key_id=7"*"::hosting:: enrol_fact key=tailnetTags value=tag:observability"*) ok "…reported sealed, by id, with the tags as an enrolment fact" ;; *) bad "sealed facts" "said: ${_tk_out}" ;; esac
+    tk_done
+    tk -- "${TK_SEAL[@]/tag:observability/tag:undeclared}"
+    [ "$_tk_rc" -ne 0 ] && case "$_tk_kube" in *"preauthkeys create"*) false ;; *) true ;; esac \
+      && ok "sealed tailnet key: an undeclared tag is still refused before anything is minted" || bad "sealed undeclared" "rc ${_tk_rc}: ${_tk_kube}"
+    tk_done
+    _seal_path="$PATH"; PATH="$SEAL_DIR/broken:$PATH"; tk -- "${TK_SEAL[@]}"; PATH="$_seal_path"
+    [ "$_tk_rc" -ne 0 ] && case "$_tk_out" in *"could not be sealed"*"The key was expired"*) true ;; *) false ;; esac \
+      && ok "sealed tailnet key: a key that could not be sealed fails the step" || bad "seal failure" "rc ${_tk_rc}: ${_tk_out}"
+    case "$_tk_kube" in *"preauthkeys expire --id 7"*) ok "…and is EXPIRED in headscale — nobody holds a live key" ;; *) bad "seal failure expires" "kubectl saw: ${_tk_kube}" ;; esac
+    case "$_tk_out" in *NEVERPRINTED*|*"sealed_item"*) bad "…printing neither the key nor a sealed item" "said: ${_tk_out}" ;; *) ok "…printing neither the key nor a sealed item" ;; esac
+    tk_done
+    tk -- "${TK_SEAL[@]/$SEAL_SPKI/$SEAL_SMALL}"
+    [ "$_tk_rc" -ne 0 ] && case "$_tk_out" in *"RSA-2048"*) true ;; *) false ;; esac && case "$_tk_kube" in *"preauthkeys create"*) false ;; *) true ;; esac \
+      && ok "sealed tailnet key: an RSA-2048 recipient is refused before anything is minted" || bad "rsa-2048" "rc ${_tk_rc}: ${_tk_out}"
+    tk_done
+    tk -- "${TK_SEAL[@]/$SEAL_SPKI/$SEAL_EC}"
+    [ "$_tk_rc" -ne 0 ] && case "$_tk_out" in *"hosting-tailnet-key: ERROR: seal-to"*) true ;; *) false ;; esac && case "$_tk_kube" in *"preauthkeys create"*) false ;; *) true ;; esac \
+      && ok "sealed tailnet key: an EC recipient is refused before anything is minted" || bad "ec recipient" "rc ${_tk_rc}: ${_tk_out}"
+    tk_done
+    tk HOSTING_DRY_RUN=true -- "${TK_SEAL[@]}"
+    [ "$_tk_rc" -eq 0 ] && case "$_tk_kube" in *"preauthkeys create"*) false ;; *) true ;; esac \
+      && ok "sealed tailnet key: a dry run checks the key and the tags and mints nothing" || bad "sealed dry run" "rc ${_tk_rc}: ${_tk_kube}"
+    tk_done
+  else
+    bad "sealed tailnet key tests need jq and python3" "missing"
+  fi
+  refuses_hard "sealed tailnet key: a seal-to that is not base64 is refused" "is not the base64" \
+    hosting-tailnet-key "${TK_SEAL[@]/$SEAL_SPKI/'not;base64'}"
+  refuses_hard "sealed tailnet key: --seal-to with --vault/--object is refused (one destination)" "two destinations" \
+    hosting-tailnet-key "${TK_SEAL[@]}" --vault kv-example --object o
+  refuses_hard "sealed tailnet key: --seal-to needs --item" "missing required flag --item" \
+    hosting-tailnet-key --namespace control --release headscale --tags tag:observability --expiration 2h --seal-to "$SEAL_SPKI"
+  refuses_hard "sealed tailnet key: an item of two letters is refused" "one lower-case letter" \
+    hosting-tailnet-key "${TK_SEAL[@]/%t/tt}"
+  refuses_hard "sealed tailnet key: the expiry bound still holds" "must be 10m–24h" \
+    hosting-tailnet-key "${TK_SEAL[@]/2h/25h}"
+
+  # ── hosting-signin-app --per-machine ──
+  PM_ARGS=(--per-machine studio-2 --domain example.com --seal-to "$SEAL_SPKI" --item e)
+  PM_URIS="https://studio-2.net.example.com/signin-microsoft https://studio-2.net.example.com/auth/callback/Microsoft https://studio-2.net.example.com/auth/ea/callback https://localhost:8443/signin-microsoft https://localhost:8443/auth/callback/Microsoft https://localhost:8443/auth/ea/callback https://memex.localhost/signin-microsoft https://memex.localhost/auth/callback/Microsoft https://memex.localhost/auth/ea/callback"
+  sa -- "${PM_ARGS[@]}"
+  [ "$_sa_rc" -eq 0 ] && ok "per-machine app: created, secret sealed" || bad "per-machine create" "exited ${_sa_rc}: ${_sa_out}"
+  case "$_sa_log" in *"ad app list --display-name MeshWeaver studio-2 (Mac) --query [].appId -o tsv"*"ad app create --display-name MeshWeaver studio-2 (Mac) --sign-in-audience AzureADMultipleOrgs --web-redirect-uris ${PM_URIS} --query appId -o tsv"*) ok "…looked up by display name, then created with ALL nine redirect URIs (net host, localhost:8443, memex.localhost)" ;; *) bad "per-machine create argv" "az saw: ${_sa_log}" ;; esac
+  case "$_sa_log" in *"ad sp create --id 0e5a1d2c-0000-4000-8000-0000000000b1"*) ok "…its service principal is created" ;; *) bad "sp create" "az saw: ${_sa_log}" ;; esac
+  case "$_sa_log" in *"ad app credential reset --id 0e5a1d2c-0000-4000-8000-0000000000b1 --append --display-name enrol-studio-2-"*) ok "…a secret is APPENDED (nothing rotated)" ;; *) bad "append" "az saw: ${_sa_log}" ;; esac
+  [ "$(seal_open "$_sa_out" e)" = "fake-client-secret-NEVER-PRINTED" ] && ok "…the sealed_item opens to exactly the client secret, without its trailing newline" || bad "per-machine round trip" "said: ${_sa_out}"
+  case "${_sa_out}${_sa_log}" in *NEVER-PRINTED*) bad "per-machine app: the secret never reaches stdout, stderr or an argv (az's stderr echo discarded)" "seen: ${_sa_out}" ;; *) ok "per-machine app: the secret never reaches stdout, stderr or an argv (az's stderr echo discarded)" ;; esac
+  case "$_sa_log" in *"keyvault"*) bad "…and no vault is touched" "az saw: ${_sa_log}" ;; *) ok "…and no vault is touched" ;; esac
+  case "$_sa_out" in *"enrol_fact key=clientId value=0e5a1d2c-0000-4000-8000-0000000000b1"*"enrol_fact key=tenant value=00000000-0000-4000-8000-0000000000aa"*"enrol_fact key=redirectUris value=https://studio-2.net.example.com/signin-microsoft,"*"https://localhost:8443/signin-microsoft"*) ok "…reported: clientId, tenant and the redirect URIs as enrolment facts" ;; *) bad "per-machine facts" "said: ${_sa_out}" ;; esac
+  case "$_sa_out" in *"::hosting:: signin_app=created"*"::hosting:: signin_secret=sealed"*) ok "…and signin_app=created, signin_secret=sealed" ;; *) bad "per-machine outcome facts" "said: ${_sa_out}" ;; esac
+  rm -rf "$_sa_state"
+
+  # Found (idempotent): an app of that name exists with a foreign URI; the missing ones are ADDED, the existing kept.
+  sa HOSTING_SA_APPS=0e5a1d2c-0000-4000-8000-0000000000c3 HOSTING_SA_REDIRECTS="https://keep.example.test/signin-microsoft" HOSTING_SA_SP=1 -- "${PM_ARGS[@]}"
+  [ "$_sa_rc" -eq 0 ] && ok "per-machine app: an existing app of that name is reused" || bad "per-machine found" "exited ${_sa_rc}: ${_sa_out}"
+  case "$_sa_log" in *"ad app create"*) bad "…never created twice" "az saw: ${_sa_log}" ;; *) ok "…never created twice" ;; esac
+  case "$_sa_log" in *"ad app update --id 0e5a1d2c-0000-4000-8000-0000000000c3 --web-redirect-uris https://keep.example.test/signin-microsoft ${PM_URIS}"*) ok "…its URIs are KEPT and the missing ones added in one update" ;; *) bad "union update" "az saw: ${_sa_log}" ;; esac
+  case "$_sa_log" in *"ad sp create"*) bad "…an existing service principal is not re-created" "az saw: ${_sa_log}" ;; *) ok "…an existing service principal is not re-created" ;; esac
+  case "$_sa_out" in *"signin_app=found"*"enrol_fact key=clientId value=0e5a1d2c-0000-4000-8000-0000000000c3"*) ok "…and reported found, with that app's client id" ;; *) bad "found facts" "said: ${_sa_out}" ;; esac
+  rm -rf "$_sa_state"
+
+  sa HOSTING_SA_APPS=$'0e5a1d2c-0000-4000-8000-0000000000c3\n0e5a1d2c-0000-4000-8000-0000000000c4' -- "${PM_ARGS[@]}"
+  [ "$_sa_rc" -ne 0 ] && case "$_sa_out" in *"2 applications are named"*) true ;; *) false ;; esac && case "$_sa_log" in *"credential reset"*) false ;; *) true ;; esac \
+    && ok "per-machine app: two apps of that name are a refusal, and no secret is minted" || bad "two apps" "rc ${_sa_rc}: ${_sa_out}"
+  rm -rf "$_sa_state"
+  sa HOSTING_SA_GRAPH_DENIED=1 -- "${PM_ARGS[@]}"
+  [ "$_sa_rc" -ne 0 ] && case "$_sa_out" in *"Application.ReadWrite.OwnedBy"*"Insufficient privileges"*) true ;; *) false ;; esac \
+    && ok "per-machine app: an identity without Graph rights is RED, naming the right and Graph's answer" || bad "graph denied" "rc ${_sa_rc}: ${_sa_out}"
+  rm -rf "$_sa_state"
+  _seal_path="$PATH"; PATH="$SEAL_DIR/broken:$PATH"; sa -- "${PM_ARGS[@]}"; PATH="$_seal_path"
+  [ "$_sa_rc" -ne 0 ] && [ -f "$_sa_state/credential-deleted" ] && ok "per-machine app: a secret that could not be sealed is DELETED from the app again" || bad "seal failure deletes" "rc ${_sa_rc}: ${_sa_out}"
+  case "$_sa_out" in *NEVER-PRINTED*|*sealed_item*) bad "…and nothing is printed" "said: ${_sa_out}" ;; *) ok "…and nothing is printed" ;; esac
+  rm -rf "$_sa_state"
+  sa HOSTING_DRY_RUN=true -- "${PM_ARGS[@]}"
+  [ "$_sa_rc" -eq 0 ] && case "$_sa_log" in *"ad app"*) false ;; *) true ;; esac && case "$_sa_out" in *"signin_app=dry-run"*) true ;; *) false ;; esac \
+    && ok "per-machine app: a dry run calls Graph not at all" || bad "per-machine dry run" "rc ${_sa_rc}: ${_sa_log} ${_sa_out}"
+  rm -rf "$_sa_state"
+  refuses_hard "per-machine app: shared-app flags beside --per-machine are refused" "are refused beside it" hosting-signin-app "${PM_ARGS[@]}" --vault V
+  refuses_hard "per-machine app: an id that is not a DNS label is refused" "is not a DNS label" hosting-signin-app "${PM_ARGS[@]/studio-2/Studio_2}"
+  refuses_hard "per-machine app: --domain is required" "missing required flag --domain" hosting-signin-app --per-machine studio-2 --seal-to "$SEAL_SPKI" --item e
+  refuses_hard "per-machine app: a domain with a metacharacter is refused" "is not a hostname" hosting-signin-app "${PM_ARGS[@]/example.com/ex;ample.com}"
+  refuses_hard "per-machine app: an RSA-2048 recipient is refused" "RSA-2048" hosting-signin-app "${PM_ARGS[@]/$SEAL_SPKI/$SEAL_SMALL}"
+
+  # ── hosting-seal-secret ──
+  SS_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/seal-secret" && pwd)"
+  ss() {  # ss [env…] -- <args…>
+    local envs=()
+    while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+    _ss_st="$(mktemp -d)"
+    _ss_out="$(env "${envs[@]}" PATH="$SS_STUBS:$PATH" HOSTING_SS_STATE="$_ss_st" hosting-seal-secret "$@" 2>&1)"; _ss_rc=$?
+    _ss_log="$(cat "$_ss_st/az.log" 2>/dev/null || true)"; rm -rf "$_ss_st"
+  }
+  SS_ARGS=(--vault kv-example --object dns01-ClientSecret --seal-to "$SEAL_SPKI" --item n)
+  ss -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -eq 0 ] && ok "seal-secret: an existing object is sealed" || bad "seal-secret" "exited ${_ss_rc}: ${_ss_out}"
+  [ "$(seal_open "$_ss_out" n)" = "dns01-secret-NEVERPRINTED-0123456789abcdefABCDEF" ] && ok "…and opens to exactly its value (az's trailing newline stripped)" || bad "seal-secret round trip" "said: ${_ss_out}"
+  case "$_ss_out" in *NEVERPRINTED*) bad "seal-secret: the value never reaches stdout or stderr" "said: ${_ss_out}" ;; *) ok "seal-secret: the value never reaches stdout or stderr" ;; esac
+  case "$_ss_log" in *"secret set"*) bad "…and nothing is written" "az saw: ${_ss_log}" ;; *) ok "…and nothing is written" ;; esac
+  case "$_ss_out" in *"::hosting:: sealed_secret=n:dns01-ClientSecret"*) ok "…reported by item and object name" ;; *) bad "seal-secret fact" "said: ${_ss_out}" ;; esac
+  # The OAEP block limit: RSA-3072 holds 318 bytes; 319 is refused naming the size, 318 seals.
+  ss HOSTING_SS_VALUE="$(printf 'A%.0s' $(seq 1 319))" -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -ne 0 ] && case "$_ss_out" in *"is 319 bytes"*"at most 318"*) true ;; *) false ;; esac \
+    && ok "seal-secret: a value over one OAEP block is refused, naming its size and the limit" || bad "oversize" "rc ${_ss_rc}: ${_ss_out}"
+  ss HOSTING_SS_VALUE="$(printf 'A%.0s' $(seq 1 318))" -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -eq 0 ] && [ "$(seal_open "$_ss_out" n | wc -c | tr -d ' ')" = "318" ] && ok "…negative control: exactly 318 bytes seals and opens" || bad "318 bytes" "rc ${_ss_rc}: ${_ss_out}"
+  # A PEM-shaped value keeps its own trailing newline: only the ONE newline `-o tsv` appends is cut.
+  ss HOSTING_SS_VALUE=$'-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg\n-----END PRIVATE KEY-----\n' -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -eq 0 ] && [ "$(seal_open "$_ss_out" n | tail -c 6 | od -An -tx1 | tr -d ' \n')" = "2d2d2d2d2d0a" ] \
+    && ok "seal-secret: a value's own trailing newline survives — exactly one byte is cut" || bad "pem newline" "rc ${_ss_rc}: $(seal_open "$_ss_out" n | od -An -c | tail -n2)"
+  ss HOSTING_SS_VALUE="" -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -ne 0 ] && case "$_ss_out" in *"is EMPTY"*) true ;; *) false ;; esac && ok "seal-secret: an empty object is refused" || bad "empty" "rc ${_ss_rc}: ${_ss_out}"
+  ss HOSTING_SS_OBJECTS="other" -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -ne 0 ] && case "$_ss_out" in *"holds no object dns01-ClientSecret"*) true ;; *) false ;; esac && case "$_ss_log" in *"--query value"*) false ;; *) true ;; esac \
+    && ok "seal-secret: an absent object is refused and no value is read" || bad "absent" "rc ${_ss_rc}: ${_ss_out}"
+  ss HOSTING_SS_LIST_FAIL=1 -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -ne 0 ] && case "$_ss_out" in *"UNKNOWN"*) true ;; *) false ;; esac && ok "seal-secret: a refused listing is UNKNOWN, never absent" || bad "list refused" "rc ${_ss_rc}: ${_ss_out}"
+  ss HOSTING_SS_SHOW_FAIL=1 -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -ne 0 ] && case "$_ss_out" in *"secret GET"*) true ;; *) false ;; esac && ok "seal-secret: a refused value read names the right" || bad "show refused" "rc ${_ss_rc}: ${_ss_out}"
+  ss HOSTING_DRY_RUN=true -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -eq 0 ] && case "$_ss_log" in *"--query value"*) false ;; *) true ;; esac && ok "seal-secret: a dry run reads no value" || bad "dry run" "rc ${_ss_rc}: ${_ss_log}"
+  ss -- "${SS_ARGS[@]/$SEAL_SPKI/$SEAL_SMALL}"
+  [ "$_ss_rc" -ne 0 ] && case "$_ss_log" in *"keyvault"*) false ;; *) true ;; esac && ok "seal-secret: an RSA-2048 recipient is refused before the vault is touched" || bad "small key" "rc ${_ss_rc}: ${_ss_log}"
+  refuses_hard "seal-secret needs --seal-to"            "missing required flag --seal-to" hosting-seal-secret --vault V --object o --item n
+  refuses_hard "seal-secret needs --object"             "missing required flag --object"  hosting-seal-secret --vault V --seal-to "$SEAL_SPKI" --item n
+  refuses_hard "seal-secret refuses an object with a metacharacter" "is not a plain name"  hosting-seal-secret --vault V --object 'o;id' --seal-to "$SEAL_SPKI" --item n
+  refuses_hard "seal-secret refuses an item that is not one letter" "one lower-case letter" hosting-seal-secret --vault V --object o --seal-to "$SEAL_SPKI" --item N
+  refuses_hard "seal-secret rejects unknown flags"      "unknown argument"                hosting-seal-secret "${SS_ARGS[@]}" --nope 1
+  rm -rf "$SEAL_DIR"
+  unset SEAL_DIR SEAL_SPKI SEAL_SMALL SEAL_EC TK_SEAL PM_ARGS PM_URIS SS_ARGS _ss_out _ss_rc _ss_log
+else
+  bad "the sealing tests need openssl" "missing"
+fi
 
 echo
 echo "── no grep -q behind a pipe (SIGPIPE under pipefail reads a match as FALSE) ──"

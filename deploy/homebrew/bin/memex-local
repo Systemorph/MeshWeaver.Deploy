@@ -21,12 +21,37 @@
 #   observability Install Grafana/Loki/Promtail/Prometheus (LocalColimaMac.md §11).
 #   doctor        Preflight: check required tools + cluster reachability.
 #   owner         The instance OWNER (id + e-mail) — its global administrator (owner --id <id> --email <e-mail>).
+#   ca            The fleet local CA: adopt its key (sealed in the enrolment code) as mkcert's CA | status.
 #   help | version
 #
 # Each step is annotated with the LocalColimaMac.md section it automates so the
 # 1:1 mapping is auditable.
 # =============================================================================
 set -euo pipefail
+
+# 🚨 The toolchain is found from WHERE THIS SCRIPT IS INSTALLED, never from whatever PATH the caller's shell
+# happens to have. A fresh Mac whose Homebrew was installed by the fleet bootstrap has no `brew shellenv`
+# in the person's ~/.zprofile, so a new Terminal lacks <prefix>/bin: `memex-local setup` then could not
+# find kubectl and printed NO token at all (measured on the second Mac Studio, 2026-11-09). The prefix is
+# the directory above Cellar/ (or the parent of bin/ for a non-keg checkout); /usr/local/bin carries the
+# root-owned tailscale link the bootstrap installs. APPENDED once, only when it exists and is missing: a
+# caller's own PATH (a pinned kubectl, a test's stubs) still wins; this only fills in what is absent.
+memex_toolchain_path() {
+  local self prefix dir
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+  # Only an installed keg (…/Cellar/memex-local/<v>/libexec/memex-local) names a Homebrew prefix; a source
+  # checkout and a Linux host are left exactly as they were (a CI runner's /usr/local/bin is not a Mac's).
+  case "$self" in */Cellar/*) prefix="${self%%/Cellar/*}" ;; esac
+  local extra=()
+  [ -n "${prefix:-}" ] && extra+=("$prefix/bin" "$prefix/sbin")
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] && extra+=(/usr/local/bin)
+  for dir in ${extra[@]+"${extra[@]}"}; do
+    [ -d "$dir" ] || continue
+    case ":$PATH:" in *":$dir:"*) ;; *) PATH="$PATH:$dir" ;; esac
+  done
+  export PATH
+}
+[ "${MEMEX_LOCAL_LIB:-}" = "1" ] || memex_toolchain_path
 
 # ---------------------------------------------------------------------------
 # Constants (the doc's defaults — same topology, no substitutions)
@@ -314,6 +339,44 @@ info() { printf '    %s\n' "$*"; }
 ok()   { printf '%s ok %s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf '%swarn%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die()  { printf '%serr %s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+# A tool a command cannot work without, checked by PRESENCE before the command reads anything through it:
+# a missing kubectl is named and FAILS the command — never an empty answer that reads like "no token".
+require_tool() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  die "required tool '$1' not found — install it (brew install ${2:-$1}). memex-local already looks in its own Homebrew prefix, so Homebrew or the formula may be missing (https://brew.sh)"
+}
+
+# What may be printed of a secret: its fingerprint, `sha256:<12 hex>` — never the value.
+secret_fingerprint() { printf 'sha256:%s' "$(printf '%s' "$1" | shasum -a 256 | cut -c1-12)"; }
+
+# 🚨 A https page on this Mac is opened in the browser only once the certificate it SERVES is trusted. The
+# second Mac Studio (2026-11-09) opened the wizard before the local CA was trusted, and the first thing the
+# person saw was a certificate error. `security verify-cert <url>` evaluates the chain the server presents
+# against this Mac's trust settings, so an untrusted CA, a stale certificate and a name mismatch all answer
+# "no". Measured on macOS 27 (2026-11-09): with a URL operand verify-cert applies the SSL server policy for that
+# host itself (its usage: "other certificates or policy options will be ignored", so no -p) — a trusted
+# https://memex.localhost:8443 answers 0, the same server reached as https://127.0.0.1:8443 (a name its certificate
+# does not carry) answers 1. Without `security` (not macOS) the answer is no. MEMEX_TRUST_CHECK=skip is for a test only.
+served_cert_trusted() {
+  [ "${MEMEX_TRUST_CHECK:-}" = skip ] && return 0
+  command -v security >/dev/null 2>&1 && security verify-cert "$1" >/dev/null 2>&1
+}
+# Opens the https URL $1 when its served certificate is trusted (exit 0); otherwise says what is missing and
+# where to go once it is ($2 names the URL to the person — default $1; a token-bearing URL is printed by the
+# caller, never here) and exits 1, so a caller's "opened" marker is not written and the next start retries.
+open_when_trusted() {
+  local url="$1" shown="${2:-$1}" origin
+  command -v open >/dev/null 2>&1 || return 1
+  origin="$(printf '%s' "$url" | sed -E 's#^(https://[^/?]+).*#\1/#')"
+  if ! served_cert_trusted "$origin"; then
+    warn "not opening the browser: the certificate $origin serves is not trusted on this Mac yet (the local CA is untrusted)."
+    info "Trust it: a fleet Mac gets the fleet local CA (its trusted-root profile + 'memex-local ca adopt', done by the join);"
+    info "any other Mac runs 'mkcert -install' once (it asks for your password). Then open $shown."
+    return 1
+  fi
+  open "$url" >/dev/null 2>&1
+}
 
 # ---------------------------------------------------------------------------
 # Asset + chart resolution
@@ -925,6 +988,32 @@ accept_summary() {
   else info "serves NO token requests (memex-local backlease accept tokens --from '$ACCEPT_DEFAULT_TOKENS_FROM' --models … --residency … to opt in)"; fi
 }
 
+# PARTICIPATION (the owner's answers, Mac onboarding contract §5): what the back-lease layer RECORDS for $1 = Jobs |
+# Tokens — `true`, `false`, or nothing (no layer, or one written before the answer existed). The recorded answer
+# decides what a join installs: the build host only on a YES to jobs; the extra token models never after a NO.
+participation_answer() {
+  [ -f "$BACKLEASE_FILE" ] || return 0
+  backlease_value "Hosting__BackLease__Accept__${1}__Enabled" || true
+}
+# The answer as a person reads it (for the line that says why something was NOT installed).
+participation_said() {
+  case "$(participation_answer "$1")" in
+    true) printf 'YES' ;; false) printf 'NO' ;;
+    *) case "$1:$ACC_JOBS_ANSWERED:$ACC_JOBS_ENABLED" in Jobs:yes:true) printf 'YES (not recorded)' ;; Jobs:yes:false) printf 'NO' ;; *) printf 'no answer recorded' ;; esac ;;
+  esac
+}
+# Whether a join installs the build host (build VM, KEDA, runners, the priority agent): the join did not say
+# --no-buildhost ($1 = yes) AND the owner said YES to fleet jobs — recorded in the layer, or (no layer: not in
+# registry mode) given as --accept-jobs on this join. No answer is not a yes.
+participation_build_host() {
+  [ "$1" = yes ] || return 1
+  case "$(participation_answer Jobs)" in
+    true) return 0 ;;
+    false) return 1 ;;
+  esac
+  [ "${ACC_JOBS_ANSWERED:-no}" = yes ] && [ "${ACC_JOBS_ENABLED:-false}" = true ]
+}
+
 # The ceiling written in the layer as "85%" → 85 (a fresh layer: the enrol default).
 backlease_ceiling() { local v; v="$(backlease_value "$1" || true)"; v="${v%\%}"; printf '%s' "${v:-70}"; }
 
@@ -1529,7 +1618,15 @@ YAML
       fi
       restart_front_door "loopback only — the private network is the only way in"
       internal_serve_when_signed_in || true
-      info "Register on the sign-in app exactly: https://${host}/signin-microsoft, https://${host}/auth/callback/Microsoft, https://${host}/auth/ea/callback"
+      # 🚨 BOTH the private-network name AND the Mac's own loopback name: the owner signs in first at
+      # the console (https://memex.localhost:8443), and a sign-in app carrying only the network name
+      # answers "redirect URI not registered" there (measured on the second Mac Studio, 2026-11-09).
+      # One app per Mac (the shared app holds at most two secrets), so the loopback names are safe on it.
+      local rp rh uris=""
+      for rh in "$host" "${HOSTNAME_LOCAL}:${HOST_PORT}" "${HOSTNAME_LOCAL}"; do
+        for rp in /signin-microsoft /auth/callback/Microsoft /auth/ea/callback; do uris="${uris:+$uris, }https://${rh}${rp}"; done
+      done
+      info "Register on THIS Mac's own sign-in app exactly: ${uris}"
       info "Apply it: memex-local update   (the portal takes the sign-in, then the private network is opened; the first person to sign in becomes the administrator — the owner)"
       ;;
     status)
@@ -1792,18 +1889,304 @@ YAML
   chmod 600 "$FLEET_FILE"
 }
 
+# ── ENROLMENT v2 (MeshWeaver.Plugins Hosting/MachineEnrolment, the shared onboarding contract) ──────────────────────
+# The request names the OWNER and both participation answers; control's ONE Approve issues every item, each sealed to
+# this join's throw-away key; this Mac POLLS for the code (signed with that key) and continues by itself. The paste and
+# --code-file stay as the fallback. Every item is opened into a 0600 file and handed to its target on stdin or by file
+# reference — a value is never an argument, never printed (fingerprints only), and the files are removed at the end.
+readonly FLEET_CODE2_PREFIX="mwenrol2."
+readonly FLEET_POLL_ROUTE="/api/enrol/poll"
+readonly FLEET_POLL_EVERY="${MEMEX_FLEET_POLL_EVERY:-10}"
+
+# A JSON value at a dotted key path of a file, raw (strings unquoted; an array as JSON). plutil on macOS, python3
+# elsewhere. Prints nothing when the key is absent.
+fleet_json() {
+  local file="$1" path="$2"
+  if command -v plutil >/dev/null 2>&1; then
+    local t; t="$(plutil -type "$path" "$file" 2>/dev/null || true)"
+    case "$t" in
+      array|dictionary) plutil -extract "$path" json -o - "$file" 2>/dev/null ;;
+      '') ;;
+      *) plutil -extract "$path" raw -o - "$file" 2>/dev/null ;;
+    esac
+  else
+    python3 -c 'import json,sys
+v=json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."):
+    v=v.get(k) if isinstance(v,dict) else None
+    if v is None: sys.exit(0)
+sys.stdout.write(json.dumps(v) if isinstance(v,(list,dict)) else ("true" if v is True else "false" if v is False else str(v)))' "$file" "$path" 2>/dev/null
+  fi
+}
+
+# The keys of a JSON object at a path, one per line.
+fleet_json_keys() {
+  if command -v plutil >/dev/null 2>&1 && plutil -extract "$2" json -o - "$1" >/dev/null 2>&1; then
+    plutil -extract "$2" json -o - "$1" 2>/dev/null | tr -d '{}' | tr ',' '\n' | sed -n 's/^ *"\([^"]*\)":.*/\1/p'
+  else
+    python3 -c 'import json,sys
+v=json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."): v=v.get(k,{}) if isinstance(v,dict) else {}
+print("\n".join(v.keys()) if isinstance(v,dict) else "")' "$1" "$2" 2>/dev/null
+  fi
+}
+
+# A space-separated list as a JSON array of strings (the values are validated patterns: no quote can occur).
+fleet_json_list() { local x out="" ; set -f; for x in $1; do out="${out:+$out,}\"$x\""; done; set +f; printf '[%s]' "$out"; }
+
+# A boolean managed preference: true/false, or nothing when unset or not a boolean.
+fleet_pref_bool() { case "$(managed_pref "$1" | tr 'A-Z' 'a-z')" in 1|true|yes) printf true ;; 0|false|no) printf false ;; esac; }
+
+# A list managed preference — a plist array (`defaults` prints "( a, b )") or a comma/space string — as one spaced line.
+fleet_pref_list() { managed_pref "$1" | tr -d '()"\n' | tr ',' ' ' | xargs 2>/dev/null || true; }
+
+# The owner's two answers from the managed preferences (deploy/macos/intune: AcceptJobs, AcceptJobsFrom,
+# AcceptJobsChannels, AcceptJobsRepos, AcceptTokens, AcceptTokensFrom, AcceptTokensModels, AcceptTokensResidency) — only
+# for a question the flags did not answer. An answer that is ON takes its scope from the same profile, else the offered default.
+fleet_participation_from_prefs() {
+  local b v
+  if [ "$ACC_JOBS_ANSWERED" = no ] && b="$(fleet_pref_bool AcceptJobs)" && [ -n "$b" ]; then
+    ACC_JOBS_ENABLED="$b"; ACC_JOBS_ANSWERED=yes
+    if [ "$b" = true ]; then
+      v="$(accept_norm "$(fleet_pref_list AcceptJobsFrom)" lower)"; ACC_JOBS_FROM="${v:-$ACCEPT_DEFAULT_JOBS_FROM}"; accept_check_patterns "$ACC_JOBS_FROM" "managed preference AcceptJobsFrom"
+      v="$(accept_norm "$(fleet_pref_list AcceptJobsChannels)" lower)"; [ -z "$v" ] || { accept_check_channels "$v" "managed preference AcceptJobsChannels"; ACC_JOBS_CHANNELS="$v"; }
+      v="$(accept_norm "$(fleet_pref_list AcceptJobsRepos)")"; [ -z "$v" ] || { accept_check_repos "$v" "managed preference AcceptJobsRepos"; ACC_JOBS_REPOS="$v"; }
+    fi
+  fi
+  if [ "$ACC_TOK_ANSWERED" = no ] && b="$(fleet_pref_bool AcceptTokens)" && [ -n "$b" ]; then
+    ACC_TOK_ENABLED="$b"; ACC_TOK_ANSWERED=yes
+    if [ "$b" = true ]; then
+      v="$(accept_norm "$(fleet_pref_list AcceptTokensFrom)" lower)"; ACC_TOK_FROM="${v:-$ACCEPT_DEFAULT_TOKENS_FROM}"; accept_check_patterns "$ACC_TOK_FROM" "managed preference AcceptTokensFrom"
+      v="$(accept_norm "$(fleet_pref_list AcceptTokensModels)")"; ACC_TOK_MODELS="${v:-$ACCEPT_DEFAULT_TOKEN_MODELS}"; accept_check_models "$ACC_TOK_MODELS" "managed preference AcceptTokensModels"
+      v="$(managed_pref AcceptTokensResidency)"; [ -z "$v" ] || { accept_check_residency "$v" "managed preference AcceptTokensResidency"; ACC_TOK_RES="$v"; }
+    fi
+  fi
+  return 0
+}
+
+# THE TWO QUESTIONS, asked up front and prominently — before any key or link exists. Answered by a flag, a managed
+# preference, or the person at the terminal; with nobody to ask an unanswered question FAILS the join (never read as no).
+fleet_participation() {
+  fleet_participation_from_prefs
+  if [ "$ACC_JOBS_ANSWERED" = no ] || [ "$ACC_TOK_ANSWERED" = no ]; then
+    accept_interactive || die "fleet join: the owner has not answered $( [ "$ACC_JOBS_ANSWERED" = no ] && printf 'whether this Mac takes BUILD JOBS' )$( [ "$ACC_JOBS_ANSWERED$ACC_TOK_ANSWERED" = nono ] && printf ' and ' )$( [ "$ACC_TOK_ANSWERED" = no ] && printf 'whether it GENERATES TOKENS' ) — give --accept-jobs <instances> | --no-accept-jobs and --accept-tokens <instances> | --no-accept-tokens, or the Intune profile's AcceptJobs / AcceptTokens. Nothing was sent."
+  fi
+  local v
+  if [ "$ACC_JOBS_ANSWERED" = no ]; then
+    printf '\n%s━━ QUESTION 1 of 2 — BUILD JOBS ━━%s\n' "$C_BLUE" "$C_RESET" >&2
+    printf 'Should this Mac take build jobs from the fleet (a build VM, runners, the release follower)?\nOff means none of it is installed and no build credential is issued.\n' >&2
+    ACC_JOBS_ENABLED="$(accept_yn "Take build jobs?" false)"; ACC_JOBS_ANSWERED=yes
+    if [ "$ACC_JOBS_ENABLED" = true ]; then
+      v="$(accept_norm "$(accept_read "  From which control instances?" "$ACCEPT_DEFAULT_JOBS_FROM")" lower)"; accept_check_patterns "$v" "jobs from"; ACC_JOBS_FROM="$v"
+    fi
+  fi
+  if [ "$ACC_TOK_ANSWERED" = no ]; then
+    printf '\n%s━━ QUESTION 2 of 2 — TOKEN GENERATION ━━%s\n' "$C_BLUE" "$C_RESET" >&2
+    printf 'Should this Mac serve its local models to other instances (the token queue)?\n' >&2
+    ACC_TOK_ENABLED="$(accept_yn "Generate tokens?" false)"; ACC_TOK_ANSWERED=yes
+    if [ "$ACC_TOK_ENABLED" = true ]; then
+      v="$(accept_norm "$(accept_read "  From which instances?" "$ACCEPT_DEFAULT_TOKENS_FROM")" lower)"; accept_check_patterns "$v" "tokens from"; ACC_TOK_FROM="$v"
+      v="$(accept_norm "$(accept_read "  Which models?" "${ACC_TOK_MODELS:-$ACCEPT_DEFAULT_TOKEN_MODELS}")")"; accept_check_models "$v" "token models"; ACC_TOK_MODELS="$v"
+      v="$(accept_read "  Where is this machine (residency, e.g. CH)?" "${ACC_TOK_RES}")"; accept_check_residency "$v" "residency"; ACC_TOK_RES="$v"
+    fi
+  fi
+  accept_validate
+  printf '\n' >&2
+  accept_summary
+}
+
+# The answers as ONE argv word per flag, into the global array FLEET_ACCEPT_ARGV — never through an unquoted
+# substitution: a pattern list ("control.example.test *.example.test") is one word, never split, never globbed.
+# $1 = first-attach: only the flags first-attach.sh takes (it has no --job-channels/--job-repos).
+FLEET_ACCEPT_ARGV=()
+fleet_accept_argv() {
+  FLEET_ACCEPT_ARGV=()
+  if [ "$ACC_JOBS_ENABLED" = true ]; then
+    FLEET_ACCEPT_ARGV+=("--accept-jobs=$ACC_JOBS_FROM")
+    if [ "${1:-}" != first-attach ]; then
+      [ -z "$ACC_JOBS_CHANNELS" ] || FLEET_ACCEPT_ARGV+=("--job-channels=$ACC_JOBS_CHANNELS")
+      [ -z "$ACC_JOBS_REPOS" ] || FLEET_ACCEPT_ARGV+=("--job-repos=$ACC_JOBS_REPOS")
+    fi
+  else FLEET_ACCEPT_ARGV+=(--no-accept-jobs); fi
+  if [ "$ACC_TOK_ENABLED" = true ]; then
+    FLEET_ACCEPT_ARGV+=("--accept-tokens=$ACC_TOK_FROM" "--token-models=$ACC_TOK_MODELS")
+    [ -z "$ACC_TOK_RES" ] || FLEET_ACCEPT_ARGV+=("--residency=$ACC_TOK_RES")
+  else FLEET_ACCEPT_ARGV+=(--no-accept-tokens); fi
+}
+
+# The v2 request (MachineEnrolment.Parse): the v1 facts, the owner and both answers, base64url.
+fleet_request_v2() {
+  local id="$1" host="$2" user="$3" machine="$4" spki="$5" owner_id="$6" owner_email="$7"
+  printf '{"v":2,"deployment":"%s","host":"%s","user":"%s","machine":"%s","key":"%s","owner":{"id":"%s","email":"%s"},"jobs":{"on":%s,"from":%s,"channels":%s,"repos":%s},"tokens":{"on":%s,"from":%s,"models":%s,"residency":"%s"}}' \
+    "$id" "$host" "$user" "$machine" "$spki" "$owner_id" "$owner_email" \
+    "$ACC_JOBS_ENABLED" "$(fleet_json_list "$ACC_JOBS_FROM")" "$(fleet_json_list "$ACC_JOBS_CHANNELS")" "$(fleet_json_list "$ACC_JOBS_REPOS")" \
+    "$ACC_TOK_ENABLED" "$(fleet_json_list "$ACC_TOK_FROM")" "$(fleet_json_list "$ACC_TOK_MODELS")" "$ACC_TOK_RES" | fleet_b64url
+}
+
+# The poll's key name: the full lower-hex SHA-256 of the public key's DER.
+fleet_key_sha256() { openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | shasum -a 256 | cut -c1-64; }
+
+# One signed poll (contract §3). Prints "<http status> <body>" on one line; never fails.
+fleet_poll_once() {
+  local control="$1" key="$2" fp="$3" ts sig
+  ts="$(date +%s)"
+  sig="$(printf 'mwenrol-poll\n%s\n%s' "$fp" "$ts" | openssl dgst -sha256 -sign "$key" 2>/dev/null | base64 | tr -d '\n')"
+  printf '{"fp":"%s","ts":%s,"sig":"%s"}' "$fp" "$ts" "$sig" \
+    | curl -sS -m 30 -X POST -H 'Content-Type: application/json' --data-binary @- -w ' %{http_code}' "$control$FLEET_POLL_ROUTE" 2>/dev/null \
+    | awk '{ code = $NF; $NF = ""; sub(/[ ]+$/, ""); print code " " $0 }' || printf '000 \n'
+}
+
+# A member of the poll's compact JSON answer (values hold no quote).
+fleet_poll_field() { printf '%s' "$2" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -1; }
+
+# Polls until the code is ready (writes it to $4, 0600, returns 0), refused (dies naming why) or the wait is over (returns 3).
+# A code that appears at --code-file meanwhile wins (the paste fallback of an unattended run).
+fleet_poll() {
+  local control="$1" key="$2" minutes="$3" out="$4" code_file="${5:-}" fp deadline line status body state last="" waiting why
+  fp="$(fleet_key_sha256 "$key")"
+  deadline=$(( $(date +%s) + minutes * 60 ))
+  info "waiting for the approval: polling $control$FLEET_POLL_ROUTE every ${FLEET_POLL_EVERY} s for up to $minutes min (signed with this join's key)"
+  while :; do
+    if [ -n "$code_file" ] && [ -s "$code_file" ]; then ( umask 077; tr -d ' \n\r' < "$code_file" > "$out" ); return 0; fi
+    line="$(fleet_poll_once "$control" "$key" "$fp")"; status="${line%% *}"; body="${line#* }"
+    state="$(fleet_poll_field state "$body")"
+    case "$status:$state" in
+      200:ready)
+        ( umask 077; fleet_poll_field code "$body" > "$out" )
+        [ -s "$out" ] || die "control answered ready without a code — approve the link again"
+        ok "the code is ready — collected from control"; return 0 ;;
+      200:refused)
+        why="$(fleet_poll_field why "$body")"
+        die "control REFUSED this join: ${why:-no reason given} — run 'memex-local fleet join' again for a fresh request" ;;
+      200:issuing)
+        waiting="$(printf '%s' "$body" | sed -n 's/.*"waiting":\[\([^]]*\)\].*/\1/p' | tr -d '"')"
+        [ "$last" = "issuing:$waiting" ] || info "approved — control is issuing the rest (waiting for: ${waiting:-?})"; last="issuing:$waiting" ;;
+      200:pending)
+        [ "$last" = pending ] || info "not approved yet — open the link above"; last=pending ;;
+      401:*) die "control refused the poll's signature: $(fleet_poll_field error "$body") — check this Mac's clock" ;;
+      400:*) die "control could not read the poll: $(fleet_poll_field error "$body")" ;;
+      404:*) [ "$last" = 404 ] || warn "control has no enrolment poll route yet ($control$FLEET_POLL_ROUTE answers 404) — the paste stays the way in"; last=404 ;;
+      *) [ "$last" = "net:$status" ] || warn "poll: control did not answer (HTTP ${status:-none}) — retrying"; last="net:$status" ;;
+    esac
+    [ "$(date +%s)" -lt "$deadline" ] || return 3
+    sleep "$FLEET_POLL_EVERY"
+  done
+}
+
+# Opens a v2 code into $3/<item> files (0600) and $3/facts.json. Fails closed naming why; prints fingerprints only.
+fleet_open_code2() {
+  local code="$1" key="$2" dir="$3" json item ct
+  mkdir -p "$dir"; chmod 700 "$dir"
+  json="$dir/code.json"
+  printf '%s' "${code#"$FLEET_CODE2_PREFIX"}" | tr -- '-_' '+/' | awk '{ n = length($0) % 4; if (n == 2) $0 = $0 "=="; else if (n == 3) $0 = $0 "="; print }' \
+    | base64 -d > "$json" 2>/dev/null || die "the enrolment code is not base64url — copy all of it"
+  [ "$(fleet_json "$json" v)" = 2 ] || die "the enrolment code is not a v2 code"
+  for item in $(fleet_json_keys "$json" s); do
+    case "$item" in [a-z]) ;; *) continue ;; esac
+    ct="$(mktemp "$dir/ct.XXXXXX")"
+    fleet_json "$json" "s.$item" | base64 -d > "$ct" 2>/dev/null || { rm -f "$ct"; die "item '$item' of the code is not base64"; }
+    ( umask 077
+      openssl pkeyutl -decrypt -inkey "$key" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+        -pkeyopt rsa_mgf1_md:sha256 -in "$ct" -out "$dir/$item" 2>/dev/null ) \
+      || { rm -f "$ct" "$dir/$item"; die "item '$item' does not open with this Mac's key — the code was issued for another join; approve THIS link again"; }
+    rm -f "$ct"
+    info "item $item opened ($(fleet_value_fingerprint "$(cat "$dir/$item")"))"
+  done
+}
+
+# A fact of an opened v2 code.
+fleet_fact_of() { fleet_json "$1/code.json" "f.$2"; }
+
+# The hand-off of the private-network key: by FILE, never an argument. As root (the bootstrap) it joins at once on the root
+# daemon's socket; otherwise it leaves the key and the login server where the bootstrap's network step takes them.
+fleet_apply_network() {
+  local id="$1" dir="$2" login; login="$(fleet_fact_of "$dir" loginServer)"
+  [ -s "$dir/t" ] || { info "network: no pre-auth key in the code"; return 0; }
+  [ -n "$login" ] || { warn "network: the code carries a pre-auth key but no login server — skipped"; return 0; }
+  local ts=(tailscale --socket="${MEMEX_TAILSCALED_SOCKET:-/var/run/tailscaled.socket}")
+  if [ "$(id -u)" = 0 ] && command -v tailscale >/dev/null 2>&1; then
+    ${ts[@]+"${ts[@]}"} up --login-server "$login" --hostname "$id" --auth-key="file:$dir/t" --reset >/dev/null \
+      && ok "network: joined $login as $id" || warn "network: 'tailscale up' failed — the bootstrap retries"
+  else
+    ( umask 077; cp "$dir/t" "$FLEET_DIR/$id.preauth"; printf '%s\n' "$login" > "$FLEET_DIR/$id.login-server" )
+    ok "network: pre-auth key handed to the device bootstrap ($FLEET_DIR/$id.preauth, 0600) — it joins on the root daemon's socket"
+  fi
+}
+
+# The sign-in app: `internal on` with the per-Mac client secret on stdin.
+fleet_apply_signin() {
+  local dir="$1" tenant cid
+  [ -s "$dir/e" ] || { info "sign-in: no client secret in the code"; return 0; }
+  tenant="$(fleet_fact_of "$dir" tenant)"; cid="$(fleet_fact_of "$dir" clientId)"
+  [ -n "$tenant" ] && [ -n "$cid" ] || { warn "sign-in: the code carries a secret but no tenant/clientId — skipped"; return 0; }
+  ( cmd_internal on --tenant "$tenant" --client-id "$cid" < "$dir/e" ) && ok "sign-in: this Mac's own app ($cid) configured" \
+    || warn "sign-in: 'internal on' failed — re-run it with the same values"
+}
+
+# The certificate: `cert config` with the DNS-01 secret on stdin, then `cert issue`.
+fleet_apply_cert() {
+  local id="$1" dir="$2" email="$3" domain cid tenant sub rg zone
+  [ -s "$dir/n" ] || { info "certificate: no DNS-01 secret in the code"; return 0; }
+  domain="$(fleet_fact_of "$dir" domain)"; cid="$(fleet_fact_of "$dir" dns01ClientId)"; tenant="$(fleet_fact_of "$dir" dns01Tenant)"
+  sub="$(fleet_fact_of "$dir" dns01Subscription)"; rg="$(fleet_fact_of "$dir" dns01ResourceGroup)"; zone="$(fleet_fact_of "$dir" dns01Zone)"
+  for v in domain cid tenant sub rg zone; do [ -n "${!v}" ] || { warn "certificate: the code lacks the fact for $v — skipped"; return 0; }; done
+  ( cmd_cert config --domain "$id.net.$domain" --email "$email" --client-id "$cid" --tenant "$tenant" --subscription "$sub" \
+      --resource-group "$rg" --zone "$zone" < "$dir/n" ) || { warn "certificate: 'cert config' failed"; return 0; }
+  ( cmd_cert issue ) && ok "certificate: issued for $id.net.$domain" || warn "certificate: 'cert issue' failed — re-run 'memex-local cert issue'"
+}
+
+# The fleet CA (item a) — ONE path, the onboarding contract's §6 drop: the opened key goes to enrol/fleet-ca.key (0600)
+# and `ca adopt --sha256 <caCertSha256>` reads it from there (refusing a key that is not the declared certificate's) and
+# deletes the drop. If the adopt cannot finish now, the drop stays and the device bootstrap adopts it on its next run by
+# the SAME command — never a second, different path.
+fleet_apply_ca() {
+  local dir="$1" sha="${2:-}" drop="$FLEET_DIR/fleet-ca.key"
+  [ -s "$dir/a" ] || { info "fleet CA: no key in the code"; return 0; }
+  [ -n "$sha" ] || sha="$(managed_pref FleetCaSha256)"
+  ( umask 077; cp "$dir/a" "$drop" ); chmod 600 "$drop"
+  if ! declare -F cmd_ca >/dev/null 2>&1; then
+    info "fleet CA: key left at $drop (0600) — this memex-local has no 'ca adopt'; the device bootstrap adopts it"; return 0
+  fi
+  [ -n "$sha" ] || { warn "fleet CA: the code names no caCertSha256 (nor the profile FleetCaSha256) — key left at $drop for the bootstrap"; return 0; }
+  ( cmd_ca adopt --sha256 "$sha" ) && ok "fleet CA adopted (sha256 ${sha:0:12}…)" \
+    || warn "fleet CA: 'ca adopt' did not finish — the key stays at $drop (0600) and the device bootstrap adopts it on its next run"
+}
+
+# The build host: first-attach with the sealed worker/pull/registry values from FILES (no vault, no az) — jobs opt-in only.
+fleet_apply_buildhost() {
+  local dir="$1" fa api reg puser preg secrets
+  [ "$ACC_JOBS_ENABLED" = true ] || { info "build host: jobs are OFF — nothing installed"; return 0; }
+  [ -s "$dir/w" ] && [ -s "$dir/p" ] || { warn "build host: jobs are on but the code carries no worker/pull token — skipped"; return 0; }
+  api="$(fleet_fact_of "$dir" buildApi)"; reg="$(fleet_fact_of "$dir" buildRegistry)"; puser="$(fleet_fact_of "$dir" pullUser)"; preg="$(fleet_fact_of "$dir" pluginsRegistry)"
+  [ -n "$api" ] && [ -n "$reg" ] && [ -n "$puser" ] || { warn "build host: the code lacks buildApi/buildRegistry/pullUser — skipped"; return 0; }
+  fa="${MEMEX_FIRST_ATTACH:-$(resolve_share)/backlease/first-attach.sh}"
+  [ -f "$fa" ] || { warn "build host: first-attach.sh is not installed ($fa) — skipped"; return 0; }
+  secrets="$dir/build"; mkdir -p "$secrets"; chmod 700 "$secrets"
+  # the registry key and the registry URL go TOGETHER (first-attach's pass-both-or-neither): a key without the URL is left
+  # out, so the attach degrades to the plain contract instead of failing
+  ( umask 077; cp "$dir/w" "$secrets/worker"; cp "$dir/p" "$secrets/pull"; if [ -s "$dir/k" ] && [ -n "$preg" ]; then cp "$dir/k" "$secrets/instance-key"; fi )
+  local args=(--api "$api" --registry "$reg" --pull-user "$puser" --secrets-from "$secrets" --set-from latest)
+  if [ -s "$dir/k" ] && [ -n "$preg" ]; then args+=(--plugins-registry "$preg"); fi
+  if [ -s "$dir/k" ] && [ -z "$preg" ]; then
+    warn "build host: the code carries a registry key but no pluginsRegistry fact — the key is left out and the host attaches with the plain plugins contract (declare Hosting:Enrolment:Facts:pluginsRegistry on control)"
+  fi
+  fleet_accept_argv first-attach
+  ( bash "$fa" ${args[@]+"${args[@]}"} ${FLEET_ACCEPT_ARGV[@]+"${FLEET_ACCEPT_ARGV[@]}"} ) && ok "build host attached (first-attach, values from the code)" \
+    || warn "build host: first-attach failed — re-run 'memex-local fleet join' or first-attach.sh by hand"
+}
+
 cmd_fleet() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
     join)
-      local control="" id="" open_link="yes" code_file="" do_update="yes" with_obs="yes" with_build="yes"
-      local accept_args=()
+      local control="" id="" open_link="yes" code_file="" do_update="yes" with_obs="yes" with_build="yes" wait_min=60
       while [ $# -gt 0 ]; do
         case "$1" in
           --control)   shift; control="${1:?--control needs the control instance URL}" ;;
           --id)        shift; id="${1:?--id needs the deployment id}" ;;
           --no-open)   open_link="no" ;;
-          --code-file) shift; code_file="${1:?--code-file needs a path}" ;;   # absent → print the link, exit 3 (unattended)
+          --code-file) shift; code_file="${1:?--code-file needs a path}" ;;   # the paste fallback, read once present
+          --wait) shift; wait_min="${1:?--wait needs minutes}"; case "$wait_min" in ''|*[!0-9]*) die "--wait: minutes, a whole number" ;; esac ;;
           --no-update) do_update="no" ;;
           --no-observability) with_obs="no" ;;
           --no-buildhost) with_build="no" ;;
@@ -1811,8 +2194,7 @@ cmd_fleet() {
           --owner-email) shift; OWNER_ARG_EMAIL="${1:?--owner-email needs the owner e-mail}" ;;
           *) accept_flag "$@"
              [ "$ACC_USED" != 0 ] || die "fleet join: unknown flag '$1'"
-             # the opt-in flags pass through to backlease enroll, which asks what they leave unanswered
-             accept_args+=("$1"); [ "$ACC_USED" = 2 ] && { accept_args+=("$2"); shift; } ;;
+             [ "$ACC_USED" = 2 ] && shift ;;
         esac
         shift
       done
@@ -1826,7 +2208,14 @@ cmd_fleet() {
       case "$control" in https://*) ;; *) die "fleet join: --control must be the control instance's https URL (got '${control:-<none>}')" ;; esac
       printf '%s' "$id" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$' \
         || die "fleet join: --id must be lower-case letters, digits and dashes (at most 63), starting and ending with a letter or digit — it becomes Deployments/<id> on control"
-      need openssl openssl; need shasum shasum
+      need openssl openssl; need shasum shasum; need curl curl
+
+      # THE TWO QUESTIONS — build jobs and token generation — up front, before any key or link exists (enrolment v2).
+      step "The owner's two answers: build jobs and token generation"
+      install_residency_valid; [ -n "$ACC_TOK_RES" ] || ACC_TOK_RES="$(install_residency)"
+      fleet_participation
+      local owner_id owner_email
+      owner_id="$(overlay_value "$OWNER_ID_KEY")"; owner_email="$(overlay_value "$OWNER_EMAIL_KEY")"
 
       step "Preflight (MacStudioFleet §2b step 1)"
       local user host machine t missing=""
@@ -1843,41 +2232,66 @@ cmd_fleet() {
       local spki fp url
       spki="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | base64 | tr -d '\n')"
       fp="$(fleet_key_fingerprint "$key")"
-      url="$control/Hosting/Heartbeats/Enrol/$(fleet_request "$id" "$host" "$(fleet_fact "$user")" "$machine" "$spki")"
+      url="$control/Hosting/Heartbeats/Enrol/$(fleet_request_v2 "$id" "$host" "$(fleet_fact "$user")" "$machine" "$spki" "$owner_id" "$owner_email")"
       ok "key fingerprint: $fp"
       info "Open this link, sign in as a global administrator of the control instance, CHECK that the page"
-      info "shows the fingerprint above, and press 'Approve and issue the keys':"
+      info "shows the fingerprint above and the owner's two answers, and press 'Approve and issue the keys'."
+      info "This Mac then collects everything by itself — nothing to paste:"
       printf '\n%s\n\n' "$url"
       [ "$open_link" = "yes" ] && command -v open >/dev/null 2>&1 && open "$url" >/dev/null 2>&1 || true
 
-      local code=""
+      local code="" got="$FLEET_DIR/$id.code.collected" rc=0
       printf '%s\n' "$url" > "$FLEET_DIR/$id.link"
-      if [ -n "$code_file" ] && [ ! -f "$code_file" ]; then
-        # unattended (a device-management run): nothing to paste into — say what is awaited and come back
-        info "WAITING for the approval on control and the enrolment code at $code_file (the link is also in $FLEET_DIR/$id.link)"
-        exit 3
-      fi
-      if [ -n "$code_file" ]; then
+      rm -f "$got"
+      if [ -n "$code_file" ] && [ -s "$code_file" ]; then
         code="$(tr -d ' \n\r' < "$code_file")"
       else
-        printf 'Paste the enrolment code the page shows, then press Enter:\n> '
-        IFS= read -r code
-        code="$(printf '%s' "$code" | tr -d ' \r')"
+        fleet_poll "$control" "$key" "$wait_min" "$got" "$code_file" || rc=$?
+        if [ "$rc" = 0 ]; then
+          code="$(cat "$got")"; rm -f "$got"
+        elif [ -z "$code_file" ] && [ -t 0 ]; then
+          printf 'Not collected within %s min. Paste the enrolment code the page shows, then press Enter (or Ctrl-C and re-run later):\n> ' "$wait_min"
+          IFS= read -r code
+          code="$(printf '%s' "$code" | tr -d ' \r')"
+        else
+          # unattended (a device-management run): the next run resumes with the same key and request
+          info "WAITING for the approval on control (the link is in $FLEET_DIR/$id.link); the next run polls again"
+          exit 3
+        fi
       fi
-      local payload="$FLEET_DIR/$id.payload.json"
-      fleet_open_code "$code" "$key" "$payload"
-      local d m c
-      d="$(fleet_payload d "$payload")"; m="$(fleet_payload m "$payload")"; c="$(fleet_payload c "$payload")"
-      rm -f "$payload"
-      [ "$d" = "$id" ] || die "the code was issued for '$d', not '$id' — approve the link this run printed"
-      [ -n "$m" ] && [ -n "$c" ] || die "the code opened but carries no keys — approve the link again"
+      local items="$FLEET_DIR/$id.items" m c
+      case "$code" in
+        "$FLEET_CODE2_PREFIX"*)
+          trap 'tools_deactivate; rm -rf "'"$items"'"' EXIT
+          fleet_open_code2 "$code" "$key" "$items"
+          [ "$(fleet_json "$items/code.json" d)" = "$id" ] || die "the code was issued for '$(fleet_json "$items/code.json" d)', not '$id' — approve the link this run printed"
+          [ -s "$items/m" ] && [ -s "$items/c" ] || die "the code opened but carries no heartbeat/announcement key — approve the link again"
+          m="$(cat "$items/m")"; c="$(cat "$items/c")" ;;
+        *)
+          local payload="$FLEET_DIR/$id.payload.json" d
+          fleet_open_code "$code" "$key" "$payload"
+          d="$(fleet_payload d "$payload")"; m="$(fleet_payload m "$payload")"; c="$(fleet_payload c "$payload")"
+          rm -f "$payload"
+          [ "$d" = "$id" ] || die "the code was issued for '$d', not '$id' — approve the link this run printed"
+          [ -n "$m" ] && [ -n "$c" ] || die "the code opened but carries no keys — approve the link again" ;;
+      esac
       write_fleet_file "$control" "$id" "$m" "$c"
-      rm -f "$key"
       ok "joined as '$id' — heartbeat key $(fleet_value_fingerprint "$m"), announcement key $(fleet_value_fingerprint "$c") (the control instance's enrolment record shows the same fingerprints)"
+      unset m c
+
+      if [ -d "$items" ]; then
+        step "The items control issued (each opened from the code, handed over by file or stdin, never printed)"
+        fleet_apply_network "$id" "$items"
+        fleet_apply_signin "$items"
+        fleet_apply_cert "$id" "$items" "$owner_email"
+        fleet_apply_ca "$items" "$(fleet_fact_of "$items" caCertSha256)"
+      fi
+      rm -f "$key"
 
       step "Back-lease, local models and the image (steps 5)"
       if registry_mode; then
-        cmd_backlease enroll --control "$control" --deployment "$id" ${accept_args[@]+"${accept_args[@]}"}
+        fleet_accept_argv
+        cmd_backlease enroll --control "$control" --deployment "$id" ${FLEET_ACCEPT_ARGV[@]+"${FLEET_ACCEPT_ARGV[@]}"}
       else
         warn "not in REGISTRY MODE — run 'memex-local registry <url>' and then 'memex-local backlease enroll --control $control --deployment $id'"
       fi
@@ -1892,9 +2306,12 @@ cmd_fleet() {
           # A subshell: a die inside (preflight, helm) fails THIS step, loudly, and the join carries on.
           ( cmd_observability ) || warn "observability did not install — re-run 'memex-local observability'"
         fi
-        if [ "$with_build" = "yes" ]; then
+        if participation_build_host "$with_build"; then
           step "Build runners (a build VM sized from this host, KEDA; the release on its first attach)"
           ( cmd_buildhost apply ) || warn "the build host did not finish — re-run 'memex-local buildhost apply'"
+          [ -d "$items" ] && fleet_apply_buildhost "$items"
+        elif [ "$with_build" = "yes" ]; then
+          info "No build host: the owner has not said YES to fleet jobs ($(participation_said Jobs)) — no build VM, runners or priority agent"
         fi
       else
         info "Apply it: memex-local update"
@@ -1915,7 +2332,7 @@ cmd_fleet() {
         info "not joined — memex-local fleet join --control https://<control-instance> --id <id>"
       fi
       ;;
-    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] [--accept-jobs=<patterns> | --no-accept-jobs] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--residency <X>] | status}" ;;
+    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--wait <min>] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] [--accept-jobs=<patterns> | --no-accept-jobs] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--residency <X>] | status}" ;;
   esac
 }
 
@@ -3096,7 +3513,20 @@ install_ingress_nginx() {
 # ---------------------------------------------------------------------------
 setup_tls() {
   step "Minting locally-trusted TLS with mkcert (§5)"
-  mkcert -install
+  # `mkcert -install` changes trust settings, which macOS allows only with a person at the UI. It is not run
+  # when the CA mkcert signs with is ALREADY trusted (the fleet local CA, deployed as a trusted-root profile and
+  # adopted with `memex-local ca adopt` — or a CA a person trusted once). MEMEX_CA_TRUST=defer (the fleet
+  # bootstrap, while the fleet CA's key has not arrived yet) creates the CA without touching any keychain.
+  local caroot; caroot="$(mkcert -CAROOT 2>/dev/null || true)"
+  if [ -n "$caroot" ] && [ -f "$caroot/rootCA.pem" ] && ca_cert_trusted "$caroot/rootCA.pem"; then
+    info "local CA already trusted ($caroot/rootCA.pem) — no trust change needed"
+  elif [ "${MEMEX_CA_TRUST:-}" = defer ]; then
+    TRUST_STORES=nss mkcert -install >/dev/null 2>&1 || true
+    [ -n "$caroot" ] && [ -f "$caroot/rootCA.pem" ] || die "mkcert could not create its CA in '${caroot:-<no CAROOT>}'"
+    warn "the local CA is NOT trusted yet (MEMEX_CA_TRUST=defer) — browsers warn until it is; the browser is not opened before"
+  else
+    mkcert -install
+  fi
   mkdir -p "$LOCAL_HOME"
   if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
     mkcert -cert-file "$CERT_FILE" -key-file "$KEY_FILE" \
@@ -3109,6 +3539,171 @@ setup_tls() {
     --cert="$CERT_FILE" --key="$KEY_FILE" \
     --dry-run=client -o yaml | kubectl apply -f -
   ok "TLS secret '$TLS_SECRET' applied in namespace '$NAMESPACE'"
+}
+
+# Whether a CA certificate (PEM file) is trusted for SSL by this Mac's trust settings. Without `security`
+# (not macOS): no.
+ca_cert_trusted() { command -v security >/dev/null 2>&1 && security verify-cert -c "$1" -p ssl >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# ca — the FLEET LOCAL CA (MeshWeaver.Plugins Hosting/MacStudioOnboarding; enrolment item `a`)
+# ---------------------------------------------------------------------------
+# `mkcert -install` needs a PERSON: macOS refuses a trust-settings change without its UI, even as root (the
+# second Mac Studio, 2026-11-09). So a fleet Mac does not trust a CA of its own. It trusts ONE fleet-wide CA,
+# whose certificate the device-management layer deploys as a trusted-root profile and whose private key
+# reaches the Mac sealed in the enrolment code. That CA is NAME-CONSTRAINED to localhost (and every name below
+# it), 127.0.0.1 and ::1: its key can sign certificates for a Mac's own loopback names and for nothing a
+# browser would accept anywhere else. `ca adopt` installs the pair as the CAROOT mkcert signs with and
+# re-issues the portal's certificate under it. It never prints the key, and it refuses a key that does not
+# belong to the declared certificate and a certificate that is not such a CA.
+#   memex-local ca adopt [--key-file <file> | --key-stdin] [--cert <pem>] [--sha256 <hex>]
+#   memex-local ca status
+# The key: base64 of the PKCS#8 DER (the enrolment item's form) or PEM, from a file only its owner can read
+# (default: the join's drop, $FLEET_CA_KEY_DROP — deleted once adopted) or stdin. The declared fingerprint:
+# --sha256, else the managed preference FleetCaSha256. The certificate: --cert, else the System keychain's
+# certificate with that fingerprint (where the profile put it).
+readonly FLEET_CA_KEY_DROP="$LOCAL_HOME/enrol/fleet-ca.key"
+readonly SYSTEM_KEYCHAIN="${MEMEX_SYSTEM_KEYCHAIN:-/Library/Keychains/System.keychain}"
+
+# The SHA-256 of a certificate's DER, lower-case hex.
+cert_sha256() { openssl x509 -in "$1" -outform DER 2>/dev/null | shasum -a 256 | cut -d' ' -f1; }
+# A fingerprint as given (colons, upper case, a sha256: prefix) → 64 lower-case hex, or nothing.
+norm_sha256() {
+  local v; v="$(printf '%s' "${1#sha256:}" | tr -d ': ' | tr 'A-F' 'a-f')"
+  printf '%s' "$v" | grep -Eq '^[0-9a-f]{64}$' && printf '%s' "$v"
+}
+# The PEM of the certificate whose SHA-256 is $1, from `security find-certificate -a -Z -p` on stdin.
+pem_for_sha256() {
+  awk -v want="$(printf '%s' "$1" | tr 'a-f' 'A-F')" '
+    /^SHA-256 hash: / { cur = $3; next }
+    /-----BEGIN CERTIFICATE-----/ { on = (cur == want) }
+    on { print }
+    /-----END CERTIFICATE-----/ { if (on) exit }'
+}
+# Refuses (dies) unless the certificate is a CA whose Name Constraints are critical and permit ONLY the
+# loopback names: DNS localhost (and .localhost), IP 127.0.0.1/32, IP ::1/128 — with DNS localhost present.
+fleet_ca_check_constraints() {
+  local text nc entry addr
+  text="$(openssl x509 -in "$1" -noout -text 2>/dev/null)" || die "ca: '$1' is not a certificate"
+  printf '%s\n' "$text" | grep -A1 'Basic Constraints' | grep -q 'CA:TRUE' || die "ca: the certificate is not a CA (Basic Constraints CA:TRUE missing)"
+  printf '%s\n' "$text" | grep -q 'X509v3 Name Constraints: critical' \
+    || die "ca: the certificate carries no CRITICAL Name Constraints — a fleet CA is constrained to localhost, *.localhost, 127.0.0.1 and ::1"
+  # the Permitted block: from "Permitted:" to the next heading (Excluded:, or the next extension)
+  nc="$(printf '%s\n' "$text" | awk '/X509v3 Name Constraints/ { on = 1; next }
+      on && /Permitted:/ { p = 1; next }
+      on && p && /^ *(DNS|IP|email|URI|DirName|othername|IP Address):/ { gsub(/^ +| +$/, ""); print; next }
+      on && p { exit }')"
+  [ -n "$nc" ] || die "ca: the Name Constraints permit nothing — not the fleet CA's shape"
+  printf '%s\n' "$nc" | grep -qx 'DNS:localhost' || die "ca: the Name Constraints do not permit DNS:localhost"
+  while IFS= read -r entry; do
+    case "$entry" in
+      DNS:localhost|DNS:.localhost) ;;
+      IP:127.0.0.1/255.255.255.255) ;;
+      IP:*) addr="$(printf '%s' "${entry#IP:}" | tr 'A-F' 'a-f')"
+            case "$addr" in
+              ::1/ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff|0:0:0:0:0:0:0:1/ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff) ;;
+              *) die "ca: the Name Constraints permit '$entry' — a fleet CA permits only localhost, *.localhost, 127.0.0.1 and ::1" ;;
+            esac ;;
+      *) die "ca: the Name Constraints permit '$entry' — a fleet CA permits only localhost, *.localhost, 127.0.0.1 and ::1" ;;
+    esac
+  done <<<"$nc"
+}
+
+cmd_ca() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    adopt)
+      local key_file="" key_stdin="no" cert="" sha=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --key-file) shift; key_file="${1:?--key-file needs a path}" ;;
+          --key-stdin) key_stdin="yes" ;;
+          --cert) shift; cert="${1:?--cert needs a PEM file}" ;;
+          --sha256) shift; sha="${1:?--sha256 needs the CA certificate fingerprint}" ;;
+          *) die "ca adopt: unknown flag '$1'" ;;
+        esac
+        shift
+      done
+      require_tool openssl openssl; require_tool mkcert mkcert
+      [ -n "$sha" ] || sha="$(managed_pref FleetCaSha256)"
+      sha="$(norm_sha256 "$sha")" || true
+      [ -n "$sha" ] || die "ca adopt: no declared fleet CA fingerprint — --sha256 <64 hex>, or the managed preference FleetCaSha256"
+      local work; work="$(mktemp -d)"; chmod 700 "$work"
+      # shellcheck disable=SC2064  # expand now: the directory is this call's
+      trap "rm -rf '$work'; tools_deactivate" EXIT
+      # 1. the certificate: as given, else the System keychain's with the declared fingerprint (the profile's)
+      if [ -z "$cert" ]; then
+        command -v security >/dev/null 2>&1 || die "ca adopt: --cert <pem> is required where there is no macOS keychain"
+        security find-certificate -a -Z -p "$SYSTEM_KEYCHAIN" 2>/dev/null | pem_for_sha256 "$sha" > "$work/ca.pem"
+        [ -s "$work/ca.pem" ] || die "ca adopt: no certificate with sha256 $sha in $SYSTEM_KEYCHAIN — the fleet local CA profile has not reached this Mac (or pass --cert)"
+        cert="$work/ca.pem"
+      fi
+      [ -f "$cert" ] || die "ca adopt: no certificate at '$cert'"
+      [ "$(cert_sha256 "$cert")" = "$sha" ] || die "ca adopt: the certificate's sha256 is $(cert_sha256 "$cert" | cut -c1-12)…, not the declared ${sha:0:12}… — refusing"
+      fleet_ca_check_constraints "$cert"
+      # 2. the key — never echoed, never an argument; written only into this call's 0700 directory
+      if [ "$key_stdin" = yes ]; then
+        ( umask 077; cat > "$work/key.in" )
+      else
+        [ -n "$key_file" ] || key_file="$FLEET_CA_KEY_DROP"
+        [ -f "$key_file" ] && [ ! -L "$key_file" ] || die "ca adopt: no key file at '$key_file' (the join drops the enrolment's item 'a' there)"
+        case "$(ls -l "$key_file" | cut -c5-10)" in ------) ;; *) die "ca adopt: '$key_file' is readable by others — refusing a key that is not 0600 (chmod 600 it, or deliver it again)" ;; esac
+        ( umask 077; cat "$key_file" > "$work/key.in" )
+      fi
+      if grep -q -- '-----BEGIN' "$work/key.in"; then
+        ( umask 077; openssl pkey -in "$work/key.in" -out "$work/key.pem" 2>/dev/null ) || die "ca adopt: the key is not a readable private key"
+      else
+        ( umask 077; tr -d ' \r\n' < "$work/key.in" | openssl base64 -d -A > "$work/key.der" 2>/dev/null \
+            && openssl pkey -inform DER -in "$work/key.der" -out "$work/key.pem" 2>/dev/null ) \
+          || die "ca adopt: the key is neither PEM nor base64 PKCS#8 DER"
+      fi
+      openssl pkey -in "$work/key.pem" -noout -text 2>/dev/null | grep -Eq 'prime256v1|P-256' \
+        || die "ca adopt: the key is not an EC P-256 key (the fleet CA's shape)"
+      [ "$(openssl pkey -in "$work/key.pem" -pubout -outform DER 2>/dev/null | shasum -a 256 | cut -d' ' -f1)" \
+        = "$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | shasum -a 256 | cut -d' ' -f1)" ] \
+        || die "ca adopt: the key does not belong to the certificate (sha256 ${sha:0:12}…) — refusing"
+      # 3. install as mkcert's CAROOT; a different CA already there is MOVED aside, never deleted
+      local caroot; caroot="$(mkcert -CAROOT 2>/dev/null || true)"
+      [ -n "$caroot" ] || die "ca adopt: mkcert names no CAROOT"
+      mkdir -p "$caroot"
+      if [ -f "$caroot/rootCA.pem" ] && [ "$(cert_sha256 "$caroot/rootCA.pem")" != "$sha" ]; then
+        local aside; aside="$caroot/replaced-$(date -u +%Y%m%dT%H%M%SZ)"
+        mkdir -p "$aside" && chmod 700 "$aside"
+        mv "$caroot/rootCA.pem" "$aside/" && { [ ! -f "$caroot/rootCA-key.pem" ] || mv "$caroot/rootCA-key.pem" "$aside/"; } \
+          || die "ca adopt: could not move the previous CA aside"
+        info "the previous local CA was moved aside: $aside"
+      fi
+      cp "$cert" "$caroot/rootCA.pem.new" && chmod 644 "$caroot/rootCA.pem.new" && mv -f "$caroot/rootCA.pem.new" "$caroot/rootCA.pem" \
+        || die "ca adopt: could not write $caroot/rootCA.pem"
+      ( umask 077; cp "$work/key.pem" "$caroot/rootCA-key.pem.new" ) && chmod 400 "$caroot/rootCA-key.pem.new" \
+        && mv -f "$caroot/rootCA-key.pem.new" "$caroot/rootCA-key.pem" || die "ca adopt: could not write the CA key"
+      ok "fleet local CA adopted as mkcert's CA ($caroot) — certificate sha256:${sha:0:12}, key $(secret_fingerprint "$(cat "$work/key.pem")")"
+      [ "$key_stdin" = yes ] || [ "$key_file" != "$FLEET_CA_KEY_DROP" ] || rm -f "$FLEET_CA_KEY_DROP"
+      # 4. the portal's certificate, re-issued under it (and the TLS secret, when the stack runs)
+      mkdir -p "$LOCAL_HOME"
+      mkcert -cert-file "$CERT_FILE" -key-file "$KEY_FILE" "$HOSTNAME_LOCAL" "*.$HOSTNAME_LOCAL" >/dev/null 2>&1 \
+        || die "ca adopt: mkcert could not issue the portal's certificate under the fleet CA"
+      ok "the portal's certificate ($HOSTNAME_LOCAL, *.$HOSTNAME_LOCAL) re-issued under the fleet CA: $CERT_FILE"
+      if command -v kubectl >/dev/null 2>&1 && colima_running && kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
+        kubectl create secret tls "$TLS_SECRET" -n "$NAMESPACE" --cert="$CERT_FILE" --key="$KEY_FILE" --dry-run=client -o yaml \
+          | kubectl apply -f - >/dev/null || die "ca adopt: could not apply the TLS secret '$TLS_SECRET'"
+        ok "TLS secret '$TLS_SECRET' updated — the ingress serves the new certificate"
+      fi
+      if ca_cert_trusted "$caroot/rootCA.pem"; then ok "this Mac trusts the fleet CA (its profile)"
+      else warn "this Mac does NOT trust the fleet CA yet — its trusted-root profile has not arrived; browsers warn until it does"; fi
+      ;;
+    status)
+      [ $# -eq 0 ] || die "ca status: unknown flag '$1'"
+      require_tool mkcert mkcert
+      local caroot2 decl; caroot2="$(mkcert -CAROOT 2>/dev/null || true)"; decl="$(norm_sha256 "$(managed_pref FleetCaSha256)")" || true
+      if [ ! -f "$caroot2/rootCA.pem" ]; then info "no local CA yet ($caroot2) — 'memex-local up' creates one"; return 0; fi
+      local have; have="$(cert_sha256 "$caroot2/rootCA.pem")"
+      info "local CA: $caroot2/rootCA.pem (sha256:${have:0:12})"
+      if [ -n "$decl" ] && [ "$have" = "$decl" ]; then ok "it is the fleet local CA (FleetCaSha256)"; elif [ -n "$decl" ]; then warn "it is NOT the fleet local CA (FleetCaSha256 sha256:${decl:0:12}) — memex-local ca adopt"; fi
+      if ca_cert_trusted "$caroot2/rootCA.pem"; then ok "trusted by this Mac"; else warn "NOT trusted by this Mac — the browser is not opened until it is"; fi
+      ;;
+    *) die "usage: memex-local ca {adopt [--key-file <file> | --key-stdin] [--cert <pem>] [--sha256 <hex>] | status}" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -3463,7 +4058,9 @@ setup_ollama() {
   # EXTRA models (MEMEX_OLLAMA_EXTRA_MODELS) — what the machine CAN offer the fleet's token queue. Pulled,
   # never offered: serving them is the owner's opt-in (`memex-local backlease accept tokens`).
   local extra
-  if [ "$OLLAMA_EXTRA_MODELS" != "none" ]; then
+  if [ "$OLLAMA_EXTRA_MODELS" != "none" ] && [ -n "$OLLAMA_EXTRA_MODELS" ] && [ "$(participation_answer Tokens)" = false ]; then
+    info "token requests: the owner said NO — the extra models ($OLLAMA_EXTRA_MODELS) are not pulled; only the portal's own chat model"
+  elif [ "$OLLAMA_EXTRA_MODELS" != "none" ]; then
     for extra in $OLLAMA_EXTRA_MODELS; do
       ollama_has_model "$extra" && continue
       ollama pull "$extra" || warn "could not pull '$extra' — re-run 'memex-local up --skip-image' (or 'ollama pull $extra')"
@@ -4984,6 +5581,7 @@ cmd_down() {
 }
 
 cmd_status() {
+  require_tool colima colima; require_tool kubectl kubernetes-cli
   step "Colima"
   colima status 2>&1 || true
   if colima_running; then
@@ -5051,6 +5649,7 @@ hand_into_setup() {
 # answer: is this portal usable? Exits non-zero when it is not, so it composes in a script —
 # 1 means broken (with remedies), 2 means still installing (see verify_usable's header).
 cmd_verify() {
+  require_tool colima colima; require_tool kubectl kubernetes-cli
   colima_running || die "Colima is not running — run 'memex-local up' first"
   verify_usable "$@"
 }
@@ -5063,24 +5662,123 @@ cmd_verify() {
 # they — can configure it. That is the whole access control on a surface that
 # collects a connection string, provider API keys and the list of platform admins,
 # so this command reads the token back out of the pod rather than inventing one.
+# ---------------------------------------------------------------------------
+# setup --apply — answer the first-run setup through its API: no browser, no person at the wizard
+# ---------------------------------------------------------------------------
+# The portal's POST /setup/api (MeshWeaver.Plugins src/Memex.Portal.Shared/Setup/README.md) takes the SAME
+# answers the wizard collects and runs them through the SAME code as the form. The one-time setup token
+# goes in the X-Setup-Token header: read here from the pod, never printed and never on a command line
+# (curl reads the header from a 0600 file). Defaults are what this install already knows: the owner
+# recorded in the overlay, the database the wizard pre-selects (storage omitted), and the Ollama embeddings
+# this install wires. Consent to the privacy statement and terms is EXPLICIT (--accept-terms, or
+# "consent": true in --answers); without it nothing is sent.
+setup_apply() {
+  local answers="$1" name="$2" company="$3" owner_name="$4" owner_email="$5" registry="$6" accept="$7"
+  need kubectl kubernetes-cli
+  command -v python3 >/dev/null 2>&1 || die "setup --apply: python3 is required (the Xcode command line tools carry it: xcode-select --install)"
+  awaiting_setup || { ok "This instance is not awaiting setup — nothing to apply."; return 0; }
+  local logs token
+  logs="$(kubectl logs deploy/memex-portal-deployment -n "$NAMESPACE" --tail=-1 2>&1)" \
+    || die "setup --apply: could not read the portal log with kubectl — $(printf '%s' "$logs" | tail -1)"
+  token="$(printf '%s\n' "$logs" | awk '/^ *Token: /{ t=$2 } END { print t }')"
+  [ -n "$token" ] || die "setup --apply: the portal is awaiting setup but its log carries no token (restart it to mint one: kubectl rollout restart deploy/memex-portal-deployment -n $NAMESPACE)"
+  [ -n "$owner_email" ] || owner_email="$(overlay_value Instance__Owner__Email)"
+  [ -n "$name" ] || name="$(scutil --get LocalHostName 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  [ -n "$owner_name" ] || owner_name="$(id -F 2>/dev/null || true)"
+  local dir body hdr out code said caroot ca=()
+  dir="$(mktemp -d)"; chmod 700 "$dir"; body="$dir/body.json"; hdr="$dir/headers"; out="$dir/out.json"
+  ( umask 077; printf 'X-Setup-Token: %s\n' "$token" > "$hdr" ); unset token logs
+  if ! SETUP_ANSWERS="$answers" SETUP_NAME="$name" SETUP_COMPANY="$company" SETUP_OWNER_NAME="$owner_name" \
+       SETUP_OWNER_EMAIL="$owner_email" SETUP_REGISTRY="${registry:-$(registry_url)}" SETUP_ACCEPT="$accept" \
+       SETUP_EMBED_ENDPOINT="$OLLAMA_ENDPOINT" SETUP_EMBED_MODEL="$EMBED_MODEL" \
+       python3 -I -c "$SETUP_ANSWERS_PY" "$body"; then
+    rm -rf "$dir"; die "setup --apply: the answers are incomplete (named above) — nothing was sent"
+  fi
+  caroot="$(mkcert -CAROOT 2>/dev/null || true)"
+  [ -n "$caroot" ] && [ -f "$caroot/rootCA.pem" ] && ca=(--cacert "$caroot/rootCA.pem")
+  step "Applying the first-run setup through the setup API (no wizard)"
+  code="$(curl ${ca[@]+"${ca[@]}"} -sS -o "$out" -w '%{http_code}' --max-time 300 -X POST \
+    -H @"$hdr" -H 'Content-Type: application/json' --data-binary @"$body" \
+    "https://${HOSTNAME_LOCAL}:${HOST_PORT}/setup/api" 2>/dev/null)" || true
+  said="$(python3 -I -c "$SETUP_SAID_PY" "$out" 2>/dev/null || true)"
+  rm -rf "$dir"
+  case "$code" in
+    200) ok "setup applied (${said:-completed}) — the portal restarts configured; check with: memex-local verify" ;;
+    400) die "setup --apply: the portal refused the answers — ${said:-no details}" ;;
+    403) die "setup --apply: the setup token was refused (the portal restarted since it was read?) — run it again" ;;
+    404|405) die "setup --apply: this portal has no setup API yet (it predates MeshWeaver.Plugins' POST /setup/api) — update the image, or answer the wizard: memex-local setup" ;;
+    409) ok "This instance is already configured — nothing to apply." ;;
+    *) die "setup --apply: unexpected answer HTTP ${code:-none}${said:+ — $said}" ;;
+  esac
+}
+
+# The answers document setup --apply sends (python3 -I, argv[1] = the output file). Kept as data so the
+# bash above never interpolates an answer into code.
+SETUP_ANSWERS_PY='
+import json, os, sys
+a = json.load(open(os.environ["SETUP_ANSWERS"])) if os.environ.get("SETUP_ANSWERS") else {}
+idn = a.setdefault("identity", {})
+for key, env in (("name", "SETUP_NAME"), ("company", "SETUP_COMPANY"), ("ownerName", "SETUP_OWNER_NAME"),
+                 ("ownerEmail", "SETUP_OWNER_EMAIL"), ("registry", "SETUP_REGISTRY")):
+    if os.environ.get(env): idn[key] = os.environ[env]
+if os.environ.get("SETUP_ACCEPT") == "yes": idn["consent"] = True
+a.setdefault("embedding", {"endpoint": os.environ["SETUP_EMBED_ENDPOINT"], "model": os.environ["SETUP_EMBED_MODEL"]})
+missing = [f"identity.{k}" for k in ("name", "company", "ownerName", "ownerEmail") if not str(idn.get(k, "")).strip()]
+if idn.get("consent") is not True: missing.append("identity.consent (--accept-terms)")
+if missing:
+    print("err  setup --apply: missing " + ", ".join(missing), file=sys.stderr); sys.exit(1)
+json.dump(a, open(sys.argv[1], "w"))
+'
+# What the setup API answered, as one line (problems by field, or the state/instance id). Never a secret:
+# the API echoes none.
+SETUP_SAID_PY='
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+probs = d.get("problems") or []
+print("; ".join("%s: %s" % (p.get("field"), p.get("message")) for p in probs) or d.get("state") or d.get("instanceId") or "")
+'
+
 cmd_setup() {
-  local open_browser="yes"
+  local open_browser="yes" apply="no" answers="" name="" company="" owner_name="" owner_email="" registry="" accept="no"
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-open) open_browser="no" ;;
       --auto) open_browser="auto" ;;   # hand_into_setup: open only if the login agent has not already
+      --apply) apply="yes" ;;
+      --answers) shift; answers="${1:?--answers needs a JSON file}" ;;
+      --name) shift; name="${1:?--name needs a value}" ;;
+      --company) shift; company="${1:?--company needs a value}" ;;
+      --owner-name) shift; owner_name="${1:?--owner-name needs a value}" ;;
+      --owner-email) shift; owner_email="${1:?--owner-email needs a value}" ;;
+      --registry) shift; registry="${1:?--registry needs a URL}" ;;
+      --accept-terms) accept="yes" ;;
       *) die "setup: unknown flag '$1'" ;;
     esac
     shift
   done
+  if [ "$apply" = "yes" ]; then
+    setup_apply "$answers" "$name" "$company" "$owner_name" "$owner_email" "$registry" "$accept"
+    return
+  fi
 
+  # The token is READ through kubectl: without it there is no token to print, and saying nothing would read
+  # as "already set up" (the second Mac Studio, 2026-11-09). Named and failed instead.
+  require_tool kubectl kubernetes-cli; require_tool curl curl
   local url token
   url="https://${HOSTNAME_LOCAL}:${HOST_PORT}/setup"
 
   # The banner is printed once per PROCESS, so a portal that has been restarted since
   # setup began has a NEW token and the old one is dead — read it fresh every time.
-  token="$(kubectl logs deploy/memex-portal-deployment -n "$NAMESPACE" --tail=-1 2>/dev/null \
-           | awk '/^ *Token: /{ t=$2 } END { print t }')"
+  # 🚨 A kubectl that is missing or cannot reach the cluster is NOT "no token": it used to read as an
+  # empty token and send the person off to restart a healthy portal. Name the tool and the error.
+  need kubectl kubernetes-cli
+  local logs
+  logs="$(kubectl logs deploy/memex-portal-deployment -n "$NAMESPACE" --tail=-1 2>&1)" \
+    || die "setup: could not read the portal log with kubectl — $(printf '%s' "$logs" | tail -1)"
+  token="$(printf '%s\n' "$logs" | awk '/^ *Token: /{ t=$2 } END { print t }')"
 
   if [ -z "$token" ]; then
     # 🚨 "No token in the log" and "this instance is configured" are DIFFERENT facts, and the first
@@ -5128,10 +5826,13 @@ cmd_setup() {
   info "SQLite needs nothing else running either — it lands at"
   info "  Data Source=/data/memex.db   (on the same PVC that survives 'memex-local update')."
   info "Pasting a connection string is only for a Postgres server of your own; this chart's is:"
+  # 🚨 The password is NEVER printed (the second Mac Studio, 2026-11-09: it was, in clear, into a terminal
+  # and its scrollback). The pre-selected option needs none; whoever does need it reads it from the overlay.
   local pg_pw
   pg_pw="$(awk '/memex_postgres_password:/ { gsub(/"/, "", $2); print $2; exit }' "$OVERLAY" 2>/dev/null)"
+  echo "  Host=memex-postgres-service;Port=5432;Database=memex;Username=postgres;Password=<memex_postgres_password in $OVERLAY>"
   if [ -n "$pg_pw" ]; then
-    echo "  Host=memex-postgres-service;Port=5432;Database=memex;Username=postgres;Password=${pg_pw}"
+    info "  (its fingerprint: $(secret_fingerprint "$pg_pw") — the value is never printed)"
   else
     warn "  (could not read the generated Postgres password from $OVERLAY)"
   fi
@@ -5150,13 +5851,15 @@ cmd_setup() {
     return 0
   fi
   if [ "$open_browser" != "no" ] && command -v open >/dev/null 2>&1; then
-    if open "${url}?token=${token}" >/dev/null 2>&1; then
+    # only once the certificate the portal serves is trusted — never into a certificate error
+    if open_when_trusted "${url}?token=${token}" "the URL above"; then
       mkdir -p "$LOCAL_HOME" && : > "$marker"
     fi
   fi
 }
 
 cmd_logs() {
+  require_tool kubectl kubernetes-cli
   local target="deploy/memex-portal-deployment" follow="-f" tail="200"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -5469,6 +6172,8 @@ colima_keep_context() {
 
 cmd_buildhost() {
   local sub="${1:-status}"; shift || true
+  [ "$sub" = apply ] && [ "$(participation_answer Jobs)" = false ] \
+    && die "buildhost apply: the owner said NO to fleet jobs on this Mac ($BACKLEASE_FILE) — no build host is installed. To opt in: memex-local backlease accept jobs --from <instances>"
   buildhost_tools
   local plan others probe
   others="$(other_vms_gib)"
@@ -5597,7 +6302,9 @@ vm_netshape_apply() {
 shift_net_cmd() {
   local profile="$1"; shift
   [ "${1:-}" = net ] && shift
-  local sub="${1:-status}"; shift || true
+  # A bare flag (`net --profile build`) is the default subcommand, as in vm-netshape.sh — never the subcommand itself.
+  local sub=status
+  case "${1:-}" in ''|--*) ;; *) sub="$1"; shift ;; esac
   while [ $# -gt 0 ]; do case "$1" in --profile) profile="${2:?--profile needs a Colima profile}"; shift ;; *) die "net: unknown flag '$1'" ;; esac; shift; done
   local flag
   case "$sub" in apply) flag=--apply ;; measure) flag=--measure ;; off) flag=--remove ;; status) flag=--status ;;
@@ -5744,8 +6451,16 @@ COMMANDS:
                   printed, only their sha256 fingerprints), runs backlease enroll, starts Ollama
                   under launchd on the Mac's loopback, updates from the public GHCR and installs
                   the observability stack sized for the VM (--no-observability skips it) and
-                  the build VM sized from this host (buildhost apply; --no-buildhost skips it).
+                  the build VM sized from this host (buildhost apply) — only when the owner said
+                  YES to fleet jobs (--accept-jobs=…); --no-buildhost skips it regardless.
                   'status' shows the fingerprints.
+  ca adopt [--key-file <file> | --key-stdin] [--cert <pem>] [--sha256 <hex>] | status
+                  The FLEET LOCAL CA: a fleet-wide CA name-constrained to localhost, *.localhost,
+                  127.0.0.1 and ::1, trusted through a device-management profile (so no person has
+                  to run 'mkcert -install'). adopt checks the key belongs to the declared certificate
+                  (--sha256 or the managed preference FleetCaSha256) and that the certificate carries
+                  those constraints, installs both as mkcert's CA and re-issues the portal's
+                  certificate under it. The key is never printed (fingerprints only).
   buildhost plan | apply [--resize] | status | priority [install|off|status]
                   BUILD RUNNERS sized from this host: a build VM (Colima profile build, containerd)
                   of cores − 2 CPU and host − portal VM − largest model − headroom GiB; runners of
@@ -5879,7 +6594,7 @@ COMMANDS:
                   and \`update\` arm it on every Homebrew install; \`off\` is remembered.
   setup [--no-open]
                   Print the FIRST-RUN WIZARD's URL (the one-time token already in it)
-                  and open it; \`up\` and \`update\` do this for you when the portal is
+                  and open it once its certificate is trusted; \`up\` and \`update\` do this for you when the portal is
                   waiting to be set up. The wizard's Registration key is optional —
                   empty registers on the free plan. A portal with no database serves
                   that wizard and nothing else;
@@ -6403,6 +7118,7 @@ main() {
     observability) cmd_observability "$@" ;;
     doctor)        cmd_doctor "$@" ;;
     owner)         cmd_owner "$@" ;;
+    ca)            cmd_ca "$@" ;;
     profile)       cmd_profile "$@" ;;
     channel)       cmd_channel "$@" ;;
     version|--version|-v) cmd_version ;;

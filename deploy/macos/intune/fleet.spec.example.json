@@ -1,0 +1,199 @@
+{
+  "_comment": "EXAMPLE — the shape of the fleet's Intune spec, with neutral placeholders. This repository is public: the installation's real spec (ids, hosts, serial numbers, owner) lives in the estate's PRIVATE configuration repository and is checked there by the reusable workflow intune-drift-check.yml. Field reference: deploy/macos/intune/README.md.",
+  "schema": 1,
+  "tenant": "00000000-0000-0000-0000-000000000000",
+  "appIdentity": {
+    "displayName": "MeshWeaver Fleet — Intune",
+    "clientId": "00000000-0000-0000-0000-000000000001",
+    "requiredRoles": [
+      "DeviceManagementConfiguration.ReadWrite.All",
+      "DeviceManagementScripts.ReadWrite.All",
+      "DeviceManagementManagedDevices.Read.All",
+      "Group.Read.All",
+      "Device.Read.All",
+      "GroupMember.ReadWrite.All"
+    ]
+  },
+  "groups": {
+    "studios": {
+      "id": "00000000-0000-4000-8000-0000000000a1",
+      "displayName": "Fleet — Mac Studios",
+      "devices": [
+        {
+          "serial": "<serial-1>",
+          "name": "studio-1"
+        },
+        {
+          "serial": "<serial-2>",
+          "name": "studio-2"
+        }
+      ]
+    },
+    "noBootstrap": {
+      "id": "00000000-0000-4000-8000-0000000000a2",
+      "displayName": "Fleet — Mac Studios, no bootstrap",
+      "devices": [
+        {
+          "serial": "<serial-1>",
+          "name": "studio-1"
+        }
+      ]
+    }
+  },
+  "scripts": [
+    {
+      "key": "bootstrap",
+      "id": "00000000-0000-4000-8000-0000000000b1",
+      "displayName": "Fleet — bootstrap (Mac Studios)",
+      "description": "MeshWeaver.Deploy deploy/macos/intune/fleet-bootstrap.sh v1.4.0 pinned at 07df3a7b364263e837707b93059c16ce649a59e2. Runs as root, hourly, idempotent; log /Library/Logs/MeshWeaver/fleet-bootstrap.log.",
+      "fileName": "fleet-bootstrap.sh",
+      "runAsAccount": "system",
+      "executionFrequency": "PT1H",
+      "retryCount": 3,
+      "blockExecutionNotifications": true,
+      "source": {
+        "repo": "Systemorph/MeshWeaver.Deploy",
+        "path": "deploy/macos/intune/fleet-bootstrap.sh",
+        "commit": "07df3a7b364263e837707b93059c16ce649a59e2",
+        "sha256": "06242902f7f9a2b593d7814485dbc7968ae31c32a68faeeb7fd02ab9bbc2f6fd"
+      },
+      "assign": {
+        "include": [
+          "studios"
+        ],
+        "exclude": [
+          "noBootstrap"
+        ]
+      }
+    }
+  ],
+  "customProfiles": [
+    {
+      "key": "memexLocal",
+      "id": "00000000-0000-4000-8000-0000000000c1",
+      "displayName": "Fleet — Memex Local (Mac Studios)",
+      "description": "com.memex.local fleet keys for the Mac Studios: ControlUrl, RegistryUrl, LoginServer, OwnerId, OwnerEmail; for the unattended first-run setup Organisation, OwnerName, AcceptTerms; FleetCaSha256 once the fleet CA is declared (memex-local ca adopt reads it); the participation answers AcceptJobs* / AcceptTokens* (lists as one comma-separated string). DeploymentId deliberately omitted (the bootstrap uses the Mac's LocalHostName).",
+      "payloadName": "Memex Local — fleet Mac Studio",
+      "payloadFileName": "fleet-studio.mobileconfig",
+      "deploymentChannel": "deviceChannel",
+      "plist": {
+        "payloadType": "com.memex.local",
+        "identifier": "com.example.intune.macos.memex-local-fleet-studio",
+        "uuid": "00000000-0000-4000-8000-0000000000f1",
+        "innerIdentifier": "com.example.intune.macos.memex-local-fleet-studio.settings",
+        "innerUuid": "00000000-0000-4000-8000-0000000000f2",
+        "displayName": "Memex Local — fleet Mac Studio",
+        "organization": "Example"
+      },
+      "keys": {
+        "ControlUrl": "https://control.example.com",
+        "RegistryUrl": "https://registry.example.com",
+        "LoginServer": "https://headscale.example.com",
+        "OwnerId": "jroe",
+        "OwnerEmail": "jane.roe@example.com",
+        "OwnerName": "Jane Roe",
+        "Organisation": "Example",
+        "AcceptTerms": true,
+        "AcceptJobs": true,
+        "AcceptJobsFrom": [
+          "control.example.com"
+        ],
+        "AcceptJobsChannels": [
+          "mac"
+        ],
+        "AcceptTokens": true,
+        "AcceptTokensFrom": [
+          "*.example.com"
+        ],
+        "AcceptTokensModels": [
+          "qwen3.8:27b-mlx",
+          "qwen3.6"
+        ],
+        "AcceptTokensResidency": "CH"
+      },
+      "assign": {
+        "include": [
+          "studios"
+        ],
+        "exclude": [
+          "noBootstrap"
+        ]
+      }
+    }
+  ],
+  "trustedRootCertificates": [
+    {
+      "key": "fleetCa",
+      "displayName": "Fleet — local CA (Mac Studios)",
+      "description": "The fleet's local CA (public certificate) trusted on every bootstrap-onboarded Studio; its private key reaches each Mac only sealed in the enrolment code (item a).",
+      "certFile": "fleet-local-ca.pem",
+      "sha256": "",
+      "assign": {
+        "include": [
+          "studios"
+        ],
+        "exclude": [
+          "noBootstrap"
+        ]
+      }
+    }
+  ],
+  "settingsPolicies": [
+    {
+      "key": "studioUpdates",
+      "id": "00000000-0000-4000-8000-0000000000d1",
+      "name": "Fleet — macOS updates (Mac Studios, night window)",
+      "settings": {
+        "softwareupdate_notifications": "softwareupdate_notifications_true",
+        "softwareupdate_automaticactions_download": "softwareupdate_automaticactions_download_1",
+        "softwareupdate_automaticactions_installosupdates": "softwareupdate_automaticactions_installosupdates_1",
+        "softwareupdate_automaticactions_installsecurityupdate": "softwareupdate_automaticactions_installsecurityupdate_1",
+        "softwareupdate_rapidsecurityresponse_enable": "softwareupdate_rapidsecurityresponse_enable_true",
+        "softwareupdate_rapidsecurityresponse_enablerollback": "softwareupdate_rapidsecurityresponse_enablerollback_false",
+        "enforcement_targetosversion": "27.2",
+        "enforcement_targetlocaldatetime": "2026-11-15T03:00:00"
+      },
+      "assign": {
+        "include": [
+          "studios"
+        ]
+      }
+    }
+  ],
+  "compliancePolicies": [
+    {
+      "key": "macosBasic",
+      "id": "00000000-0000-4000-8000-0000000000e1",
+      "displayName": "<the tenant's macOS compliance policy>",
+      "hold": "the owner's go: the tenant-wide macOS compliance policy changes for every Mac",
+      "assign": {
+        "include": [
+          "allDevices"
+        ],
+        "exclude": [
+          "studios"
+        ],
+        "remove": [
+          "allLicensedUsers"
+        ]
+      }
+    },
+    {
+      "key": "studioCompliance",
+      "displayName": "Fleet — macOS compliance (Mac Studios)",
+      "description": "The Studios' compliance without a password rule: a Studio runs unattended over SSH, and a tenant password rule can expire the console password at enrolment.",
+      "hold": "the owner's go, together with the exclusion from Macos Basic Policies",
+      "properties": {
+        "@odata.type": "#microsoft.graph.macOSCompliancePolicy",
+        "passwordRequired": false,
+        "storageRequireEncryption": true,
+        "gatekeeperAllowedAppSource": "macAppStoreAndIdentifiedDevelopers"
+      },
+      "assign": {
+        "include": [
+          "studios"
+        ]
+      }
+    }
+  ]
+}

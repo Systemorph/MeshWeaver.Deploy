@@ -12,6 +12,13 @@
 #     [--accept-jobs <patterns> | --no-accept-jobs] [--accept-tokens <patterns> | --no-accept-tokens]
 #     [--token-models <m>] [--residency <X>] [--owner <user-id> --owner-email <e-mail>]
 #
+#   FROM AN ENROLMENT (no vault, no az): `memex-local fleet join` opens the worker token, the pull password and the
+#   read-only registry key from its enrolment code into 0600 files and calls
+#     first-attach.sh --api … --registry … --pull-user … --secrets-from <dir> --set-from <channel> [--plugins-registry …]
+#   <dir> holds `worker`, `pull` and optionally `instance-key` (each 0600, owned by the caller); --set-from reads the
+#   version and the three digests from control's complete-set route (GET <api>/channels/<channel>/set, the same read
+#   follow-set.py makes), so no set is passed by hand.
+#
 # THE OWNER comes first: the Mac's owner (recorded by `memex-local owner`, the instance's global administrator) is the
 # person whose answers the opt-in records. Given with --owner/--owner-email it is written through memex-local; a Mac
 # with no owner recorded is REFUSED before anything changes.
@@ -51,7 +58,7 @@
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 chart="$here/../helm"
-profile=build api= registry= vault= worker= pull= pulluser= version= tester= portal= runner= pluginsreg= instkey=
+profile=build api= registry= vault= worker= pull= pulluser= version= tester= portal= runner= pluginsreg= instkey= secrets_from= set_from=
 acc_jobs='' acc_tokens='' acc_models='' acc_res=''   # empty = not answered by a flag; "off" = declined
 owner_id='' owner_email='' follow=latest
 while [ $# -gt 0 ]; do
@@ -68,10 +75,33 @@ while [ $# -gt 0 ]; do
     --plugins-registry) pluginsreg="$2";; --instance-key-secret) instkey="$2";;
     --version) version="$2";; --tester) tester="$2";; --portal) portal="$2";; --runner) runner="$2";;
     --follow) follow="${2:?--follow needs a channel, or off}";;
+    --secrets-from) secrets_from="${2:?--secrets-from needs a directory}";; --set-from) set_from="${2:?--set-from needs a channel}";;
     *) echo "unknown argument $1" >&2; exit 2;;
   esac; shift 2
 done
-for v in api registry vault worker pull pulluser version tester portal runner; do
+if [ -n "$secrets_from" ]; then
+  # the values come from 0600 files an enrolment opened — the vault flags are not used, and mixing the two is refused
+  [ -z "$vault$worker$pull$instkey" ] || { echo "ERROR: --secrets-from replaces --vault/--worker-secret/--pull-secret/--instance-key-secret — give one or the other" >&2; exit 2; }
+  for f in worker pull; do
+    [ -f "$secrets_from/$f" ] && [ ! -L "$secrets_from/$f" ] || { echo "ERROR: --secrets-from: $secrets_from/$f is missing" >&2; exit 2; }
+    [ "$(stat -f%Lp "$secrets_from/$f" 2>/dev/null || stat -c%a "$secrets_from/$f")" = 600 ] || { echo "ERROR: --secrets-from: $secrets_from/$f must be mode 0600" >&2; exit 2; }
+  done
+fi
+if [ -n "$set_from" ]; then
+  [[ "$set_from" =~ ^[a-z][a-z0-9-]{0,62}$ ]] || { echo "ERROR: --set-from must be a channel name" >&2; exit 2; }
+  [ -z "$version$tester$portal$runner" ] || { echo "ERROR: --set-from replaces --version/--tester/--portal/--runner — give one or the other" >&2; exit 2; }
+  [[ "$api" == https://* ]] || { echo "ERROR: --api must be https (the worker token rides on it)" >&2; exit 2; }
+  set_json="$(curl -fsS -m 30 "${api%/}/channels/$set_from/set")" || { echo "ERROR: could not read ${api%/}/channels/$set_from/set. Nothing was changed." >&2; exit 1; }
+  read -r version tester portal runner < <(python3 -c 'import json,sys
+d=json.loads(sys.argv[1]); keys=("platformVersion","testerDigest","portalDigest","runnerDigest")
+missing=[k for k in keys if not str(d.get(k) or "").strip()]
+if missing: sys.exit("the set names no " + ", ".join(missing))
+print(*(d[k] for k in keys))' "$set_json") \
+    || { echo "ERROR: ${api%/}/channels/$set_from/set is not a complete set. Nothing was changed." >&2; exit 1; }
+fi
+required=(api registry pulluser version tester portal runner)
+[ -n "$secrets_from" ] || required+=(vault worker pull)
+for v in "${required[@]}"; do
   [ -n "${!v}" ] || { echo "ERROR: --${v//_/-} is required (see the header)" >&2; exit 2; }
 done
 [[ "$api" == https://* ]] || { echo "ERROR: --api must be https (the worker token rides on it)" >&2; exit 2; }
@@ -79,8 +109,9 @@ done
 # the host takes its plugins layer exactly as the cluster hosts do — the sealed publication /hosts/inputs names, or none.
 # Measured 2026-11-07: the registry serves a mixed package (AI) as an assemblies-only bundle, which module-fetch refuses,
 # so an H8 host never claimed.
+if [ -n "$secrets_from" ] && [ -f "$secrets_from/instance-key" ]; then instkey="(file)"; fi
 if [ -n "$pluginsreg$instkey" ]; then
-  { [ -n "$pluginsreg" ] && [ -n "$instkey" ]; } || { echo "ERROR: --plugins-registry and --instance-key-secret go together" >&2; exit 2; }
+  { [ -n "$pluginsreg" ] && [ -n "$instkey" ]; } || { echo "ERROR: --plugins-registry and --instance-key-secret (or <secrets-from>/instance-key) go together" >&2; exit 2; }
   [[ "$pluginsreg" == https://* ]] || { echo "ERROR: --plugins-registry must be https (the instance key rides on it)" >&2; exit 2; }
 fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: --version must be x.y.z" >&2; exit 2; }
@@ -177,12 +208,21 @@ alloc="$(k get nodes -o jsonpath='{.items[0].status.allocatable.cpu} {.items[0].
 k get pods -A -o json | python3 "$here/host-fits-node.py" "$alloc" "$here/build-host-mac.values.yaml" --pods-json - \
   || { echo "Nothing was changed." >&2; exit 1; }
 # The vault reads happen BEFORE any apply, so a failed read never replaces a working Secret with an empty one.
+key_value=
+if [ -n "$secrets_from" ]; then
+  worker_value="$(cat "$secrets_from/worker")"; pull_value="$(cat "$secrets_from/pull")"
+  [ -n "$worker_value" ] && [ -n "$pull_value" ] || { echo "ERROR: --secrets-from: the worker or pull file is empty. Nothing was changed." >&2; exit 1; }
+  if [ -f "$secrets_from/instance-key" ]; then
+    key_value="$(cat "$secrets_from/instance-key")"
+    [[ "$key_value" == mwi_* ]] || { echo "ERROR: --secrets-from: instance-key is not a mwi_ instance key. Nothing was changed." >&2; exit 1; }
+  fi
+else
 worker_value="$(az keyvault secret show --vault-name "$vault" --name "$worker" --query value -o tsv)" \
   && [ -n "$worker_value" ] || { echo "ERROR: could not read the worker token $worker from $vault. Nothing was changed." >&2; exit 1; }
 pull_value="$(az keyvault secret show --vault-name "$vault" --name "$pull" --query value -o tsv)" \
   && [ -n "$pull_value" ] || { echo "ERROR: could not read the pull token $pull from $vault. Nothing was changed." >&2; exit 1; }
-key_value=
-if [ -n "$instkey" ]; then
+fi
+if [ -n "$instkey" ] && [ -z "$secrets_from" ]; then
   key_value="$(az keyvault secret show --vault-name "$vault" --name "$instkey" --query value -o tsv)" \
     && [[ "$key_value" == mwi_* ]] || { echo "ERROR: could not read a mwi_ instance key from $instkey in $vault. Nothing was changed." >&2; exit 1; }
 fi
@@ -264,7 +304,9 @@ k -n build-mac get deploy,scaledobject,pvc
 
 echo "== 5/6 fleet jobs at the lowest priority (launchd governor for profile $profile)"
 # The runners are deployed by now: a governor that cannot load is reported, never a failed attach.
-bash "$here/../homebrew/share/buildhost-priority.sh" --install --profile "$profile" \
+# from a checkout: deploy/homebrew/share; from the brew install (libexec/share/backlease): the share beside it
+prio="$here/../homebrew/share/buildhost-priority.sh"; [ -f "$prio" ] || prio="$here/../buildhost-priority.sh"
+bash "$prio" --install --profile "$profile" \
   || echo "WARN: the priority governor did not load — the build VM competes at the default band; re-run: bash deploy/homebrew/share/buildhost-priority.sh --install --profile $profile" >&2
 # The network too (maintainer, 2026-11-08): the build VM's internet traffic is capped at a share of the measured link
 # and marked DSCP CS1, so an artefact upload never fills the owner's uplink (mw-netshape.service in the VM).

@@ -239,6 +239,8 @@ spec:
             # The shared tree (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3): the warm main tree once per repository on the
             # shared cache volume, not once per replica.
             - { name: MW_BUILD_SHARED_TREE, value: {{ ternary "true" "false" $b.sharedTree | quote }} }
+            # The run overlay (Hosting/BuildQueue.md §7.3b): a run's tree is the shared generation (read-only) + its own upper.
+            - { name: MW_BUILD_RUN_OVERLAY, value: {{ ternary "true" "false" $b.runOverlay | quote }} }
             {{- if eq $c.kind "channel" }}
             - { name: MW_BUILD_CHANNEL, value: {{ $c.name | quote }} }
             {{- else }}
@@ -333,6 +335,10 @@ spec:
           {{- if eq $b.cache.medium "node" }}
           # Node-local (cache.medium: node): a host in its own user namespace cannot mount an SMB/NFS claim.
           emptyDir: {{- if $b.cache.size }} { sizeLimit: {{ $b.cache.size | quote }} }{{- else }} {}{{- end }}
+          {{- else if eq $b.cache.medium "host" }}
+          # Node-local and SHARED (cache.medium: host): every host on the node, across restarts and scale-in. `Directory`,
+          # never DirectoryOrCreate — node setup prepares it owned by the host's uid; a missing one keeps the pod failing.
+          hostPath: { path: {{ $b.cache.path | quote }}, type: Directory }
           {{- else }}
           persistentVolumeClaim: { claimName: {{ $b.cacheClaim | quote }} }
           {{- end }}

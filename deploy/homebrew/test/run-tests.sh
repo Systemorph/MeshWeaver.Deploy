@@ -65,6 +65,17 @@ for a in "$@"; do
   prev="$a"
 done
 if [ -n "${FAKE_CURL_FAILS:-}" ]; then printf '000'; exit 7; fi
+# The enrolment poll (fleet join, enrolment v2): the signed body is kept, and the next scripted answer
+# ("<status> <json>" per line of $FAKE_POLL_DIR/answers; the last one repeats) is written with ' <status>'.
+case "$url" in
+  */api/enrol/poll)
+    if [ -n "${FAKE_POLL_DIR:-}" ]; then
+      n=$(( $(find "$FAKE_POLL_DIR" -name 'body.*' | wc -l) + 1 ))
+      cat > "$FAKE_POLL_DIR/body.$n"
+      line="$(sed -n "${n}p" "$FAKE_POLL_DIR/answers")"; [ -n "$line" ] || line="$(tail -1 "$FAKE_POLL_DIR/answers")"
+      printf '%s %s' "${line#* }" "${line%% *}"; exit 0
+    fi ;;
+esac
 case "$fmt" in
   *redirect_url*)
     # Only an instance awaiting setup redirects the ROOT to the wizard.
@@ -1651,10 +1662,10 @@ M="$(printf 'a%.0s' $(seq 64))"; C="$(printf 'b%.0s' $(seq 64))"
 # (payload built first: bash 3.2 splits escaped quotes nested inside "$(…)")
 P2='{"v":1,"d":"studio-2","m":"'"$M"'","c":"'"$C"'"}'; P9='{"v":1,"d":"studio-9","m":"'"$M"'","c":"'"$C"'"}'
 sealed="$(seal "$P2" "$KEY")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/code.txt"
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/code.txt" --owner owner1 --owner-email owner1@example.com 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/code.txt" --owner owner1 --owner-email owner1@example.com 2>&1)"; RC=$?
 grep -qx '    Auth__GlobalAdmins__0: "owner1"' "$FJ/home/.memex-local/values.local.yaml" && ok "fleet join --owner/--owner-email (executed) records the owner in the overlay" || bad "fleet join --owner flag" "$(grep -n Owner "$FJ/home/.memex-local/values.local.yaml")"
 case "$RC:$OUT" in 0:*"joined as 'studio-2'"*) ok "fleet join opens a code sealed to its key and joins" ;; *) bad "fleet join with a good code" "rc=$RC: $OUT" ;; esac
-OUT2="$(env PATH="$STUBS:$PATH" HOME="$FJ/home2" MEMEX_LOCAL_HOME="$FJ/home2/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --code-file "$FJ/code.txt" 2>&1 </dev/null)"; RC2=$?
+OUT2="$(env PATH="$STUBS:$PATH" HOME="$FJ/home2" MEMEX_LOCAL_HOME="$FJ/home2/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/code.txt" 2>&1 </dev/null)"; RC2=$?
 case "$RC2:$OUT2" in 0:*) bad "an unattended fleet join without an owner joined" "$OUT2" ;; *"no OWNER"*) ok "an unattended fleet join without an owner FAILS before anything is joined" ;; *) bad "ownerless join" "rc=$RC2 $OUT2" ;; esac
 case "$OUT" in *"$M"*|*"$C"*) bad "fleet join never prints a key value" "a value is in the output" ;; *) ok "fleet join prints no key value (fingerprints only)" ;; esac
 case "$OUT" in *"Hosting/Heartbeats/Enrol/"*) ok "fleet join prints the control instance's approval link" ;; *) bad "approval link" "$OUT" ;; esac
@@ -1670,10 +1681,10 @@ fmode="$(ls -l "$F" 2>/dev/null | cut -c1-10)"
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$KEY" 2>/dev/null ); OTHER="$FJ/other.pem"
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$OTHER" 2>/dev/null )
 sealed="$(seal "$P2" "$OTHER")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/wrong.txt"
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/wrong.txt" 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/wrong.txt" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "a code for another key is refused" "exited 0" ;; *"does not open with this Mac's key"*) ok "a code sealed to another key is refused by name" ;; *) bad "wrong-key refusal" "$OUT" ;; esac
 sealed="$(seal "$P9" "$KEY")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/other-id.txt"
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/other-id.txt" 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/other-id.txt" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "a code for another id is refused" "exited 0" ;; *"issued for 'studio-9'"*) ok "a code issued for another id is refused by name" ;; *) bad "other-id refusal" "$OUT" ;; esac
 OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id Bad_Id --no-open 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "a bad id is refused" "exited 0" ;; *"--id must be lower-case"*) ok "an id that cannot be a record id is refused" ;; *) bad "bad id refusal" "$OUT" ;; esac
@@ -1682,11 +1693,72 @@ case "$OUT" in *"JOINED as 'studio-2'"*"sha256:"*) ok "fleet status shows the jo
 case "$OUT" in *"$M"*|*"$C"*) bad "fleet status never prints a key value" "a value is in the output" ;; *) ok "fleet status prints no key value" ;; esac
 # Unattended (a device-management run): no code yet → the link is printed and kept, exit 3, nothing joined.
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$FJ/home/.memex-local/enrol/studio-3.key.pem" 2>/dev/null )
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --code-file "$FJ/none.code" 2>&1)"; RC=$?
-case "$RC:$OUT" in 3:*"WAITING for the approval on control and the enrolment code at $FJ/none.code"*) ok "unattended: no code yet → says what it waits for, exit 3" ;; *) bad "unattended join waits" "rc=$RC: $OUT" ;; esac
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --no-accept-jobs --no-accept-tokens --wait 0 --code-file "$FJ/none.code" 2>&1)"; RC=$?
+case "$RC:$OUT" in 3:*"WAITING for the approval on control"*) ok "unattended: no code yet → polls within its wait, says what it waits for, exit 3" ;; *) bad "unattended join waits" "rc=$RC: $OUT" ;; esac
 grep -q '/Hosting/Heartbeats/Enrol/' "$FJ/home/.memex-local/enrol/studio-3.link" 2>/dev/null && ok "unattended: the approval link is kept in enrol/<id>.link" || bad "link kept" "$(cat "$FJ/home/.memex-local/enrol/studio-3.link" 2>/dev/null)"
 [ -f "$FJ/home/.memex-local/enrol/studio-3.key.pem" ] && ok "unattended: the throw-away key is kept for the run that brings the code" || bad "key kept while waiting" "gone"
 grep -q 'mode_args+=(-f "$FLEET_FILE")' "$CLI" && ok "helm_deploy layers the fleet file" || bad "helm_deploy layers the fleet file" "no -f \$FLEET_FILE"
+
+echo "── fleet join v2: both answers up front, the signed poll, the itemised code (enrolment v2) ──"
+# The v2 request: owner and both answers, base64url of the JSON MachineEnrolment.Parse reads.
+req="$(fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="control.example.test"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=false; ACC_TOK_RES=CH; fleet_request_v2 studio-5 host-a jroe C02X AAAA jroe jane.roe@example.com')"
+dec="$(printf '%s' "$req" | tr '_-' '/+' | awk '{ n = length($0) % 4; if (n) $0 = $0 substr("===", 1, 4 - n); print }' | base64 -d 2>/dev/null)"
+[ "$dec" = '{"v":2,"deployment":"studio-5","host":"host-a","user":"jroe","machine":"C02X","key":"AAAA","owner":{"id":"jroe","email":"jane.roe@example.com"},"jobs":{"on":true,"from":["control.example.test"],"channels":["mac"],"repos":[]},"tokens":{"on":false,"from":[],"models":[],"residency":"CH"}}' ] \
+  && ok "fleet_request_v2 carries the owner and both explicit answers" || bad "fleet_request_v2" "$dec"
+# Managed preferences answer the two questions (an Intune profile): a plist array or a comma string.
+PREFS="$(fj_lib 'managed_pref() { case "$1" in AcceptJobs) echo 1 ;; AcceptJobsFrom) printf "(\n    \"control.example.test\",\n    \"*.example.test\"\n)" ;; AcceptTokens) echo false ;; esac; }; fleet_participation_from_prefs; echo "$ACC_JOBS_ANSWERED $ACC_JOBS_ENABLED [$ACC_JOBS_FROM] $ACC_TOK_ANSWERED $ACC_TOK_ENABLED"')"
+[ "$PREFS" = 'yes true [control.example.test *.example.test] yes false' ] && ok "the Intune profile's AcceptJobs/AcceptJobsFrom/AcceptTokens answer both questions" || bad "participation from managed prefs" "$PREFS"
+# Unattended with no answer: FAILS before any key or link exists — an unanswered question is never read as no.
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home4" MEMEX_LOCAL_HOME="$FJ/home4/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-4 --no-open --no-update --wait 0 2>&1 </dev/null)"; RC=$?
+case "$RC:$OUT" in 0:*|3:*) bad "an unanswered join is refused" "rc=$RC $OUT" ;; *"has not answered whether this Mac takes BUILD JOBS and whether it GENERATES TOKENS"*) ok "unattended with no answers: the join FAILS naming both questions" ;; *) bad "unanswered join" "rc=$RC $OUT" ;; esac
+[ ! -e "$FJ/home4/.memex-local/enrol/studio-4.link" ] && ok "…and nothing was sent (no key, no link)" || bad "unanswered join sent a request" "link exists"
+# The POLL: pending, then issuing, then ready with an itemised code; every item opens, lands by file, and none is printed.
+KEY5="$FJ/home5/.memex-local/enrol/studio-5.key.pem"; mkdir -p "$(dirname "$KEY5")" "$FJ/poll"
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$KEY5" 2>/dev/null )
+openssl pkey -in "$KEY5" -pubout -out "$FJ/pub5.pem" 2>/dev/null
+TV="tskey-auth-$(printf 't%.0s' $(seq 20))"; EV="$(printf 'e%.0s' $(seq 40))"
+code2='{"v":2,"d":"studio-5","f":{"loginServer":"https://hs.example.test","tenant":"<tenant-id>","clientId":"c1"},"s":{"m":"'"$(seal "$M" "$KEY5")"'","c":"'"$(seal "$C" "$KEY5")"'","t":"'"$(seal "$TV" "$KEY5")"'","e":"'"$(seal "$EV" "$KEY5")"'"}}'
+CODE2="mwenrol2.$(printf '%s' "$code2" | base64 | tr -d '\n=' | tr '+/' '-_')"
+{ printf '200 {"state":"pending"}\n'; printf '200 {"state":"issuing","waiting":["t","e"]}\n'; printf '200 {"state":"ready","code":"%s"}\n' "$CODE2"; } > "$FJ/poll/answers"
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home5" MEMEX_LOCAL_HOME="$FJ/home5/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com FAKE_POLL_DIR="$FJ/poll" MEMEX_FLEET_POLL_EVERY=0 \
+  "$CLI" fleet join --control https://control.example.test --id studio-5 --no-open --no-update --no-accept-jobs --no-accept-tokens --wait 1 2>&1 </dev/null)"; RC=$?
+case "$RC:$OUT" in 0:*"not approved yet"*"waiting for: t,e"*"the code is ready"*"joined as 'studio-5'"*) ok "fleet join polls pending → issuing → ready and continues by itself" ;; *) bad "polling join" "rc=$RC: $OUT" ;; esac
+case "$OUT" in *"$M"*|*"$C"*|*"$TV"*|*"$EV"*) bad "the polling join never prints a value" "a value is in the output" ;; *) ok "the polling join prints no value (fingerprints only)" ;; esac
+grep -q "Hosting__ModuleReportSecret: \"$M\"" "$FJ/home5/.memex-local/fleet.yaml" && ok "items m and c land in the fleet layer" || bad "v2 fleet layer" ""
+PA="$FJ/home5/.memex-local/enrol/studio-5.preauth"
+[ "$(cat "$PA" 2>/dev/null)" = "$TV" ] && [ "$(ls -l "$PA" | cut -c1-10)" = "-rw-------" ] && [ "$(cat "$FJ/home5/.memex-local/enrol/studio-5.login-server")" = "https://hs.example.test" ] \
+  && ok "not root: item t is handed to the device bootstrap as a 0600 file, with the login server beside it" || bad "pre-auth hand-off" "$(ls -l "$FJ/home5/.memex-local/enrol")"
+[ ! -e "$FJ/home5/.memex-local/enrol/studio-5.items" ] && [ ! -e "$KEY5" ] && ok "the opened items and the throw-away key are removed at the end" || bad "items/key cleanup" "$(ls "$FJ/home5/.memex-local/enrol")"
+# Every poll is signed with the throw-away key over 'mwenrol-poll\n{fp}\n{ts}', fp = the full SHA-256 of the key's DER.
+B1="$FJ/poll/body.1"; pfp="$(sed -n 's/.*"fp":"\([0-9a-f]*\)".*/\1/p' "$B1")"; pts="$(sed -n 's/.*"ts":\([0-9]*\).*/\1/p' "$B1")"
+sed -n 's/.*"sig":"\([^"]*\)".*/\1/p' "$B1" | base64 -d > "$FJ/sig.bin" 2>/dev/null
+[ "$(find "$FJ/poll" -name 'body.*' | wc -l | tr -d ' ')" = 3 ] && [ "${#pfp}" = 64 ] && [ -n "$pts" ] && ok "three signed polls, each naming the key by its full SHA-256" || bad "poll bodies" "$(cat "$B1")"
+printf 'mwenrol-poll\n%s\n%s' "$pfp" "$pts" | openssl dgst -sha256 -verify "$FJ/pub5.pem" -signature "$FJ/sig.bin" >/dev/null 2>&1 \
+  && [ "$pfp" = "$(openssl pkey -pubin -in "$FJ/pub5.pem" -outform DER 2>/dev/null | shasum -a 256 | cut -c1-64)" ] && ok "the poll signs exactly 'mwenrol-poll\\n{fp}\\n{ts}' with the throw-away key (RSA-SHA256)" || bad "poll signature shape" "missing"
+# A refused join stops loudly, naming why.
+printf '200 {"state":"refused","why":"superseded by a later approval"}\n' > "$FJ/poll/answers"; rm -f "$FJ/poll"/body.*
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$FJ/home5/.memex-local/enrol/studio-6.key.pem" 2>/dev/null )
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home5" MEMEX_LOCAL_HOME="$FJ/home5/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com FAKE_POLL_DIR="$FJ/poll" MEMEX_FLEET_POLL_EVERY=0 \
+  "$CLI" fleet join --control https://control.example.test --id studio-6 --no-open --no-update --no-accept-jobs --no-accept-tokens --wait 1 2>&1 </dev/null)"; RC=$?
+case "$RC:$OUT" in 0:*|3:*) bad "a refused join stops" "rc=$RC" ;; *"REFUSED this join: superseded by a later approval"*) ok "a refused join stops, naming control's reason" ;; *) bad "refused join" "rc=$RC $OUT" ;; esac
+grep -q 'drop="$FLEET_DIR/fleet-ca.key"' "$CLI" && grep -q '( cmd_ca adopt --sha256 "$sha" )' "$CLI" \
+  && ok "item a takes the ONE §6 path: the 0600 drop enrol/fleet-ca.key, then ca adopt --sha256 <caCertSha256> (the bootstrap adopts the same drop if this fails)" || bad "ca adopt path" "missing"
+# The owner's answers reach backlease enroll and first-attach as ONE argv word per flag — a multi-pattern list is never
+# split or globbed (executed, in a directory holding a file a glob would match).
+mkdir -p "$FJ/globdir" && : > "$FJ/globdir/evil.example.test"
+ARGV="$(cd "$FJ/globdir" && fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="control.example.test *.example.test"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=false; fleet_accept_argv first-attach; printf "[%s]\n" "${FLEET_ACCEPT_ARGV[@]}"')"
+[ "$ARGV" = "$(printf '[--accept-jobs=control.example.test *.example.test]\n[--no-accept-tokens]')" ] \
+  && ok "first-attach gets the multi-pattern answer as one word, unsplit and unglobbed (no --job-* flags)" || bad "accept argv for first-attach" "$ARGV"
+ARGV="$(fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="a.example b.example"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=true; ACC_TOK_FROM="*.example.test"; ACC_TOK_MODELS="qwen3.6 qwen3.8:27b-mlx"; ACC_TOK_RES=CH; fleet_accept_argv; printf "[%s]\n" "${FLEET_ACCEPT_ARGV[@]}"')"
+[ "$(printf '%s\n' "$ARGV" | wc -l | tr -d ' ')" = 5 ] && printf '%s' "$ARGV" | grep -qx '\[--token-models=qwen3.6 qwen3.8:27b-mlx\]' \
+  && ok "backlease enroll gets every answer as one word per flag" || bad "accept argv for backlease" "$ARGV"
+grep -q 'if \[ -s "$dir/k" \] && \[ -n "$preg" \]; then cp "$dir/k"' "$CLI" && ok "a registry key without the registry URL is left out (first-attach stays pass-both-or-neither)" || bad "k without pluginsRegistry" "missing"
+! grep -q 'SC2046' "$CLI" || bad "no unquoted accept substitution remains" "$(grep -n SC2046 "$CLI")"
+grep -q -- '--auth-key="file:$dir/t"' "$CLI" && ok "as root the pre-auth key goes to tailscale by FILE reference on the root daemon's socket" || bad "tailscale auth by file" "missing"
+grep -q 'cmd_internal on --tenant "$tenant" --client-id "$cid" < "$dir/e"' "$CLI" && grep -q '< "$dir/n" )' "$CLI" \
+  && ok "the sign-in and DNS-01 secrets reach internal on / cert config on STDIN" || bad "secrets on stdin" "missing"
+grep -q '\[ "$ACC_JOBS_ENABLED" = true \] || { info "build host: jobs are OFF' "$CLI" && grep -q -- '--secrets-from "$secrets" --set-from latest' "$CLI" \
+  && ok "the build host is attached ONLY on a jobs opt-in, with its values from files (no vault)" || bad "build host gating" "missing"
 rm -rf "$FJ"
 
 echo "── a fleet Mac's template carries Hosting (fleet join / backlease, registry mode) ──"
@@ -1954,6 +2026,8 @@ case "$*" in *redirect_url*) printf '%s' "${FAKE_REDIRECT:-}" ;; *) printf '%s' 
 EOF
 printf '#!/usr/bin/env bash\nprintf "info: Banner\\n  Token: %%s\\n" "$FAKE_TOKEN"\n' > "$SO/stubs/kubectl"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$FAKE_OPEN_LOG"\n' > "$SO/stubs/open"
+# the served certificate is trusted unless a test says otherwise (FAKE_UNTRUSTED)
+printf '#!/usr/bin/env bash\n[ "$1" = verify-cert ] && [ -z "${FAKE_UNTRUSTED:-}" ]\n' > "$SO/stubs/security"
 chmod +x "$SO/stubs/"*
 so_run() {
   : > "$SO/open.log"
@@ -1972,6 +2046,12 @@ so_run FAKE_REDIRECT="https://memex.localhost:8443/login" FAKE_TOKEN=tok3
 [ ! -s "$SO/open.log" ] && ok "a set-up instance opens nothing" || bad "a set-up instance opens nothing" "$(cat "$SO/open.log")"
 so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok4 MEMEX_HEADLESS=1
 [ ! -s "$SO/open.log" ] && ok "a headless host opens nothing" || bad "a headless host opens nothing" "$(cat "$SO/open.log")"
+so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok9 FAKE_UNTRUSTED=1
+[ ! -s "$SO/open.log" ] && case "$OUT" in *"NOT opening the browser"*"not trusted"*) true ;; *) false ;; esac \
+  && ok "the login agent never opens the wizard into an untrusted certificate (defect 10), and says why" || bad "agent opens into an untrusted cert" "open: $(cat "$SO/open.log") out: $OUT"
+case "$OUT" in *tok9*) bad "the agent's untrusted-certificate line never carries the token" "$OUT" ;; *) ok "the agent's untrusted-certificate line never carries the token" ;; esac
+so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok9
+[ "$(cat "$SO/open.log")" = "https://memex.localhost:8443/setup?token=tok9" ] && ok "…and opens it on a later start, once the certificate is trusted (no marker was written)" || bad "agent retries after trust" "$(cat "$SO/open.log")"
 grep -q '^open_setup_if_waiting &$' "$PF" && ok "the agent runs it in the background, before the forward" || bad "the agent runs it in the background" ""
 named=""; for m in "$SO/home/.memex-local/"setup-opened.*; do case "$m" in *tok*) named="$m" ;; esac; done
 if [ -n "$named" ]; then bad "the marker never names the token" "$named"
@@ -2637,7 +2717,7 @@ printf '  0 9:00.00 kernel_task\n  10 0:40.00 /Applications/Safari\n  11 0:15.00
 [ -z "$(oc 1200)" ] && ok "a gap longer than three intervals reports nothing (a stale window is not a reading)" || bad "stale gap" "$(oc 1200)"
 [ -z "$(OC_GOV="$OC/missing.sh" oc 1230)" ] && ok "no governor library to measure with → the field is absent" || bad "no governor" ""
 # the splice: only into a JSON object — a degraded host reading stays valid JSON
-osp() { env HOSTJSON="$1" MEMEX_BACKLEASE_DIR="$OC/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "%s" "$HOSTJSON"; }; owner_cpu() { printf 150; }
+osp() { env HOSTJSON="$1" MEMEX_BACKLEASE_DIR="$OC/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "%s" "$HOSTJSON"; }; owner_cpu() { printf 150; }; host_cpu() { :; }; net_rate() { :; }
   sample_models() { printf "[]"; }; sample_vm() { printf null; }; colima() { return 1; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }
   OUT="$1"; write_sample; cat "$OUT"' "$SAMPLER" "$OC/out.json"; }
 osp '{"cores":2}' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"]=={"cores":2,"ownerCpuPercent":150}' 2>/dev/null \
@@ -2654,6 +2734,39 @@ OUT="$(MEMEX_BACKLEASE_SAMPLER_LIB=1 MEMEX_BACKLEASE_DIR="$OC/dir" bash "$SAMPLE
 [ "$RC" = 2 ] && case "$OUT" in *"for sourcing only"*) true ;; *) false ;; esac \
   && ok "library mode fails CLOSED: executed with the variable set, the sampler stops loudly instead of sampling" || bad "lib guard fails open" "rc=$RC $OUT"
 rm -rf "$OC"
+
+echo "── back-lease sampler: host.cpuPercent and the network rate (Hosting/FleetMetricHistory) ──"
+NR="$(mktemp -d)"; mkdir -p "$NR/dir"
+SAMPLER="$HERE/../share/backlease-sampler.sh"
+printf 'Processes: 1 total\nCPU usage: 10.00%% user, 5.00%% sys, 85.00%% idle \nProcesses: 1 total\nCPU usage: 30.50%% user, 7.25%% sys, 62.25%% idle \n' > "$NR/top.out"
+hc() { env MEMEX_BACKLEASE_DIR="$NR/dir" MEMEX_SAMPLER_TOP="cat $1" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; host_cpu' "$SAMPLER"; }
+[ "$(hc "$NR/top.out")" = 37.8 ] && ok "cpuPercent = 100 − idle of the SECOND top sample (a delta, never the boot average)" || bad "cpuPercent" "$(hc "$NR/top.out")"
+printf 'garbage\n' > "$NR/top.bad"
+[ -z "$(hc "$NR/top.bad")" ] && ok "an unparseable top reports no cpuPercent (absent, never 0)" || bad "cpu garbage" "$(hc "$NR/top.bad")"
+ns() { # $1 = now, $2 = en0 Ibytes, $3 = en0 Obytes
+  printf 'Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll\nlo0   16384 <Link#1>                       9     0      99999        9     0      99999     0\nen0   1500  <Link#11>   aa:bb:cc:dd:ee:ff  100   0  %s  100   0  %s  0\nen0   1500  192.168.1     192.168.1.10   100   0  555  100   0  555  -\nen1   1500  <Link#12>   aa:bb:cc:dd:ee:00  1     0  1000  1   0  2000  0\nutun0 1380  <Link#20>                      5     0      77777        5     0      77777     0\n' "$2" "$3" > "$NR/netstat.out"
+  env MEMEX_BACKLEASE_DIR="$NR/dir" MEMEX_BACKLEASE_INTERVAL=30 MEMEX_SAMPLER_NOW="$1" MEMEX_SAMPLER_NETSTAT="cat $NR/netstat.out" MEMEX_BACKLEASE_SAMPLER_LIB=1 \
+    bash -c '. "$0"; net_rate' "$SAMPLER"; }
+[ -z "$(ns 1000 1000000 500000 2>&1)" ] && ok "the first network sample reports nothing (no window yet), and says nothing on stderr" || bad "net first" "$(ns 1000 1000000 500000 2>&1)"
+[ "$(ns 1030 4000000 1100000)" = "100000 20000" ] && ok "netIn/Out = the en* link-level byte delta over the interval (loopback, utun and address rows excluded)" || bad "net rate" "$(ns 1030 4000000 1100000)"
+[ -z "$(ns 1200 5000000 1200000)" ] && ok "a gap longer than three intervals reports nothing" || bad "net gap" "$(ns 1200 5000000 1200000)"
+[ -z "$(ns 1230 100 100)" ] && ok "a counter that went backwards (reboot, reset) reports nothing, never a negative rate" || bad "net reset" "$(ns 1230 100 100)"
+[ "$(ns 1260 3100 2100)" = "100 67" ] && ok "after a reset the next window measures again" || bad "net after reset" "$(ns 1260 3100 2100)"
+ws() { env HOSTJSON="$1" MEMEX_BACKLEASE_DIR="$NR/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "%s" "$HOSTJSON"; }; owner_cpu() { :; }; host_cpu() { printf 12.5; }; net_rate() { printf "100 200"; }
+  sample_models() { printf "[]"; }; sample_vm() { printf null; }; colima() { return 1; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }
+  OUT="$1"; write_sample; cat "$OUT"' "$SAMPLER" "$NR/out.json"; }
+ws '{"cores":2}' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"]=={"cores":2,"cpuPercent":12.5,"netInBytesPerSec":100,"netOutBytesPerSec":200}' 2>/dev/null \
+  && ok "cpuPercent and the network rate are spliced into the host object" || bad "net/cpu splice" "$(ws '{"cores":2}')"
+ws 'null' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"] is None' 2>/dev/null \
+  && ok "a degraded host reading stays valid JSON with the new fields too" || bad "net/cpu splice into null" "$(ws null)"
+wsj() { env HOSTJSON='{"cores":2}' NET="$1" MEMEX_BACKLEASE_DIR="$NR/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "%s" "$HOSTJSON"; }; owner_cpu() { :; }; host_cpu() { :; }; net_rate() { printf "%s" "$NET"; }
+  sample_models() { printf "[]"; }; sample_vm() { printf null; }; colima() { return 1; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }
+  OUT="$1"; write_sample; cat "$OUT"' "$SAMPLER" "$NR/out.json"; }
+bad_net=0; for v in '1 2junk' 'x 2' '1 ' ' 2' '12'; do
+  wsj "$v" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"]=={"cores":2}' 2>/dev/null || bad_net=1
+done
+[ "$bad_net" = 0 ] && ok "a malformed network reading (non-numeric, half-empty, one token) splices nothing and the JSON stays valid" || bad "net guard" "$(wsj '1 2junk')"
+rm -rf "$NR"
 
 echo "── token slots: the machine's capacity; the owner's ceiling is optional (Hosting/BackLease §14.5) ──"
 TS="$(mktemp -d)"; mkdir -p "$TS/home"
@@ -2701,11 +2814,159 @@ OUT="$(env MEMEX_LOCAL_HOME="$NSHOME" bash "$NS" --apply --profile 'Bad Name' 2>
 mkdir -p "$NSHOME/.ml"; printf '[ -n "${MEMEX_NET_LINK_UP_KBIT:-}" ] || MEMEX_NET_LINK_UP_KBIT=20000\n[ -n "${MEMEX_NET_LINK_DOWN_KBIT:-}" ] || MEMEX_NET_LINK_DOWN_KBIT=100000\n' > "$NSHOME/.ml/netshape-build.env"
 [ "$(env -u MEMEX_NET_LINK_UP_KBIT -u MEMEX_NET_LINK_DOWN_KBIT MEMEX_LOCAL_HOME="$NSHOME/.ml" MEMEX_NET_PROFILE=default MEMEX_NETSHAPE_LIB=1 MEMEX_NET_NO_MEASURE=1 bash -c '. "$0"; link_rates' "$NS")" = "20000 100000" ] \
   && ok "another profile's measurement is reused (one uplink per Mac — the line is measured once)" || bad "link reuse" ""
+# a 0/0 record (a failed measurement, as recorded before) is no reading: the sibling's measurement is reused instead
+printf '[ -n "${MEMEX_NET_LINK_UP_KBIT:-}" ] || MEMEX_NET_LINK_UP_KBIT=0\n[ -n "${MEMEX_NET_LINK_DOWN_KBIT:-}" ] || MEMEX_NET_LINK_DOWN_KBIT=0\n' > "$NSHOME/.ml/netshape-default.env"
+[ "$(env MEMEX_NET_LINK_UP_KBIT=0 MEMEX_NET_LINK_DOWN_KBIT=0 MEMEX_LOCAL_HOME="$NSHOME/.ml" MEMEX_NET_PROFILE=default MEMEX_NETSHAPE_LIB=1 MEMEX_NET_NO_MEASURE=1 bash -c '. "$0"; link_rates' "$NS")" = "20000 100000" ] \
+  && ok "a recorded 0/0 link does not stick: another profile's measurement is reused" || bad "0/0 record sticks" ""
+# apply against a stub VM: a failed measurement records NO link (so the next apply measures or reuses again), and
+# MEMEX_NET_SHAPE=off — read by the shaper itself, so first-attach.sh honours it too — touches neither the VM nor the record
+NSV="$(mktemp -d)"; mkdir -p "$NSV/bin" "$NSV/home"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/colima.log"; cat >/dev/null; exit 0\n' "$NSV" > "$NSV/bin/colima"; chmod +x "$NSV/bin/colima"
+nsapply() { env -u MEMEX_NET_UP_KBIT -u MEMEX_NET_DOWN_KBIT -u MEMEX_NET_LINK_UP_KBIT -u MEMEX_NET_LINK_DOWN_KBIT PATH="$NSV/bin:$PATH" \
+  MEMEX_LOCAL_HOME="$NSV/home" MEMEX_NET_NO_MEASURE=1 "$@" bash "$NS" --apply --profile build </dev/null 2>&1; }
+OUT="$(nsapply env)"
+{ [ -s "$NSV/colima.log" ] && [ -f "$NSV/home/netshape-build.env" ] && ! grep -q 'MEMEX_NET_LINK_UP_KBIT' "$NSV/home/netshape-build.env"; } \
+  && ok "apply installs the shaper in the VM and records no link when the measurement failed" || bad "apply after a failed measurement" "$OUT | $(cat "$NSV/home/netshape-build.env" 2>/dev/null)"
+rm -f "$NSV/colima.log" "$NSV/home/netshape-build.env"
+OUT="$(nsapply env MEMEX_NET_SHAPE=off)"; RC=$?
+{ [ "$RC" = 0 ] && [ ! -e "$NSV/colima.log" ] && [ ! -e "$NSV/home/netshape-build.env" ]; } && case "$OUT" in *"MEMEX_NET_SHAPE=off"*) true ;; *) false ;; esac \
+  && ok "MEMEX_NET_SHAPE=off is honoured by the shaper itself: no VM call, no record, exit 0" || bad "MEMEX_NET_SHAPE=off in vm-netshape.sh" "rc=$RC $OUT"
+case "$(cat "$HERE/../../backlease/first-attach.sh")" in *'homebrew/share/vm-netshape.sh" --apply'*) ok "first-attach.sh shapes through vm-netshape.sh --apply (so the switch above covers it)" ;; *) bad "first-attach shaper call" "" ;; esac
+rm -rf "$NSV"
+# `memex-local net --profile build` (no subcommand) is `status` for that profile, as vm-netshape.sh defaults a bare flag
+NSS="$(mktemp -d)"; printf '#!/bin/bash\nprintf "%%s" "$*"\n' > "$NSS/vm-netshape.sh"
+[ "$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; resolve_share() { printf "%s" "$1"; }; shift_net_cmd default --profile build' "$CLI" "$NSS" 2>&1)" = "--status --profile build" ] \
+  && ok "'net --profile build' with no subcommand runs status for that profile" || bad "net bare flag" "$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; resolve_share() { printf "%s" "$1"; }; shift_net_cmd default --profile build' "$CLI" "$NSS" 2>&1)"
+rm -rf "$NSS"
 rm -rf "$NSHOME"
+
+echo "── the second Mac Studio's defects, pinned (2026-11-09) ─────────────"
+OB="$(mktemp -d)"; mkdir -p "$OB/stubs" "$OB/brewbin" "$OB/home/.memex-local" "$OB/sys"
+# a PATH with the system's tools but NO kubectl/colima (and none of Homebrew's): what the person's shell had
+for f in /usr/bin/* /bin/*; do b="$(basename "$f")"; case "$b" in kubectl|colima|helm|mkcert|security|open) continue ;; esac; [ -e "$OB/sys/$b" ] || ln -s "$f" "$OB/sys/$b"; done
+# kubectl that serves the setup banner; curl that says the portal answers
+printf '#!/usr/bin/env bash\ncase "$*" in *logs*) printf "info: Setup\\n  Token: tok-ob-123\\n" ;; *version*) echo "Client Version: v1.37.1" ;; esac\nexit 0\n' > "$OB/brewbin/kubectl"
+printf '#!/usr/bin/env bash\nprintf 302\n' > "$OB/stubs/curl"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$FAKE_OPEN_LOG"\n' > "$OB/stubs/open"
+printf '#!/usr/bin/env bash\n[ "$1" = verify-cert ] && [ -z "${FAKE_UNTRUSTED:-}" ]\n' > "$OB/stubs/security"
+chmod +x "$OB/stubs/"* "$OB/brewbin/"*
+PGPW="pgsecret-$(openssl rand -hex 12)"
+printf 'secrets:\n  memex_postgres_password: "%s"\n' "$PGPW" > "$OB/home/.memex-local/values.local.yaml"
+obrun() { OUT="$(env -i HOME="$OB/home" MEMEX_LOCAL_HOME="$OB/home/.memex-local" PATH="$OB/stubs:$OB/sys" FAKE_OPEN_LOG="$OB/open.log" "$@" bash "$CLI" setup 2>&1)"; RC=$?; : ; }
+# Defect 5 (the PATH half is memex_toolchain_path, #217): a command that needs kubectl/colima and finds none FAILS
+# naming it — never an empty answer. Sourced, so no toolchain directory is added: the PATH is exactly this one.
+obsrc() { OUT="$(env -i HOME="$OB/home" MEMEX_LOCAL_HOME="$OB/home/.memex-local" PATH="$OB/stubs:$OB/sys" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; '"$1" "$CLI" 2>&1)"; RC=$?; }
+obsrc 'cmd_setup --no-open'
+case "$RC:$OUT" in 0:*) bad "setup without kubectl fails" "$OUT" ;; *"required tool 'kubectl' not found"*"brew install kubernetes-cli"*) ok "setup without kubectl FAILS naming kubectl (defect 5: it used to print nothing)" ;; *) bad "setup names kubectl" "rc=$RC $OUT" ;; esac
+for c in verify status logs; do
+  obsrc "cmd_$c"
+  case "$RC:$OUT" in 0:*) bad "$c without the tools fails" "$OUT" ;; *"required tool '"*"' not found"*) ok "$c without colima/kubectl FAILS naming the missing tool" ;; *) bad "$c names the tool" "rc=$RC $OUT" ;; esac
+done
+cp "$OB/brewbin/kubectl" "$OB/stubs/kubectl"
+# Defect 7: setup never prints the in-cluster Postgres password — only where it is and its fingerprint.
+obrun FAKE_UNTRUSTED=1
+case "$OUT" in *"$PGPW"*) bad "setup never prints the Postgres password" "the value is in the output" ;; *) ok "setup never prints the in-cluster Postgres password (defect 7)" ;; esac
+case "$OUT" in *"Password=<memex_postgres_password in $OB/home/.memex-local/values.local.yaml>"*"its fingerprint: sha256:"*) ok "…it names where the password is, with its fingerprint" ;; *) bad "password pointer" "$OUT" ;; esac
+# Defect 10: the browser is never opened into an untrusted certificate.
+[ ! -s "$OB/open.log" ] && case "$OUT" in *"not opening the browser"*"not trusted"*) true ;; *) false ;; esac \
+  && ok "setup does NOT open the wizard while the served certificate is untrusted, and says what is missing (defect 10)" || bad "no open when untrusted" "open: $(cat "$OB/open.log") $OUT"
+: > "$OB/open.log"; obrun
+[ "$(cat "$OB/open.log")" = "https://memex.localhost:8443/setup?token=tok-ob-123" ] && ok "…and opens it once the certificate is trusted" || bad "open when trusted" "$(cat "$OB/open.log") $OUT"
+! grep -nE '(^|[^_])open "\$\{url\}\?token' "$CLI" && ok "no code path opens the token URL without the trust check" || bad "unguarded open" "$(grep -n 'open "${url}?token' "$CLI")"
+
+# Participation (contract §5): the build host only on the owner's YES to jobs; no extra token models after a NO.
+pb() { env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$OB/home/.memex-local" HOME="$OB/home" bash -c '. "$0"; '"$1" "$CLI" 2>&1; }
+BL="$OB/home/.memex-local/backlease.yaml"
+rm -f "$BL"
+[ "$(pb 'participation_build_host yes && echo BUILD || echo NONE')" = NONE ] && ok "no recorded answer → no build host (no answer is not a yes)" || bad "unanswered builds" ""
+[ "$(pb 'ACC_JOBS_ANSWERED=yes; ACC_JOBS_ENABLED=true; participation_build_host yes && echo BUILD || echo NONE')" = BUILD ] && ok "no layer, but --accept-jobs on this join → build host" || bad "flag yes" ""
+printf 'config:\n  memex_portal:\n    Hosting__BackLease__Accept__Jobs__Enabled: "false"\n    Hosting__BackLease__Accept__Tokens__Enabled: "false"\n' > "$BL"
+[ "$(pb 'participation_build_host yes && echo BUILD || echo NONE')" = NONE ] && ok "jobs NO recorded → no build host" || bad "jobs no builds" ""
+[ "$(pb 'ACC_JOBS_ANSWERED=yes; ACC_JOBS_ENABLED=true; participation_build_host yes && echo BUILD || echo NONE')" = NONE ] && ok "…the recorded NO wins over a stale flag value" || bad "recorded no" ""
+OUT="$(pb 'MEMEX_HOST_CORES=8 MEMEX_HOST_MEM_GIB=64 cmd_buildhost apply; echo SURVIVED')"
+case "$OUT" in *SURVIVED*) bad "buildhost apply refused after a NO to jobs" "$OUT" ;; *"owner said NO to fleet jobs"*) ok "buildhost apply is REFUSED after the owner's NO to jobs" ;; *) bad "buildhost refusal" "$OUT" ;; esac
+[ "$(pb 'participation_answer Tokens')" = false ] && ok "the recorded token answer is read" || bad "token answer" ""
+printf 'config:\n  memex_portal:\n    Hosting__BackLease__Accept__Jobs__Enabled: "true"\n' > "$BL"
+[ "$(pb 'participation_build_host yes && echo BUILD || echo NONE')" = BUILD ] && ok "jobs YES recorded → build host" || bad "jobs yes" ""
+[ "$(pb 'participation_build_host no && echo BUILD || echo NONE')" = NONE ] && ok "--no-buildhost wins over a YES" || bad "no-buildhost" ""
+grep -q '^        if participation_build_host "\$with_build"; then$' "$CLI" && ok "fleet join installs the build host only through participation_build_host" || bad "join gate" ""
+case "$(fn_body setup_ollama)" in *'"$(participation_answer Tokens)" = false'*"are not pulled"*) ok "setup_ollama pulls no extra token models after the owner's NO to tokens" ;; *) bad "extras gate" "" ;; esac
+rm -f "$BL"
+
+# Defect 4 (Mac half): `memex-local ca adopt` — the fleet local CA, name-constrained, key never printed.
+MINT="$HERE/../../macos/fleet-ca/mint-fleet-ca.sh"
+CA="$OB/ca"; mkdir -p "$CA/caroot" "$CA/bin" "$CA/home/.memex-local/enrol"
+bash "$MINT" --key-file "$CA/fleet.key" --cert-out "$CA/fleet.pem" >/dev/null 2>&1
+bash "$MINT" --key-file "$CA/other.key" --cert-out "$CA/other.pem" >/dev/null 2>&1
+FSHA="$(openssl x509 -in "$CA/fleet.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)"
+KEYB64="$(cat "$CA/fleet.key")"
+# mkcert: CAROOT from the environment; a leaf "issued" by signing nothing — the test is about what adopt does
+cat > "$CA/bin/mkcert" <<'MK'
+#!/usr/bin/env bash
+case "$1" in -CAROOT) printf '%s\n' "$CAROOT"; exit 0 ;; esac
+printf '%s\n' "$*" >> "$FAKE_MKCERT_LOG"
+[ -f "$CAROOT/rootCA-key.pem" ] || exit 1
+c=""; k=""; prev=""; for a in "$@"; do [ "$prev" = -cert-file ] && c="$a"; [ "$prev" = -key-file ] && k="$a"; prev="$a"; done
+printf 'leaf\n' > "$c"; printf 'leafkey\n' > "$k"
+MK
+chmod +x "$CA/bin/mkcert"
+adopt() { OUT="$(env PATH="$CA/bin:$PATH" CAROOT="$CA/caroot" HOME="$CA/home" MEMEX_LOCAL_HOME="$CA/home/.memex-local" FAKE_MKCERT_LOG="$CA/mkcert.log" MEMEX_KUBE_CONTEXT=none "$@" 2>&1)"; RC=$?; }
+printf 'old\n' > "$CA/caroot/rootCA.pem"; printf 'oldkey\n' > "$CA/caroot/rootCA-key.pem"
+cp "$CA/fleet.key" "$CA/home/.memex-local/enrol/fleet-ca.key"; chmod 600 "$CA/home/.memex-local/enrol/fleet-ca.key"
+# the forms the minted fleet CA is stored in: the key as ONE line of base64 PKCS#8 DER (the vault object, enrolment
+# item `a`), the certificate permitting DNS:localhost alone (RFC 5280: it covers every name below localhost)
+[ "$(wc -l < "$CA/fleet.key" | tr -d ' ')" = 1 ] && ! grep -q -- '-----BEGIN' "$CA/fleet.key" \
+  && openssl x509 -in "$CA/fleet.pem" -noout -text | grep -q '^ *DNS:localhost$' && ! openssl x509 -in "$CA/fleet.pem" -noout -text | grep -q 'DNS:\.localhost' \
+  && ok "the adopted pair is in the stored form: one line of base64 PKCS#8 DER, a CA permitting DNS:localhost alone" || bad "stored form" "$(cat "$CA/fleet.key" | wc -l)"
+adopt "$CLI" ca adopt --cert "$CA/fleet.pem" --sha256 "$FSHA"
+case "$RC:$OUT" in 0:*"fleet local CA adopted"*"re-issued under the fleet CA"*) ok "ca adopt installs the fleet CA (the join's drop, the declared sha256) and re-issues the portal's certificate" ;; *) bad "ca adopt" "rc=$RC $OUT" ;; esac
+case "$OUT" in *"$KEYB64"*|*"PRIVATE KEY"*) bad "ca adopt never prints the key" "$OUT" ;; *) ok "ca adopt never prints the key (fingerprints only)" ;; esac
+[ "$(openssl x509 -in "$CA/caroot/rootCA.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)" = "$FSHA" ] \
+  && [ "$(openssl pkey -in "$CA/caroot/rootCA-key.pem" -pubout -outform DER | shasum -a 256)" = "$(openssl x509 -in "$CA/fleet.pem" -noout -pubkey | openssl pkey -pubin -outform DER | shasum -a 256)" ] \
+  && ok "mkcert's CAROOT now holds the fleet CA and its key" || bad "caroot contents" "$(ls -la "$CA/caroot")"
+[ "$(ls -l "$CA/caroot/rootCA-key.pem" | cut -c1-10)" = "-r--------" ] && ok "the CA key is 0400" || bad "key mode" "$(ls -l "$CA/caroot/rootCA-key.pem")"
+ls "$CA/caroot"/replaced-*/rootCA.pem >/dev/null 2>&1 && [ "$(cat "$CA/caroot"/replaced-*/rootCA.pem)" = old ] && ok "the previous local CA is moved aside, never deleted" || bad "previous CA kept" "$(ls -R "$CA/caroot")"
+[ ! -e "$CA/home/.memex-local/enrol/fleet-ca.key" ] && ok "the join's key drop is removed once adopted" || bad "drop removed" ""
+grep -q -- "-cert-file $CA/home/.memex-local/memex.localhost.pem -key-file $CA/home/.memex-local/memex.localhost-key.pem memex.localhost \*.memex.localhost" "$CA/mkcert.log" \
+  && ok "the portal's certificate (memex.localhost, *.memex.localhost) is re-issued under the adopted CA" || bad "re-issue" "$(cat "$CA/mkcert.log")"
+adopt bash -c 'cat "$1" | "$2" ca adopt --key-stdin --cert "$3" --sha256 "$4"' _ "$CA/fleet.key" "$CLI" "$CA/fleet.pem" "$FSHA"
+case "$RC:$OUT" in 0:*"adopted"*) ok "--key-stdin adopts (idempotent: the same CA again)" ;; *) bad "key stdin" "rc=$RC $OUT" ;; esac
+[ "$(ls -d "$CA/caroot"/replaced-* | wc -l | tr -d ' ')" = 1 ] && ok "re-adopting the same CA moves nothing aside" || bad "re-adopt aside" "$(ls "$CA/caroot")"
+chmod 600 "$CA/other.key"
+adopt "$CLI" ca adopt --key-file "$CA/other.key" --cert "$CA/fleet.pem" --sha256 "$FSHA"
+case "$RC:$OUT" in 0:*) bad "a key of another CA is refused" "$OUT" ;; *"does not belong to the certificate"*) ok "a key that does not belong to the declared certificate is REFUSED" ;; *) bad "wrong key" "rc=$RC $OUT" ;; esac
+adopt "$CLI" ca adopt --key-file "$CA/fleet.key" --cert "$CA/other.pem" --sha256 "$FSHA"
+case "$RC:$OUT" in 0:*) bad "a certificate other than the declared one is refused" "$OUT" ;; *"not the declared"*) ok "a certificate whose sha256 is not the declared one is REFUSED" ;; *) bad "wrong cert" "rc=$RC $OUT" ;; esac
+chmod 644 "$CA/fleet.key"
+adopt "$CLI" ca adopt --key-file "$CA/fleet.key" --cert "$CA/fleet.pem" --sha256 "$FSHA"
+case "$RC:$OUT" in 0:*) bad "a key file readable by others is refused" "$OUT" ;; *"not 0600"*) ok "a key file others can read is REFUSED" ;; *) bad "key mode refusal" "rc=$RC $OUT" ;; esac
+chmod 600 "$CA/fleet.key"
+adopt "$CLI" ca adopt --key-file "$CA/fleet.key" --cert "$CA/fleet.pem"
+case "$RC:$OUT" in 0:*) bad "no declared fingerprint is refused" "$OUT" ;; *"no declared fleet CA fingerprint"*) ok "without a declared fingerprint (--sha256 / FleetCaSha256) nothing is adopted" ;; *) bad "no sha" "rc=$RC $OUT" ;; esac
+# a CA that is NOT name-constrained to the loopback names — the right key for it, still refused
+mkca() { printf '[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=t\n[v3]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign\n%s\n' "$2" > "$CA/$1.cnf"
+  openssl ecparam -name prime256v1 -genkey -noout -out "$CA/$1.ec" 2>/dev/null
+  openssl req -new -x509 -key "$CA/$1.ec" -config "$CA/$1.cnf" -extensions v3 -days 2 -out "$CA/$1.pem" 2>/dev/null
+  ( umask 077; openssl pkcs8 -topk8 -nocrypt -in "$CA/$1.ec" -outform DER | openssl base64 -A > "$CA/$1.key" ); }
+mkca wide 'nameConstraints=critical,permitted;DNS:localhost,permitted;DNS:example.com'
+adopt "$CLI" ca adopt --key-file "$CA/wide.key" --cert "$CA/wide.pem" --sha256 "$(openssl x509 -in "$CA/wide.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)"
+case "$RC:$OUT" in 0:*) bad "a CA permitting more than the loopback names is refused" "$OUT" ;; *"permit 'DNS:example.com'"*) ok "a CA that permits a name beyond localhost is REFUSED" ;; *) bad "wide CA" "rc=$RC $OUT" ;; esac
+mkca bare ''
+adopt "$CLI" ca adopt --key-file "$CA/bare.key" --cert "$CA/bare.pem" --sha256 "$(openssl x509 -in "$CA/bare.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)"
+case "$RC:$OUT" in 0:*) bad "an unconstrained CA is refused" "$OUT" ;; *"no CRITICAL Name Constraints"*) ok "an UNCONSTRAINED CA is refused" ;; *) bad "bare CA" "rc=$RC $OUT" ;; esac
+mkca soft 'nameConstraints=permitted;DNS:localhost'
+adopt "$CLI" ca adopt --key-file "$CA/soft.key" --cert "$CA/soft.pem" --sha256 "$(openssl x509 -in "$CA/soft.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)"
+case "$RC:$OUT" in 0:*) bad "non-critical constraints are refused" "$OUT" ;; *"no CRITICAL Name Constraints"*) ok "Name Constraints that are not CRITICAL are refused" ;; *) bad "soft CA" "rc=$RC $OUT" ;; esac
+[ "$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; norm_sha256 "$1"' "$CLI" "sha256:$(printf '%s' "$FSHA" | tr a-f A-F | sed 's/../&:/g; s/:$//')")" = "$FSHA" ] \
+  && ok "a fingerprint with colons, upper case or a sha256: prefix is normalised" || bad "norm_sha256" ""
+# setup_tls does not ask for a trust change when the CA is already trusted (the adopted fleet CA)
+case "$(fn_body setup_tls)" in *'ca_cert_trusted "$caroot/rootCA.pem"; then'*'no trust change needed'*'MEMEX_CA_TRUST:-}" = defer'*'TRUST_STORES=nss mkcert -install'*'else'*'mkcert -install'*) ok "up runs 'mkcert -install' only when the local CA is not already trusted (and never under MEMEX_CA_TRUST=defer)" ;; *) bad "setup_tls trust" "$(fn_body setup_tls)" ;; esac
+rm -rf "$OB"
+
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
-for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease buildhost net fleet llm residency relay publish autoupdate instances; do
+for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease buildhost net fleet llm residency relay publish autoupdate instances ca; do
   case "$help_out" in
     *"$cmd"*) ;;
     *) bad "help documents '$cmd'" "not in the usage text"; continue ;;
@@ -2713,6 +2974,39 @@ for cmd in up down status setup logs update registry verify port-forward observa
   if grep -q "^    ${cmd})" "$CLI"; then ok "help documents '$cmd', and main dispatches it"
   else bad "help documents '$cmd'" "no dispatch arm in main()"; fi
 done
+
+echo "── the toolchain is found from the install, not the caller's PATH ──"
+KEG="$(mktemp -d)"; mkdir -p "$KEG/Cellar/memex-local/9.9.9/libexec" "$KEG/bin"; cp "$CLI" "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local"
+cp -R "$(dirname "$CLI")/../share" "$KEG/Cellar/memex-local/9.9.9/libexec/share" 2>/dev/null || true
+KB="$(cd "$KEG/bin" && pwd -P)"
+TP="$(env -i HOME="$HOME" PATH=/usr/bin:/bin MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(cd "$(dirname "$CLI")/../share" && pwd)" bash -c '. "$0"; memex_toolchain_path; printf "%s" "$PATH"' "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local" 2>/dev/null)"
+case ":$TP:" in *":$KB:"*) ok "an installed keg finds its Homebrew prefix's bin/ even from a shell without it on PATH (memex-local setup finds kubectl)" ;; *) bad "toolchain PATH from the keg" "$TP" ;; esac
+TP2="$(env -i HOME="$HOME" PATH="$KB:/usr/bin:/bin" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(cd "$(dirname "$CLI")/../share" && pwd)" bash -c '. "$0"; memex_toolchain_path; memex_toolchain_path; printf "%s" "$PATH"' "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local" 2>/dev/null)"
+[ "$(printf '%s' "$TP2" | tr ':' '\n' | grep -cx "$KB")" = "1" ] && ok "the prefix's bin/ is added once (idempotent), and a caller's PATH keeps its order" || bad "toolchain PATH idempotent" "$TP2"
+TP3="$(env -i HOME="$HOME" PATH=/usr/bin:/bin MEMEX_LOCAL_LIB=1 bash -c '. "$0"; memex_toolchain_path; printf "%s" "$PATH"' "$CLI" 2>/dev/null)"
+want="/usr/bin:/bin"; [ "$(uname -s)" = Darwin ] && [ -d /usr/local/bin ] && want="$want:/usr/local/bin"
+[ "$TP3" = "$want" ] && ok "a source checkout gets no prefix (only a Mac's /usr/local/bin): the test stubs and a Linux runner are untouched" || bad "checkout PATH unchanged" "$TP3"
+rm -rf "$KEG"
+grep -q 'need kubectl kubernetes-cli' <(sed -n '/^cmd_setup() {/,/^}/p' "$CLI") && grep -q 'could not read the portal log with kubectl' "$CLI" \
+  && ok "setup resolves kubectl and FAILS naming it — never an empty token" || bad "setup kubectl loud" "missing"
+! grep -q 'Password=\${pg_pw}' "$CLI" && grep -q 'Password=<memex_postgres_password in' "$CLI" \
+  && ok "setup never prints the in-cluster Postgres password" || bad "postgres password masked" "still printed"
+
+echo "── setup --apply: the first-run setup through its API, consent explicit ──"
+SAPY="$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; printf "%s" "$SETUP_ANSWERS_PY"' "$CLI")"
+SA="$(mktemp -d)"
+if env SETUP_NAME=studio-2 SETUP_COMPANY=Acme SETUP_OWNER_NAME="Jane Roe" SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=no \
+     SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/a.json" 2>"$SA/err"; then bad "no consent → nothing sent" "accepted"
+else grep -q 'identity.consent' "$SA/err" && [ ! -e "$SA/a.json" ] && ok "setup --apply without --accept-terms sends nothing and names identity.consent" || bad "consent named" "$(cat "$SA/err")"; fi
+env SETUP_NAME=studio-2 SETUP_COMPANY= SETUP_OWNER_NAME= SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=yes \
+  SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/b.json" 2>"$SA/err2" \
+  && bad "missing company/owner → refused" "accepted" || { grep -q 'identity.company' "$SA/err2" && grep -q 'identity.ownerName' "$SA/err2" && ok "every missing answer is named by its field" || bad "missing fields named" "$(cat "$SA/err2")"; }
+env SETUP_NAME=studio-2 SETUP_COMPANY=Acme SETUP_OWNER_NAME="Jane Roe" SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=yes SETUP_REGISTRY=https://registry.example.com \
+  SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/c.json" \
+  && python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); i=d["identity"]; assert i["consent"] is True and i["name"]=="studio-2" and i["company"]=="Acme" and i["registry"]=="https://registry.example.com"; assert d["embedding"]=={"endpoint":"http://e/v1","model":"m"}; assert "storage" not in d' "$SA/c.json" \
+  && ok "a complete answer carries identity + consent + this install's embeddings, and leaves storage to the wizard's pre-selected default" || bad "complete answers" "$(cat "$SA/c.json" 2>/dev/null)"
+grep -q 'X-Setup-Token: %s' "$CLI" && ! grep -qE 'curl[^\n]*X-Setup-Token: \$' "$CLI" && ok "the setup token travels in a 0600 header file, never on a command line" || bad "token header file" "missing"
+rm -rf "$SA"
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"

@@ -178,8 +178,12 @@ write_config() {
   f="$(config_file)"; mkdir -p "$LOCAL_HOME"
   {
     printf '# written by vm-netshape.sh (memex-local net); the link was measured once — "memex-local net measure" re-measures\n'
-    printf '[ -n "${MEMEX_NET_LINK_UP_KBIT:-}" ] || MEMEX_NET_LINK_UP_KBIT=%s\n' "$link_up"
-    printf '[ -n "${MEMEX_NET_LINK_DOWN_KBIT:-}" ] || MEMEX_NET_LINK_DOWN_KBIT=%s\n' "$link_down"
+    # A failed measurement (0 0) is NOT a reading and is not recorded: recording it would make every later apply
+    # return 0/0 before it looked at another profile's record or measured again.
+    if whole "$link_up" && [ "$link_up" -gt 0 ]; then
+      printf '[ -n "${MEMEX_NET_LINK_UP_KBIT:-}" ] || MEMEX_NET_LINK_UP_KBIT=%s\n' "$link_up"
+      printf '[ -n "${MEMEX_NET_LINK_DOWN_KBIT:-}" ] || MEMEX_NET_LINK_DOWN_KBIT=%s\n' "$link_down"
+    fi
     printf '[ -n "${MEMEX_NET_SHARE_PCT:-}" ] || MEMEX_NET_SHARE_PCT=%s\n' "${MEMEX_NET_SHARE_PCT:-$SHARE_PCT_DEFAULT}"
     [ -n "${MEMEX_NET_UP_KBIT:-}" ] && printf '[ -n "${MEMEX_NET_UP_KBIT:-}" ] || MEMEX_NET_UP_KBIT=%s\n' "$MEMEX_NET_UP_KBIT"
     [ -n "${MEMEX_NET_DOWN_KBIT:-}" ] && printf '[ -n "${MEMEX_NET_DOWN_KBIT:-}" ] || MEMEX_NET_DOWN_KBIT=%s\n' "$MEMEX_NET_DOWN_KBIT"
@@ -190,7 +194,9 @@ write_config() {
 # The link: the profile's record, else any other profile's record on this Mac (one uplink), else one measurement.
 link_rates() {
   local f lu ld
-  if whole "${MEMEX_NET_LINK_UP_KBIT:-}" && whole "${MEMEX_NET_LINK_DOWN_KBIT:-}" && [ "${1:-}" != remeasure ]; then
+  # (a 0/0 record written before failed measurements stopped being recorded reads as no record)
+  if whole "${MEMEX_NET_LINK_UP_KBIT:-}" && whole "${MEMEX_NET_LINK_DOWN_KBIT:-}" && [ "${MEMEX_NET_LINK_UP_KBIT}" -gt 0 ] \
+    && [ "${1:-}" != remeasure ]; then
     printf '%s %s' "$MEMEX_NET_LINK_UP_KBIT" "$MEMEX_NET_LINK_DOWN_KBIT"; return 0
   fi
   if [ "${1:-}" != remeasure ]; then
@@ -210,6 +216,11 @@ link_rates() {
 
 apply() {
   local link lu ld c up down tmp
+  # The owner's escape hatch is read HERE, so every caller honours it (memex-local up, buildhost apply, `net apply`,
+  # first-attach.sh) — never only the callers that remember to check it. `--remove` is not gated: it only undoes.
+  if [ "${MEMEX_NET_SHAPE:-on}" = off ]; then
+    echo "profile $PROFILE: network shaping is off (MEMEX_NET_SHAPE=off) — nothing applied"; return 0
+  fi
   link="$(link_rates "${1:-}")"; lu="${link% *}"; ld="${link#* }"
   c="$(caps "$lu" "$ld" "${MEMEX_NET_SHARE_PCT:-$SHARE_PCT_DEFAULT}" "${MEMEX_NET_UP_KBIT:-}" "${MEMEX_NET_DOWN_KBIT:-}")"
   up="${c% *}"; down="${c#* }"
