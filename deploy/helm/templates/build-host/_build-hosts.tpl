@@ -17,6 +17,8 @@ The refusals, and why each one exists:
     — the worker token rides on it;
   * at least one channel must be enabled — an enabled block that renders no host is a typo;
   * `cache.create` needs its storageClass and size — the chart never guesses a volume's tier or size;
+  * `cache.medium: host` needs an absolute `cache.path` and refuses a `size` (a hostPath has no size limit to
+    enforce) and `create` (no claim is made); a `path` beside any other medium would be silently ignored;
   * the artifact store is `upload: true` (through the build API) OR a `file:` store — never both, never anything else.
 */ -}}
 {{- define "memex.buildHosts" -}}
@@ -62,21 +64,43 @@ The refusals, and why each one exists:
 {{- /* medium: `claim` (default) — a claim every replica shares; `node` — a node-local emptyDir, for a host in its OWN
        user namespace (sandbox.userNamespace): the pod's volumes are ID-mapped, and SMB/NFS (Azure Files) supports no
        idmap mount — measured: "failed to set MOUNT_ATTR_IDMAP … maybe the filesystem used doesn't support idmap
-       mounts on this kernel?". A node-local cache is per replica and lives as long as the pod. */ -}}
+       mounts on this kernel?". A node-local cache is per replica and lives as long as the pod.
+       `host` — a hostPath directory on the NODE (`cache.path`), shared by every host on that node and outliving a pod
+       restart and a scale-in (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3b point 6: the node-local master). Mounted
+       as type `Directory`, never DirectoryOrCreate: node setup prepares it owned by the host's uid (an ID-mapped volume
+       shows the on-disk owner unchanged, so a kubelet-created root:root 0755 directory would be read-only to the host),
+       and a missing one keeps the pod visibly failing instead of handing it a root-owned directory. */ -}}
 {{- /* hasKey, not `default`: Sprig's default turns a present false, 0 or "" into "claim", which would silently
        select the claim (an SMB mount a user-namespaced host cannot take). A PRESENT key must itself be valid. */ -}}
 {{- $medium := "claim" -}}
 {{- if hasKey $cc "medium" -}}{{- $medium = $cc.medium -}}{{- end -}}
-{{- if not (and (kindIs "string" $medium) (has $medium (list "claim" "node"))) -}}
-{{- fail (printf "buildHosts.cache.medium %q must be claim or node" $medium) -}}
+{{- if not (and (kindIs "string" $medium) (has $medium (list "claim" "node" "host"))) -}}
+{{- fail (printf "buildHosts.cache.medium %q must be claim, node or host" $medium) -}}
+{{- end -}}
+{{- $cachePath := "" -}}
+{{- if eq $medium "host" -}}
+{{- $cachePath = $cc.path | default "" -}}
+{{- /* absolute, plain segments only, no `.`/`..` segment and not `/` itself: the hostPath is a node directory node
+       setup prepared, never a path the values can steer elsewhere */ -}}
+{{- if not (and (kindIs "string" $cachePath) (regexMatch "^(/[A-Za-z0-9._-]+)+$" $cachePath) (not (regexMatch "(^|/)[.][.]?(/|$)" $cachePath))) -}}
+{{- fail (printf "buildHosts.cache.path %q must be an absolute node directory (e.g. /var/lib/mw-build-cache) when cache.medium is host — the hostPath every build host on the node shares, prepared by node setup" (toString $cachePath)) -}}
+{{- end -}}
+{{- if $cc.size -}}
+{{- fail (printf "buildHosts.cache.size %q is not supported with cache.medium host — a hostPath has no size limit to enforce" (toString $cc.size)) -}}
+{{- end -}}
+{{- if $cc.create -}}
+{{- fail "buildHosts.cache.create is not supported with cache.medium host — the cache is the node directory, no claim is created" -}}
+{{- end -}}
+{{- else if $cc.path -}}
+{{- fail (printf "buildHosts.cache.path is only for cache.medium host (medium is %q) — it would be ignored" $medium) -}}
 {{- end -}}
 {{- $cache := "" -}}
 {{- if eq $medium "claim" -}}
-{{- $cache = required "buildHosts.cacheClaimName is required — the shared RWX build-cache claim (or cache.medium: node)" $b.cacheClaimName -}}
+{{- $cache = required "buildHosts.cacheClaimName is required — the shared RWX build-cache claim (or cache.medium: node or host)" $b.cacheClaimName -}}
 {{- end -}}
-{{- $cacheCreate := dict "create" false "medium" $medium "size" ($cc.size | default "") -}}
+{{- $cacheCreate := dict "create" false "medium" $medium "size" ($cc.size | default "") "path" $cachePath -}}
 {{- if and (eq $medium "claim") $cc.create -}}
-{{- $cacheCreate = dict "create" true "medium" $medium
+{{- $cacheCreate = dict "create" true "medium" $medium "path" ""
       "storageClass" (required "buildHosts.cache.storageClass is required when buildHosts.cache.create — the build cache is shared by every replica, so it needs a ReadWriteMany class (e.g. azurefile-memex)" $cc.storageClass)
       "size" (required "buildHosts.cache.size is required when buildHosts.cache.create — the chart will not guess a volume size" $cc.size)
       "accessMode" ($cc.accessMode | default "ReadWriteMany") -}}

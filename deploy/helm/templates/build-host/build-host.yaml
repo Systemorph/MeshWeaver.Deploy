@@ -335,6 +335,10 @@ spec:
           {{- if eq $b.cache.medium "node" }}
           # Node-local (cache.medium: node): a host in its own user namespace cannot mount an SMB/NFS claim.
           emptyDir: {{- if $b.cache.size }} { sizeLimit: {{ $b.cache.size | quote }} }{{- else }} {}{{- end }}
+          {{- else if eq $b.cache.medium "host" }}
+          # Node-local and SHARED (cache.medium: host): every host on the node, across restarts and scale-in. `Directory`,
+          # never DirectoryOrCreate — node setup prepares it owned by the host's uid; a missing one keeps the pod failing.
+          hostPath: { path: {{ $b.cache.path | quote }}, type: Directory }
           {{- else }}
           persistentVolumeClaim: { claimName: {{ $b.cacheClaim | quote }} }
           {{- end }}

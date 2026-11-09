@@ -3385,7 +3385,11 @@ def _update_mirror(repo: str, url: str, mirror_root: str, mirror: str, wanted: l
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
         else:
+            # Said, not silent: on a cache that outlives the pod (a node hostPath, a leased Mac's volume) this line is the
+            # evidence that the master was already there and only fetched (Plugins Hosting/BuildQueue.md §7.3b).
+            started = time.monotonic()
             git("-C", mirror, "fetch", "--quiet", "--prune", "origin")
+            log(f"git mirror fetched (existing): {mirror} in {time.monotonic() - started:.1f} s")
         # A PR head (refs/pull/N/head) or the exact sha may not be on a mirrored ref yet.
         git("-C", mirror, "fetch", "--quiet", "origin", *wanted)
 
@@ -6795,11 +6799,15 @@ def self_test() -> int:
         check("mirror/the PR ref and the sha are fetched into the mirror",
               any(c[:3] == ("-C", mirror, "fetch") and "refs/pull/7/head" in c and "d" * 40 in c for c in calls), calls)
         calls.clear()
+        mlog: list[str] = []
         default_checkout("MeshWeaver.Plugins", "d" * 40, [], os.path.join(tmp, "r2", "src"),
-                         None, genv, lambda s: None, git=fake_git)
+                         None, genv, mlog.append, git=fake_git)
         check("mirror/later use fetches --prune, never re-clones the mirror",
               not any(c[:2] == ("clone", "--mirror") for c in calls)
               and any(c[:4] == ("-C", mirror, "fetch", "--quiet") and "--prune" in c for c in calls), calls)
+        check("mirror/later use SAYS it fetched an existing mirror, and never that it created one",
+              any(m.startswith(f"git mirror fetched (existing): {mirror} in ") for m in mlog)
+              and not any(m.startswith("git mirror created:") for m in mlog), mlog)
         check("mirror/the checkout is detached at the sha", calls[-1][-2:] == ("--detach", "d" * 40), calls[-1])
 
         # ── 5a''. NOTHING IS EVER COPIED (§7.3b): the gate reads this file's own source ─────────────────────────────────

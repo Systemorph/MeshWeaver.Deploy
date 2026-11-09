@@ -687,6 +687,46 @@ else
   report "the node-local cache values did not render:"; sed 's/^/    /' "$WORK/nodecache.err"
 fi
 
+# 3e2. a node-local SHARED cache (cache.medium: host): a hostPath of type Directory (never DirectoryOrCreate — node setup
+#      prepares it owned by the host's uid) at cache.path on every host, no emptyDir and no claim. Negative control: the
+#      same check run on the node render (3e) must FAIL, so it cannot pass vacuously.
+host_cache_check() {
+  python3 - "$1" <<'PY4H'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+problems = []
+hosts = [d for d in docs if d.get("kind") == "Deployment" and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "build-host"]
+if not hosts: problems.append("no build-host Deployment rendered")
+for d in hosts:
+    vols = {v["name"]: v for v in d["spec"]["template"]["spec"]["volumes"]}
+    cache = vols.get("cache", {})
+    if cache != {"name": "cache", "hostPath": {"path": "/var/lib/mw-build-cache", "type": "Directory"}}:
+        problems.append(f"{d['metadata']['name']}: cache volume {cache}")
+    mounts = {m["name"]: m["mountPath"] for c in d["spec"]["template"]["spec"]["containers"] for m in c.get("volumeMounts", [])}
+    if mounts.get("cache") != "/cache":
+        problems.append(f"{d['metadata']['name']}: the cache is not mounted at /cache ({mounts.get('cache')})")
+pvcs = [d["metadata"]["name"] for d in docs if d.get("kind") == "PersistentVolumeClaim"]
+if pvcs: problems.append(f"a claim rendered although the cache is a hostPath: {pvcs}")
+for p in problems: print("   ", p)
+sys.exit(1 if problems else 0)
+PY4H
+}
+if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.cache.medium=host \
+     --set buildHosts.cache.path=/var/lib/mw-build-cache --namespace check > "$WORK/hostcache.yaml" 2> "$WORK/hostcache.err"; then
+  host_cache_check "$WORK/hostcache.yaml" && ok "cache.medium host renders a hostPath (type Directory) cache at cache.path on every host and no claim" || report "the hostPath cache render is wrong (above)"
+else
+  report "the hostPath cache values did not render:"; sed 's/^/    /' "$WORK/hostcache.err"
+fi
+# The control must fail for the RIGHT reason — the cache volume comparison, naming the emptyDir — never a traceback, a
+# parse error or "no build-host Deployment rendered".
+if [ -s "$WORK/nodecache.yaml" ] && ! host_cache_check "$WORK/nodecache.yaml" > "$WORK/hostcheck-on-node.out" 2>&1 \
+     && grep -q ": cache volume {'name': 'cache', 'emptyDir': {'sizeLimit': '100Gi'}}" "$WORK/hostcheck-on-node.out" \
+     && ! grep -q "Traceback\|no build-host Deployment rendered" "$WORK/hostcheck-on-node.out"; then
+  ok "negative control: the hostPath check refuses the node medium's render, on its emptyDir cache volume"
+else
+  report "negative control failed: the hostPath check passed on the node medium's render, or failed for another reason:"; sed 's/^/    /' "$WORK/hostcheck-on-node.out" 2>/dev/null
+fi
+
 # 3f. artifactStore.upload: the hosts hand their artifacts to the BUILD API (MW_BUILD_ARTIFACT_STORE=api:) — no store claim, no
 #     /ci-artifacts mount (a host in its own user namespace cannot mount the share) — and upload beside a claim is refused.
 if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.artifactStore.claimName= \
@@ -796,10 +836,17 @@ for entry in \
   "values.build-hosts-cache-bad-access.yaml|must be ReadWriteMany or ReadWriteOnce" \
   "values.build-hosts-extra-channel-dash.yaml|ending in a letter or digit" \
   "values.build-hosts-userns-not-bool.yaml|sandbox.userNamespace" \
-  "values.build-hosts-cache-bad-medium.yaml|must be claim or node" \
-  "values.build-hosts-cache-medium-false.yaml|must be claim or node" \
-  "values.build-hosts-cache-medium-zero.yaml|must be claim or node" \
-  "values.build-hosts-cache-medium-empty.yaml|must be claim or node" \
+  "values.build-hosts-cache-bad-medium.yaml|must be claim, node or host" \
+  "values.build-hosts-cache-medium-false.yaml|must be claim, node or host" \
+  "values.build-hosts-cache-medium-zero.yaml|must be claim, node or host" \
+  "values.build-hosts-cache-medium-empty.yaml|must be claim, node or host" \
+  "values.build-hosts-cache-host-no-path.yaml|buildHosts.cache.path \"\" must be an absolute node directory" \
+  "values.build-hosts-cache-host-relative-path.yaml|buildHosts.cache.path \"var/lib/mw-build-cache\" must be an absolute node directory" \
+  "values.build-hosts-cache-host-dotdot-path.yaml|buildHosts.cache.path \"/var/lib/../etc\" must be an absolute node directory" \
+  "values.build-hosts-cache-host-root-path.yaml|buildHosts.cache.path \"/\" must be an absolute node directory" \
+  "values.build-hosts-cache-host-size.yaml|is not supported with cache.medium host" \
+  "values.build-hosts-cache-node-path.yaml|buildHosts.cache.path is only for cache.medium host" \
+  "values.build-hosts-cache-host-create.yaml|buildHosts.cache.create is not supported with cache.medium host" \
   "values.build-hosts-userns-empty-0.yaml|sandbox.userNamespace" \
   "values.build-hosts-userns-empty-string.yaml|sandbox.userNamespace" \
   "values.build-hosts-userns-empty-list.yaml|sandbox.userNamespace" \
