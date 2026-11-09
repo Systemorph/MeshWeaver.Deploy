@@ -9,14 +9,45 @@
 #   HOSTING_SA_GRAPH_DENIED=1 every `ad app …` call fails as an identity with no Graph right does
 #   HOSTING_SA_SET_FAIL=1     every `keyvault secret set` refuses
 #
+# Per-machine mode (--per-machine) additionally:
+#   HOSTING_SA_APPS           newline-separated app ids `ad app list --display-name` answers (default: none)
+#   HOSTING_SA_SP=1           `ad sp show` finds the service principal (default: absent → `ad sp create`)
+#   state/redirects           written by `ad app create` / `ad app update`; `ad app show` answers it when present
+#   state/credentials         `ad app credential reset` appends its --display-name; `delete` removes it
+#
 # 🚨 `ad app credential reset` prints the minted secret on STDERR as well as stdout — exactly as
 # the real az does (runbook step 1 measured it) — so the test can prove the script discards it.
 set -uo pipefail
 state="${HOSTING_SA_STATE:?the az stub needs HOSTING_SA_STATE}"
 printf 'az %s\n' "$*" >> "$state/az.log"
 SECRET="fake-client-secret-NEVER-PRINTED"
+uris_after() {  # the --web-redirect-uris values of this argv, one per line
+  local on=0 a
+  for a in "$@"; do
+    case "$a" in --web-redirect-uris) on=1; continue ;; --*) on=0 ;; esac
+    [ "$on" = 1 ] && printf '%s\n' "$a"
+  done
+}
 case "${1:-} ${2:-} ${3:-}" in
+  "account show "*)
+    printf '%s\n' "00000000-0000-4000-8000-0000000000aa"; exit 0 ;;
+  "ad app list")
+    [ "${HOSTING_SA_GRAPH_DENIED:-0}" = "1" ] && { echo "ERROR: Insufficient privileges to complete the operation." >&2; exit 1; }
+    [ -n "${HOSTING_SA_APPS:-}" ] && printf '%s\n' "$HOSTING_SA_APPS"
+    exit 0 ;;
+  "ad app create")
+    [ "${HOSTING_SA_GRAPH_DENIED:-0}" = "1" ] && { echo "ERROR: Insufficient privileges to complete the operation." >&2; exit 1; }
+    uris_after "$@" > "$state/redirects"
+    printf '%s\n' "0e5a1d2c-0000-4000-8000-0000000000b1"; exit 0 ;;
+  "ad app update")
+    uris_after "$@" > "$state/redirects"; exit 0 ;;
+  "ad sp show")
+    [ "${HOSTING_SA_SP:-0}" = "1" ] && { printf '%s\n' "sp-object-id"; exit 0; }
+    echo "ERROR: Resource does not exist or one of its queried reference-property objects are not present." >&2; exit 3 ;;
+  "ad sp create")
+    printf '%s\n' "sp-object-id"; : > "$state/sp-created"; exit 0 ;;
   "ad app show")
+    [ -f "$state/redirects" ] && [ "${HOSTING_SA_GRAPH_DENIED:-0}" != "1" ] && { cat "$state/redirects"; exit 0; }
     [ "${HOSTING_SA_GRAPH_DENIED:-0}" = "1" ] && { echo "ERROR: Insufficient privileges to complete the operation." >&2; exit 1; }
     printf '%s\n' "${HOSTING_SA_REDIRECTS-https://acme.meshweaver.cloud/signin-microsoft}"; exit 0 ;;
   "ad app credential")
@@ -24,9 +55,12 @@ case "${1:-} ${2:-} ${3:-}" in
     case "${4:-}" in
       reset) for a in "$@"; do [ "$a" = "--append" ] && appended=1; done
              [ "${appended:-0}" = "1" ] || { echo "az stub: credential reset WITHOUT --append would revoke the app's other credentials — refusing" >&2; exit 1; }
-             echo "WARNING: The output includes credentials that you must protect. $SECRET" >&2
-             printf '%s\n' "$SECRET"; exit 0 ;;
-      list)  printf '2027-09-12T00:00:00Z\n'; exit 0 ;;
+             label=""; prev=""; for a in "$@"; do [ "$prev" = "--display-name" ] && label="$a"; prev="$a"; done
+             printf '%s\n' "$label" >> "$state/credentials"
+             echo "WARNING: The output includes credentials that you must protect. ${HOSTING_SA_SECRET:-$SECRET}" >&2
+             printf '%s\n' "${HOSTING_SA_SECRET:-$SECRET}"; exit 0 ;;
+      list)  case "$*" in *keyId*) printf '%s\n' "11111111-2222-4333-8444-555555555555" ;; *) printf '2027-09-12T00:00:00Z\n' ;; esac; exit 0 ;;
+      delete) : > "$state/credential-deleted"; exit 0 ;;
     esac ;;
   "keyvault secret list")
     [ "${HOSTING_SA_LIST_FAIL:-0}" = "1" ] && { echo "ERROR: (Forbidden) secrets list permission" >&2; exit 1; }

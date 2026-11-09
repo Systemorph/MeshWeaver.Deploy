@@ -25,21 +25,98 @@ profile. Its keys are `ControlUrl`, `DeploymentId`, `RegistryUrl`, `LoginServer`
 variables `FLEET_CONTROL_URL`, `FLEET_MACHINE_ID`, `FLEET_REGISTRY_URL` and `FLEET_LOGIN_SERVER` override
 them. Nothing secret is configured.
 
-**Registering it**: upload this file's content at a tagged version as the Intune shell script. Set it to
-run as the signed-in system context, repeat it (for example daily), and assign it to the Mac Studio group.
-The version is `FLEET_BOOTSTRAP_VERSION` in the file; the run log names it on every line.
+**Registering it** is the reconcile's job (section "Intune objects as code" below): the spec pins the script to a full commit of this
+repository and the file's sha256, `--apply` uploads exactly those bytes (refusing any that hash differently), and
+`--check` names a live copy that differs. A new version is a new pin in the spec, never a moving reference. It runs
+as the system context, every hour (`PT1H`), 3 retries, with the Studios group included and the hand-attached
+machines' group excluded. The version is `FLEET_BOOTSTRAP_VERSION` in the file; the run log names it on every line.
 
 **Tests**: `deploy/macos/test/run-tests.sh` (the plist lints, the console-user and machine-id rules, and
 a dry run on a bare Mac that plans every step, changes nothing and waits). `FLEET_BOOTSTRAP_DRY_RUN=1`
 prints every changing command instead of running it.
+
+## Intune objects as code (`intune-reconcile.py` + a declared spec)
+
+A new Mac Studio needs exactly two human steps: the owner enrols it in Intune, and a global administrator presses
+**Approve** on control. Everything Intune has to carry for that — the groups, the bootstrap, the `com.memex.local`
+keys, the fleet CA's trust, the update window, the compliance carve-out, and the Mac's own group membership — is a
+DECLARED spec reconciled by `intune-reconcile.py` (Python standard library only).
+
+| Command | What it does |
+|---|---|
+| `--check --spec <f>` | Read-only. One line per object: `OK`, `DRIFT`, `HELD`, `PENDING`, `INFO` or `ERROR`, and every non-OK line says what `--apply` WOULD do. Exit 0 in sync (PENDING allowed), 2 drift, 1 error |
+| `--apply --spec <f>` | Creates and patches to match. **Never deletes**: an assignment, group member or object the spec does not name is reported as kept. Assignments are written as the union of live and declared; the only target ever dropped is one the spec lists under `assign.remove`. An object with `hold` is never written |
+| `--validate --spec <f>` | The spec's shape, no Graph call (CI) |
+| `--self-test` | Against an in-memory Graph: create, no-op, drift, exclusion assignment, declared removal, held objects, device membership, a pinned source that does not match its sha256 |
+
+**This repository holds the tool and an EXAMPLE** (`fleet.spec.example.json`, placeholders only). The installation's
+real spec — object ids, hosts, serial numbers, the owner — lives in the estate's private configuration repository,
+whose workflow calls [`intune-drift-check.yml`](../../../.github/workflows/intune-drift-check.yml) so the drift report
+is written to a private log. `.github/workflows/intune-reconcile.yml` runs the self-test and validates the example here.
+
+**Credential** (first that is present; the token is never printed): `INTUNE_CLIENT_ID` + `INTUNE_TENANT_ID` with
+`INTUNE_CLIENT_SECRET`, or with `AZURE_FEDERATED_TOKEN_FILE` (workload identity federation — what the drift check
+uses); otherwise `az account get-access-token --resource https://graph.microsoft.com --tenant <spec.tenant>`.
+🔐 The scheduled drift check must NOT sign in as the apply identity: its federated credential would have to trust the
+private repository's pull-request subject, and every pull-request branch could then mint a token that WRITES device
+management. It signs in as a separate READ-ONLY identity (`DeviceManagementConfiguration.Read.All`,
+`DeviceManagementScripts.Read.All`, `DeviceManagementManagedDevices.Read.All`, `Group.Read.All`, `Device.Read.All`),
+whose federated credentials name that repository's `main` and `pull_request` subjects; the `appIdentity` line then
+reads INFO (a different application), and the apply identity's grants are verified when a person runs `--apply`.
+⚠️ The Azure CLI's own sign-in carries NO Intune scopes (measured 2026-11-09: every `deviceManagement` read →
+403), so a person's `az login` reads the groups and nothing else; the reconcile needs the app identity.
+
+**What each object is** (spec section → Intune object):
+
+| Spec | Intune / directory object | Notes |
+|---|---|---|
+| `appIdentity.requiredRoles` | the app identity's Graph application permissions | **verified only** (from the token's `roles` claim): `DeviceManagementConfiguration.ReadWrite.All`, `DeviceManagementScripts.ReadWrite.All`, `DeviceManagementManagedDevices.Read.All`, `Group.Read.All`, `Device.Read.All`, `GroupMember.ReadWrite.All`. A missing one is drift no `--apply` repairs: an admin-consented grant is the owner's act |
+| `groups.studios` / `groups.noBootstrap` | two ASSIGNED security groups: the Studios, and the hand-attached Studios the bootstrap must not touch | the app identity cannot create a group (no `Group.Create`); an absent group is reported with the body a person creates |
+| `groups.*.devices` `[{serial, name}]` | group membership | serial → `managedDevices` (macOS) → `azureADDeviceId` → the directory `device` object → `POST /groups/{id}/members/$ref`. A Mac not yet enrolled is `PENDING`; a member the spec does not declare is reported and kept |
+| `scripts[]` | `deviceShellScript` | content = `source.path` at `source.commit` (a full sha) with `source.sha256`; `runAsAccount`, `executionFrequency`, `retryCount`, `blockExecutionNotifications`, include + exclude |
+| `customProfiles[]` | `macOSCustomConfiguration`, device channel, domain `com.memex.local` | the payload is BUILT from `plist` + `keys` and compared by parsed value, not bytes. Keys: `ControlUrl`, `RegistryUrl`, `LoginServer`, `OwnerId`, `OwnerEmail` and the participation answers `AcceptJobs`, `AcceptJobsFrom`, `AcceptJobsChannels`, `AcceptJobsRepos`, `AcceptTokens`, `AcceptTokensFrom`, `AcceptTokensModels`, `AcceptTokensResidency`. `AcceptJobs` / `AcceptTokens` must be explicit booleans (validation refuses a spec without them), and `AcceptTokens: true` needs `AcceptTokensModels` (the bootstrap refuses tokens on without models, so validation does too); a list is written as ONE comma-separated string, the form `memex-local --accept-jobs=…` / `--token-models` take, so the bootstrap passes `defaults read` output through unchanged |
+| `trustedRootCertificates[]` | `macOSTrustedRootCertificate` | the fleet local CA's PUBLIC certificate (`certFile`, PEM or DER, next to the spec) and its DER sha256. Until the CA is minted, `sha256` is empty and the line is `PENDING — CA not minted yet` |
+| `settingsPolicies[]` | settings-catalog policy (the DDM night-window software-update policy) | `settings` maps `settingDefinitionId` → value; `--apply` rewrites those values in the LIVE tree and PUTs it back (the tree itself is created in the admin center, then its id is recorded). Each Apple release bumps `enforcement_targetosversion` + `enforcement_targetlocaldatetime` here |
+| `compliancePolicies[]` | `deviceCompliancePolicy` | existing policies by id (assignments, declared `properties`), new ones created from `properties` |
+
+### The console password that expired at enrolment (2026-11-09)
+
+Read-only Graph on 2026-11-09: no macOS configuration profile and no macOS settings-catalog policy in the tenant
+carries a password rule. The ONLY password rule reaching every Mac is the tenant's macOS **compliance** policy:
+`passwordRequired: true`, `passwordRequiredType: deviceDefault`, no expiry days, no minimum length, assigned to
+**all licensed users AND all devices**. Intune delivers a compliance password rule to a Mac as a passcode payload;
+the second Studio's local password was marked expired right after enrolment, and every non-interactive SSH login
+failed. NOT established: which passcode key macOS evaluated to expire it — no device-side profile dump was taken.
+
+The fix, declared and **held** (it changes the tenant-wide policy, so it waits for the owner's go):
+1. the tenant policy is assigned to **all devices** only, with **Fleet — Mac Studios** EXCLUDED, and its
+   all-licensed-users assignment is a declared removal. Intune does not evaluate a DEVICE-group exclusion against a
+   USER-targeted assignment, so excluding the Studios while the policy still reaches their enrolling user would
+   change nothing; for a macOS-only policy the all-devices target already covers every enrolled Mac;
+2. a Studios compliance policy without a password rule (`storageRequireEncryption`, Gatekeeper), assigned to the
+   Studios, so they keep a compliance verdict.
+Lifting the hold is a reviewed change to the spec (delete `hold`), never a command-line flag.
+
+### Device membership without a spec line: the dynamic-group alternative (evaluated, not created)
+
+A dynamic device group would add a Studio without anyone naming its serial. What the directory offers for these
+Macs (read 2026-11-09): `deviceOSType = MacMDM`, `deviceModel = Mac17,14`, `manufacturer = Apple`,
+`enrollmentProfileName` empty, `deviceOwnership = Personal` (Company Portal enrolment). So:
+- `(device.deviceOSType -eq "MacMDM") and (device.deviceModel -in [...])` would work today, but the list of Mac
+  Studio model identifiers has to grow with every generation, and it would ALSO capture any person's Mac Studio that
+  is not a fleet machine — the fleet bootstrap would then run as root on it;
+- `device.enrollmentProfileName -eq "<ADE profile>"` is the right rule once the Studios enrol through Apple
+  Business Manager (automated device enrolment with a fleet-only enrolment profile): membership then follows the
+  purchase, nothing is named, nothing is mis-captured. Without ABM it matches nothing.
+Until ABM exists, the declared serial list is the safer choice: a Mac joins the fleet because someone named it.
 
 ## Microsoft sign-in: the device's work account, silently
 
 A managed Mac is signed in to macOS with a LOCAL account, while Company Portal registered it with the
 person's Entra work account; a managed iPhone may carry a private Apple ID while it is MDM-enrolled for the
 work account. Microsoft sign-in on these devices must use the WORK account — and never silently pick a
-personal Microsoft account. Three pieces, committed here and created in Intune only on the maintainer's go
-(nothing in this repository calls Graph):
+personal Microsoft account. Three pieces, committed here as profiles and Graph bodies; the fleet objects the reconcile declares (section
+above) are the ones it creates and checks — these sign-in pieces are registered by hand from the bodies below:
 
 | # | Profile (source of truth) | Graph body | What it does |
 |---|---|---|---|

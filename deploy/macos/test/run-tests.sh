@@ -427,6 +427,19 @@ ln -sf /etc/hosts "$T/kh/enrol/studio-3.preauth"
 env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; take_preauth_key "$1" "$2" "$(id -un)"' "$FB" "$T/kh/enrol/none.preauth" "$T/kh/held/c.key" && [ ! -e "$T/kh/held/c.key" ] \
   && ok "no dropped key: nothing taken, no failure" || bad "no key" "failed"
 grep -q 'softwareupdate said:' "$FB" && ok "a failed Command Line Tools install logs what softwareupdate said" || bad "softwareupdate output logged" "missing"
+mkdir -p "$T/shh"
+SO="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_USER_HOME="$T/shh" FLEET_BREW_PREFIX="$T/brewx" FLEET_LOG_DIR="$T/shlog" bash -c '. "$0"; ensure_shellenv jroe' "$FB" 2>&1)"
+case "$SO" in *"adding the shellenv line to $T/shh/.zprofile"*"DRY-RUN"*) ok "the bootstrap puts Homebrew's shellenv into the person's ~/.zprofile (a new Terminal finds the tools)" ;; *) bad "shellenv written" "$SO" ;; esac
+printf 'eval "$(%s/bin/brew shellenv)"\n' "$T/brewx" > "$T/shh/.zprofile"
+[ -z "$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_USER_HOME="$T/shh" FLEET_BREW_PREFIX="$T/brewx" FLEET_LOG_DIR="$T/shlog" bash -c '. "$0"; ensure_shellenv jroe' "$FB" 2>&1)" ] \
+  && ok "an existing shellenv line is left alone (idempotent)" || bad "shellenv idempotent" "rewritten"
+AS="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_LOG_DIR="$T/aslog" FLEET_MANAGED_PREFS="$T/none" FLEET_ORGANISATION=Acme FLEET_OWNER_NAME="Jane Roe" \
+  FLEET_OWNER_EMAIL=jane.roe@example.com FLEET_ACCEPT_TERMS=true bash -c '. "$0"; answer_setup jroe studio-2 /opt/x/memex-local' "$FB" 2>&1)"; RC=$?
+case "$RC:$OUT$AS" in 0:*"DRY-RUN: sudo -u jroe -H env"*"/opt/x/memex-local setup --apply --name studio-2 --company Acme --owner-name Jane\ Roe --owner-email jane.roe@example.com --accept-terms"*"setup answered"*) ok "a fleet Mac never waits for a person at the wizard: the bootstrap answers the setup API from the profile, as the console user (executed)" ;; *) bad "unattended setup executed" "rc=$RC: $AS" ;; esac
+AS2="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_LOG_DIR="$T/aslog" FLEET_MANAGED_PREFS="$T/none" FLEET_ORGANISATION=Acme FLEET_OWNER_NAME="Jane Roe" \
+  FLEET_OWNER_EMAIL=jane.roe@example.com bash -c '. "$0"; answer_setup jroe studio-2 /opt/x/memex-local' "$FB" 2>&1)"; RC=$?
+case "$RC:$AS2" in 0:*"WAITING for the first-run setup answers"*) case "$AS2" in *"setup --apply"*) bad "no AcceptTerms → nothing answered" "$AS2" ;; *) ok "without AcceptTerms=true nothing is answered, and the run says what it waits for" ;; esac ;; *) bad "no AcceptTerms → waits" "rc=$RC: $AS2" ;; esac
+! grep -q "runs 'memex-local setup'" "$FB" && ok "the bootstrap never asks a person to run memex-local setup" || bad "no person at the wizard" "still asks"
 grep -q 'installondemand.in-progress' "$FB" && grep -q 'rm -f "$flag"' "$FB" && ok "the on-demand flag is set for the catalogue and always removed" || bad "on-demand flag" "missing"
 grep -q -- '--auth-key="file:$key_file"' "$FB" && ! grep -q -- '--auth-key "\$key"' "$FB" \
   && ok "the pre-auth key is passed by FILE reference (never an argument)" || bad "auth key by file" "missing"
@@ -456,6 +469,16 @@ case "$RC:$OUT" in 0:*"memex: provisioning the local stack"*"the join follows on
 case "$OUT" in *"joined as"*) bad "a dry run never claims a join" "$OUT" ;; *) ok "a dry run never claims a join" ;; esac
 OUT="$(env FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_CONSOLE_USER=root FLEET_LOG_DIR="$T/logs" bash "$FB" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*"no one is logged in"*) ok "no one at the console: nothing to do, exit 0" ;; *) bad "no console user" "rc=$RC: $OUT" ;; esac
+
+echo "── Intune objects as code: the reconcile (deploy/macos/intune/intune-reconcile.py) ──"
+RECON="$MACOS/intune/intune-reconcile.py"
+OUT="$(python3 "$RECON" --self-test 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "the reconcile's self-test against a fake Graph passes ($(grep -c '^  ok' <<<"$OUT") cases)" || bad "intune-reconcile --self-test" "$OUT"
+OUT="$(python3 "$RECON" --validate --spec "$MACOS/intune/fleet.spec.example.json" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "the example fleet spec validates" || bad "fleet.spec.example.json invalid" "$OUT"
+sed 's/"AcceptTokens": false,//; s/"AcceptTokens": true,//' "$MACOS/intune/fleet.spec.example.json" > "$T/no-answer.spec.json"
+OUT="$(python3 "$RECON" --validate --spec "$T/no-answer.spec.json" 2>&1)"; RC=$?
+case "$RC:$OUT" in 1:*"keys.AcceptTokens must be an explicit true/false"*) ok "a spec without the owner's token answer is refused (participation is never implied)" ;; *) bad "missing AcceptTokens accepted" "rc=$RC: $OUT" ;; esac
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
