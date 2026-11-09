@@ -24,7 +24,8 @@ bin/hosting-kv-rotate  — TRANSITIONAL: reads the vaulted registry key to compa
 bin/hosting-registry-register  — TRANSITIONAL: reads the held instance key and the bootstrap key to call the registry
 bin/hosting-registry-coupon  — TRANSITIONAL: reads the registry's coupon-mint credential to call the registry; writes the minted coupon through --file, existence checked with `list`
 bin/hosting-tailnet-key  — writes the minted single-use Headscale pre-auth key through a mode-600 --file, tagged with metadata only; confirms by list-versions, no value read
-bin/hosting-signin-app  — writes the minted Entra client secret through --file; existence is checked with `list`, no value read
+bin/hosting-signin-app  — writes the minted Entra client secret through --file; existence is checked with `list`, no value read (its --per-machine mode writes no vault object at all: the secret is sealed to an enrolling Mac's key)
+bin/hosting-seal-secret  — reads ONE named vault object into a mode-600 file and emits only its RSA-OAEP ciphertext sealed to an enrolling Mac's throw-away key (enrolment v2); never prints, never writes
 bin/hosting-image-mirror  — TRANSITIONAL: reads the registry publisher password to push the mirror
 bin/hosting-pull-secret  — TRANSITIONAL: reads the registry pull key to render the image pull Secret
 bin/hosting-deploy  — TRANSITIONAL: downloads the helm values half (helm-values-<release>); retired with the vault half

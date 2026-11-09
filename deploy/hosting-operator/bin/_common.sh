@@ -504,3 +504,80 @@ hosting::find_drift_dir() {
   done
   hosting::die "the drift scripts (check-chart-drift.sh, chart-drift-record.py, kind-not-served.sh) are not beside this command — looked in \$HOSTING_DRIFT_SCRIPTS, ${self}/../../scripts, ${self}/../../aks/scripts and /opt/hosting/drift. The lane's MeshWeaver.Deploy checkout must include deploy/aks/scripts (the image carries them at /opt/hosting/drift): they hold the chart comparison and the one rule for a kind this cluster does not serve."
 }
+
+# ── sealing a value to an enrolling Mac's throw-away key (Hosting/MacStudioFleet §2b, enrolment v2) ──
+#
+# An enrolment code carries each secret SEALED SEPARATELY to the request's public key (RSA-3072+,
+# OAEP-SHA256 with MGF1-SHA256, one block per item), so a value minted HERE — a tailnet key, an Entra
+# client secret, a vault object — is sealed where it exists and leaves this job as ciphertext only.
+# The one machine line a sealed item produces (MeshWeaver.Plugins OperatorOutput.ReadSealedItem):
+#
+#     ::hosting:: sealed_item item=<x> fp=<sha256:12hex | withheld:low-entropy> b64=<base64 ciphertext>
+#
+# and a plain fact for the code's `f` part:  ::hosting:: enrol_fact key=<k> value=<v>
+#
+# 🚨 THE PLAINTEXT NEVER LEAVES A MODE-600 FILE. It is read by openssl from that file, never put on an
+# argv, a variable that is echoed, or a fact; what crosses back is the ciphertext and the fingerprint
+# (hosting::fingerprint — the same rule as every vault tag: no hash of a low-entropy value).
+#
+# Both helpers set globals and die in place — call them directly, NEVER inside $(…) (see hosting::safe_name).
+
+# hosting::seal_key <spki base64> <private work dir> — validate the recipient key and leave
+# <dir>/seal.pem behind. Sets HOSTING_SEAL_LIMIT (the largest plaintext one OAEP-SHA256 block holds:
+# modulus bytes − 66) and HOSTING_SEAL_BITS. Refuses anything but an RSA key of at least 3072 bits.
+# shellcheck disable=SC2034  # HOSTING_SEAL_BITS/HOSTING_SEAL_LIMIT are read by the sourcing command
+HOSTING_SEAL_LIMIT="" HOSTING_SEAL_BITS=""
+hosting::seal_key() {
+  local spki="$1" dir="$2" text bits
+  # Length apart from the alphabet: bash's ERE caps a {m,n} bound at 255.
+  [ "${#spki}" -ge 200 ] && [ "${#spki}" -le 2400 ] && [[ "$spki" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] \
+    || hosting::die "seal-to is not the base64 of a public key (SubjectPublicKeyInfo DER, standard alphabet) — refusing"
+  command -v openssl >/dev/null 2>&1 || hosting::die "openssl is not installed here — a value cannot be sealed, so nothing is minted"
+  printf '%s' "$spki" | base64 -d > "$dir/seal.der" 2>/dev/null \
+    || hosting::die "seal-to does not decode as base64 — refusing"
+  text="$(openssl rsa -pubin -inform DER -in "$dir/seal.der" -noout -text 2>/dev/null | head -n1)"
+  [[ "$text" =~ \(([0-9]+)\ bit\) ]] \
+    || hosting::die "seal-to is not an RSA public key (SubjectPublicKeyInfo DER) — refusing to seal to it"
+  bits="${BASH_REMATCH[1]}"
+  [ "$bits" -ge 3072 ] && [ "$bits" -le 8192 ] \
+    || hosting::die "seal-to is an RSA-${bits} key — an enrolment seals only to RSA-3072 to RSA-8192"
+  openssl rsa -pubin -inform DER -in "$dir/seal.der" -outform PEM -out "$dir/seal.pem" >/dev/null 2>&1 \
+    || hosting::die "seal-to could not be converted for openssl — refusing"
+  HOSTING_SEAL_BITS="$bits"
+  HOSTING_SEAL_LIMIT=$(( bits / 8 - 66 ))
+}
+
+# hosting::safe_item <item> — one lower-case letter, the enrolment code's item alphabet (`t`, `e`, `n`, …).
+hosting::safe_item() {
+  [[ "${1:-}" =~ ^[a-z]$ ]] || hosting::die "item '${1:-}' is not one lower-case letter — the enrolment code names each sealed item by one"
+}
+
+# hosting::seal_item <item> <plaintext file> <dir> — seal the file's bytes to <dir>/seal.pem and PRINT
+# the sealed_item fact. RETURNS 1 (never dies) when it cannot, setting HOSTING_SEAL_ERR, so a caller
+# that holds a live credential (a minted key) can revoke it before it fails the step.
+# shellcheck disable=SC2034  # HOSTING_SEAL_ERR is read by the sourcing command
+HOSTING_SEAL_ERR=""
+# shellcheck disable=SC2034  # HOSTING_SEAL_ERR is read by the sourcing command
+hosting::seal_item() {
+  local item="$1" file="$2" dir="$3" size fp b64
+  HOSTING_SEAL_ERR=""
+  size="$(LC_ALL=C wc -c < "$file" | tr -d ' ')"
+  if [ "$size" -lt 1 ]; then HOSTING_SEAL_ERR="the value for item ${item} is empty"; return 1; fi
+  if [ "$size" -gt "$HOSTING_SEAL_LIMIT" ]; then
+    HOSTING_SEAL_ERR="the value for item ${item} is ${size} bytes — one RSA-${HOSTING_SEAL_BITS} OAEP-SHA256 block holds at most ${HOSTING_SEAL_LIMIT}"
+    return 1
+  fi
+  if ! openssl pkeyutl -encrypt -pubin -inkey "$dir/seal.pem" -in "$file" -out "$dir/sealed.${item}" \
+        -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 >/dev/null 2>&1; then
+    HOSTING_SEAL_ERR="openssl could not seal item ${item} to the given key"
+    return 1
+  fi
+  b64="$(base64 < "$dir/sealed.${item}" | tr -d '\n')"
+  rm -f "$dir/sealed.${item}"
+  [ -n "$b64" ] || { HOSTING_SEAL_ERR="sealing item ${item} produced no ciphertext"; return 1; }
+  fp="$(hosting::fingerprint "$file")"
+  printf '%s sealed_item item=%s fp=%s b64=%s\n' "$HOSTING_MARKER" "$item" "$fp" "$b64"
+}
+
+# hosting::enrol_fact <key> <value> — a PLAIN fact for the enrolment code (never a secret).
+hosting::enrol_fact() { printf '%s enrol_fact key=%s value=%s\n' "$HOSTING_MARKER" "$1" "$2"; }
