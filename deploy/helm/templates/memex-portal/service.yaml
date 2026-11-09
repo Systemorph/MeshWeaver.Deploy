@@ -34,4 +34,27 @@ spec:
       port: {{ .Values.grpc.port }}
       targetPort: {{ .Values.grpc.port }}
 {{- end }}
+---
+# The portal pods INCLUDING the ones not ready yet — the boot page's (boot-page.yaml) and
+# memex-local's way to the booting process's /_boot/progress (BootProgressEndpoint in
+# MeshWeaver.Plugins). Rendered whenever the portal is, so memex-local reads it with or without an
+# Ingress. Never an Ingress backend: traffic for people goes to memex-portal-service, which lists
+# ready pods only.
+apiVersion: "v1"
+kind: "Service"
+metadata:
+  name: "memex-portal-boot"
+  labels:
+    app.kubernetes.io/name: "{{ .Chart.Name }}"
+    app.kubernetes.io/component: "memex-portal-boot"
+    app.kubernetes.io/instance: "{{ .Release.Name }}"
+spec:
+  type: "ClusterIP"
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: "{{ .Chart.Name }}"
+    app.kubernetes.io/component: "memex-portal"
+    app.kubernetes.io/instance: "{{ .Release.Name }}"
+  ports:
+    - { name: "http", protocol: "TCP", port: 8080, targetPort: 8080 }
 {{- end }}

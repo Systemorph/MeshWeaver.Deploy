@@ -2613,6 +2613,9 @@ grep -q 'Hosting__LocalInstances__Root: "/host-instances"' "$IF" && grep -q 'Hos
 HD="$(awk '/^helm_deploy\(\) \{/,/^}$/' "$CLI")"
 grep -q 'mode_args+=(-f "$INSTANCES_FILE")' <<<"$HD" && [ "$(grep -n 'mode_args+=(-f "$BACKLEASE_FILE")' <<<"$HD" | cut -d: -f1)" -lt "$(grep -n 'mode_args+=(-f "$INSTANCES_FILE")' <<<"$HD" | cut -d: -f1)" ] \
   && ok "helm_deploy layers the bridge on the first instance, after back-lease" || bad "bridge in helm_deploy" ""
+# share/boot-progress.py — the terminal's reading of the portal's /_boot/progress (what changed between
+# two readings, the heartbeat with the ETA, errors, the ready line); pure, so its self-test needs no cluster.
+OUT="$(python3 -I "$HERE/../share/boot-progress.py" --self-test 2>&1)" && ok "boot-progress.py prints phases, landed modules, errors and the ETA heartbeat from the portal's own report" || bad "boot-progress.py self-test" "$OUT"
 grep -q 'instances-host' "$HERE/../share/instances.py" && bad "instances.py names the bridge layer" "" || ok "a created instance never gets the bridge layer (instances.py does not know it)"
 grep -c 'ensure_instances_agent  ' "$CLI" | grep -qx 2 && ok "up and update install the executor agent (registry mode)" || bad "agent install" "$(grep -n ensure_instances_agent "$CLI")"
 rm -rf "$IX"
