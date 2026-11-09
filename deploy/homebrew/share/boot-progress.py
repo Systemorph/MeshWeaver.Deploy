@@ -79,7 +79,12 @@ def lines(prev, cur, now, last_beat):
 
 
 def kubectl(context, *args):
-    return subprocess.run(["kubectl", "--context", context, *args], capture_output=True, text=True, timeout=20)
+    """One kubectl call. A call that does not answer in 20 s (a VM busy pulling the portal image is
+    exactly when this runs) is an unreadable reading like any other, never a crash."""
+    try:
+        return subprocess.run(["kubectl", "--context", context, *args], capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", "kubectl did not answer within 20 s")
 
 
 def newest_pod(context, ns):

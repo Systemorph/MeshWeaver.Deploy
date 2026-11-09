@@ -88,6 +88,7 @@ server {
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
   var el = function (tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  var sawReady = false;
   var mark = { done: "✓", failed: "✗", running: "●", pending: "○", skipped: "–" };
   function dur(s) { if (s == null) return ""; s = Math.round(s); return s < 60 ? s + " s" : Math.floor(s / 60) + " min " + (s % 60) + " s"; }
   function size(b) { if (b == null) return ""; return b >= 1048576 ? (b / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(b / 1024)) + " KB"; }
@@ -98,7 +99,10 @@ server {
       $("progress").hidden = true;
       return;
     }
-    if (r.ready) { location.reload(); return; }
+    // Ready twice in a row before reloading: the ingress keeps serving this page until the readiness
+    // probe passes and the endpoints propagate, and a reload on the first reading would loop.
+    if (r.ready) { if (sawReady) { location.reload(); } sawReady = true; return; }
+    sawReady = false;
     $("headline").textContent = r.headline + " — up " + dur(r.uptimeSeconds);
     var running = (r.phases || []).filter(function (p) { return p.state === "running"; }).pop();
     var counted = running && running.total != null;

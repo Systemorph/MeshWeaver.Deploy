@@ -35,11 +35,11 @@ spec:
       targetPort: {{ .Values.grpc.port }}
 {{- end }}
 ---
-# The portal pods INCLUDING the ones not ready yet — the boot page's (boot-page.yaml) and
-# memex-local's way to the booting process's /_boot/progress (BootProgressEndpoint in
-# MeshWeaver.Plugins). Rendered whenever the portal is, so memex-local reads it with or without an
-# Ingress. Never an Ingress backend: traffic for people goes to memex-portal-service, which lists
-# ready pods only.
+# The portal pods INCLUDING the ones not ready yet — the boot page's (boot-page.yaml) way to the
+# booting process's /_boot/progress (BootProgressEndpoint in MeshWeaver.Plugins). memex-local does
+# NOT use it: it reads the newest pod through the API server's pod proxy, so a still-ready old pod
+# cannot answer for a new one. Never an Ingress backend: traffic for people goes to
+# memex-portal-service, which lists ready pods only.
 apiVersion: "v1"
 kind: "Service"
 metadata:

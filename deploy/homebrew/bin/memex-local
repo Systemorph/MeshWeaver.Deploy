@@ -4974,7 +4974,9 @@ write_instances_layer() {
 follow_boot_progress() {
   local share; share="$(resolve_share)"
   [ -f "$share/boot-progress.py" ] && command -v python3 >/dev/null 2>&1 || return 0
-  python3 -I "$share/boot-progress.py" --namespace "$NAMESPACE" --context "${MEMEX_KUBE_CONTEXT:-colima}" \
+  # The SAME context the `kubectl rollout status` after it reads (the ambient one up/update deploy into).
+  local ctx; ctx="$(kubectl config current-context 2>/dev/null)" || return 0
+  python3 -I "$share/boot-progress.py" --namespace "$NAMESPACE" --context "$ctx" \
     --timeout "${1:-900}" || warn "the portal did not report ready in time — 'memex-local logs' says why"
 }
 

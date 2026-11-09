@@ -15,7 +15,7 @@
 # (MeshWeaver.Plugins BootProgressEndpoint, rendered by core's BootProgressReport). This backend
 # proxies that path to the portal pods through `memex-portal-boot` below, a Service that publishes
 # NOT-ready addresses — the portal's own Service has none while it boots, which is why this page
-# is showing at all. memex-local reads the same path through the same Service.
+# is showing at all. memex-local reads the same path through the API server's pod proxy instead.
 ---
 apiVersion: "v1"
 kind: "ConfigMap"
