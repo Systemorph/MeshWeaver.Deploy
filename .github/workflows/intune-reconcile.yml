@@ -42,7 +42,8 @@ jobs:
           if grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$f" | grep -v '^00000000-' ; then
             echo "::error file=$f::a GUID that is not a 00000000- placeholder — the real spec belongs in the estate's private repository"; exit 1
           fi
-          if grep -Eo 'https://[a-z0-9.*-]+' "$f" | grep -v 'example\.com$'; then
+          # Case-insensitive, any scheme, up to the first character that cannot be in a host (port and path dropped).
+          if grep -Eio '[a-z][a-z0-9+.-]*://[^/:"[:space:]]+' "$f" | grep -Eiv '://([a-z0-9*-]+\.)*example\.com$'; then
             echo "::error file=$f::a host that is not example.com"; exit 1
           fi
           echo "placeholders only"
