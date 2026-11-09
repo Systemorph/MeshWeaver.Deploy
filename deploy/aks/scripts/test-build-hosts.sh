@@ -712,16 +712,19 @@ sys.exit(1 if problems else 0)
 PY4H
 }
 if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.cache.medium=host \
-     --set buildHosts.cache.path=/var/lib/mw-build-cache --set buildHosts.cache.create=true --set buildHosts.cache.storageClass=azurefile-memex \
-     --namespace check > "$WORK/hostcache.yaml" 2> "$WORK/hostcache.err"; then
+     --set buildHosts.cache.path=/var/lib/mw-build-cache --namespace check > "$WORK/hostcache.yaml" 2> "$WORK/hostcache.err"; then
   host_cache_check "$WORK/hostcache.yaml" && ok "cache.medium host renders a hostPath (type Directory) cache at cache.path on every host and no claim" || report "the hostPath cache render is wrong (above)"
 else
   report "the hostPath cache values did not render:"; sed 's/^/    /' "$WORK/hostcache.err"
 fi
-if [ -s "$WORK/nodecache.yaml" ] && ! host_cache_check "$WORK/nodecache.yaml" >/dev/null; then
-  ok "negative control: the hostPath check refuses the node medium's render (an emptyDir cache)"
+# The control must fail for the RIGHT reason — the cache volume comparison, naming the emptyDir — never a traceback, a
+# parse error or "no build-host Deployment rendered".
+if [ -s "$WORK/nodecache.yaml" ] && ! host_cache_check "$WORK/nodecache.yaml" > "$WORK/hostcheck-on-node.out" 2>&1 \
+     && grep -q ": cache volume {'name': 'cache', 'emptyDir': {'sizeLimit': '100Gi'}}" "$WORK/hostcheck-on-node.out" \
+     && ! grep -q "Traceback\|no build-host Deployment rendered" "$WORK/hostcheck-on-node.out"; then
+  ok "negative control: the hostPath check refuses the node medium's render, on its emptyDir cache volume"
 else
-  report "negative control failed: the hostPath check passed on the node medium's render, or there was none to check"
+  report "negative control failed: the hostPath check passed on the node medium's render, or failed for another reason:"; sed 's/^/    /' "$WORK/hostcheck-on-node.out" 2>/dev/null
 fi
 
 # 3f. artifactStore.upload: the hosts hand their artifacts to the BUILD API (MW_BUILD_ARTIFACT_STORE=api:) — no store claim, no
@@ -843,6 +846,7 @@ for entry in \
   "values.build-hosts-cache-host-root-path.yaml|buildHosts.cache.path \"/\" must be an absolute node directory" \
   "values.build-hosts-cache-host-size.yaml|is not supported with cache.medium host" \
   "values.build-hosts-cache-node-path.yaml|buildHosts.cache.path is only for cache.medium host" \
+  "values.build-hosts-cache-host-create.yaml|buildHosts.cache.create is not supported with cache.medium host" \
   "values.build-hosts-userns-empty-0.yaml|sandbox.userNamespace" \
   "values.build-hosts-userns-empty-string.yaml|sandbox.userNamespace" \
   "values.build-hosts-userns-empty-list.yaml|sandbox.userNamespace" \

@@ -1248,7 +1248,8 @@ buildHosts:
     accessMode: "ReadWriteMany"
     # claim (default): the claim above, shared by every replica. node: a node-local emptyDir (sized by `size`, no
     # claim) — what a host in its own user namespace (sandbox.userNamespace) needs, since an SMB/NFS claim cannot be
-    # ID-mapped into it. host: a hostPath directory on the node (`path`, absolute, no `size`) shared by every host on
+    # ID-mapped into it. host: a hostPath directory on the node (`path`, absolute; `size` and `create` are refused, no
+    # claim is made, and storageClass/accessMode are unused) shared by every host on
     # that node and outliving restarts and scale-in — node setup must prepare it owned by the host's uid (1654), since
     # it is mounted as type Directory.
     medium: "claim"

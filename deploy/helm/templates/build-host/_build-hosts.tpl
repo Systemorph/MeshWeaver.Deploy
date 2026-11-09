@@ -17,8 +17,8 @@ The refusals, and why each one exists:
     — the worker token rides on it;
   * at least one channel must be enabled — an enabled block that renders no host is a typo;
   * `cache.create` needs its storageClass and size — the chart never guesses a volume's tier or size;
-  * `cache.medium: host` needs an absolute `cache.path` and refuses a `size` — a hostPath has no size limit to
-    enforce, and a `path` beside any other medium would be silently ignored;
+  * `cache.medium: host` needs an absolute `cache.path` and refuses a `size` (a hostPath has no size limit to
+    enforce) and `create` (no claim is made); a `path` beside any other medium would be silently ignored;
   * the artifact store is `upload: true` (through the build API) OR a `file:` store — never both, never anything else.
 */ -}}
 {{- define "memex.buildHosts" -}}
@@ -88,12 +88,15 @@ The refusals, and why each one exists:
 {{- if $cc.size -}}
 {{- fail (printf "buildHosts.cache.size %q is not supported with cache.medium host — a hostPath has no size limit to enforce" (toString $cc.size)) -}}
 {{- end -}}
+{{- if $cc.create -}}
+{{- fail "buildHosts.cache.create is not supported with cache.medium host — the cache is the node directory, no claim is created" -}}
+{{- end -}}
 {{- else if $cc.path -}}
 {{- fail (printf "buildHosts.cache.path is only for cache.medium host (medium is %q) — it would be ignored" $medium) -}}
 {{- end -}}
 {{- $cache := "" -}}
 {{- if eq $medium "claim" -}}
-{{- $cache = required "buildHosts.cacheClaimName is required — the shared RWX build-cache claim (or cache.medium: node)" $b.cacheClaimName -}}
+{{- $cache = required "buildHosts.cacheClaimName is required — the shared RWX build-cache claim (or cache.medium: node or host)" $b.cacheClaimName -}}
 {{- end -}}
 {{- $cacheCreate := dict "create" false "medium" $medium "size" ($cc.size | default "") "path" $cachePath -}}
 {{- if and (eq $medium "claim") $cc.create -}}
