@@ -6,7 +6,7 @@
 # `MachineReadings` shape the Hosting module's BackLeaseHeartbeat forwards to control
 # (MeshWeaver.Plugins Hosting/BackLease §5, Hosting/Queue/Source/Placement.cs):
 #
-#   { os, machine, models[{name,sizeGb,loaded,lastUsedAt}], vm{…}, host{…}, health{…}, sampledAt }
+#   { os, machine, models[{name,sizeGb,loaded,lastUsedAt}], vm{…}, host{…}, versions{…}, health{…}, sampledAt }
 #
 # Everything is a MEASUREMENT: nothing is configured here, nothing is guessed — a reading that cannot
 # be taken is omitted (the portal reads what is present) and the component is marked in `health`.
@@ -20,6 +20,8 @@
 #          sysctl -n vm.loadavg; pmset -g therm (CPU_Speed_Limit → thermal level); df -k $HOME;
 #          sysctl -n kern.boottime; pmset -g batt (power source)
 #   models ollama's native API: /api/tags (installed) + /api/ps (loaded)
+#   versions  memex-local — the Homebrew keg this agent runs from (MEMEX_LOCAL_SHARE); build-host — the
+#          platform-version annotation of the build host's Deployment in the build VM's cluster
 #   vm     kubectl get --raw /api/v1/nodes/<node>/proxy/stats/summary (the kubelet summary) and the
 #          pod requests + `mw/run` labels of the pods in the memex namespace
 #
@@ -197,6 +199,41 @@ net_rate() {
     'BEGIN { if (a < c || b < d) exit; printf "%.0f %.0f", (a - c) / t, (b - d) / t }'
 }
 
+# A version string as the heartbeat may carry it: digits-led, no quotes or spaces (spliced into JSON verbatim).
+# The WHOLE string is matched (bash =~), never line by line: `grep` passes a value when ANY of its lines matches,
+# so a multi-line annotation with a version-shaped first line would reach the JSON with its later lines attached.
+VERSION_RE='^[0-9]+(\.[0-9A-Za-z+-]+)+$'
+version_ok() { [[ $1 =~ $VERSION_RE ]]; }
+
+# The memex-local CLI's version: the Homebrew keg this agent runs from (MEMEX_LOCAL_SHARE is
+# …/Cellar/memex-local/<version>/libexec/share). `memex-local version` is NOT read: it prints the series
+# constant (0.3.0), not the build the formula installed. Prints nothing when the path names no keg.
+memex_local_version() {
+  local v
+  v="$(printf '%s' "${MEMEX_LOCAL_SHARE:-}" | sed -nE 's#.*/memex-local/([^/]+)/libexec/share/?$#\1#p')"
+  version_ok "$v" && printf '%s' "$v"
+}
+
+# The platform set the build host runs: the `hosting.meshweaver.io/platform-version` annotation its release
+# stamps on the build-host Deployment, read from the build VM's cluster (Colima profile MEMEX_BUILD_PROFILE,
+# default `build` — the context memex-local's build_ctx names). Prints nothing without a build host.
+build_host_version() {
+  local profile="${MEMEX_BUILD_PROFILE:-build}" ctx v
+  if [ "$profile" = default ]; then ctx=colima; else ctx="colima-$profile"; fi
+  v="$(kubectl --context "$ctx" get deployments -A -l app.kubernetes.io/component=build-host --request-timeout=5s \
+    -o jsonpath='{.items[0].metadata.annotations.hosting\.meshweaver\.io/platform-version}' 2>/dev/null)" || return 0
+  version_ok "$v" && printf '%s' "$v"
+}
+
+# The `versions` object (Hosting MachineReadings.Versions): only what was measured; `{}` when nothing was.
+sample_versions() {
+  local ml bh out=""
+  ml="$(memex_local_version)"; bh="$(build_host_version)"
+  [ -n "$ml" ] && out="\"memex-local\":\"$ml\""
+  [ -n "$bh" ] && out="${out:+$out,}\"build-host\":\"$bh\""
+  printf '{%s}' "$out"
+}
+
 health_of() { # name, probe-exit → "ok" or the reason
   if [ "$2" = 0 ]; then printf '"%s":"ok"' "$1"; else printf '"%s":"%s"' "$1" "$3"; fi
 }
@@ -227,7 +264,7 @@ write_sample() {
   {
     printf '{"os":"macOS %s","machine":"%s",' "$(sw_vers -productVersion 2>/dev/null || echo unknown)" \
       "$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Model Name|Chip|Memory/ {printf "%s ", $2}' | sed 's/ *$//')"
-    printf '"models":%s,"vm":%s,"host":%s,' "$models" "$vm" "$host"
+    printf '"models":%s,"vm":%s,"host":%s,"versions":%s,' "$models" "$vm" "$host" "$(sample_versions)"
     printf '"health":{%s,%s,%s,%s},' \
       "$(health_of portal "$portal_rc" "no 200 from /health on :${MEMEX_PORT:-8443}")" \
       "$(health_of ollama "$m_rc" "ollama did not answer /api/tags at $OLLAMA")" \
