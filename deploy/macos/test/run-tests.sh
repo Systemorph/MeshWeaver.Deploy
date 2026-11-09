@@ -169,10 +169,12 @@ DPAY="$FULL/memex-local-daemon.pkg/Payload"
 
 echo "── DRIFT: the package's share/ is the formula's share/, file for file ──"
 # Formula/memex-local.rb installs exactly: bin/memex-local → libexec, share/* → libexec/share, deploy/helm/* → libexec/share/helm,
-# plus the env wrapper. The package mirrors those three sources under /opt/memex; any fourth source in the formula is drift.
+# deploy/backlease/* → libexec/share/backlease, plus the env wrapper. The package mirrors those four sources under /opt/memex;
+# any fifth source in the formula is drift.
 installs="$(sed -n '/^  def install/,/^  end/p' "$BREW/Formula/memex-local.rb" | grep -c '\.install \|write_env_script')"
-[ "$installs" = "4" ] && ok "the formula's install block has the 4 steps build-pkg.sh mirrors (3 installs + the env wrapper)" \
-  || bad "the formula's install block has 4 steps" "found $installs — a new install source in the formula must be mirrored in build-pkg.sh and this test"
+[ "$installs" = "5" ] && grep -q 'cp -R "$repo/deploy/backlease/." "$p/share/backlease/"' "$MACOS/build-pkg.sh" \
+  && ok "the formula's install block has the 5 steps build-pkg.sh mirrors (4 installs, share/backlease included, + the env wrapper)" \
+  || bad "the formula's install block has 5 steps" "found $installs — a new install source in the formula must be mirrored in build-pkg.sh and this test"
 grep -q 'libexec.install "deploy/homebrew/bin/memex-local"' "$BREW/Formula/memex-local.rb" \
   && grep -q '(libexec/"share").install Dir\["deploy/homebrew/share/\*"\]' "$BREW/Formula/memex-local.rb" \
   && grep -q '(libexec/"share/helm").install Dir\["deploy/helm/\*"\]' "$BREW/Formula/memex-local.rb" \
@@ -186,11 +188,15 @@ while IFS= read -r f; do
   rel="${f#deploy/helm/}"
   [ -e "$PAY/opt/memex/share/helm/$rel" ] || drift="$drift helm/$rel"
 done < <(git -C "$REPO" ls-files deploy/helm)
-[ -z "$drift" ] && ok "every tracked file of deploy/homebrew/share and deploy/helm is in the payload" || bad "every tracked share/helm file is in the payload" "missing:$drift"
+while IFS= read -r f; do
+  rel="${f#deploy/backlease/}"
+  [ -e "$PAY/opt/memex/share/backlease/$rel" ] || drift="$drift backlease/$rel"
+done < <(git -C "$REPO" ls-files deploy/backlease)
+[ -z "$drift" ] && ok "every tracked file of deploy/homebrew/share, deploy/helm and deploy/backlease is in the payload" || bad "every tracked share/helm file is in the payload" "missing:$drift"
 extra=""
 while IFS= read -r f; do
   rel="${f#"$PAY"/opt/memex/share/}"
-  case "$rel" in helm/*|doc/*) continue ;; esac
+  case "$rel" in helm/*|doc/*|backlease/*) continue ;; esac
   [ -e "$BREW/share/$rel" ] || extra="$extra $rel"
 done < <(find "$PAY/opt/memex/share" -type f)
 [ -z "$extra" ] && ok "the payload's share/ has nothing the formula would not install" || bad "no extra share/ files in the payload" "extra:$extra"
@@ -437,6 +443,16 @@ case "$RC:$AS2" in 0:*"WAITING for the first-run setup answers"*) case "$AS2" in
 grep -q 'installondemand.in-progress' "$FB" && grep -q 'rm -f "$flag"' "$FB" && ok "the on-demand flag is set for the catalogue and always removed" || bad "on-demand flag" "missing"
 grep -q -- '--auth-key="file:$key_file"' "$FB" && ! grep -q -- '--auth-key "\$key"' "$FB" \
   && ok "the pre-auth key is passed by FILE reference (never an argument)" || bad "auth key by file" "missing"
+# Enrolment v2: the join POLLS control for its own code (bounded per run), and a successful join joins the network at once.
+grep -q -- 'fleet join --control "$control" --id "$machine" --no-open --wait "$wait_min" --code-file "$code_file" ${PART_ARGS' "$FB" \
+  && ok "the bootstrap runs the POLLING join (bounded wait per run; the code file stays the fallback)" || bad "polling join" "missing"
+grep -A3 '^    0) as_user' "$FB" | grep -q 'step_network "$machine" "$user"' \
+  && ok "a successful join hands its pre-auth key straight to the network step (no wait for the next run)" || bad "network after join" "missing"
+mkdir -p "$T/lh/u/.memex-local/enrol" && printf 'https://hs.example.test\n' > "$T/lh/u/.memex-local/enrol/studio-9.login-server"
+LS="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_USER_HOME="$T/lh/u" FLEET_MANAGED_PREFS="$T/none" FLEET_LOG_DIR="$T/lslog" FLEET_TAILSCALED_SOCKET="$T/no.sock" FLEET_TS_DIR="$T/nots" \
+  bash -c '. "$0"; step_network studio-9 "$(id -un)"' "$FB" 2>&1)"
+case "$LS" in *"WAITING for a single-use pre-auth key"*) ok "with the login server named by the code but no key yet, the network step still waits" ;; *) bad "login-server fallback, no key" "$LS" ;; esac
+grep -q '\.login-server' "$FB" && ok "the network step reads the login server the enrolment code named when the profile names none" || bad "login-server fallback" "missing"
 # The dry runs are HERMETIC: the owner's answers given (no), and no password policy read from this machine.
 printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict/></plist>\n' > "$T/nopol.plist"
 FB_HERMETIC="FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=false FLEET_ACCOUNT_POLICIES_FILE=$T/nopol.plist FLEET_USER_ACCOUNT_POLICIES_FILE=$T/nopol.plist FLEET_ACCOUNT_POLICY_DATA_FILE=$T/nopol.plist"
@@ -595,7 +611,7 @@ smrun() { : > "$T/sm/calls"; OUT="$(env $FCA_ENV FLEET_BOOTSTRAP_LIB=1 FLEET_LOG
 smrun FLEET_CA_SHA256="$FSHA"
 case "$OUT" in *"fleet local CA is trusted by profile"*"not waiting on 'mkcert -install'"*"rc=0"*) ok "a fleet CA trusted by profile: no wait on 'mkcert -install' (defect 4)" ;; *) bad "fleet CA no wait" "$OUT" ;; esac
 grep -q 'env MEMEX_CA_TRUST=defer .*/memex-local up$' "$T/sm/calls" && ok "…and 'up' runs with MEMEX_CA_TRUST=defer (no keychain change, no prompt)" || bad "up deferred" "$(cat "$T/sm/calls")"
-grep -q 'fleet join --control https://control.example.test --id studio-2 --no-open --code-file .* --no-accept-jobs --no-buildhost --no-accept-tokens$' "$T/sm/calls" \
+grep -q 'fleet join --control https://control.example.test --id studio-2 --no-open --wait 10 --code-file .* --no-accept-jobs --no-buildhost --no-accept-tokens$' "$T/sm/calls" \
   && ok "fleet join gets the owner's answers: jobs NO → --no-accept-jobs --no-buildhost, tokens NO → --no-accept-tokens" || bad "join participation args" "$(cat "$T/sm/calls")"
 printf '%s\n' "$KEYB64" > "$T/sm/home/.memex-local/enrol/fleet-ca.key"
 smrun FLEET_CA_SHA256="$FSHA"
