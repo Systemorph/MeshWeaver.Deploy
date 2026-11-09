@@ -3591,7 +3591,13 @@ class DeploymentTree:
         self.lock_path = os.path.join(self.root, ".locks", f"{repo}.lock")
         self.mirror = master_path(cache, repo)
         self.manifest_path = os.path.join(self.host, "manifest.json")
+        # core's worktree for THIS repository's builds (§7.3b step 2): a `git worktree` of the platform master at the set's
+        # commit, built IN PLACE by the warmBuild and the read-only lower of every stage's writable platform view — never
+        # inside the repository's tree (a stage's discovery walks the checkout), never a copy
+        self.platform = os.path.join(self.root, ".platform", repo)
+        self.platform_manifest_path = os.path.join(self.host, "platform-manifest.json")
         self.last_refusal: Optional[str] = None
+        self.platform_lower: Optional[str] = None
 
     def ident(self, tip: str) -> str:
         return f"{self.deployment}/{self.repo}@{tip}"
@@ -3622,22 +3628,34 @@ class DeploymentTree:
             return None
         return a if a and os.path.isfile(os.path.join(a, "HEAD")) else None
 
-    def publish(self, tip: str, key: str) -> None:
-        """The writer's last step, still under its lock: the manifest FIRST, then the state that names the tip built — a
-        reader verifies the tree against the manifest before it mounts it."""
+    def platform_ident(self, commit: str) -> str:
+        return f"{self.deployment}/{self.repo}/platform@{commit}"
+
+    def publish(self, tip: str, key: str, platform: Optional[str] = None) -> None:
+        """The writer's last step, still under its lock: the manifests FIRST (the tree's, and the platform tree's when the
+        warmBuild built core in place at `platform`), then the state that names what was built — a reader verifies each
+        tree against its manifest before it mounts it."""
         os.makedirs(self.host, exist_ok=True)
-        part = self.manifest_path + f".{os.getpid()}.part"
-        with open(part, "w", encoding="utf-8") as fh:
-            json.dump(tree_manifest(self.tree, self.ident(tip)), fh, separators=(",", ":"))
-        os.replace(part, self.manifest_path)
-        self.write_state({"key": key, "tip": tip, "built": tip})
+        for tree, path, ident in ((self.tree, self.manifest_path, self.ident(tip)),
+                                  *([(self.platform, self.platform_manifest_path, self.platform_ident(platform))] if platform else [])):
+            part = path + f".{os.getpid()}.part"
+            with open(part, "w", encoding="utf-8") as fh:
+                json.dump(tree_manifest(tree, ident), fh, separators=(",", ":"))
+            os.replace(part, path)
+        if not platform:
+            try:
+                os.remove(self.platform_manifest_path)
+            except OSError:
+                pass
+        self.write_state({"key": key, "tip": tip, "built": tip, **({"platform": platform} if platform else {})})
 
     def unbuild(self, key: str, tip: str) -> None:
-        """Not built: readers go cold until the writer's next successful build (the manifest goes first)."""
-        try:
-            os.remove(self.manifest_path)
-        except OSError:
-            pass
+        """Not built: readers go cold until the writer's next successful build (the manifests go first)."""
+        for path in (self.manifest_path, self.platform_manifest_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         self.write_state({"key": key, "tip": tip, "built": None})
 
     @contextlib.contextmanager
@@ -3676,6 +3694,15 @@ class DeploymentTree:
                     self.last_refusal = f"the deployment tree's integrity check refused it: {why}"
                 else:
                     held = (self.tree, tip)
+                    # the warm platform tree is OPTIONAL: a missing or refused one leaves the stages on the image's tree
+                    self.platform_lower = None
+                    pc = str(st.get("platform") or "")
+                    if SHA.match(pc) and os.path.isdir(self.platform):
+                        pwhy = verify_tree(self.platform, self.platform_manifest_path, self.platform_ident(pc))
+                        if pwhy is None:
+                            self.platform_lower = self.platform
+                        else:
+                            self.last_refusal = f"the platform tree's integrity check refused it (stages take the image's tree): {pwhy}"
             if held is None:
                 fh.close()
                 fh = None
@@ -3731,6 +3758,61 @@ def advance_deployment_tree(dt: DeploymentTree, tip: str, key: str, git: Callabl
     git(*g, "clean", "-ffdxq", *[a for k in WARM_KEEP for a in ("-e", k)])
     dt.write_state({"key": key, "tip": tip, "built": None})
     return f"deployment tree: moved to main@{tip[:12]} in place (obj/ and bin/ kept)"
+
+
+def source_commit(platform_src: str) -> Optional[str]:
+    """The commit the image's platform source was archived from (its `.source-commit`), or None. Pure apart from the read."""
+    try:
+        with open(os.path.join(platform_src, ".source-commit")) as fh:
+            c = fh.read().strip().lower()
+    except OSError:
+        return None
+    return c if SHA.match(c) else None
+
+
+def advance_platform_tree(dt: DeploymentTree, commit: str, git: Callable[..., None]) -> str:
+    """The WRITER's move of the deployment's PLATFORM tree (`dt.platform`) to core at `commit` (call it holding
+    `dt.writer()`, the master fetched to `commit`): first use → `git worktree add --detach` of the platform master under its
+    lock; afterwards IN PLACE — `checkout --detach -f` and `clean` keeping obj/ and bin/, so core's outputs from the last
+    warmBuild stay valid while the set's commit holds and rebuild incrementally when it moves. Writes `.source-commit`, as the
+    image's tree carries it. Never a copy. Raises Refusal/OSError."""
+    mirror = master_path(dt.cache, PLATFORM_REPO)
+    admin_file = os.path.join(dt.host, "platform-admin")
+    try:
+        with open(admin_file) as fh:
+            admin: Optional[str] = fh.read().strip() or None
+    except OSError:
+        admin = None
+    if admin is not None and not os.path.isfile(os.path.join(admin, "HEAD")):
+        admin = None
+    if admin is None or not os.path.isdir(dt.platform):
+        with master_lock(os.path.dirname(mirror), PLATFORM_REPO):
+            if os.path.islink(dt.platform):
+                os.remove(dt.platform)                     # a planted link: removed, never followed
+            elif os.path.lexists(dt.platform):
+                shutil.rmtree(dt.platform)                 # a half-added tree: removed, never adopted
+            git("--git-dir", mirror, "worktree", "prune")
+            os.makedirs(os.path.dirname(dt.platform), exist_ok=True)
+            git("--git-dir", mirror, "worktree", "add", "--detach", "--quiet", dt.platform, commit)
+            with open(os.path.join(dt.platform, ".git")) as fh:
+                line = fh.read().strip()
+            admin = os.path.normpath(os.path.join(dt.platform, line[len("gitdir:"):].strip())) if line.startswith("gitdir:") else ""
+            if not os.path.isfile(os.path.join(admin, "HEAD")):
+                raise Refusal(f"git worktree add left no admin directory for the platform tree ({line[:120]!r})")
+            os.makedirs(dt.host, exist_ok=True)
+            with open(admin_file, "w") as fh:
+                fh.write(admin + "\n")
+        verb = "added"
+    else:
+        _restore_git_link(dt.platform, admin)
+        g = ("--git-dir", admin, "--work-tree", dt.platform)
+        git(*g, "update-index", "-q", "--refresh")
+        git(*g, "checkout", "--quiet", "--detach", "-f", commit)
+        git(*g, "clean", "-ffdxq", *[a for k in WARM_KEEP for a in ("-e", k)])
+        verb = "moved in place (obj/ and bin/ kept)"
+    with open(os.path.join(dt.platform, ".source-commit"), "w") as fh:
+        fh.write(commit + "\n")
+    return f"platform tree: {verb} at {commit[:12]} ({dt.platform}) — core is built where it lies, never copied"
 
 
 def cold_worktree(cache: str, repo: str, sha: str, dest: str, git: Callable[..., None]) -> None:
@@ -4244,6 +4326,7 @@ class Host:
         # doc-gate stages run `python3 /core-tests/core-tests.py …` from it.
         self.sandbox = sandbox or Sandbox(env.get("BWRAP", "bwrap"), sandbox_readonly_roots(env), outer_ids(env))
         self.run_holds = contextlib.ExitStack()
+        self.run_platform_lower: Optional[str] = None   # the deployment's warm platform tree this run holds (§7.3b step 2)
         self.cold_tree: Optional[tuple] = None
         self.legacy_retired = False                  # §7.3's <cache>/shared removed by this process's first idle pass
         self.run_mount: Optional[Callable[[str, str], None]] = None   # the run overlay's mount (injectable for the self-test)
@@ -4755,24 +4838,43 @@ class Host:
             dt.write_state({"key": key, "tip": tip, "built": "building"})
             started = self.clock()
             platform_src = self.env.get("MW_PLATFORM_SOURCE", "") or prepared.get("MW_PLATFORM_SOURCE", "")
+            platform_built: Optional[str] = None
             with contextlib.ExitStack() as views:
                 warm_binds = []
+                warm_ro = [dt.mirror, os.path.join(self.cache, "nuget")]
                 if platform_src and os.path.isdir(platform_src):
-                    # a WRITABLE VIEW of the platform source (an overlay, or a cold worktree of its master — never a copy),
-                    # appearing AT the prepared tree's own path — the path a run's stages are handed — so a warm build that
-                    # names the platform by MW_PLATFORM_SOURCE records the same platform paths in obj/ as a run does
-                    psrc = views.enter_context(platform_source_view(platform_src, os.path.join(scratch, "platform"), self.env, self.log))
+                    # The deployment's PLATFORM TREE (§7.3b step 2): core's worktree at the set's commit, built IN PLACE and
+                    # kept — so every stage's platform view starts from core's warm obj/ and bin/ — appearing AT the
+                    # prepared tree's own path, the path a run's stages are handed, so obj/ records the same platform paths
+                    # in the warm build as in a run. Nothing is copied; a tree that cannot be made falls back to a
+                    # throwaway view of the image's tree (said), which a stage then rebuilds.
                     extra["MW_PLATFORM_SOURCE"] = platform_src
-                    warm_binds.append((psrc, platform_src))
+                    pc = source_commit(platform_src)
+                    try:
+                        if pc is None:
+                            raise Refusal("the image's platform source names no .source-commit")
+                        base = self.env.get("MW_BUILD_GIT_BASE", "https://github.com/Systemorph").rstrip("/")
+                        pmirror = master_path(self.cache, PLATFORM_REPO)
+                        _update_mirror(PLATFORM_REPO, f"{base}/{PLATFORM_REPO}.git", os.path.dirname(pmirror), pmirror, [pc], g, self.log)
+                        self.log(advance_platform_tree(dt, pc, g))
+                        warm_binds.append((dt.platform, platform_src))
+                        warm_ro.append(pmirror)              # the platform tree's .git names the platform master's worktree admin
+                        platform_built = pc
+                    except (Refusal, subprocess.SubprocessError, OSError) as e:
+                        self.log(f"platform tree: not kept ({str(e)[:200]}) — this warm build builds core in a throwaway view, "
+                                 f"and every stage rebuilds what it needs of core")
+                        psrc = views.enter_context(platform_source_view(platform_src, os.path.join(scratch, "platform"), self.env, self.log))
+                        warm_binds.append((psrc, platform_src))
                 rc, text = self._sandboxed_capture(decl["command"], dt.tree, out_dir, scratch, extra,
-                                                   [dt.mirror, os.path.join(self.cache, "nuget")], [], decl["timeoutMinutes"] * 60,
+                                                   warm_ro, [], decl["timeoutMinutes"] * 60,
                                                    cancel=self.warm_cancel, mount=SANDBOX_CHECKOUT,
                                                    binds=[(warm_nuget_dir, SANDBOX_NUGET), *warm_binds])
             if rc == 0:
-                dt.publish(tip, key)                       # manifest, then state — still under the writer lock
+                dt.publish(tip, key, platform_built)       # manifests, then state — still under the writer lock
                 self.warm_failed.pop(repo, None)
                 self.log(f"deployment tree: built main@{tip[:12]} with the tip's warmBuild in {int(self.clock() - started)} s "
-                         f"({dt.tree}; integrity manifest written)")
+                         f"({dt.tree}; integrity manifest written"
+                         f"{f'; platform tree at {platform_built[:12]} built in place' if platform_built else ''})")
                 return "built"
             dt.unbuild(key, tip)
             # the cooldown covers a failed BUILD too: an unchanged failing tip is not rebuilt every pass
@@ -4812,6 +4914,7 @@ class Host:
                     why = dt.last_refusal
                 else:
                     lower, tip = held
+                    self.run_platform_lower = dt.platform_lower    # held by the same shared lock, for the stages' views
                     started = time.monotonic()
                     try:
                         overlay_run_tree(repo, sha, refs, lower, tip, dest, token, self.env, self.log, deadline=deadline,
@@ -4850,6 +4953,7 @@ class Host:
         started = self.clock()
         self.sweep_workspaces()
         workdir = tempfile.mkdtemp(prefix=f"{repo}-{sha[:12]}-", dir=self.work)
+        self.run_platform_lower = None                   # set by seed_run_tree when the deployment's platform tree is warm
         # the run's tree is always its OWN (an overlay of its deployment tree, or a cold worktree — §7.3b), gone with the workdir
         checkout_dir = os.path.join(workdir, "src")
         outputs_dir = os.path.join(workdir, "out")
@@ -5104,9 +5208,11 @@ class Host:
                 def work(spec=spec, sink=sink, art=art, stage_env=stage_env, readonly=readonly, name=st["name"],
                          art_before=art_before) -> None:
                     try:
-                        ok = self.run_stage(spec, checkout_dir, outputs_dir, sink, stage_env,
+                        with contextlib.ExitStack() as pviews:
+                            ok = self.run_stage(spec, checkout_dir, outputs_dir, sink, stage_env,
                                             readonly=readonly, writable=[art, *([self.module_broker.io] if self.module_broker else [])],
-                                            binds=[(nuget_dir, SANDBOX_NUGET)],
+                                            binds=[(nuget_dir, SANDBOX_NUGET),
+                                                   *self.stage_platform_binds(stage_env, workdir, name, pviews)],
                                             hand_over=lambda: self.hand_over_artifacts(repo, sha, name, art, deadline=run_end,
                                                                                        cancel=cancel),
                                             cancel=cancel,
@@ -5428,6 +5534,26 @@ class Host:
             **platform_scripts_env(os.path.dirname(os.path.abspath(__file__))),
             **self.run_env,
         }
+
+    def stage_platform_binds(self, stage_env: dict, workdir: str, name: str, views: contextlib.ExitStack) -> list:
+        """A run stage's OWN writable view of the platform source (§7.3b step 2), bound AT the path MW_PLATFORM_SOURCE names
+        — the image's prepared tree — so a stage builds core where it lies, with the same absolute paths the warm build
+        recorded in obj/. Its lower is the deployment's warm PLATFORM TREE when this run holds one (core's outputs carried),
+        else the image's tree; an overlay, or a cold worktree of the platform master — never a copy. Each stage its own
+        view (stages run in parallel and each writes core's obj/), removed when the stage ends (`views`). A view that
+        cannot be made binds nothing: the stage sees the read-only tree and says so itself, never a copy."""
+        target = stage_env.get("MW_PLATFORM_SOURCE", "")
+        if not target or not os.path.isdir(target):
+            return []
+        lower = self.run_platform_lower or target
+        try:
+            view = views.enter_context(platform_source_view(lower, os.path.join(workdir, "platform", name), self.env, self.log))
+        except (Refusal, subprocess.SubprocessError, OSError) as e:
+            self.log(f"stage {name}: no writable platform view ({str(e)[:200]}) — the stage sees the image's read-only tree")
+            return []
+        self.log(f"stage {name}: platform source writable at {target} — a view of "
+                 f"{'the deployment platform tree (core warm)' if lower != target else 'the image tree (core cold)'}; nothing copied")
+        return [(view, target)]
 
     def warm_nuget(self, repo: str, workdir: str, plan: dict, sink: "EventSink", run_end: float) -> None:
         """Fill `<cache>/nuget` from the DEFAULT BRANCH's tip per `plan` (`nuget_warm_plan`): the tip's OWN restore
@@ -7786,15 +7912,99 @@ def self_test() -> int:
                 return 0, ""
             hf._sandboxed_capture = capture_view
             hf.warm_main_when_idle()
-            check("warm-idle/the platform VIEW is bound at the PREPARED path and named by it, populated while the build runs",
+            check("warm-idle/the deployment's PLATFORM TREE is bound at the PREPARED path and named by it, populated while the "
+                  "build runs — core's worktree at the set's commit, under the deployment, never a copy",
                   seen_b and seen_b[0][0].get("MW_PLATFORM_SOURCE") == image_src
-                  and any(b[1] == image_src and b[0] != image_src and b[0].endswith("/platform") and ok_
-                          for b, ok_ in zip(seen_b[0][1], seen_b[0][2]))
+                  and any(b[1] == image_src and b[0] == fdt.platform and ok_ for b, ok_ in zip(seen_b[0][1], seen_b[0][2]))
                   and any(b[1] == SANDBOX_NUGET for b in seen_b[0][1]), seen_b)
-            pv_bound = [b[0] for b in (seen_b[0][1] if seen_b else []) if b[1] == image_src]
-            check("warm-idle/...and the view is removed and pruned afterwards (nothing registered on the platform's master)",
-                  pv_bound and not os.path.exists(pv_bound[0])
-                  and wt_count(pv_bound[0], master_path(wenv["MW_BUILD_CACHE"], "MeshWeaver")) == 0, pv_bound)
+            psc = source_commit(image_src)
+            check("warm-idle/...and it is KEPT for the stages: a registered worktree of the platform master at the image's "
+                  ".source-commit, named in the state and covered by its own integrity manifest",
+                  psc is not None and os.path.isdir(fdt.platform)
+                  and wt_count(fdt.platform, master_path(wenv["MW_BUILD_CACHE"], "MeshWeaver")) == 1
+                  and (fdt.state() or {}).get("platform") == psc and os.path.isfile(fdt.platform_manifest_path)
+                  and open(os.path.join(fdt.platform, ".source-commit")).read().strip() == psc,
+                  (psc, fdt.state(), os.path.exists(fdt.platform_manifest_path)))
+            with fdt.reader(warm_key(hf.env, hf.identity)) as r_p:
+                check("warm-idle/a reader of the built tree is handed the verified platform tree as its stages' lower",
+                      r_p is not None and fdt.platform_lower == fdt.platform, (r_p, fdt.platform_lower, fdt.last_refusal))
+            # a tampered platform tree: the reader still holds the repo tree, but the stages fall back to the image's tree
+            with open(os.path.join(fdt.platform, "Directory.Build.props"), "a") as fh:
+                fh.write("<!-- planted -->")
+            with fdt.reader(warm_key(hf.env, hf.identity)) as r_t2:
+                check("warm-idle/a platform tree failing its integrity check is NOT handed to the stages (the image's tree is), "
+                      "and the repo tree is still read",
+                      r_t2 is not None and fdt.platform_lower is None and "platform tree" in (fdt.last_refusal or ""),
+                      (r_t2, fdt.platform_lower, fdt.last_refusal))
+            # the next warm build moves the platform tree IN PLACE (no second worktree, obj/ kept)
+            os.makedirs(os.path.join(fdt.platform, "src", "obj"), exist_ok=True)
+            open(os.path.join(fdt.platform, "src", "obj", "kept.txt"), "w").write("warm")
+            fdt.unbuild(warm_key(hf.env, hf.identity), c3)
+            seen_b.clear()
+            hf.warm_main_when_idle()
+            check("warm-idle/a second warm build moves the platform tree in place: still ONE registered worktree, obj/ kept, the "
+                  "planted change reset",
+                  seen_b and wt_count(fdt.platform, master_path(wenv["MW_BUILD_CACHE"], "MeshWeaver")) == 1
+                  and os.path.isfile(os.path.join(fdt.platform, "src", "obj", "kept.txt"))
+                  and "planted" not in open(os.path.join(fdt.platform, "Directory.Build.props")).read(), seen_b)
+
+            # a LINK where the platform tree belongs (planted, or left by a crash) is removed, never followed nor fatal
+            shutil.rmtree(fdt.platform)
+            os.remove(os.path.join(fdt.host, "platform-admin"))
+            os.symlink(wroot, fdt.platform)
+            fdt.unbuild(warm_key(hf.env, hf.identity), c3)
+            seen_b.clear()
+            hf.warm_main_when_idle()
+            check("warm-idle/a symlink at the platform tree's path is removed (not followed) and the tree is re-added",
+                  seen_b and not os.path.islink(fdt.platform) and os.path.isdir(fdt.platform) and os.path.isdir(wroot)
+                  and any(b[0] == fdt.platform for b in seen_b[0][1]), seen_b)
+
+            # a run STAGE's platform view (§7.3b step 2): its own, bound AT the MW_PLATFORM_SOURCE path, lower = the warm platform
+            # tree the run holds, else the image's tree; a view that cannot be made binds nothing (the stage sees read-only)
+            real_psv = globals()["platform_source_view"]
+            psv_calls: list = []
+
+            @contextlib.contextmanager
+            def fake_psv(lower_, dest_, env_, log_, **kw_):
+                psv_calls.append((lower_, dest_))
+                os.makedirs(dest_, exist_ok=True)
+                yield dest_
+                psv_calls.append(("released", dest_))
+
+            globals()["platform_source_view"] = fake_psv
+            try:
+                swd = os.path.join(wroot, "stage-views")
+                with contextlib.ExitStack() as sv:
+                    hf.run_platform_lower = None
+                    check("stage-view/no platform source named: nothing bound",
+                          hf.stage_platform_binds({}, swd, "gate", sv) == [] and psv_calls == [], psv_calls)
+                    b_cold = hf.stage_platform_binds({"MW_PLATFORM_SOURCE": image_src}, swd, "gate", sv)
+                    check("stage-view/no warm platform tree: a view of the IMAGE's tree, bound at the image path, per stage",
+                          b_cold == [(os.path.join(swd, "platform", "gate"), image_src)] and psv_calls[-1][0] == image_src, (b_cold, psv_calls))
+                    hf.run_platform_lower = fdt.platform
+                    b_warm = hf.stage_platform_binds({"MW_PLATFORM_SOURCE": image_src}, swd, "portal-hosts", sv)
+                    check("stage-view/the run holds the warm platform tree: it is the view's LOWER, still bound at the image path",
+                          b_warm == [(os.path.join(swd, "platform", "portal-hosts"), image_src)] and psv_calls[-1][0] == fdt.platform,
+                          (b_warm, psv_calls))
+                check("stage-view/each view is released when its stage ends",
+                      [c for c in psv_calls if c[0] == "released"] and len([c for c in psv_calls if c[0] == "released"]) == 2, psv_calls)
+
+                @contextlib.contextmanager
+                def refusing_psv(*a_, **k_):
+                    raise Refusal("no overlay and no .source-commit")
+                    yield  # pragma: no cover
+                globals()["platform_source_view"] = refusing_psv
+                said: list = []
+                real_log = hf.log
+                hf.log = said.append
+                with contextlib.ExitStack() as sv2:
+                    b_none = hf.stage_platform_binds({"MW_PLATFORM_SOURCE": image_src}, swd, "modules", sv2)
+                hf.log = real_log
+                check("stage-view/a view that cannot be made binds NOTHING and says so (never a copy, never a host defect)",
+                      b_none == [] and any("no writable platform view" in m for m in said), (b_none, said))
+            finally:
+                globals()["platform_source_view"] = real_psv
+                hf.run_platform_lower = None
 
             # a claim STOPS a warm build in flight (its sandbox killed) and leaves the tree NOT BUILT — never waits it out
             with open(os.path.join(seed, ".github", "build-stages.json"), "w") as fh:
