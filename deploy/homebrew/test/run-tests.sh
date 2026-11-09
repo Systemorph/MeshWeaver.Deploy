@@ -2422,11 +2422,13 @@ done; chmod +x "$BH/stubs/"*
 # PATH holds the stubs and the system directories ONLY (no Homebrew), and MEMEX_PREFIX names an empty
 # prefix: the resolver can find no real colima, helm or kubectl — a test must never start a VM.
 mkdir -p "$BH/prefix"
-bh() { env PATH="$BH/stubs:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" MEMEX_PREFIX="$BH/prefix" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
+bh() { env PATH="$BH/stubs:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" MEMEX_PREFIX="$BH/prefix" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_NET_NO_MEASURE=1 MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
 OUT="$(bh "$CLI" buildhost apply 2>&1)"
 grep -q 'colima start -p build --cpu 16 --memory 104 --disk 100 --runtime containerd --kubernetes' "$BH/log" && grep -q 'kubectl --context colima-build get crd scaledobjects.keda.sh' "$BH/log" \
   && case "$OUT" in *"first attach installs it"*) true ;; *) false ;; esac \
   && ok "apply creates the build VM at the plan (containerd, k3s), checks KEDA in colima-build, and names the first attach for a missing release" || bad "apply create" "$OUT / $(cat "$BH/log")"
+grep -q 'colima ssh -p build -- sudo systemctl restart mw-netshape.service' "$BH/log" && [ -f "$BH/.memex-local/netshape-build.env" ] \
+  && ok "apply also shapes the build VM's network (mw-netshape.service in the VM) and records the rates" || bad "apply netshape" "$(grep netshape "$BH/log")"
 : > "$BH/log"
 OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
 grep -q 'helm --kube-context colima-build -n build-mac upgrade build-host-mac .* --reuse-values --set buildHosts.mac.minReplicas=1 --set buildHosts.mac.maxReplicas=4 --set-string buildHosts.resources.requests.cpu=3500m --set-string buildHosts.resources.requests.memory=20Gi --set-string buildHosts.resources.limits.cpu=4 --set-string buildHosts.resources.limits.memory=24Gi --set buildHosts.stageSlots=4' "$BH/log" \
@@ -2798,6 +2800,49 @@ tsh 'Tokens__Slots: "2"' && tsh 'Tokens__MaxConcurrency: "1"' \
 OUT="$(ts "$CLI" backlease accept tokens --yield-at 5 </dev/null 2>&1)" && bad "yield-at 5 accepted" "$OUT" || ok "a yield threshold outside 10–3200 % is refused"
 rm -rf "$TS"
 
+echo "── vm network shaper: fleet traffic yields to the owner's network ──"
+NS="$HERE/../share/vm-netshape.sh"
+NSHOME="$(mktemp -d)"
+ns() { env -u MEMEX_NET_UP_KBIT -u MEMEX_NET_DOWN_KBIT -u MEMEX_NET_SHARE_PCT -u MEMEX_NET_LINK_UP_KBIT -u MEMEX_NET_LINK_DOWN_KBIT \
+  MEMEX_LOCAL_HOME="$NSHOME" MEMEX_NETSHAPE_LIB=1 bash -c 'set -u; . "$0"; shift; "$@"' "$NS" _ "$@"; }
+[ "$(ns caps 40000 200000 25 '' '')" = "10000 50000" ] && ok "the caps are the declared share of the measured link, each direction" || bad "share caps" "$(ns caps 40000 200000 25 '' '')"
+[ "$(ns caps 40000 200000 25 3000 0)" = "3000 0" ] && ok "a declared rate wins over the share; 0 means uncapped" || bad "declared caps" "$(ns caps 40000 200000 25 3000 0)"
+[ "$(ns caps 0 0 25 '' '')" = "4000 40000" ] && ok "an unknown link takes the fallback caps, never no cap" || bad "fallback caps" "$(ns caps 0 0 25 '' '')"
+[ "$(ns caps 500 800 10 '' '')" = "256 256" ] && ok "a share below 256 kbit/s is floored (keepalives must still pass)" || bad "floor" "$(ns caps 500 800 10 '' '')"
+R="$(env MEMEX_LOCAL_HOME="$NSHOME" MEMEX_NET_UP_KBIT=3000 MEMEX_NET_DOWN_KBIT=20000 bash "$NS" --render)"
+sh -n <<<"$R" && ok "the in-VM script parses as POSIX sh" || bad "render parse" ""
+case "$R" in *'UP_KBIT=3000'*'DOWN_KBIT=20000'*'match ip "$3" "$LOCALNET" flowid 1:10'*'stop) clear'*'mirred egress redirect dev "$IFB"'*'--set-dscp-class CS1'*) ok "the in-VM script caps both directions, exempts the Mac's subnet, marks DSCP CS1 and can remove itself" ;; *) bad "render content" "$R" ;; esac
+OUT="$(env MEMEX_LOCAL_HOME="$NSHOME" MEMEX_NET_UP_KBIT=fast bash "$NS" --render 2>&1)" && bad "a non-numeric rate was accepted" "$OUT" || ok "a rate that is not a whole number is refused"
+OUT="$(env MEMEX_LOCAL_HOME="$NSHOME" bash "$NS" --apply --profile 'Bad Name' 2>&1)" && bad "a bad profile was accepted" "$OUT" || ok "the shaper refuses a profile that is not a Colima profile name"
+mkdir -p "$NSHOME/.ml"; printf '[ -n "${MEMEX_NET_LINK_UP_KBIT:-}" ] || MEMEX_NET_LINK_UP_KBIT=20000\n[ -n "${MEMEX_NET_LINK_DOWN_KBIT:-}" ] || MEMEX_NET_LINK_DOWN_KBIT=100000\n' > "$NSHOME/.ml/netshape-build.env"
+[ "$(env -u MEMEX_NET_LINK_UP_KBIT -u MEMEX_NET_LINK_DOWN_KBIT MEMEX_LOCAL_HOME="$NSHOME/.ml" MEMEX_NET_PROFILE=default MEMEX_NETSHAPE_LIB=1 MEMEX_NET_NO_MEASURE=1 bash -c '. "$0"; link_rates' "$NS")" = "20000 100000" ] \
+  && ok "another profile's measurement is reused (one uplink per Mac — the line is measured once)" || bad "link reuse" ""
+# a 0/0 record (a failed measurement, as recorded before) is no reading: the sibling's measurement is reused instead
+printf '[ -n "${MEMEX_NET_LINK_UP_KBIT:-}" ] || MEMEX_NET_LINK_UP_KBIT=0\n[ -n "${MEMEX_NET_LINK_DOWN_KBIT:-}" ] || MEMEX_NET_LINK_DOWN_KBIT=0\n' > "$NSHOME/.ml/netshape-default.env"
+[ "$(env MEMEX_NET_LINK_UP_KBIT=0 MEMEX_NET_LINK_DOWN_KBIT=0 MEMEX_LOCAL_HOME="$NSHOME/.ml" MEMEX_NET_PROFILE=default MEMEX_NETSHAPE_LIB=1 MEMEX_NET_NO_MEASURE=1 bash -c '. "$0"; link_rates' "$NS")" = "20000 100000" ] \
+  && ok "a recorded 0/0 link does not stick: another profile's measurement is reused" || bad "0/0 record sticks" ""
+# apply against a stub VM: a failed measurement records NO link (so the next apply measures or reuses again), and
+# MEMEX_NET_SHAPE=off — read by the shaper itself, so first-attach.sh honours it too — touches neither the VM nor the record
+NSV="$(mktemp -d)"; mkdir -p "$NSV/bin" "$NSV/home"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/colima.log"; cat >/dev/null; exit 0\n' "$NSV" > "$NSV/bin/colima"; chmod +x "$NSV/bin/colima"
+nsapply() { env -u MEMEX_NET_UP_KBIT -u MEMEX_NET_DOWN_KBIT -u MEMEX_NET_LINK_UP_KBIT -u MEMEX_NET_LINK_DOWN_KBIT PATH="$NSV/bin:$PATH" \
+  MEMEX_LOCAL_HOME="$NSV/home" MEMEX_NET_NO_MEASURE=1 "$@" bash "$NS" --apply --profile build </dev/null 2>&1; }
+OUT="$(nsapply env)"
+{ [ -s "$NSV/colima.log" ] && [ -f "$NSV/home/netshape-build.env" ] && ! grep -q 'MEMEX_NET_LINK_UP_KBIT' "$NSV/home/netshape-build.env"; } \
+  && ok "apply installs the shaper in the VM and records no link when the measurement failed" || bad "apply after a failed measurement" "$OUT | $(cat "$NSV/home/netshape-build.env" 2>/dev/null)"
+rm -f "$NSV/colima.log" "$NSV/home/netshape-build.env"
+OUT="$(nsapply env MEMEX_NET_SHAPE=off)"; RC=$?
+{ [ "$RC" = 0 ] && [ ! -e "$NSV/colima.log" ] && [ ! -e "$NSV/home/netshape-build.env" ]; } && case "$OUT" in *"MEMEX_NET_SHAPE=off"*) true ;; *) false ;; esac \
+  && ok "MEMEX_NET_SHAPE=off is honoured by the shaper itself: no VM call, no record, exit 0" || bad "MEMEX_NET_SHAPE=off in vm-netshape.sh" "rc=$RC $OUT"
+case "$(cat "$HERE/../../backlease/first-attach.sh")" in *'homebrew/share/vm-netshape.sh" --apply'*) ok "first-attach.sh shapes through vm-netshape.sh --apply (so the switch above covers it)" ;; *) bad "first-attach shaper call" "" ;; esac
+rm -rf "$NSV"
+# `memex-local net --profile build` (no subcommand) is `status` for that profile, as vm-netshape.sh defaults a bare flag
+NSS="$(mktemp -d)"; printf '#!/bin/bash\nprintf "%%s" "$*"\n' > "$NSS/vm-netshape.sh"
+netbare() { env NSS_DIR="$NSS" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; resolve_share() { printf "%s" "$NSS_DIR"; }; shift_net_cmd default --profile build' "$CLI" 2>&1; }
+[ "$(netbare)" = "--status --profile build" ] \
+  && ok "'net --profile build' with no subcommand runs status for that profile" || bad "net bare flag" "$(netbare)"
+rm -rf "$NSS"
+rm -rf "$NSHOME"
 
 echo "── the second Mac Studio's defects, pinned (2026-11-09) ─────────────"
 OB="$(mktemp -d)"; mkdir -p "$OB/stubs" "$OB/brewbin" "$OB/home/.memex-local" "$OB/sys"
@@ -2925,7 +2970,7 @@ rm -rf "$OB"
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
-for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease buildhost fleet llm residency relay publish autoupdate instances ca; do
+for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease buildhost net fleet llm residency relay publish autoupdate instances ca; do
   case "$help_out" in
     *"$cmd"*) ;;
     *) bad "help documents '$cmd'" "not in the usage text"; continue ;;

@@ -47,6 +47,8 @@
 #   5. fleet jobs at the LOWEST priority on this Mac: loads the launchd governor (deploy/homebrew/share/buildhost-priority.sh
 #      --install) that puts the build VM's process in the background band while the owner, the portal VM or Ollama want
 #      the cores, and gives it every idle core otherwise (nice/renice do nothing on macOS — see the script's header).
+#      And the network: deploy/homebrew/share/vm-netshape.sh --apply caps the build VM's internet traffic (tc, inside the
+#      VM) at a share of the link measured once with networkQuality, and marks it DSCP CS1.
 #   6. FOLLOWS the sealed set from then on (follow-set.py, launchd com.memex.local.buildhost-follow.<profile>): every 5 min
 #      it reads the complete set channel `--follow` (default latest) runs from control and, when the release runs another,
 #      re-applies THIS chart with that set (--reuse-values) — so the host never falls behind what main needs and nobody
@@ -306,6 +308,10 @@ echo "== 5/6 fleet jobs at the lowest priority (launchd governor for profile $pr
 prio="$here/../homebrew/share/buildhost-priority.sh"; [ -f "$prio" ] || prio="$here/../buildhost-priority.sh"
 bash "$prio" --install --profile "$profile" \
   || echo "WARN: the priority governor did not load — the build VM competes at the default band; re-run: bash deploy/homebrew/share/buildhost-priority.sh --install --profile $profile" >&2
+# The network too (maintainer, 2026-11-08): the build VM's internet traffic is capped at a share of the measured link
+# and marked DSCP CS1, so an artefact upload never fills the owner's uplink (mw-netshape.service in the VM).
+bash "$here/../homebrew/share/vm-netshape.sh" --apply --profile "$profile" \
+  || echo "WARN: the build VM's network is NOT shaped — its uploads compete with the owner's traffic; re-run: bash deploy/homebrew/share/vm-netshape.sh --apply --profile $profile" >&2
 
 echo "== 6/6 follow the sealed set of channel ${follow}"
 # Installed AFTER the runners exist; a follower that cannot load is reported, never a failed attach (the host still runs
