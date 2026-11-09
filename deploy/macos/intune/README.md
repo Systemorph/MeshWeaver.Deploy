@@ -8,14 +8,16 @@ MeshWeaver.Plugins `Hosting/MacStudioFleet.md` §2b and §2b.2.
 
 | Step | What it does | Waits (exit 0) when |
 |---|---|---|
-| console user | the person the Mac's memex runs as (`stat -f%Su /dev/console`) | no one is logged in |
+| console user | the person the Mac's memex runs as (`stat -f%Su /dev/console`). If that person's password must be changed (an expired password, or a device-management "change at next sign-in" policy whose moment has passed — read from `pwpolicy -getaccountpolicies` and `dscl … accountPolicyData`), the run's FIRST line says so with the remedy: every non-interactive SSH login fails until the person changes it at the console | no one is logged in |
+| participation | the owner's two answers, `AcceptJobs` and `AcceptTokens` (below), read BEFORE anything is installed | — **fails** (exit 1, the missing key named) when either is absent or not a boolean, or a YES lacks its `…From` (tokens: also `AcceptTokensModels`) |
 | Homebrew | `/opt/homebrew`, owned by that person (the documented untar install, no prompt) | — |
-| tools | `colima docker kubectl helm ollama` and `systemorph/memex/memex-local` (the tap tapped AND trusted first), as that person | — |
+| tools | `colima docker kubectl helm ollama` and `systemorph/memex/memex-local` (the tap tapped AND trusted first), as that person. Every command run as that person gets `/opt/homebrew/bin` and `/usr/local/bin` on PATH | — |
+| shell | `eval "$(/opt/homebrew/bin/brew shellenv)"` appended ONCE to the person's `~/.zprofile` (left alone when it already loads Homebrew), so their own `memex-local` finds `kubectl` | — |
 | tailscale binaries | `tailscale` + `tailscaled` fetched BY ROOT from Homebrew's bottle (URL and sha256 from the formula API, verified) into the root-owned `/Library/MeshWeaver/tailscale` — what runs as root never comes from the user-owned Homebrew tree | — |
 | tailscaled | a ROOT LaunchDaemon `com.meshweaver.fleet.tailscaled` on `/var/run/tailscaled.socket` (the Tailscale app does not run before login; this does). memex-local uses this socket by itself | — |
 | network | `tailscale up --auth-key=file:<FLEET_PREAUTH_KEY_FILE>` (by file reference, never an argument; deleted only after the join succeeded) | no key yet (control mints it at enrolment) |
-| local CA | — | the mkcert CA (`<CAROOT>/rootCA.pem`, a PUBLIC certificate) is not yet trusted: deploy it as a certificate payload of the `com.memex.local` profile, or a person runs `mkcert -install` once (the keychain step needs an interactive authorisation) |
-| memex | registry mode (once — never re-written); the local CA created without the keychain prompt; `memex-local up` until `memex-local verify` passes, `memex-local fleet join --code-file ~/.memex-local/enrol/<id>.code`, and a joined Mac's unfinished back-lease enrolment resumed from its stored credentials | no `ControlUrl` yet, or the approval and the enrolment code are pending (the link is in the log and in `~/.memex-local/enrol/<id>.link`) |
+| local CA | a FLEET Mac does not wait: when the fleet local CA (`FleetCaSha256`) is in the System keychain and trusted (its trusted-root profile), `up` runs with `MEMEX_CA_TRUST=defer` until its key arrives with the enrolment code (`~/.memex-local/enrol/fleet-ca.key`), and then `memex-local ca adopt` makes it mkcert's CA and re-issues the portal's certificate | no fleet CA and the mkcert CA (`<CAROOT>/rootCA.pem`, a PUBLIC certificate) is not yet trusted: a person runs `mkcert -install` once (macOS allows the trust change only with a person at the UI, even as root) |
+| memex | registry mode (once — never re-written); the local CA created without the keychain prompt; `memex-local up` until `memex-local verify` passes, `memex-local fleet join --code-file ~/.memex-local/enrol/<id>.code` with the owner's answers (`--accept-jobs=…` or `--no-accept-jobs --no-buildhost`, `--accept-tokens=… --token-models … [--residency …]` or `--no-accept-tokens`), and a joined Mac's unfinished back-lease enrolment resumed from its stored credentials | no `ControlUrl` yet, or the approval and the enrolment code are pending (the link is in the log and in `~/.memex-local/enrol/<id>.link`) |
 
 **Configuration** comes from the managed-preference domain `com.memex.local`, deployed as a configuration
 profile. Its keys are `ControlUrl`, `DeploymentId`, `RegistryUrl`, `LoginServer`, and the machine's OWNER,
@@ -24,6 +26,30 @@ profile. Its keys are `ControlUrl`, `DeploymentId`, `RegistryUrl`, `LoginServer`
 (when MeshWeaver user ids are UPN prefixes) and `{{mail}}`. The environment
 variables `FLEET_CONTROL_URL`, `FLEET_MACHINE_ID`, `FLEET_REGISTRY_URL` and `FLEET_LOGIN_SERVER` override
 them. Nothing secret is configured.
+
+`FleetCaSha256` names the fleet local CA's certificate (64 hex, its SHA-256): the certificate itself is a
+trusted-root profile, minted once on the owner's go with `deploy/macos/fleet-ca/mint-fleet-ca.sh` (EC P-256,
+critical Name Constraints: `DNS:localhost` — which covers every name below it — `127.0.0.1`, `::1`; the key goes
+straight into a vault object and reaches each Mac sealed in its enrolment code, item `a`). Sharing one key is
+tolerable only because macOS ENFORCES those constraints on the root. Measured on macOS 27 (2026-11-09) with Apple's
+evaluator (`security verify-cert -c <leaf> -r <fleet CA> -p ssl -n <name>`): a leaf for `memex.localhost` signed by
+the CA verifies; a leaf for `example.com` signed by the same CA is refused, *"Certificate violates name constraints
+placed on issuing CA"*. Re-measure on the first profile-trusted fleet Mac (Safari and Chrome) before relying on it.
+
+**Participation — required, never defaulted** (the owner's answers, Mac onboarding contract §5):
+
+| Key | Type | Meaning |
+|---|---|---|
+| `AcceptJobs` | boolean, **required** | the Mac takes the fleet's build-queue jobs. NO ⇒ no build host at all (no build VM, runners or priority agent; `fleet join --no-accept-jobs --no-buildhost`) |
+| `AcceptJobsFrom` | list (array or comma string), required on YES | the instances whose jobs it takes (`control.example.com`, `*.example.cloud`, `*`) |
+| `AcceptJobsChannels`, `AcceptJobsRepos` | list, optional | narrow the jobs to these release channels / `owner/repo`s |
+| `AcceptTokens` | boolean, **required** | the Mac serves local models to the fleet's token queue. NO ⇒ no token models beyond the portal's own chat model |
+| `AcceptTokensFrom`, `AcceptTokensModels` | list, both required on YES | whose token requests, which models |
+| `AcceptTokensResidency` | string, optional | where the Mac is (`CH`, `Eu`) — stamped on what it serves |
+
+The environment variables `FLEET_ACCEPT_JOBS`, `FLEET_ACCEPT_JOBS_FROM`, `FLEET_ACCEPT_JOBS_CHANNELS`,
+`FLEET_ACCEPT_JOBS_REPOS`, `FLEET_ACCEPT_TOKENS`, `FLEET_ACCEPT_TOKENS_FROM`, `FLEET_ACCEPT_TOKENS_MODELS`,
+`FLEET_ACCEPT_TOKENS_RESIDENCY` and `FLEET_CA_SHA256` override them.
 
 **Registering it** is the reconcile's job (section "Intune objects as code" below): the spec pins the script to a full commit of this
 repository and the file's sha256, `--apply` uploads exactly those bytes (refusing any that hash differently), and
