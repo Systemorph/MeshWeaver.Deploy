@@ -4074,16 +4074,40 @@ def remove_workspace(path: str, release: Callable[[str], None] = release_run_tre
     shutil.rmtree(path, ignore_errors=True)
 
 
+def lower_is_writable_through(lower: str) -> bool:
+    """Whether an overlay with `lower` beneath can be WRITTEN by this process, read from the lower's ROOT directory's owner:
+    this process's uid for the runner's own trees under the cache, an id this user namespace does not map for the image's
+    tree (overlayfs checks the lower's permissions on every copy-up into a directory). Both real lowers are single-owner
+    trees, so the root decides; a mixed-ownership lower is not detected here. A missing or unreadable lower is not
+    writable-through. Pure apart from a stat."""
+    try:
+        return os.stat(lower).st_uid == os.getuid()
+    except OSError:
+        return False
+
+
 @contextlib.contextmanager
 def platform_source_view(platform_src: str, dest: str, env: dict, log: Callable[[str], None],
                          git: Optional[Callable[..., None]] = None, mount: Optional[Callable[[str, str], None]] = None,
-                         can_overlay: Optional[bool] = None):
+                         can_overlay: Optional[bool] = None, create_master: bool = True):
     """A WRITABLE view of the host's platform source (MW_PLATFORM_SOURCE, read-only in the image) at `dest`, for a
     repository-declared command that builds or restores projects referencing the platform (MSBuild writes their obj/ and
     bin/ into that tree) — and NOT A COPY: an overlay with the image's tree as the read-only lower where this runner may
     mount one, else a cold `git worktree add` of the platform's master at the tree's `.source-commit` (the image's tree IS
     that commit's `git archive`), said. Removed when the block ends. Raises Refusal when neither is possible."""
     can = env.get(IN_NS_ENV) == "1" if can_overlay is None else can_overlay
+    if can and not lower_is_writable_through(platform_src):
+        # The IMAGE's tree is owned by the pod's root, which this runner's own user namespace does not map: an overlay of
+        # it mounts, but no directory of it can be written through it ("Access to the path …/obj is denied" — measured on
+        # eiger 2026-11-09, every prepared input and warm restore red the moment the overlay probe passed, #213). Such a
+        # lower takes the cold worktree, whose files this process owns; the deployment's platform tree (owned) overlays.
+        try:
+            owner: object = os.stat(platform_src).st_uid
+        except OSError as e:
+            owner = f"unreadable: {type(e).__name__}"
+        log(f"platform source: {platform_src} is not owned by this runner (owner {owner}, runner uid {os.getuid()}) — an "
+            f"overlay of it could not be written; a cold worktree of the platform's master instead")
+        can = False
     layered, cold = False, False
     if can:
         try:
@@ -4105,6 +4129,10 @@ def platform_source_view(platform_src: str, dest: str, env: dict, log: Callable[
         base = env.get("MW_BUILD_GIT_BASE", "https://github.com/Systemorph").rstrip("/")
         g = git or _git_runner(env, os.path.dirname(dest), None, None)
         mirror = master_path(cache, repo)
+        if not create_master and not os.path.isfile(os.path.join(mirror, "HEAD")):
+            # a STAGE never creates (clones) the platform master — the warm build and the prepared inputs own that; a stage
+            # without one binds no view and says so, instead of cloning the platform per stage
+            raise Refusal(f"no {repo} master on this host yet ({mirror}) — a stage does not clone one")
         log(f"platform source: COLD worktree of the {repo} master at {commit[:12]} (this runner cannot overlay the image's tree) — nothing copied")
         _update_mirror(repo, f"{base}/{repo}.git", os.path.dirname(mirror), mirror, [commit], g, log)
         shutil.rmtree(dest, ignore_errors=True)
@@ -5551,7 +5579,8 @@ class Host:
             return []
         lower = self.run_platform_lower or target
         try:
-            view = views.enter_context(platform_source_view(lower, os.path.join(workdir, "platform", name), self.env, self.log))
+            view = views.enter_context(platform_source_view(lower, os.path.join(workdir, "platform", name), self.env, self.log,
+                                                            create_master=False))
         except (Refusal, subprocess.SubprocessError, OSError) as e:
             self.log(f"stage {name}: no writable platform view ({str(e)[:200]}) — the stage sees the image's read-only tree")
             return []
@@ -7192,6 +7221,54 @@ def self_test() -> int:
                                       mount=lambda lo, de: (pv_mounts.append((lo, de)), os.makedirs(de, exist_ok=True))) as pv2:
                 check("platform-view/inside the runner's namespace: an OVERLAY with the image's tree as the read-only lower",
                       pv_mounts == [(image_src, pv2)], pv_mounts)
+            # the IMAGE's tree as it is on a host: owned by an id the runner's namespace does not map — an overlay of it mounts
+            # but cannot be written (eiger, 2026-11-09: every prepared input and warm restore "Access … is denied"), so it
+            # takes the cold worktree even though the runner can overlay; an OWNED lower still overlays
+            real_lw = globals()["lower_is_writable_through"]
+            globals()["lower_is_writable_through"] = lambda lo: lo != image_src
+            try:
+                pv_mounts.clear(); said_own: list = []
+                with platform_source_view(image_src, os.path.join(wroot, "work", "pv4", "platform"), wenv, said_own.append,
+                                          can_overlay=True, mount=lambda lo, de: pv_mounts.append((lo, de))) as pv4:
+                    open(os.path.join(pv4, "obj.txt"), "w").write("restore output")
+                    check("platform-view/a lower this runner does not OWN is never overlaid (it could not be written): a cold "
+                          "worktree instead, said with both uids",
+                          pv_mounts == [] and any("not owned by this runner" in m for m in said_own)
+                          and any("COLD worktree" in m for m in said_own)
+                          and wt_count(pv4, master_path(wenv["MW_BUILD_CACHE"], "MeshWeaver")) == 1, (pv_mounts, said_own))
+                owned = os.path.join(wroot, "owned-lower"); os.makedirs(owned)
+                open(os.path.join(owned, ".source-commit"), "w").write(pc + "\n")
+                with platform_source_view(owned, os.path.join(wroot, "work", "pv5", "platform"), wenv, log0, can_overlay=True,
+                                          mount=lambda lo, de: (pv_mounts.append((lo, de)), os.makedirs(de, exist_ok=True))) as pv5:
+                    check("platform-view/...while an OWNED lower (the deployment's platform tree) still overlays",
+                          pv_mounts == [(owned, pv5)], pv_mounts)
+            finally:
+                globals()["lower_is_writable_through"] = real_lw
+            said_missing: list = []
+            real_lw2 = globals()["lower_is_writable_through"]
+            globals()["lower_is_writable_through"] = lambda lo: False
+            try:
+                try:
+                    with platform_source_view(os.path.join(wroot, "gone-lower"), os.path.join(wroot, "work", "pv7", "platform"), wenv,
+                                              said_missing.append, can_overlay=True, mount=lambda lo, de: None):
+                        pass
+                except Refusal:
+                    pass
+            finally:
+                globals()["lower_is_writable_through"] = real_lw2
+            check("platform-view/a MISSING lower is said (owner unreadable) and refused, never an exception from the log line",
+                  any("owner unreadable: FileNotFoundError" in m for m in said_missing), said_missing)
+            check("platform-view/ownership is read from the lower itself: this process's own directory is writable-through, a "
+                  "missing one is not", lower_is_writable_through(image_src) and not lower_is_writable_through(os.path.join(wroot, "nope")))
+            empty_cache = os.path.join(wroot, "empty-cache"); os.makedirs(empty_cache)
+            try:
+                with platform_source_view(image_src, os.path.join(wroot, "work", "pv6", "platform"), dict(wenv, MW_BUILD_CACHE=empty_cache),
+                                          log0, can_overlay=False, create_master=False):
+                    pass
+                check("platform-view/a STAGE's view never clones the platform master: none on the host is a Refusal", False, "yielded")
+            except Refusal as e:
+                check("platform-view/a STAGE's view never clones the platform master: none on the host is a Refusal",
+                      "does not clone" in str(e) and not os.path.exists(master_path(empty_cache, "MeshWeaver")), str(e))
             no_commit = os.path.join(wroot, "image-no-commit"); os.makedirs(no_commit)
             try:
                 with platform_source_view(no_commit, os.path.join(wroot, "work", "pv3", "platform"), wenv, log0, can_overlay=False):

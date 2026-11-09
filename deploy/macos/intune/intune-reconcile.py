@@ -221,6 +221,14 @@ def validate(spec, spec_dir):
                 p.append(f"{w}: AcceptJobs is true but AcceptJobsFrom names no instance")
             if keys.get("AcceptTokens") is True and not keys.get("AcceptTokensFrom"):
                 p.append(f"{w}: AcceptTokens is true but AcceptTokensFrom names no instance")
+            if keys.get("AcceptTokens") is True and not keys.get("AcceptTokensModels"):
+                p.append(f"{w}: AcceptTokens is true but AcceptTokensModels names no model (the bootstrap refuses that)")
+            cas = [t.get("sha256") for t in spec.get("trustedRootCertificates", []) if t.get("sha256")]
+            if keys.get("FleetCaSha256") and keys["FleetCaSha256"] not in cas:
+                p.append(f"{w}: keys.FleetCaSha256 names no declared trustedRootCertificates sha256 (memex-local ca adopt "
+                         "would look for a certificate the profile never delivers)")
+            if cas and not keys.get("FleetCaSha256"):
+                p.append(f"{w}: a fleet CA is declared but keys.FleetCaSha256 is absent (memex-local ca adopt reads it)")
             if "AcceptTokensResidency" in keys and not isinstance(keys["AcceptTokensResidency"], str):
                 p.append(f"{w}: keys.AcceptTokensResidency must be a string")
         targets(w, c.get("assign"))
@@ -958,6 +966,21 @@ def self_test():
     v = validate(bad, ".")
     expect("validate: a missing participation answer, a branch instead of a pin and an undeclared group are each refused",
            any("AcceptTokens" in x for x in v) and any("40-hex" in x for x in v) and any("nowhere" in x for x in v), v)
+    ca = copy.deepcopy(spec)
+    ca["trustedRootCertificates"][0]["sha256"] = "f" * 64
+    v = validate(ca, ".")
+    expect("validate: a declared CA without FleetCaSha256 in the profile is refused", any("FleetCaSha256 is absent" in x for x in v), v)
+    ca["customProfiles"][0]["keys"]["FleetCaSha256"] = "e" * 64
+    v = validate(ca, ".")
+    expect("validate: a FleetCaSha256 that names no declared CA is refused", any("names no declared" in x for x in v), v)
+    ca["customProfiles"][0]["keys"]["FleetCaSha256"] = "f" * 64
+    expect("validate: the profile's FleetCaSha256 equal to the declared CA passes", not validate(ca, "."), validate(ca, "."))
+    tok_on = copy.deepcopy(spec)
+    tok_on["customProfiles"][0]["keys"].update(AcceptTokens=True, AcceptTokensFrom=["*.example.com"])
+    v = validate(tok_on, ".")
+    expect("validate: tokens on without models is refused, as the bootstrap refuses it", any("AcceptTokensModels" in x for x in v), v)
+    tok_on["customProfiles"][0]["keys"]["AcceptTokensModels"] = ["model-a"]
+    expect("validate: tokens on with models passes", not validate(tok_on, "."), validate(tok_on, "."))
 
     wrong = copy.deepcopy(spec)
     wrong["scripts"][0]["source"]["sha256"] = "0" * 64
