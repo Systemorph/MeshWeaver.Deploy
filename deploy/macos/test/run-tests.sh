@@ -454,6 +454,16 @@ case "$OUT" in *"joined as"*) bad "a dry run never claims a join" "$OUT" ;; *) o
 OUT="$(env FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_CONSOLE_USER=root FLEET_LOG_DIR="$T/logs" bash "$FB" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*"no one is logged in"*) ok "no one at the console: nothing to do, exit 0" ;; *) bad "no console user" "rc=$RC: $OUT" ;; esac
 
+echo "── Intune objects as code: the reconcile (deploy/macos/intune/intune-reconcile.py) ──"
+RECON="$MACOS/intune/intune-reconcile.py"
+OUT="$(python3 "$RECON" --self-test 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "the reconcile's self-test against a fake Graph passes ($(grep -c '^  ok' <<<"$OUT") cases)" || bad "intune-reconcile --self-test" "$OUT"
+OUT="$(python3 "$RECON" --validate --spec "$MACOS/intune/fleet.spec.example.json" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "the example fleet spec validates" || bad "fleet.spec.example.json invalid" "$OUT"
+sed 's/"AcceptTokens": false,//; s/"AcceptTokens": true,//' "$MACOS/intune/fleet.spec.example.json" > "$T/no-answer.spec.json"
+OUT="$(python3 "$RECON" --validate --spec "$T/no-answer.spec.json" 2>&1)"; RC=$?
+case "$RC:$OUT" in 1:*"keys.AcceptTokens must be an explicit true/false"*) ok "a spec without the owner's token answer is refused (participation is never implied)" ;; *) bad "missing AcceptTokens accepted" "rc=$RC: $OUT" ;; esac
+
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
