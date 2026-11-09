@@ -5971,6 +5971,10 @@ if command -v openssl >/dev/null 2>&1; then
     && ok "seal-secret: a value over one OAEP block is refused, naming its size and the limit" || bad "oversize" "rc ${_ss_rc}: ${_ss_out}"
   ss HOSTING_SS_VALUE="$(printf 'A%.0s' $(seq 1 318))" -- "${SS_ARGS[@]}"
   [ "$_ss_rc" -eq 0 ] && [ "$(seal_open "$_ss_out" n | wc -c | tr -d ' ')" = "318" ] && ok "…negative control: exactly 318 bytes seals and opens" || bad "318 bytes" "rc ${_ss_rc}: ${_ss_out}"
+  # A PEM-shaped value keeps its own trailing newline: only the ONE newline `-o tsv` appends is cut.
+  ss HOSTING_SS_VALUE=$'-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg\n-----END PRIVATE KEY-----\n' -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -eq 0 ] && [ "$(seal_open "$_ss_out" n | tail -c 6 | od -An -tx1 | tr -d ' \n')" = "2d2d2d2d2d0a" ] \
+    && ok "seal-secret: a value's own trailing newline survives — exactly one byte is cut" || bad "pem newline" "rc ${_ss_rc}: $(seal_open "$_ss_out" n | od -An -c | tail -n2)"
   ss HOSTING_SS_VALUE="" -- "${SS_ARGS[@]}"
   [ "$_ss_rc" -ne 0 ] && case "$_ss_out" in *"is EMPTY"*) true ;; *) false ;; esac && ok "seal-secret: an empty object is refused" || bad "empty" "rc ${_ss_rc}: ${_ss_out}"
   ss HOSTING_SS_OBJECTS="other" -- "${SS_ARGS[@]}"
