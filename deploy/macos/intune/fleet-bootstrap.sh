@@ -14,7 +14,8 @@
 #      the network must be up before anyone logs in, which the Tailscale app does not do. memex-local finds
 #      this socket by itself.
 #   4. The private network: joined with a single-use pre-auth key when one is provided (FLEET_PREAUTH_KEY_FILE,
-#      read and deleted, never printed). Until control mints it at enrolment, a run without one says so.
+#      else ~<console user>/.memex-local/enrol/<machine>.preauth — the path an Intune run can reach, since Intune
+#      sets no environment; read by file reference and deleted after the join, never printed). Until control mints it at enrolment, a run without one says so.
 #   5. memex-local: registry mode, `up`, then `fleet join`. The join's approval happens on control; the run
 #      prints the approval link (and writes it to the log), and a later run completes the join once the
 #      enrolment code is at its code file. Until control hands the code back itself (§2b.1, target 1), the
@@ -240,10 +241,21 @@ step_tailscaled() {
   run launchctl bootstrap system "$TAILSCALED_PLIST" || { log "tailscaled: FAILED to load the daemon"; return 1; }
 }
 
+# The pre-auth key file: FLEET_PREAUTH_KEY_FILE, else the console user's enrol directory. A default-path file is
+# taken only when it is a REGULAR file owned by that user (never a symlink): root passes its content to the
+# login server, so it must never be steered at another file. Prints the path, or nothing.
+preauth_key_file() {
+  local user="$1" machine="$2" f
+  if [ -n "${FLEET_PREAUTH_KEY_FILE:-}" ]; then printf '%s' "$FLEET_PREAUTH_KEY_FILE"; return 0; fi
+  f="$(user_home "$user")/.memex-local/enrol/$machine.preauth"
+  [ -f "$f" ] && [ ! -L "$f" ] && [ "$(stat -f%Su "$f" 2>/dev/null)" = "$user" ] && printf '%s' "$f"
+  return 0
+}
+
 step_network() {
-  local machine="$1" ts=("$TS_DIR/bin/tailscale" --socket="$TAILSCALED_SOCKET")
+  local machine="$1" user="${2:-}" ts=("$TS_DIR/bin/tailscale" --socket="$TAILSCALED_SOCKET")
   if "${ts[@]}" status >/dev/null 2>&1; then log "network: joined"; return 0; fi
-  local key_file="${FLEET_PREAUTH_KEY_FILE:-}" login; login="$(setting FLEET_LOGIN_SERVER LoginServer)"
+  local key_file login; key_file="$(preauth_key_file "$user" "$machine")"; login="$(setting FLEET_LOGIN_SERVER LoginServer)"
   if [ -z "$key_file" ] || [ ! -f "$key_file" ] || [ -z "$login" ]; then
     log "network: WAITING for a single-use pre-auth key and the login server (control mints the key at enrolment — Hosting/MacStudioFleet §2b.1 target 2)"
     return 0
@@ -336,7 +348,7 @@ main() {
   [ "$failed" = 0 ] && { step_tools "$user" || failed=1; }
   [ "$failed" = 0 ] && { step_tailscale_binaries || failed=1; }
   [ "$failed" = 0 ] && { step_tailscaled || failed=1; }
-  [ "$failed" = 0 ] && { step_network "$machine" || failed=1; }
+  [ "$failed" = 0 ] && { step_network "$machine" "$user" || failed=1; }
   [ "$failed" = 0 ] && { step_memex "$user" "$machine" || failed=1; }
   [ "$failed" = 0 ] && log "done (everything this run could do)" || log "a step FAILED — the next run retries from it"
   exit "$failed"

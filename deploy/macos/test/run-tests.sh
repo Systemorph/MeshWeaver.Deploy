@@ -410,6 +410,16 @@ grep -q 'TRUST_STORES=nss' "$FB" && grep -q 'WAITING for the local CA to be trus
 mkdir -p "$T/clt/usr/bin" && printf '#!/bin/sh\n' > "$T/clt/usr/bin/clang" && chmod +x "$T/clt/usr/bin/clang"
 env FLEET_BOOTSTRAP_LIB=1 FLEET_CLT_DIR="$T/clt" FLEET_LOG_DIR="$T/clog" bash -c '. "$0"; step_devtools' "$FB" | grep -q 'developer tools: present' \
   && ok "installed Command Line Tools are detected and left alone" || bad "developer tools present" "$(env FLEET_BOOTSTRAP_LIB=1 FLEET_CLT_DIR="$T/clt" FLEET_LOG_DIR="$T/clog" bash -c '. "$0"; step_devtools' "$FB" 2>&1)"
+mkdir -p "$T/kh/.memex-local/enrol" && : > "$T/kh/.memex-local/enrol/studio-2.preauth"
+[ "$(env FLEET_BOOTSTRAP_LIB=1 FLEET_USER_HOME="$T/kh" bash -c '. "$0"; preauth_key_file "$(id -un)" studio-2' "$FB")" = "$T/kh/.memex-local/enrol/studio-2.preauth" ] \
+  && ok "an Intune run (no environment) finds the pre-auth key in the console user's enrol directory" || bad "default pre-auth key path" "not found"
+ln -sf /etc/hosts "$T/kh/.memex-local/enrol/studio-3.preauth"
+[ -z "$(env FLEET_BOOTSTRAP_LIB=1 FLEET_USER_HOME="$T/kh" bash -c '. "$0"; preauth_key_file "$(id -un)" studio-3' "$FB")" ] \
+  && ok "a symlinked pre-auth key file is refused (root never reads a file it was steered at)" || bad "symlink key refused" "taken"
+[ -z "$(env FLEET_BOOTSTRAP_LIB=1 FLEET_USER_HOME="$T/kh" bash -c '. "$0"; preauth_key_file nobody-else studio-2' "$FB")" ] \
+  && ok "a pre-auth key file the console user does not own is refused" || bad "foreign-owned key refused" "taken"
+[ "$(env FLEET_BOOTSTRAP_LIB=1 FLEET_PREAUTH_KEY_FILE=/x/k FLEET_USER_HOME="$T/kh" bash -c '. "$0"; preauth_key_file "$(id -un)" studio-2' "$FB")" = "/x/k" ] \
+  && ok "FLEET_PREAUTH_KEY_FILE still wins" || bad "env key file wins" "no"
 grep -q 'installondemand.in-progress' "$FB" && grep -q 'rm -f "$flag"' "$FB" && ok "the on-demand flag is set for the catalogue and always removed" || bad "on-demand flag" "missing"
 grep -q -- '--auth-key="file:$key_file"' "$FB" && ! grep -q -- '--auth-key "\$key"' "$FB" \
   && ok "the pre-auth key is passed by FILE reference (never an argument)" || bad "auth key by file" "missing"
