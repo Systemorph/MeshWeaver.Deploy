@@ -1954,6 +1954,8 @@ case "$*" in *redirect_url*) printf '%s' "${FAKE_REDIRECT:-}" ;; *) printf '%s' 
 EOF
 printf '#!/usr/bin/env bash\nprintf "info: Banner\\n  Token: %%s\\n" "$FAKE_TOKEN"\n' > "$SO/stubs/kubectl"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$FAKE_OPEN_LOG"\n' > "$SO/stubs/open"
+# the served certificate is trusted unless a test says otherwise (FAKE_UNTRUSTED)
+printf '#!/usr/bin/env bash\n[ "$1" = verify-cert ] && [ -z "${FAKE_UNTRUSTED:-}" ]\n' > "$SO/stubs/security"
 chmod +x "$SO/stubs/"*
 so_run() {
   : > "$SO/open.log"
@@ -1972,6 +1974,12 @@ so_run FAKE_REDIRECT="https://memex.localhost:8443/login" FAKE_TOKEN=tok3
 [ ! -s "$SO/open.log" ] && ok "a set-up instance opens nothing" || bad "a set-up instance opens nothing" "$(cat "$SO/open.log")"
 so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok4 MEMEX_HEADLESS=1
 [ ! -s "$SO/open.log" ] && ok "a headless host opens nothing" || bad "a headless host opens nothing" "$(cat "$SO/open.log")"
+so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok9 FAKE_UNTRUSTED=1
+[ ! -s "$SO/open.log" ] && case "$OUT" in *"NOT opening the browser"*"not trusted"*) true ;; *) false ;; esac \
+  && ok "the login agent never opens the wizard into an untrusted certificate (defect 10), and says why" || bad "agent opens into an untrusted cert" "open: $(cat "$SO/open.log") out: $OUT"
+case "$OUT" in *tok9*) bad "the agent's untrusted-certificate line never carries the token" "$OUT" ;; *) ok "the agent's untrusted-certificate line never carries the token" ;; esac
+so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok9
+[ "$(cat "$SO/open.log")" = "https://memex.localhost:8443/setup?token=tok9" ] && ok "…and opens it on a later start, once the certificate is trusted (no marker was written)" || bad "agent retries after trust" "$(cat "$SO/open.log")"
 grep -q '^open_setup_if_waiting &$' "$PF" && ok "the agent runs it in the background, before the forward" || bad "the agent runs it in the background" ""
 named=""; for m in "$SO/home/.memex-local/"setup-opened.*; do case "$m" in *tok*) named="$m" ;; esac; done
 if [ -n "$named" ]; then bad "the marker never names the token" "$named"
@@ -2738,10 +2746,134 @@ tsh 'Tokens__Slots: "2"' && tsh 'Tokens__MaxConcurrency: "1"' \
 OUT="$(ts "$CLI" backlease accept tokens --yield-at 5 </dev/null 2>&1)" && bad "yield-at 5 accepted" "$OUT" || ok "a yield threshold outside 10–3200 % is refused"
 rm -rf "$TS"
 
+
+echo "── the second Mac Studio's defects, pinned (2026-11-09) ─────────────"
+OB="$(mktemp -d)"; mkdir -p "$OB/stubs" "$OB/brewbin" "$OB/home/.memex-local" "$OB/sys"
+# a PATH with the system's tools but NO kubectl/colima (and none of Homebrew's): what the person's shell had
+for f in /usr/bin/* /bin/*; do b="$(basename "$f")"; case "$b" in kubectl|colima|helm|mkcert|security|open) continue ;; esac; [ -e "$OB/sys/$b" ] || ln -s "$f" "$OB/sys/$b"; done
+# kubectl that serves the setup banner; curl that says the portal answers
+printf '#!/usr/bin/env bash\ncase "$*" in *logs*) printf "info: Setup\\n  Token: tok-ob-123\\n" ;; *version*) echo "Client Version: v1.37.1" ;; esac\nexit 0\n' > "$OB/brewbin/kubectl"
+printf '#!/usr/bin/env bash\nprintf 302\n' > "$OB/stubs/curl"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$FAKE_OPEN_LOG"\n' > "$OB/stubs/open"
+printf '#!/usr/bin/env bash\n[ "$1" = verify-cert ] && [ -z "${FAKE_UNTRUSTED:-}" ]\n' > "$OB/stubs/security"
+chmod +x "$OB/stubs/"* "$OB/brewbin/"*
+PGPW="pgsecret-$(openssl rand -hex 12)"
+printf 'secrets:\n  memex_postgres_password: "%s"\n' "$PGPW" > "$OB/home/.memex-local/values.local.yaml"
+obrun() { OUT="$(env -i HOME="$OB/home" MEMEX_LOCAL_HOME="$OB/home/.memex-local" PATH="$OB/stubs:$OB/sys" FAKE_OPEN_LOG="$OB/open.log" "$@" bash "$CLI" setup 2>&1)"; RC=$?; : ; }
+# Defect 5 (the PATH half is memex_toolchain_path, #217): a command that needs kubectl/colima and finds none FAILS
+# naming it — never an empty answer. Sourced, so no toolchain directory is added: the PATH is exactly this one.
+obsrc() { OUT="$(env -i HOME="$OB/home" MEMEX_LOCAL_HOME="$OB/home/.memex-local" PATH="$OB/stubs:$OB/sys" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; '"$1" "$CLI" 2>&1)"; RC=$?; }
+obsrc 'cmd_setup --no-open'
+case "$RC:$OUT" in 0:*) bad "setup without kubectl fails" "$OUT" ;; *"required tool 'kubectl' not found"*"brew install kubernetes-cli"*) ok "setup without kubectl FAILS naming kubectl (defect 5: it used to print nothing)" ;; *) bad "setup names kubectl" "rc=$RC $OUT" ;; esac
+for c in verify status logs; do
+  obsrc "cmd_$c"
+  case "$RC:$OUT" in 0:*) bad "$c without the tools fails" "$OUT" ;; *"required tool '"*"' not found"*) ok "$c without colima/kubectl FAILS naming the missing tool" ;; *) bad "$c names the tool" "rc=$RC $OUT" ;; esac
+done
+cp "$OB/brewbin/kubectl" "$OB/stubs/kubectl"
+# Defect 7: setup never prints the in-cluster Postgres password — only where it is and its fingerprint.
+obrun FAKE_UNTRUSTED=1
+case "$OUT" in *"$PGPW"*) bad "setup never prints the Postgres password" "the value is in the output" ;; *) ok "setup never prints the in-cluster Postgres password (defect 7)" ;; esac
+case "$OUT" in *"Password=<memex_postgres_password in $OB/home/.memex-local/values.local.yaml>"*"its fingerprint: sha256:"*) ok "…it names where the password is, with its fingerprint" ;; *) bad "password pointer" "$OUT" ;; esac
+# Defect 10: the browser is never opened into an untrusted certificate.
+[ ! -s "$OB/open.log" ] && case "$OUT" in *"not opening the browser"*"not trusted"*) true ;; *) false ;; esac \
+  && ok "setup does NOT open the wizard while the served certificate is untrusted, and says what is missing (defect 10)" || bad "no open when untrusted" "open: $(cat "$OB/open.log") $OUT"
+: > "$OB/open.log"; obrun
+[ "$(cat "$OB/open.log")" = "https://memex.localhost:8443/setup?token=tok-ob-123" ] && ok "…and opens it once the certificate is trusted" || bad "open when trusted" "$(cat "$OB/open.log") $OUT"
+! grep -nE '(^|[^_])open "\$\{url\}\?token' "$CLI" && ok "no code path opens the token URL without the trust check" || bad "unguarded open" "$(grep -n 'open "${url}?token' "$CLI")"
+
+# Participation (contract §5): the build host only on the owner's YES to jobs; no extra token models after a NO.
+pb() { env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$OB/home/.memex-local" HOME="$OB/home" bash -c '. "$0"; '"$1" "$CLI" 2>&1; }
+BL="$OB/home/.memex-local/backlease.yaml"
+rm -f "$BL"
+[ "$(pb 'participation_build_host yes && echo BUILD || echo NONE')" = NONE ] && ok "no recorded answer → no build host (no answer is not a yes)" || bad "unanswered builds" ""
+[ "$(pb 'ACC_JOBS_ANSWERED=yes; ACC_JOBS_ENABLED=true; participation_build_host yes && echo BUILD || echo NONE')" = BUILD ] && ok "no layer, but --accept-jobs on this join → build host" || bad "flag yes" ""
+printf 'config:\n  memex_portal:\n    Hosting__BackLease__Accept__Jobs__Enabled: "false"\n    Hosting__BackLease__Accept__Tokens__Enabled: "false"\n' > "$BL"
+[ "$(pb 'participation_build_host yes && echo BUILD || echo NONE')" = NONE ] && ok "jobs NO recorded → no build host" || bad "jobs no builds" ""
+[ "$(pb 'ACC_JOBS_ANSWERED=yes; ACC_JOBS_ENABLED=true; participation_build_host yes && echo BUILD || echo NONE')" = NONE ] && ok "…the recorded NO wins over a stale flag value" || bad "recorded no" ""
+OUT="$(pb 'MEMEX_HOST_CORES=8 MEMEX_HOST_MEM_GIB=64 cmd_buildhost apply; echo SURVIVED')"
+case "$OUT" in *SURVIVED*) bad "buildhost apply refused after a NO to jobs" "$OUT" ;; *"owner said NO to fleet jobs"*) ok "buildhost apply is REFUSED after the owner's NO to jobs" ;; *) bad "buildhost refusal" "$OUT" ;; esac
+[ "$(pb 'participation_answer Tokens')" = false ] && ok "the recorded token answer is read" || bad "token answer" ""
+printf 'config:\n  memex_portal:\n    Hosting__BackLease__Accept__Jobs__Enabled: "true"\n' > "$BL"
+[ "$(pb 'participation_build_host yes && echo BUILD || echo NONE')" = BUILD ] && ok "jobs YES recorded → build host" || bad "jobs yes" ""
+[ "$(pb 'participation_build_host no && echo BUILD || echo NONE')" = NONE ] && ok "--no-buildhost wins over a YES" || bad "no-buildhost" ""
+grep -q '^        if participation_build_host "\$with_build"; then$' "$CLI" && ok "fleet join installs the build host only through participation_build_host" || bad "join gate" ""
+case "$(fn_body setup_ollama)" in *'"$(participation_answer Tokens)" = false'*"are not pulled"*) ok "setup_ollama pulls no extra token models after the owner's NO to tokens" ;; *) bad "extras gate" "" ;; esac
+rm -f "$BL"
+
+# Defect 4 (Mac half): `memex-local ca adopt` — the fleet local CA, name-constrained, key never printed.
+MINT="$HERE/../../macos/fleet-ca/mint-fleet-ca.sh"
+CA="$OB/ca"; mkdir -p "$CA/caroot" "$CA/bin" "$CA/home/.memex-local/enrol"
+bash "$MINT" --key-file "$CA/fleet.key" --cert-out "$CA/fleet.pem" >/dev/null 2>&1
+bash "$MINT" --key-file "$CA/other.key" --cert-out "$CA/other.pem" >/dev/null 2>&1
+FSHA="$(openssl x509 -in "$CA/fleet.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)"
+KEYB64="$(cat "$CA/fleet.key")"
+# mkcert: CAROOT from the environment; a leaf "issued" by signing nothing — the test is about what adopt does
+cat > "$CA/bin/mkcert" <<'MK'
+#!/usr/bin/env bash
+case "$1" in -CAROOT) printf '%s\n' "$CAROOT"; exit 0 ;; esac
+printf '%s\n' "$*" >> "$FAKE_MKCERT_LOG"
+[ -f "$CAROOT/rootCA-key.pem" ] || exit 1
+c=""; k=""; prev=""; for a in "$@"; do [ "$prev" = -cert-file ] && c="$a"; [ "$prev" = -key-file ] && k="$a"; prev="$a"; done
+printf 'leaf\n' > "$c"; printf 'leafkey\n' > "$k"
+MK
+chmod +x "$CA/bin/mkcert"
+adopt() { OUT="$(env PATH="$CA/bin:$PATH" CAROOT="$CA/caroot" HOME="$CA/home" MEMEX_LOCAL_HOME="$CA/home/.memex-local" FAKE_MKCERT_LOG="$CA/mkcert.log" MEMEX_KUBE_CONTEXT=none "$@" 2>&1)"; RC=$?; }
+printf 'old\n' > "$CA/caroot/rootCA.pem"; printf 'oldkey\n' > "$CA/caroot/rootCA-key.pem"
+cp "$CA/fleet.key" "$CA/home/.memex-local/enrol/fleet-ca.key"; chmod 600 "$CA/home/.memex-local/enrol/fleet-ca.key"
+# the forms the minted fleet CA is stored in: the key as ONE line of base64 PKCS#8 DER (the vault object, enrolment
+# item `a`), the certificate permitting DNS:localhost alone (RFC 5280: it covers every name below localhost)
+[ "$(wc -l < "$CA/fleet.key" | tr -d ' ')" = 1 ] && ! grep -q -- '-----BEGIN' "$CA/fleet.key" \
+  && openssl x509 -in "$CA/fleet.pem" -noout -text | grep -q '^ *DNS:localhost$' && ! openssl x509 -in "$CA/fleet.pem" -noout -text | grep -q 'DNS:\.localhost' \
+  && ok "the adopted pair is in the stored form: one line of base64 PKCS#8 DER, a CA permitting DNS:localhost alone" || bad "stored form" "$(cat "$CA/fleet.key" | wc -l)"
+adopt "$CLI" ca adopt --cert "$CA/fleet.pem" --sha256 "$FSHA"
+case "$RC:$OUT" in 0:*"fleet local CA adopted"*"re-issued under the fleet CA"*) ok "ca adopt installs the fleet CA (the join's drop, the declared sha256) and re-issues the portal's certificate" ;; *) bad "ca adopt" "rc=$RC $OUT" ;; esac
+case "$OUT" in *"$KEYB64"*|*"PRIVATE KEY"*) bad "ca adopt never prints the key" "$OUT" ;; *) ok "ca adopt never prints the key (fingerprints only)" ;; esac
+[ "$(openssl x509 -in "$CA/caroot/rootCA.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)" = "$FSHA" ] \
+  && [ "$(openssl pkey -in "$CA/caroot/rootCA-key.pem" -pubout -outform DER | shasum -a 256)" = "$(openssl x509 -in "$CA/fleet.pem" -noout -pubkey | openssl pkey -pubin -outform DER | shasum -a 256)" ] \
+  && ok "mkcert's CAROOT now holds the fleet CA and its key" || bad "caroot contents" "$(ls -la "$CA/caroot")"
+[ "$(ls -l "$CA/caroot/rootCA-key.pem" | cut -c1-10)" = "-r--------" ] && ok "the CA key is 0400" || bad "key mode" "$(ls -l "$CA/caroot/rootCA-key.pem")"
+ls "$CA/caroot"/replaced-*/rootCA.pem >/dev/null 2>&1 && [ "$(cat "$CA/caroot"/replaced-*/rootCA.pem)" = old ] && ok "the previous local CA is moved aside, never deleted" || bad "previous CA kept" "$(ls -R "$CA/caroot")"
+[ ! -e "$CA/home/.memex-local/enrol/fleet-ca.key" ] && ok "the join's key drop is removed once adopted" || bad "drop removed" ""
+grep -q -- "-cert-file $CA/home/.memex-local/memex.localhost.pem -key-file $CA/home/.memex-local/memex.localhost-key.pem memex.localhost \*.memex.localhost" "$CA/mkcert.log" \
+  && ok "the portal's certificate (memex.localhost, *.memex.localhost) is re-issued under the adopted CA" || bad "re-issue" "$(cat "$CA/mkcert.log")"
+adopt bash -c 'cat "$1" | "$2" ca adopt --key-stdin --cert "$3" --sha256 "$4"' _ "$CA/fleet.key" "$CLI" "$CA/fleet.pem" "$FSHA"
+case "$RC:$OUT" in 0:*"adopted"*) ok "--key-stdin adopts (idempotent: the same CA again)" ;; *) bad "key stdin" "rc=$RC $OUT" ;; esac
+[ "$(ls -d "$CA/caroot"/replaced-* | wc -l | tr -d ' ')" = 1 ] && ok "re-adopting the same CA moves nothing aside" || bad "re-adopt aside" "$(ls "$CA/caroot")"
+chmod 600 "$CA/other.key"
+adopt "$CLI" ca adopt --key-file "$CA/other.key" --cert "$CA/fleet.pem" --sha256 "$FSHA"
+case "$RC:$OUT" in 0:*) bad "a key of another CA is refused" "$OUT" ;; *"does not belong to the certificate"*) ok "a key that does not belong to the declared certificate is REFUSED" ;; *) bad "wrong key" "rc=$RC $OUT" ;; esac
+adopt "$CLI" ca adopt --key-file "$CA/fleet.key" --cert "$CA/other.pem" --sha256 "$FSHA"
+case "$RC:$OUT" in 0:*) bad "a certificate other than the declared one is refused" "$OUT" ;; *"not the declared"*) ok "a certificate whose sha256 is not the declared one is REFUSED" ;; *) bad "wrong cert" "rc=$RC $OUT" ;; esac
+chmod 644 "$CA/fleet.key"
+adopt "$CLI" ca adopt --key-file "$CA/fleet.key" --cert "$CA/fleet.pem" --sha256 "$FSHA"
+case "$RC:$OUT" in 0:*) bad "a key file readable by others is refused" "$OUT" ;; *"not 0600"*) ok "a key file others can read is REFUSED" ;; *) bad "key mode refusal" "rc=$RC $OUT" ;; esac
+chmod 600 "$CA/fleet.key"
+adopt "$CLI" ca adopt --key-file "$CA/fleet.key" --cert "$CA/fleet.pem"
+case "$RC:$OUT" in 0:*) bad "no declared fingerprint is refused" "$OUT" ;; *"no declared fleet CA fingerprint"*) ok "without a declared fingerprint (--sha256 / FleetCaSha256) nothing is adopted" ;; *) bad "no sha" "rc=$RC $OUT" ;; esac
+# a CA that is NOT name-constrained to the loopback names — the right key for it, still refused
+mkca() { printf '[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=t\n[v3]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign\n%s\n' "$2" > "$CA/$1.cnf"
+  openssl ecparam -name prime256v1 -genkey -noout -out "$CA/$1.ec" 2>/dev/null
+  openssl req -new -x509 -key "$CA/$1.ec" -config "$CA/$1.cnf" -extensions v3 -days 2 -out "$CA/$1.pem" 2>/dev/null
+  ( umask 077; openssl pkcs8 -topk8 -nocrypt -in "$CA/$1.ec" -outform DER | openssl base64 -A > "$CA/$1.key" ); }
+mkca wide 'nameConstraints=critical,permitted;DNS:localhost,permitted;DNS:example.com'
+adopt "$CLI" ca adopt --key-file "$CA/wide.key" --cert "$CA/wide.pem" --sha256 "$(openssl x509 -in "$CA/wide.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)"
+case "$RC:$OUT" in 0:*) bad "a CA permitting more than the loopback names is refused" "$OUT" ;; *"permit 'DNS:example.com'"*) ok "a CA that permits a name beyond localhost is REFUSED" ;; *) bad "wide CA" "rc=$RC $OUT" ;; esac
+mkca bare ''
+adopt "$CLI" ca adopt --key-file "$CA/bare.key" --cert "$CA/bare.pem" --sha256 "$(openssl x509 -in "$CA/bare.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)"
+case "$RC:$OUT" in 0:*) bad "an unconstrained CA is refused" "$OUT" ;; *"no CRITICAL Name Constraints"*) ok "an UNCONSTRAINED CA is refused" ;; *) bad "bare CA" "rc=$RC $OUT" ;; esac
+mkca soft 'nameConstraints=permitted;DNS:localhost'
+adopt "$CLI" ca adopt --key-file "$CA/soft.key" --cert "$CA/soft.pem" --sha256 "$(openssl x509 -in "$CA/soft.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)"
+case "$RC:$OUT" in 0:*) bad "non-critical constraints are refused" "$OUT" ;; *"no CRITICAL Name Constraints"*) ok "Name Constraints that are not CRITICAL are refused" ;; *) bad "soft CA" "rc=$RC $OUT" ;; esac
+[ "$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; norm_sha256 "$1"' "$CLI" "sha256:$(printf '%s' "$FSHA" | tr a-f A-F | sed 's/../&:/g; s/:$//')")" = "$FSHA" ] \
+  && ok "a fingerprint with colons, upper case or a sha256: prefix is normalised" || bad "norm_sha256" ""
+# setup_tls does not ask for a trust change when the CA is already trusted (the adopted fleet CA)
+case "$(fn_body setup_tls)" in *'ca_cert_trusted "$caroot/rootCA.pem"; then'*'no trust change needed'*'MEMEX_CA_TRUST:-}" = defer'*'TRUST_STORES=nss mkcert -install'*'else'*'mkcert -install'*) ok "up runs 'mkcert -install' only when the local CA is not already trusted (and never under MEMEX_CA_TRUST=defer)" ;; *) bad "setup_tls trust" "$(fn_body setup_tls)" ;; esac
+rm -rf "$OB"
+
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
-for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease buildhost fleet llm residency relay publish autoupdate instances; do
+for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease buildhost fleet llm residency relay publish autoupdate instances ca; do
   case "$help_out" in
     *"$cmd"*) ;;
     *) bad "help documents '$cmd'" "not in the usage text"; continue ;;
@@ -2749,6 +2881,39 @@ for cmd in up down status setup logs update registry verify port-forward observa
   if grep -q "^    ${cmd})" "$CLI"; then ok "help documents '$cmd', and main dispatches it"
   else bad "help documents '$cmd'" "no dispatch arm in main()"; fi
 done
+
+echo "── the toolchain is found from the install, not the caller's PATH ──"
+KEG="$(mktemp -d)"; mkdir -p "$KEG/Cellar/memex-local/9.9.9/libexec" "$KEG/bin"; cp "$CLI" "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local"
+cp -R "$(dirname "$CLI")/../share" "$KEG/Cellar/memex-local/9.9.9/libexec/share" 2>/dev/null || true
+KB="$(cd "$KEG/bin" && pwd -P)"
+TP="$(env -i HOME="$HOME" PATH=/usr/bin:/bin MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(cd "$(dirname "$CLI")/../share" && pwd)" bash -c '. "$0"; memex_toolchain_path; printf "%s" "$PATH"' "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local" 2>/dev/null)"
+case ":$TP:" in *":$KB:"*) ok "an installed keg finds its Homebrew prefix's bin/ even from a shell without it on PATH (memex-local setup finds kubectl)" ;; *) bad "toolchain PATH from the keg" "$TP" ;; esac
+TP2="$(env -i HOME="$HOME" PATH="$KB:/usr/bin:/bin" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(cd "$(dirname "$CLI")/../share" && pwd)" bash -c '. "$0"; memex_toolchain_path; memex_toolchain_path; printf "%s" "$PATH"' "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local" 2>/dev/null)"
+[ "$(printf '%s' "$TP2" | tr ':' '\n' | grep -cx "$KB")" = "1" ] && ok "the prefix's bin/ is added once (idempotent), and a caller's PATH keeps its order" || bad "toolchain PATH idempotent" "$TP2"
+TP3="$(env -i HOME="$HOME" PATH=/usr/bin:/bin MEMEX_LOCAL_LIB=1 bash -c '. "$0"; memex_toolchain_path; printf "%s" "$PATH"' "$CLI" 2>/dev/null)"
+want="/usr/bin:/bin"; [ "$(uname -s)" = Darwin ] && [ -d /usr/local/bin ] && want="$want:/usr/local/bin"
+[ "$TP3" = "$want" ] && ok "a source checkout gets no prefix (only a Mac's /usr/local/bin): the test stubs and a Linux runner are untouched" || bad "checkout PATH unchanged" "$TP3"
+rm -rf "$KEG"
+grep -q 'need kubectl kubernetes-cli' <(sed -n '/^cmd_setup() {/,/^}/p' "$CLI") && grep -q 'could not read the portal log with kubectl' "$CLI" \
+  && ok "setup resolves kubectl and FAILS naming it — never an empty token" || bad "setup kubectl loud" "missing"
+! grep -q 'Password=\${pg_pw}' "$CLI" && grep -q 'Password=<memex_postgres_password in' "$CLI" \
+  && ok "setup never prints the in-cluster Postgres password" || bad "postgres password masked" "still printed"
+
+echo "── setup --apply: the first-run setup through its API, consent explicit ──"
+SAPY="$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; printf "%s" "$SETUP_ANSWERS_PY"' "$CLI")"
+SA="$(mktemp -d)"
+if env SETUP_NAME=studio-2 SETUP_COMPANY=Acme SETUP_OWNER_NAME="Jane Roe" SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=no \
+     SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/a.json" 2>"$SA/err"; then bad "no consent → nothing sent" "accepted"
+else grep -q 'identity.consent' "$SA/err" && [ ! -e "$SA/a.json" ] && ok "setup --apply without --accept-terms sends nothing and names identity.consent" || bad "consent named" "$(cat "$SA/err")"; fi
+env SETUP_NAME=studio-2 SETUP_COMPANY= SETUP_OWNER_NAME= SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=yes \
+  SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/b.json" 2>"$SA/err2" \
+  && bad "missing company/owner → refused" "accepted" || { grep -q 'identity.company' "$SA/err2" && grep -q 'identity.ownerName' "$SA/err2" && ok "every missing answer is named by its field" || bad "missing fields named" "$(cat "$SA/err2")"; }
+env SETUP_NAME=studio-2 SETUP_COMPANY=Acme SETUP_OWNER_NAME="Jane Roe" SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=yes SETUP_REGISTRY=https://registry.example.com \
+  SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/c.json" \
+  && python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); i=d["identity"]; assert i["consent"] is True and i["name"]=="studio-2" and i["company"]=="Acme" and i["registry"]=="https://registry.example.com"; assert d["embedding"]=={"endpoint":"http://e/v1","model":"m"}; assert "storage" not in d' "$SA/c.json" \
+  && ok "a complete answer carries identity + consent + this install's embeddings, and leaves storage to the wizard's pre-selected default" || bad "complete answers" "$(cat "$SA/c.json" 2>/dev/null)"
+grep -q 'X-Setup-Token: %s' "$CLI" && ! grep -qE 'curl[^\n]*X-Setup-Token: \$' "$CLI" && ok "the setup token travels in a 0600 header file, never on a command line" || bad "token header file" "missing"
+rm -rf "$SA"
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"

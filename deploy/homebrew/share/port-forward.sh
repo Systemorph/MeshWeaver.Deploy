@@ -64,6 +64,13 @@ open_setup_if_waiting() {
   # the browser actually opened, so a failed launch is retried on the next start.
   marker="${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/setup-opened.$(printf '%s' "$token" | shasum -a 256 | cut -c1-64)"
   [ -f "$marker" ] && return 0
+  # 🚨 Never into a certificate error (the second Mac Studio, 2026-11-09): opened only once the certificate the
+  # portal SERVES is trusted on this Mac (`security verify-cert <url>` evaluates the presented chain). No marker
+  # is written, so the next start opens it once the CA is trusted; `memex-local setup` prints the link meanwhile.
+  if ! { command -v security >/dev/null 2>&1 && security verify-cert "$base/" >/dev/null 2>&1; }; then
+    echo "$(date -u +%FT%TZ) first-run setup is waiting — NOT opening the browser: the certificate $base serves is not trusted on this Mac yet (the local CA). 'memex-local setup' prints the link."
+    return 0
+  fi
   echo "$(date -u +%FT%TZ) first-run setup is waiting — opening the wizard"
   if open "$base/setup?token=${token}"; then
     mkdir -p "$(dirname "$marker")" && : > "$marker"

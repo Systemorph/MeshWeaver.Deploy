@@ -421,12 +421,28 @@ ln -sf /etc/hosts "$T/kh/enrol/studio-3.preauth"
 env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; take_preauth_key "$1" "$2" "$(id -un)"' "$FB" "$T/kh/enrol/none.preauth" "$T/kh/held/c.key" && [ ! -e "$T/kh/held/c.key" ] \
   && ok "no dropped key: nothing taken, no failure" || bad "no key" "failed"
 grep -q 'softwareupdate said:' "$FB" && ok "a failed Command Line Tools install logs what softwareupdate said" || bad "softwareupdate output logged" "missing"
+mkdir -p "$T/shh"
+SO="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_USER_HOME="$T/shh" FLEET_BREW_PREFIX="$T/brewx" FLEET_LOG_DIR="$T/shlog" bash -c '. "$0"; ensure_shellenv jroe' "$FB" 2>&1)"
+case "$SO" in *"adding the shellenv line to $T/shh/.zprofile"*"DRY-RUN"*) ok "the bootstrap puts Homebrew's shellenv into the person's ~/.zprofile (a new Terminal finds the tools)" ;; *) bad "shellenv written" "$SO" ;; esac
+printf 'eval "$(%s/bin/brew shellenv)"\n' "$T/brewx" > "$T/shh/.zprofile"
+[ -z "$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_USER_HOME="$T/shh" FLEET_BREW_PREFIX="$T/brewx" FLEET_LOG_DIR="$T/shlog" bash -c '. "$0"; ensure_shellenv jroe' "$FB" 2>&1)" ] \
+  && ok "an existing shellenv line is left alone (idempotent)" || bad "shellenv idempotent" "rewritten"
+AS="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_LOG_DIR="$T/aslog" FLEET_MANAGED_PREFS="$T/none" FLEET_ORGANISATION=Acme FLEET_OWNER_NAME="Jane Roe" \
+  FLEET_OWNER_EMAIL=jane.roe@example.com FLEET_ACCEPT_TERMS=true bash -c '. "$0"; answer_setup jroe studio-2 /opt/x/memex-local' "$FB" 2>&1)"; RC=$?
+case "$RC:$OUT$AS" in 0:*"DRY-RUN: sudo -u jroe -H env"*"/opt/x/memex-local setup --apply --name studio-2 --company Acme --owner-name Jane\ Roe --owner-email jane.roe@example.com --accept-terms"*"setup answered"*) ok "a fleet Mac never waits for a person at the wizard: the bootstrap answers the setup API from the profile, as the console user (executed)" ;; *) bad "unattended setup executed" "rc=$RC: $AS" ;; esac
+AS2="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_LOG_DIR="$T/aslog" FLEET_MANAGED_PREFS="$T/none" FLEET_ORGANISATION=Acme FLEET_OWNER_NAME="Jane Roe" \
+  FLEET_OWNER_EMAIL=jane.roe@example.com bash -c '. "$0"; answer_setup jroe studio-2 /opt/x/memex-local' "$FB" 2>&1)"; RC=$?
+case "$RC:$AS2" in 0:*"WAITING for the first-run setup answers"*) case "$AS2" in *"setup --apply"*) bad "no AcceptTerms → nothing answered" "$AS2" ;; *) ok "without AcceptTerms=true nothing is answered, and the run says what it waits for" ;; esac ;; *) bad "no AcceptTerms → waits" "rc=$RC: $AS2" ;; esac
+! grep -q "runs 'memex-local setup'" "$FB" && ok "the bootstrap never asks a person to run memex-local setup" || bad "no person at the wizard" "still asks"
 grep -q 'installondemand.in-progress' "$FB" && grep -q 'rm -f "$flag"' "$FB" && ok "the on-demand flag is set for the catalogue and always removed" || bad "on-demand flag" "missing"
 grep -q -- '--auth-key="file:$key_file"' "$FB" && ! grep -q -- '--auth-key "\$key"' "$FB" \
   && ok "the pre-auth key is passed by FILE reference (never an argument)" || bad "auth key by file" "missing"
+# The dry runs are HERMETIC: the owner's answers given (no), and no password policy read from this machine.
+printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict/></plist>\n' > "$T/nopol.plist"
+FB_HERMETIC="FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=false FLEET_ACCOUNT_POLICIES_FILE=$T/nopol.plist FLEET_USER_ACCOUNT_POLICIES_FILE=$T/nopol.plist FLEET_ACCOUNT_POLICY_DATA_FILE=$T/nopol.plist"
 # A dry run on a bare Mac: every changing command is printed, nothing runs, and it waits (exit 0) for the key and the control URL.
 OUT="$(env FLEET_TS_FORMULA_API="file://$T/tailscale.json" FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_CONSOLE_USER=jroe FLEET_USER_HOME="$T/home" FLEET_BREW_PREFIX="$T/brew" FLEET_LOG_DIR="$T/logs" \
-  FLEET_TS_DIR="$T/tsbin" FLEET_LAUNCHDAEMONS_DIR="$T/ld" FLEET_TAILSCALED_SOCKET="$T/no.sock" FLEET_TAILSCALED_STATE_DIR="$T/ts" FLEET_MANAGED_PREFS="$T/none" FLEET_MACHINE_ID=studio-2 \
+  FLEET_TS_DIR="$T/tsbin" FLEET_LAUNCHDAEMONS_DIR="$T/ld" FLEET_TAILSCALED_SOCKET="$T/no.sock" FLEET_TAILSCALED_STATE_DIR="$T/ts" FLEET_MANAGED_PREFS="$T/none" FLEET_MACHINE_ID=studio-2 $FB_HERMETIC \
   FLEET_CLT_DIR="$T/noclt" bash "$FB" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*"homebrew: installing"*"developer tools: installing the Command Line Tools"*"DRY-RUN: softwareupdate -i"*"tools: installing"*) ok "a bare Mac gets the Command Line Tools (headless softwareupdate) BEFORE the tools: memex-local builds from source" ;; *) bad "bootstrap installs the developer tools first" "rc=$RC: $OUT" ;; esac
 case "$RC:$OUT" in 0:*"homebrew: installing"*"tools: installing"*"tailscale: installing 1.104.5 from the verified bottle"*"tailscaled: (re)loading the root LaunchDaemon"*"network: WAITING"*"memex: WAITING for ControlUrl"*"done"*) ok "a dry run on a bare Mac plans every step (tap trusted, binaries from the verified bottle) and waits, exit 0" ;; *) bad "bootstrap dry run" "rc=$RC: $OUT" ;; esac
@@ -434,12 +450,179 @@ case "$OUT" in *"DRY-RUN: mkdir -p $T/brew"*"DRY-RUN: write $T/ld/com.meshweaver
 [ ! -e "$T/brew" ] && [ ! -e "$T/ld/com.meshweaver.fleet.tailscaled.plist" ] && ok "the dry run changed nothing" || bad "dry run changed the machine" "$(ls "$T")"
 grep -q 'network: WAITING' "$T/logs/fleet-bootstrap.log" && ok "the run is logged to /Library/Logs/MeshWeaver/fleet-bootstrap.log" || bad "bootstrap log" "$(cat "$T/logs/fleet-bootstrap.log" 2>/dev/null)"
 OUT="$(env FLEET_TS_FORMULA_API="file://$T/tailscale.json" FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_CONSOLE_USER=jroe FLEET_USER_HOME="$T/home" FLEET_BREW_PREFIX="$T/brew" FLEET_LOG_DIR="$T/logs" \
-  FLEET_TS_DIR="$T/tsbin" FLEET_LAUNCHDAEMONS_DIR="$T/ld" FLEET_TAILSCALED_SOCKET="$T/no.sock" FLEET_TAILSCALED_STATE_DIR="$T/ts" FLEET_MANAGED_PREFS="$T/none" FLEET_MACHINE_ID=studio-2 \
+  FLEET_TS_DIR="$T/tsbin" FLEET_LAUNCHDAEMONS_DIR="$T/ld" FLEET_TAILSCALED_SOCKET="$T/no.sock" FLEET_TAILSCALED_STATE_DIR="$T/ts" FLEET_MANAGED_PREFS="$T/none" FLEET_MACHINE_ID=studio-2 $FB_HERMETIC \
   FLEET_CONTROL_URL=https://control.example.test bash "$FB" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*"memex: provisioning the local stack"*"the join follows once the stack verifies"*) ok "a dry run with a control URL plans the provisioning from real probes" ;; *) bad "dry run with ControlUrl" "rc=$RC: $OUT" ;; esac
 case "$OUT" in *"joined as"*) bad "a dry run never claims a join" "$OUT" ;; *) ok "a dry run never claims a join" ;; esac
 OUT="$(env FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_CONSOLE_USER=root FLEET_LOG_DIR="$T/logs" bash "$FB" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*"no one is logged in"*) ok "no one at the console: nothing to do, exit 0" ;; *) bad "no console user" "rc=$RC: $OUT" ;; esac
+
+echo "── the second Mac Studio's defects, pinned (2026-11-09) ─────────────"
+# Defect 2 (bootstrap 1.3.2, Deploy #214): the Command Line Tools come FIRST — a failed install stops the run before
+# `brew install` (which would refuse with "No developer tools installed").
+OUT="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$T/d2log" bash -c '. "$0"; step_homebrew() { log "homebrew: present"; }; step_devtools() { log "developer tools: FAILED (test)"; return 1; }
+  step_tools() { log "tools: REACHED"; }; failed=0; step_homebrew u || failed=1; [ "$failed" = 0 ] && { step_devtools || failed=1; }; [ "$failed" = 0 ] && { step_tools u || failed=1; }; echo "failed=$failed"' "$FB" 2>&1)"
+case "$OUT" in *"tools: REACHED"*) bad "a failed developer-tools install stops the run before the tools" "$OUT" ;; *"failed=1"*) ok "a failed developer-tools install stops the run before 'brew install' (defect 2)" ;; *) bad "devtools ordering" "$OUT" ;; esac
+awk '/^main\(\) \{/{on=1} on' "$FB" | grep -n 'step_devtools\|step_tools "\$user"' | awk -F: 'NR==1 && $0 ~ /devtools/ {d=1} END {exit !d}' \
+  && ok "main runs step_devtools before step_tools (defect 2)" || bad "main order devtools → tools" "$(awk '/^main\(\) \{/{on=1} on' "$FB")"
+
+# Defect 5: Homebrew on every PATH the bootstrap hands the person's commands (the login shell: ensure_shellenv, #217).
+up="$(FB_EVAL='user_path' fb)"
+case ":$up:" in *":/opt/homebrew/bin:"*"/usr/local/bin:"*) ok "commands run as the console user get /opt/homebrew/bin and /usr/local/bin on PATH (defect 5)" ;; *) bad "user_path" "$up" ;; esac
+grep -q 'PATH="\$(user_path)"' "$FB" && [ "$(grep -c 'PATH="\$(user_path)"' "$FB")" = 2 ] && ! grep -q 'PATH="\$BREW_PREFIX/bin:\$TS_DIR' "$FB" \
+  && ok "as_user and probe_as_user both use that PATH" || bad "as_user PATH" "$(grep -n 'PATH=' "$FB")"
+# Defect 1: an expired console password is the FIRST line of the run, with the remedy.
+mkpol() { cat > "$1" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>policyCategoryPasswordChange</key><array>
+<dict><key>policyContent</key><string>(policyAttributeLastPasswordChangeTime &lt; policyAttributeNewPasswordRequiredTime) and (policyAttributeCurrentTime &gt;= policyAttributeNewPasswordRequiredTime)</string>
+<key>policyIdentifier</key><string>ProfilePayload:test:changeAtNextAuth</string>
+<key>policyParameters</key><dict><key>policyAttributeNewPasswordRequiredTime</key><real>$2</real></dict></dict>
+$3
+</array></dict></plist>
+PL
+}
+mkapd() { printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>passwordLastSetTime</key><real>%s</real></dict></plist>\n' "$2" > "$1"; }
+mkpol "$T/pol.plist" 1000.5 ""
+mkapd "$T/apd-old.plist" 500.25; mkapd "$T/apd-new.plist" 1500.0
+pv() { env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; password_expiry_verdict "$1" "$2" "$3"' "$FB" "$@"; }
+case "$(pv "$T/pol.plist" "$T/apd-old.plist" 2000)" in *"REQUIRED"*"changeAtNextAuth"*) ok "changeAtNextAuth past, password set before it → a change is due" ;; *) bad "changeAtNextAuth due" "$(pv "$T/pol.plist" "$T/apd-old.plist" 2000)" ;; esac
+[ -z "$(pv "$T/pol.plist" "$T/apd-new.plist" 2000)" ] && ok "a password changed after the policy's moment is not expired" || bad "changed after" "$(pv "$T/pol.plist" "$T/apd-new.plist" 2000)"
+[ -z "$(pv "$T/pol.plist" "$T/apd-old.plist" 900)" ] && ok "a policy moment still in the future is not a verdict yet" || bad "future moment" ""
+[ -z "$(pv "$T/pol.plist" "$T/nopol.plist" 2000)" ] && ok "no readable last-set time → no verdict (never a guess)" || bad "unreadable apd" ""
+mkpol "$T/pol-age.plist" 1 '<dict><key>policyIdentifier</key><string>age</string><key>policyParameters</key><dict><key>policyAttributeExpiresEveryNDays</key><integer>1</integer></dict></dict>'
+case "$(pv "$T/pol-age.plist" "$T/apd-new.plist" $(( 1500 + 86400 )))" in *"EXPIRED"*"1 days"*) ok "a password older than policyAttributeExpiresEveryNDays has expired" ;; *) bad "age expiry" "$(pv "$T/pol-age.plist" "$T/apd-new.plist" $(( 1500 + 86400 )))" ;; esac
+OUT="$(env FLEET_TS_FORMULA_API="file://$T/tailscale.json" FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_CONSOLE_USER=jroe FLEET_USER_HOME="$T/home" FLEET_BREW_PREFIX="$T/brew" FLEET_LOG_DIR="$T/pwlog" \
+  FLEET_TS_DIR="$T/tsbin" FLEET_LAUNCHDAEMONS_DIR="$T/ld" FLEET_TAILSCALED_SOCKET="$T/no.sock" FLEET_TAILSCALED_STATE_DIR="$T/ts" FLEET_MANAGED_PREFS="$T/none" FLEET_MACHINE_ID=studio-2 \
+  FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=false FLEET_ACCOUNT_POLICIES_FILE="$T/pol.plist" FLEET_USER_ACCOUNT_POLICIES_FILE="$T/nopol.plist" FLEET_ACCOUNT_POLICY_DATA_FILE="$T/apd-old.plist" FLEET_NOW=2000 \
+  FLEET_CLT_DIR="$T/clt" bash "$FB" 2>&1)"
+case "$(printf '%s\n' "$OUT" | head -1)" in *"PASSWORD EXPIRED for jroe"*"REMEDY"*"console"*) ok "an expired console password is the FIRST line of the run, with the remedy (defect 1)" ;; *) bad "password first line" "$OUT" ;; esac
+case "$(head -1 "$T/pwlog/fleet-bootstrap.log")" in *"PASSWORD EXPIRED"*) ok "…and the first line of the run's log" ;; *) bad "password first log line" "$(head -1 "$T/pwlog/fleet-bootstrap.log")" ;; esac
+
+# Participation (contract §5): both answers REQUIRED — never defaulted — and passed to fleet join.
+rp() { env FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$T/plog" FLEET_MANAGED_PREFS="$T/none" "$@" bash -c '. "$0"; read_participation; rc=$?; printf "rc=%s jobs=%s tokens=%s args=%s\n" "$rc" "$PART_JOBS" "$PART_TOKENS" "${PART_ARGS[*]-}"' "$FB" 2>&1; }
+OUT="$(rp)"
+case "$OUT" in *"AcceptJobs is absent"*"AcceptTokens is absent"*"rc=1"*) ok "no AcceptJobs and no AcceptTokens → FAILS, naming both" ;; *) bad "participation absent" "$OUT" ;; esac
+OUT="$(rp FLEET_ACCEPT_JOBS=maybe FLEET_ACCEPT_TOKENS=false)"
+case "$OUT" in *"AcceptJobs is not a boolean ('maybe')"*"rc=1"*) ok "an answer that is not a boolean FAILS (never read as no)" ;; *) bad "participation maybe" "$OUT" ;; esac
+OUT="$(rp FLEET_ACCEPT_JOBS=true FLEET_ACCEPT_TOKENS=false)"
+case "$OUT" in *"AcceptJobsFrom is empty"*"rc=1"*) ok "jobs YES without AcceptJobsFrom FAILS" ;; *) bad "jobs without from" "$OUT" ;; esac
+OUT="$(rp FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=true FLEET_ACCEPT_TOKENS_FROM='*.meshweaver.cloud')"
+case "$OUT" in *"AcceptTokensModels is empty"*"rc=1"*) ok "tokens YES without models FAILS" ;; *) bad "tokens without models" "$OUT" ;; esac
+OUT="$(rp FLEET_ACCEPT_JOBS=0 FLEET_ACCEPT_TOKENS=no)"
+case "$OUT" in *"rc=0 jobs=false tokens=false args=--no-accept-jobs --no-buildhost --no-accept-tokens"*) ok "jobs NO → --no-accept-jobs --no-buildhost (no build host); tokens NO → --no-accept-tokens" ;; *) bad "participation no/no" "$OUT" ;; esac
+OUT="$(rp FLEET_ACCEPT_JOBS=1 FLEET_ACCEPT_JOBS_FROM=control.example.test FLEET_ACCEPT_JOBS_CHANNELS=latest FLEET_ACCEPT_JOBS_REPOS=acme/plugins \
+  FLEET_ACCEPT_TOKENS=true FLEET_ACCEPT_TOKENS_FROM='*.example.cloud' FLEET_ACCEPT_TOKENS_MODELS='qwen3.8:27b-mlx' FLEET_ACCEPT_TOKENS_RESIDENCY=CH)"
+case "$OUT" in *"rc=0 jobs=true tokens=true args=--accept-jobs=control.example.test --job-channels latest --job-repos acme/plugins --accept-tokens=*.example.cloud --token-models qwen3.8:27b-mlx --residency CH"*) ok "YES answers become --accept-jobs/--job-channels/--job-repos and --accept-tokens/--token-models/--residency" ;; *) bad "participation yes/yes" "$OUT" ;; esac
+# …read from a real managed-preference plist: a boolean and an ARRAY, as Intune writes them.
+mkdir -p "$T/mp"
+cat > "$T/mp/com.memex.local.plist" <<'PL'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>AcceptJobs</key><false/>
+<key>AcceptTokens</key><true/>
+<key>AcceptTokensFrom</key><array><string>*.example.cloud</string><string>control.example.test</string></array>
+<key>AcceptTokensModels</key><array><string>qwen3.8:27b-mlx</string></array>
+</dict></plist>
+PL
+OUT="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$T/plog" FLEET_MANAGED_PREFS="$T/mp/com.memex.local" bash -c '. "$0"; read_participation; printf "rc=%s args=%s\n" "$?" "${PART_ARGS[*]-}"' "$FB" 2>&1)"
+case "$OUT" in *"rc=0 args=--no-accept-jobs --no-buildhost --accept-tokens=*.example.cloud,control.example.test --token-models qwen3.8:27b-mlx"*) ok "the profile's boolean and array preferences are read as Intune writes them" ;; *) bad "managed-pref participation" "$OUT" ;; esac
+OUT="$(env FLEET_TS_FORMULA_API="file://$T/tailscale.json" FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_CONSOLE_USER=jroe FLEET_USER_HOME="$T/home" FLEET_BREW_PREFIX="$T/brew" FLEET_LOG_DIR="$T/palog" \
+  FLEET_MANAGED_PREFS="$T/none" FLEET_MACHINE_ID=studio-2 FLEET_ACCOUNT_POLICIES_FILE="$T/nopol.plist" FLEET_USER_ACCOUNT_POLICIES_FILE="$T/nopol.plist" FLEET_ACCOUNT_POLICY_DATA_FILE="$T/nopol.plist" bash "$FB" 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "a run without the owner's answers exits 0" "$OUT" ;; *"AcceptJobs is absent"*) case "$OUT" in *"homebrew:"*) bad "nothing is installed before the answers" "$OUT" ;; *) ok "a run without the owner's answers exits non-zero BEFORE installing anything, naming the keys" ;; esac ;; *) bad "unanswered run" "rc=$RC $OUT" ;; esac
+
+# Defect 4 (Mac half): the fleet local CA, trusted by profile, ends the wait on `mkcert -install`.
+MINT="$MACOS/fleet-ca/mint-fleet-ca.sh"
+bash -n "$MINT" && ok "mint-fleet-ca.sh parses" || bad "mint parses" "$(bash -n "$MINT" 2>&1)"
+OUT="$(bash "$MINT" --key-file "$T/fca.key" --cert-out "$T/fca.pem" 2>&1)"; RC=$?
+FSHA="$(openssl x509 -in "$T/fca.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)"
+KEYB64="$(cat "$T/fca.key")"
+[ "$RC" = 0 ] && [ "$(ls -l "$T/fca.key" | cut -c1-10)" = "-rw-------" ] && ok "mint --key-file writes the key to a NEW 0600 file" || bad "mint key file" "rc=$RC $OUT"
+case "$OUT" in *"$KEYB64"*|*"PRIVATE KEY"*) bad "mint never prints the key" "$OUT" ;; *"$FSHA"*) ok "mint prints the certificate's sha256 (FleetCaSha256), never the key" ;; *) bad "mint output" "$OUT" ;; esac
+openssl base64 -d -A <<<"$KEYB64" | openssl pkey -inform DER -noout -text 2>/dev/null | grep -q 'prime256v1\|P-256' && ok "the key is base64 PKCS#8 DER of an EC P-256 key (the enrolment item's form)" || bad "key form" ""
+CT="$(openssl x509 -in "$T/fca.pem" -noout -text)"
+case "$CT" in *"Basic Constraints: critical"*"CA:TRUE, pathlen:0"*"Name Constraints: critical"*"Permitted:"*"DNS:localhost"*"IP:127.0.0.1/255.255.255.255"*"IP:0:0:0:0:0:0:0:1/FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF"*) ok "the CA is critical-name-constrained to localhost, 127.0.0.1 and ::1, pathlen 0" ;; *) bad "CA constraints" "$CT" ;; esac
+case "$CT" in *"Excluded"*|*"DNS:memex"*|*"DNS:*"*) bad "no other names permitted" "$CT" ;; *) ok "nothing else is permitted" ;; esac
+OUT="$(bash "$MINT" --key-file "$T/fca.key" --cert-out "$T/fca2.pem" 2>&1)" && bad "mint overwrote an existing key file" "$OUT" || ok "mint refuses to overwrite an existing key"
+mkdir -p "$T/azb"; cat > "$T/azb/az" <<'AZ'
+#!/bin/bash
+printf '%s\n' "$*" >> "$FAKE_AZ_LOG"
+case "$*" in *"secret show"*) exit "${FAKE_AZ_EXISTS:-1}" ;; esac
+prev=""; for a in "$@"; do [ "$prev" = "--file" ] && { cp "$a" "$FAKE_AZ_VALUE"; ls -l "$a" | cut -c1-10 > "$FAKE_AZ_VALUE.mode"; }; prev="$a"; done
+AZ
+chmod +x "$T/azb/az"
+OUT="$(env PATH="$T/azb:$PATH" FAKE_AZ_LOG="$T/az.log" FAKE_AZ_VALUE="$T/az.value" bash "$MINT" --vault fleetvault --object fleet-local-ca-key --subscription acme-sub --cert-out "$T/fca3.pem" 2>&1)"; RC=$?
+V="$(cat "$T/az.value" 2>/dev/null)"
+[ "$RC" = 0 ] && [ -n "$V" ] && grep -q -- 'secret set --subscription acme-sub --vault-name fleetvault --name fleet-local-ca-key --file ' "$T/az.log" && [ "$(grep -c -- '--subscription acme-sub' "$T/az.log")" = "$(wc -l < "$T/az.log" | tr -d ' ')" ] && [ "$(cat "$T/az.value.mode")" = "-rw-------" ] \
+  && ok "mint --vault hands the key to 'az keyvault secret set --file' through a 0600 file" || bad "mint to vault" "rc=$RC $OUT $(cat "$T/az.log")"
+case "$OUT$(cat "$T/az.log")" in *"$V"*) bad "the key is never printed nor an argument" "" ;; *) ok "the key is never printed nor an argument" ;; esac
+OUT="$(env PATH="$T/azb:$PATH" FAKE_AZ_LOG="$T/az.log" FAKE_AZ_VALUE="$T/az2.value" FAKE_AZ_EXISTS=0 bash "$MINT" --vault fleetvault --object fleet-local-ca-key --subscription acme-sub 2>&1)" \
+  && bad "mint replaced an existing vault object" "$OUT" || { [ ! -e "$T/az2.value" ] && ok "mint refuses to replace an existing vault object (a second CA orphans every Mac's trust)" || bad "vault replace refused" ""; }
+: > "$T/az.log"
+OUT="$(env PATH="$T/azb:$PATH" FAKE_AZ_LOG="$T/az.log" FAKE_AZ_VALUE="$T/az3.value" bash "$MINT" --vault fleetvault --object fleet-local-ca-key 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "vault mode without --subscription is refused" "$OUT" ;; *"--subscription <name|id> is required"*"shared"*) [ ! -s "$T/az.log" ] && [ ! -e "$T/az3.value" ] && ok "vault mode without --subscription is REFUSED before any az call, naming why (the shared login's default subscription)" || bad "no az call without subscription" "$(cat "$T/az.log")" ;; *) bad "subscription refusal" "rc=$RC $OUT" ;; esac
+# the System keychain as `security find-certificate -a -Z -p` prints it: another certificate first, then the fleet CA
+{ printf 'SHA-256 hash: %s\nSHA-1 hash: 00\n' "$(printf 'a%.0s' $(seq 64) | tr a-f A-F)"; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout /dev/null -subj /CN=other -days 1 2>/dev/null
+  printf 'SHA-256 hash: %s\nSHA-1 hash: 00\n' "$(printf '%s' "$FSHA" | tr a-f A-F)"; cat "$T/fca.pem"; } > "$T/keychain.txt"
+diff <(env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; pem_for_sha256 "$1" < "$2"' "$FB" "$FSHA" "$T/keychain.txt") "$T/fca.pem" >/dev/null \
+  && ok "the fleet CA's certificate is found in the keychain listing by its sha256" || bad "pem_for_sha256" ""
+mkdir -p "$T/secb"; cat > "$T/secb/security" <<'SEC'
+#!/bin/bash
+case "$1" in
+  find-certificate) cat "$FAKE_KEYCHAIN" ;;
+  verify-cert) f=""; prev=""; for a in "$@"; do [ "$prev" = "-c" ] && f="$a"; prev="$a"; done
+               [ -n "${FAKE_TRUSTED_PEM:-}" ] && cmp -s "$f" "$FAKE_TRUSTED_PEM" ;;
+  *) exit 1 ;;
+esac
+SEC
+chmod +x "$T/secb/security"
+FCA_ENV="PATH=$T/secb:$PATH FAKE_KEYCHAIN=$T/keychain.txt FAKE_TRUSTED_PEM=$T/fca.pem"
+[ "$(env $FCA_ENV FLEET_CA_SHA256="$FSHA" FLEET_MANAGED_PREFS="$T/none" FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; fleet_ca_trusted_by_profile' "$FB")" = "$FSHA" ] \
+  && ok "a fleet CA in the System keychain that this Mac trusts is detected (security verify-cert)" || bad "fleet CA detected" ""
+env PATH="$T/secb:$PATH" FAKE_KEYCHAIN="$T/keychain.txt" FAKE_TRUSTED_PEM="$T/none.pem" FLEET_CA_SHA256="$FSHA" FLEET_MANAGED_PREFS="$T/none" FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; fleet_ca_trusted_by_profile' "$FB" >/dev/null \
+  && bad "an UNTRUSTED fleet CA certificate is not 'trusted by profile'" "" || ok "an untrusted fleet CA certificate is not 'trusted by profile'"
+env $FCA_ENV FLEET_MANAGED_PREFS="$T/none" FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; fleet_ca_trusted_by_profile' "$FB" >/dev/null \
+  && bad "no FleetCaSha256 → no fleet CA" "" || ok "no declared FleetCaSha256 → no fleet CA (nothing is guessed from the keychain)"
+# step_memex end to end, with the person's commands recorded instead of run (as_user/probe_as_user replaced).
+mkdir -p "$T/sm/caroot" "$T/sm/home/.memex-local/enrol"; cp "$T/fca2.pem" "$T/sm/caroot/rootCA.pem" 2>/dev/null || openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout /dev/null -out "$T/sm/caroot/rootCA.pem" -subj /CN=mkcert -days 1 2>/dev/null
+SM='as_user() { shift; printf "%s\n" "$*" >> "$SM_CALLS"; case "$*" in *-CAROOT*) printf "%s" "$SM_CAROOT" ;; esac; return 0; }
+    probe_as_user() { return 1; }
+    read_participation >/dev/null; step_memex jroe studio-2; echo "rc=$?"'
+smrun() { : > "$T/sm/calls"; OUT="$(env $FCA_ENV FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$T/smlog" FLEET_MANAGED_PREFS="$T/none" FLEET_USER_HOME="$T/sm/home" FLEET_BREW_PREFIX="$T/brew" \
+  FLEET_CONTROL_URL=https://control.example.test SM_CALLS="$T/sm/calls" SM_CAROOT="$T/sm/caroot" FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=false "$@" bash -c '. "$0"; '"$SM" "$FB" 2>&1)"; }
+smrun FLEET_CA_SHA256="$FSHA"
+case "$OUT" in *"fleet local CA is trusted by profile"*"not waiting on 'mkcert -install'"*"rc=0"*) ok "a fleet CA trusted by profile: no wait on 'mkcert -install' (defect 4)" ;; *) bad "fleet CA no wait" "$OUT" ;; esac
+grep -q 'env MEMEX_CA_TRUST=defer .*/memex-local up$' "$T/sm/calls" && ok "…and 'up' runs with MEMEX_CA_TRUST=defer (no keychain change, no prompt)" || bad "up deferred" "$(cat "$T/sm/calls")"
+grep -q 'fleet join --control https://control.example.test --id studio-2 --no-open --code-file .* --no-accept-jobs --no-buildhost --no-accept-tokens$' "$T/sm/calls" \
+  && ok "fleet join gets the owner's answers: jobs NO → --no-accept-jobs --no-buildhost, tokens NO → --no-accept-tokens" || bad "join participation args" "$(cat "$T/sm/calls")"
+printf '%s\n' "$KEYB64" > "$T/sm/home/.memex-local/enrol/fleet-ca.key"
+smrun FLEET_CA_SHA256="$FSHA"
+grep -q "memex-local ca adopt --key-file $T/sm/home/.memex-local/enrol/fleet-ca.key --sha256 $FSHA\$" "$T/sm/calls" && ! grep -q 'MEMEX_CA_TRUST=defer' "$T/sm/calls" \
+  && ok "the fleet CA's key delivered → 'memex-local ca adopt' with the declared sha256, then a normal 'up'" || bad "adopt on delivery" "$(cat "$T/sm/calls")"
+case "$OUT" in *"$KEYB64"*) bad "the bootstrap never logs the CA key" "" ;; *) ok "the bootstrap never logs the CA key" ;; esac
+# a refused adopt: its reason reaches the bootstrap log (review on #223)
+SMF='as_user() { shift; printf "%s\n" "$*" >> "$SM_CALLS"; case "$*" in *-CAROOT*) printf "%s" "$SM_CAROOT" ;; *"ca adopt"*) echo "err  ca adopt: the key does not belong to the certificate"; return 1 ;; esac; return 0; }
+    probe_as_user() { return 1; }
+    read_participation >/dev/null; step_memex jroe studio-2; echo "rc=$?"'
+printf '%s\n' "$KEYB64" > "$T/sm/home/.memex-local/enrol/fleet-ca.key"
+: > "$T/sm/calls"; OUT="$(env $FCA_ENV FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$T/smlog" FLEET_MANAGED_PREFS="$T/none" FLEET_USER_HOME="$T/sm/home" FLEET_BREW_PREFIX="$T/brew" \
+  FLEET_CONTROL_URL=https://control.example.test SM_CALLS="$T/sm/calls" SM_CAROOT="$T/sm/caroot" FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=false FLEET_CA_SHA256="$FSHA" bash -c '. "$0"; '"$SMF" "$FB" 2>&1)"
+case "$OUT" in *"ca adopt' FAILED"*"memex:   err  ca adopt: the key does not belong to the certificate"*"rc=1"*) ok "a refused 'ca adopt' logs adopt's own reason and fails the step" ;; *) bad "adopt failure reason logged" "$OUT" ;; esac
+rm -f "$T/sm/home/.memex-local/enrol/fleet-ca.key"
+smrun
+case "$OUT" in *"WAITING for the local CA to be trusted"*"rc=0"*) ok "no fleet CA and an untrusted mkcert CA: WAITING (unchanged), naming the fleet profile remedy" ;; *) bad "no fleet CA waits" "$OUT" ;; esac
+! grep -q 'memex-local up' "$T/sm/calls" && ok "…and 'up' is not run while it waits" || bad "up while waiting" "$(cat "$T/sm/calls")"
+echo "── Intune objects as code: the reconcile (deploy/macos/intune/intune-reconcile.py) ──"
+RECON="$MACOS/intune/intune-reconcile.py"
+OUT="$(python3 "$RECON" --self-test 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "the reconcile's self-test against a fake Graph passes ($(grep -c '^  ok' <<<"$OUT") cases)" || bad "intune-reconcile --self-test" "$OUT"
+OUT="$(python3 "$RECON" --validate --spec "$MACOS/intune/fleet.spec.example.json" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "the example fleet spec validates" || bad "fleet.spec.example.json invalid" "$OUT"
+sed 's/"AcceptTokens": false,//; s/"AcceptTokens": true,//' "$MACOS/intune/fleet.spec.example.json" > "$T/no-answer.spec.json"
+OUT="$(python3 "$RECON" --validate --spec "$T/no-answer.spec.json" 2>&1)"; RC=$?
+case "$RC:$OUT" in 1:*"keys.AcceptTokens must be an explicit true/false"*) ok "a spec without the owner's token answer is refused (participation is never implied)" ;; *) bad "missing AcceptTokens accepted" "rc=$RC: $OUT" ;; esac
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"

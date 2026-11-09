@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # hosting-signin-app --name <id> --host <host> --vault <vault> --object <prefix>Authentication-Microsoft-ClientSecret
 #                    [--client-id <Entra app id>] [--years 1]
+# hosting-signin-app --per-machine <id> --domain <domain> --seal-to <base64 SPKI> --item <x> [--years 1]
 #
 # The SIGN-IN (Entra) app's client secret, in the vault, for the app the record names
 # (MeshWeaver.Plugins#1719). Runbook step 1 registered the multi-tenant app, minted a secret and
@@ -22,6 +23,24 @@
 #     automated here: it needs the same Graph right AND writing the new client id back to the
 #     git-owned record — RED with the runbook's exact commands and what to set on the record.
 #
+# PER-MACHINE MODE (--per-machine; Hosting/MacStudioFleet §2b.1 target 6, enrolment v2): an enrolling
+# Mac gets its OWN Entra app, created here and owned by the operator identity — never a hand-added URI
+# on a shared app (100-URI cap, no wildcards):
+#   • found by its display name `MeshWeaver <id> (Mac)` among the apps this identity can see, else
+#     CREATED (multi-tenant, like the shared app); exactly one may exist — two is a refusal;
+#   • its web redirect URIs are the FIXED set — /signin-microsoft, /auth/callback/Microsoft and
+#     /auth/ea/callback on https://<id>.net.<domain>, https://localhost:8443 and https://memex.localhost
+#     (a Mac's portal answers on all three; the first Mac's owner met "localhost:8443/signin-microsoft is
+#     not registered"). A found app keeps every URI it has and gains the missing ones; nothing on the
+#     command line can add any other URI, so an approval cannot point an app at a foreign host;
+#   • its service principal exists (created when absent);
+#   • a NEW client secret is APPENDED (never a rotation) and SEALED inside this job to the Mac's
+#     throw-away key (`::hosting:: sealed_item item=<x> …`); no vault object is written;
+#   • the plain facts the enrolment code needs: `enrol_fact` clientId, tenant, redirectUris (comma-joined).
+# It needs Graph `Application.ReadWrite.OwnedBy` (create + own) on the operator identity; a refusal is
+# RED naming the right and the first line Graph answered. A secret that could not be sealed is DELETED
+# from the app again before the step fails.
+#
 # 🚨 NEVER PRINTS THE SECRET. `az ad app credential reset` prints the minted secret on STDERR as
 # well as in its output (measured, runbook step 1) — stderr is discarded, the value goes from az's
 # stdout into a mode-600 temporary and reaches the vault through --file, never argv, never a log.
@@ -30,18 +49,143 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
 # shellcheck disable=SC2034  # read by hosting::die in _common.sh, which shellcheck does not follow here
 HOSTING_CMD="hosting-signin-app"
 
-name="" host="" vault="" object="" client_id="" years="1"
+name="" host="" vault="" object="" client_id="" years="1" per_machine="" domain="" seal_to="" item=""
+# A flag given LAST with no value must not spin (see hosting-registry-coupon).
+shift_value() { if [ $# -ge 2 ]; then shift_n=2; else shift_n=1; fi; }
 while [ $# -gt 0 ]; do
+  shift_n=1
   case "$1" in
-    --name)      name="${2:-}";      shift 2 ;;
-    --host)      host="${2:-}";      shift 2 ;;
-    --vault)     vault="${2:-}";     shift 2 ;;
-    --object)    object="${2:-}";    shift 2 ;;
-    --client-id) client_id="${2:-}"; shift 2 ;;
-    --years)     years="${2:-}";     shift 2 ;;
+    --name)        name="${2:-}";        shift_value "$@" ;;
+    --host)        host="${2:-}";        shift_value "$@" ;;
+    --vault)       vault="${2:-}";       shift_value "$@" ;;
+    --object)      object="${2:-}";      shift_value "$@" ;;
+    --client-id)   client_id="${2:-}";   shift_value "$@" ;;
+    --years)       years="${2:-}";       shift_value "$@" ;;
+    --per-machine) per_machine="${2:-}"; shift_value "$@" ;;
+    --domain)      domain="${2:-}";      shift_value "$@" ;;
+    --seal-to)     seal_to="${2:-}";     shift_value "$@" ;;
+    --item)        item="${2:-}";        shift_value "$@" ;;
     *) hosting::die "unknown argument '$1'" ;;
   esac
+  shift "$shift_n"
 done
+
+if [ -n "$per_machine" ] || [ -n "$domain" ] || [ -n "$seal_to" ] || [ -n "$item" ]; then
+  # ── per-machine mode: create (or find) the Mac's own app, seal a new secret ──────────────────────
+  hosting::need_flag per-machine "$per_machine"
+  hosting::need_flag domain "$domain"
+  hosting::need_flag seal-to "$seal_to"
+  hosting::need_flag item "$item"
+  [ -z "$name$host$vault$object$client_id" ] \
+    || hosting::die "--per-machine creates the machine's OWN app and seals its secret — --name/--host/--vault/--object/--client-id belong to the shared-app mode and are refused beside it"
+  [[ "$per_machine" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
+    || hosting::die "per-machine '${per_machine}' is not a DNS label (lower-case letters, digits, '-') — it becomes <id>.net.<domain>"
+  hosting::safe_host domain "$domain"
+  [[ "$domain" == *.* ]] || hosting::die "domain '${domain}' is not a dotted domain name"
+  hosting::safe_item "$item"
+  [[ "$years" =~ ^[1-2]$ ]] || hosting::die "years '${years}' — a per-machine secret lives 1 or 2 years"
+  umask 077
+  work="$(mktemp -d)" || hosting::die "could not create a private working directory. Nothing was changed."
+  trap 'hosting::on_exit; rm -rf "$work"' EXIT
+  hosting::seal_key "$seal_to" "$work"
+
+  display="MeshWeaver ${per_machine} (Mac)"
+  uris=()
+  for base in "https://${per_machine}.net.${domain}" "https://localhost:8443" "https://memex.localhost"; do
+    for route in /signin-microsoft /auth/callback/Microsoft /auth/ea/callback; do uris+=("${base}${route}"); done
+  done
+  joined="$(IFS=,; printf '%s' "${uris[*]}")"
+  right="the operator identity needs Microsoft Graph Application.ReadWrite.OwnedBy (application permission, admin-consented) to create and own a per-machine app"
+
+  if hosting::dry; then
+    hosting::log "(dry run) would find or create the app '${display}' with ${#uris[@]} redirect URIs (${joined}), ensure its service principal, append a ${years}-year client secret and seal it to the given RSA-${HOSTING_SEAL_BITS} key as item ${item} — nothing is changed"
+    hosting::say signin_app dry-run
+    hosting::enrol_fact redirectUris "$joined"
+    exit 0
+  fi
+
+  hosting::step "Find or create the machine's sign-in app"
+  hosting::probe any az account show --query tenantId -o tsv
+  tenant="$HOSTING_PROBE_OUT"
+  [[ "$tenant" =~ ^[0-9a-fA-F-]{36}$ ]] || hosting::die "could not read the tenant this identity signed in to (${HOSTING_PROBE_ERR:-no answer}). Nothing was changed."
+  hosting::probe any az ad app list --display-name "$display" --query "[].appId" -o tsv; rc=$?
+  [ "$rc" -eq 0 ] || hosting::die "Graph refused to list applications — ${right}. It answered: ${HOSTING_PROBE_ERR:-nothing}. Nothing was changed."
+  found="$(grep -c . <<< "$HOSTING_PROBE_OUT" || true)"
+  [ "$found" -le 1 ] || hosting::die "${found} applications are named '${display}' — exactly one may serve a machine. Delete the extra one(s) by hand (az ad app delete --id <appId>), then re-request. Nothing was changed."
+  if [ "$found" -eq 1 ]; then
+    app_id="$(head -n1 <<< "$HOSTING_PROBE_OUT")"
+    outcome=found
+  else
+    hosting::probe any az ad app create --display-name "$display" --sign-in-audience AzureADMultipleOrgs \
+      --web-redirect-uris "${uris[@]}" --query appId -o tsv; rc=$?
+    [ "$rc" -eq 0 ] || hosting::die "Graph refused to create '${display}' — ${right}. It answered: ${HOSTING_PROBE_ERR:-nothing}. Nothing was changed."
+    app_id="$HOSTING_PROBE_OUT"
+    outcome=created
+  fi
+  [[ "$app_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+    || hosting::die "Graph answered '${app_id}' for '${display}', which is not an application (client) id — refusing to act on it"
+  hosting::log "${outcome}   app ${app_id} '${display}'"
+
+  hosting::step "Register the machine's redirect URIs"
+  hosting::probe any az ad app show --id "$app_id" --query 'web.redirectUris' -o tsv; rc=$?
+  [ "$rc" -eq 0 ] || hosting::die "could not read app ${app_id} back — ${right}. It answered: ${HOSTING_PROBE_ERR:-nothing}"
+  have="$HOSTING_PROBE_OUT"
+  missing=()
+  for u in "${uris[@]}"; do grep -qxF -- "$u" <<< "$have" || missing+=("$u"); done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    union=()
+    while IFS= read -r u; do [ -n "$u" ] && union+=("$u"); done <<< "$have"
+    union+=("${missing[@]}")
+    hosting::probe any az ad app update --id "$app_id" --web-redirect-uris "${union[@]}"; rc=$?
+    [ "$rc" -eq 0 ] || hosting::die "could not add ${#missing[@]} redirect URI(s) to app ${app_id} — ${right}. It answered: ${HOSTING_PROBE_ERR:-nothing}"
+    hosting::probe any az ad app show --id "$app_id" --query 'web.redirectUris' -o tsv
+    have="$HOSTING_PROBE_OUT"
+    for u in "${uris[@]}"; do
+      grep -qxF -- "$u" <<< "$have" || hosting::die "app ${app_id} still does not list ${u} after the update — refusing to hand out a secret for an app whose sign-in would fail with AADSTS50011"
+    done
+    hosting::log "added     ${#missing[@]} redirect URI(s) to app ${app_id} (read back)"
+  else
+    hosting::log "verified  app ${app_id} lists all ${#uris[@]} redirect URIs"
+  fi
+
+  hosting::step "Ensure the app's service principal"
+  hosting::probe output az ad sp show --id "$app_id" --query id -o tsv; rc=$?
+  case "$rc" in
+    0) hosting::log "verified  the service principal of ${app_id}" ;;
+    2) hosting::die "REFUSED, not absent: Graph would not show the service principal of ${app_id} — ${right}. It answered: ${HOSTING_PROBE_ERR}" ;;
+    *) hosting::probe any az ad sp create --id "$app_id" --query id -o tsv; rc=$?
+       [ "$rc" -eq 0 ] || hosting::die "could not create the service principal of ${app_id} — ${right}. It answered: ${HOSTING_PROBE_ERR:-nothing}"
+       hosting::log "created   the service principal of ${app_id}" ;;
+  esac
+
+  hosting::step "Add a client secret and seal it to the enrolling machine"
+  label="enrol-${per_machine}-$(date -u +%Y%m%d%H%M%S)"
+  # 🚨 stderr DISCARDED: az prints the minted secret there too. --append: nothing existing is rotated.
+  if ! az ad app credential reset --id "$app_id" --append --display-name "$label" --years "$years" \
+         --query password -o tsv > "$work/secret" 2>/dev/null; then
+    rm -f "$work/secret"
+    hosting::die "could not add a credential to app ${app_id} — ${right} (on an app it OWNS). Nothing was sealed."
+  fi
+  [ -s "$work/secret" ] || hosting::die "az ad app credential reset returned no password for app ${app_id} — nothing was sealed"
+  # A trailing newline from -o tsv would become part of the secret the portal presents.
+  printf '%s' "$(cat "$work/secret")" > "$work/secret"
+  if ! hosting::seal_item "$item" "$work/secret" "$work"; then
+    rm -f "$work/secret"
+    key_id="$(az ad app credential list --id "$app_id" --query "[?displayName=='${label}'].keyId | [0]" -o tsv 2>/dev/null || true)"
+    if [[ "$key_id" =~ ^[0-9a-fA-F-]{36}$ ]] && az ad app credential delete --id "$app_id" --key-id "$key_id" >/dev/null 2>&1; then
+      hosting::die "the credential '${label}' could not be sealed (${HOSTING_SEAL_ERR}); it was DELETED from app ${app_id} again — nothing holds it"
+    fi
+    hosting::die "the credential '${label}' could not be sealed (${HOSTING_SEAL_ERR}) and could NOT be removed — delete it by hand: az ad app credential delete --id ${app_id} --key-id <the '${label}' credential>"
+  fi
+  rm -f "$work/secret"
+  hosting::log "added     credential '${label}' to app ${app_id} (valid ${years} year(s)) → sealed as item ${item}; never shown, never stored"
+  hosting::say signin_app "$outcome"
+  hosting::say signin_secret sealed
+  hosting::enrol_fact clientId "$app_id"
+  hosting::enrol_fact tenant "$tenant"
+  hosting::enrol_fact redirectUris "$joined"
+  exit 0
+fi
 hosting::need_flag name "$name"
 hosting::need_flag host "$host"
 hosting::need_flag vault "$vault"
