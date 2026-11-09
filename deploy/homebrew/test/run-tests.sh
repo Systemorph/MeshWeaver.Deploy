@@ -1741,6 +1741,7 @@ printf '200 {"state":"refused","why":"superseded by a later approval"}\n' > "$FJ
 OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home5" MEMEX_LOCAL_HOME="$FJ/home5/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com FAKE_POLL_DIR="$FJ/poll" MEMEX_FLEET_POLL_EVERY=0 \
   "$CLI" fleet join --control https://control.example.test --id studio-6 --no-open --no-update --no-accept-jobs --no-accept-tokens --wait 1 2>&1 </dev/null)"; RC=$?
 case "$RC:$OUT" in 0:*|3:*) bad "a refused join stops" "rc=$RC" ;; *"REFUSED this join: superseded by a later approval"*) ok "a refused join stops, naming control's reason" ;; *) bad "refused join" "rc=$RC $OUT" ;; esac
+grep -q 'cmd_ca adopt --key-file "$dir/a" ${2:+--sha256 "$2"}' "$CLI" && ok "item a goes to ca adopt by file, checked against the code's caCertSha256 (Deploy#223's interface)" || bad "ca adopt interface" "missing"
 grep -q -- '--auth-key="file:$dir/t"' "$CLI" && ok "as root the pre-auth key goes to tailscale by FILE reference on the root daemon's socket" || bad "tailscale auth by file" "missing"
 grep -q 'cmd_internal on --tenant "$tenant" --client-id "$cid" < "$dir/e"' "$CLI" && grep -q '< "$dir/n" )' "$CLI" \
   && ok "the sign-in and DNS-01 secrets reach internal on / cert config on STDIN" || bad "secrets on stdin" "missing"

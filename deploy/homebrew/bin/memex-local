@@ -2037,7 +2037,9 @@ fleet_apply_ca() {
   local dir="$1"
   [ -s "$dir/a" ] || { info "fleet CA: no key in the code"; return 0; }
   if declare -F cmd_ca >/dev/null 2>&1; then
-    ( cmd_ca adopt --key-file "$dir/a" ${2:+--cert-sha256 "$2"} ) && ok "fleet CA adopted" || warn "fleet CA: 'ca adopt' failed"
+    # MeshWeaver.Deploy#223: ca adopt [--key-file <f> | --key-stdin] [--cert <pem>] [--sha256 <hex>] — the fingerprint is
+    # the code's caCertSha256 fact, so a key that does not belong to the fleet CA is refused
+    ( cmd_ca adopt --key-file "$dir/a" ${2:+--sha256 "$2"} ) && ok "fleet CA adopted" || warn "fleet CA: 'ca adopt' failed"
   else
     info "fleet CA: this memex-local has no 'ca adopt' yet — skipped (the key is discarded with the code)"
   fi
