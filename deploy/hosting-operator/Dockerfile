@@ -45,7 +45,9 @@ ARG TARGETARCH=amd64
 # `one-values-half-per-release`) reads a captured half's KEY NAMES and filters it to the record's
 # declared keys without touching a kept value — YAML block scalars (a PEM key) are not something to
 # rewrite in bash. The az CLI's own PyYAML lives in its private site-packages; this is the system one.
-RUN tdnf install -y --refresh postgresql tar shadow-utils ca-certificates jq python3 PyYAML \
+# openssl: hosting-tailnet-key --seal-to, hosting-signin-app --per-machine and hosting-seal-secret seal a value to an
+# enrolling Mac's throw-away RSA key (pkeyutl, OAEP-SHA256) inside the job — named, not assumed from the base.
+RUN tdnf install -y --refresh postgresql tar shadow-utils ca-certificates jq python3 PyYAML openssl \
  && tdnf clean all \
  && curl -fsSLo /usr/local/bin/kubectl \
       "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" \
