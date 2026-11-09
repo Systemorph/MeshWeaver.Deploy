@@ -305,6 +305,30 @@ ca_trusted() {
   security verify-cert -c "$1" -p ssl >/dev/null 2>&1
 }
 
+# The first-run setup, answered through the portal's setup API from the managed profile (no person at the
+# wizard). Waits (returns 0) when the profile lacks an answer; returns 1 when the API refused or failed.
+answer_setup() {
+  local user="$1" machine="$2" mlocal="$3"
+  # 🚨 No person at the wizard on a fleet Mac (owner, 2026-11-09: "pls get rid of this memex-local setup step"):
+  # the setup is answered through the portal's setup API from the managed profile — the instance name is the
+  # machine id, the owner and organisation are the profile's, the database is the one the wizard pre-selects,
+  # and the privacy statement and terms are accepted ONLY where the profile says so (AcceptTerms = true).
+  local org owner_name owner_email accept
+  org="$(setting FLEET_ORGANISATION Organisation)"; owner_name="$(setting FLEET_OWNER_NAME OwnerName)"
+  owner_email="$(setting FLEET_OWNER_EMAIL OwnerEmail)"; accept="$(setting FLEET_ACCEPT_TERMS AcceptTerms)"
+  case "$accept" in 1|true|TRUE|True|yes) accept=yes ;; *) accept=no ;; esac
+  if [ -z "$org" ] || [ -z "$owner_name" ] || [ -z "$owner_email" ] || [ "$accept" != "yes" ]; then
+    log "memex: WAITING for the first-run setup answers in the com.memex.local profile (Organisation, OwnerName, OwnerEmail, AcceptTerms=true) — nothing is answered without them"
+    return 0
+  fi
+  log "memex: answering the first-run setup through the setup API (instance $machine, organisation $org, owner $owner_email)"
+  as_user "$user" "$mlocal" setup --apply --name "$machine" --company "$org" --owner-name "$owner_name" \
+    --owner-email "$owner_email" --accept-terms 2>&1 | while IFS= read -r l; do log "memex:   $l"; done
+  [ "${PIPESTATUS[0]}" = "0" ] || { log "memex: the setup API refused or failed (above) — retried next run"; return 1; }
+  log "memex: setup answered — the portal restarts configured; the join follows on the next run"
+  return 0
+}
+
 step_memex() {
   local user="$1" machine="$2" control registry home code_file out rc mlocal
   control="$(setting FLEET_CONTROL_URL ControlUrl)"; registry="$(setting FLEET_REGISTRY_URL RegistryUrl)"
@@ -339,24 +363,7 @@ step_memex() {
   # finalised until the console user has configured it.
   if probe_as_user "$user" env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(memex_libexec)/share" MEMEX_CHART_DIR="$(memex_libexec)/share/helm" \
        /bin/bash -c '. "$0"; awaiting_setup' "$(memex_libexec)/memex-local"; then
-    # 🚨 No person at the wizard on a fleet Mac (owner, 2026-11-09: "pls get rid of this memex-local setup step"):
-    # the setup is answered through the portal's setup API from the managed profile — the instance name is the
-    # machine id, the owner and organisation are the profile's, the database is the one the wizard pre-selects,
-    # and the privacy statement and terms are accepted ONLY where the profile says so (AcceptTerms = true).
-    local org owner_name owner_email accept
-    org="$(setting FLEET_ORGANISATION Organisation)"; owner_name="$(setting FLEET_OWNER_NAME OwnerName)"
-    owner_email="$(setting FLEET_OWNER_EMAIL OwnerEmail)"; accept="$(setting FLEET_ACCEPT_TERMS AcceptTerms)"
-    case "$accept" in 1|true|TRUE|True|yes) accept=yes ;; *) accept=no ;; esac
-    if [ -z "$org" ] || [ -z "$owner_name" ] || [ -z "$owner_email" ] || [ "$accept" != "yes" ]; then
-      log "memex: WAITING for the first-run setup answers in the com.memex.local profile (Organisation, OwnerName, OwnerEmail, AcceptTerms=true) — nothing is answered without them"
-      return 0
-    fi
-    log "memex: answering the first-run setup through the setup API (instance $machine, organisation $org, owner $owner_email)"
-    as_user "$user" "$mlocal" setup --apply --name "$machine" --company "$org" --owner-name "$owner_name" \
-      --owner-email "$owner_email" --accept-terms 2>&1 | grep -v 'token' | while IFS= read -r l; do log "memex:   $l"; done
-    [ "${PIPESTATUS[0]}" = "0" ] || { log "memex: the setup API refused or failed (above) — retried next run"; return 1; }
-    log "memex: setup answered — the portal restarts configured; the join follows on the next run"
-    return 0
+    answer_setup "$user" "$machine" "$mlocal"; return
   fi
   if [ -f "$home/.memex-local/fleet.yaml" ]; then
     # joined: resume a finalisation an earlier run did not finish, from the stored credentials (no new code).

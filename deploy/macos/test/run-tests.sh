@@ -427,8 +427,13 @@ case "$SO" in *"adding the shellenv line to $T/shh/.zprofile"*"DRY-RUN"*) ok "th
 printf 'eval "$(%s/bin/brew shellenv)"\n' "$T/brewx" > "$T/shh/.zprofile"
 [ -z "$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_USER_HOME="$T/shh" FLEET_BREW_PREFIX="$T/brewx" FLEET_LOG_DIR="$T/shlog" bash -c '. "$0"; ensure_shellenv jroe' "$FB" 2>&1)" ] \
   && ok "an existing shellenv line is left alone (idempotent)" || bad "shellenv idempotent" "rewritten"
-! grep -q "runs 'memex-local setup'" "$FB" && grep -q 'setup --apply --name "$machine"' "$FB" && grep -q 'AcceptTerms' "$FB" \
-  && ok "a fleet Mac never waits for a person at the wizard: the bootstrap answers the setup API from the profile, consent only with AcceptTerms" || bad "unattended setup" "missing"
+AS="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_LOG_DIR="$T/aslog" FLEET_MANAGED_PREFS="$T/none" FLEET_ORGANISATION=Acme FLEET_OWNER_NAME="Jane Roe" \
+  FLEET_OWNER_EMAIL=jane.roe@example.com FLEET_ACCEPT_TERMS=true bash -c '. "$0"; answer_setup jroe studio-2 /opt/x/memex-local' "$FB" 2>&1)"; RC=$?
+case "$RC:$OUT$AS" in 0:*"DRY-RUN: sudo -u jroe -H env"*"/opt/x/memex-local setup --apply --name studio-2 --company Acme --owner-name Jane\ Roe --owner-email jane.roe@example.com --accept-terms"*"setup answered"*) ok "a fleet Mac never waits for a person at the wizard: the bootstrap answers the setup API from the profile, as the console user (executed)" ;; *) bad "unattended setup executed" "rc=$RC: $AS" ;; esac
+AS2="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_LOG_DIR="$T/aslog" FLEET_MANAGED_PREFS="$T/none" FLEET_ORGANISATION=Acme FLEET_OWNER_NAME="Jane Roe" \
+  FLEET_OWNER_EMAIL=jane.roe@example.com bash -c '. "$0"; answer_setup jroe studio-2 /opt/x/memex-local' "$FB" 2>&1)"; RC=$?
+case "$RC:$AS2" in 0:*"WAITING for the first-run setup answers"*) case "$AS2" in *"setup --apply"*) bad "no AcceptTerms → nothing answered" "$AS2" ;; *) ok "without AcceptTerms=true nothing is answered, and the run says what it waits for" ;; esac ;; *) bad "no AcceptTerms → waits" "rc=$RC: $AS2" ;; esac
+! grep -q "runs 'memex-local setup'" "$FB" && ok "the bootstrap never asks a person to run memex-local setup" || bad "no person at the wizard" "still asks"
 grep -q 'installondemand.in-progress' "$FB" && grep -q 'rm -f "$flag"' "$FB" && ok "the on-demand flag is set for the catalogue and always removed" || bad "on-demand flag" "missing"
 grep -q -- '--auth-key="file:$key_file"' "$FB" && ! grep -q -- '--auth-key "\$key"' "$FB" \
   && ok "the pre-auth key is passed by FILE reference (never an argument)" || bad "auth key by file" "missing"
