@@ -2727,6 +2727,32 @@ for cmd in up down status setup logs update registry verify port-forward observa
   else bad "help documents '$cmd'" "no dispatch arm in main()"; fi
 done
 
+echo "── the toolchain is found from the install, not the caller's PATH ──"
+TP="$(env -i HOME="$HOME" PATH=/usr/bin:/bin MEMEX_LOCAL_LIB=1 bash -c '. "$0"; memex_toolchain_path; printf "%s" "$PATH"' "$CLI" 2>/dev/null)"
+case ":$TP:" in *":$(cd "$(dirname "$CLI")" && pwd -P):"*) ok "a shell without Homebrew on PATH still gets the install's bin/ (memex-local setup finds kubectl)" ;; *) bad "toolchain PATH from the install" "$TP" ;; esac
+TP2="$(env -i HOME="$HOME" PATH="$(cd "$(dirname "$CLI")" && pwd -P):/usr/bin:/bin" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; memex_toolchain_path; memex_toolchain_path; printf "%s" "$PATH"' "$CLI" 2>/dev/null)"
+[ "$(printf '%s' "$TP2" | tr ':' '\n' | grep -cx "$(cd "$(dirname "$CLI")" && pwd -P)")" = "1" ] && ok "the install's bin/ is added once (idempotent)" || bad "toolchain PATH idempotent" "$TP2"
+grep -q 'need kubectl kubernetes-cli' <(sed -n '/^cmd_setup() {/,/^}/p' "$CLI") && grep -q 'could not read the portal log with kubectl' "$CLI" \
+  && ok "setup resolves kubectl and FAILS naming it — never an empty token" || bad "setup kubectl loud" "missing"
+! grep -q 'Password=\${pg_pw}' "$CLI" && grep -q 'Password=<memex_postgres_password in' "$CLI" \
+  && ok "setup never prints the in-cluster Postgres password" || bad "postgres password masked" "still printed"
+
+echo "── setup --apply: the first-run setup through its API, consent explicit ──"
+SAPY="$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; printf "%s" "$SETUP_ANSWERS_PY"' "$CLI")"
+SA="$(mktemp -d)"
+if env SETUP_NAME=studio-2 SETUP_COMPANY=Acme SETUP_OWNER_NAME="Jane Roe" SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=no \
+     SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/a.json" 2>"$SA/err"; then bad "no consent → nothing sent" "accepted"
+else grep -q 'identity.consent' "$SA/err" && [ ! -e "$SA/a.json" ] && ok "setup --apply without --accept-terms sends nothing and names identity.consent" || bad "consent named" "$(cat "$SA/err")"; fi
+env SETUP_NAME=studio-2 SETUP_COMPANY= SETUP_OWNER_NAME= SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=yes \
+  SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/b.json" 2>"$SA/err2" \
+  && bad "missing company/owner → refused" "accepted" || { grep -q 'identity.company' "$SA/err2" && grep -q 'identity.ownerName' "$SA/err2" && ok "every missing answer is named by its field" || bad "missing fields named" "$(cat "$SA/err2")"; }
+env SETUP_NAME=studio-2 SETUP_COMPANY=Acme SETUP_OWNER_NAME="Jane Roe" SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=yes SETUP_REGISTRY=https://registry.example.com \
+  SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/c.json" \
+  && python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); i=d["identity"]; assert i["consent"] is True and i["name"]=="studio-2" and i["company"]=="Acme" and i["registry"]=="https://registry.example.com"; assert d["embedding"]=={"endpoint":"http://e/v1","model":"m"}; assert "storage" not in d' "$SA/c.json" \
+  && ok "a complete answer carries identity + consent + this install's embeddings, and leaves storage to the wizard's pre-selected default" || bad "complete answers" "$(cat "$SA/c.json" 2>/dev/null)"
+grep -q 'X-Setup-Token: %s' "$CLI" && ! grep -qE 'curl[^\n]*X-Setup-Token: \$' "$CLI" && ok "the setup token travels in a 0600 header file, never on a command line" || bad "token header file" "missing"
+rm -rf "$SA"
+
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

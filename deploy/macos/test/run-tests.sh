@@ -421,6 +421,14 @@ ln -sf /etc/hosts "$T/kh/enrol/studio-3.preauth"
 env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; take_preauth_key "$1" "$2" "$(id -un)"' "$FB" "$T/kh/enrol/none.preauth" "$T/kh/held/c.key" && [ ! -e "$T/kh/held/c.key" ] \
   && ok "no dropped key: nothing taken, no failure" || bad "no key" "failed"
 grep -q 'softwareupdate said:' "$FB" && ok "a failed Command Line Tools install logs what softwareupdate said" || bad "softwareupdate output logged" "missing"
+mkdir -p "$T/shh"
+SO="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_USER_HOME="$T/shh" FLEET_BREW_PREFIX="$T/brewx" FLEET_LOG_DIR="$T/shlog" bash -c '. "$0"; ensure_shellenv jroe' "$FB" 2>&1)"
+case "$SO" in *"adding the shellenv line to $T/shh/.zprofile"*"DRY-RUN"*) ok "the bootstrap puts Homebrew's shellenv into the person's ~/.zprofile (a new Terminal finds the tools)" ;; *) bad "shellenv written" "$SO" ;; esac
+printf 'eval "$(%s/bin/brew shellenv)"\n' "$T/brewx" > "$T/shh/.zprofile"
+[ -z "$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_USER_HOME="$T/shh" FLEET_BREW_PREFIX="$T/brewx" FLEET_LOG_DIR="$T/shlog" bash -c '. "$0"; ensure_shellenv jroe' "$FB" 2>&1)" ] \
+  && ok "an existing shellenv line is left alone (idempotent)" || bad "shellenv idempotent" "rewritten"
+! grep -q "runs 'memex-local setup'" "$FB" && grep -q 'setup --apply --name "$machine"' "$FB" && grep -q 'AcceptTerms' "$FB" \
+  && ok "a fleet Mac never waits for a person at the wizard: the bootstrap answers the setup API from the profile, consent only with AcceptTerms" || bad "unattended setup" "missing"
 grep -q 'installondemand.in-progress' "$FB" && grep -q 'rm -f "$flag"' "$FB" && ok "the on-demand flag is set for the catalogue and always removed" || bad "on-demand flag" "missing"
 grep -q -- '--auth-key="file:$key_file"' "$FB" && ! grep -q -- '--auth-key "\$key"' "$FB" \
   && ok "the pre-auth key is passed by FILE reference (never an argument)" || bad "auth key by file" "missing"
