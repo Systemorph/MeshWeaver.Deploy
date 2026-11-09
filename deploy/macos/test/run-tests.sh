@@ -611,7 +611,7 @@ smrun() { : > "$T/sm/calls"; OUT="$(env $FCA_ENV FLEET_BOOTSTRAP_LIB=1 FLEET_LOG
 smrun FLEET_CA_SHA256="$FSHA"
 case "$OUT" in *"fleet local CA is trusted by profile"*"not waiting on 'mkcert -install'"*"rc=0"*) ok "a fleet CA trusted by profile: no wait on 'mkcert -install' (defect 4)" ;; *) bad "fleet CA no wait" "$OUT" ;; esac
 grep -q 'env MEMEX_CA_TRUST=defer .*/memex-local up$' "$T/sm/calls" && ok "…and 'up' runs with MEMEX_CA_TRUST=defer (no keychain change, no prompt)" || bad "up deferred" "$(cat "$T/sm/calls")"
-grep -q 'fleet join --control https://control.example.test --id studio-2 --no-open --code-file .* --no-accept-jobs --no-buildhost --no-accept-tokens$' "$T/sm/calls" \
+grep -q 'fleet join --control https://control.example.test --id studio-2 --no-open --wait 10 --code-file .* --no-accept-jobs --no-buildhost --no-accept-tokens$' "$T/sm/calls" \
   && ok "fleet join gets the owner's answers: jobs NO → --no-accept-jobs --no-buildhost, tokens NO → --no-accept-tokens" || bad "join participation args" "$(cat "$T/sm/calls")"
 printf '%s\n' "$KEYB64" > "$T/sm/home/.memex-local/enrol/fleet-ca.key"
 smrun FLEET_CA_SHA256="$FSHA"
