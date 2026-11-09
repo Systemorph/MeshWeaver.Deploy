@@ -102,6 +102,10 @@
         "AcceptTokensFrom": [
           "*.example.com"
         ],
+        "AcceptTokensModels": [
+          "qwen3.8:27b-mlx",
+          "qwen3.6"
+        ],
         "AcceptTokensResidency": "CH"
       },
       "assign": {

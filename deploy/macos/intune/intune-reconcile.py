@@ -221,6 +221,8 @@ def validate(spec, spec_dir):
                 p.append(f"{w}: AcceptJobs is true but AcceptJobsFrom names no instance")
             if keys.get("AcceptTokens") is True and not keys.get("AcceptTokensFrom"):
                 p.append(f"{w}: AcceptTokens is true but AcceptTokensFrom names no instance")
+            if keys.get("AcceptTokens") is True and not keys.get("AcceptTokensModels"):
+                p.append(f"{w}: AcceptTokens is true but AcceptTokensModels names no model (the bootstrap refuses that)")
             if "AcceptTokensResidency" in keys and not isinstance(keys["AcceptTokensResidency"], str):
                 p.append(f"{w}: keys.AcceptTokensResidency must be a string")
         targets(w, c.get("assign"))
@@ -958,6 +960,12 @@ def self_test():
     v = validate(bad, ".")
     expect("validate: a missing participation answer, a branch instead of a pin and an undeclared group are each refused",
            any("AcceptTokens" in x for x in v) and any("40-hex" in x for x in v) and any("nowhere" in x for x in v), v)
+    tok_on = copy.deepcopy(spec)
+    tok_on["customProfiles"][0]["keys"].update(AcceptTokens=True, AcceptTokensFrom=["*.example.com"])
+    v = validate(tok_on, ".")
+    expect("validate: tokens on without models is refused, as the bootstrap refuses it", any("AcceptTokensModels" in x for x in v), v)
+    tok_on["customProfiles"][0]["keys"]["AcceptTokensModels"] = ["model-a"]
+    expect("validate: tokens on with models passes", not validate(tok_on, "."), validate(tok_on, "."))
 
     wrong = copy.deepcopy(spec)
     wrong["scripts"][0]["source"]["sha256"] = "0" * 64
