@@ -28,6 +28,30 @@
 # =============================================================================
 set -euo pipefail
 
+# 🚨 The toolchain is found from WHERE THIS SCRIPT IS INSTALLED, never from whatever PATH the caller's shell
+# happens to have. A fresh Mac whose Homebrew was installed by the fleet bootstrap has no `brew shellenv`
+# in the person's ~/.zprofile, so a new Terminal lacks <prefix>/bin: `memex-local setup` then could not
+# find kubectl and printed NO token at all (measured on the second Mac Studio, 2026-11-09). The prefix is
+# the directory above Cellar/ (or the parent of bin/ for a non-keg checkout); /usr/local/bin carries the
+# root-owned tailscale link the bootstrap installs. APPENDED once, only when it exists and is missing: a
+# caller's own PATH (a pinned kubectl, a test's stubs) still wins; this only fills in what is absent.
+memex_toolchain_path() {
+  local self prefix dir
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+  # Only an installed keg (…/Cellar/memex-local/<v>/libexec/memex-local) names a Homebrew prefix; a source
+  # checkout and a Linux host are left exactly as they were (a CI runner's /usr/local/bin is not a Mac's).
+  case "$self" in */Cellar/*) prefix="${self%%/Cellar/*}" ;; esac
+  local extra=()
+  [ -n "${prefix:-}" ] && extra+=("$prefix/bin" "$prefix/sbin")
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] && extra+=(/usr/local/bin)
+  for dir in ${extra[@]+"${extra[@]}"}; do
+    [ -d "$dir" ] || continue
+    case ":$PATH:" in *":$dir:"*) ;; *) PATH="$PATH:$dir" ;; esac
+  done
+  export PATH
+}
+[ "${MEMEX_LOCAL_LIB:-}" = "1" ] || memex_toolchain_path
+
 # ---------------------------------------------------------------------------
 # Constants (the doc's defaults — same topology, no substitutions)
 # ---------------------------------------------------------------------------
@@ -1529,7 +1553,15 @@ YAML
       fi
       restart_front_door "loopback only — the private network is the only way in"
       internal_serve_when_signed_in || true
-      info "Register on the sign-in app exactly: https://${host}/signin-microsoft, https://${host}/auth/callback/Microsoft, https://${host}/auth/ea/callback"
+      # 🚨 BOTH the private-network name AND the Mac's own loopback name: the owner signs in first at
+      # the console (https://memex.localhost:8443), and a sign-in app carrying only the network name
+      # answers "redirect URI not registered" there (measured on the second Mac Studio, 2026-11-09).
+      # One app per Mac (the shared app holds at most two secrets), so the loopback names are safe on it.
+      local rp rh uris=""
+      for rh in "$host" "${HOSTNAME_LOCAL}:${HOST_PORT}" "${HOSTNAME_LOCAL}"; do
+        for rp in /signin-microsoft /auth/callback/Microsoft /auth/ea/callback; do uris="${uris:+$uris, }https://${rh}${rp}"; done
+      done
+      info "Register on THIS Mac's own sign-in app exactly: ${uris}"
       info "Apply it: memex-local update   (the portal takes the sign-in, then the private network is opened; the first person to sign in becomes the administrator — the owner)"
       ;;
     status)
@@ -5062,24 +5094,120 @@ cmd_verify() {
 # they — can configure it. That is the whole access control on a surface that
 # collects a connection string, provider API keys and the list of platform admins,
 # so this command reads the token back out of the pod rather than inventing one.
+# ---------------------------------------------------------------------------
+# setup --apply — answer the first-run setup through its API: no browser, no person at the wizard
+# ---------------------------------------------------------------------------
+# The portal's POST /setup/api (MeshWeaver.Plugins src/Memex.Portal.Shared/Setup/README.md) takes the SAME
+# answers the wizard collects and runs them through the SAME code as the form. The one-time setup token
+# goes in the X-Setup-Token header: read here from the pod, never printed and never on a command line
+# (curl reads the header from a 0600 file). Defaults are what this install already knows: the owner
+# recorded in the overlay, the database the wizard pre-selects (storage omitted), and the Ollama embeddings
+# this install wires. Consent to the privacy statement and terms is EXPLICIT (--accept-terms, or
+# "consent": true in --answers); without it nothing is sent.
+setup_apply() {
+  local answers="$1" name="$2" company="$3" owner_name="$4" owner_email="$5" registry="$6" accept="$7"
+  need kubectl kubernetes-cli
+  command -v python3 >/dev/null 2>&1 || die "setup --apply: python3 is required (the Xcode command line tools carry it: xcode-select --install)"
+  awaiting_setup || { ok "This instance is not awaiting setup — nothing to apply."; return 0; }
+  local logs token
+  logs="$(kubectl logs deploy/memex-portal-deployment -n "$NAMESPACE" --tail=-1 2>&1)" \
+    || die "setup --apply: could not read the portal log with kubectl — $(printf '%s' "$logs" | tail -1)"
+  token="$(printf '%s\n' "$logs" | awk '/^ *Token: /{ t=$2 } END { print t }')"
+  [ -n "$token" ] || die "setup --apply: the portal is awaiting setup but its log carries no token (restart it to mint one: kubectl rollout restart deploy/memex-portal-deployment -n $NAMESPACE)"
+  [ -n "$owner_email" ] || owner_email="$(overlay_value Instance__Owner__Email)"
+  [ -n "$name" ] || name="$(scutil --get LocalHostName 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  [ -n "$owner_name" ] || owner_name="$(id -F 2>/dev/null || true)"
+  local dir body hdr out code said caroot ca=()
+  dir="$(mktemp -d)"; chmod 700 "$dir"; body="$dir/body.json"; hdr="$dir/headers"; out="$dir/out.json"
+  ( umask 077; printf 'X-Setup-Token: %s\n' "$token" > "$hdr" ); unset token logs
+  if ! SETUP_ANSWERS="$answers" SETUP_NAME="$name" SETUP_COMPANY="$company" SETUP_OWNER_NAME="$owner_name" \
+       SETUP_OWNER_EMAIL="$owner_email" SETUP_REGISTRY="${registry:-$(registry_url)}" SETUP_ACCEPT="$accept" \
+       SETUP_EMBED_ENDPOINT="$OLLAMA_ENDPOINT" SETUP_EMBED_MODEL="$EMBED_MODEL" \
+       python3 -I -c "$SETUP_ANSWERS_PY" "$body"; then
+    rm -rf "$dir"; die "setup --apply: the answers are incomplete (named above) — nothing was sent"
+  fi
+  caroot="$(mkcert -CAROOT 2>/dev/null || true)"
+  [ -n "$caroot" ] && [ -f "$caroot/rootCA.pem" ] && ca=(--cacert "$caroot/rootCA.pem")
+  step "Applying the first-run setup through the setup API (no wizard)"
+  code="$(curl ${ca[@]+"${ca[@]}"} -sS -o "$out" -w '%{http_code}' --max-time 300 -X POST \
+    -H @"$hdr" -H 'Content-Type: application/json' --data-binary @"$body" \
+    "https://${HOSTNAME_LOCAL}:${HOST_PORT}/setup/api" 2>/dev/null)" || true
+  said="$(python3 -I -c "$SETUP_SAID_PY" "$out" 2>/dev/null || true)"
+  rm -rf "$dir"
+  case "$code" in
+    200) ok "setup applied (${said:-completed}) — the portal restarts configured; check with: memex-local verify" ;;
+    400) die "setup --apply: the portal refused the answers — ${said:-no details}" ;;
+    403) die "setup --apply: the setup token was refused (the portal restarted since it was read?) — run it again" ;;
+    404|405) die "setup --apply: this portal has no setup API yet (it predates MeshWeaver.Plugins' POST /setup/api) — update the image, or answer the wizard: memex-local setup" ;;
+    409) ok "This instance is already configured — nothing to apply." ;;
+    *) die "setup --apply: unexpected answer HTTP ${code:-none}${said:+ — $said}" ;;
+  esac
+}
+
+# The answers document setup --apply sends (python3 -I, argv[1] = the output file). Kept as data so the
+# bash above never interpolates an answer into code.
+SETUP_ANSWERS_PY='
+import json, os, sys
+a = json.load(open(os.environ["SETUP_ANSWERS"])) if os.environ.get("SETUP_ANSWERS") else {}
+idn = a.setdefault("identity", {})
+for key, env in (("name", "SETUP_NAME"), ("company", "SETUP_COMPANY"), ("ownerName", "SETUP_OWNER_NAME"),
+                 ("ownerEmail", "SETUP_OWNER_EMAIL"), ("registry", "SETUP_REGISTRY")):
+    if os.environ.get(env): idn[key] = os.environ[env]
+if os.environ.get("SETUP_ACCEPT") == "yes": idn["consent"] = True
+a.setdefault("embedding", {"endpoint": os.environ["SETUP_EMBED_ENDPOINT"], "model": os.environ["SETUP_EMBED_MODEL"]})
+missing = [f"identity.{k}" for k in ("name", "company", "ownerName", "ownerEmail") if not str(idn.get(k, "")).strip()]
+if idn.get("consent") is not True: missing.append("identity.consent (--accept-terms)")
+if missing:
+    print("err  setup --apply: missing " + ", ".join(missing), file=sys.stderr); sys.exit(1)
+json.dump(a, open(sys.argv[1], "w"))
+'
+# What the setup API answered, as one line (problems by field, or the state/instance id). Never a secret:
+# the API echoes none.
+SETUP_SAID_PY='
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+probs = d.get("problems") or []
+print("; ".join("%s: %s" % (p.get("field"), p.get("message")) for p in probs) or d.get("state") or d.get("instanceId") or "")
+'
+
 cmd_setup() {
-  local open_browser="yes"
+  local open_browser="yes" apply="no" answers="" name="" company="" owner_name="" owner_email="" registry="" accept="no"
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-open) open_browser="no" ;;
       --auto) open_browser="auto" ;;   # hand_into_setup: open only if the login agent has not already
+      --apply) apply="yes" ;;
+      --answers) shift; answers="${1:?--answers needs a JSON file}" ;;
+      --name) shift; name="${1:?--name needs a value}" ;;
+      --company) shift; company="${1:?--company needs a value}" ;;
+      --owner-name) shift; owner_name="${1:?--owner-name needs a value}" ;;
+      --owner-email) shift; owner_email="${1:?--owner-email needs a value}" ;;
+      --registry) shift; registry="${1:?--registry needs a URL}" ;;
+      --accept-terms) accept="yes" ;;
       *) die "setup: unknown flag '$1'" ;;
     esac
     shift
   done
+  if [ "$apply" = "yes" ]; then
+    setup_apply "$answers" "$name" "$company" "$owner_name" "$owner_email" "$registry" "$accept"
+    return
+  fi
 
   local url token
   url="https://${HOSTNAME_LOCAL}:${HOST_PORT}/setup"
 
   # The banner is printed once per PROCESS, so a portal that has been restarted since
   # setup began has a NEW token and the old one is dead — read it fresh every time.
-  token="$(kubectl logs deploy/memex-portal-deployment -n "$NAMESPACE" --tail=-1 2>/dev/null \
-           | awk '/^ *Token: /{ t=$2 } END { print t }')"
+  # 🚨 A kubectl that is missing or cannot reach the cluster is NOT "no token": it used to read as an
+  # empty token and send the person off to restart a healthy portal. Name the tool and the error.
+  need kubectl kubernetes-cli
+  local logs
+  logs="$(kubectl logs deploy/memex-portal-deployment -n "$NAMESPACE" --tail=-1 2>&1)" \
+    || die "setup: could not read the portal log with kubectl — $(printf '%s' "$logs" | tail -1)"
+  token="$(printf '%s\n' "$logs" | awk '/^ *Token: /{ t=$2 } END { print t }')"
 
   if [ -z "$token" ]; then
     # 🚨 "No token in the log" and "this instance is configured" are DIFFERENT facts, and the first
@@ -5130,7 +5258,9 @@ cmd_setup() {
   local pg_pw
   pg_pw="$(awk '/memex_postgres_password:/ { gsub(/"/, "", $2); print $2; exit }' "$OVERLAY" 2>/dev/null)"
   if [ -n "$pg_pw" ]; then
-    echo "  Host=memex-postgres-service;Port=5432;Database=memex;Username=postgres;Password=${pg_pw}"
+    # 🚨 Never the password itself in a terminal (scrollback, screen shares, pasted logs): it is in the
+    # overlay's secrets (0600) and the chart's Secret, and the pre-selected option needs neither.
+    echo "  Host=memex-postgres-service;Port=5432;Database=memex;Username=postgres;Password=<memex_postgres_password in $OVERLAY>"
   else
     warn "  (could not read the generated Postgres password from $OVERLAY)"
   fi
