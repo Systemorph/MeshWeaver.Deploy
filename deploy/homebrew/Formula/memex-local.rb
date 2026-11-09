@@ -65,6 +65,9 @@ class MemexLocal < Formula
     # Vendor a snapshot of the chart so a standalone install works offline.
     # A live MEMEX_REPO / MEMEX_CHART_DIR overrides this at runtime.
     (libexec/"share/helm").install Dir["deploy/helm/*"]
+    # The build-host first attach (deploy/backlease), which `fleet join` runs on a jobs opt-in with the values its
+    # enrolment code carried; beside share/helm, so its ../helm is the vendored chart.
+    (libexec/"share/backlease").install Dir["deploy/backlease/*"]
 
     # Wrapper on PATH that points the CLI at the vendored assets + chart.
     (bin/"memex-local").write_env_script libexec/"memex-local",
