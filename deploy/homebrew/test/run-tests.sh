@@ -65,6 +65,17 @@ for a in "$@"; do
   prev="$a"
 done
 if [ -n "${FAKE_CURL_FAILS:-}" ]; then printf '000'; exit 7; fi
+# The enrolment poll (fleet join, enrolment v2): the signed body is kept, and the next scripted answer
+# ("<status> <json>" per line of $FAKE_POLL_DIR/answers; the last one repeats) is written with ' <status>'.
+case "$url" in
+  */api/enrol/poll)
+    if [ -n "${FAKE_POLL_DIR:-}" ]; then
+      n=$(( $(find "$FAKE_POLL_DIR" -name 'body.*' | wc -l) + 1 ))
+      cat > "$FAKE_POLL_DIR/body.$n"
+      line="$(sed -n "${n}p" "$FAKE_POLL_DIR/answers")"; [ -n "$line" ] || line="$(tail -1 "$FAKE_POLL_DIR/answers")"
+      printf '%s %s' "${line#* }" "${line%% *}"; exit 0
+    fi ;;
+esac
 case "$fmt" in
   *redirect_url*)
     # Only an instance awaiting setup redirects the ROOT to the wizard.
@@ -1651,10 +1662,10 @@ M="$(printf 'a%.0s' $(seq 64))"; C="$(printf 'b%.0s' $(seq 64))"
 # (payload built first: bash 3.2 splits escaped quotes nested inside "$(…)")
 P2='{"v":1,"d":"studio-2","m":"'"$M"'","c":"'"$C"'"}'; P9='{"v":1,"d":"studio-9","m":"'"$M"'","c":"'"$C"'"}'
 sealed="$(seal "$P2" "$KEY")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/code.txt"
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/code.txt" --owner owner1 --owner-email owner1@example.com 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/code.txt" --owner owner1 --owner-email owner1@example.com 2>&1)"; RC=$?
 grep -qx '    Auth__GlobalAdmins__0: "owner1"' "$FJ/home/.memex-local/values.local.yaml" && ok "fleet join --owner/--owner-email (executed) records the owner in the overlay" || bad "fleet join --owner flag" "$(grep -n Owner "$FJ/home/.memex-local/values.local.yaml")"
 case "$RC:$OUT" in 0:*"joined as 'studio-2'"*) ok "fleet join opens a code sealed to its key and joins" ;; *) bad "fleet join with a good code" "rc=$RC: $OUT" ;; esac
-OUT2="$(env PATH="$STUBS:$PATH" HOME="$FJ/home2" MEMEX_LOCAL_HOME="$FJ/home2/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --code-file "$FJ/code.txt" 2>&1 </dev/null)"; RC2=$?
+OUT2="$(env PATH="$STUBS:$PATH" HOME="$FJ/home2" MEMEX_LOCAL_HOME="$FJ/home2/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/code.txt" 2>&1 </dev/null)"; RC2=$?
 case "$RC2:$OUT2" in 0:*) bad "an unattended fleet join without an owner joined" "$OUT2" ;; *"no OWNER"*) ok "an unattended fleet join without an owner FAILS before anything is joined" ;; *) bad "ownerless join" "rc=$RC2 $OUT2" ;; esac
 case "$OUT" in *"$M"*|*"$C"*) bad "fleet join never prints a key value" "a value is in the output" ;; *) ok "fleet join prints no key value (fingerprints only)" ;; esac
 case "$OUT" in *"Hosting/Heartbeats/Enrol/"*) ok "fleet join prints the control instance's approval link" ;; *) bad "approval link" "$OUT" ;; esac
@@ -1670,10 +1681,10 @@ fmode="$(ls -l "$F" 2>/dev/null | cut -c1-10)"
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$KEY" 2>/dev/null ); OTHER="$FJ/other.pem"
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$OTHER" 2>/dev/null )
 sealed="$(seal "$P2" "$OTHER")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/wrong.txt"
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/wrong.txt" 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/wrong.txt" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "a code for another key is refused" "exited 0" ;; *"does not open with this Mac's key"*) ok "a code sealed to another key is refused by name" ;; *) bad "wrong-key refusal" "$OUT" ;; esac
 sealed="$(seal "$P9" "$KEY")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/other-id.txt"
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/other-id.txt" 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/other-id.txt" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "a code for another id is refused" "exited 0" ;; *"issued for 'studio-9'"*) ok "a code issued for another id is refused by name" ;; *) bad "other-id refusal" "$OUT" ;; esac
 OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id Bad_Id --no-open 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "a bad id is refused" "exited 0" ;; *"--id must be lower-case"*) ok "an id that cannot be a record id is refused" ;; *) bad "bad id refusal" "$OUT" ;; esac
@@ -1682,11 +1693,72 @@ case "$OUT" in *"JOINED as 'studio-2'"*"sha256:"*) ok "fleet status shows the jo
 case "$OUT" in *"$M"*|*"$C"*) bad "fleet status never prints a key value" "a value is in the output" ;; *) ok "fleet status prints no key value" ;; esac
 # Unattended (a device-management run): no code yet → the link is printed and kept, exit 3, nothing joined.
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$FJ/home/.memex-local/enrol/studio-3.key.pem" 2>/dev/null )
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --code-file "$FJ/none.code" 2>&1)"; RC=$?
-case "$RC:$OUT" in 3:*"WAITING for the approval on control and the enrolment code at $FJ/none.code"*) ok "unattended: no code yet → says what it waits for, exit 3" ;; *) bad "unattended join waits" "rc=$RC: $OUT" ;; esac
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --no-accept-jobs --no-accept-tokens --wait 0 --code-file "$FJ/none.code" 2>&1)"; RC=$?
+case "$RC:$OUT" in 3:*"WAITING for the approval on control"*) ok "unattended: no code yet → polls within its wait, says what it waits for, exit 3" ;; *) bad "unattended join waits" "rc=$RC: $OUT" ;; esac
 grep -q '/Hosting/Heartbeats/Enrol/' "$FJ/home/.memex-local/enrol/studio-3.link" 2>/dev/null && ok "unattended: the approval link is kept in enrol/<id>.link" || bad "link kept" "$(cat "$FJ/home/.memex-local/enrol/studio-3.link" 2>/dev/null)"
 [ -f "$FJ/home/.memex-local/enrol/studio-3.key.pem" ] && ok "unattended: the throw-away key is kept for the run that brings the code" || bad "key kept while waiting" "gone"
 grep -q 'mode_args+=(-f "$FLEET_FILE")' "$CLI" && ok "helm_deploy layers the fleet file" || bad "helm_deploy layers the fleet file" "no -f \$FLEET_FILE"
+
+echo "── fleet join v2: both answers up front, the signed poll, the itemised code (enrolment v2) ──"
+# The v2 request: owner and both answers, base64url of the JSON MachineEnrolment.Parse reads.
+req="$(fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="control.example.test"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=false; ACC_TOK_RES=CH; fleet_request_v2 studio-5 host-a jroe C02X AAAA jroe jane.roe@example.com')"
+dec="$(printf '%s' "$req" | tr '_-' '/+' | awk '{ n = length($0) % 4; if (n) $0 = $0 substr("===", 1, 4 - n); print }' | base64 -d 2>/dev/null)"
+[ "$dec" = '{"v":2,"deployment":"studio-5","host":"host-a","user":"jroe","machine":"C02X","key":"AAAA","owner":{"id":"jroe","email":"jane.roe@example.com"},"jobs":{"on":true,"from":["control.example.test"],"channels":["mac"],"repos":[]},"tokens":{"on":false,"from":[],"models":[],"residency":"CH"}}' ] \
+  && ok "fleet_request_v2 carries the owner and both explicit answers" || bad "fleet_request_v2" "$dec"
+# Managed preferences answer the two questions (an Intune profile): a plist array or a comma string.
+PREFS="$(fj_lib 'managed_pref() { case "$1" in AcceptJobs) echo 1 ;; AcceptJobsFrom) printf "(\n    \"control.example.test\",\n    \"*.example.test\"\n)" ;; AcceptTokens) echo false ;; esac; }; fleet_participation_from_prefs; echo "$ACC_JOBS_ANSWERED $ACC_JOBS_ENABLED [$ACC_JOBS_FROM] $ACC_TOK_ANSWERED $ACC_TOK_ENABLED"')"
+[ "$PREFS" = 'yes true [control.example.test *.example.test] yes false' ] && ok "the Intune profile's AcceptJobs/AcceptJobsFrom/AcceptTokens answer both questions" || bad "participation from managed prefs" "$PREFS"
+# Unattended with no answer: FAILS before any key or link exists — an unanswered question is never read as no.
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home4" MEMEX_LOCAL_HOME="$FJ/home4/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-4 --no-open --no-update --wait 0 2>&1 </dev/null)"; RC=$?
+case "$RC:$OUT" in 0:*|3:*) bad "an unanswered join is refused" "rc=$RC $OUT" ;; *"has not answered whether this Mac takes BUILD JOBS and whether it GENERATES TOKENS"*) ok "unattended with no answers: the join FAILS naming both questions" ;; *) bad "unanswered join" "rc=$RC $OUT" ;; esac
+[ ! -e "$FJ/home4/.memex-local/enrol/studio-4.link" ] && ok "…and nothing was sent (no key, no link)" || bad "unanswered join sent a request" "link exists"
+# The POLL: pending, then issuing, then ready with an itemised code; every item opens, lands by file, and none is printed.
+KEY5="$FJ/home5/.memex-local/enrol/studio-5.key.pem"; mkdir -p "$(dirname "$KEY5")" "$FJ/poll"
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$KEY5" 2>/dev/null )
+openssl pkey -in "$KEY5" -pubout -out "$FJ/pub5.pem" 2>/dev/null
+TV="tskey-auth-$(printf 't%.0s' $(seq 20))"; EV="$(printf 'e%.0s' $(seq 40))"
+code2='{"v":2,"d":"studio-5","f":{"loginServer":"https://hs.example.test","tenant":"<tenant-id>","clientId":"c1"},"s":{"m":"'"$(seal "$M" "$KEY5")"'","c":"'"$(seal "$C" "$KEY5")"'","t":"'"$(seal "$TV" "$KEY5")"'","e":"'"$(seal "$EV" "$KEY5")"'"}}'
+CODE2="mwenrol2.$(printf '%s' "$code2" | base64 | tr -d '\n=' | tr '+/' '-_')"
+{ printf '200 {"state":"pending"}\n'; printf '200 {"state":"issuing","waiting":["t","e"]}\n'; printf '200 {"state":"ready","code":"%s"}\n' "$CODE2"; } > "$FJ/poll/answers"
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home5" MEMEX_LOCAL_HOME="$FJ/home5/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com FAKE_POLL_DIR="$FJ/poll" MEMEX_FLEET_POLL_EVERY=0 \
+  "$CLI" fleet join --control https://control.example.test --id studio-5 --no-open --no-update --no-accept-jobs --no-accept-tokens --wait 1 2>&1 </dev/null)"; RC=$?
+case "$RC:$OUT" in 0:*"not approved yet"*"waiting for: t,e"*"the code is ready"*"joined as 'studio-5'"*) ok "fleet join polls pending → issuing → ready and continues by itself" ;; *) bad "polling join" "rc=$RC: $OUT" ;; esac
+case "$OUT" in *"$M"*|*"$C"*|*"$TV"*|*"$EV"*) bad "the polling join never prints a value" "a value is in the output" ;; *) ok "the polling join prints no value (fingerprints only)" ;; esac
+grep -q "Hosting__ModuleReportSecret: \"$M\"" "$FJ/home5/.memex-local/fleet.yaml" && ok "items m and c land in the fleet layer" || bad "v2 fleet layer" ""
+PA="$FJ/home5/.memex-local/enrol/studio-5.preauth"
+[ "$(cat "$PA" 2>/dev/null)" = "$TV" ] && [ "$(ls -l "$PA" | cut -c1-10)" = "-rw-------" ] && [ "$(cat "$FJ/home5/.memex-local/enrol/studio-5.login-server")" = "https://hs.example.test" ] \
+  && ok "not root: item t is handed to the device bootstrap as a 0600 file, with the login server beside it" || bad "pre-auth hand-off" "$(ls -l "$FJ/home5/.memex-local/enrol")"
+[ ! -e "$FJ/home5/.memex-local/enrol/studio-5.items" ] && [ ! -e "$KEY5" ] && ok "the opened items and the throw-away key are removed at the end" || bad "items/key cleanup" "$(ls "$FJ/home5/.memex-local/enrol")"
+# Every poll is signed with the throw-away key over 'mwenrol-poll\n{fp}\n{ts}', fp = the full SHA-256 of the key's DER.
+B1="$FJ/poll/body.1"; pfp="$(sed -n 's/.*"fp":"\([0-9a-f]*\)".*/\1/p' "$B1")"; pts="$(sed -n 's/.*"ts":\([0-9]*\).*/\1/p' "$B1")"
+sed -n 's/.*"sig":"\([^"]*\)".*/\1/p' "$B1" | base64 -d > "$FJ/sig.bin" 2>/dev/null
+[ "$(find "$FJ/poll" -name 'body.*' | wc -l | tr -d ' ')" = 3 ] && [ "${#pfp}" = 64 ] && [ -n "$pts" ] && ok "three signed polls, each naming the key by its full SHA-256" || bad "poll bodies" "$(cat "$B1")"
+printf 'mwenrol-poll\n%s\n%s' "$pfp" "$pts" | openssl dgst -sha256 -verify "$FJ/pub5.pem" -signature "$FJ/sig.bin" >/dev/null 2>&1 \
+  && [ "$pfp" = "$(openssl pkey -pubin -in "$FJ/pub5.pem" -outform DER 2>/dev/null | shasum -a 256 | cut -c1-64)" ] && ok "the poll signs exactly 'mwenrol-poll\\n{fp}\\n{ts}' with the throw-away key (RSA-SHA256)" || bad "poll signature shape" "missing"
+# A refused join stops loudly, naming why.
+printf '200 {"state":"refused","why":"superseded by a later approval"}\n' > "$FJ/poll/answers"; rm -f "$FJ/poll"/body.*
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$FJ/home5/.memex-local/enrol/studio-6.key.pem" 2>/dev/null )
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home5" MEMEX_LOCAL_HOME="$FJ/home5/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com FAKE_POLL_DIR="$FJ/poll" MEMEX_FLEET_POLL_EVERY=0 \
+  "$CLI" fleet join --control https://control.example.test --id studio-6 --no-open --no-update --no-accept-jobs --no-accept-tokens --wait 1 2>&1 </dev/null)"; RC=$?
+case "$RC:$OUT" in 0:*|3:*) bad "a refused join stops" "rc=$RC" ;; *"REFUSED this join: superseded by a later approval"*) ok "a refused join stops, naming control's reason" ;; *) bad "refused join" "rc=$RC $OUT" ;; esac
+grep -q 'drop="$FLEET_DIR/fleet-ca.key"' "$CLI" && grep -q '( cmd_ca adopt --sha256 "$sha" )' "$CLI" \
+  && ok "item a takes the ONE §6 path: the 0600 drop enrol/fleet-ca.key, then ca adopt --sha256 <caCertSha256> (the bootstrap adopts the same drop if this fails)" || bad "ca adopt path" "missing"
+# The owner's answers reach backlease enroll and first-attach as ONE argv word per flag — a multi-pattern list is never
+# split or globbed (executed, in a directory holding a file a glob would match).
+mkdir -p "$FJ/globdir" && : > "$FJ/globdir/evil.example.test"
+ARGV="$(cd "$FJ/globdir" && fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="control.example.test *.example.test"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=false; fleet_accept_argv first-attach; printf "[%s]\n" "${FLEET_ACCEPT_ARGV[@]}"')"
+[ "$ARGV" = "$(printf '[--accept-jobs=control.example.test *.example.test]\n[--no-accept-tokens]')" ] \
+  && ok "first-attach gets the multi-pattern answer as one word, unsplit and unglobbed (no --job-* flags)" || bad "accept argv for first-attach" "$ARGV"
+ARGV="$(fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="a.example b.example"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=true; ACC_TOK_FROM="*.example.test"; ACC_TOK_MODELS="qwen3.6 qwen3.8:27b-mlx"; ACC_TOK_RES=CH; fleet_accept_argv; printf "[%s]\n" "${FLEET_ACCEPT_ARGV[@]}"')"
+[ "$(printf '%s\n' "$ARGV" | wc -l | tr -d ' ')" = 5 ] && printf '%s' "$ARGV" | grep -qx '\[--token-models=qwen3.6 qwen3.8:27b-mlx\]' \
+  && ok "backlease enroll gets every answer as one word per flag" || bad "accept argv for backlease" "$ARGV"
+grep -q 'if \[ -s "$dir/k" \] && \[ -n "$preg" \]; then cp "$dir/k"' "$CLI" && ok "a registry key without the registry URL is left out (first-attach stays pass-both-or-neither)" || bad "k without pluginsRegistry" "missing"
+! grep -q 'SC2046' "$CLI" || bad "no unquoted accept substitution remains" "$(grep -n SC2046 "$CLI")"
+grep -q -- '--auth-key="file:$dir/t"' "$CLI" && ok "as root the pre-auth key goes to tailscale by FILE reference on the root daemon's socket" || bad "tailscale auth by file" "missing"
+grep -q 'cmd_internal on --tenant "$tenant" --client-id "$cid" < "$dir/e"' "$CLI" && grep -q '< "$dir/n" )' "$CLI" \
+  && ok "the sign-in and DNS-01 secrets reach internal on / cert config on STDIN" || bad "secrets on stdin" "missing"
+grep -q '\[ "$ACC_JOBS_ENABLED" = true \] || { info "build host: jobs are OFF' "$CLI" && grep -q -- '--secrets-from "$secrets" --set-from latest' "$CLI" \
+  && ok "the build host is attached ONLY on a jobs opt-in, with its values from files (no vault)" || bad "build host gating" "missing"
 rm -rf "$FJ"
 
 echo "── a fleet Mac's template carries Hosting (fleet join / backlease, registry mode) ──"

@@ -1889,18 +1889,304 @@ YAML
   chmod 600 "$FLEET_FILE"
 }
 
+# ── ENROLMENT v2 (MeshWeaver.Plugins Hosting/MachineEnrolment, the shared onboarding contract) ──────────────────────
+# The request names the OWNER and both participation answers; control's ONE Approve issues every item, each sealed to
+# this join's throw-away key; this Mac POLLS for the code (signed with that key) and continues by itself. The paste and
+# --code-file stay as the fallback. Every item is opened into a 0600 file and handed to its target on stdin or by file
+# reference — a value is never an argument, never printed (fingerprints only), and the files are removed at the end.
+readonly FLEET_CODE2_PREFIX="mwenrol2."
+readonly FLEET_POLL_ROUTE="/api/enrol/poll"
+readonly FLEET_POLL_EVERY="${MEMEX_FLEET_POLL_EVERY:-10}"
+
+# A JSON value at a dotted key path of a file, raw (strings unquoted; an array as JSON). plutil on macOS, python3
+# elsewhere. Prints nothing when the key is absent.
+fleet_json() {
+  local file="$1" path="$2"
+  if command -v plutil >/dev/null 2>&1; then
+    local t; t="$(plutil -type "$path" "$file" 2>/dev/null || true)"
+    case "$t" in
+      array|dictionary) plutil -extract "$path" json -o - "$file" 2>/dev/null ;;
+      '') ;;
+      *) plutil -extract "$path" raw -o - "$file" 2>/dev/null ;;
+    esac
+  else
+    python3 -c 'import json,sys
+v=json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."):
+    v=v.get(k) if isinstance(v,dict) else None
+    if v is None: sys.exit(0)
+sys.stdout.write(json.dumps(v) if isinstance(v,(list,dict)) else ("true" if v is True else "false" if v is False else str(v)))' "$file" "$path" 2>/dev/null
+  fi
+}
+
+# The keys of a JSON object at a path, one per line.
+fleet_json_keys() {
+  if command -v plutil >/dev/null 2>&1 && plutil -extract "$2" json -o - "$1" >/dev/null 2>&1; then
+    plutil -extract "$2" json -o - "$1" 2>/dev/null | tr -d '{}' | tr ',' '\n' | sed -n 's/^ *"\([^"]*\)":.*/\1/p'
+  else
+    python3 -c 'import json,sys
+v=json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."): v=v.get(k,{}) if isinstance(v,dict) else {}
+print("\n".join(v.keys()) if isinstance(v,dict) else "")' "$1" "$2" 2>/dev/null
+  fi
+}
+
+# A space-separated list as a JSON array of strings (the values are validated patterns: no quote can occur).
+fleet_json_list() { local x out="" ; set -f; for x in $1; do out="${out:+$out,}\"$x\""; done; set +f; printf '[%s]' "$out"; }
+
+# A boolean managed preference: true/false, or nothing when unset or not a boolean.
+fleet_pref_bool() { case "$(managed_pref "$1" | tr 'A-Z' 'a-z')" in 1|true|yes) printf true ;; 0|false|no) printf false ;; esac; }
+
+# A list managed preference — a plist array (`defaults` prints "( a, b )") or a comma/space string — as one spaced line.
+fleet_pref_list() { managed_pref "$1" | tr -d '()"\n' | tr ',' ' ' | xargs 2>/dev/null || true; }
+
+# The owner's two answers from the managed preferences (deploy/macos/intune: AcceptJobs, AcceptJobsFrom,
+# AcceptJobsChannels, AcceptJobsRepos, AcceptTokens, AcceptTokensFrom, AcceptTokensModels, AcceptTokensResidency) — only
+# for a question the flags did not answer. An answer that is ON takes its scope from the same profile, else the offered default.
+fleet_participation_from_prefs() {
+  local b v
+  if [ "$ACC_JOBS_ANSWERED" = no ] && b="$(fleet_pref_bool AcceptJobs)" && [ -n "$b" ]; then
+    ACC_JOBS_ENABLED="$b"; ACC_JOBS_ANSWERED=yes
+    if [ "$b" = true ]; then
+      v="$(accept_norm "$(fleet_pref_list AcceptJobsFrom)" lower)"; ACC_JOBS_FROM="${v:-$ACCEPT_DEFAULT_JOBS_FROM}"; accept_check_patterns "$ACC_JOBS_FROM" "managed preference AcceptJobsFrom"
+      v="$(accept_norm "$(fleet_pref_list AcceptJobsChannels)" lower)"; [ -z "$v" ] || { accept_check_channels "$v" "managed preference AcceptJobsChannels"; ACC_JOBS_CHANNELS="$v"; }
+      v="$(accept_norm "$(fleet_pref_list AcceptJobsRepos)")"; [ -z "$v" ] || { accept_check_repos "$v" "managed preference AcceptJobsRepos"; ACC_JOBS_REPOS="$v"; }
+    fi
+  fi
+  if [ "$ACC_TOK_ANSWERED" = no ] && b="$(fleet_pref_bool AcceptTokens)" && [ -n "$b" ]; then
+    ACC_TOK_ENABLED="$b"; ACC_TOK_ANSWERED=yes
+    if [ "$b" = true ]; then
+      v="$(accept_norm "$(fleet_pref_list AcceptTokensFrom)" lower)"; ACC_TOK_FROM="${v:-$ACCEPT_DEFAULT_TOKENS_FROM}"; accept_check_patterns "$ACC_TOK_FROM" "managed preference AcceptTokensFrom"
+      v="$(accept_norm "$(fleet_pref_list AcceptTokensModels)")"; ACC_TOK_MODELS="${v:-$ACCEPT_DEFAULT_TOKEN_MODELS}"; accept_check_models "$ACC_TOK_MODELS" "managed preference AcceptTokensModels"
+      v="$(managed_pref AcceptTokensResidency)"; [ -z "$v" ] || { accept_check_residency "$v" "managed preference AcceptTokensResidency"; ACC_TOK_RES="$v"; }
+    fi
+  fi
+  return 0
+}
+
+# THE TWO QUESTIONS, asked up front and prominently — before any key or link exists. Answered by a flag, a managed
+# preference, or the person at the terminal; with nobody to ask an unanswered question FAILS the join (never read as no).
+fleet_participation() {
+  fleet_participation_from_prefs
+  if [ "$ACC_JOBS_ANSWERED" = no ] || [ "$ACC_TOK_ANSWERED" = no ]; then
+    accept_interactive || die "fleet join: the owner has not answered $( [ "$ACC_JOBS_ANSWERED" = no ] && printf 'whether this Mac takes BUILD JOBS' )$( [ "$ACC_JOBS_ANSWERED$ACC_TOK_ANSWERED" = nono ] && printf ' and ' )$( [ "$ACC_TOK_ANSWERED" = no ] && printf 'whether it GENERATES TOKENS' ) — give --accept-jobs <instances> | --no-accept-jobs and --accept-tokens <instances> | --no-accept-tokens, or the Intune profile's AcceptJobs / AcceptTokens. Nothing was sent."
+  fi
+  local v
+  if [ "$ACC_JOBS_ANSWERED" = no ]; then
+    printf '\n%s━━ QUESTION 1 of 2 — BUILD JOBS ━━%s\n' "$C_BLUE" "$C_RESET" >&2
+    printf 'Should this Mac take build jobs from the fleet (a build VM, runners, the release follower)?\nOff means none of it is installed and no build credential is issued.\n' >&2
+    ACC_JOBS_ENABLED="$(accept_yn "Take build jobs?" false)"; ACC_JOBS_ANSWERED=yes
+    if [ "$ACC_JOBS_ENABLED" = true ]; then
+      v="$(accept_norm "$(accept_read "  From which control instances?" "$ACCEPT_DEFAULT_JOBS_FROM")" lower)"; accept_check_patterns "$v" "jobs from"; ACC_JOBS_FROM="$v"
+    fi
+  fi
+  if [ "$ACC_TOK_ANSWERED" = no ]; then
+    printf '\n%s━━ QUESTION 2 of 2 — TOKEN GENERATION ━━%s\n' "$C_BLUE" "$C_RESET" >&2
+    printf 'Should this Mac serve its local models to other instances (the token queue)?\n' >&2
+    ACC_TOK_ENABLED="$(accept_yn "Generate tokens?" false)"; ACC_TOK_ANSWERED=yes
+    if [ "$ACC_TOK_ENABLED" = true ]; then
+      v="$(accept_norm "$(accept_read "  From which instances?" "$ACCEPT_DEFAULT_TOKENS_FROM")" lower)"; accept_check_patterns "$v" "tokens from"; ACC_TOK_FROM="$v"
+      v="$(accept_norm "$(accept_read "  Which models?" "${ACC_TOK_MODELS:-$ACCEPT_DEFAULT_TOKEN_MODELS}")")"; accept_check_models "$v" "token models"; ACC_TOK_MODELS="$v"
+      v="$(accept_read "  Where is this machine (residency, e.g. CH)?" "${ACC_TOK_RES}")"; accept_check_residency "$v" "residency"; ACC_TOK_RES="$v"
+    fi
+  fi
+  accept_validate
+  printf '\n' >&2
+  accept_summary
+}
+
+# The answers as ONE argv word per flag, into the global array FLEET_ACCEPT_ARGV — never through an unquoted
+# substitution: a pattern list ("control.example.test *.example.test") is one word, never split, never globbed.
+# $1 = first-attach: only the flags first-attach.sh takes (it has no --job-channels/--job-repos).
+FLEET_ACCEPT_ARGV=()
+fleet_accept_argv() {
+  FLEET_ACCEPT_ARGV=()
+  if [ "$ACC_JOBS_ENABLED" = true ]; then
+    FLEET_ACCEPT_ARGV+=("--accept-jobs=$ACC_JOBS_FROM")
+    if [ "${1:-}" != first-attach ]; then
+      [ -z "$ACC_JOBS_CHANNELS" ] || FLEET_ACCEPT_ARGV+=("--job-channels=$ACC_JOBS_CHANNELS")
+      [ -z "$ACC_JOBS_REPOS" ] || FLEET_ACCEPT_ARGV+=("--job-repos=$ACC_JOBS_REPOS")
+    fi
+  else FLEET_ACCEPT_ARGV+=(--no-accept-jobs); fi
+  if [ "$ACC_TOK_ENABLED" = true ]; then
+    FLEET_ACCEPT_ARGV+=("--accept-tokens=$ACC_TOK_FROM" "--token-models=$ACC_TOK_MODELS")
+    [ -z "$ACC_TOK_RES" ] || FLEET_ACCEPT_ARGV+=("--residency=$ACC_TOK_RES")
+  else FLEET_ACCEPT_ARGV+=(--no-accept-tokens); fi
+}
+
+# The v2 request (MachineEnrolment.Parse): the v1 facts, the owner and both answers, base64url.
+fleet_request_v2() {
+  local id="$1" host="$2" user="$3" machine="$4" spki="$5" owner_id="$6" owner_email="$7"
+  printf '{"v":2,"deployment":"%s","host":"%s","user":"%s","machine":"%s","key":"%s","owner":{"id":"%s","email":"%s"},"jobs":{"on":%s,"from":%s,"channels":%s,"repos":%s},"tokens":{"on":%s,"from":%s,"models":%s,"residency":"%s"}}' \
+    "$id" "$host" "$user" "$machine" "$spki" "$owner_id" "$owner_email" \
+    "$ACC_JOBS_ENABLED" "$(fleet_json_list "$ACC_JOBS_FROM")" "$(fleet_json_list "$ACC_JOBS_CHANNELS")" "$(fleet_json_list "$ACC_JOBS_REPOS")" \
+    "$ACC_TOK_ENABLED" "$(fleet_json_list "$ACC_TOK_FROM")" "$(fleet_json_list "$ACC_TOK_MODELS")" "$ACC_TOK_RES" | fleet_b64url
+}
+
+# The poll's key name: the full lower-hex SHA-256 of the public key's DER.
+fleet_key_sha256() { openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | shasum -a 256 | cut -c1-64; }
+
+# One signed poll (contract §3). Prints "<http status> <body>" on one line; never fails.
+fleet_poll_once() {
+  local control="$1" key="$2" fp="$3" ts sig
+  ts="$(date +%s)"
+  sig="$(printf 'mwenrol-poll\n%s\n%s' "$fp" "$ts" | openssl dgst -sha256 -sign "$key" 2>/dev/null | base64 | tr -d '\n')"
+  printf '{"fp":"%s","ts":%s,"sig":"%s"}' "$fp" "$ts" "$sig" \
+    | curl -sS -m 30 -X POST -H 'Content-Type: application/json' --data-binary @- -w ' %{http_code}' "$control$FLEET_POLL_ROUTE" 2>/dev/null \
+    | awk '{ code = $NF; $NF = ""; sub(/[ ]+$/, ""); print code " " $0 }' || printf '000 \n'
+}
+
+# A member of the poll's compact JSON answer (values hold no quote).
+fleet_poll_field() { printf '%s' "$2" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -1; }
+
+# Polls until the code is ready (writes it to $4, 0600, returns 0), refused (dies naming why) or the wait is over (returns 3).
+# A code that appears at --code-file meanwhile wins (the paste fallback of an unattended run).
+fleet_poll() {
+  local control="$1" key="$2" minutes="$3" out="$4" code_file="${5:-}" fp deadline line status body state last="" waiting why
+  fp="$(fleet_key_sha256 "$key")"
+  deadline=$(( $(date +%s) + minutes * 60 ))
+  info "waiting for the approval: polling $control$FLEET_POLL_ROUTE every ${FLEET_POLL_EVERY} s for up to $minutes min (signed with this join's key)"
+  while :; do
+    if [ -n "$code_file" ] && [ -s "$code_file" ]; then ( umask 077; tr -d ' \n\r' < "$code_file" > "$out" ); return 0; fi
+    line="$(fleet_poll_once "$control" "$key" "$fp")"; status="${line%% *}"; body="${line#* }"
+    state="$(fleet_poll_field state "$body")"
+    case "$status:$state" in
+      200:ready)
+        ( umask 077; fleet_poll_field code "$body" > "$out" )
+        [ -s "$out" ] || die "control answered ready without a code — approve the link again"
+        ok "the code is ready — collected from control"; return 0 ;;
+      200:refused)
+        why="$(fleet_poll_field why "$body")"
+        die "control REFUSED this join: ${why:-no reason given} — run 'memex-local fleet join' again for a fresh request" ;;
+      200:issuing)
+        waiting="$(printf '%s' "$body" | sed -n 's/.*"waiting":\[\([^]]*\)\].*/\1/p' | tr -d '"')"
+        [ "$last" = "issuing:$waiting" ] || info "approved — control is issuing the rest (waiting for: ${waiting:-?})"; last="issuing:$waiting" ;;
+      200:pending)
+        [ "$last" = pending ] || info "not approved yet — open the link above"; last=pending ;;
+      401:*) die "control refused the poll's signature: $(fleet_poll_field error "$body") — check this Mac's clock" ;;
+      400:*) die "control could not read the poll: $(fleet_poll_field error "$body")" ;;
+      404:*) [ "$last" = 404 ] || warn "control has no enrolment poll route yet ($control$FLEET_POLL_ROUTE answers 404) — the paste stays the way in"; last=404 ;;
+      *) [ "$last" = "net:$status" ] || warn "poll: control did not answer (HTTP ${status:-none}) — retrying"; last="net:$status" ;;
+    esac
+    [ "$(date +%s)" -lt "$deadline" ] || return 3
+    sleep "$FLEET_POLL_EVERY"
+  done
+}
+
+# Opens a v2 code into $3/<item> files (0600) and $3/facts.json. Fails closed naming why; prints fingerprints only.
+fleet_open_code2() {
+  local code="$1" key="$2" dir="$3" json item ct
+  mkdir -p "$dir"; chmod 700 "$dir"
+  json="$dir/code.json"
+  printf '%s' "${code#"$FLEET_CODE2_PREFIX"}" | tr -- '-_' '+/' | awk '{ n = length($0) % 4; if (n == 2) $0 = $0 "=="; else if (n == 3) $0 = $0 "="; print }' \
+    | base64 -d > "$json" 2>/dev/null || die "the enrolment code is not base64url — copy all of it"
+  [ "$(fleet_json "$json" v)" = 2 ] || die "the enrolment code is not a v2 code"
+  for item in $(fleet_json_keys "$json" s); do
+    case "$item" in [a-z]) ;; *) continue ;; esac
+    ct="$(mktemp "$dir/ct.XXXXXX")"
+    fleet_json "$json" "s.$item" | base64 -d > "$ct" 2>/dev/null || { rm -f "$ct"; die "item '$item' of the code is not base64"; }
+    ( umask 077
+      openssl pkeyutl -decrypt -inkey "$key" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+        -pkeyopt rsa_mgf1_md:sha256 -in "$ct" -out "$dir/$item" 2>/dev/null ) \
+      || { rm -f "$ct" "$dir/$item"; die "item '$item' does not open with this Mac's key — the code was issued for another join; approve THIS link again"; }
+    rm -f "$ct"
+    info "item $item opened ($(fleet_value_fingerprint "$(cat "$dir/$item")"))"
+  done
+}
+
+# A fact of an opened v2 code.
+fleet_fact_of() { fleet_json "$1/code.json" "f.$2"; }
+
+# The hand-off of the private-network key: by FILE, never an argument. As root (the bootstrap) it joins at once on the root
+# daemon's socket; otherwise it leaves the key and the login server where the bootstrap's network step takes them.
+fleet_apply_network() {
+  local id="$1" dir="$2" login; login="$(fleet_fact_of "$dir" loginServer)"
+  [ -s "$dir/t" ] || { info "network: no pre-auth key in the code"; return 0; }
+  [ -n "$login" ] || { warn "network: the code carries a pre-auth key but no login server — skipped"; return 0; }
+  local ts=(tailscale --socket="${MEMEX_TAILSCALED_SOCKET:-/var/run/tailscaled.socket}")
+  if [ "$(id -u)" = 0 ] && command -v tailscale >/dev/null 2>&1; then
+    ${ts[@]+"${ts[@]}"} up --login-server "$login" --hostname "$id" --auth-key="file:$dir/t" --reset >/dev/null \
+      && ok "network: joined $login as $id" || warn "network: 'tailscale up' failed — the bootstrap retries"
+  else
+    ( umask 077; cp "$dir/t" "$FLEET_DIR/$id.preauth"; printf '%s\n' "$login" > "$FLEET_DIR/$id.login-server" )
+    ok "network: pre-auth key handed to the device bootstrap ($FLEET_DIR/$id.preauth, 0600) — it joins on the root daemon's socket"
+  fi
+}
+
+# The sign-in app: `internal on` with the per-Mac client secret on stdin.
+fleet_apply_signin() {
+  local dir="$1" tenant cid
+  [ -s "$dir/e" ] || { info "sign-in: no client secret in the code"; return 0; }
+  tenant="$(fleet_fact_of "$dir" tenant)"; cid="$(fleet_fact_of "$dir" clientId)"
+  [ -n "$tenant" ] && [ -n "$cid" ] || { warn "sign-in: the code carries a secret but no tenant/clientId — skipped"; return 0; }
+  ( cmd_internal on --tenant "$tenant" --client-id "$cid" < "$dir/e" ) && ok "sign-in: this Mac's own app ($cid) configured" \
+    || warn "sign-in: 'internal on' failed — re-run it with the same values"
+}
+
+# The certificate: `cert config` with the DNS-01 secret on stdin, then `cert issue`.
+fleet_apply_cert() {
+  local id="$1" dir="$2" email="$3" domain cid tenant sub rg zone
+  [ -s "$dir/n" ] || { info "certificate: no DNS-01 secret in the code"; return 0; }
+  domain="$(fleet_fact_of "$dir" domain)"; cid="$(fleet_fact_of "$dir" dns01ClientId)"; tenant="$(fleet_fact_of "$dir" dns01Tenant)"
+  sub="$(fleet_fact_of "$dir" dns01Subscription)"; rg="$(fleet_fact_of "$dir" dns01ResourceGroup)"; zone="$(fleet_fact_of "$dir" dns01Zone)"
+  for v in domain cid tenant sub rg zone; do [ -n "${!v}" ] || { warn "certificate: the code lacks the fact for $v — skipped"; return 0; }; done
+  ( cmd_cert config --domain "$id.net.$domain" --email "$email" --client-id "$cid" --tenant "$tenant" --subscription "$sub" \
+      --resource-group "$rg" --zone "$zone" < "$dir/n" ) || { warn "certificate: 'cert config' failed"; return 0; }
+  ( cmd_cert issue ) && ok "certificate: issued for $id.net.$domain" || warn "certificate: 'cert issue' failed — re-run 'memex-local cert issue'"
+}
+
+# The fleet CA (item a) — ONE path, the onboarding contract's §6 drop: the opened key goes to enrol/fleet-ca.key (0600)
+# and `ca adopt --sha256 <caCertSha256>` reads it from there (refusing a key that is not the declared certificate's) and
+# deletes the drop. If the adopt cannot finish now, the drop stays and the device bootstrap adopts it on its next run by
+# the SAME command — never a second, different path.
+fleet_apply_ca() {
+  local dir="$1" sha="${2:-}" drop="$FLEET_DIR/fleet-ca.key"
+  [ -s "$dir/a" ] || { info "fleet CA: no key in the code"; return 0; }
+  [ -n "$sha" ] || sha="$(managed_pref FleetCaSha256)"
+  ( umask 077; cp "$dir/a" "$drop" ); chmod 600 "$drop"
+  if ! declare -F cmd_ca >/dev/null 2>&1; then
+    info "fleet CA: key left at $drop (0600) — this memex-local has no 'ca adopt'; the device bootstrap adopts it"; return 0
+  fi
+  [ -n "$sha" ] || { warn "fleet CA: the code names no caCertSha256 (nor the profile FleetCaSha256) — key left at $drop for the bootstrap"; return 0; }
+  ( cmd_ca adopt --sha256 "$sha" ) && ok "fleet CA adopted (sha256 ${sha:0:12}…)" \
+    || warn "fleet CA: 'ca adopt' did not finish — the key stays at $drop (0600) and the device bootstrap adopts it on its next run"
+}
+
+# The build host: first-attach with the sealed worker/pull/registry values from FILES (no vault, no az) — jobs opt-in only.
+fleet_apply_buildhost() {
+  local dir="$1" fa api reg puser preg secrets
+  [ "$ACC_JOBS_ENABLED" = true ] || { info "build host: jobs are OFF — nothing installed"; return 0; }
+  [ -s "$dir/w" ] && [ -s "$dir/p" ] || { warn "build host: jobs are on but the code carries no worker/pull token — skipped"; return 0; }
+  api="$(fleet_fact_of "$dir" buildApi)"; reg="$(fleet_fact_of "$dir" buildRegistry)"; puser="$(fleet_fact_of "$dir" pullUser)"; preg="$(fleet_fact_of "$dir" pluginsRegistry)"
+  [ -n "$api" ] && [ -n "$reg" ] && [ -n "$puser" ] || { warn "build host: the code lacks buildApi/buildRegistry/pullUser — skipped"; return 0; }
+  fa="${MEMEX_FIRST_ATTACH:-$(resolve_share)/backlease/first-attach.sh}"
+  [ -f "$fa" ] || { warn "build host: first-attach.sh is not installed ($fa) — skipped"; return 0; }
+  secrets="$dir/build"; mkdir -p "$secrets"; chmod 700 "$secrets"
+  # the registry key and the registry URL go TOGETHER (first-attach's pass-both-or-neither): a key without the URL is left
+  # out, so the attach degrades to the plain contract instead of failing
+  ( umask 077; cp "$dir/w" "$secrets/worker"; cp "$dir/p" "$secrets/pull"; if [ -s "$dir/k" ] && [ -n "$preg" ]; then cp "$dir/k" "$secrets/instance-key"; fi )
+  local args=(--api "$api" --registry "$reg" --pull-user "$puser" --secrets-from "$secrets" --set-from latest)
+  if [ -s "$dir/k" ] && [ -n "$preg" ]; then args+=(--plugins-registry "$preg"); fi
+  if [ -s "$dir/k" ] && [ -z "$preg" ]; then
+    warn "build host: the code carries a registry key but no pluginsRegistry fact — the key is left out and the host attaches with the plain plugins contract (declare Hosting:Enrolment:Facts:pluginsRegistry on control)"
+  fi
+  fleet_accept_argv first-attach
+  ( bash "$fa" ${args[@]+"${args[@]}"} ${FLEET_ACCEPT_ARGV[@]+"${FLEET_ACCEPT_ARGV[@]}"} ) && ok "build host attached (first-attach, values from the code)" \
+    || warn "build host: first-attach failed — re-run 'memex-local fleet join' or first-attach.sh by hand"
+}
+
 cmd_fleet() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
     join)
-      local control="" id="" open_link="yes" code_file="" do_update="yes" with_obs="yes" with_build="yes"
-      local accept_args=()
+      local control="" id="" open_link="yes" code_file="" do_update="yes" with_obs="yes" with_build="yes" wait_min=60
       while [ $# -gt 0 ]; do
         case "$1" in
           --control)   shift; control="${1:?--control needs the control instance URL}" ;;
           --id)        shift; id="${1:?--id needs the deployment id}" ;;
           --no-open)   open_link="no" ;;
-          --code-file) shift; code_file="${1:?--code-file needs a path}" ;;   # absent → print the link, exit 3 (unattended)
+          --code-file) shift; code_file="${1:?--code-file needs a path}" ;;   # the paste fallback, read once present
+          --wait) shift; wait_min="${1:?--wait needs minutes}"; case "$wait_min" in ''|*[!0-9]*) die "--wait: minutes, a whole number" ;; esac ;;
           --no-update) do_update="no" ;;
           --no-observability) with_obs="no" ;;
           --no-buildhost) with_build="no" ;;
@@ -1908,8 +2194,7 @@ cmd_fleet() {
           --owner-email) shift; OWNER_ARG_EMAIL="${1:?--owner-email needs the owner e-mail}" ;;
           *) accept_flag "$@"
              [ "$ACC_USED" != 0 ] || die "fleet join: unknown flag '$1'"
-             # the opt-in flags pass through to backlease enroll, which asks what they leave unanswered
-             accept_args+=("$1"); [ "$ACC_USED" = 2 ] && { accept_args+=("$2"); shift; } ;;
+             [ "$ACC_USED" = 2 ] && shift ;;
         esac
         shift
       done
@@ -1923,7 +2208,14 @@ cmd_fleet() {
       case "$control" in https://*) ;; *) die "fleet join: --control must be the control instance's https URL (got '${control:-<none>}')" ;; esac
       printf '%s' "$id" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$' \
         || die "fleet join: --id must be lower-case letters, digits and dashes (at most 63), starting and ending with a letter or digit — it becomes Deployments/<id> on control"
-      need openssl openssl; need shasum shasum
+      need openssl openssl; need shasum shasum; need curl curl
+
+      # THE TWO QUESTIONS — build jobs and token generation — up front, before any key or link exists (enrolment v2).
+      step "The owner's two answers: build jobs and token generation"
+      install_residency_valid; [ -n "$ACC_TOK_RES" ] || ACC_TOK_RES="$(install_residency)"
+      fleet_participation
+      local owner_id owner_email
+      owner_id="$(overlay_value "$OWNER_ID_KEY")"; owner_email="$(overlay_value "$OWNER_EMAIL_KEY")"
 
       step "Preflight (MacStudioFleet §2b step 1)"
       local user host machine t missing=""
@@ -1940,41 +2232,66 @@ cmd_fleet() {
       local spki fp url
       spki="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | base64 | tr -d '\n')"
       fp="$(fleet_key_fingerprint "$key")"
-      url="$control/Hosting/Heartbeats/Enrol/$(fleet_request "$id" "$host" "$(fleet_fact "$user")" "$machine" "$spki")"
+      url="$control/Hosting/Heartbeats/Enrol/$(fleet_request_v2 "$id" "$host" "$(fleet_fact "$user")" "$machine" "$spki" "$owner_id" "$owner_email")"
       ok "key fingerprint: $fp"
       info "Open this link, sign in as a global administrator of the control instance, CHECK that the page"
-      info "shows the fingerprint above, and press 'Approve and issue the keys':"
+      info "shows the fingerprint above and the owner's two answers, and press 'Approve and issue the keys'."
+      info "This Mac then collects everything by itself — nothing to paste:"
       printf '\n%s\n\n' "$url"
       [ "$open_link" = "yes" ] && command -v open >/dev/null 2>&1 && open "$url" >/dev/null 2>&1 || true
 
-      local code=""
+      local code="" got="$FLEET_DIR/$id.code.collected" rc=0
       printf '%s\n' "$url" > "$FLEET_DIR/$id.link"
-      if [ -n "$code_file" ] && [ ! -f "$code_file" ]; then
-        # unattended (a device-management run): nothing to paste into — say what is awaited and come back
-        info "WAITING for the approval on control and the enrolment code at $code_file (the link is also in $FLEET_DIR/$id.link)"
-        exit 3
-      fi
-      if [ -n "$code_file" ]; then
+      rm -f "$got"
+      if [ -n "$code_file" ] && [ -s "$code_file" ]; then
         code="$(tr -d ' \n\r' < "$code_file")"
       else
-        printf 'Paste the enrolment code the page shows, then press Enter:\n> '
-        IFS= read -r code
-        code="$(printf '%s' "$code" | tr -d ' \r')"
+        fleet_poll "$control" "$key" "$wait_min" "$got" "$code_file" || rc=$?
+        if [ "$rc" = 0 ]; then
+          code="$(cat "$got")"; rm -f "$got"
+        elif [ -z "$code_file" ] && [ -t 0 ]; then
+          printf 'Not collected within %s min. Paste the enrolment code the page shows, then press Enter (or Ctrl-C and re-run later):\n> ' "$wait_min"
+          IFS= read -r code
+          code="$(printf '%s' "$code" | tr -d ' \r')"
+        else
+          # unattended (a device-management run): the next run resumes with the same key and request
+          info "WAITING for the approval on control (the link is in $FLEET_DIR/$id.link); the next run polls again"
+          exit 3
+        fi
       fi
-      local payload="$FLEET_DIR/$id.payload.json"
-      fleet_open_code "$code" "$key" "$payload"
-      local d m c
-      d="$(fleet_payload d "$payload")"; m="$(fleet_payload m "$payload")"; c="$(fleet_payload c "$payload")"
-      rm -f "$payload"
-      [ "$d" = "$id" ] || die "the code was issued for '$d', not '$id' — approve the link this run printed"
-      [ -n "$m" ] && [ -n "$c" ] || die "the code opened but carries no keys — approve the link again"
+      local items="$FLEET_DIR/$id.items" m c
+      case "$code" in
+        "$FLEET_CODE2_PREFIX"*)
+          trap 'tools_deactivate; rm -rf "'"$items"'"' EXIT
+          fleet_open_code2 "$code" "$key" "$items"
+          [ "$(fleet_json "$items/code.json" d)" = "$id" ] || die "the code was issued for '$(fleet_json "$items/code.json" d)', not '$id' — approve the link this run printed"
+          [ -s "$items/m" ] && [ -s "$items/c" ] || die "the code opened but carries no heartbeat/announcement key — approve the link again"
+          m="$(cat "$items/m")"; c="$(cat "$items/c")" ;;
+        *)
+          local payload="$FLEET_DIR/$id.payload.json" d
+          fleet_open_code "$code" "$key" "$payload"
+          d="$(fleet_payload d "$payload")"; m="$(fleet_payload m "$payload")"; c="$(fleet_payload c "$payload")"
+          rm -f "$payload"
+          [ "$d" = "$id" ] || die "the code was issued for '$d', not '$id' — approve the link this run printed"
+          [ -n "$m" ] && [ -n "$c" ] || die "the code opened but carries no keys — approve the link again" ;;
+      esac
       write_fleet_file "$control" "$id" "$m" "$c"
-      rm -f "$key"
       ok "joined as '$id' — heartbeat key $(fleet_value_fingerprint "$m"), announcement key $(fleet_value_fingerprint "$c") (the control instance's enrolment record shows the same fingerprints)"
+      unset m c
+
+      if [ -d "$items" ]; then
+        step "The items control issued (each opened from the code, handed over by file or stdin, never printed)"
+        fleet_apply_network "$id" "$items"
+        fleet_apply_signin "$items"
+        fleet_apply_cert "$id" "$items" "$owner_email"
+        fleet_apply_ca "$items" "$(fleet_fact_of "$items" caCertSha256)"
+      fi
+      rm -f "$key"
 
       step "Back-lease, local models and the image (steps 5)"
       if registry_mode; then
-        cmd_backlease enroll --control "$control" --deployment "$id" ${accept_args[@]+"${accept_args[@]}"}
+        fleet_accept_argv
+        cmd_backlease enroll --control "$control" --deployment "$id" ${FLEET_ACCEPT_ARGV[@]+"${FLEET_ACCEPT_ARGV[@]}"}
       else
         warn "not in REGISTRY MODE — run 'memex-local registry <url>' and then 'memex-local backlease enroll --control $control --deployment $id'"
       fi
@@ -1992,6 +2309,7 @@ cmd_fleet() {
         if participation_build_host "$with_build"; then
           step "Build runners (a build VM sized from this host, KEDA; the release on its first attach)"
           ( cmd_buildhost apply ) || warn "the build host did not finish — re-run 'memex-local buildhost apply'"
+          [ -d "$items" ] && fleet_apply_buildhost "$items"
         elif [ "$with_build" = "yes" ]; then
           info "No build host: the owner has not said YES to fleet jobs ($(participation_said Jobs)) — no build VM, runners or priority agent"
         fi
@@ -2014,7 +2332,7 @@ cmd_fleet() {
         info "not joined — memex-local fleet join --control https://<control-instance> --id <id>"
       fi
       ;;
-    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] [--accept-jobs=<patterns> | --no-accept-jobs] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--residency <X>] | status}" ;;
+    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--wait <min>] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] [--accept-jobs=<patterns> | --no-accept-jobs] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--residency <X>] | status}" ;;
   esac
 }
 
