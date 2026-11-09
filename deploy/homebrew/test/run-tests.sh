@@ -2838,8 +2838,9 @@ case "$(cat "$HERE/../../backlease/first-attach.sh")" in *'homebrew/share/vm-net
 rm -rf "$NSV"
 # `memex-local net --profile build` (no subcommand) is `status` for that profile, as vm-netshape.sh defaults a bare flag
 NSS="$(mktemp -d)"; printf '#!/bin/bash\nprintf "%%s" "$*"\n' > "$NSS/vm-netshape.sh"
-[ "$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; resolve_share() { printf "%s" "$1"; }; shift_net_cmd default --profile build' "$CLI" "$NSS" 2>&1)" = "--status --profile build" ] \
-  && ok "'net --profile build' with no subcommand runs status for that profile" || bad "net bare flag" "$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; resolve_share() { printf "%s" "$1"; }; shift_net_cmd default --profile build' "$CLI" "$NSS" 2>&1)"
+netbare() { env NSS_DIR="$NSS" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; resolve_share() { printf "%s" "$NSS_DIR"; }; shift_net_cmd default --profile build' "$CLI" 2>&1; }
+[ "$(netbare)" = "--status --profile build" ] \
+  && ok "'net --profile build' with no subcommand runs status for that profile" || bad "net bare flag" "$(netbare)"
 rm -rf "$NSS"
 rm -rf "$NSHOME"
 
