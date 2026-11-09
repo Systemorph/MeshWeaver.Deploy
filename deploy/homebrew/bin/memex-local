@@ -5284,6 +5284,20 @@ write_instances_layer() {
   } > "$INSTANCES_FILE"
 }
 
+# The portal's own boot progress, followed in the terminal — the same facts the boot page shows
+# (share/boot-progress.py reads the newest portal pod's /_boot/progress: the phase, each module landing
+# with version, size and seconds, an ETA from the measured rate, the checks that still say no and any
+# error). It never decides anything: `rollout status` right after it does, exactly as before. A portal
+# image that predates the endpoint makes it step aside at once.
+follow_boot_progress() {
+  local share; share="$(resolve_share)"
+  [ -f "$share/boot-progress.py" ] && command -v python3 >/dev/null 2>&1 || return 0
+  # The SAME context the `kubectl rollout status` after it reads (the ambient one up/update deploy into).
+  local ctx; ctx="$(kubectl config current-context 2>/dev/null)" || return 0
+  python3 -I "$share/boot-progress.py" --namespace "$NAMESPACE" --context "$ctx" \
+    --timeout "${1:-900}" || warn "the portal did not report ready in time — 'memex-local logs' says why"
+}
+
 # Runs share/instances.py with this Mac's context. The program never re-derives what this file knows.
 instances_exec() {
   local share net ip=""; share="$(resolve_share)"
@@ -5505,6 +5519,7 @@ cmd_up() {
   apply_logging                                   # full logging override
 
   step "Waiting for the portal rollout (§4)"
+  follow_boot_progress 900
   kubectl rollout status deploy/memex-portal-deployment -n "$NAMESPACE" --timeout=300s || \
     warn "portal rollout not complete — check 'memex-local logs' / 'memex-local status'"
   # "Never 403": a real completion from inside the portal pod, through what the portal was configured with.
@@ -5977,6 +5992,7 @@ cmd_update() {
   step "Forcing a fresh portal pod (:latest tag unchanged → rollout restart picks up the rebuilt image)"
   kubectl rollout restart deploy/memex-portal-deployment -n "$NAMESPACE"
   apply_logging
+  follow_boot_progress 900
   kubectl rollout status deploy/memex-portal-deployment -n "$NAMESPACE" --timeout=300s
   llm_chat_smoke_or_die
   embed_smoke_or_die
