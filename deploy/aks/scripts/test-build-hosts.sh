@@ -223,6 +223,8 @@ for ch, (tester, portal, runner, mx, pv, mn) in want.items():
         problems.append(f"{ch}: the warm workspace is not OFF by default (MW_BUILD_WARM_WORKSPACE={env.get('MW_BUILD_WARM_WORKSPACE')})")
     if env.get("MW_BUILD_SHARED_TREE", {}).get("value") != "false":
         problems.append(f"{ch}: the shared tree is not OFF by default (MW_BUILD_SHARED_TREE={env.get('MW_BUILD_SHARED_TREE')})")
+    if env.get("MW_BUILD_RUN_OVERLAY", {}).get("value") != "false":
+        problems.append(f"{ch}: the run overlay is not OFF by default (MW_BUILD_RUN_OVERLAY={env.get('MW_BUILD_RUN_OVERLAY')})")
     if env.get("MW_BUILD_MODULE_HUB_ENABLED", {}).get("value") != "false":
         problems.append(f"{ch}: the module-hub broker is not OFF by default (MW_BUILD_MODULE_HUB_ENABLED={env.get('MW_BUILD_MODULE_HUB_ENABLED')})")
     if "BUILD_TOKEN" in env:
@@ -601,6 +603,7 @@ else:
     if env.get("MW_BUILD_WARM_WORKSPACE") != "true": problems.append(f"the Mac's warm workspace is not on: MW_BUILD_WARM_WORKSPACE={env.get('MW_BUILD_WARM_WORKSPACE')!r}")
     if env.get("MW_BUILD_MODULE_HUB_ENABLED") != "true": problems.append(f"the Mac's module-hub broker is not on: MW_BUILD_MODULE_HUB_ENABLED={env.get('MW_BUILD_MODULE_HUB_ENABLED')!r}")
     if env.get("MW_BUILD_SHARED_TREE") != "true": problems.append(f"the Mac's shared tree is not on: MW_BUILD_SHARED_TREE={env.get('MW_BUILD_SHARED_TREE')!r}")
+    if env.get("MW_BUILD_RUN_OVERLAY") != "true": problems.append(f"the Mac's run overlay is not on: MW_BUILD_RUN_OVERLAY={env.get('MW_BUILD_RUN_OVERLAY')!r}")
     if env.get("BUILD_API") != "https://control.example.com/api/builds": problems.append(f"BUILD_API={env.get('BUILD_API')!r}")
     if env.get("MW_REGISTRY_URL") != "https://registry.example.com" or env.get("MW_REGISTRY_KEY_FILE") != "/run/registry-key/key":
         problems.append("the plugins layer is not read through the registry bundle index (H8)")
