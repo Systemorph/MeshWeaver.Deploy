@@ -596,6 +596,14 @@ smrun FLEET_CA_SHA256="$FSHA"
 grep -q "memex-local ca adopt --key-file $T/sm/home/.memex-local/enrol/fleet-ca.key --sha256 $FSHA\$" "$T/sm/calls" && ! grep -q 'MEMEX_CA_TRUST=defer' "$T/sm/calls" \
   && ok "the fleet CA's key delivered → 'memex-local ca adopt' with the declared sha256, then a normal 'up'" || bad "adopt on delivery" "$(cat "$T/sm/calls")"
 case "$OUT" in *"$KEYB64"*) bad "the bootstrap never logs the CA key" "" ;; *) ok "the bootstrap never logs the CA key" ;; esac
+# a refused adopt: its reason reaches the bootstrap log (review on #223)
+SMF='as_user() { shift; printf "%s\n" "$*" >> "$SM_CALLS"; case "$*" in *-CAROOT*) printf "%s" "$SM_CAROOT" ;; *"ca adopt"*) echo "err  ca adopt: the key does not belong to the certificate"; return 1 ;; esac; return 0; }
+    probe_as_user() { return 1; }
+    read_participation >/dev/null; step_memex jroe studio-2; echo "rc=$?"'
+printf '%s\n' "$KEYB64" > "$T/sm/home/.memex-local/enrol/fleet-ca.key"
+: > "$T/sm/calls"; OUT="$(env $FCA_ENV FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$T/smlog" FLEET_MANAGED_PREFS="$T/none" FLEET_USER_HOME="$T/sm/home" FLEET_BREW_PREFIX="$T/brew" \
+  FLEET_CONTROL_URL=https://control.example.test SM_CALLS="$T/sm/calls" SM_CAROOT="$T/sm/caroot" FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=false FLEET_CA_SHA256="$FSHA" bash -c '. "$0"; '"$SMF" "$FB" 2>&1)"
+case "$OUT" in *"ca adopt' FAILED"*"memex:   err  ca adopt: the key does not belong to the certificate"*"rc=1"*) ok "a refused 'ca adopt' logs adopt's own reason and fails the step" ;; *) bad "adopt failure reason logged" "$OUT" ;; esac
 rm -f "$T/sm/home/.memex-local/enrol/fleet-ca.key"
 smrun
 case "$OUT" in *"WAITING for the local CA to be trusted"*"rc=0"*) ok "no fleet CA and an untrusted mkcert CA: WAITING (unchanged), naming the fleet profile remedy" ;; *) bad "no fleet CA waits" "$OUT" ;; esac

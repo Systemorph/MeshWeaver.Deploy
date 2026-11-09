@@ -488,8 +488,14 @@ step_memex() {
   elif fleet_sha="$(fleet_ca_trusted_by_profile)"; then
     if [ -f "$key_drop" ]; then
       log "memex: adopting the fleet local CA (trusted by profile, sha256:${fleet_sha:0:12}) — its key arrived with the enrolment code"
-      as_user "$user" "$mlocal" ca adopt --key-file "$key_drop" --sha256 "$fleet_sha" >/dev/null 2>&1 \
-        || { log "memex: 'memex-local ca adopt' FAILED — retried next run"; return 1; }
+      # adopt's own refusals (key not 0600, key ≠ the declared certificate, no such certificate in the keychain) are the
+      # reasons an unattended Mac needs in its log. adopt never prints the key (fingerprints only), so its output is logged.
+      local adopt_out
+      if ! adopt_out="$(as_user "$user" "$mlocal" ca adopt --key-file "$key_drop" --sha256 "$fleet_sha" 2>&1)"; then
+        log "memex: 'memex-local ca adopt' FAILED — retried next run; it said:"
+        printf '%s\n' "$adopt_out" | tail -5 | while IFS= read -r l; do log "memex:   $l"; done
+        return 1
+      fi
     else
       log "memex: the fleet local CA is trusted by profile (sha256:${fleet_sha:0:12}) — not waiting on 'mkcert -install'; the portal's certificate moves under it when its key arrives with the enrolment code"
       ca_env=(env MEMEX_CA_TRUST=defer)

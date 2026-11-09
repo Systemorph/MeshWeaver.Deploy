@@ -30,7 +30,11 @@ them. Nothing secret is configured.
 `FleetCaSha256` names the fleet local CA's certificate (64 hex, its SHA-256): the certificate itself is a
 trusted-root profile, minted once on the owner's go with `deploy/macos/fleet-ca/mint-fleet-ca.sh` (EC P-256,
 critical Name Constraints: `DNS:localhost` — which covers every name below it — `127.0.0.1`, `::1`; the key goes
-straight into a vault object and reaches each Mac sealed in its enrolment code, item `a`).
+straight into a vault object and reaches each Mac sealed in its enrolment code, item `a`). Sharing one key is
+tolerable only because macOS ENFORCES those constraints on the root. Measured on macOS 27 (2026-11-09) with Apple's
+evaluator (`security verify-cert -c <leaf> -r <fleet CA> -p ssl -n <name>`): a leaf for `memex.localhost` signed by
+the CA verifies; a leaf for `example.com` signed by the same CA is refused, *"Certificate violates name constraints
+placed on issuing CA"*. Re-measure on the first profile-trusted fleet Mac (Safari and Chrome) before relying on it.
 
 **Participation — required, never defaulted** (the owner's answers, Mac onboarding contract §5):
 

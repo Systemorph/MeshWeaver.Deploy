@@ -346,7 +346,10 @@ secret_fingerprint() { printf 'sha256:%s' "$(printf '%s' "$1" | shasum -a 256 | 
 # second Mac Studio (2026-11-09) opened the wizard before the local CA was trusted, and the first thing the
 # person saw was a certificate error. `security verify-cert <url>` evaluates the chain the server presents
 # against this Mac's trust settings, so an untrusted CA, a stale certificate and a name mismatch all answer
-# "no". Without `security` (not macOS) the answer is no. MEMEX_TRUST_CHECK=skip is for a test only.
+# "no". Measured on macOS 27 (2026-11-09): with a URL operand verify-cert applies the SSL server policy for that
+# host itself (its usage: "other certificates or policy options will be ignored", so no -p) — a trusted
+# https://memex.localhost:8443 answers 0, the same server reached as https://127.0.0.1:8443 (a name its certificate
+# does not carry) answers 1. Without `security` (not macOS) the answer is no. MEMEX_TRUST_CHECK=skip is for a test only.
 served_cert_trusted() {
   [ "${MEMEX_TRUST_CHECK:-}" = skip ] && return 0
   command -v security >/dev/null 2>&1 && security verify-cert "$1" >/dev/null 2>&1
