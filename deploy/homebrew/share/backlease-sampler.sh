@@ -15,6 +15,8 @@
 # Sources, all without sudo:
 #   host   sysctl -n hw.ncpu / hw.memsize; vm_stat (page size × active+wired+compressed);
 #          ownerCpuPercent — the OWNER's CPU over the interval (see owner_cpu below);
+#          cpuPercent — the host's CPU busy, % of all cores (top, see host_cpu below);
+#          netIn/OutBytesPerSec — physical-interface traffic over the interval (netstat -ibn, see net_rate below);
 #          sysctl -n vm.loadavg; pmset -g therm (CPU_Speed_Limit → thermal level); df -k $HOME;
 #          sysctl -n kern.boottime; pmset -g batt (power source)
 #   models ollama's native API: /api/tags (installed) + /api/ps (loaded)
@@ -165,6 +167,36 @@ owner_cpu() {
   printf '%s' $(( ( ${reading% *} - ${reading#* } ) / dt ))
 }
 
+# host.cpuPercent — the host's CPU busy, in percent of ALL cores (0–100): 100 minus the idle share of a one-second `top`
+# sample (the second of two, so it is a delta, never the since-boot average). Prints nothing — the field is ABSENT —
+# when `top` gives no parseable line. MEMEX_SAMPLER_TOP (and MEMEX_SAMPLER_NETSTAT below) are test seams expanded
+# UNQUOTED on purpose, so the override is word-split: give a command whose words contain no spaces. Recorded into the fleet's metric history (MeshWeaver.Plugins Hosting/FleetMetricHistory).
+host_cpu() {
+  ${MEMEX_SAMPLER_TOP:-top -l 2 -n 0 -s 1} 2>/dev/null | awk '/^CPU usage:/ {
+      for (i = 1; i <= NF; i++) if ($(i+1) ~ /^idle/) { v = $i; gsub(/%/, "", v); idle = v } }
+    END { if (idle != "" && idle + 0 >= 0 && idle + 0 <= 100) printf "%.1f", 100 - idle }'
+}
+
+# host.netInBytesPerSec / host.netOutBytesPerSec — bytes received and sent per second over the host's PHYSICAL
+# interfaces (en*, the link-level rows of `netstat -ibn`: Ibytes and Obytes), averaged over the interval since the
+# previous sample — what lets a home-network burst be lined up with what the machine was doing. Prints "in out", or
+# nothing (both fields ABSENT) on the first sample, after a gap longer than three intervals, or when a counter went
+# backwards (a reboot or an interface reset): a stale or negative window is not a reading.
+net_rate() {
+  local prev="$DIR/net.prev" now cur t0 in0 out0 dt
+  now="${MEMEX_SAMPLER_NOW:-$(date +%s)}"
+  cur="$(${MEMEX_SAMPLER_NETSTAT:-netstat -ibn} 2>/dev/null | awk '$1 ~ /^en[0-9]+$/ && $3 ~ /^<Link#/ && NF >= 11 { i += $7; o += $10; n++ }
+    END { if (n > 0) printf "%.0f %.0f", i, o }')"
+  [ -n "$cur" ] || { rm -f "$prev"; return 0; }
+  t0=""; [ -f "$prev" ] && read -r t0 in0 out0 < "$prev"
+  printf '%s %s\n' "$now" "$cur" > "$prev" 2>/dev/null || { rm -f "$prev"; return 0; }
+  case "$t0" in ''|*[!0-9]*) return 0 ;; esac
+  dt=$(( now - t0 ))
+  [ "$dt" -ge 1 ] && [ "$dt" -le $(( INTERVAL * 3 )) ] || return 0
+  awk -v a="${cur% *}" -v b="${cur#* }" -v c="$in0" -v d="$out0" -v t="$dt" \
+    'BEGIN { if (a < c || b < d) exit; printf "%.0f %.0f", (a - c) / t, (b - d) / t }'
+}
+
 health_of() { # name, probe-exit → "ok" or the reason
   if [ "$2" = 0 ]; then printf '"%s":"ok"' "$1"; else printf '"%s":"%s"' "$1" "$3"; fi
 }
@@ -175,6 +207,15 @@ write_sample() {
   local owner; owner="$(owner_cpu)"
   # spliced only into a JSON OBJECT: a degraded host reading (anything not ending in `}`) is written as it was
   case "$owner" in ''|*[!0-9]*) ;; *) case "$host" in '{'*'}') host="${host%\}},\"ownerCpuPercent\":$owner}" ;; esac ;; esac
+  local cpu; cpu="$(host_cpu)"
+  case "$cpu" in ''|*[!0-9.]*) ;; *) case "$host" in '{'*'}') host="${host%\}},\"cpuPercent\":$cpu}" ;; esac ;; esac
+  local net net_in net_out; net="$(net_rate)"; net_in="${net% *}"; net_out="${net#* }"
+  # each token on its own: two whole numbers or nothing is spliced (never `2junk` into the JSON)
+  case "$net" in *' '*)
+    case "$net_in$net_out" in ''|*[!0-9]*) ;; *)
+      [ -n "$net_in" ] && [ -n "$net_out" ] && case "$host" in '{'*'}') host="${host%\}},\"netInBytesPerSec\":$net_in,\"netOutBytesPerSec\":$net_out}" ;; esac ;;
+    esac ;;
+  esac
   models="$(sample_models)"; m_rc=$?
   vm="$(sample_vm)"; v_rc=$?
   colima status >/dev/null 2>&1; colima_rc=$?
