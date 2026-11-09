@@ -553,13 +553,16 @@ case "$*" in *"secret show"*) exit "${FAKE_AZ_EXISTS:-1}" ;; esac
 prev=""; for a in "$@"; do [ "$prev" = "--file" ] && { cp "$a" "$FAKE_AZ_VALUE"; ls -l "$a" | cut -c1-10 > "$FAKE_AZ_VALUE.mode"; }; prev="$a"; done
 AZ
 chmod +x "$T/azb/az"
-OUT="$(env PATH="$T/azb:$PATH" FAKE_AZ_LOG="$T/az.log" FAKE_AZ_VALUE="$T/az.value" bash "$MINT" --vault fleetvault --object fleet-local-ca-key --cert-out "$T/fca3.pem" 2>&1)"; RC=$?
+OUT="$(env PATH="$T/azb:$PATH" FAKE_AZ_LOG="$T/az.log" FAKE_AZ_VALUE="$T/az.value" bash "$MINT" --vault fleetvault --object fleet-local-ca-key --subscription acme-sub --cert-out "$T/fca3.pem" 2>&1)"; RC=$?
 V="$(cat "$T/az.value" 2>/dev/null)"
-[ "$RC" = 0 ] && [ -n "$V" ] && grep -q -- 'secret set --vault-name fleetvault --name fleet-local-ca-key --file ' "$T/az.log" && [ "$(cat "$T/az.value.mode")" = "-rw-------" ] \
+[ "$RC" = 0 ] && [ -n "$V" ] && grep -q -- 'secret set --subscription acme-sub --vault-name fleetvault --name fleet-local-ca-key --file ' "$T/az.log" && [ "$(grep -c -- '--subscription acme-sub' "$T/az.log")" = "$(wc -l < "$T/az.log" | tr -d ' ')" ] && [ "$(cat "$T/az.value.mode")" = "-rw-------" ] \
   && ok "mint --vault hands the key to 'az keyvault secret set --file' through a 0600 file" || bad "mint to vault" "rc=$RC $OUT $(cat "$T/az.log")"
 case "$OUT$(cat "$T/az.log")" in *"$V"*) bad "the key is never printed nor an argument" "" ;; *) ok "the key is never printed nor an argument" ;; esac
-OUT="$(env PATH="$T/azb:$PATH" FAKE_AZ_LOG="$T/az.log" FAKE_AZ_VALUE="$T/az2.value" FAKE_AZ_EXISTS=0 bash "$MINT" --vault fleetvault --object fleet-local-ca-key 2>&1)" \
+OUT="$(env PATH="$T/azb:$PATH" FAKE_AZ_LOG="$T/az.log" FAKE_AZ_VALUE="$T/az2.value" FAKE_AZ_EXISTS=0 bash "$MINT" --vault fleetvault --object fleet-local-ca-key --subscription acme-sub 2>&1)" \
   && bad "mint replaced an existing vault object" "$OUT" || { [ ! -e "$T/az2.value" ] && ok "mint refuses to replace an existing vault object (a second CA orphans every Mac's trust)" || bad "vault replace refused" ""; }
+: > "$T/az.log"
+OUT="$(env PATH="$T/azb:$PATH" FAKE_AZ_LOG="$T/az.log" FAKE_AZ_VALUE="$T/az3.value" bash "$MINT" --vault fleetvault --object fleet-local-ca-key 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*) bad "vault mode without --subscription is refused" "$OUT" ;; *"--subscription <name|id> is required"*"shared"*) [ ! -s "$T/az.log" ] && [ ! -e "$T/az3.value" ] && ok "vault mode without --subscription is REFUSED before any az call, naming why (the shared login's default subscription)" || bad "no az call without subscription" "$(cat "$T/az.log")" ;; *) bad "subscription refusal" "rc=$RC $OUT" ;; esac
 # the System keychain as `security find-certificate -a -Z -p` prints it: another certificate first, then the fleet CA
 { printf 'SHA-256 hash: %s\nSHA-1 hash: 00\n' "$(printf 'a%.0s' $(seq 64) | tr a-f A-F)"; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout /dev/null -subj /CN=other -days 1 2>/dev/null
   printf 'SHA-256 hash: %s\nSHA-1 hash: 00\n' "$(printf '%s' "$FSHA" | tr a-f A-F)"; cat "$T/fca.pem"; } > "$T/keychain.txt"

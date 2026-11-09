@@ -8,7 +8,7 @@
 # 🚨 MINTING THE FLEET CA IS THE OWNER'S CALL. Run it once, on the owner's go; every fleet Mac trusts what it
 # signs (for the loopback names only — the constraints are what make sharing one key across Macs tolerable).
 #
-#   mint-fleet-ca.sh --vault <key vault> --object <secret name> [--cert-out <file>] [--days <n>] [--cn <name>]
+#   mint-fleet-ca.sh --vault <key vault> --object <secret name> --subscription <name|id> [--cert-out <file>] [--days <n>] [--cn <name>]
 #   mint-fleet-ca.sh --key-file <new file> [--cert-out <file>] …      (offline: the key into a NEW 0600 file)
 #
 # Output: the certificate PEM (to --cert-out, else stdout) and, on stderr, its SHA-256 — the value of the managed
@@ -16,15 +16,18 @@
 # run, converted to the enrolment item's form (base64 of the PKCS#8 DER, one line) in a 0600 file, handed to
 # `az keyvault secret set --file` (never an argument, never printed — not even a fingerprint of it), and the
 # directory is removed. An existing vault object is never overwritten (a second CA would orphan every Mac's
-# trust); --key-file refuses an existing file for the same reason.
+# trust); --key-file refuses an existing file for the same reason. Vault mode REQUIRES --subscription, passed to every
+# `az keyvault` call: the az login is shared, its default subscription is whatever someone last selected, and a vault
+# name resolved there can be the wrong vault (or tenant). Never `az account set`.
 set -euo pipefail
 
-vault="" object="" key_out="" cert_out="" days=3650 cn="MeshWeaver Fleet Local CA"
+vault="" object="" subscription="" key_out="" cert_out="" days=3650 cn="MeshWeaver Fleet Local CA"
 die() { printf 'mint-fleet-ca: %s\n' "$*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --vault) shift; vault="${1:?--vault needs a name}" ;;
     --object) shift; object="${1:?--object needs a secret name}" ;;
+    --subscription) shift; subscription="${1:?--subscription needs a subscription name or id}" ;;
     --key-file) shift; key_out="${1:?--key-file needs a path}" ;;
     --cert-out) shift; cert_out="${1:?--cert-out needs a path}" ;;
     --days) shift; days="${1:?--days needs a number}" ;;
@@ -37,12 +40,13 @@ done
 case "$days" in ''|*[!0-9]*) die "--days must be a whole number" ;; esac
 case "$cn" in *[!A-Za-z0-9\ ._-]*) die "--cn: letters, digits, spaces, dot, dash and underscore only" ;; esac
 if [ -n "$key_out" ]; then
-  [ -z "$vault$object" ] || die "--key-file OR --vault/--object, not both"
+  [ -z "$vault$object$subscription" ] || die "--key-file OR --vault/--object/--subscription, not both"
   [ ! -e "$key_out" ] && [ ! -L "$key_out" ] || die "--key-file '$key_out' exists — refusing to overwrite a CA key"
 else
-  [ -n "$vault" ] && [ -n "$object" ] || die "name where the key goes: --vault <v> --object <name> (or --key-file <new file>)"
+  [ -n "$vault" ] && [ -n "$object" ] || die "name where the key goes: --vault <v> --object <name> --subscription <s> (or --key-file <new file>)"
+  [ -n "$subscription" ] || die "--subscription <name|id> is required with --vault: the az login is shared and its default subscription is whatever was selected last — a vault resolved there can be the wrong one (never 'az account set')"
   command -v az >/dev/null 2>&1 || die "az (Azure CLI) not found"
-  if az keyvault secret show --vault-name "$vault" --name "$object" -o none >/dev/null 2>&1; then
+  if az keyvault secret show --subscription "$subscription" --vault-name "$vault" --name "$object" -o none >/dev/null 2>&1; then
     die "the vault object $vault/$object already exists — refusing to replace the fleet CA (every Mac trusts the old one)"
   fi
 fi
@@ -77,7 +81,7 @@ if [ -n "$key_out" ]; then
   chmod 600 "$key_out"
   where="$key_out (0600)"
 else
-  az keyvault secret set --vault-name "$vault" --name "$object" --file "$work/key.b64" --encoding utf-8 \
+  az keyvault secret set --subscription "$subscription" --vault-name "$vault" --name "$object" --file "$work/key.b64" --encoding utf-8 \
     --content-type "application/pkcs8;base64" -o none >/dev/null || die "could not store the key in $vault/$object"
   where="$vault/$object"
 fi

@@ -2797,6 +2797,11 @@ chmod +x "$CA/bin/mkcert"
 adopt() { OUT="$(env PATH="$CA/bin:$PATH" CAROOT="$CA/caroot" HOME="$CA/home" MEMEX_LOCAL_HOME="$CA/home/.memex-local" FAKE_MKCERT_LOG="$CA/mkcert.log" MEMEX_KUBE_CONTEXT=none "$@" 2>&1)"; RC=$?; }
 printf 'old\n' > "$CA/caroot/rootCA.pem"; printf 'oldkey\n' > "$CA/caroot/rootCA-key.pem"
 cp "$CA/fleet.key" "$CA/home/.memex-local/enrol/fleet-ca.key"; chmod 600 "$CA/home/.memex-local/enrol/fleet-ca.key"
+# the forms the minted fleet CA is stored in: the key as ONE line of base64 PKCS#8 DER (the vault object, enrolment
+# item `a`), the certificate permitting DNS:localhost alone (RFC 5280: it covers every name below localhost)
+[ "$(wc -l < "$CA/fleet.key" | tr -d ' ')" = 1 ] && ! grep -q -- '-----BEGIN' "$CA/fleet.key" \
+  && openssl x509 -in "$CA/fleet.pem" -noout -text | grep -q '^ *DNS:localhost$' && ! openssl x509 -in "$CA/fleet.pem" -noout -text | grep -q 'DNS:\.localhost' \
+  && ok "the adopted pair is in the stored form: one line of base64 PKCS#8 DER, a CA permitting DNS:localhost alone" || bad "stored form" "$(cat "$CA/fleet.key" | wc -l)"
 adopt "$CLI" ca adopt --cert "$CA/fleet.pem" --sha256 "$FSHA"
 case "$RC:$OUT" in 0:*"fleet local CA adopted"*"re-issued under the fleet CA"*) ok "ca adopt installs the fleet CA (the join's drop, the declared sha256) and re-issues the portal's certificate" ;; *) bad "ca adopt" "rc=$RC $OUT" ;; esac
 case "$OUT" in *"$KEYB64"*|*"PRIVATE KEY"*) bad "ca adopt never prints the key" "$OUT" ;; *) ok "ca adopt never prints the key (fingerprints only)" ;; esac
