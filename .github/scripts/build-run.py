@@ -4075,9 +4075,11 @@ def remove_workspace(path: str, release: Callable[[str], None] = release_run_tre
 
 
 def lower_is_writable_through(lower: str) -> bool:
-    """Whether an overlay with `lower` beneath can be WRITTEN by this process: its directories must be owned by this
-    process's uid (the runner's own trees under the cache are; the image's tree, owned by an id this user namespace does
-    not map, is not — overlayfs checks the lower's permissions on every copy-up into a directory). Pure apart from a stat."""
+    """Whether an overlay with `lower` beneath can be WRITTEN by this process, read from the lower's ROOT directory's owner:
+    this process's uid for the runner's own trees under the cache, an id this user namespace does not map for the image's
+    tree (overlayfs checks the lower's permissions on every copy-up into a directory). Both real lowers are single-owner
+    trees, so the root decides; a mixed-ownership lower is not detected here. A missing or unreadable lower is not
+    writable-through. Pure apart from a stat."""
     try:
         return os.stat(lower).st_uid == os.getuid()
     except OSError:
@@ -4099,8 +4101,12 @@ def platform_source_view(platform_src: str, dest: str, env: dict, log: Callable[
         # it mounts, but no directory of it can be written through it ("Access to the path …/obj is denied" — measured on
         # eiger 2026-11-09, every prepared input and warm restore red the moment the overlay probe passed, #213). Such a
         # lower takes the cold worktree, whose files this process owns; the deployment's platform tree (owned) overlays.
-        log(f"platform source: {platform_src} is not owned by this runner (uid {os.stat(platform_src).st_uid}, runner "
-            f"{os.getuid()}) — an overlay of it could not be written; a cold worktree of the platform's master instead")
+        try:
+            owner: object = os.stat(platform_src).st_uid
+        except OSError as e:
+            owner = f"unreadable: {type(e).__name__}"
+        log(f"platform source: {platform_src} is not owned by this runner (owner {owner}, runner uid {os.getuid()}) — an "
+            f"overlay of it could not be written; a cold worktree of the platform's master instead")
         can = False
     layered, cold = False, False
     if can:
@@ -7238,6 +7244,20 @@ def self_test() -> int:
                           pv_mounts == [(owned, pv5)], pv_mounts)
             finally:
                 globals()["lower_is_writable_through"] = real_lw
+            said_missing: list = []
+            real_lw2 = globals()["lower_is_writable_through"]
+            globals()["lower_is_writable_through"] = lambda lo: False
+            try:
+                try:
+                    with platform_source_view(os.path.join(wroot, "gone-lower"), os.path.join(wroot, "work", "pv7", "platform"), wenv,
+                                              said_missing.append, can_overlay=True, mount=lambda lo, de: None):
+                        pass
+                except Refusal:
+                    pass
+            finally:
+                globals()["lower_is_writable_through"] = real_lw2
+            check("platform-view/a MISSING lower is said (owner unreadable) and refused, never an exception from the log line",
+                  any("owner unreadable: FileNotFoundError" in m for m in said_missing), said_missing)
             check("platform-view/ownership is read from the lower itself: this process's own directory is writable-through, a "
                   "missing one is not", lower_is_writable_through(image_src) and not lower_is_writable_through(os.path.join(wroot, "nope")))
             empty_cache = os.path.join(wroot, "empty-cache"); os.makedirs(empty_cache)
