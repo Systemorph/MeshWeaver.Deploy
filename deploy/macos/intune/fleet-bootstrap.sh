@@ -14,7 +14,8 @@
 #      the network must be up before anyone logs in, which the Tailscale app does not do. memex-local finds
 #      this socket by itself.
 #   4. The private network: joined with a single-use pre-auth key when one is provided (FLEET_PREAUTH_KEY_FILE,
-#      read and deleted, never printed). Until control mints it at enrolment, a run without one says so.
+#      else ~<console user>/.memex-local/enrol/<machine>.preauth — the path an Intune run can reach, since Intune
+#      sets no environment; read by file reference and deleted after the join, never printed). Until control mints it at enrolment, a run without one says so.
 #   5. memex-local: registry mode, `up`, then `fleet join`. The join's approval happens on control; the run
 #      prints the approval link (and writes it to the log), and a later run completes the join once the
 #      enrolment code is at its code file. Until control hands the code back itself (§2b.1, target 1), the
@@ -31,7 +32,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.3.1"
+readonly FLEET_BOOTSTRAP_VERSION="1.3.2"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -46,6 +47,9 @@ readonly BREW_TOOLS=(colima docker kubectl helm ollama)
 readonly TS_DIR="${FLEET_TS_DIR:-/Library/MeshWeaver/tailscale}"
 readonly TS_FORMULA_API="${FLEET_TS_FORMULA_API:-https://formulae.brew.sh/api/formula/tailscale.json}"
 readonly MEMEX_FORMULA="systemorph/memex/memex-local"
+# The Command Line Tools: memex-local is a source formula, so `brew install` refuses with "No developer tools
+# installed" on a fresh Mac (measured on the second Mac Studio, 2026-11-09). Installed headless, as root.
+readonly CLT_DIR="${FLEET_CLT_DIR:-/Library/Developer/CommandLineTools}"
 
 log() {
   local line; line="$(date -u +%Y-%m-%dT%H:%M:%SZ) fleet-bootstrap ${FLEET_BOOTSTRAP_VERSION}: $*"
@@ -144,6 +148,35 @@ step_homebrew() {
     || { log "homebrew: FAILED to install"; return 1; }
 }
 
+# Whether a compiler toolchain Homebrew accepts is present: the Command Line Tools, or (only when the CLT
+# directory is not overridden) a selected Xcode. Pure read.
+devtools_present() {
+  [ -x "$CLT_DIR/usr/bin/clang" ] && return 0
+  [ -z "${FLEET_CLT_DIR:-}" ] || return 1
+  local dev; dev="$(xcode-select -p 2>/dev/null || true)"
+  [ -n "$dev" ] && [ -x "$dev/usr/bin/clang" ]
+}
+
+# The Command Line Tools, installed with softwareupdate (no dialog, no person): the on-demand flag makes the
+# catalogue offer them, the newest label is installed, and the flag is removed whatever happened.
+step_devtools() {
+  if devtools_present; then log "developer tools: present"; return 0; fi
+  local flag="/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress" label
+  log "developer tools: installing the Command Line Tools (softwareupdate, headless — memex-local builds from source)"
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then printf 'DRY-RUN: softwareupdate -i "<newest Command Line Tools label>"\n'; return 0; fi
+  touch "$flag"
+  label="$(softwareupdate -l 2>/dev/null | sed -n 's/^[[:space:]]*\* Label: \(Command Line Tools.*\)$/\1/p' | sort -V | tail -1)"
+  if [ -z "$label" ]; then rm -f "$flag"; log "developer tools: FAILED — softwareupdate offers no Command Line Tools (retried next run)"; return 1; fi
+  local out; out="$(softwareupdate -i "$label" 2>&1)"
+  rm -f "$flag"
+  if ! devtools_present; then
+    log "developer tools: FAILED to install '$label' (retried next run) — softwareupdate said:"
+    printf '%s\n' "$out" | tail -5 | while IFS= read -r l; do log "developer tools:   $l"; done
+    return 1
+  fi
+  log "developer tools: installed '$label'"
+}
+
 step_tools() {
   local user="$1" missing=() t
   for t in "${BREW_TOOLS[@]}"; do [ -x "$BREW_PREFIX/bin/$t" ] || missing+=("$t"); done
@@ -212,10 +245,31 @@ step_tailscaled() {
   run launchctl bootstrap system "$TAILSCALED_PLIST" || { log "tailscaled: FAILED to load the daemon"; return 1; }
 }
 
+# A default-path pre-auth key is taken into ROOT's hands before it is used: the directory entry is RENAMED into
+# the root-owned state directory (a rename moves a symlink as a symlink, never its target), validated THERE —
+# where the console user can no longer swap it — and made root's own. Only then is it read, by file reference.
+# Returns 1 (and removes it) when it is not a regular file the console user owned.
+take_preauth_key() {
+  local src="$1" held="$2" user="$3"
+  [ -e "$src" ] || [ -L "$src" ] || return 0
+  run mv -f "$src" "$held" || { log "network: FAILED to take the pre-auth key file"; return 1; }
+  [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] && return 0
+  if [ -L "$held" ] || [ ! -f "$held" ] || [ "$(stat -f%Su "$held" 2>/dev/null)" != "$user" ]; then
+    rm -f "$held"; log "network: REFUSED the pre-auth key file (not a regular file owned by $user) — removed"; return 1
+  fi
+  chown root:wheel "$held" 2>/dev/null || true; chmod 600 "$held"
+}
+
 step_network() {
-  local machine="$1" ts=("$TS_DIR/bin/tailscale" --socket="$TAILSCALED_SOCKET")
+  local machine="$1" user="${2:-}" ts=("$TS_DIR/bin/tailscale" --socket="$TAILSCALED_SOCKET")
   if "${ts[@]}" status >/dev/null 2>&1; then log "network: joined"; return 0; fi
-  local key_file="${FLEET_PREAUTH_KEY_FILE:-}" login; login="$(setting FLEET_LOGIN_SERVER LoginServer)"
+  local held="$TAILSCALED_STATE_DIR/preauth.key" key_file="" login; login="$(setting FLEET_LOGIN_SERVER LoginServer)"
+  if [ -n "${FLEET_PREAUTH_KEY_FILE:-}" ]; then key_file="$FLEET_PREAUTH_KEY_FILE"
+  else
+    # Intune sets no environment: the key is dropped at ~<console user>/.memex-local/enrol/<machine>.preauth
+    [ -n "$user" ] && { take_preauth_key "$(user_home "$user")/.memex-local/enrol/$machine.preauth" "$held" "$user" || return 1; }
+    [ -f "$held" ] && key_file="$held"
+  fi
   if [ -z "$key_file" ] || [ ! -f "$key_file" ] || [ -z "$login" ]; then
     log "network: WAITING for a single-use pre-auth key and the login server (control mints the key at enrolment — Hosting/MacStudioFleet §2b.1 target 2)"
     return 0
@@ -304,10 +358,11 @@ main() {
   machine="$(machine_id)"
   log "run for console user $user, machine $machine"
   step_homebrew "$user" || failed=1
+  [ "$failed" = 0 ] && { step_devtools || failed=1; }
   [ "$failed" = 0 ] && { step_tools "$user" || failed=1; }
   [ "$failed" = 0 ] && { step_tailscale_binaries || failed=1; }
   [ "$failed" = 0 ] && { step_tailscaled || failed=1; }
-  [ "$failed" = 0 ] && { step_network "$machine" || failed=1; }
+  [ "$failed" = 0 ] && { step_network "$machine" "$user" || failed=1; }
   [ "$failed" = 0 ] && { step_memex "$user" "$machine" || failed=1; }
   [ "$failed" = 0 ] && log "done (everything this run could do)" || log "a step FAILED — the next run retries from it"
   exit "$failed"
