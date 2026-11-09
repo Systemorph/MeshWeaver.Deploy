@@ -43,7 +43,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.4.1"
+readonly FLEET_BOOTSTRAP_VERSION="1.4.2"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -51,7 +51,7 @@ readonly TAILSCALED_SOCKET="${FLEET_TAILSCALED_SOCKET:-/var/run/tailscaled.socke
 readonly TAILSCALED_STATE_DIR="${FLEET_TAILSCALED_STATE_DIR:-/var/lib/tailscale}"
 readonly LOG_DIR="${FLEET_LOG_DIR:-/Library/Logs/MeshWeaver}"
 readonly MANAGED_PREFS="${FLEET_MANAGED_PREFS:-/Library/Managed Preferences/com.memex.local}"
-readonly BREW_TOOLS=(colima docker kubectl helm ollama)
+readonly BREW_TOOLS=(colima docker kubectl helm ollama lego)   # lego: memex-local cert issue (the internal name's certificate, DNS-01)
 # 🚨 What runs AS ROOT never comes from the Homebrew tree, which the console user owns (they could replace the
 # binary and run code as root at the next boot). tailscale/tailscaled are fetched BY ROOT from Homebrew's bottle
 # (the formula API names the URL and its sha256, verified here), into a root-owned directory under /Library.
