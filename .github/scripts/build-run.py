@@ -1063,7 +1063,8 @@ class ModuleHubBroker:
         # a hand-over that failed HERE (the upload refused, a link in the output, the tar) is named with the server's answer —
         # the server records it as the step's error, but the stage's warning read only "failed — the head stays at the last
         # good step" and twenty modules lost their reuse with no reason in the run's log (2026-11-08)
-        why = server_why if body["succeeded"] or not done.get("succeeded") else f"{body.get('error')}; the hub recorded: {server_why}"
+        why = (server_why if body["succeeded"] or not done.get("succeeded")
+               else f"{body.get('error') or 'the hand-over failed with no local reason recorded'}; the hub recorded: {server_why}")
         return {"accepted": accepted, "succeeded": accepted and body["succeeded"], "why": why, "outputHash": body.get("outputHash")}
 
     def release_open_grants(self, why: str) -> None:
@@ -6823,7 +6824,6 @@ def self_test() -> int:
         puts_ = [c[3] for c in api_g.calls if c[0] == "PUT"]
         check("modhub/the output upload names its LEASE (holder, granted seq, fingerprint) — control accepts it only from the live holder",
               puts_ == [{"holder": br.host, "seq": "4", "fingerprint": fp4["B"]}], puts_)
-        import gzip as _gz
         check("modhub/the broker hands the output over gzip-compressed", uploaded[put_path][:2] == b"\x1f\x8b", uploaded[put_path][:4])
         # an upload the ingress refuses (a bare 413, no body): the stage's warning names THAT, not only the hub's verdict
         br413, _ = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Grant", "step": {"seq": 9}})],
