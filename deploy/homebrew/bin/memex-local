@@ -1995,17 +1995,23 @@ fleet_participation() {
   accept_summary
 }
 
-# The answers as the flags `backlease enroll` takes, so it asks nothing again.
-fleet_accept_args() {
+# The answers as ONE argv word per flag, into the global array FLEET_ACCEPT_ARGV — never through an unquoted
+# substitution: a pattern list ("control.example.test *.example.test") is one word, never split, never globbed.
+# $1 = first-attach: only the flags first-attach.sh takes (it has no --job-channels/--job-repos).
+FLEET_ACCEPT_ARGV=()
+fleet_accept_argv() {
+  FLEET_ACCEPT_ARGV=()
   if [ "$ACC_JOBS_ENABLED" = true ]; then
-    printf '%s\n' "--accept-jobs=$ACC_JOBS_FROM"
-    [ -z "$ACC_JOBS_CHANNELS" ] || printf '%s\n' "--job-channels=$ACC_JOBS_CHANNELS"
-    [ -z "$ACC_JOBS_REPOS" ] || printf '%s\n' "--job-repos=$ACC_JOBS_REPOS"
-  else printf '%s\n' --no-accept-jobs; fi
+    FLEET_ACCEPT_ARGV+=("--accept-jobs=$ACC_JOBS_FROM")
+    if [ "${1:-}" != first-attach ]; then
+      [ -z "$ACC_JOBS_CHANNELS" ] || FLEET_ACCEPT_ARGV+=("--job-channels=$ACC_JOBS_CHANNELS")
+      [ -z "$ACC_JOBS_REPOS" ] || FLEET_ACCEPT_ARGV+=("--job-repos=$ACC_JOBS_REPOS")
+    fi
+  else FLEET_ACCEPT_ARGV+=(--no-accept-jobs); fi
   if [ "$ACC_TOK_ENABLED" = true ]; then
-    printf '%s\n' "--accept-tokens=$ACC_TOK_FROM" "--token-models=$ACC_TOK_MODELS"
-    [ -z "$ACC_TOK_RES" ] || printf '%s\n' "--residency=$ACC_TOK_RES"
-  else printf '%s\n' --no-accept-tokens; fi
+    FLEET_ACCEPT_ARGV+=("--accept-tokens=$ACC_TOK_FROM" "--token-models=$ACC_TOK_MODELS")
+    [ -z "$ACC_TOK_RES" ] || FLEET_ACCEPT_ARGV+=("--residency=$ACC_TOK_RES")
+  else FLEET_ACCEPT_ARGV+=(--no-accept-tokens); fi
 }
 
 # The v2 request (MachineEnrolment.Parse): the v1 facts, the owner and both answers, base64url.
@@ -2156,11 +2162,16 @@ fleet_apply_buildhost() {
   fa="${MEMEX_FIRST_ATTACH:-$(resolve_share)/backlease/first-attach.sh}"
   [ -f "$fa" ] || { warn "build host: first-attach.sh is not installed ($fa) — skipped"; return 0; }
   secrets="$dir/build"; mkdir -p "$secrets"; chmod 700 "$secrets"
-  ( umask 077; cp "$dir/w" "$secrets/worker"; cp "$dir/p" "$secrets/pull"; [ ! -s "$dir/k" ] || cp "$dir/k" "$secrets/instance-key" )
+  # the registry key and the registry URL go TOGETHER (first-attach's pass-both-or-neither): a key without the URL is left
+  # out, so the attach degrades to the plain contract instead of failing
+  ( umask 077; cp "$dir/w" "$secrets/worker"; cp "$dir/p" "$secrets/pull"; if [ -s "$dir/k" ] && [ -n "$preg" ]; then cp "$dir/k" "$secrets/instance-key"; fi )
   local args=(--api "$api" --registry "$reg" --pull-user "$puser" --secrets-from "$secrets" --set-from latest)
-  [ -s "$dir/k" ] && [ -n "$preg" ] && args+=(--plugins-registry "$preg")
-  # shellcheck disable=SC2046
-  ( bash "$fa" ${args[@]+"${args[@]}"} $(fleet_accept_args | grep -v -- "^--job-") ) && ok "build host attached (first-attach, values from the code)" \
+  if [ -s "$dir/k" ] && [ -n "$preg" ]; then args+=(--plugins-registry "$preg"); fi
+  if [ -s "$dir/k" ] && [ -z "$preg" ]; then
+    warn "build host: the code carries a registry key but no pluginsRegistry fact — the key is left out and the host attaches with the plain plugins contract (declare Hosting:Enrolment:Facts:pluginsRegistry on control)"
+  fi
+  fleet_accept_argv first-attach
+  ( bash "$fa" ${args[@]+"${args[@]}"} ${FLEET_ACCEPT_ARGV[@]+"${FLEET_ACCEPT_ARGV[@]}"} ) && ok "build host attached (first-attach, values from the code)" \
     || warn "build host: first-attach failed — re-run 'memex-local fleet join' or first-attach.sh by hand"
 }
 
@@ -2279,8 +2290,8 @@ cmd_fleet() {
 
       step "Back-lease, local models and the image (steps 5)"
       if registry_mode; then
-        # shellcheck disable=SC2046
-        cmd_backlease enroll --control "$control" --deployment "$id" $(fleet_accept_args)
+        fleet_accept_argv
+        cmd_backlease enroll --control "$control" --deployment "$id" ${FLEET_ACCEPT_ARGV[@]+"${FLEET_ACCEPT_ARGV[@]}"}
       else
         warn "not in REGISTRY MODE — run 'memex-local registry <url>' and then 'memex-local backlease enroll --control $control --deployment $id'"
       fi

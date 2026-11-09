@@ -1743,6 +1743,17 @@ OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home5" MEMEX_LOCAL_HOME="$FJ/home5/.mem
 case "$RC:$OUT" in 0:*|3:*) bad "a refused join stops" "rc=$RC" ;; *"REFUSED this join: superseded by a later approval"*) ok "a refused join stops, naming control's reason" ;; *) bad "refused join" "rc=$RC $OUT" ;; esac
 grep -q 'drop="$FLEET_DIR/fleet-ca.key"' "$CLI" && grep -q '( cmd_ca adopt --sha256 "$sha" )' "$CLI" \
   && ok "item a takes the ONE §6 path: the 0600 drop enrol/fleet-ca.key, then ca adopt --sha256 <caCertSha256> (the bootstrap adopts the same drop if this fails)" || bad "ca adopt path" "missing"
+# The owner's answers reach backlease enroll and first-attach as ONE argv word per flag — a multi-pattern list is never
+# split or globbed (executed, in a directory holding a file a glob would match).
+mkdir -p "$FJ/globdir" && : > "$FJ/globdir/evil.example.test"
+ARGV="$(cd "$FJ/globdir" && fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="control.example.test *.example.test"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=false; fleet_accept_argv first-attach; printf "[%s]\n" "${FLEET_ACCEPT_ARGV[@]}"')"
+[ "$ARGV" = "$(printf '[--accept-jobs=control.example.test *.example.test]\n[--no-accept-tokens]')" ] \
+  && ok "first-attach gets the multi-pattern answer as one word, unsplit and unglobbed (no --job-* flags)" || bad "accept argv for first-attach" "$ARGV"
+ARGV="$(fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="a.example b.example"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=true; ACC_TOK_FROM="*.example.test"; ACC_TOK_MODELS="qwen3.6 qwen3.8:27b-mlx"; ACC_TOK_RES=CH; fleet_accept_argv; printf "[%s]\n" "${FLEET_ACCEPT_ARGV[@]}"')"
+[ "$(printf '%s\n' "$ARGV" | wc -l | tr -d ' ')" = 5 ] && printf '%s' "$ARGV" | grep -qx '\[--token-models=qwen3.6 qwen3.8:27b-mlx\]' \
+  && ok "backlease enroll gets every answer as one word per flag" || bad "accept argv for backlease" "$ARGV"
+grep -q 'if \[ -s "$dir/k" \] && \[ -n "$preg" \]; then cp "$dir/k"' "$CLI" && ok "a registry key without the registry URL is left out (first-attach stays pass-both-or-neither)" || bad "k without pluginsRegistry" "missing"
+! grep -q 'SC2046' "$CLI" || bad "no unquoted accept substitution remains" "$(grep -n SC2046 "$CLI")"
 grep -q -- '--auth-key="file:$dir/t"' "$CLI" && ok "as root the pre-auth key goes to tailscale by FILE reference on the root daemon's socket" || bad "tailscale auth by file" "missing"
 grep -q 'cmd_internal on --tenant "$tenant" --client-id "$cid" < "$dir/e"' "$CLI" && grep -q '< "$dir/n" )' "$CLI" \
   && ok "the sign-in and DNS-01 secrets reach internal on / cert config on STDIN" || bad "secrets on stdin" "missing"
