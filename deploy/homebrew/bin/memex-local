@@ -38,11 +38,13 @@ set -euo pipefail
 memex_toolchain_path() {
   local self prefix dir
   self="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
-  case "$self" in
-    */Cellar/*) prefix="${self%%/Cellar/*}" ;;
-    */bin/*|*/libexec/*) prefix="$(cd "$(dirname "$self")/.." 2>/dev/null && pwd -P)" ;;
-  esac
-  for dir in ${prefix:+"$prefix/bin"} ${prefix:+"$prefix/sbin"} /usr/local/bin; do
+  # Only an installed keg (…/Cellar/memex-local/<v>/libexec/memex-local) names a Homebrew prefix; a source
+  # checkout and a Linux host are left exactly as they were (a CI runner's /usr/local/bin is not a Mac's).
+  case "$self" in */Cellar/*) prefix="${self%%/Cellar/*}" ;; esac
+  local extra=()
+  [ -n "${prefix:-}" ] && extra+=("$prefix/bin" "$prefix/sbin")
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] && extra+=(/usr/local/bin)
+  for dir in ${extra[@]+"${extra[@]}"}; do
     [ -d "$dir" ] || continue
     case ":$PATH:" in *":$dir:"*) ;; *) PATH="$PATH:$dir" ;; esac
   done

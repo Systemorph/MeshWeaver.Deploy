@@ -2728,10 +2728,17 @@ for cmd in up down status setup logs update registry verify port-forward observa
 done
 
 echo "── the toolchain is found from the install, not the caller's PATH ──"
-TP="$(env -i HOME="$HOME" PATH=/usr/bin:/bin MEMEX_LOCAL_LIB=1 bash -c '. "$0"; memex_toolchain_path; printf "%s" "$PATH"' "$CLI" 2>/dev/null)"
-case ":$TP:" in *":$(cd "$(dirname "$CLI")" && pwd -P):"*) ok "a shell without Homebrew on PATH still gets the install's bin/ (memex-local setup finds kubectl)" ;; *) bad "toolchain PATH from the install" "$TP" ;; esac
-TP2="$(env -i HOME="$HOME" PATH="$(cd "$(dirname "$CLI")" && pwd -P):/usr/bin:/bin" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; memex_toolchain_path; memex_toolchain_path; printf "%s" "$PATH"' "$CLI" 2>/dev/null)"
-[ "$(printf '%s' "$TP2" | tr ':' '\n' | grep -cx "$(cd "$(dirname "$CLI")" && pwd -P)")" = "1" ] && ok "the install's bin/ is added once (idempotent)" || bad "toolchain PATH idempotent" "$TP2"
+KEG="$(mktemp -d)"; mkdir -p "$KEG/Cellar/memex-local/9.9.9/libexec" "$KEG/bin"; cp "$CLI" "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local"
+cp -R "$(dirname "$CLI")/../share" "$KEG/Cellar/memex-local/9.9.9/libexec/share" 2>/dev/null || true
+KB="$(cd "$KEG/bin" && pwd -P)"
+TP="$(env -i HOME="$HOME" PATH=/usr/bin:/bin MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(cd "$(dirname "$CLI")/../share" && pwd)" bash -c '. "$0"; memex_toolchain_path; printf "%s" "$PATH"' "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local" 2>/dev/null)"
+case ":$TP:" in *":$KB:"*) ok "an installed keg finds its Homebrew prefix's bin/ even from a shell without it on PATH (memex-local setup finds kubectl)" ;; *) bad "toolchain PATH from the keg" "$TP" ;; esac
+TP2="$(env -i HOME="$HOME" PATH="$KB:/usr/bin:/bin" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(cd "$(dirname "$CLI")/../share" && pwd)" bash -c '. "$0"; memex_toolchain_path; memex_toolchain_path; printf "%s" "$PATH"' "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local" 2>/dev/null)"
+[ "$(printf '%s' "$TP2" | tr ':' '\n' | grep -cx "$KB")" = "1" ] && ok "the prefix's bin/ is added once (idempotent), and a caller's PATH keeps its order" || bad "toolchain PATH idempotent" "$TP2"
+TP3="$(env -i HOME="$HOME" PATH=/usr/bin:/bin MEMEX_LOCAL_LIB=1 bash -c '. "$0"; memex_toolchain_path; printf "%s" "$PATH"' "$CLI" 2>/dev/null)"
+want="/usr/bin:/bin"; [ "$(uname -s)" = Darwin ] && [ -d /usr/local/bin ] && want="$want:/usr/local/bin"
+[ "$TP3" = "$want" ] && ok "a source checkout gets no prefix (only a Mac's /usr/local/bin): the test stubs and a Linux runner are untouched" || bad "checkout PATH unchanged" "$TP3"
+rm -rf "$KEG"
 grep -q 'need kubectl kubernetes-cli' <(sed -n '/^cmd_setup() {/,/^}/p' "$CLI") && grep -q 'could not read the portal log with kubectl' "$CLI" \
   && ok "setup resolves kubectl and FAILS naming it — never an empty token" || bad "setup kubectl loud" "missing"
 ! grep -q 'Password=\${pg_pw}' "$CLI" && grep -q 'Password=<memex_postgres_password in' "$CLI" \
