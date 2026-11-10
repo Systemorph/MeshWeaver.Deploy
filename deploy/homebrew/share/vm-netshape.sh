@@ -16,8 +16,13 @@
 #   • DSCP CS1 — every internet-bound packet is marked low-priority (lower effort), so a router or Wi-Fi access point
 #               that honours DSCP (WMM maps CS1 to the background access category) deprioritises it as well
 #
-# The rates come from a declared SHARE of the measured link: `--measure` runs macOS `networkQuality` ONCE (it saturates
-# the line for ~20 s) and records the uplink and downlink; the cap is MEMEX_NET_SHARE_PCT (default 25) percent of each.
+# The rates come from a declared SHARE of the measured link: `--measure` runs macOS `networkQuality` per DIRECTION,
+# MEMEX_NET_SAMPLES (default 3) times each (it saturates the line ~15 s per run), takes the MEDIAN of each direction,
+# logs the raw samples, and records the uplink and downlink; the cap is MEMEX_NET_SHARE_PCT (default 25) percent of
+# each, never below MEMEX_NET_MIN_KBIT (default 2000) — so a bad probe can never throttle the line to a trickle.
+# Measured 2026-11-10 on the second Mac Studio: ONE combined sequential run (`-s -M 25`) recorded 370 kbit/s up and
+# 237972 kbit/s down on a symmetric fibre line, and the 256 kbit floor of the time capped its uploads at 256 kbit/s. A
+# recorded uplink under 1/50 of the downlink is no real line's shape, so such a record is re-measured, not reused.
 # The owner overrides either rate (MEMEX_NET_UP_KBIT / MEMEX_NET_DOWN_KBIT; 0 = no cap in that direction, the DSCP
 # marking stays). Everything is recorded in ~/.memex-local/netshape-<profile>.env and persisted INSIDE the VM as a
 # systemd unit (mw-netshape.service), so it survives a VM restart.
@@ -39,6 +44,13 @@ SHARE_PCT_DEFAULT=25
 # Used when nothing is declared and the link cannot be measured: a typical home DSL/cable uplink is 5–20 Mbit/s.
 FALLBACK_UP_KBIT=4000
 FALLBACK_DOWN_KBIT=40000
+# The least a cap DERIVED from a measurement may be, each direction (a declared rate is the owner's and is not raised).
+MIN_CAP_KBIT_DEFAULT=2000
+# networkQuality runs per direction, and how long each may take (seconds).
+SAMPLES_DEFAULT=3
+SAMPLE_MAX_S=15
+# An uplink under 1/ASYMMETRY_MAX of the downlink is not a real line (ADSL is ~1:16, DOCSIS ~1:20): a bad probe.
+ASYMMETRY_MAX=50
 UNIT=mw-netshape
 DSCP_CLASS=CS1
 
@@ -57,31 +69,62 @@ whole() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
 
 # The caps, pure: uplink kbit, downlink kbit (0 = unknown), share percent, explicit up, explicit down (empty =
 # not declared). Prints "<up kbit> <down kbit>". A declared rate wins; otherwise share × measured link, never below
-# 256 kbit (a cap that small would starve git's keepalives); an unknown link takes the fallback.
+# MEMEX_NET_MIN_KBIT (default 2000 — a bad measurement must not throttle the line to a trickle); an unknown link
+# takes the fallback.
 caps() {
-  local link_up="$1" link_down="$2" share="$3" up="$4" down="$5"
+  local link_up="$1" link_down="$2" share="$3" up="$4" down="$5" min="${MEMEX_NET_MIN_KBIT:-$MIN_CAP_KBIT_DEFAULT}"
   if ! whole "$up"; then
     if whole "$link_up" && [ "$link_up" -gt 0 ]; then up=$(( link_up * share / 100 )); else up=$FALLBACK_UP_KBIT; fi
-    [ "$up" -ge 256 ] || up=256
+    [ "$up" -ge "$min" ] || up=$min
   fi
   if ! whole "$down"; then
     if whole "$link_down" && [ "$link_down" -gt 0 ]; then down=$(( link_down * share / 100 )); else down=$FALLBACK_DOWN_KBIT; fi
-    [ "$down" -ge 256 ] || down=256
+    [ "$down" -ge "$min" ] || down=$min
   fi
   printf '%s %s' "$up" "$down"
 }
 
-# Measure the link once with macOS networkQuality (sequential, so upload and download are measured separately;
-# capped at 25 s). Prints "<up kbit> <down kbit>", or nothing when networkQuality is absent or fails.
-measure_link() {
-  command -v networkQuality >/dev/null 2>&1 || return 0
-  networkQuality -s -c -M 25 2>/dev/null | python3 -c '
+# One networkQuality run in ONE direction ($1 = up | down): the whole run budget goes to that direction, never shared
+# with the other. Prints whole kbit/s, or nothing when the run fails or reports no throughput.
+measure_once() {
+  local flag key
+  if [ "$1" = up ]; then flag=-d; key=ul_throughput; else flag=-u; key=dl_throughput; fi
+  networkQuality -c "$flag" -M "${MEMEX_NET_SAMPLE_MAX_S:-$SAMPLE_MAX_S}" 2>/dev/null | python3 -c '
 import json, sys
 try:
-    d = json.load(sys.stdin)
-    print(int(d["ul_throughput"] / 1000), int(d["dl_throughput"] / 1000))
+    v = int(json.load(sys.stdin)[sys.argv[1]] / 1000)
+    if v > 0: print(v)
 except Exception:
-    pass'
+    pass' "$key"
+}
+
+# The median of whole numbers (the lower-middle mean for an even count); nothing for none.
+median() { printf '%s\n' "$@" | grep -E '^[0-9]+$' | sort -n | awk '{ a[NR] = $1 } END { if (NR == 0) exit; if (NR % 2) print a[(NR + 1) / 2]; else print int((a[NR / 2] + a[NR / 2 + 1]) / 2) }'; }
+
+# 0 when an uplink/downlink pair is a plausible line (both > 0 and the uplink at least 1/ASYMMETRY_MAX of the downlink).
+plausible_link() { whole "$1" && whole "$2" && [ "$1" -gt 0 ] && [ "$2" -gt 0 ] && [ $(( $1 * ASYMMETRY_MAX )) -ge "$2" ]; }
+
+# Measure the link with macOS networkQuality: MEMEX_NET_SAMPLES runs per direction, the median of each. Logs the raw
+# samples on stderr (and keeps them for the record's comment). Prints "<up kbit> <down kbit>", or nothing when
+# networkQuality is absent or no run in some direction answered.
+measure_link() {
+  command -v networkQuality >/dev/null 2>&1 || return 0
+  local n="${MEMEX_NET_SAMPLES:-$SAMPLES_DEFAULT}" i=0 v ups="" downs="" mu md
+  whole "$n" && [ "$n" -ge 1 ] || n=$SAMPLES_DEFAULT
+  while [ "$i" -lt "$n" ]; do
+    i=$(( i + 1 ))
+    v="$(measure_once up)"; whole "$v" && ups="$ups $v"
+    v="$(measure_once down)"; whole "$v" && downs="$downs $v"
+  done
+  # shellcheck disable=SC2086 # word-splitting the sample lists is the point
+  mu="$(median $ups)"; md="$(median $downs)"
+  MEASURE_NOTE="networkQuality samples (kbit/s, ${n} per direction): up${ups:- none} -> median ${mu:-none}; down${downs:- none} -> median ${md:-none}"
+  echo "$MEASURE_NOTE" >&2
+  mkdir -p "$LOCAL_HOME" && printf '%s\n' "$MEASURE_NOTE" > "$LOCAL_HOME/.netshape-last-measure"
+  [ -n "$mu" ] && [ -n "$md" ] || return 0
+  plausible_link "$mu" "$md" \
+    || echo "WARN: the measured uplink ${mu} kbit/s is under 1/${ASYMMETRY_MAX} of the downlink ${md} kbit/s — no real line has that shape; the cap is held at no less than ${MEMEX_NET_MIN_KBIT:-$MIN_CAP_KBIT_DEFAULT} kbit/s. Declare MEMEX_NET_UP_KBIT if the uplink really is that small, or 'memex-local net measure' again." >&2
+  printf '%s %s' "$mu" "$md"
 }
 
 # The script that runs INSIDE the VM as root (mw-netshape apply|stop). POSIX sh; the rates are baked in.
@@ -178,6 +221,8 @@ write_config() {
   f="$(config_file)"; mkdir -p "$LOCAL_HOME"
   {
     printf '# written by vm-netshape.sh (memex-local net); the link was measured once — "memex-local net measure" re-measures\n'
+    # the raw samples of the measurement this record came from (written by measure_link), when one ran just now
+    [ -f "$LOCAL_HOME/.netshape-last-measure" ] && sed 's/^/# /' "$LOCAL_HOME/.netshape-last-measure" && rm -f "$LOCAL_HOME/.netshape-last-measure"
     # A failed measurement (0 0) is NOT a reading and is not recorded: recording it would make every later apply
     # return 0/0 before it looked at another profile's record or measured again.
     if whole "$link_up" && [ "$link_up" -gt 0 ]; then
@@ -192,22 +237,27 @@ write_config() {
 }
 
 # The link: the profile's record, else any other profile's record on this Mac (one uplink), else one measurement.
+# An IMPLAUSIBLE record (plausible_link: an uplink under 1/ASYMMETRY_MAX of the downlink — what one bad probe recorded)
+# is not reused: it is said, and the link is measured again.
 link_rates() {
   local f lu ld
   # (a 0/0 record written before failed measurements stopped being recorded reads as no record)
   if whole "${MEMEX_NET_LINK_UP_KBIT:-}" && whole "${MEMEX_NET_LINK_DOWN_KBIT:-}" && [ "${MEMEX_NET_LINK_UP_KBIT}" -gt 0 ] \
     && [ "${1:-}" != remeasure ]; then
-    printf '%s %s' "$MEMEX_NET_LINK_UP_KBIT" "$MEMEX_NET_LINK_DOWN_KBIT"; return 0
+    if plausible_link "$MEMEX_NET_LINK_UP_KBIT" "$MEMEX_NET_LINK_DOWN_KBIT"; then
+      printf '%s %s' "$MEMEX_NET_LINK_UP_KBIT" "$MEMEX_NET_LINK_DOWN_KBIT"; return 0
+    fi
+    echo "the recorded link (${MEMEX_NET_LINK_UP_KBIT} kbit/s up, ${MEMEX_NET_LINK_DOWN_KBIT} kbit/s down) is implausible — measuring again" >&2
   fi
   if [ "${1:-}" != remeasure ]; then
     for f in "$LOCAL_HOME"/netshape-*.env; do
       [ -f "$f" ] || continue
       lu="$(sed -n 's/.*MEMEX_NET_LINK_UP_KBIT=\([0-9]*\)$/\1/p' "$f")"; ld="$(sed -n 's/.*MEMEX_NET_LINK_DOWN_KBIT=\([0-9]*\)$/\1/p' "$f")"
-      if whole "$lu" && whole "$ld" && [ "$lu" -gt 0 ]; then printf '%s %s' "$lu" "$ld"; return 0; fi
+      if plausible_link "$lu" "$ld"; then printf '%s %s' "$lu" "$ld"; return 0; fi
     done
   fi
   [ "${MEMEX_NET_NO_MEASURE:-}" = 1 ] && { printf '0 0'; return 0; }
-  echo "measuring the link once with networkQuality (about 20 s; it fills the line while it runs)…" >&2
+  echo "measuring the link with networkQuality: ${MEMEX_NET_SAMPLES:-$SAMPLES_DEFAULT} runs per direction, up to ${MEMEX_NET_SAMPLE_MAX_S:-$SAMPLE_MAX_S} s each (it fills the line while it runs)…" >&2
   local m; m="$(measure_link)"
   [ -n "$m" ] && { printf '%s' "$m"; return 0; }
   echo "WARN: networkQuality could not measure the link — using the fallback caps (${FALLBACK_UP_KBIT}/${FALLBACK_DOWN_KBIT} kbit/s); declare MEMEX_NET_UP_KBIT / MEMEX_NET_DOWN_KBIT to set them" >&2
@@ -260,7 +310,7 @@ while [ $# -gt 0 ]; do
   esac; shift
 done
 [[ "$PROFILE" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "ERROR: --profile must be a Colima profile name" >&2; exit 2; }
-for v in MEMEX_NET_UP_KBIT MEMEX_NET_DOWN_KBIT MEMEX_NET_SHARE_PCT; do
+for v in MEMEX_NET_UP_KBIT MEMEX_NET_DOWN_KBIT MEMEX_NET_SHARE_PCT MEMEX_NET_MIN_KBIT MEMEX_NET_SAMPLES MEMEX_NET_SAMPLE_MAX_S; do
   [ -z "${!v:-}" ] || whole "${!v}" || { echo "ERROR: $v must be a whole number (got '${!v}')" >&2; exit 2; }
 done
 load_config
