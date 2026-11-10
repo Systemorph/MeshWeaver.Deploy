@@ -692,7 +692,7 @@ cmd_registry() {
         ok "REGISTRY MODE — this install consumes $(registry_url)"
         info "instance id:   $(registry_instance_id)"
         if registry_has_key; then
-          info "registration:  with bootstrap key $(awk '/PluginCatalog__BootstrapKey:/ { gsub(/"/, "", $2); print substr($2, 1, 8) "…" ; exit }' "$REGISTRY_FILE") (presented once on first boot; never printed)"
+          info "registration:  with bootstrap key $(awk '/PluginCatalog__BootstrapKey:/ { gsub(/"/, "", $2); print substr($2, 1, 8) "…" ; exit }' "$REGISTRY_FILE") (presented once: it registers the install on its plan, or — already registered — raises the plan to it; never printed)"
         else
           info "registration:  OPEN — no key; the registry enrols this install into its default plan"
           info "               (the free tier on memex.meshweaver.cloud). A platform admin there raises it."
@@ -2135,6 +2135,39 @@ fleet_apply_cert() {
   ( cmd_cert issue ) && ok "certificate: issued for $id.net.$domain" || warn "certificate: 'cert issue' failed — re-run 'memex-local cert issue'"
 }
 
+# The registry-plan coupon (item r): a single-use registration key the enrolment minted for the fleet's plan at this
+# install's plugin registry. It is written as the registry file's PluginCatalog:BootstrapKey (0600, never printed), so the
+# portal's next boot presents it: a portal not registered yet registers ON that plan, and one that registered OPEN (free —
+# every fleet Mac does, at install time) redeems it as an UPGRADE (core Doc/Architecture/PluginRegistry → "A key raises a
+# registered instance's plan"). Before this, a global administrator raised every enrolled Mac's plan by hand.
+fleet_apply_registry_key() {
+  local dir="$1" key url
+  [ -s "$dir/r" ] || { info "registry plan: no coupon in the code — the plan stays what the registry gave this install"; return 0; }
+  key="$(tr -d ' \n\r' < "$dir/r")"
+  case "$key" in
+    mwr_*) ;;
+    *) warn "registry plan: item r is not a registration key (mwr_…) — ignored; the plan stays as it is"; return 0 ;;
+  esac
+  if ! registry_mode; then
+    warn "registry plan: this install is not in REGISTRY MODE — the coupon is not kept. Run 'memex-local registry <url>' and join again"
+    return 0
+  fi
+  url="$(registry_url)"
+  # A key already in the file is REPLACED, deliberately: the enrolment's coupon is the plan control declares for the
+  # fleet. Nothing is lost by it — a key the portal already presented is recorded on its stored credential, and a
+  # redemption never LOWERS a plan (a lower coupon is refused by the registry, plan unchanged). Said, never silent.
+  local held fp
+  held="$(awk '$1 == "PluginCatalog__BootstrapKey:" { gsub(/"/, "", $2); print $2; exit }' "$REGISTRY_FILE" 2>/dev/null)"
+  fp="$(fleet_value_fingerprint "$key")"
+  if [ -n "$held" ] && [ "$held" != "$key" ]; then
+    warn "registry plan: replacing the registration key already in $REGISTRY_FILE ($(fleet_value_fingerprint "$held")) with the enrolment's coupon — a coupon never lowers the plan the registry holds for this install"
+  fi
+  unset held
+  write_registry_file "$url" "$key" "$(registry_instance_id)"
+  unset key
+  ok "registry plan: the enrolment's coupon is this install's registration key ($fp) — the portal presents it on its next boot (registers on, or redeems itself up to, the fleet's plan)"
+}
+
 # The fleet CA (item a) — ONE path, the onboarding contract's §6 drop: the opened key goes to enrol/fleet-ca.key (0600)
 # and `ca adopt --sha256 <caCertSha256>` reads it from there (refusing a key that is not the declared certificate's) and
 # deletes the drop. If the adopt cannot finish now, the drop stays and the device bootstrap adopts it on its next run by
@@ -2389,6 +2422,7 @@ cmd_fleet() {
         fleet_apply_signin "$items"
         fleet_apply_cert "$id" "$items" "$owner_email"
         fleet_apply_ca "$items" "$(fleet_fact_of "$items" caCertSha256)"
+        fleet_apply_registry_key "$items"
       fi
       rm -f "$key"
 

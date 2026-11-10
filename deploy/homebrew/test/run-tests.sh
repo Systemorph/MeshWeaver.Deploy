@@ -3091,6 +3091,50 @@ env SETUP_NAME=studio-2 SETUP_COMPANY=Acme SETUP_OWNER_NAME="Jane Roe" SETUP_OWN
 grep -q 'X-Setup-Token: %s' "$CLI" && ! grep -qE 'curl[^\n]*X-Setup-Token: \$' "$CLI" && ok "the setup token travels in a 0600 header file, never on a command line" || bad "token header file" "missing"
 rm -rf "$SA"
 
+# fleet join: the enrolment's registry-plan coupon (item r) becomes this install's registration key — so its portal
+# registers on, or redeems itself up to, the fleet's plan without a global administrator raising it by hand.
+RK="$(mktemp -d)"; mkdir -p "$RK/home/.memex-local" "$RK/items"
+rk() { env HOME="$RK/home" MEMEX_LOCAL_HOME="$RK/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c ". \"$CLI\"; fleet_apply_registry_key \"\$0\"" "$RK/items" 2>&1; }
+rk_file() { cat "$RK/home/.memex-local/registry.yaml" 2>/dev/null; }
+rk_open() { env HOME="$RK/home" MEMEX_LOCAL_HOME="$RK/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c ". \"$CLI\"; write_registry_file \"\$0\" '' \"\$1\"" "$1" "$2"; }
+rk_open https://registry.example.test 595714be-0000-4000-8000-000000000001
+printf 'mwr_fleet-coupon-NEVER-PRINTED' > "$RK/items/r"
+RKO="$(rk)"
+rk_file | grep -q '^    PluginCatalog__BootstrapKey: "mwr_fleet-coupon-NEVER-PRINTED"$' \
+  && ok "fleet join: the coupon (item r) is written as the registry file's bootstrap key" || bad "coupon written" "$(rk_file)"
+rk_file | grep -q 'registryUrl: "https://registry.example.test"' && rk_file | grep -q 'instanceId: "595714be-0000-4000-8000-000000000001"' \
+  && ok "…keeping the registry URL and the pinned instance id" || bad "url and id kept" "$(rk_file)"
+[ "$(stat -f '%Lp' "$RK/home/.memex-local/registry.yaml" 2>/dev/null || stat -c '%a' "$RK/home/.memex-local/registry.yaml")" = "600" ] \
+  && ok "…in a 0600 file" || bad "registry file mode" "$(ls -l "$RK/home/.memex-local/registry.yaml")"
+case "$RKO" in *NEVER-PRINTED*|*mwr_*) bad "…and the coupon is never printed" "said: $RKO" ;; *"registry plan:"*sha256:*) ok "…and the coupon is never printed (a fingerprint only)" ;; *) bad "coupon fingerprint said" "said: $RKO" ;; esac
+[ "$(printf '%s' "$RKO" | grep -o 'sha256:[0-9a-f]*')" = "$(printf 'sha256:%s' "$(printf '%s' 'mwr_fleet-coupon-NEVER-PRINTED' | shasum -a 256 | cut -c1-12)")" ] \
+  && ok "…and the fingerprint said is the one of the key written" || bad "fingerprint of the written key" "said: $RKO"
+printf '  mwr_fleet-coupon-NEVER-PRINTED \n' > "$RK/items/r"; RKO="$(rk)"
+rk_file | grep -q '^    PluginCatalog__BootstrapKey: "mwr_fleet-coupon-NEVER-PRINTED"$' \
+  && [ "$(printf '%s' "$RKO" | grep -o 'sha256:[0-9a-f]*' | tail -n1)" = "$(printf 'sha256:%s' "$(printf '%s' 'mwr_fleet-coupon-NEVER-PRINTED' | shasum -a 256 | cut -c1-12)")" ] \
+  && ok "fleet join: a padded drop is trimmed, and the fingerprint is of the trimmed key" || bad "trimmed key" "$RKO / $(rk_file)"
+env HOME="$RK/home" MEMEX_LOCAL_HOME="$RK/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c ". \"$CLI\"; write_registry_file https://registry.example.test mwr_older-key-NEVER-PRINTED ''"
+printf 'mwr_fleet-coupon-NEVER-PRINTED' > "$RK/items/r"; RKO="$(rk)"
+rk_file | grep -q 'BootstrapKey: "mwr_fleet-coupon-NEVER-PRINTED"' && case "$RKO" in *"replacing the registration key already in"*) true ;; *) false ;; esac \
+  && case "$RKO" in *NEVER-PRINTED*|*mwr_*) false ;; *) true ;; esac \
+  && ok "fleet join: a key already in the file is replaced by the coupon, and that is SAID (fingerprints only)" || bad "replace said" "$RKO / $(rk_file)"
+RKO="$(rk)"
+case "$RKO" in *"replacing"*) bad "re-applying the same coupon is silent" "said: $RKO" ;; *) ok "…while re-applying the same coupon says nothing about replacing" ;; esac
+rk_open https://registry.example.test ""
+RKO="$(rk)"
+rk_file | grep -q 'PluginCatalog__BootstrapKey: "mwr_' && ! rk_file | grep -q 'instanceId:' \
+  && ok "fleet join: with no pinned id the wizard's id stays in charge (no id is invented)" || bad "no id invented" "$(rk_file)"
+rk_open https://registry.example.test ""; rm -f "$RK/items/r"; RKO="$(rk)"
+! rk_file | grep -q 'BootstrapKey' && case "$RKO" in *"no coupon in the code"*) true ;; *) false ;; esac \
+  && ok "fleet join: a code without item r leaves the registry file as it was, and says so" || bad "no r" "$RKO / $(rk_file)"
+printf 'mwi_not-a-registration-key' > "$RK/items/r"; RKO="$(rk)"
+! rk_file | grep -q 'BootstrapKey' && case "$RKO" in *"not a registration key"*) true ;; *) false ;; esac \
+  && ok "fleet join: an item r that is not mwr_ is refused and nothing is written" || bad "non-mwr r" "$RKO / $(rk_file)"
+rm -f "$RK/home/.memex-local/registry.yaml"; printf 'mwr_fleet-coupon-NEVER-PRINTED' > "$RK/items/r"; RKO="$(rk)"
+[ ! -e "$RK/home/.memex-local/registry.yaml" ] && case "$RKO" in *"not in REGISTRY MODE"*) true ;; *) false ;; esac \
+  && ok "fleet join: outside registry mode the coupon is not kept, and that is said" || bad "not registry mode" "$RKO"
+grep -q '        fleet_apply_registry_key "$items"' "$CLI" && ok "fleet join applies the coupon with the other items" || bad "join applies r" "missing"
+rm -rf "$RK"
 echo "── kubelet's root on the portal VM's data disk (2026-11-10) ──────────"
 KR="$(mktemp -d)"; mkdir -p "$KR/stubs" "$KR/home/.memex-local" "$KR/colima/default"
 cat > "$KR/stubs/colima" <<'KEOF'

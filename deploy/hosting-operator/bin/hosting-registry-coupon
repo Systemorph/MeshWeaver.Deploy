@@ -2,6 +2,17 @@
 # hosting-registry-coupon --registry-url <https://registry> --vault <vault> --object <vault object>
 #                         --tier <plan> --description <text> --mint-secret <vault object>
 #                         [--expires-days <n>] [--max-usages <n>]
+# hosting-registry-coupon --registry-url <https://registry> --vault <vault> --tier <plan> --description <text>
+#                         --mint-secret <vault object> --seal-to <base64 SPKI of an RSA-3072+ key> --item <x>
+#                         [--expires-days <n>] [--max-usages <n>]
+#
+# SEAL MODE (--seal-to/--item, no --object; Hosting/MacStudioFleet §2b, enrolment v2): the coupon is
+# minted exactly as below and then SEALED to an enrolling Mac's throw-away public key (RSA-OAEP-SHA256,
+# one block) instead of being stored — `::hosting:: sealed_item item=<x> …` is the only thing that
+# leaves, and nothing is written to any vault. The Mac writes it as its PluginCatalog:BootstrapKey: a
+# Mac not registered yet registers ON the coupon's plan, one that registered open (free) at install
+# time redeems it as an upgrade (core Doc/Architecture/PluginRegistry → "A key raises a registered
+# instance's plan"). The recipient key is checked BEFORE the mint credential is read.
 #
 # MINT a registration COUPON into Key Vault without anyone seeing it (Doc/Architecture/PluginRegistry
 # → "Coupons"). A coupon is a registration bootstrap key (`mwr_…`) that carries a PLAN, EXPIRES and
@@ -29,7 +40,7 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
 # shellcheck disable=SC2034  # read by hosting::die in _common.sh, which shellcheck does not follow here
 HOSTING_CMD="hosting-registry-coupon"
 
-registry="" vault="" object="" tier="" description="" mint_secret="" expires_days="30" max_usages="1"
+registry="" vault="" object="" tier="" description="" mint_secret="" expires_days="30" max_usages="1" seal_to="" item=""
 # A flag given LAST with no value must not spin: `shift 2` on one remaining argument shifts nothing,
 # so the loop would never end. Shift what is there; the empty value is then refused by need_flag.
 shift_value() { if [ $# -ge 2 ]; then shift_n=2; else shift_n=1; fi; }
@@ -44,19 +55,31 @@ while [ $# -gt 0 ]; do
     --mint-secret)  mint_secret="${2:-}";  shift_value "$@" ;;
     --expires-days) expires_days="${2:-}"; shift_value "$@" ;;
     --max-usages)   max_usages="${2:-}";   shift_value "$@" ;;
+    --seal-to)      seal_to="${2:-}";      shift_value "$@" ;;
+    --item)         item="${2:-}";         shift_value "$@" ;;
     *) hosting::die "unknown argument '$1'" ;;
   esac
   shift "$shift_n"
 done
 hosting::need_flag registry-url "$registry"
 hosting::need_flag vault "$vault"
-hosting::need_flag object "$object"
+# Seal mode names a recipient and an item and NO object; vault mode names an object and neither.
+sealing=false
+if [ -n "$seal_to" ] || [ -n "$item" ]; then
+  sealing=true
+  hosting::need_flag seal-to "$seal_to"
+  hosting::need_flag item "$item"
+  hosting::safe_item "$item"
+  [ -z "$object" ] || hosting::die "--object is refused beside --seal-to: a sealed coupon is stored nowhere"
+else
+  hosting::need_flag object "$object"
+fi
 hosting::need_flag tier "$tier"
 hosting::need_flag description "$description"
 hosting::need_flag mint-secret "$mint_secret"
 hosting::safe_url registry-url "$registry"
 hosting::safe_name vault "$vault"
-hosting::safe_name object "$object"
+[ "$sealing" = true ] || hosting::safe_name object "$object"
 hosting::safe_name mint-secret "$mint_secret"
 [[ "$tier" =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]] \
   || hosting::die "tier '${tier}' is not a plan id (lowercase letters, digits, hyphens) — the registry's tier ladder (Admin/Tiers/*) names plans that way"
@@ -77,7 +100,20 @@ kv_exists() {
   return "$rc"
 }
 
-if kv_exists "$object"; then
+if [ "$sealing" = true ]; then
+  umask 077
+  seal_work="$(mktemp -d)" || hosting::die "could not create a private working directory. Nothing was minted."
+  trap 'hosting::on_exit; rm -rf "$seal_work"' EXIT
+  # The recipient first: nothing is read and nothing is minted for a key that could not be sealed to.
+  hosting::seal_key "$seal_to" "$seal_work"
+  hosting::log "seal-to   RSA-${HOSTING_SEAL_BITS} public key, sha256 $(hosting::sha256 < "$seal_work/seal.der" | cut -c1-12)… (item ${item})"
+  if hosting::dry; then
+    hosting::log "(dry run) a real run mints a coupon for plan '${tier}' (${max_usages} use(s), expires in ${expires_days} day(s)) at ${registry}/api/instances/coupons with the credential in ${mint_secret}, and seals it as item ${item} (never stored, never shown)"
+    hosting::say registry_coupon dry-run
+    hosting::say registry_coupon_plan "$tier"
+    exit 0
+  fi
+elif kv_exists "$object"; then
   held_plan="$(az keyvault secret list --vault-name "$vault" --query "[?name=='${object}'].tags.\"mw-plan\" | [0]" -o tsv 2>/dev/null || true)"
   # 🚨 Kept only for the plan this run approved: a coupon tagged for ANOTHER plan would register the
   # instance on that plan while the approval said ${tier}. An untagged object (a coupon a registry admin
@@ -92,7 +128,7 @@ if kv_exists "$object"; then
   exit 0
 fi
 
-if hosting::dry; then
+if [ "$sealing" != true ] && hosting::dry; then
   hosting::log "(dry run) ${object} is absent from vault ${vault} — a real run mints a coupon for plan '${tier}' (${max_usages} use(s), expires in ${expires_days} day(s)) at ${registry}/api/instances/coupons with the credential in ${mint_secret}, and stores it under ${object} (never shown)"
   hosting::say registry_coupon dry-run
   hosting::say registry_coupon_plan "$tier"
@@ -126,7 +162,11 @@ esac
 coupon_id="$(field id)"; coupon_tier="$(field tier)"; coupon_expires="$(field expiresAt)"
 umask 077
 coupon_file="$(mktemp)"
-trap 'hosting::on_exit; rm -f "$coupon_file"' EXIT
+if [ "$sealing" = true ]; then
+  trap 'hosting::on_exit; rm -f "$coupon_file"; rm -rf "$seal_work"' EXIT
+else
+  trap 'hosting::on_exit; rm -f "$coupon_file"' EXIT
+fi
 printf '%s' "$answer" | jq -rj '.coupon // empty' > "$coupon_file" 2>/dev/null
 unset answer
 case "$(head -c 4 "$coupon_file")" in
@@ -136,6 +176,20 @@ esac
 [ "$coupon_tier" = "$tier" ] \
   || { rm -f "$coupon_file"; hosting::die "the registry minted a coupon for plan '${coupon_tier:-?}', not '${tier}' — refusing to store it. Revoke it on the registry (Registration keys ▸ ${coupon_id:-?})."; }
 fp="$(hosting::fingerprint "$coupon_file")"
+
+if [ "$sealing" = true ]; then
+  hosting::step "Seal the coupon to the enrolling machine"
+  if ! hosting::seal_item "$item" "$coupon_file" "$seal_work"; then
+    rm -f "$coupon_file"
+    hosting::die "the registry minted coupon ${coupon_id:-?} but it could not be sealed: ${HOSTING_SEAL_ERR}. It is shown nowhere and stored nowhere; it expires in ${expires_days} day(s) — revoke it on the registry (Registration keys ▸ ${coupon_id:-?}) and approve again."
+  fi
+  rm -f "$coupon_file"
+  hosting::log "minted  coupon ${coupon_id} for plan ${tier} (${max_usages} use(s), expires ${coupon_expires}) → sealed as item ${item} (${fp}; stored nowhere)"
+  hosting::say registry_coupon sealed
+  hosting::say registry_coupon_plan "$tier"
+  hosting::say registry_coupon_id "$coupon_id"
+  exit 0
+fi
 
 hosting::step "Store the coupon in Key Vault"
 if ! az keyvault secret set --vault-name "$vault" --name "$object" --file "$coupon_file" \
