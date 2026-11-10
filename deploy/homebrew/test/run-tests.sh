@@ -3101,6 +3101,7 @@ case "$1" in
   ssh) cat >/dev/null
        # KR_SSH_EMPTY_FIRST=N: the first N reads see no pods/ yet (kubelet still starting)
        n=$(( $(grep -c '^ssh' "$KR_DIR/colima.log") ))
+       [ -n "${KR_SSH_ERR:-}" ] && { echo "$KR_SSH_ERR" >&2; exit 1; }
        [ "$n" -le "${KR_SSH_EMPTY_FIRST:-0}" ] && exit 1
        printf '%s' "${KR_SSH-81G free of 98G}" ;;
   *) exit 0 ;;
@@ -3142,6 +3143,15 @@ OUT="$(KR_SSH_EMPTY_FIRST=2 MEMEX_KUBELET_ROOT_WAIT_S=0 kr bash -c '. "$0"; cmd_
 [ "$RC" = 0 ] && [ "$(grep -c '^ssh -- sudo' "$KR/colima.log")" = 3 ] \
   && ok "kubelet-root apply waits for kubelet to create pods/ instead of failing on the first read" \
   || bad "kubelet-root apply wait" "rc=$RC $(grep -c '^ssh' "$KR/colima.log") reads $OUT"
+cp "$KR/old.yaml" "$KR/colima/default/colima.yaml"; rm -f "$KR/colima.log"
+OUT="$(KR_SSH_ERR='sudo: a password is required' MEMEX_KUBELET_ROOT_WAIT_TRIES=2 MEMEX_KUBELET_ROOT_WAIT_S=0 kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" != 0 ] && case "$OUT" in *"UNKNOWN"*"a password is required"*) true ;; *) false ;; esac && case "$OUT" in *"did not take the root-dir"*) false ;; *) true ;; esac \
+  && ok "a read that ERRORS is reported as unknown with its answer, never as 'kubelet did not take the root-dir'" \
+  || bad "kubelet-root apply read error" "rc=$RC $OUT"
+cp "$KR/old.yaml" "$KR/colima/default/colima.yaml"; rm -f "$KR/colima.log"
+OUT="$(MEMEX_KUBELET_ROOT_WAIT_TRIES=0 kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" = 0 ] && [ "$(grep -c '^ssh -- sudo' "$KR/colima.log")" = 1 ] \
+  && ok "MEMEX_KUBELET_ROOT_WAIT_TRIES=0 still reads once (no verdict without a read)" || bad "wait tries 0" "rc=$RC $OUT"
 cp "$KR/colima/default/colima.yaml" "$KR/after.yaml"; rm -f "$KR/colima.log"
 OUT="$(kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
 [ "$RC" = 0 ] && cmp -s "$KR/after.yaml" "$KR/colima/default/colima.yaml" && ! grep -qE '^(stop|start)' "$KR/colima.log" 2>/dev/null \
