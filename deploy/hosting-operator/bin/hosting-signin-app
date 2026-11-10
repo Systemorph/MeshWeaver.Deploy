@@ -127,7 +127,19 @@ if [ -n "$per_machine" ] || [ -n "$domain" ] || [ -n "$seal_to" ] || [ -n "$item
   hosting::log "${outcome}   app ${app_id} '${display}'"
 
   hosting::step "Register the machine's redirect URIs"
+  # A just-created application is not readable at once: Graph replicates a new object across its
+  # directory replicas for seconds up to a couple of minutes, and a read that lands on a replica
+  # that has not seen it answers "does not exist" although the create succeeded (measured
+  # 2026-11-10, moench: created, then read back 'does not exist' at once). Wait that out — for a
+  # CREATED app only, and only while the answer is "does not exist"; any other refusal is a right.
   hosting::probe any az ad app show --id "$app_id" --query 'web.redirectUris' -o tsv; rc=$?
+  waited=0
+  while [ "$rc" -ne 0 ] && [ "$outcome" = created ] && [ "$waited" -lt "${HOSTING_GRAPH_REPLICATION_WAIT:-180}" ] \
+        && grep -qiE "does not exist|not found|Request_ResourceNotFound" <<< "${HOSTING_PROBE_ERR:-}"; do
+    sleep 10; waited=$((waited + 10))
+    hosting::probe any az ad app show --id "$app_id" --query 'web.redirectUris' -o tsv; rc=$?
+  done
+  [ "$waited" -eq 0 ] || hosting::log "waited    ${waited} s for Graph to replicate the new app ${app_id}"
   [ "$rc" -eq 0 ] || hosting::die "could not read app ${app_id} back — ${right}. It answered: ${HOSTING_PROBE_ERR:-nothing}"
   have="$HOSTING_PROBE_OUT"
   missing=()
@@ -154,6 +166,12 @@ if [ -n "$per_machine" ] || [ -n "$domain" ] || [ -n "$seal_to" ] || [ -n "$item
     0) hosting::log "verified  the service principal of ${app_id}" ;;
     2) hosting::die "REFUSED, not absent: Graph would not show the service principal of ${app_id} — ${right}. It answered: ${HOSTING_PROBE_ERR}" ;;
     *) hosting::probe any az ad sp create --id "$app_id" --query id -o tsv; rc=$?
+       waited=0  # the same replication lag as above can answer the create with "does not exist"
+       while [ "$rc" -ne 0 ] && [ "$outcome" = created ] && [ "$waited" -lt "${HOSTING_GRAPH_REPLICATION_WAIT:-180}" ] \
+             && grep -qiE "does not exist|not found|Request_ResourceNotFound" <<< "${HOSTING_PROBE_ERR:-}"; do
+         sleep 10; waited=$((waited + 10))
+         hosting::probe any az ad sp create --id "$app_id" --query id -o tsv; rc=$?
+       done
        [ "$rc" -eq 0 ] || hosting::die "could not create the service principal of ${app_id} — ${right}. It answered: ${HOSTING_PROBE_ERR:-nothing}"
        hosting::log "created   the service principal of ${app_id}" ;;
   esac
