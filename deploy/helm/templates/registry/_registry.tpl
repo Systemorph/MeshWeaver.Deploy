@@ -91,9 +91,13 @@ start. The one exception is deliberate and safe: `publisher.passwordBcrypt` is a
 {{- fail (printf "registry.maintenance.garbageCollect %q is not a run id — 1 to 40 lowercase letters, digits or '-', the suffix of the Job memex-registry-gc-<run>" $garbageCollect) -}}
 {{- end -}}
 {{- end -}}
-{{- $gcDeadline := int ($maintenance.gcDeadlineSeconds | default 1800) -}}
-{{- if or (lt $gcDeadline 60) (gt $gcDeadline 2400) -}}
-{{- fail (printf "registry.maintenance.gcDeadlineSeconds %d is outside 60..2400 — the collect runs inside one maintenance job, which is cut at 45 minutes" $gcDeadline) -}}
+{{- $gcDeadlineRaw := (($maintenance.gcDeadlineSeconds | default 1500) | toString | trim) -}}
+{{- if not (regexMatch "^[0-9]+$" $gcDeadlineRaw) -}}
+{{- fail (printf "registry.maintenance.gcDeadlineSeconds %q is not a whole number of seconds" $gcDeadlineRaw) -}}
+{{- end -}}
+{{- $gcDeadline := int $gcDeadlineRaw -}}
+{{- if or (lt $gcDeadline 60) (gt $gcDeadline 1500) -}}
+{{- fail (printf "registry.maintenance.gcDeadlineSeconds %d is outside 60..1500 — the collect runs inside one maintenance job, cut at 45 minutes, which must also hold both pod-by-pod verifications and the restore" $gcDeadline) -}}
 {{- end -}}
 {{- $notificationUrl := ($notifications.url | default "") -}}
 {{- $notificationSecretObject := ($kv.notificationSecretObject | default "") -}}

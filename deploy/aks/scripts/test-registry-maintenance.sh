@@ -14,7 +14,7 @@
 #      ServiceAccount and workload identity, over the same ConfigMap, never retried (backoffLimit 0),
 #      with the declared deadline — and leaves the registry pod template exactly as the read-only render;
 #   4. the refusals hold: a collect outside a read-only window, a run id that is not one, a readOnly that
-#      is not a boolean, and a deadline outside 60..2400.
+#      is not a boolean, and a deadline that is not a number or is outside 60..1500.
 #
 # NO SKIP-TRAPDOOR: helm, python3 and PyYAML are asserted; a render that yields nothing is RED.
 set -uo pipefail
@@ -108,7 +108,7 @@ else:
     if pod.get("serviceAccountName") != g["registrySa"]: p.append("the Job does not run as the registry ServiceAccount")
     if (tmeta.get("labels") or {}).get("azure.workload.identity/use") != "true": p.append("the Job pod does not use the workload identity")
     if pod.get("restartPolicy") != "Never" or spec.get("backoffLimit") != 0: p.append("the Job may be retried")
-    if spec.get("activeDeadlineSeconds") != 1800: p.append("the Job deadline is %r, expected the default 1800" % (spec.get("activeDeadlineSeconds"),))
+    if spec.get("activeDeadlineSeconds") != 1500: p.append("the Job deadline is %r, expected the default 1500" % (spec.get("activeDeadlineSeconds"),))
     if not any((v.get("configMap") or {}).get("name") == "memex-registry-config" for v in pod.get("volumes") or []):
         p.append("the Job does not mount the registry configuration")
     if (tmeta.get("annotations") or {}).get("checksum/config") != r["annotations"].get("checksum/config"):
@@ -149,7 +149,9 @@ refuses "a run id that is not one" "is not a run id" \
   --set registry.maintenance.readOnly=true --set-string registry.maintenance.garbageCollect='Bad_Run'
 refuses "a readOnly that is not a boolean" "must be true or false" \
   --set-string registry.maintenance.readOnly=yes
-refuses "a collect deadline past the job cut" "is outside 60..2400" \
-  --set registry.maintenance.readOnly=true --set-string registry.maintenance.garbageCollect="$RUN" --set registry.maintenance.gcDeadlineSeconds=3600
+refuses "a collect deadline past the window's budget" "is outside 60..1500" \
+  --set registry.maintenance.readOnly=true --set-string registry.maintenance.garbageCollect="$RUN" --set registry.maintenance.gcDeadlineSeconds=1800
+refuses "a collect deadline that is not a number" "is not a whole number of seconds" \
+  --set registry.maintenance.readOnly=true --set-string registry.maintenance.garbageCollect="$RUN" --set-string registry.maintenance.gcDeadlineSeconds=abc
 
 exit $fail

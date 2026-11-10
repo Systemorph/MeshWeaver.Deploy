@@ -53,10 +53,15 @@ WINDOW_PY="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_registry_window.py"
 DEPLOYMENT="memex-registry-deployment"
 
 # ── declared bounds (seconds) ───────────────────────────────────────────────────────────────────
-# The whole window runs inside ONE operator job, cut at 45 minutes; these add up below that.
-SETTLE_WAIT="${HOSTING_REGISTRY_SETTLE_WAIT:-420}"           # one registry roll, until every pod is on the new side
+# The whole window runs inside ONE operator job, cut at 45 minutes (2700 s), and the read-write restore
+# must fit inside it too. Worst case, every wait run to its bound:
+#   read-only verify 300 + collect 1560 + collect delete 120 + read-write verify 300 = 2280 s,
+# which leaves 420 s for the four helm upgrades and their server-side dry runs. GC_WAIT bounds the
+# collect whatever the Job's own deadline says (the chart caps it at 1500): past it, the window stops
+# the Job and restores read-write.
+SETTLE_WAIT="${HOSTING_REGISTRY_SETTLE_WAIT:-300}"           # one registry roll, until every pod is on the new side
 SETTLE_INTERVAL="${HOSTING_REGISTRY_SETTLE_INTERVAL:-5}"
-GC_WAIT="${HOSTING_REGISTRY_GC_WAIT:-1860}"                  # the Job's own deadline (1800) plus a minute
+GC_WAIT="${HOSTING_REGISTRY_GC_WAIT:-1560}"                  # the Job's default deadline (1500) plus a minute
 GC_INTERVAL="${HOSTING_REGISTRY_GC_INTERVAL:-10}"
 
 mode="${1:-}"

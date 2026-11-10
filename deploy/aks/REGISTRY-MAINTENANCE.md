@@ -13,7 +13,7 @@ cleanup run that holds the registry-maintenance lease (MeshWeaver.Plugins
 |---|---|---|
 | `registry.maintenance.readOnly` | `false` | `true` → `storage.maintenance.readonly.enabled: true` in `memex-registry-config`, and the registry pod template carries `memex-registry/maintenance: read-only`. The ConfigMap's checksum is on the pod template, so the apply ROLLS the registry pods. Pushes and DELETEs are refused; pulls keep working |
 | `registry.maintenance.garbageCollect` | `""` | a run id → ONE Job `memex-registry-gc-<run>` running `registry garbage-collect /etc/registry/config.yml` with the registry's image, configuration, ServiceAccount and workload identity, `backoffLimit: 0`. Refused unless `readOnly` is `true` |
-| `registry.maintenance.gcDeadlineSeconds` | `1800` | the collect Job's `activeDeadlineSeconds` (60..2400 — the window runs inside one operator job, which is cut at 45 minutes) |
+| `registry.maintenance.gcDeadlineSeconds` | `1500` | the collect Job's `activeDeadlineSeconds` (60..1500). The window runs inside one operator job, which is cut at 45 minutes. Run to their bounds, both pod-by-pod verifications (300 s each), the collect (1500 s plus a minute) and the collect's deletion (120 s) still leave the restore inside that cut |
 
 With none of them set the chart renders byte-identically to a chart that does not know them
 (`deploy/aks/scripts/test-registry-maintenance.sh` holds that, and the rest of this table).

@@ -1091,7 +1091,7 @@ registry:
     readOnly: false               # true → storage.maintenance.readonly: pushes and DELETEs refused, pulls served
     garbageCollect: ""            # a run id → the Job memex-registry-gc-<run> (`registry garbage-collect`,
                                   #            no --delete-untagged); refused unless readOnly is true
-    gcDeadlineSeconds: 1800       # the collect Job's activeDeadlineSeconds (60..2400)
+    gcDeadlineSeconds: 1500       # the collect Job's activeDeadlineSeconds (60..1500 — the window's budget)
   ingress:
     className: "nginx"
     clusterIssuer: ""             # cert-manager ClusterIssuer; empty = tlsSecret is pre-created
