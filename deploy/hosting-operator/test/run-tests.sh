@@ -5641,6 +5641,100 @@ refuses_hard "chart drift cluster with a metacharacter" "is not a plain name" \
 rm -rf "$_cd"; unset _cd _cd_out _cd_rc
 
 echo
+echo "── hosting-registry-maintenance: the blob collect inside a read-only window, read-write restored on every exit ──"
+# MeshWeaver.Plugins#4370 slice 3 (the owner's decision 1A; deploy/aks/REGISTRY-MAINTENANCE.md). The stubs keep a
+# two-pod registry whose side follows the last apply; what is asserted is the ORDER of the script's writes, that the
+# collect starts only once every pod is read-only, and that every exit path after the first write restores read-write.
+RM_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/registry-maintenance" && pwd)"
+RM_CHART="$(mktemp -d)"
+_rm_run() {  # _rm_run [ENV=…] -- <args…>   → _rm_out, _rm_rc, _rm_helm (non-dry-run upgrades only), _rm_kube
+  local envs=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  [ "${1:-}" = "--" ] && shift
+  _rm_st="$(mktemp -d)"
+  _rm_out="$(env PATH="$RM_STUBS:$PATH" HOSTING_RM_STATE="$_rm_st" HOSTING_CHART="$RM_CHART" \
+    HOSTING_REGISTRY_SETTLE_WAIT=0 HOSTING_REGISTRY_SETTLE_INTERVAL=0 HOSTING_REGISTRY_GC_INTERVAL=0 \
+    "${envs[@]}" hosting-registry-maintenance "$@" 2>&1)"; _rm_rc=$?
+  _rm_helm="$(grep '^upgrade ' "$_rm_st/helm.log" 2>/dev/null | grep -v -- '--dry-run=server' | sed -E 's/.*readOnly=([a-z]+).*garbageCollect=([^ ]*).*/ro=\1 gc=\2/' | tr '\n' ';')"
+  _rm_kube="$(cat "$_rm_st/kubectl.log" 2>/dev/null)"
+  _rm_mode="$(cat "$_rm_st/mode" 2>/dev/null)"
+  rm -rf "$_rm_st"
+}
+_rm_last() { printf '%s\n' "$_rm_out" | sed -n 's/^::hosting:: registry_window=//p' | tail -1; }
+RM_ARGS=(--namespace memex-registry-host --release memex --run 20261110101500)
+if command -v jq >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
+  _rm_run -- window "${RM_ARGS[@]}"
+  [ "$_rm_rc" -eq 0 ] && [ "$(_rm_last)" = closed ] \
+    && ok "window: a clean run ends registry_window=closed, exit 0" || bad "window clean run" "rc ${_rm_rc}; out: ${_rm_out}"
+  [ "$_rm_helm" = "ro=true gc=;ro=true gc=20261110101500;ro=false gc=;" ] \
+    && ok "window: the writes are read-only, then the collect inside it, then read-write — in that order and no others" \
+    || bad "window write order" "upgrades: ${_rm_helm}"
+  case "$_rm_out" in *"registry_window=read-only"*"registry_gc=complete"*"registry_gc_summary=41 blobs marked, 7 blobs and 0 manifests eligible for deletion"*"registry_window=read-write"*"registry_window=closed"*) ok "window: read-only verified, collect complete with distribution's own summary, read-write verified, closed" ;;
+    *) bad "window facts" "out: ${_rm_out}" ;; esac
+  case "$_rm_out" in *"registry_gc_summary=blob eligible"*) bad "the summary is the closing line, never a per-blob line" "out: ${_rm_out}" ;; *) ok "the summary is the closing line, never a per-blob line" ;; esac
+  [ "$_rm_mode" = read-write ] && ok "window: the registry is read-write at the end" || bad "window end state" "mode ${_rm_mode}"
+  case "$_rm_kube" in *"get job memex-registry-gc-20261110101500"*"delete jobs -l app.kubernetes.io/component=memex-registry-gc,app.kubernetes.io/instance=memex --ignore-not-found --cascade=foreground --wait=true"*) ok "window: the collect Job is followed, then deleted in the foreground before read-write" ;;
+    *) bad "collect followed then stopped" "kubectl: ${_rm_kube}" ;; esac
+  case "$_rm_out" in *"--delete-untagged"*) bad "never --delete-untagged" "out: ${_rm_out}" ;; *) ok "never --delete-untagged" ;; esac
+
+  # The collect waits for EVERY pod: one registry pod still on the read-write configuration stops the window before
+  # the collect is rendered — and the registry is restored.
+  _rm_run HOSTING_RM_LAG=1 -- window "${RM_ARGS[@]}"
+  [ "$_rm_rc" -ne 0 ] && [ "$(_rm_last)" = restored ] \
+    && ok "a pod left read-write: the window is RED and read-write is restored" || bad "lagging pod" "rc ${_rm_rc}; out: ${_rm_out}"
+  case "$_rm_helm" in *"gc=2026"*) bad "a pod left read-write: the collect is never rendered" "upgrades: ${_rm_helm}" ;; *) ok "a pod left read-write: the collect is never rendered" ;; esac
+  case "$_rm_kube" in *"get job "*) bad "a pod left read-write: no collect Job is followed" "kubectl: ${_rm_kube}" ;; *) ok "a pod left read-write: no collect Job is followed" ;; esac
+  case "$_rm_out" in *"memex-registry-b is not read-only"*|*"memex-registry-b was started from another configuration"*) ok "…naming the pod that is not read-only" ;; *) bad "names the pod" "out: ${_rm_out}" ;; esac
+
+  # A collect that FAILS: the window is RED, the restore stops the Job and applies read-write.
+  _rm_run HOSTING_RM_GC=failed -- window "${RM_ARGS[@]}"
+  [ "$_rm_rc" -ne 0 ] && [ "$(_rm_last)" = restored ] && [ "$_rm_mode" = read-write ] \
+    && ok "a failed collect: RED, and read-write restored" || bad "failed collect" "rc ${_rm_rc}; mode ${_rm_mode}; out: ${_rm_out}"
+  case "$_rm_out" in *"registry_gc=complete"*|*"registry_window=closed"*) bad "a failed collect never reads complete or closed" "out: ${_rm_out}" ;; *) ok "a failed collect never reads complete or closed" ;; esac
+  case "$_rm_helm" in *"ro=false gc=;") ok "a failed collect: the LAST write is read-write" ;; *) bad "restore is the last write" "upgrades: ${_rm_helm}" ;; esac
+
+  # A collect that completes with no summary: its outcome is not claimed from silence — RED, restored.
+  _rm_run HOSTING_RM_NO_SUMMARY=1 -- window "${RM_ARGS[@]}"
+  [ "$_rm_rc" -ne 0 ] && [ "$(_rm_last)" = restored ] \
+    && case "$_rm_out" in *"printed no summary"*) true ;; *) false ;; esac \
+    && ok "a collect with no summary: RED, restored, never claimed from silence" || bad "no summary" "rc ${_rm_rc}; out: ${_rm_out}"
+
+  # The restore never applies read-write while a collect pod may still run.
+  _rm_run HOSTING_RM_GC=failed HOSTING_RM_GC_STUCK=1 -- window "${RM_ARGS[@]}"
+  [ "$_rm_rc" -ne 0 ] && [ "$(_rm_last)" = restore_failed ] && [ "$_rm_mode" = read-only ] \
+    && ok "a collect pod still present: read-write is NOT applied and the window says restore_failed" \
+    || bad "stuck collect pod" "rc ${_rm_rc}; mode ${_rm_mode}; out: ${_rm_out}"
+
+  # The window is applied over the release's own values; a chart that moved since would ride along. Refused before
+  # the first write — and then there is nothing to restore.
+  _rm_run HOSTING_RM_DRIFT=1 -- window "${RM_ARGS[@]}"
+  [ "$_rm_rc" -ne 0 ] && [ -z "$_rm_helm" ] && [ "$(_rm_last)" = unchanged ] \
+    && case "$_rm_out" in *"Deployment//memex-portal-deployment would CHANGE"*) true ;; *) false ;; esac \
+    && ok "a chart that would change the portal: refused before any write, naming it; registry_window=unchanged" \
+    || bad "drift refused" "rc ${_rm_rc}; upgrades: ${_rm_helm}; out: ${_rm_out}"
+
+  # …and the restore holds to the same guard: a drifting read-write apply after the collect leaves it read-only, RED.
+  _rm_run HOSTING_RM_DRIFT_RW=1 -- window "${RM_ARGS[@]}"
+  [ "$_rm_rc" -ne 0 ] && [ "$(_rm_last)" = restore_failed ] \
+    && ok "a read-write apply that would change more than the window: restore_failed, never a silent portal change" \
+    || bad "restore drift" "rc ${_rm_rc}; out: ${_rm_out}"
+
+  # restore on its own: stop every collect, then read-write, verified.
+  _rm_run -- restore --namespace memex-registry-host --release memex
+  [ "$_rm_rc" -eq 0 ] && [ "$(_rm_last)" = restored ] && [ "$_rm_helm" = "ro=false gc=;" ] \
+    && case "$_rm_kube" in "delete jobs -l app.kubernetes.io/component=memex-registry-gc"*|*$'\n'"-n memex-registry-host delete jobs -l"*|"-n memex-registry-host delete jobs -l"*) true ;; *) false ;; esac \
+    && ok "restore: every collect stopped first, then ONE read-write write, verified" || bad "restore" "rc ${_rm_rc}; upgrades: ${_rm_helm}; kubectl: ${_rm_kube}; out: ${_rm_out}"
+else
+  bad "hosting-registry-maintenance tests need jq and python3 with PyYAML" "missing"
+fi
+refuses_hard "registry maintenance: window or restore" "is 'window' or 'restore'" hosting-registry-maintenance collect --namespace a --release b
+refuses_hard "registry maintenance: window needs --run" "window needs --run" env HOSTING_CHART="$RM_CHART" hosting-registry-maintenance window --namespace a --release b
+refuses_hard "registry maintenance: restore takes no --run" "restore takes no --run" env HOSTING_CHART="$RM_CHART" hosting-registry-maintenance restore --namespace a --release b --run x
+refuses_hard "registry maintenance: a namespace with a metacharacter" "is not a Kubernetes name" hosting-registry-maintenance window --namespace 'a; kubectl delete ns --all' --release b --run x
+refuses_hard "registry maintenance: a run id with a metacharacter" "is not a run id" env HOSTING_CHART="$RM_CHART" hosting-registry-maintenance window --namespace a --release b --run 'x;y'
+rm -rf "$RM_CHART"
+unset _rm_out _rm_rc _rm_helm _rm_kube _rm_mode _rm_st RM_CHART
+
 echo "── hosting-runner-reap: runners ARC reports Running whose pods exited; the remedy restarts their controller ──"
 # The RunnerReap action's one step (MeshWeaver.Plugins Hosting/InstanceAction, kind RunnerReap; Memex#879).
 # The fixture is the 2026-10-26 shape: runner pods Completed / with an exited runner container / gone,

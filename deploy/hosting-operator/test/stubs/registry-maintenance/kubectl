@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# A stand-in `kubectl` for hosting-registry-maintenance's behaviour tests (see the helm stub beside it).
+# Two registry pods follow the mode the helm stub last applied, unless told otherwise.
+#
+#   HOSTING_RM_STATE          the shared state directory
+#   HOSTING_RM_LAG=1          one registry pod stays on the READ-WRITE configuration whatever was applied
+#   HOSTING_RM_GC=failed      the collect Job fails (default: completes)
+#   HOSTING_RM_GC_STUCK=1     a collect pod is still listed after its Job was deleted
+#   HOSTING_RM_NO_SUMMARY=1   the collect completes and prints no summary line
+set -uo pipefail
+state="${HOSTING_RM_STATE:?the registry-maintenance kubectl stub needs HOSTING_RM_STATE}"
+printf '%s\n' "$*" >> "$state/kubectl.log"
+mode="$(cat "$state/mode" 2>/dev/null || echo read-write)"
+note() { [ "$1" = read-only ] && printf ', "memex-registry/maintenance": "read-only"'; }
+pod() {  # pod <name> <side>
+  printf '{"metadata": {"name": "%s", "annotations": {"checksum/config": "sum-%s"%s}}, "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}}' \
+    "$1" "$2" "$(note "$2")"
+}
+case "$*" in
+  *" get deployment memex-registry-deployment -o json")
+    printf '{"metadata": {"generation": 3}, "status": {"observedGeneration": 3}, "spec": {"replicas": 2, "template": {"metadata": {"annotations": {"checksum/config": "sum-%s"%s}}}}}\n' \
+      "$mode" "$(note "$mode")" ;;
+  *" get pods -l app.kubernetes.io/component=memex-registry,"*)
+    second="$mode"; [ "${HOSTING_RM_LAG:-0}" = 1 ] && second=read-write
+    printf '{"items": [%s, %s]}\n' "$(pod memex-registry-a "$mode")" "$(pod memex-registry-b "$second")" ;;
+  *" get job memex-registry-gc-"*" -o json")
+    [ "${HOSTING_RM_GC:-complete}" = failed ] && type=Failed || type=Complete
+    printf '{"status": {"conditions": [{"type": "%s", "status": "True"}]}}\n' "$type" ;;
+  *" logs job/memex-registry-gc-"*)
+    echo "blob eligible for deletion: sha256:aaaa"
+    [ "${HOSTING_RM_NO_SUMMARY:-0}" = 1 ] || echo "41 blobs marked, 7 blobs and 0 manifests eligible for deletion" ;;
+  *" delete jobs -l app.kubernetes.io/component=memex-registry-gc,"*) touch "$state/gc-deleted"; echo 'job.batch "x" deleted' ;;
+  *" get pods -l app.kubernetes.io/component=memex-registry-gc,"*)
+    if [ "${HOSTING_RM_GC_STUCK:-0}" = 1 ]; then echo '{"items": [{"metadata": {"name": "memex-registry-gc-x-abcde"}}]}'
+    else echo '{"items": []}'; fi ;;
+  *) echo "kubectl stub (registry-maintenance): unexpected invocation: $*" >&2; exit 1 ;;
+esac
