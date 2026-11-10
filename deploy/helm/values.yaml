@@ -1326,6 +1326,18 @@ buildHosts:
   # the control instance's content-addressed, append-only module store, so an evicted one is fetched again by its hash.
   # Unbounded, it reached 117 GB on a Mac (2026-11-10) and put the node at DiskPressure (MeshWeaver.Plugins Hosting/OneBuildTree.md).
   sliceCacheMaxGi: 32
+  # NO NETWORK DURING A RUN (MeshWeaver.Plugins Hosting/OneBuildTree.md): `offline` runs every stage in its own network
+  # namespace (loopback only) with the prepared package folder as NuGet's ONLY source, and a package restored per run is an
+  # ERROR (MWPREP001). `open` keeps today's network and says what a run still fetched. Turn `offline` on once a run's whole
+  # package closure is prepared (the seed / warm restore) — before that, every run that restores per run goes red.
+  stageNetwork: "open"
+  # THE NODE'S DISK. Every replica's work volume (workSizeLimit), the cache and the images share one disk; replicas ×
+  # workSizeLimit may exceed it (a 98 GB Mac with 3 × 52 GiB evicted 17 pods for DiskPressure, 2026-11-10). A host therefore
+  # claims a run only when, measured on the node at claim time, `runDiskGi` (what one run may write) still leaves
+  # `diskHeadroomPercent` of the disk free (above the kubelet's default hard threshold, nodefs.available < 10 %). 0 / 0
+  # turns the guard off.
+  runDiskGi: 20
+  diskHeadroomPercent: 15
   # The SHARED TREE switch — INERT since §7.3b, kept only so existing values still render (retire it in a later chart change).
   # The deployment trees always live on the cache volume, so the warm path is chosen by the two other switches alone:
   #   warmWorkspace  runOverlay  →  a run's tree

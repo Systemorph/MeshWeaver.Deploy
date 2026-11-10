@@ -237,8 +237,13 @@ spec:
             # stage's behalf, with fingerprints IT computes from a default-branch declaration (`moduleHub`).
             - { name: MW_BUILD_MODULE_HUB_ENABLED, value: {{ ternary "true" "false" $b.moduleHub | quote }} }
             # The BOUND of the host's module-slice cache (<cache>/module-slices), in GiB: least-recently-used slices above it are
-            # evicted — a cache of control's append-only store, re-fetched by hash (MeshWeaver.Plugins Hosting/OneBuildTree.md §5).
+            # evicted — a cache of control's append-only store, re-fetched by hash (MeshWeaver.Plugins Hosting/OneBuildTree.md §4, Deviations).
             - { name: MW_BUILD_SLICE_CACHE_MAX_GIB, value: {{ $b.sliceCacheMaxGi | quote }} }
+            # NO NETWORK DURING A RUN (MeshWeaver.Plugins Hosting/OneBuildTree.md): open | offline.
+            - { name: MW_BUILD_STAGE_NETWORK, value: {{ $b.stageNetwork | quote }} }
+            # The node's disk: claim only when one run's footprint leaves the eviction headroom free (measured at claim time).
+            - { name: MW_BUILD_RUN_DISK_GIB, value: {{ $b.runDiskGi | quote }} }
+            - { name: MW_BUILD_DISK_HEADROOM_PERCENT, value: {{ $b.diskHeadroomPercent | quote }} }
             # The shared tree (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3): the warm main tree once per repository on the
             # shared cache volume, not once per replica.
             - { name: MW_BUILD_SHARED_TREE, value: {{ ternary "true" "false" $b.sharedTree | quote }} }
