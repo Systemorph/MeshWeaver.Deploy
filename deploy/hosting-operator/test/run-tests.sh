@@ -6087,6 +6087,42 @@ if command -v openssl >/dev/null 2>&1; then
   refuses_hard "seal-secret refuses an object with a metacharacter" "is not a plain name"  hosting-seal-secret --vault V --object 'o;id' --seal-to "$SEAL_SPKI" --item n
   refuses_hard "seal-secret refuses an item that is not one letter" "one lower-case letter" hosting-seal-secret --vault V --object o --seal-to "$SEAL_SPKI" --item N
   refuses_hard "seal-secret rejects unknown flags"      "unknown argument"                hosting-seal-secret "${SS_ARGS[@]}" --nope 1
+
+  # ── hosting-registry-coupon --seal-to (the enrolment's registry-plan coupon, item r) ──
+  # Minted exactly as the vault mode mints, then SEALED to the Mac's key and stored nowhere: an enrolled Mac writes it
+  # as its PluginCatalog:BootstrapKey and registers on (or redeems itself up to) the fleet's plan.
+  RCS_ARGS=(--registry-url https://registry.test --vault kv-example --tier dedicated --description "fleet enrolment studio-2" \
+    --expires-days 2 --max-usages 1 --mint-secret registry-Coupon-MintSecret --seal-to "$SEAL_SPKI" --item r)
+  if command -v jq >/dev/null 2>&1; then
+    rc normal "$RC_CRED" -- "${RCS_ARGS[@]}"
+    [ "$_rc_rc" -eq 0 ] && ok "sealed coupon: minted at the registry and sealed" || bad "sealed coupon" "exited ${_rc_rc}: ${_rc_out}"
+    case "$_rc_reglog" in *"MINT tier=dedicated uses=1 days=2 cred=ok"*) ok "…single-use, two days, with the mint credential" ;; *) bad "sealed coupon mint" "registry saw: ${_rc_reglog}" ;; esac
+    [ "$(seal_open "$_rc_out" r)" = "mwr_fake-coupon-NEVER-PRINTED-dedicated" ] && ok "…and opens to exactly the coupon" || bad "sealed coupon round trip" "said: ${_rc_out}"
+    case "$_rc_azlog" in *"secret set"*) bad "…and NOTHING is written to the vault" "az saw: ${_rc_azlog}" ;; *) ok "…and NOTHING is written to the vault" ;; esac
+    case "$_rc_azlog" in *"secret list"*) bad "…nor an object looked for (it is stored nowhere)" "az saw: ${_rc_azlog}" ;; *) ok "…nor an object looked for (it is stored nowhere)" ;; esac
+    case "${_rc_out}${_rc_azlog}" in *NEVER-PRINTED*|*mwr_*) bad "sealed coupon: neither the coupon nor the credential is printed" "seen: ${_rc_out} ${_rc_azlog}" ;; *) ok "sealed coupon: neither the coupon nor the credential is printed" ;; esac
+    case "$_rc_out" in *"::hosting:: registry_coupon=sealed"*"registry_coupon_plan=dedicated"*"registry_coupon_id=c0ffee123456"*) ok "…reported as sealed, with its plan and id" ;; *) bad "sealed coupon facts" "said: ${_rc_out}" ;; esac
+    rc_done
+    rc normal "$RC_CRED" -- "${RCS_ARGS[@]/$SEAL_SPKI/$SEAL_SMALL}"
+    [ "$_rc_rc" -ne 0 ] && [ -z "$_rc_reglog" ] && case "$_rc_azlog" in *keyvault*) false ;; *) true ;; esac \
+      && ok "sealed coupon: an RSA-2048 recipient is refused before the credential is read or anything minted" || bad "sealed coupon small key" "rc ${_rc_rc}: ${_rc_reglog} ${_rc_azlog}"
+    rc_done
+    _seal_path="$PATH"; PATH="$SEAL_DIR/broken:$PATH"; rc normal "$RC_CRED" -- "${RCS_ARGS[@]}"; PATH="$_seal_path"
+    [ "$_rc_rc" -ne 0 ] && case "$_rc_out" in *"could not be sealed"*"revoke it on the registry"*c0ffee123456*) true ;; *) false ;; esac \
+      && ok "sealed coupon: a coupon that could not be sealed is RED, naming the coupon id to revoke" || bad "sealed coupon seal failure" "rc ${_rc_rc}: ${_rc_out}"
+    case "$_rc_out" in *NEVER-PRINTED*|*sealed_item*) bad "…and nothing is printed" "said: ${_rc_out}" ;; *) ok "…and nothing is printed" ;; esac
+    rc_done
+    rc normal "$RC_CRED" HOSTING_DRY_RUN=true -- "${RCS_ARGS[@]}"
+    [ "$_rc_rc" -eq 0 ] && [ -z "$_rc_reglog" ] && case "$_rc_azlog" in *"--query value"*) false ;; *) true ;; esac \
+      && case "$_rc_out" in *"registry_coupon=dry-run"*) true ;; *) false ;; esac \
+      && ok "sealed coupon: a dry run checks the key and mints nothing" || bad "sealed coupon dry run" "rc ${_rc_rc}: ${_rc_reglog} ${_rc_azlog} ${_rc_out}"
+    rc_done
+  else
+    bad "the sealed-coupon tests need jq" "missing"
+  fi
+  refuses_hard "sealed coupon: --object beside --seal-to is refused" "refused beside --seal-to" hosting-registry-coupon "${RCS_ARGS[@]}" --object o
+  refuses_hard "sealed coupon: --seal-to needs --item" "missing required flag --item" hosting-registry-coupon --registry-url https://r.test --vault V --tier pro --description d --mint-secret m --seal-to "$SEAL_SPKI"
+  refuses_hard "sealed coupon: the item is one letter" "one lower-case letter" hosting-registry-coupon --registry-url https://r.test --vault V --tier pro --description d --mint-secret m --seal-to "$SEAL_SPKI" --item R
   rm -rf "$SEAL_DIR"
   unset SEAL_DIR SEAL_SPKI SEAL_SMALL SEAL_EC TK_SEAL PM_ARGS PM_URIS SS_ARGS _ss_out _ss_rc _ss_log
 else
