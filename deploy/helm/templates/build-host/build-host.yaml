@@ -237,7 +237,7 @@ spec:
             # stage's behalf, with fingerprints IT computes from a default-branch declaration (`moduleHub`).
             - { name: MW_BUILD_MODULE_HUB_ENABLED, value: {{ ternary "true" "false" $b.moduleHub | quote }} }
             # The BOUND of the host's module-slice cache (<cache>/module-slices), in GiB: least-recently-used slices above it are
-            # evicted — a cache of control's append-only store, re-fetched by hash (MeshWeaver.Plugins Hosting/OneBuildTree.md §5).
+            # evicted — a cache of control's append-only store, re-fetched by hash (MeshWeaver.Plugins Hosting/OneBuildTree.md §4, Deviations).
             - { name: MW_BUILD_SLICE_CACHE_MAX_GIB, value: {{ $b.sliceCacheMaxGi | quote }} }
             # NO NETWORK DURING A RUN (MeshWeaver.Plugins Hosting/OneBuildTree.md): open | offline.
             - { name: MW_BUILD_STAGE_NETWORK, value: {{ $b.stageNetwork | quote }} }

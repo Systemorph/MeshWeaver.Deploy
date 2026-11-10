@@ -129,7 +129,7 @@ The refusals, and why each one exists:
 {{- if or (lt $stageSlots 1) (gt $stageSlots 32) -}}
 {{- fail (printf "buildHosts.stageSlots %d must be within [1, 32] — how many of one run's stages a host runs at once (1 = serial)" $stageSlots) -}}
 {{- end -}}
-{{- /* The module-slice cache's BOUND (MeshWeaver.Plugins Hosting/OneBuildTree.md §5): a whole number of GiB, at least 1 — the
+{{- /* The module-slice cache's BOUND (MeshWeaver.Plugins Hosting/OneBuildTree.md §4, Deviations): a whole number of GiB, at least 1 — the
        runner evicts least-recently-used slices above it (they are a cache of control's append-only store). hasKey, not
        `default`: an explicit 0 is refused, never turned into the default and never "unbounded". */ -}}
 {{- $sliceCacheMaxGi := 32 -}}

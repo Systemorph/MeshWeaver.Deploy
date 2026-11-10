@@ -837,7 +837,7 @@ def safe_extract(tar_file: str, dest: str) -> None:
         tar.extractall(root, filter="data") if hasattr(tarfile, "data_filter") else tar.extractall(root)
 
 
-# ───────────── the host's slice cache is BOUNDED: a size cap and least-recently-used eviction (Plugins OneBuildTree §5) ─────
+# ───────────── the host's slice cache is BOUNDED: a size cap and least-recently-used eviction (Plugins OneBuildTree §4, Deviations) ─
 # `<cache>/module-slices/<repo>/<module>/<sha256>/` held every output any run ever handed over or fetched, and nothing ever
 # removed one: 117 GB on eiger on 2026-11-10, the node at DiskPressure and 18 build pods evicted. The slices are a CACHE of
 # the control instance's content-addressed store (append-only, never pruned): an evicted slice is fetched again by its hash
@@ -1039,7 +1039,7 @@ class ModuleHubBroker:
                  slice_cache: Optional[str] = None, build_tag: Optional[dict] = None) -> None:
         self.api, self.repo, self.sha, self.host, self.root = api, repo, sha, host, root
         # what the outputs were built AGAINST (the platform set, the framework identity), sent with every completion so the
-        # store's entry is TAGGED with it — its key stays the content hash (Plugins OneBuildTree §3)
+        # store's entry is TAGGED with it — its key stays the content hash (Plugins OneBuildTree §1, Binary store)
         self.build_tag = {k: v for k, v in (build_tag or {}).items() if isinstance(v, str) and v}
         self.fps, self.trunk, self.order, self.pr, self.log = fingerprints, trunk, order, pull_request, log
         self.sleep, self.clock = sleep, clock
