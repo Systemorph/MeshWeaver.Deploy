@@ -3098,7 +3098,12 @@ cat > "$KR/stubs/colima" <<'KEOF'
 echo "$*" >> "$KR_DIR/colima.log"
 case "$1" in
   status) [ "${KR_RUNNING:-yes}" = yes ] ;;
-  ssh) cat >/dev/null; printf '%s' "${KR_SSH-81G free of 98G}" ;;
+  ssh) cat >/dev/null
+       # KR_SSH_EMPTY_FIRST=N: the first N reads see no pods/ yet (kubelet still starting)
+       n=$(( $(grep -c '^ssh' "$KR_DIR/colima.log") ))
+       [ -n "${KR_SSH_ERR:-}" ] && { echo "$KR_SSH_ERR" >&2; exit 1; }
+       [ "$n" -le "${KR_SSH_EMPTY_FIRST:-0}" ] && exit 1
+       printf '%s' "${KR_SSH-81G free of 98G}" ;;
   *) exit 0 ;;
 esac
 KEOF
@@ -3130,6 +3135,23 @@ A="$(kr bash -c '. "$0"; colima_k3s_args "$1"' "$CLI" "$KR/colima/default/colima
   && case "$OUT" in *"portal and everything in it is DOWN"*"81G free of 98G"*) true ;; *) false ;; esac \
   && ok "kubelet-root apply adds the arg (one line, the rest untouched, a backup beside it), says the portal is down, restarts the VM and proves the data disk" \
   || bad "kubelet-root apply" "rc=$RC args=[$A] log=$(tr '\n' ' ' < "$KR/colima.log") $OUT"
+grep -q '^ssh -- sudo sh -c test -d /var/lib/rancher/kubelet/pods' "$KR/colima.log" \
+  && ok "kubelet-root apply reads the root-owned kubelet dir AS ROOT (an unprivileged test -d read 'permission denied' as absent — moench)" \
+  || bad "kubelet-root apply sudo" "$(grep '^ssh' "$KR/colima.log")"
+cp "$KR/old.yaml" "$KR/colima/default/colima.yaml"; rm -f "$KR/colima.log"
+OUT="$(KR_SSH_EMPTY_FIRST=2 MEMEX_KUBELET_ROOT_WAIT_S=0 kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" = 0 ] && [ "$(grep -c '^ssh -- sudo' "$KR/colima.log")" = 3 ] \
+  && ok "kubelet-root apply waits for kubelet to create pods/ instead of failing on the first read" \
+  || bad "kubelet-root apply wait" "rc=$RC $(grep -c '^ssh' "$KR/colima.log") reads $OUT"
+cp "$KR/old.yaml" "$KR/colima/default/colima.yaml"; rm -f "$KR/colima.log"
+OUT="$(KR_SSH_ERR='sudo: a password is required' MEMEX_KUBELET_ROOT_WAIT_TRIES=2 MEMEX_KUBELET_ROOT_WAIT_S=0 kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" != 0 ] && case "$OUT" in *"UNKNOWN"*"a password is required"*) true ;; *) false ;; esac && case "$OUT" in *"did not take the root-dir"*) false ;; *) true ;; esac \
+  && ok "a read that ERRORS is reported as unknown with its answer, never as 'kubelet did not take the root-dir'" \
+  || bad "kubelet-root apply read error" "rc=$RC $OUT"
+cp "$KR/old.yaml" "$KR/colima/default/colima.yaml"; rm -f "$KR/colima.log"
+OUT="$(MEMEX_KUBELET_ROOT_WAIT_TRIES=0 kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" = 0 ] && [ "$(grep -c '^ssh -- sudo' "$KR/colima.log")" = 1 ] \
+  && ok "MEMEX_KUBELET_ROOT_WAIT_TRIES=0 still reads once (no verdict without a read)" || bad "wait tries 0" "rc=$RC $OUT"
 cp "$KR/colima/default/colima.yaml" "$KR/after.yaml"; rm -f "$KR/colima.log"
 OUT="$(kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
 [ "$RC" = 0 ] && cmp -s "$KR/after.yaml" "$KR/colima/default/colima.yaml" && ! grep -qE '^(stop|start)' "$KR/colima.log" 2>/dev/null \
