@@ -2197,10 +2197,20 @@ fleet_apply_buildhost() {
   secrets="$dir/build"; mkdir -p "$secrets"; chmod 700 "$secrets"
   # the registry key and the registry URL go TOGETHER (first-attach's pass-both-or-neither): a key without the URL is left
   # out, so the attach degrades to the plain contract instead of failing
-  ( umask 077; cp "$dir/w" "$secrets/worker"; cp "$dir/p" "$secrets/pull"; if [ -s "$dir/k" ] && [ -n "$preg" ]; then cp "$dir/k" "$secrets/instance-key"; fi )
+  # 🚨 The registry bundle index (H8) stays OPT-IN (MEMEX_BUILDHOST_REGISTRY_BUNDLES=1): the registry serves the mixed
+  # AI package as an assemblies-only bundle, module-fetch refuses it ("carries no node definitions … must pack with
+  # --content"), and an H8 host never claims — measured on the first Mac (2026-11-07, first-attach.sh's header) and
+  # again on the second (2026-11-10), whose join passed the key by default and left it polling forever on
+  # "NOT claiming this cycle". Without it the host takes its plugins layer as the cluster hosts do.
+  local h8=""
+  if [ "${MEMEX_BUILDHOST_REGISTRY_BUNDLES:-0}" = 1 ] && [ -s "$dir/k" ] && [ -n "$preg" ]; then h8=1; fi
+  ( umask 077; cp "$dir/w" "$secrets/worker"; cp "$dir/p" "$secrets/pull"; if [ -n "$h8" ]; then cp "$dir/k" "$secrets/instance-key"; fi )
   local args=(--api "$api" --registry "$reg" --pull-user "$puser" --secrets-from "$secrets" --set-from latest)
-  if [ -s "$dir/k" ] && [ -n "$preg" ]; then args+=(--plugins-registry "$preg"); fi
-  if [ -s "$dir/k" ] && [ -z "$preg" ]; then
+  if [ -n "$h8" ]; then args+=(--plugins-registry "$preg"); fi
+  if [ -s "$dir/k" ] && [ -z "$h8" ]; then
+    info "build host: the registry bundle index stays off (assemblies-only AI bundle; MEMEX_BUILDHOST_REGISTRY_BUNDLES=1 opts in) — plugins layer as the cluster hosts take it"
+  fi
+  if [ "${MEMEX_BUILDHOST_REGISTRY_BUNDLES:-0}" = 1 ] && [ -s "$dir/k" ] && [ -z "$preg" ]; then
     warn "build host: the code carries a registry key but no pluginsRegistry fact — the key is left out and the host attaches with the plain plugins contract (declare Hosting:Enrolment:Facts:pluginsRegistry on control)"
   fi
   fleet_accept_argv first-attach
