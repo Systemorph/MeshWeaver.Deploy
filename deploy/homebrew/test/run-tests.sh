@@ -3265,6 +3265,29 @@ sed -n '/^cmd_fleet() {/,/^}/p' "$CLI" | sed -n '/^    join)/,/^      ;;/p' | gr
 OUT="$(env PATH="$HB/stubs:$PATH" HOME="$HB/home" MEMEX_LOCAL_HOME="$HB/home/.memex-local" "$CLI" fleet heartbeat --wait x 2>&1)" && bad "--wait x accepted" "$OUT" || ok "fleet heartbeat refuses a --wait that is not whole minutes"
 rm -rf "$HB"
 
+echo "── first-attach brings PyYAML when python3 has none (2026-11-10) ──────"
+PY="$(mktemp -d)"; mkdir -p "$PY/bin"; REALPY="$(command -v python3)"
+cat > "$PY/bin/python3" <<STUB
+#!/bin/bash
+if [ "\$1" = -c ] && [ "\$2" = 'import yaml' ]; then exit 1; fi
+if [ "\$1" = -m ] && [ "\$2" = venv ]; then
+  mkdir -p "\$3/bin"
+  printf '#!/bin/bash\nexit 0\n' > "\$3/bin/python3"
+  printf '#!/bin/bash\necho "\$*" >> "$PY/pip.log"\nexit 0\n' > "\$3/bin/pip"
+  chmod +x "\$3/bin/python3" "\$3/bin/pip"; exit 0
+fi
+exec "$REALPY" "\$@"
+STUB
+chmod +x "$PY/bin/python3"
+OUT="$(PATH="$PY/bin:$FAO/bin:$PATH" MEMEX_ATTACH_VENV="$PY/venv" MEMEX_HEADLESS=1 bash "$FA" "${FA_ARGS[@]}" --owner bob --owner-email bob@example.com </dev/null 2>&1)"
+grep -q "PyYAML for the attach" <<<"$OUT" && grep -q "install -q --disable-pip-version-check pyyaml" "$PY/pip.log" 2>/dev/null && ! grep -q "No module named 'yaml'" <<<"$OUT" \
+  && ok "first-attach creates a private venv with PyYAML when python3 lacks it (the second Mac Studio died at 0/6 without it)" \
+  || bad "first-attach pyyaml" "$(tail -c 700 <<<"$OUT") | pip: $(cat "$PY/pip.log" 2>/dev/null)"
+OUT2="$(PATH="$PY/bin:$FAO/bin:$PATH" MEMEX_ATTACH_VENV="$PY/venv" MEMEX_HEADLESS=1 bash "$FA" "${FA_ARGS[@]}" --owner bob --owner-email bob@example.com </dev/null 2>&1)"
+[ "$(grep -c pyyaml "$PY/pip.log")" = 1 ] && ! grep -q "PyYAML for the attach" <<<"$OUT2" \
+  && ok "…and reuses that venv on the next attach (no second install)" || bad "first-attach pyyaml reuse" "$(cat "$PY/pip.log")"
+rm -rf "$PY"
+
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
