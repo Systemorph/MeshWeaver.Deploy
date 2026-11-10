@@ -3455,8 +3455,16 @@ cmd_kubelet_root() {
       colima start || die "kubelet-root apply: colima start failed — the profile is edited ($y; the backup beside it); 'colima start' again"
       kubectl --context colima wait --for=condition=Ready node --all --timeout=300s >/dev/null \
         || warn "the k3s node is not Ready after 300 s — 'kubectl --context colima get nodes'"
-      local seen
-      seen="$(colima ssh -- sh -c "test -d ${KUBELET_ROOT_DIR}/pods && df -h ${KUBELET_ROOT_DIR} | tail -1 | awk '{print \$4\" free of \"\$2}'" 2>/dev/null </dev/null || true)"
+      # 🚨 The kubelet root is root-owned (0700): an unprivileged `test -d` answers "permission
+      # denied" and reads as absent although kubelet took the arg (moench, 2026-11-10). And kubelet
+      # creates pods/ only once it runs, a few seconds after the node turns Ready — so read it as
+      # root and give it a minute.
+      local seen="" tries=0
+      while [ -z "$seen" ] && [ "$tries" -lt "${MEMEX_KUBELET_ROOT_WAIT_TRIES:-12}" ]; do
+        [ "$tries" -eq 0 ] || sleep "${MEMEX_KUBELET_ROOT_WAIT_S:-5}"
+        tries=$((tries + 1))
+        seen="$(colima ssh -- sudo sh -c "test -d ${KUBELET_ROOT_DIR}/pods && df -h ${KUBELET_ROOT_DIR} | tail -1 | awk '{print \$4\" free of \"\$2}'" 2>/dev/null </dev/null || true)"
+      done
       [ -n "$seen" ] || die "kubelet-root apply: the VM restarted but ${KUBELET_ROOT_DIR}/pods does not exist — kubelet did not take the root-dir; 'colima ssh -- ps -ef | grep k3s' shows its args"
       ok "kubelet's root is ${KUBELET_ROOT_DIR} on the data disk: ${seen}"
       step "Waiting for the portal to come back"
