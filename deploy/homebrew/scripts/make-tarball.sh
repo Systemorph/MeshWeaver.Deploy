@@ -24,8 +24,19 @@ repo="$(cd "$here/../../.." && pwd)"
 mkdir -p "$(dirname "$out")"
 # `gzip -n` omits the timestamp so the same tree yields the same bytes — the sha256 the formula
 # pins is then a statement about CONTENT, and a re-run of the publish step is a no-op.
+# 🚨 The archived directories are READ FROM THE FORMULA's install lines, never listed here: a fixed
+# list (deploy/homebrew deploy/helm) silently dropped deploy/backlease when the formula started
+# installing it, so every tap install lacked first-attach.sh and `fleet join` skipped the build
+# host on the second Mac Studio (2026-11-10) — a warn line on a join that otherwise succeeded.
+formula="$repo/deploy/homebrew/Formula/memex-local.rb"
+dirs=()
+while IFS= read -r d; do [ -n "$d" ] && dirs+=("$d"); done \
+  < <(grep -oE 'Dir\["deploy/[A-Za-z0-9_.-]+' "$formula" | sed 's/^Dir\["//' | sort -u)
+for d in deploy/homebrew deploy/helm; do
+  printf '%s\n' "${dirs[@]}" | grep -qxF "$d" || dirs+=("$d")
+done
 git -C "$repo" archive --format=tar --prefix="memex-local-${version}/" "$ref" \
-  deploy/homebrew deploy/helm | gzip -n > "$out"
+  "${dirs[@]}" | gzip -n > "$out"
 
 # A tarball that does not carry the CLI is a green step that installs nothing — assert the one
 # file everything else depends on is inside, never "tar exited 0".
@@ -37,4 +48,10 @@ if ! grep -qxF "memex-local-${version}/deploy/homebrew/bin/memex-local" <<<"$ent
   echo "tarball $out does not contain deploy/homebrew/bin/memex-local" >&2
   exit 1
 fi
+# …and every directory the formula installs from is IN it (an empty Dir[] installs nothing, quietly).
+for d in "${dirs[@]}"; do
+  grep -qE "^memex-local-${version}/${d}/." <<<"$entries" || { echo "tarball $out carries nothing under $d, which the formula installs" >&2; exit 1; }
+done
+grep -qxF "memex-local-${version}/deploy/backlease/first-attach.sh" <<<"$entries" \
+  || { echo "tarball $out does not contain deploy/backlease/first-attach.sh (fleet join's build-host attach)" >&2; exit 1; }
 printf '%s\n' "$out"

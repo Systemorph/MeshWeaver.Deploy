@@ -3265,6 +3265,23 @@ sed -n '/^cmd_fleet() {/,/^}/p' "$CLI" | sed -n '/^    join)/,/^      ;;/p' | gr
 OUT="$(env PATH="$HB/stubs:$PATH" HOME="$HB/home" MEMEX_LOCAL_HOME="$HB/home/.memex-local" "$CLI" fleet heartbeat --wait x 2>&1)" && bad "--wait x accepted" "$OUT" || ok "fleet heartbeat refuses a --wait that is not whole minutes"
 rm -rf "$HB"
 
+echo "── the tap tarball carries every directory the formula installs (2026-11-10) ──────"
+TB="$(mktemp -d)"
+if out="$(bash "$HERE/../../../deploy/homebrew/scripts/make-tarball.sh" 0.0.0-test "$TB/t.tar.gz" HEAD 2>&1)"; then
+  E="$(tar -tzf "$TB/t.tar.gz")"
+  grep -qxF "memex-local-0.0.0-test/deploy/backlease/first-attach.sh" <<<"$E" \
+    && ok "the tarball ships deploy/backlease/first-attach.sh (fleet join's build-host attach skipped without it on the second Mac Studio)" \
+    || bad "tarball backlease" "$(grep -c '' <<<"$E") entries, no first-attach.sh"
+  miss=""
+  for d in $(grep -oE 'Dir\["deploy/[A-Za-z0-9_.-]+' "$HERE/../../../deploy/homebrew/Formula/memex-local.rb" | sed 's/^Dir\["//' | sort -u); do
+    grep -qE "^memex-local-0.0.0-test/$d/." <<<"$E" || miss="$miss $d"
+  done
+  [ -z "$miss" ] && ok "every Dir[] the formula installs from is in the tarball" || bad "tarball dirs" "missing:$miss"
+else
+  bad "make-tarball" "$out"
+fi
+rm -rf "$TB"
+
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
