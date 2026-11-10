@@ -318,7 +318,30 @@ memex-local fleet join --control https://<control-instance> --id studio-2
    `update` pulls the **public GHCR** images anonymously, so no `az login` is needed (`--from-acr`
    still works).
 
+6. It **waits for this Mac's first heartbeat** (bounded: `--heartbeat-wait <min>`, default 20; `0` skips;
+   `memex-local fleet heartbeat` waits again later). The heartbeat ships in the Hosting module, which the
+   default install lands *after* the update — and a landed module loads only at the next process start
+   (`[DefaultInstall] … MODULE SET proposed: sequence N — the landed modules load at the next restart`). So
+   when that line names Hosting, the join restarts the portal **once** itself, then ends on
+   `ok heartbeat posted to https://<control>/api/hooks/Hosting/Heartbeats HTTP 200`. A registry plan
+   that refuses Hosting (`Hosting needs plan tier enterprise, this instance is on free`) stops the join
+   at once with that cause and its remedy (raise the instance's plan on the registry, or register with
+   a key minted for that plan), never a wait that cannot end. Measured on the second Mac Studio
+   (2026-11-10): before this, no heartbeat left the Mac until a person ran `kubectl rollout restart`.
+
 `memex-local fleet status` shows the join and both fingerprints.
+
+**Kubelet's root lives on the VM's data disk.** A Colima VM has a ~19 GiB root disk and a large data disk
+at `/var/lib/rancher`. k3s puts kubelet's root (its "nodefs", what the node — and the Hosting heartbeat's
+`vm.diskFreeGi` — reports as its disk) on the root disk unless told otherwise, and control's placement
+(`minDiskGi: 20`) then refuses the Mac (the second Mac Studio reported 15.7). `up` therefore starts a NEW
+portal VM with `--k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet`,
+exactly as `buildhost apply` always started the build VM (both args, because a `--k3s-arg` replaces
+colima's default list). An EXISTING VM keeps its root disk: `fleet join`, `doctor` and `verify` warn about
+it, and `memex-local kubelet-root apply` repairs it — it adds the arg to `~/.colima/default/colima.yaml`
+(a backup beside it), restarts the VM (the portal is down for a few minutes; the database volume lives
+under `/var/lib/rancher` and is kept), and proves `/var/lib/rancher/kubelet/pods` exists afterwards.
+It is idempotent; `kubelet-root status` reports.
 
 **A fleet Mac's template carries the Hosting app.** In registry mode, a joined (`fleet join`) or
 back-leased (`backlease enroll`) Mac layers `share/values.local.fleet-host.yaml`. That layer names
@@ -479,7 +502,7 @@ rolled in place; the **migration** is re-run as a Job (it has no Deployment).
 | Doc section | Manual step | CLI implementation (function in `bin/memex-local`) |
 |---|---|---|
 | §1 Prerequisites | `brew install colima kubectl helm mkcert ollama socket_vmnet` + .NET SDK | Formula `depends_on`; `preflight()` re-checks at runtime |
-| §2 Colima k3s | `colima start --kubernetes --cpu 8 --memory 16`; verify context/node | `start_colima()` |
+| §2 Colima k3s | `colima start --kubernetes --cpu 8 --memory 16 --k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet`; verify context/node; warn when an existing VM lacks root-dir | `start_colima()`, `cmd_kubelet_root()` |
 | §3 Image (A) | pull multi-arch from ACR, verify `arm64` in manifest, retag | `image_pull_acr()` (`up --from-acr`) |
 | §3 Image (B) | `dotnet publish -t:PublishContainer` portal+migration, `docker tag` to chart name | `image_build_local()` (default) |
 | §4 Helm | `helm upgrade --install memex deploy/helm -f values.yaml -f overlay -n memex` | `helm_deploy()` + `ensure_overlay()` |

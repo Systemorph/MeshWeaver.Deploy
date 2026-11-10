@@ -102,9 +102,18 @@ traffic inside the VM with Linux `tc`, so nothing on the Mac or the router needs
 | Marking | DSCP CS1 (lower effort) on every internet-bound packet, for routers and Wi-Fi that honour it |
 | Exempt | the VM's on-link subnet: the Mac itself (gateway, port forwards, kube API) |
 
-The cap is `MEMEX_NET_SHARE_PCT` (default 25) percent of the link in each direction. The link is measured
-ONCE with macOS `networkQuality`, which fills the line for about 20 s, and recorded in
-`~/.memex-local/netshape-<profile>.env`; a second profile reuses the first one's measurement. The owner declares
+The cap is `MEMEX_NET_SHARE_PCT` (default 25) percent of the link in each direction, never below
+`MEMEX_NET_MIN_KBIT` (default 2000) when it is derived from a measurement. The link is measured ONCE per Mac
+with macOS `networkQuality`, **per direction** (`-d` upload only, `-u` download only, up to 15 s each),
+`MEMEX_NET_SAMPLES` (default 3) times, and the **median** of each direction is recorded in
+`~/.memex-local/netshape-<profile>.env` together with the raw samples (a comment line, also printed); a
+second profile reuses the first one's measurement. A record whose uplink is under 1/50 of its downlink is
+no real line's shape (ADSL is ~1:16, DOCSIS ~1:20) and is re-measured instead of reused. Why: on the
+second Mac Studio (2026-11-10) ONE combined sequential run (`networkQuality -s -M 25`) recorded
+370 kbit/s up and 237972 kbit/s down on a fibre line, and the 256 kbit/s floor of the time capped the
+build VM's uploads at 256 kbit/s. The cause of that one bad reading was not established (the same
+command measured 306 Mbit/s up on another Mac's line); the median, the per-direction budget, the
+plausibility check and the floor make the cap robust to it whatever it was. The owner declares
 the caps instead with `MEMEX_NET_UP_KBIT` / `MEMEX_NET_DOWN_KBIT` (0 = no cap in that direction; the marking
 stays). In the VM the shaper is `/usr/local/sbin/mw-netshape` under the systemd unit `mw-netshape.service`, so it
 survives a VM restart.
