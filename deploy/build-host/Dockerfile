@@ -46,7 +46,7 @@ RUN set -eu \
  && fetch /src/deploy "$DEPLOY_REPO" "$DEPLOY_COMMIT" \
  && fetch /src/platform "$PLATFORM_REPO" "$PLATFORM_COMMIT" \
  && mkdir -p /out/scripts \
- && cp /src/deploy/.github/scripts/build-run.py /src/deploy/deploy/build-host/host-postgres.sh /out/scripts/ \
+ && cp /src/deploy/.github/scripts/build-run.py /src/deploy/deploy/build-host/host-postgres.sh /src/deploy/deploy/build-host/apt-mirrors.sh /out/scripts/ \
  && for f in compose-gate-host.sh sandbox-postgres.sh module-build-key.py node-repo-scope.py ci-artifact-store.py compile-check.py; do \
       [ -s "/src/platform/.github/scripts/$f" ] || { echo "the platform at $PLATFORM_COMMIT has no .github/scripts/$f"; exit 1; }; \
       cp "/src/platform/.github/scripts/$f" /out/scripts/; \
@@ -96,6 +96,16 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0
 # extension line the CI runners' shared server and the developer container run (pgvector/pgvector:pg17);
 # the base image's distribution ships an older major and pgvector 0.6.
 ARG PG_MAJOR=17
+# Every Ubuntu source is a MIRROR LIST before the first apt-get, never the base image's one host
+# (apt-mirrors.sh; MeshWeaver.Deploy#235: five amd64 builds in a row sat out the job's 30-minute cap
+# in connect timeouts against archive.ubuntu.com while arm64, on another host, passed). amd64 asks the
+# cloud's regional mirror first; every list falls back to Canonical's host and an independent mirror,
+# and every index is still verified against the image's Ubuntu keyring. The self-test's negative
+# control is the base image's own sources, refused; `apply` ends in `check`, so an image left on one
+# host fails its BUILD.
+COPY --from=sources /out/scripts/apt-mirrors.sh /opt/build-host/apt-mirrors.sh
+RUN bash /opt/build-host/apt-mirrors.sh --self-test \
+ && bash /opt/build-host/apt-mirrors.sh apply
 # jq: core's MeshWeaver.Documentation.Test runs the publication workflow's own `run:` steps
 # (PluginPublicationProvenanceTest), and those steps call jq exactly as they do on Actions' ubuntu
 # runner, which ships it. Without it a host's shard 7 was RED on 11 tests (`step.sh: jq: command not

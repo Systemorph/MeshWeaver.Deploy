@@ -153,6 +153,9 @@ jobs:
         run: python3 deploy/.github/scripts/build-host-announcement.py --self-test
       - name: The runner's platform reading can say no (self-test)
         run: python3 deploy/.github/scripts/build-host-platforms.py --self-test
+      # The image's Ubuntu sources are mirror lists, never one host (#235); the build runs it again.
+      - name: The apt sources can say no (self-test)
+        run: bash deploy/deploy/build-host/apt-mirrors.sh --self-test
       # The publishing identity holds AcrPush on the registry resource ONLY. Hold this lane to it:
       # every azure/login tenant-level, every registry call on the data plane (no ARM lookup).
       - name: The registry is reached as a resource-scoped identity can (self-test + this lane)
