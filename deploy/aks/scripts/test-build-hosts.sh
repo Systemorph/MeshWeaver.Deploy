@@ -233,6 +233,8 @@ for ch, (tester, portal, runner, mx, pv, mn) in want.items():
         problems.append(f"{ch}: BUILD_TOKEN_FILE is not /run/build-worker/token")
     if env.get("MW_BUILD_STAGE_SLOTS", {}).get("value") != "8":
         problems.append(f"{ch}: MW_BUILD_STAGE_SLOTS is not the chart's default 8 (fan-out): {env.get('MW_BUILD_STAGE_SLOTS')}")
+    if env.get("MW_BUILD_SLICE_CACHE_MAX_GIB", {}).get("value") != "32":
+        problems.append(f"{ch}: MW_BUILD_SLICE_CACHE_MAX_GIB is not the chart's default bound 32 (the slice cache): {env.get('MW_BUILD_SLICE_CACHE_MAX_GIB')}")
     if pod.get("terminationGracePeriodSeconds") != 7200 or env.get("MW_BUILD_RUN_DEADLINE_SECONDS", {}).get("value") != "7200":
         problems.append(f"{ch}: terminationGracePeriodSeconds / the run deadline are not the same 7200 s (the default run budget)")
     if build.get("securityContext", {}).get("seccompProfile", {}) != {"type": "Unconfined"}:
@@ -818,6 +820,8 @@ for entry in \
   "values.build-hosts-run-deadline-zero.yaml|RUN budget" \
   "values.build-hosts-stage-slots-zero.yaml|buildHosts.stageSlots 0 must be within" \
   "values.build-hosts-stage-slots-fraction.yaml|buildHosts.stageSlots 2.9 must be a whole number" \
+  "values.build-hosts-slice-cache-zero.yaml|buildHosts.sliceCacheMaxGi 0 must be within" \
+  "values.build-hosts-slice-cache-fraction.yaml|buildHosts.sliceCacheMaxGi 1.5 must be a whole number" \
   "values.build-hosts-alias-twice.yaml|an alias is ONE version" \
   "values.build-hosts-version-twice.yaml|one deployment per version" \
   "values.build-hosts-bad-version.yaml|must be MAJOR.MINOR.PATCH" \

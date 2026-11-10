@@ -129,6 +129,19 @@ The refusals, and why each one exists:
 {{- if or (lt $stageSlots 1) (gt $stageSlots 32) -}}
 {{- fail (printf "buildHosts.stageSlots %d must be within [1, 32] — how many of one run's stages a host runs at once (1 = serial)" $stageSlots) -}}
 {{- end -}}
+{{- /* The module-slice cache's BOUND (MeshWeaver.Plugins Hosting/OneBuildTree.md §5): a whole number of GiB, at least 1 — the
+       runner evicts least-recently-used slices above it (they are a cache of control's append-only store). hasKey, not
+       `default`: an explicit 0 is refused, never turned into the default and never "unbounded". */ -}}
+{{- $sliceCacheMaxGi := 32 -}}
+{{- if hasKey $b "sliceCacheMaxGi" -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $b.sliceCacheMaxGi)) -}}
+{{- fail (printf "buildHosts.sliceCacheMaxGi %v must be a whole number of GiB within [1, 4096] — the bound of the host's module-slice cache" $b.sliceCacheMaxGi) -}}
+{{- end -}}
+{{- $sliceCacheMaxGi = int $b.sliceCacheMaxGi -}}
+{{- end -}}
+{{- if or (lt $sliceCacheMaxGi 1) (gt $sliceCacheMaxGi 4096) -}}
+{{- fail (printf "buildHosts.sliceCacheMaxGi %d must be within [1, 4096] — the bound of the host's module-slice cache" $sliceCacheMaxGi) -}}
+{{- end -}}
 {{- $sb := ($b.sandbox | default dict) -}}
 {{- $sandbox := dict "seccompProfile" ($sb.seccompProfile | default "") "seccompLocalhostProfile" ($sb.seccompLocalhostProfile | default "")
       "appArmorProfile" ($sb.appArmorProfile | default "") "appArmorLocalhostProfile" ($sb.appArmorLocalhostProfile | default "")
@@ -323,7 +336,7 @@ The refusals, and why each one exists:
       "orasImage" (required "buildHosts.orasImage is required" $b.orasImage)
       "nodeSelector" $nodeSelector "tolerations" $tolerations
       "resources" ($b.resources | default dict) "workSizeLimit" ($b.workSizeLimit | default "60Gi")
-      "runDeadline" $runDeadline "stageSlots" $stageSlots
+      "runDeadline" $runDeadline "stageSlots" $stageSlots "sliceCacheMaxGi" $sliceCacheMaxGi
       "warmWorkspace" (eq (toString ($b.warmWorkspace | default false)) "true")
       "moduleHub" (eq (toString ($b.moduleHub | default false)) "true")
       "sharedTree" (eq (toString ($b.sharedTree | default false)) "true")

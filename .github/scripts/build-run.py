@@ -172,6 +172,8 @@ Environment (rendered by the chart from `buildHosts.*`):
   MW_BUILD_GIT_BASE            clone base                                  default https://github.com/Systemorph
   MW_BUILD_IDLE_SECONDS        sleep after a 204                           default 15
   MW_BUILD_RUN_DEADLINE_SECONDS  the whole run's deadline (= the pod's grace) default 3600
+  MW_BUILD_SLICE_CACHE_MAX_GIB  the bound of <cache>/module-slices, GiB; least-recently-used slices above it are
+                               evicted (a cache of control's append-only module store)   default 32
   MW_BUILD_STAGE_SLOTS         how many of a `parallel` run's stages run at once  default 1 (serial); the host
                                refuses to START when its cgroup cannot give each slot 1 CPU and 2 GiB, or
                                when neither the cgroup v2 nor the v1 limits can be read (more than 1 slot)
@@ -835,6 +837,154 @@ def safe_extract(tar_file: str, dest: str) -> None:
         tar.extractall(root, filter="data") if hasattr(tarfile, "data_filter") else tar.extractall(root)
 
 
+# ───────────── the host's slice cache is BOUNDED: a size cap and least-recently-used eviction (Plugins OneBuildTree §5) ─────
+# `<cache>/module-slices/<repo>/<module>/<sha256>/` held every output any run ever handed over or fetched, and nothing ever
+# removed one: 117 GB on eiger on 2026-11-10, the node at DiskPressure and 18 build pods evicted. The slices are a CACHE of
+# the control instance's content-addressed store (append-only, never pruned): an evicted slice is fetched again by its hash
+# on its next Hit, so eviction loses no version. Bound: MW_BUILD_SLICE_CACHE_MAX_GIB (chart buildHosts.sliceCacheMaxGi).
+# Each entry records its size (`.bytes`) and its last use (the mtime of `.complete`, touched on every Hit); a reader holds
+# a SHARED flock on the entry's sibling lock (`<sha256>.lock`) while it copies, and the evictor takes it EXCLUSIVE and
+# non-blocking, so an entry being read is never removed under its reader.
+SLICE_CACHE_MAX_ENV = "MW_BUILD_SLICE_CACHE_MAX_GIB"
+SLICE_CACHE_DEFAULT_GIB = 32.0
+SLICE_CACHE_MIN_AGE = 600.0          # seconds: an entry used this recently is never evicted (a run is about to read it)
+SLICE_CACHE_LOW_WATER = 0.9          # evict down to this fraction of the cap, so the next hand-over does not evict again
+SLICE_STAGING_MAX_AGE = 86400.0      # a staging directory a killed process left behind is removed after a day
+
+
+def slice_cache_cap(env: dict) -> int:
+    """The slice cache's bound in bytes: MW_BUILD_SLICE_CACHE_MAX_GIB (a positive number), else the default. A value that
+    is not a positive number is the DEFAULT, never unbounded. Pure."""
+    try:
+        gib = float((env.get(SLICE_CACHE_MAX_ENV) or "").strip() or SLICE_CACHE_DEFAULT_GIB)
+    except ValueError:
+        gib = SLICE_CACHE_DEFAULT_GIB
+    if not 0 < gib <= 1 << 20:                                 # NaN, zero, negative and infinity alike: the default
+        gib = SLICE_CACHE_DEFAULT_GIB
+    return int(gib * (1 << 30))
+
+
+def _tree_bytes(path: str) -> int:
+    total = 0
+    for d, _ds, fs in os.walk(path, onerror=lambda e: None):
+        for f in fs:
+            try:
+                total += os.lstat(os.path.join(d, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def slice_entry_bytes(entry: str) -> int:
+    """An entry's size: its recorded `.bytes`, else measured once and recorded. Never raises."""
+    try:
+        with open(os.path.join(entry, ".bytes")) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        pass
+    n = _tree_bytes(entry)
+    try:
+        with open(os.path.join(entry, ".bytes"), "w") as fh:
+            fh.write(str(n))
+    except OSError:
+        pass
+    return n
+
+
+def slice_cache_entries(root: str) -> list:
+    """Every COMPLETE entry under `root` as (last use, bytes, entry dir, lock path), oldest use first. Never raises."""
+    out = []
+    for repo in _listdir(root):
+        if repo.startswith("."):
+            continue
+        for module in _listdir(os.path.join(root, repo)):
+            mdir = os.path.join(root, repo, module)
+            for name in _listdir(mdir):
+                entry = os.path.join(mdir, name)
+                if not re.fullmatch(r"[0-9a-f]{64}", name) or os.path.islink(entry):
+                    continue
+                try:
+                    used = os.stat(os.path.join(entry, ".complete")).st_mtime
+                except OSError:
+                    continue                                   # not complete: a put still renaming, or a broken entry
+                out.append((used, slice_entry_bytes(entry), entry, entry + ".lock"))
+    out.sort()
+    return out
+
+
+def _listdir(path: str) -> list:
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        return []
+
+
+def bound_slice_cache(root: str, cap: int, log: Callable[[str], None], now: Optional[float] = None,
+                      min_age: float = SLICE_CACHE_MIN_AGE) -> "tuple[int, int]":
+    """Keep `root` (the host's slice cache) at or under `cap` bytes: when it is over, evict the least-recently-used complete
+    entries — none used in the last `min_age` seconds, none whose lock a reader holds — down to SLICE_CACHE_LOW_WATER of the
+    cap; and remove staging directories older than a day. One evictor at a time per cache (`.bound.lock`, non-blocking: a
+    second one skips). An entry is renamed out of the tree under its exclusive lock, then deleted. Returns (entries evicted,
+    bytes held afterwards). Never raises."""
+    import fcntl
+    now = time.time() if now is None else now
+    if not os.path.isdir(root):
+        return 0, 0
+    guard = _try_lock(os.path.join(root, ".bound.lock"), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if guard is None:
+        return 0, -1                                           # another evictor is at work on this cache
+    try:
+        for repo in _listdir(root):
+            for module in ([] if repo.startswith(".") else _listdir(os.path.join(root, repo))):
+                for name in _listdir(os.path.join(root, repo, module)):
+                    if ".staging-" in name:
+                        stg = os.path.join(root, repo, module, name)
+                        try:
+                            if now - os.lstat(stg).st_mtime > SLICE_STAGING_MAX_AGE:
+                                _rm_tree(stg)
+                        except OSError:
+                            pass
+        for name in _listdir(root):
+            if name.startswith(".evicted-"):
+                _rm_tree(os.path.join(root, name))             # an eviction a killed process did not finish
+        entries = slice_cache_entries(root)
+        total = sum(e[1] for e in entries)
+        if total <= cap:
+            return 0, total
+        target = int(cap * SLICE_CACHE_LOW_WATER)
+        before, evicted, freed = total, 0, 0
+        for used, size, entry, lock in entries:
+            if total <= target:
+                break
+            if now - used < min_age:
+                continue
+            fh = _try_lock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if fh is None:
+                continue                                       # a reader is copying it: kept, the next one is tried
+            try:
+                gone = os.path.join(root, f".evicted-{os.getpid()}-{threading.get_ident()}-{evicted}")
+                try:
+                    os.rename(entry, gone)
+                except OSError:
+                    continue
+                try:
+                    os.remove(lock)
+                except OSError:
+                    pass
+            finally:
+                fh.close()
+            _rm_tree(gone)
+            total -= size
+            freed += size
+            evicted += 1
+        log(f"slice cache: {len(entries)} entries, {before / (1 << 30):.1f} GiB over the bound of {cap / (1 << 30):.1f} GiB "
+            f"({SLICE_CACHE_MAX_ENV}) — evicted the {evicted} least recently used ({freed / (1 << 30):.1f} GiB); "
+            f"{total / (1 << 30):.1f} GiB held{'' if total <= cap else ' — STILL OVER: every remaining entry is in use or younger than ' + str(int(min_age)) + ' s'}")
+        return evicted, total
+    finally:
+        guard.close()
+
+
 class ModuleHubBroker:
     """The host side of a stage's module-hub requests. Identity — fingerprint, lane, commit, order, holder — is the HOST's;
     the stage only names modules and hands over the output directory the broker assigned.
@@ -850,8 +1000,11 @@ class ModuleHubBroker:
     def __init__(self, api: "Api", repo: str, sha: str, host: str, root: str, fingerprints: dict, trunk: bool,
                  order: int, pull_request: Optional[int], log: Callable[[str], None],
                  sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
-                 slice_cache: Optional[str] = None) -> None:
+                 slice_cache: Optional[str] = None, build_tag: Optional[dict] = None) -> None:
         self.api, self.repo, self.sha, self.host, self.root = api, repo, sha, host, root
+        # what the outputs were built AGAINST (the platform set, the framework identity), sent with every completion so the
+        # store's entry is TAGGED with it — its key stays the content hash (Plugins OneBuildTree §3)
+        self.build_tag = {k: v for k, v in (build_tag or {}).items() if isinstance(v, str) and v}
         self.fps, self.trunk, self.order, self.pr, self.log = fingerprints, trunk, order, pull_request, log
         self.sleep, self.clock = sleep, clock
         self.utcnow = lambda: datetime.datetime.now(datetime.timezone.utc)
@@ -980,24 +1133,27 @@ class ModuleHubBroker:
         hexd = output_hash.split(":", 1)[-1]
         if not re.fullmatch(r"[0-9a-f]{64}", hexd):
             return {"verdict": "Failed", "why": f"the hub names an output that is no sha256 ({output_hash!r})"}
-        cached = self._cached(module, hexd)
-        source = "from this host's slice cache"
-        if cached is None:
-            tmp = os.path.join(self.priv, f"{module}.tar")
-            status, why = self.api.download(self._path(module, f"/outputs/{hexd}"), tmp, timeout=600)
-            if status != 200:
-                return {"verdict": "Failed", "why": f"the output {hexd[:12]} could not be fetched ({status}: {why})"}
-            if _sha256_file(tmp) != hexd:
-                return {"verdict": "Failed", "why": f"the fetched output does not hash to {hexd[:12]} — refused"}
-            cached = self._cache_put(module, hexd, tmp)
-            os.remove(tmp)
-            source = "fetched from the hub's store"
-        if cached is None:
-            return {"verdict": "Failed", "why": "the output could not be extracted"}
         dest = os.path.join(self.out, "outputs", module)
-        shutil.rmtree(dest, ignore_errors=True)
-        shutil.copytree(cached, dest, symlinks=False, ignore=shutil.ignore_patterns(".complete"))
-        return {"verdict": "Hit", "seq": seq, "outputHash": hexd, "outputDir": dest, "source": source}
+        if self._copy_cached(module, hexd, dest):
+            return {"verdict": "Hit", "seq": seq, "outputHash": hexd, "outputDir": dest, "source": "from this host's slice cache"}
+        # a COLD host fills from the one store: the content-addressed output, verified against its hash, then cached
+        tmp = os.path.join(self.priv, f"{module}.tar")
+        status, why = self.api.download(self._path(module, f"/outputs/{hexd}"), tmp, timeout=600)
+        if status != 200:
+            return {"verdict": "Failed", "why": f"the output {hexd[:12]} could not be fetched ({status}: {why})"}
+        if _sha256_file(tmp) != hexd:
+            return {"verdict": "Failed", "why": f"the fetched output does not hash to {hexd[:12]} — refused"}
+        cached = self._cache_put(module, hexd, tmp)
+        if cached is None or not self._copy_cached(module, hexd, dest):
+            # the bound evicted it between the put and the copy (or the cache is unwritable): served from the download
+            shutil.rmtree(dest, ignore_errors=True)
+            try:
+                safe_extract(tmp, dest)
+            except (Refusal, OSError) as e:
+                os.remove(tmp)
+                return {"verdict": "Failed", "why": f"the output could not be extracted ({str(e)[:160]})"}
+        os.remove(tmp)
+        return {"verdict": "Hit", "seq": seq, "outputHash": hexd, "outputDir": dest, "source": "fetched from the hub's store"}
 
     def _cache_dir(self, module: str, hexd: str) -> str:
         return os.path.join(self.slice_cache or os.path.join(self.priv, "slices"), self.repo, module, hexd)
@@ -1005,6 +1161,30 @@ class ModuleHubBroker:
     def _cached(self, module: str, hexd: str) -> Optional[str]:
         d = self._cache_dir(module, hexd)
         return d if os.path.isfile(os.path.join(d, ".complete")) else None
+
+    def _copy_cached(self, module: str, hexd: str, dest: str) -> bool:
+        """Copy a complete cached slice to `dest` holding its SHARED lock (the bound never evicts it meanwhile) and mark it
+        used (the `.complete` mtime the LRU reads). False when the cache does not hold it."""
+        import fcntl
+        d = self._cache_dir(module, hexd)
+        fh = _try_lock(d + ".lock", fcntl.LOCK_SH)
+        if fh is None:
+            return False
+        try:
+            if not os.path.isfile(os.path.join(d, ".complete")):
+                return False
+            shutil.rmtree(dest, ignore_errors=True)
+            shutil.copytree(d, dest, symlinks=False, ignore=shutil.ignore_patterns(".complete", ".bytes"))
+            try:
+                os.utime(os.path.join(d, ".complete"))
+            except OSError:
+                pass
+            return True
+        except OSError:
+            shutil.rmtree(dest, ignore_errors=True)
+            return False
+        finally:
+            fh.close()
 
     def _cache_put(self, module: str, hexd: str, tar: str) -> Optional[str]:
         """Extract a VERIFIED output into the (host-only) slice cache atomically: staging renamed into place."""
@@ -1014,6 +1194,8 @@ class ModuleHubBroker:
         staging = f"{final}.staging-{os.getpid()}-{threading.get_ident()}"
         shutil.rmtree(staging, ignore_errors=True)
         safe_extract(tar, staging)
+        with open(os.path.join(staging, ".bytes"), "w") as fh:
+            fh.write(str(_tree_bytes(staging)))
         with open(os.path.join(staging, ".complete"), "w") as fh:
             fh.write(hexd)
         os.makedirs(os.path.dirname(final), exist_ok=True)
@@ -1031,7 +1213,9 @@ class ModuleHubBroker:
         until = self.lease_until.get(module)
         if until is not None and self.utcnow() >= until - datetime.timedelta(seconds=MODULE_HUB_LEASE_MARGIN):
             return {"accepted": False, "succeeded": False, "why": f"the lease ended at {until.isoformat()} — nothing was handed over"}
-        body = {"holder": self.host, "seq": seq, "fingerprint": fp, "succeeded": False, "error": str(done.get("error") or "the stage reported a failure")[:2000]}
+        # the tag FIRST: a tag key can never override the host's identity fields; the success branch below only updates
+        body = {**self.build_tag, "holder": self.host, "seq": seq, "fingerprint": fp, "succeeded": False,
+                "error": str(done.get("error") or "the stage reported a failure")[:2000]}
         if done.get("succeeded") is True:
             staged = os.path.join(self.priv, f"stage-{module}")
             refused = self._copy_output_private(module, staged)
@@ -3406,8 +3590,9 @@ def _update_mirror(repo: str, url: str, mirror_root: str, mirror: str, wanted: l
 # · "we can even have one master checkout" · "and then worktree per deployment". With MW_BUILD_WARM_WORKSPACE=true:
 #   * the MASTER is the host's bare mirror per repository, `<cache>/git/<repo>.git` (`_update_mirror`), written only by
 #     `git fetch`; ONE master lock (`master_lock`, the mirror's flock) serialises fetch, `git worktree add`, `remove`, `prune`;
-#   * ONE persistent worktree per repository per DEPLOYMENT (the host's lane plus its `warm_key`):
-#     `<cache>/deploy/<deployment>/<repo>`, a `git worktree add --detach` of the master. Its single WRITER (an exclusive,
+#   * ONE persistent worktree per repository per HOST, kept across platform updates (Plugins Hosting/OneBuildTree.md):
+#     `<cache>/deploy/<channel>-tree/<repo>`, a `git worktree add --detach` of the master. A new BUILD IDENTITY (`warm_key`:
+#     a platform update, a new SDK) rebuilds that same tree WHOLE in place; a runner roll rebuilds nothing. Its single WRITER (an exclusive,
 #     NON-blocking flock on the tree's lock — taken only while no reader holds it) advances it IN PLACE while idle:
 #     `checkout --detach -f <tip>` (only changed files are rewritten), `clean` keeping obj/ and bin/, the tip's `warmBuild`,
 #     then the integrity manifest and the state, before the lock is released. A failed build leaves it "not built";
@@ -3426,79 +3611,51 @@ TREE_SAMPLE = 32
 PLATFORM_REPO = "MeshWeaver"
 
 
-# What in THIS runner changes a build's output is keyed MECHANICALLY: the source of the functions that decide how a warm
-# tree or a module output is built — the sandbox (argv, env, allow-list), the trees' layout and advance, the platform
-# views, the module fingerprints — hashed (`runner_build_code`), so a change to any of them re-keys without anyone
-# remembering to, and a change anywhere else in this file re-keys nothing. WARM_LAYOUT is for an output-shaping change
-# OUTSIDE those functions (rare; bump it then). Never the image digest — that moved on every merge to this repository and
-# threw every warm tree and module output away (eiger 2026-11-09: 50 rolls in a day, no warm run).
-WARM_LAYOUT = "2026-11-10.1"
+# ONE TREE, kept across core updates (Plugins Hosting/OneBuildTree.md, maintainer 2026-11-10: "we can keep the tree stable
+# even across the core updates ==> it is like updating nuget packages" · "updating core means updating the compiler" · "we
+# always ever need one tree, in case of platform update, we need whole rebuild"). The tree's DIRECTORY is named by the host's
+# lane alone (`deployment_name`), so neither a new platform set, a new image digest nor a runner roll starts a second tree.
+# What the tree's obj/ and bin/ were built BY is its BUILD IDENTITY (`warm_key`), recorded in the tree's state: a different
+# identity is a COMPILER change and the writer rebuilds the whole tree IN PLACE (obj/ and bin/ of every project removed
+# first, `advance_deployment_tree(whole=True)`), so no assembly built by the previous compiler survives.
+#
+# The identity is the platform set and what is genuinely NOT determined by it — nothing that a merge to this repository
+# moves:
+#   * the platform set (MW_BUILD_PLATFORM_VERSION), its framework identity and its tester and portal image digests: the
+#     compiler and the reference set a build compiles against (determined by the set; listed so a re-sealed set with the same
+#     version still rebuilds);
+#   * the .NET SDKs the runner image carries: the floating `dotnet/sdk:10.0` base can move under an unchanged Dockerfile, and
+#     the SDK is the compiler too;
+#   * the CPU architecture (a property of the machine, never of the set);
+#   * WARM_LAYOUT, bumped BY HAND for a change to this runner that changes what a tree's outputs mean (rare).
+# NOT the runner's own code, NOT its build helpers' content and NOT the runner image's digest: each of those moved on every
+# merge to this repository and threw every tree and every module output away (eiger 2026-11-09: 50 rolls in a day, no warm
+# run; the module hubs 2026-11-10: no two runs on consecutive pods shared a fingerprint, so the store never answered a Hit).
+# The module fingerprints carry the same identity (`Host.start_module_broker`), so the shared store's entries are reused
+# across rolls and across hosts.
+WARM_LAYOUT = "2026-11-10.2"
 TOOLCHAIN_ENV = "MW_BUILD_TOOLCHAIN"
-RUNNER_BUILD_CODE = ("Sandbox.argv", "sandbox_env", "advance_deployment_tree", "advance_platform_tree", "cold_run_tree",
-                     "overlay_run_tree", "platform_source_view", "module_fingerprints", "Host._warm_one",
-                     "Host.stage_platform_binds")
-RUNNER_BUILD_CONSTANTS = ("ENV_ALLOW", "WARM_KEEP", "SANDBOX_CHECKOUT", "SANDBOX_NUGET", "PREPARED_ROOT")
-# The runner image's BUILD HELPERS — the only files under the prepared root a build executes or imports — hashed by
-# content, by an explicit list (never a walk: nothing else under the root, written at run time or not, can churn the key).
-TOOLCHAIN_HELPERS = ("plugin-build", "compose-gate-host.sh", "sandbox-postgres.sh", "module-build-key.py",
-                     "node-repo-scope.py", "ci-artifact-store.py", "compile-check.py", "host-postgres.sh")
 
 
-def runner_build_code() -> str:
-    """sha256 (16 hex) over the source of RUNNER_BUILD_CODE and the values of RUNNER_BUILD_CONSTANTS. A name that no longer
-    resolves is named in the hash input, so a rename still re-keys and the self-test pins that every name resolves."""
-    import inspect
-    h = hashlib.sha256()
-    for name in RUNNER_BUILD_CODE:
-        obj: object = globals()
-        try:
-            for part in name.split("."):
-                obj = obj[part] if isinstance(obj, dict) else getattr(obj, part)
-            h.update(name.encode() + b"\0" + inspect.getsource(obj).encode())   # type: ignore[arg-type]
-        except (KeyError, AttributeError, OSError, TypeError):
-            h.update(f"missing:{name}".encode())
-    for name in RUNNER_BUILD_CONSTANTS:
-        h.update(f"{name}={globals().get(name, 'missing')!r}".encode())
-    return h.hexdigest()[:16]
-
-
-def build_toolchain(root: str = PREPARED_ROOT, which: Callable[[str], Optional[str]] = shutil.which) -> str:
-    """The build toolchain this host runs, by CONTENT: WARM_LAYOUT, the runner's build-shaping code (`runner_build_code`),
-    the CPU architecture, the .NET SDKs installed (the floating `dotnet/sdk:10.0` base can move under an unchanged
-    Dockerfile) and a sha256 over the image's build helpers (TOOLCHAIN_HELPERS under `root`, each named, a missing one as
-    `absent`). Never the image digest. Never raises: what cannot be read is named in the value, so it keys distinctly."""
+def build_toolchain(which: Callable[[str], Optional[str]] = shutil.which) -> str:
+    """The compiler part of the build identity that the platform set does NOT determine: WARM_LAYOUT, the CPU architecture
+    and the .NET SDKs installed. Never the runner's code, its helpers or the image digest (a Deploy merge moves those).
+    Never raises: what cannot be read is named in the value, so it keys distinctly."""
     import platform as _platform
-    parts = [f"layout={WARM_LAYOUT}", f"code={runner_build_code()}", f"arch={_platform.machine()}"]
+    parts = [f"layout={WARM_LAYOUT}", f"arch={_platform.machine()}"]
     dn = which("dotnet")
     try:
         sdks = sorted(os.listdir(os.path.join(os.path.dirname(os.path.realpath(dn)), "sdk"))) if dn else ["no-dotnet"]
     except OSError:
         sdks = ["unreadable"]
     parts.append("sdk=" + ",".join(sdks))
-    if not os.path.isdir(root):
-        parts.append(f"helpers=no-root:{root}")
-        return ";".join(parts)
-    h = hashlib.sha256()
-    for name in TOOLCHAIN_HELPERS:
-        top = os.path.join(root, name)
-        files = ([top] if os.path.isfile(top) else
-                 sorted(os.path.join(d, f) for d, _ds, fs in os.walk(top) for f in fs) if os.path.isdir(top) else [])
-        if not files:
-            h.update(f"absent:{name}".encode())
-        for path in files:
-            try:
-                with open(path, "rb") as fh:
-                    h.update(os.path.relpath(path, root).encode() + b"\0" + hashlib.sha256(fh.read()).digest())
-            except OSError:
-                h.update(f"unreadable:{os.path.relpath(path, root)}".encode())
-    parts.append(f"helpers={h.hexdigest()[:16]}")
     return ";".join(parts)
 
 
 def warm_key(env: dict, identity: str) -> str:
-    """What invalidates a warm tree — what changes a BUILD'S OUTPUT: the platform set, the framework identity, the tester
-    and portal images a build compiles against, and the build toolchain (`build_toolchain`: SDK, helpers' content,
-    WARM_LAYOUT). Not the runner image's digest. Pure."""
+    """The BUILD IDENTITY of a tree (what built its obj/ and bin/): the platform set, the framework identity, the tester and
+    portal images a build compiles against, and `build_toolchain` (SDKs, architecture, WARM_LAYOUT). It names no directory
+    — a change rebuilds the one tree in place. Not the runner image's digest, not the runner's code. Pure."""
     parts = [f"platform={env.get('MW_BUILD_PLATFORM_VERSION', '')}", f"identity={identity}"]
     parts += [f"{k}={env.get(k, '')}" for k in ("MW_BUILD_TESTER_DIGEST", "MW_BUILD_PORTAL_DIGEST", TOOLCHAIN_ENV)]
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:32]
@@ -3514,14 +3671,15 @@ def shared_tree_enabled(env: dict) -> bool:
     return warm_enabled(env) and (env.get("MW_BUILD_SHARED_TREE") or "").strip().lower() in ("1", "true", "yes")
 
 
-def deployment_name(lane: Optional[str], key: str) -> str:
-    """The deployment a host builds for: its lane (channel or version) and the warm key. A path segment overlayfs can parse
-    (no `,`, `:` or `\\`). Pure."""
+def deployment_name(lane: Optional[str]) -> str:
+    """The ONE tree directory a host keeps per repository: its lane alone, never a key — a platform update rebuilds this
+    tree in place (`warm_key` is recorded in its state), it never starts another. A path segment overlayfs can parse (no
+    `,`, `:` or `\\`). Pure."""
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", (lane or "").strip()) or "default"
-    return f"{safe[:48]}-{key[:16]}"
+    return f"{safe[:48]}-tree"
 
 
-STALE_DEPLOYMENT_SECONDS = 3600.0   # a deployment of another key untouched this long is retired (a draining replica keeps it)
+STALE_DEPLOYMENT_SECONDS = 3600.0   # a LEGACY keyed deployment untouched this long is retired (a draining replica keeps it)
 
 
 def _rm_tree(path: str) -> None:
@@ -3554,17 +3712,18 @@ def _newest_mtime(path: str, depth: int = 3) -> float:
     return newest
 
 
-def retire_stale_deployments(cache: str, lane: Optional[str], current: str, log: Callable[[str], None],
+def retire_legacy_deployments(cache: str, lane: Optional[str], current: str, log: Callable[[str], None],
                              git: Callable[..., None], now: Optional[float] = None,
                              stale: float = STALE_DEPLOYMENT_SECONDS) -> list:
-    """Remove THIS lane's deployment directories (`<cache>/deploy/<lane>-<key>`) of every OTHER warm key — a platform set
-    or image change gives a deployment a new key, so without this every set left its ~20 GiB trees behind (measured on
-    eiger 2026-11-09: nine deployments, 92 GB in one day, the node at DiskPressure and 18 build pods evicted). A
-    deployment is retired only when (1) none of its repository locks is held — no reader runs on it, no writer advances
-    it — taken exclusively and non-blocking for the whole removal, and (2) nothing in it changed for `stale` seconds, so a
-    replica still draining the old set keeps its tree. Its worktrees are deregistered from the masters (`worktree
-    prune` under the master lock), then the directory is deleted — a deletion, never a copy. Returns what was removed.
-    Never raises."""
+    """A ONE-TIME MIGRATION, nothing more: remove THIS lane's LEGACY keyed deployment directories
+    (`<cache>/deploy/<lane>-<16-char key>`), left by the runner that kept a tree per platform set and image. Since one tree
+    per host (Plugins Hosting/OneBuildTree.md) the current tree is `<lane>-tree` and a platform update rebuilds it in place,
+    so there is no other key to retire — only what the old shape left on disk (eiger 2026-11-09: nine deployments, 92 GB in
+    one day, the node at DiskPressure and 18 build pods evicted). A legacy deployment is removed only when (1) none of its
+    repository locks is held — no reader runs on it, no writer advances it — taken exclusively and non-blocking for the
+    whole removal, and (2) nothing in it changed for `stale` seconds, so a replica of the old runner still draining keeps
+    its tree. Its worktrees are deregistered from the masters (`worktree prune` under the master lock), then the directory
+    is deleted — a deletion, never a copy. Returns what was removed. Never raises."""
     import fcntl
     now = time.time() if now is None else now
     root = os.path.join(cache, DEPLOY_DIR)
@@ -3594,7 +3753,7 @@ def retire_stale_deployments(cache: str, lane: Optional[str], current: str, log:
                     break
                 held.append(fh)
             if busy:
-                log(f"deployment {name}: another key's trees are still in use (a lock is held) — kept, retried when idle")
+                log(f"deployment {name}: a legacy keyed deployment is still in use (a lock is held) — kept, retried when idle")
                 continue
             repos = {d for d in os.listdir(dep) if REPO.match(d) and not d.startswith(".")}
             if os.path.lexists(os.path.join(dep, ".platform")):
@@ -3609,8 +3768,8 @@ def retire_stale_deployments(cache: str, lane: Optional[str], current: str, log:
                     except (Refusal, OSError, subprocess.SubprocessError):
                         pass
             gone = not os.path.exists(dep)
-            log(f"deployment {name}: another key's deployment {'retired' if gone else 'NOT fully removed'} (untouched "
-                f"{int(age)} s, no lock held) — the current one is {current}")
+            log(f"deployment {name}: a legacy keyed deployment {'retired' if gone else 'NOT fully removed'} (untouched "
+                f"{int(age)} s, no lock held) — the one tree is {current}")
             if gone:
                 removed.append(dep)
         except OSError as e:
@@ -3830,14 +3989,17 @@ class DeploymentTree:
                 pass
         self.write_state({"key": key, "tip": tip, "built": tip, **({"platform": platform} if platform else {})})
 
-    def unbuild(self, key: str, tip: str) -> None:
-        """Not built: readers go cold until the writer's next successful build (the manifests go first)."""
+    def unbuild(self, key: str, tip: str, whole: Optional[bool] = None) -> None:
+        """Not built: readers go cold until the writer's next successful build (the manifests go first). A pending whole
+        rebuild (`whole`, or — when not given — the one the state already records) is kept, so only `publish` clears it."""
         for path in (self.manifest_path, self.platform_manifest_path):
             try:
                 os.remove(path)
             except OSError:
                 pass
-        self.write_state({"key": key, "tip": tip, "built": None})
+        if whole is None:
+            whole = (self.state() or {}).get("whole") is True
+        self.write_state({"key": key, "tip": tip, "built": None, **({"whole": True} if whole else {})})
 
     @contextlib.contextmanager
     def writer(self):
@@ -3866,7 +4028,7 @@ class DeploymentTree:
             if st is None or not os.path.isdir(self.tree):
                 self.last_refusal = "no deployment tree yet (the host builds it from main's tip while idle)"
             elif st.get("key") != key:
-                self.last_refusal = "the deployment tree is for another platform set or images"
+                self.last_refusal = "the tree was built by another build identity (a platform update or a new SDK) — the host rebuilds it whole while idle"
             elif not SHA.match(tip) or st.get("built") != tip:
                 self.last_refusal = "the deployment tree is not built (its last build failed, or was interrupted)"
             else:
@@ -3906,13 +4068,25 @@ def _restore_git_link(tree: str, admin: str) -> None:
         fh.write(f"gitdir: {admin}\n")
 
 
+def whole_rebuild_due(prior: Optional[dict], key: str) -> bool:
+    """Whether the tree's obj/ and bin/ must go before it is built: its state names another BUILD IDENTITY (a platform
+    update — a new compiler), names none (a tree whose state was lost: nothing tells what built it), or a whole rebuild
+    that was started was never finished (`whole` still set: the removal or the build after it was interrupted). Pure."""
+    return prior is None or prior.get("key") != key or prior.get("whole") is True
+
+
 def advance_deployment_tree(dt: DeploymentTree, tip: str, key: str, git: Callable[..., None]) -> str:
-    """The WRITER's move of its deployment tree to `tip` (call it holding `dt.writer()`), from the LOCAL master only:
+    """The WRITER's move of its ONE tree to `tip` (call it holding `dt.writer()`), from the LOCAL master only:
     first use → `git worktree add --detach` under the master lock; afterwards IN PLACE — `checkout --detach -f`, which
     rewrites only the files that differ (unchanged sources keep their mtimes, so MSBuild's incremental checks hold), then
-    `clean` keeping obj/ and bin/. Every git step names the host-recorded admin directory explicitly. The tree is "not
-    built" from the first step until `publish`. Returns what happened; raises Refusal/OSError."""
-    dt.unbuild(key, tip)
+    `clean` keeping obj/ and bin/ — UNLESS the build identity changed (`whole_rebuild_due`: a platform update), when the
+    `clean` keeps NOTHING, so every project is rebuilt by the new compiler and no assembly of the old one survives. The
+    pending whole rebuild is recorded (`whole: true`) BEFORE the removal and cleared only by `publish`, so an interrupted one
+    is redone. Every git step names the host-recorded admin directory explicitly. The tree is "not built" from the first
+    step until `publish`. Returns what happened; raises Refusal/OSError."""
+    prior = dt.state()
+    whole = whole_rebuild_due(prior, key)
+    dt.unbuild(key, tip, whole=whole)
     admin = dt.admin()
     if admin is None or not os.path.isdir(dt.tree):
         with master_lock(os.path.dirname(dt.mirror), dt.repo):
@@ -3929,15 +4103,19 @@ def advance_deployment_tree(dt: DeploymentTree, tip: str, key: str, git: Callabl
             os.makedirs(dt.host, exist_ok=True)
             with open(os.path.join(dt.host, "admin"), "w") as fh:
                 fh.write(admin + "\n")
-        dt.write_state({"key": key, "tip": tip, "built": None})
+        dt.write_state({"key": key, "tip": tip, "built": None, "whole": True})
         return f"deployment tree: added at main@{tip[:12]} ({dt.tree})"
     _restore_git_link(dt.tree, admin)
     g = ("--git-dir", admin, "--work-tree", dt.tree)
     # a stat-dirty entry (a touched but unchanged file) is re-hashed first, so `checkout -f` rewrites only what differs
     git(*g, "update-index", "-q", "--refresh")
     git(*g, "checkout", "--quiet", "--detach", "-f", tip)
-    git(*g, "clean", "-ffdxq", *[a for k in WARM_KEEP for a in ("-e", k)])
-    dt.write_state({"key": key, "tip": tip, "built": None})
+    git(*g, "clean", "-ffdxq", *([] if whole else [a for k in WARM_KEEP for a in ("-e", k)]))
+    dt.write_state({"key": key, "tip": tip, "built": None, **({"whole": True} if whole else {})})
+    if whole:
+        was = str((prior or {}).get("key") or "none")[:16]
+        return (f"deployment tree: moved to main@{tip[:12]} in place — WHOLE REBUILD: the build identity changed "
+                f"({was} → {key[:16]}, a platform update or a new SDK), obj/ and bin/ of every project removed")
     return f"deployment tree: moved to main@{tip[:12]} in place (obj/ and bin/ kept)"
 
 
@@ -3951,7 +4129,7 @@ def source_commit(platform_src: str) -> Optional[str]:
     return c if SHA.match(c) else None
 
 
-def advance_platform_tree(dt: DeploymentTree, commit: str, git: Callable[..., None]) -> str:
+def advance_platform_tree(dt: DeploymentTree, commit: str, git: Callable[..., None], whole: bool = False) -> str:
     """The WRITER's move of the deployment's PLATFORM tree (`dt.platform`) to core at `commit` (call it holding
     `dt.writer()`, the master fetched to `commit`): first use → `git worktree add --detach` of the platform master under its
     lock; afterwards IN PLACE — `checkout --detach -f` and `clean` keeping obj/ and bin/, so core's outputs from the last
@@ -3989,8 +4167,10 @@ def advance_platform_tree(dt: DeploymentTree, commit: str, git: Callable[..., No
         g = ("--git-dir", admin, "--work-tree", dt.platform)
         git(*g, "update-index", "-q", "--refresh")
         git(*g, "checkout", "--quiet", "--detach", "-f", commit)
-        git(*g, "clean", "-ffdxq", *[a for k in WARM_KEEP for a in ("-e", k)])
-        verb = "moved in place (obj/ and bin/ kept)"
+        # a WHOLE rebuild of the repository's tree (a new build identity) rebuilds core's tree with it: nothing it keeps was
+        # built by the previous compiler
+        git(*g, "clean", "-ffdxq", *([] if whole else [a for k in WARM_KEEP for a in ("-e", k)]))
+        verb = "moved in place — WHOLE REBUILD (obj/ and bin/ removed)" if whole else "moved in place (obj/ and bin/ kept)"
     with open(os.path.join(dt.platform, ".source-commit"), "w") as fh:
         fh.write(commit + "\n")
     return f"platform tree: {verb} at {commit[:12]} ({dt.platform}) — core is built where it lies, never copied"
@@ -4348,7 +4528,7 @@ def platform_source_view(platform_src: str, dest: str, env: dict, log: Callable[
 # ─── the no-copy gate: build-run.py reads its own source; any tree copy outside the named allow-list fails the self-test ───
 # Each allowed site copies something that is NOT a source or build tree, and says what.
 NO_COPY_ALLOWED = {
-    "ModuleHubBroker._fetch":
+    "ModuleHubBroker._copy_cached":
         "materialises ONE verified module output (a content-addressed slice from the host's slice cache) where the stage "
         "reads it — an artifact of the module store (§7.3), not a source or build tree",
     "promote_outputs":
@@ -4675,6 +4855,8 @@ class Host:
                 if rc_ != 0:
                     raise Refusal(f"git ls-tree failed (exit {rc_}): {out_.strip()[-200:]}")
                 return out_
+            # the BUILD IDENTITY's parts (platform set, framework identity, compiler) — never the runner's code, so a Deploy
+            # merge keeps every fingerprint and the store answers Hits across rolls and across hosts
             toolchain = f"{self.platform_version}|{self.identity}|{self.env.get(TOOLCHAIN_ENV, '')}"
             fps = module_fingerprints(decl, ls_tree, toolchain)
             order = 0
@@ -4690,7 +4872,8 @@ class Host:
                 return
             root = os.path.join(workdir, "module-hub")
             self.module_broker = ModuleHubBroker(self.api, repo, sha, self.host, root, fps, trunk, order, pr, self.log,
-                                                 slice_cache=os.path.join(self.cache, "module-slices"))
+                                                 slice_cache=self.slice_cache_root(),
+                                                 build_tag={"platformVersion": self.platform_version, "frameworkIdentity": self.identity})
             self.module_broker.start()
             self.log(f"module hub: {len(fps)} module(s) fingerprinted from the pristine tree; lane "
                      f"{'main (order ' + str(order) + ')' if trunk else 'pull request #' + str(pr)}")
@@ -4702,6 +4885,18 @@ class Host:
         broker, self.module_broker = self.module_broker, None
         if broker is not None:
             broker.stop("the run ended before this module was handed over")
+            self.bound_slices()
+
+    def slice_cache_root(self) -> str:
+        return os.path.join(self.cache, "module-slices")
+
+    def bound_slices(self) -> None:
+        """The slice cache back under its bound (`bound_slice_cache`), after every run that handed slices over and on every
+        idle pass. Never raises: a bound that cannot be applied is said, the run's verdict is not touched."""
+        try:
+            bound_slice_cache(self.slice_cache_root(), slice_cache_cap(self.env), self.log)
+        except Exception as e:      # the bound must never take a run or the idle loop down
+            self.log(f"slice cache: not bounded this pass ({type(e).__name__}: {str(e)[:160]})")
 
     def preflight(self) -> None:
         missing = []
@@ -4980,8 +5175,10 @@ class Host:
         self.warm_cancel.clear()
 
     def deployment(self, key: Optional[str] = None) -> str:
-        """This host's deployment: its lane plus the warm key (§7.3b)."""
-        return deployment_name(self.lane, key or warm_key(self.env, self.identity))
+        """This host's ONE tree directory (Plugins Hosting/OneBuildTree.md): its channel — or `versioned` for a versioned
+        server, whose version is a property of the set, not of the tree — never the build identity (`key` is accepted and
+        ignored: a new identity rebuilds this tree in place)."""
+        return deployment_name(self.channel or "versioned")
 
     def warm_main_when_idle(self) -> None:
         """§7.3b, the WRITER's half: while nothing is claimable, advance each known repository's deployment tree to the
@@ -4992,8 +5189,9 @@ class Host:
         if not self.legacy_retired:
             retire_legacy_shared(self.cache, self.log)     # §7.3's generations: removed once per process, before warming
             self.legacy_retired = True
-        # every idle pass: the lane's deployments of OTHER keys (an older platform set or image), once unused and quiet
-        retire_stale_deployments(self.cache, self.lane, self.deployment(key), self.log,
+        self.bound_slices()                                # every idle pass: the slice cache under its bound
+        # every idle pass: the one-time migration — the lane's LEGACY keyed deployments (a tree per set and image), once unused and quiet
+        retire_legacy_deployments(self.cache, self.lane, self.deployment(key), self.log,
                                  _git_runner(self.env, self.work, None, time.monotonic() + 120))
         repos = set(self.warm_repos)
         # every repository this deployment already holds a tree of is kept warm by whichever replica is idle, not only by
@@ -5068,7 +5266,9 @@ class Host:
             warm_nuget_dir = os.path.join(scratch, "nuget")
             os.makedirs(warm_nuget_dir, exist_ok=True)
             extra["NUGET_PACKAGES"] = SANDBOX_NUGET
-            dt.write_state({"key": key, "tip": tip, "built": "building"})
+            # a pending WHOLE rebuild stays recorded until `publish`: an interrupted one is redone, never resumed incrementally
+            whole = (dt.state() or {}).get("whole") is True
+            dt.write_state({"key": key, "tip": tip, "built": "building", **({"whole": True} if whole else {})})
             started = self.clock()
             platform_src = self.env.get("MW_PLATFORM_SOURCE", "") or prepared.get("MW_PLATFORM_SOURCE", "")
             platform_built: Optional[str] = None
@@ -5089,7 +5289,7 @@ class Host:
                         base = self.env.get("MW_BUILD_GIT_BASE", "https://github.com/Systemorph").rstrip("/")
                         pmirror = master_path(self.cache, PLATFORM_REPO)
                         _update_mirror(PLATFORM_REPO, f"{base}/{PLATFORM_REPO}.git", os.path.dirname(pmirror), pmirror, [pc], g, self.log)
-                        self.log(advance_platform_tree(dt, pc, g))
+                        self.log(advance_platform_tree(dt, pc, g, whole=whole))
                         warm_binds.append((dt.platform, platform_src))
                         warm_ro.append(pmirror)              # the platform tree's .git names the platform master's worktree admin
                         platform_built = pc
@@ -7258,9 +7458,10 @@ def self_test() -> int:
               "no longer hashes" in (verify_tree(t5, m5p, "d/R@" + "1" * 40, sample=1000) or ""))
         check("integrity/another tip's (or tree's) manifest is refused",
               "not" in (verify_tree(t0, m0, "d/R@" + "2" * 40, sample=0) or ""))
-        check("deploy/the deployment is the lane plus the key, a path overlayfs can parse",
-              deployment_name("stable", "a" * 32) == "stable-" + "a" * 16 and deployment_name(None, "b" * 32) == "default-" + "b" * 16
-              and not any(c in deployment_name("3.1,x:y\\z", "c" * 32) for c in ",:\\"))
+        check("deploy/the ONE tree is named by the lane alone — no key, so a platform update starts no second tree — and is a "
+              "path overlayfs can parse",
+              deployment_name("stable") == "stable-tree" and deployment_name(None) == "default-tree"
+              and not any(c in deployment_name("3.1,x:y\\z") for c in ",:\\"))
 
         plat_commit, plat_base = "0" * 40, "file:///nonexistent"      # the platform's master, set below where git exists
         # ── 5b'. THE MASTER AND THE DEPLOYMENT TREE (§7.3b), against REAL git: a local origin, the real master path ─────
@@ -7325,8 +7526,41 @@ def self_test() -> int:
                 with dt.writer() as w_r:
                     check("deploy/the writer NEVER advances while a reader holds the tree", w_r is None)
             with dt.reader("k2") as other_k:
-                check("deploy/a reader of another key gets nothing (another platform set or images), said",
-                      other_k is None and "another platform set" in (dt.last_refusal or ""), dt.last_refusal)
+                check("deploy/a reader of another build identity gets nothing (the tree was built by another compiler), said",
+                      other_k is None and "another build identity" in (dt.last_refusal or ""), dt.last_refusal)
+            # A PLATFORM UPDATE (a new build identity) rebuilds the ONE tree WHOLE, in place: same directory, same worktree,
+            # obj/ and bin/ of every project removed; the pending whole rebuild survives an interruption until `publish`
+            dt_w = DeploymentTree(wenv["MW_BUILD_CACHE"], "whole-tree", "R")
+            with dt_w.writer() as ww:
+                advance_deployment_tree(ww, c1, "id-A", gw)
+                check("whole/a NEW tree is due a whole build (nothing tells what built it)", (dt_w.state() or {}).get("whole") is True)
+                os.makedirs(os.path.join(dt_w.tree, "src", "obj")); os.makedirs(os.path.join(dt_w.tree, "src", "bin"))
+                open(os.path.join(dt_w.tree, "src", "obj", "project.assets.json"), "w").write("A")
+                open(os.path.join(dt_w.tree, "src", "bin", "M.dll"), "w").write("built by A")
+                ww.publish(c1, "id-A")
+                check("whole/publish clears the pending whole rebuild", "whole" not in (dt_w.state() or {}), dt_w.state())
+                line_same = advance_deployment_tree(ww, c2, "id-A", gw)
+                check("whole/the SAME identity keeps obj/ and bin/ (incremental)", "WHOLE" not in line_same
+                      and os.path.isfile(os.path.join(dt_w.tree, "src", "bin", "M.dll")), line_same)
+                ww.publish(c2, "id-A")
+                ino_tree = os.stat(dt_w.tree).st_ino
+                line_new = advance_deployment_tree(ww, c2, "id-B", gw)
+                check("whole/a NEW identity (a platform update) rebuilds WHOLE in the same tree: obj/ and bin/ removed, said",
+                      "WHOLE REBUILD" in line_new and os.stat(dt_w.tree).st_ino == ino_tree and wt_count(dt_w.tree) == 1
+                      and not os.path.exists(os.path.join(dt_w.tree, "src", "obj")) and not os.path.exists(os.path.join(dt_w.tree, "src", "bin"))
+                      and open(os.path.join(dt_w.tree, "a.cs")).read() == "v2", line_new)
+                # interrupted (a claim stopped the build): the next advance with the SAME new identity is still WHOLE
+                os.makedirs(os.path.join(dt_w.tree, "src", "obj"))
+                open(os.path.join(dt_w.tree, "src", "obj", "half.dll"), "w").write("half-built by B")
+                ww.unbuild("id-B", c2)
+                check("whole/an interrupted whole rebuild stays pending (unbuild keeps it)", (dt_w.state() or {}).get("whole") is True)
+                line_again = advance_deployment_tree(ww, c2, "id-B", gw)
+                check("whole/an interrupted whole rebuild is REDONE, never resumed incrementally",
+                      "WHOLE REBUILD" in line_again and not os.path.exists(os.path.join(dt_w.tree, "src", "obj")), line_again)
+                ww.publish(c2, "id-B")
+            check("whole/whole_rebuild_due: lost state, another key or a pending flag — and nothing else",
+                  whole_rebuild_due(None, "k") and whole_rebuild_due({"key": "j"}, "k") and whole_rebuild_due({"key": "k", "whole": True}, "k")
+                  and not whole_rebuild_due({"key": "k", "built": "x"}, "k"))
             # advancing from an OLDER tip, in place: only changed files are rewritten, unchanged ones keep their mtime and
             # inode, obj/ and bin/ are kept, anything else untracked is cleaned
             old_t = 1_000_000_000
@@ -7495,55 +7729,32 @@ def self_test() -> int:
                     check(f"warm/{bad_w} is refused", False, "accepted")
                 except Refusal:
                     pass
-            check("warm/the key rides on the platform set, the identity, the tester/portal images and the build toolchain",
+            check("warm/the BUILD IDENTITY rides on the platform set, the framework identity, the tester/portal images and the compiler",
                   warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.1"}, "c003") != warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.2"}, "c003")
                   and warm_key({}, "a") != warm_key({}, "b")
                   and warm_key({"MW_BUILD_TESTER_DIGEST": "t"}, "a") != warm_key({}, "a")
                   and warm_key({TOOLCHAIN_ENV: "sdk=10.0.403"}, "a") != warm_key({TOOLCHAIN_ENV: "sdk=10.0.404"}, "a"))
-            check("warm/the RUNNER IMAGE DIGEST keys nothing: a rebuilt runner with the same toolchain keeps every warm tree",
+            check("warm/the RUNNER IMAGE DIGEST keys nothing: a rebuilt runner with the same compiler keeps the tree's obj/ and bin/",
                   warm_key({"MW_BUILD_RUNNER_DIGEST": "sha256:" + "a" * 64, TOOLCHAIN_ENV: "x"}, "a")
                   == warm_key({"MW_BUILD_RUNNER_DIGEST": "sha256:" + "b" * 64, TOOLCHAIN_ENV: "x"}, "a"))
-            # the toolchain by CONTENT: the SDKs, the helpers' bytes (an explicit list), the runner's build-shaping code
-            tc_root = os.path.join(wroot, "tc-root"); tc_dn = os.path.join(wroot, "tc-dotnet")
-            os.makedirs(os.path.join(tc_root, "plugin-build")); os.makedirs(os.path.join(tc_dn, "sdk", "10.0.403"))
-            for sub in ("platform-src", "deploy-src", "browser", "state"):
-                os.makedirs(os.path.join(tc_root, sub))
+            # the compiler part: the SDKs and the architecture; NOT the runner's code or its helpers (a Deploy merge moves those)
+            tc_dn = os.path.join(wroot, "tc-dotnet")
+            os.makedirs(os.path.join(tc_dn, "sdk", "10.0.403"))
             open(os.path.join(tc_dn, "dotnet"), "w").close()
-            open(os.path.join(tc_root, "plugin-build", "Directory.Build.props"), "w").write("<Project/>")
-            open(os.path.join(tc_root, "compose-gate-host.sh"), "w").write("echo a")
-            open(os.path.join(tc_root, "build-run.py"), "w").write("v1")
             tc_which = lambda n: os.path.join(tc_dn, "dotnet") if n == "dotnet" else None
-            tc0 = build_toolchain(tc_root, tc_which)
-            open(os.path.join(tc_root, "build-run.py"), "w").write("v2")
-            for sub in ("platform-src", "deploy-src", "browser", "state"):
-                open(os.path.join(tc_root, sub, "f"), "w").write("changed")
-            open(os.path.join(tc_root, "run.log"), "w").write("written at run time")
-            check("toolchain/a new copy of build-run.py, the platform source, the chart, the browser, or ANY file not on the "
-                  "helper list (state, a log written at run time) leaves it unchanged",
-                  build_toolchain(tc_root, tc_which) == tc0, (tc0, build_toolchain(tc_root, tc_which)))
-            open(os.path.join(tc_root, "plugin-build", "Directory.Build.props"), "w").write("<Project><x/></Project>")
-            tc1 = build_toolchain(tc_root, tc_which)
-            check("toolchain/a changed BUILD HELPER (plugin-build/, the composer) changes it", tc1 != tc0, (tc0, tc1))
-            os.remove(os.path.join(tc_root, "compose-gate-host.sh"))
-            check("toolchain/a helper that disappears changes it (named absent)", build_toolchain(tc_root, tc_which) != tc1)
-            os.makedirs(os.path.join(tc_dn, "sdk", "10.0.404"))
-            check("toolchain/another .NET SDK in the image changes it", "sdk=10.0.403,10.0.404" in build_toolchain(tc_root, tc_which))
-            no_root = build_toolchain(os.path.join(wroot, "nope"), lambda n: None)
-            check("toolchain/no dotnet and no prepared root are NAMED in the value (never an exception, never the empty digest)",
-                  "sdk=no-dotnet" in no_root and "helpers=no-root:" in no_root, no_root)
-            # the runner's build-shaping code: every listed name resolves, and a change to one of them re-keys
-            import inspect as _insp
-            check("toolchain/every RUNNER_BUILD_CODE name resolves (a rename must update the list, never go unkeyed)",
-                  all(_insp.getsource(eval(n.split(".")[0]) if "." not in n else getattr(eval(n.split(".")[0]), n.split(".")[1]))
-                      for n in RUNNER_BUILD_CODE))
-            rc0 = runner_build_code()
+            tc0 = build_toolchain(tc_which)
+            check("toolchain/it names the layout, the architecture and the SDKs — and nothing of the runner (no code, no helpers)",
+                  f"layout={WARM_LAYOUT}" in tc0 and "arch=" in tc0 and "sdk=10.0.403" in tc0
+                  and "code=" not in tc0 and "helpers=" not in tc0, tc0)
             real_wk = globals()["WARM_KEEP"]
             globals()["WARM_KEEP"] = real_wk + ("planted/",)
-            rc1 = runner_build_code()
+            check("toolchain/a change to the runner's build code (a Deploy merge) leaves it unchanged — no whole rebuild",
+                  build_toolchain(tc_which) == tc0)
             globals()["WARM_KEEP"] = real_wk
-            check("toolchain/a changed build-shaping constant (WARM_KEEP) changes the runner's code hash, and restoring it "
-                  "restores the hash", rc1 != rc0 and runner_build_code() == rc0, (rc0, rc1))
-            check("toolchain/it is part of the toolchain value", f"code={rc0}" in build_toolchain(tc_root, tc_which))
+            os.makedirs(os.path.join(tc_dn, "sdk", "10.0.404"))
+            check("toolchain/another .NET SDK in the image changes it (a new compiler)", "sdk=10.0.403,10.0.404" in build_toolchain(tc_which))
+            no_root = build_toolchain(lambda n: None)
+            check("toolchain/no dotnet is NAMED in the value (never an exception, never the empty digest)", "sdk=no-dotnet" in no_root, no_root)
             check("warm/opt-in only", warm_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}) and not warm_enabled({}))
             check("warm/sharedTree stays a switch, only with the warm workspace", shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true", "MW_BUILD_SHARED_TREE": "true"})
                   and not shared_tree_enabled({"MW_BUILD_SHARED_TREE": "true"}) and not shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}))
@@ -7672,8 +7883,13 @@ def self_test() -> int:
             fh.write(b"built B")
         with open(os.path.join(br.io, "done", "B.json"), "w") as fh:
             json.dump({"succeeded": True}, fh)
+        br.build_tag = {"platformVersion": "3.1.11700", "frameworkIdentity": "c3e1"}
         br.poll_once()
         ack_ = json.load(open(os.path.join(br.out, "ack", "B.json")))
+        check("modhub/the completion TAGS the stored output with the platform set and framework identity it was built against "
+              "(its key stays the content hash)",
+              [(c[2] or {}).get("platformVersion") for c in api_g.calls if c[1].endswith("/complete")] == ["3.1.11700"]
+              and [(c[2] or {}).get("frameworkIdentity") for c in api_g.calls if c[1].endswith("/complete")] == ["c3e1"])
         comp_ = [c[2] for c in api_g.calls if c[1].endswith("/complete")]
         put_path = next(iter(uploaded))
         check("modhub/a granted build's output is uploaded BY ITS HASH, then the step completed with the granted seq",
@@ -7727,6 +7943,57 @@ def self_test() -> int:
               len(downloads) == 1 and resp_c.get("source") == "from this host's slice cache"
               and open(os.path.join(resp_c["outputDir"], "B.dll"), "rb").read() == b"built B"
               and os.path.isfile(os.path.join(sc, "MeshWeaver.Plugins", "B", out_hex, ".complete")), (downloads, resp_c))
+        check("slices/a put records the entry's size beside it (`.bytes`), and the stage's copy carries no cache bookkeeping",
+              int(open(os.path.join(sc, "MeshWeaver.Plugins", "B", out_hex, ".bytes")).read()) == len(b"built B")
+              and not os.path.exists(os.path.join(resp_c["outputDir"], ".bytes"))
+              and not os.path.exists(os.path.join(resp_c["outputDir"], ".complete")))
+        # THE BOUND: least recently used first, never an entry in use or used recently, down to the low-water mark
+        lru = os.path.join(tmp, "lru-slices")
+        t_now = time.time()
+        for i_, (age_, kib_) in enumerate([(9000, 400), (8000, 400), (7000, 400), (100, 400)]):
+            e_ = os.path.join(lru, "R", f"M{i_}", f"{i_:064x}")
+            os.makedirs(e_)
+            open(os.path.join(e_, "M.dll"), "wb").write(b"x" * (kib_ * 1024))
+            open(os.path.join(e_, ".complete"), "w").write("h")
+            os.utime(os.path.join(e_, ".complete"), (t_now - age_, t_now - age_))
+        os.makedirs(os.path.join(lru, "R", "M0", "f" * 64 + ".staging-1-2"))
+        os.utime(os.path.join(lru, "R", "M0", "f" * 64 + ".staging-1-2"), (t_now - 2 * 86400, t_now - 2 * 86400))
+        import fcntl as _fc
+        held_ = open(os.path.join(lru, "R", "M1", f"{1:064x}.lock"), "a+")
+        _fc.flock(held_.fileno(), _fc.LOCK_SH)               # a reader copying M1 right now
+        lru_log: list = []
+        ev_, after_ = bound_slice_cache(lru, 1000 * 1024, lru_log.append, now=t_now)
+        held_.close()
+        left_ = sorted(os.listdir(os.path.join(lru, "R", m_)) for m_ in ("M0", "M1", "M2", "M3"))
+        check("slices/over the bound the LEAST RECENTLY USED go first; an entry a reader holds and one used within the minimum "
+              "age are kept; it stops at the low-water mark; the line names the bound",
+              ev_ == 2 and not os.path.exists(os.path.join(lru, "R", "M0", f"{0:064x}")) and not os.path.exists(os.path.join(lru, "R", "M2", f"{2:064x}"))
+              and os.path.isdir(os.path.join(lru, "R", "M1", f"{1:064x}")) and os.path.isdir(os.path.join(lru, "R", "M3", f"{3:064x}"))
+              and 800 * 1024 <= after_ <= 800 * 1024 + 64 and any(SLICE_CACHE_MAX_ENV in m_ and "evicted the 2 least recently used" in m_ for m_ in lru_log),
+              (ev_, after_, left_, lru_log))
+        check("slices/a staging directory a killed process left behind (over a day old) is removed",
+              not os.path.exists(os.path.join(lru, "R", "M0", "f" * 64 + ".staging-1-2")))
+        check("slices/an entry with no recorded size is measured once and recorded",
+              os.path.isfile(os.path.join(lru, "R", "M3", f"{3:064x}", ".bytes")))
+        check("slices/under the bound nothing is evicted", bound_slice_cache(lru, 10 << 20, lambda m_: None, now=t_now) == (0, after_))
+        check("slices/a second evictor on the same cache skips (one at a time)",
+              (lambda g_: (bound_slice_cache(lru, 1, lambda m_: None, now=t_now), g_.close())[0])(
+                  _try_lock(os.path.join(lru, ".bound.lock"), _fc.LOCK_EX | _fc.LOCK_NB)) == (0, -1))
+        check("slices/the bound is MW_BUILD_SLICE_CACHE_MAX_GIB, else the default — never unbounded",
+              slice_cache_cap({SLICE_CACHE_MAX_ENV: "2"}) == 2 << 30 and slice_cache_cap({}) == int(SLICE_CACHE_DEFAULT_GIB * (1 << 30))
+              and all(slice_cache_cap({SLICE_CACHE_MAX_ENV: v_}) == int(SLICE_CACHE_DEFAULT_GIB * (1 << 30)) for v_ in ("0", "-3", "x", "nan", "inf")))
+        # an evicted slice is fetched again from the store by its hash (it is a cache of the store, never the only copy)
+        shutil.rmtree(os.path.join(sc, "MeshWeaver.Plugins", "B", out_hex))
+        brc.answered.discard("req:B")
+        shutil.rmtree(os.path.join(brc.out, "resp"), ignore_errors=True); os.makedirs(os.path.join(brc.out, "resp"))
+        api_c.script[("GET-BYTES", "/modules/MeshWeaver.Plugins/B/outputs/" + out_hex)] = [(200, out_bytes)]
+        api_c.script[("POST", "/modules/MeshWeaver.Plugins/B/request")] = [(200, {"verdict": "Hit", "step": {"seq": 4, "outputHash": "sha256:" + out_hex}})]
+        with open(os.path.join(brc.io, "req", "B.json"), "w") as fh:
+            json.dump({"module": "B"}, fh)
+        brc.poll_once()
+        resp_e = json.load(open(os.path.join(brc.out, "resp", "B.json")))
+        check("slices/an EVICTED slice is filled again from the store by its hash (a cold host fills before it builds)",
+              resp_e.get("source") == "fetched from the hub's store" and open(os.path.join(resp_e["outputDir"], "B.dll"), "rb").read() == b"built B", resp_e)
         brl, api_l = broker_with({("POST", "/modules/MeshWeaver.Plugins/B/request"): [(200, {"verdict": "Grant", "step": {"seq": 9}, "leaseUntil": "2026-11-08T10:00:00Z"})],
                                   ("PUT", "/modules/MeshWeaver.Plugins/B/outputs/"): put_,
                                   ("POST", "/modules/MeshWeaver.Plugins/B/complete"): lambda p_, b_: (200, {"accepted": True})})
@@ -8091,7 +8358,8 @@ def self_test() -> int:
             check("warm-idle/the first idle pass REMOVES the §7.3 generations left on the cache (no 18 GiB beside the new trees)",
                   not os.path.exists(legacy_gen) and hi.legacy_retired
                   and any(m.startswith("legacy shared tree:") and "removed" in m for m in idle_log), (legacy_gen, idle_log[:3]))
-            check("warm-idle/the deployment is the host's lane plus its warm key", os.path.basename(idt.root) == deployment_name(hi.lane, warm_key(hi.env, hi.identity)))
+            check("warm-idle/the ONE tree is the host's channel alone, never its build identity", os.path.basename(idt.root) == deployment_name(hi.channel)
+                  and (idt.state() or {}).get("key") == warm_key(hi.env, hi.identity))
             hi.cycle()
             if hi.warm_thread:
                 hi.warm_thread.join(60)
@@ -8337,7 +8605,7 @@ def self_test() -> int:
             busy_fh = open(os.path.join(rdep, "mac-busybusybusybusy", ".locks", "R.lock"))
             _fcntl.flock(busy_fh.fileno(), _fcntl.LOCK_SH)         # a run still reading the old key's tree
             r_log: list = []
-            gone_ = retire_stale_deployments(rc_, "mac", "mac-currentcurrent00", r_log.append,
+            gone_ = retire_legacy_deployments(rc_, "mac", "mac-currentcurrent00", r_log.append,
                                              lambda *a_: subprocess.run(["git", *a_], check=True, capture_output=True))
             busy_fh.close()
             check("retire/the lane's OTHER key, unused and quiet, is retired — directory gone and its worktree deregistered",
@@ -8354,7 +8622,7 @@ def self_test() -> int:
                   os.path.isdir(os.path.join(rdep, "mac-oldish-but-not-a-key")))
             check("retire/the log names the MEASURED age, not the threshold",
                   any("retired (untouched " in m and f"untouched {int(STALE_DEPLOYMENT_SECONDS)} s" not in m for m in r_log), r_log)
-            check("retire/a cache with no deploy directory is no error", retire_stale_deployments(os.path.join(wroot, "nope"), "mac", "x", log0, lambda *a_: None) == [])
+            check("retire/a cache with no deploy directory is no error", retire_legacy_deployments(os.path.join(wroot, "nope"), "mac", "x", log0, lambda *a_: None) == [])
 
             # a run STAGE's platform view (§7.3b step 2): its own, bound AT the MW_PLATFORM_SOURCE path, lower = the warm platform
             # tree the run holds, else the image's tree; a view that cannot be made binds nothing (the stage sees read-only)
