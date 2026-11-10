@@ -3424,10 +3424,59 @@ TREE_SAMPLE = 32
 PLATFORM_REPO = "MeshWeaver"
 
 
+# What in THIS runner changes a build's output, beside the SDK: bump it when build-run.py changes how a warm tree or a module
+# output is laid out or built (bind paths, the env a build sees). Never the image digest — that moved on every merge to
+# this repository and threw every warm tree and module output away (eiger 2026-11-09: 50 rolls in a day, no warm run).
+WARM_LAYOUT = "2026-11-10.1"
+TOOLCHAIN_ENV = "MW_BUILD_TOOLCHAIN"
+# The runner image's files that can change a build's OUTPUT are hashed by content; the others never key a build: the
+# runner itself (its effect is WARM_LAYOUT), the platform's source (keyed by the platform set), the chart (no warm build
+# reads it) and the browser (a test runtime).
+TOOLCHAIN_SKIP = ("build-run.py", "platform-src", "deploy-src", "browser")
+
+
+def build_toolchain(root: str = PREPARED_ROOT, which: Callable[[str], Optional[str]] = shutil.which) -> str:
+    """The build toolchain this host runs, by CONTENT: the .NET SDKs installed (the floating `dotnet/sdk:10.0` base can move
+    under an unchanged Dockerfile), the CPU architecture, a sha256 over the runner image's build helpers under `root`
+    (plugin-build/, the composer and key scripts — TOOLCHAIN_SKIP aside) and WARM_LAYOUT. Never the image digest. Never
+    raises: what cannot be read is named in the value, so it still keys distinctly."""
+    import platform as _platform
+    parts = [f"layout={WARM_LAYOUT}", f"arch={_platform.machine()}"]
+    dn = which("dotnet")
+    try:
+        sdks = sorted(os.listdir(os.path.join(os.path.dirname(os.path.realpath(dn)), "sdk"))) if dn else []
+    except OSError:
+        sdks = ["unreadable"]
+    parts.append("sdk=" + ",".join(sdks))
+    h = hashlib.sha256()
+    try:
+        for d, dirs, files in os.walk(root):
+            rel = os.path.relpath(d, root)
+            if rel != "." and rel.split(os.sep)[0] in TOOLCHAIN_SKIP:
+                dirs[:] = []
+                continue
+            dirs.sort()
+            for f in sorted(files):
+                if rel == "." and f in TOOLCHAIN_SKIP:
+                    continue
+                path = os.path.join(d, f)
+                try:
+                    with open(path, "rb") as fh:
+                        h.update(os.path.normpath(os.path.join(rel, f)).encode() + b"\0" + hashlib.sha256(fh.read()).digest())
+                except OSError:
+                    h.update(f"unreadable:{rel}/{f}".encode())
+    except OSError:
+        h.update(b"no-prepared-root")
+    parts.append(f"helpers={h.hexdigest()[:16]}")
+    return ";".join(parts)
+
+
 def warm_key(env: dict, identity: str) -> str:
-    """What invalidates a warm tree: the platform set, the framework identity and the images the host runs. Pure."""
+    """What invalidates a warm tree — what changes a BUILD'S OUTPUT: the platform set, the framework identity, the tester
+    and portal images a build compiles against, and the build toolchain (`build_toolchain`: SDK, helpers' content,
+    WARM_LAYOUT). Not the runner image's digest. Pure."""
     parts = [f"platform={env.get('MW_BUILD_PLATFORM_VERSION', '')}", f"identity={identity}"]
-    parts += [f"{k}={env.get(k, '')}" for k in ("MW_BUILD_TESTER_DIGEST", "MW_BUILD_PORTAL_DIGEST", "MW_BUILD_RUNNER_DIGEST")]
+    parts += [f"{k}={env.get(k, '')}" for k in ("MW_BUILD_TESTER_DIGEST", "MW_BUILD_PORTAL_DIGEST", TOOLCHAIN_ENV)]
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:32]
 
 
@@ -4465,6 +4514,9 @@ class Host:
                  capacity: Callable[[], "tuple[float, Optional[int]] | str"] = None,
                  nuget_feeds: Optional[NugetFeeds] = None) -> None:
         self.env = env
+        # the build toolchain by CONTENT, once per process (the warm key and the module fingerprints read it)
+        if TOOLCHAIN_ENV not in self.env:
+            self.env[TOOLCHAIN_ENV] = build_toolchain()
         # Where a package promoted into the warm NuGet cache is checked against its source feed (promote_nuget).
         self.nuget_feeds = nuget_feeds or NugetFeeds(trusted=nuget_trusted_sources(env))
         self.api = api
@@ -4599,7 +4651,7 @@ class Host:
                 if rc_ != 0:
                     raise Refusal(f"git ls-tree failed (exit {rc_}): {out_.strip()[-200:]}")
                 return out_
-            toolchain = f"{self.platform_version}|{self.identity}|{self.env.get('MW_BUILD_RUNNER_DIGEST', '')}"
+            toolchain = f"{self.platform_version}|{self.identity}|{self.env.get(TOOLCHAIN_ENV, '')}"
             fps = module_fingerprints(decl, ls_tree, toolchain)
             order = 0
             if trunk:
@@ -7410,9 +7462,38 @@ def self_test() -> int:
                     check(f"warm/{bad_w} is refused", False, "accepted")
                 except Refusal:
                     pass
-            check("warm/the key rides on the platform set, the identity and the images",
+            check("warm/the key rides on the platform set, the identity, the tester/portal images and the build toolchain",
                   warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.1"}, "c003") != warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.2"}, "c003")
-                  and warm_key({}, "a") != warm_key({}, "b") and warm_key({"MW_BUILD_RUNNER_DIGEST": "x"}, "a") != warm_key({}, "a"))
+                  and warm_key({}, "a") != warm_key({}, "b")
+                  and warm_key({"MW_BUILD_TESTER_DIGEST": "t"}, "a") != warm_key({}, "a")
+                  and warm_key({TOOLCHAIN_ENV: "sdk=10.0.403"}, "a") != warm_key({TOOLCHAIN_ENV: "sdk=10.0.404"}, "a"))
+            check("warm/the RUNNER IMAGE DIGEST keys nothing: a rebuilt runner with the same toolchain keeps every warm tree",
+                  warm_key({"MW_BUILD_RUNNER_DIGEST": "sha256:" + "a" * 64, TOOLCHAIN_ENV: "x"}, "a")
+                  == warm_key({"MW_BUILD_RUNNER_DIGEST": "sha256:" + "b" * 64, TOOLCHAIN_ENV: "x"}, "a"))
+            # the toolchain by CONTENT: the SDKs, the helpers' bytes, the layout — and nothing the skip list names
+            tc_root = os.path.join(wroot, "tc-root"); tc_dn = os.path.join(wroot, "tc-dotnet")
+            os.makedirs(os.path.join(tc_root, "plugin-build")); os.makedirs(os.path.join(tc_dn, "sdk", "10.0.403"))
+            for sub in ("platform-src", "deploy-src", "browser"):
+                os.makedirs(os.path.join(tc_root, sub))
+            open(os.path.join(tc_dn, "dotnet"), "w").close()
+            open(os.path.join(tc_root, "plugin-build", "Directory.Build.props"), "w").write("<Project/>")
+            open(os.path.join(tc_root, "compose-gate-host.sh"), "w").write("echo a")
+            open(os.path.join(tc_root, "build-run.py"), "w").write("v1")
+            tc_which = lambda n: os.path.join(tc_dn, "dotnet") if n == "dotnet" else None
+            tc0 = build_toolchain(tc_root, tc_which)
+            open(os.path.join(tc_root, "build-run.py"), "w").write("v2")
+            for sub in ("platform-src", "deploy-src", "browser"):
+                open(os.path.join(tc_root, sub, "f"), "w").write("changed")
+            check("toolchain/a new runner script (build-run.py), platform source, chart or browser asset leaves it unchanged",
+                  build_toolchain(tc_root, tc_which) == tc0, (tc0, build_toolchain(tc_root, tc_which)))
+            open(os.path.join(tc_root, "plugin-build", "Directory.Build.props"), "w").write("<Project><x/></Project>")
+            tc1 = build_toolchain(tc_root, tc_which)
+            check("toolchain/a changed BUILD HELPER (plugin-build/, the composer) changes it", tc1 != tc0, (tc0, tc1))
+            os.makedirs(os.path.join(tc_dn, "sdk", "10.0.404"))
+            check("toolchain/another .NET SDK in the image changes it",
+                  build_toolchain(tc_root, tc_which) != tc1 and "sdk=10.0.403,10.0.404" in build_toolchain(tc_root, tc_which))
+            check("toolchain/no dotnet and no prepared root still yield a distinct, named value (never an exception)",
+                  "sdk=" in build_toolchain(os.path.join(wroot, "nope"), lambda n: None))
             check("warm/opt-in only", warm_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}) and not warm_enabled({}))
             check("warm/sharedTree stays a switch, only with the warm workspace", shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true", "MW_BUILD_SHARED_TREE": "true"})
                   and not shared_tree_enabled({"MW_BUILD_SHARED_TREE": "true"}) and not shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}))
