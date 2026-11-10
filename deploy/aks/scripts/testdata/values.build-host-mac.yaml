@@ -24,7 +24,7 @@ buildHosts:
   runOverlay: true
   # The plugins layer through the registry's bundle index with a read-only instance key (H8): a Mac has no workload identity.
   registry: {url: "https://registry.example.com", instanceKeySecret: {name: "build-registry-key-mac", key: "key"}}
-  rolloutStrategy: "RollingUpdate"     # one replica at a time (deploy/backlease/build-host-mac.values.yaml)
+  rolloutStrategy: "Recreate"     # kept until the exec readiness probe passes on the Macs (deploy/backlease/build-host-mac.values.yaml)
   nodeSelector: null
   tolerations: null
   resources:

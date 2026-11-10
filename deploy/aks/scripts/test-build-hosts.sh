@@ -615,8 +615,8 @@ else:
     if vols.get("registry-key", {}).get("secret", {}).get("secretName") != "build-registry-key-mac": problems.append("no registry-key volume")
     builds = [c for c in spec["containers"] if c["name"] == "build"]
     if not builds or builds[0]["resources"]["requests"] != {"cpu": "4", "memory": "8Gi"}: problems.append(f"requests: {builds and builds[0]['resources']}")
-    # one replica at a time, never all at once: drain-then-replace, no surge (a Recreate roll left the Macs at 0 ready)
-    if dep["spec"]["strategy"] != {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}}: problems.append(f"strategy: {dep['spec']['strategy']}")
+    # Recreate until the exec readiness probe passes on the Macs (a rolling step waits for READY; see the values file)
+    if dep["spec"]["strategy"] != {"type": "Recreate"}: problems.append(f"strategy: {dep['spec']['strategy']}")
     if env.get("MW_BUILD_STAGE_NETWORK") != "open" or env.get("MW_BUILD_RUN_DISK_GIB") != "20" or env.get("MW_BUILD_DISK_HEADROOM_PERCENT") != "15":
         problems.append(f"the stage network / disk guard defaults: {env.get('MW_BUILD_STAGE_NETWORK')!r} {env.get('MW_BUILD_RUN_DISK_GIB')!r} {env.get('MW_BUILD_DISK_HEADROOM_PERCENT')!r}")
 so = [d for d in docs if d["kind"] == "ScaledObject"]
