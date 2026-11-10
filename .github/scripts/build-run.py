@@ -33,7 +33,9 @@ THE LOOP, and the order that matters:
      replaces it) or the instance answers its set current again; it never exits on its own, so a
      record change that is not applied yet cannot crash-loop the host (Memex#885). 200 = a run: `{path, repo, sha, refs, isTrunk, publish, stages, labels}` — `path`
      is authoritative; `labels` (the pull request's live labels, which a host has no credential to read) reach every stage
-     as `MW_BUILD_LABELS` (comma-separated; left UNSET when the claim carries none, so the stage says it was not told) (a non-latest run's node id is `<sha>-<channel>`). The host then posts the
+     as `MW_BUILD_LABELS` (comma-separated; left UNSET when the claim carries none, so the stage says it was not told); the base a
+     pull-request head was merged onto reaches every stage as `MW_BUILD_MERGE_BASE` (also when the head already contained it and
+     git made no merge commit; UNSET on an unmerged run) (a non-latest run's node id is `<sha>-<channel>`). The host then posts the
      PLAN (`{"kind":"plan","stages":[…]}`, host-emitted only) and keeps the claim's lease with a
      batch at least every 45 s (an empty batch is the heartbeat); every stage route's batches are
      numbered (`seq`) and a retried batch keeps its number. No claim survives a host restart.
@@ -5558,6 +5560,12 @@ class Host:
             labels = claim_labels(claim)
             if labels is not None:
                 extra["MW_BUILD_LABELS"] = labels
+            # The base this attempt's head was merged onto, handed to every stage: when the head already CONTAINS it
+            # (a settle pull request cut from main's tip) git answers "Already up to date" and makes NO merge commit, so a
+            # selector that reads `HEAD^2` finds nothing and would select the FULL set. With the base named it narrows to
+            # `<base>...HEAD` in both shapes. UNSET on a run that was not merged (trunk, a plain probe).
+            if merge_base:
+                extra["MW_BUILD_MERGE_BASE"] = merge_base
             # A stage is skipped only when a stage it runs AFTER failed (`after`); its independent siblings still
             # run. `failed` holds every red stage — ran red or was skipped — so a skip propagates to the skipped
             # stage's own dependants. `why` is a RUN-WIDE stop (a prepared input, the run deadline) that ends every
@@ -5871,7 +5879,10 @@ class Host:
         if rc != 0:
             self.git_runner(["-C", checkout, "merge", "--abort"], genv)
             raise Refusal(f"the head does not merge onto {base[:12]} (exit {rc}) — a conflict is red, never a test of the unmerged head: {out.strip()[-200:]}")
-        self.log(f"merged the head onto {base[:12]} — every stage of this attempt tests that tree")
+        if re.search(r"up[ -]to[ -]date", out, re.I):   # "Already up to date." — older git hyphenates it
+            self.log(f"the head already contains {base[:12]} — no merge commit; every stage sees the base as MW_BUILD_MERGE_BASE")
+        else:
+            self.log(f"merged the head onto {base[:12]} — every stage of this attempt tests that tree")
         return base
 
     def sweep_workspaces(self, now: Optional[float] = None) -> list[str]:
@@ -11256,7 +11267,7 @@ def self_test() -> int:
         check("claim/the claimId is a uuid", all(len(i) == 36 and i.count("-") == 4 for i in ids), ids)
         # ONE merged tree per attempt: null → main's tip resolved ONCE and reused; non-null → verbatim;
         # trunk → no merge
-        def merge_host(gitlog, tip="e" * 40, merge_rc=0):
+        def merge_host(gitlog, tip="e" * 40, merge_rc=0, merge_out="", command="true"):
             def git(args, env_):
                 # The warm NuGet cache's plan reads the mirror too (rev-parse → show → ls-tree); those reads are not the
                 # merge's, so they are left out of the log these cases assert on — the rev-parse it opened with included.
@@ -11268,11 +11279,11 @@ def self_test() -> int:
                 if "rev-parse" in args:
                     return 0, tip + "\n"
                 if "merge" in args and "--abort" not in args:
-                    return merge_rc, "CONFLICT" if merge_rc else ""
+                    return merge_rc, "CONFLICT" if merge_rc else merge_out
                 return 0, ""
             posted.clear()
             return host(api_ev(), env=env_s, git_runner=git, checkout=checkout_with({"stages": [
-                {"name": "a", "kind": "build", "command": "true"}, {"name": "b", "kind": "test", "command": "true"}]}))
+                {"name": "a", "kind": "build", "command": "true"}, {"name": "b", "kind": "test", "command": command}]}))
         plans = lambda: [e for _, es in posted for e in es if e["kind"] == "plan"]
         gl: list = []
         merge_host(gl).run(dict(claim, isTrunk=False, mergeBaseSha=None))
@@ -11324,6 +11335,21 @@ def self_test() -> int:
         merge_host(gl).run(dict(claim, isTrunk=False, mergeBaseSha="not-a-sha"))
         rf = [e for _, es in posted for e in es if e["kind"] == "run-finished"]
         check("merge/a malformed mergeBaseSha is refused", rf and "not a full commit" in rf[0]["error"], rf)
+        # the merged base reaches every stage as MW_BUILD_MERGE_BASE — with a merge commit AND when the head already
+        # contained the base (git: "Already up to date", no commit), so a selector narrows in both; UNSET when unmerged
+        seen_mb = os.path.join(tmp, "seen-merge-base")
+        for label, kw, run_kw, want in (
+                ("a merge commit", {}, {"isTrunk": False, "mergeBaseSha": None}, "e" * 40),
+                ("an already-up-to-date head", {"merge_out": "Already up to date.\n"},
+                 {"isTrunk": False, "mergeBaseSha": "D" * 40}, "d" * 40),
+                ("a trunk run", {}, {"isTrunk": True, "mergeBaseSha": None}, "unset"),
+                ("a plain probe", {}, {"isTrunk": False, "isProbe": True, "mergeBaseSha": None}, "unset")):
+            if os.path.exists(seen_mb):
+                os.remove(seen_mb)
+            gl = []
+            merge_host(gl, command=f"echo \"[${{MW_BUILD_MERGE_BASE-unset}}]\" >> {seen_mb}", **kw).run(dict(claim, **run_kw))
+            got = open(seen_mb).read().strip() if os.path.exists(seen_mb) else "<stage did not run>"
+            check(f"merge/{label}: the stage sees MW_BUILD_MERGE_BASE={want[:12]}", got == f"[{want}]", (got, gl))
 
         # every batch carries the assignment's claimId; a stale-claim 409 ends the run; 503 is retried
         bodies: list[dict] = []
