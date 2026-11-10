@@ -3390,6 +3390,10 @@ def _update_mirror(repo: str, url: str, mirror_root: str, mirror: str, wanted: l
             started = time.monotonic()
             git("-C", mirror, "fetch", "--quiet", "--prune", "origin")
             log(f"git mirror fetched (existing): {mirror} in {time.monotonic() - started:.1f} s")
+        # NO automatic gc on a master: runs borrow its objects through `alternates` (overlay and cold trees alike) with no
+        # ref the master knows about, so a fetch's auto-gc / maintenance could prune what a running stage still reads
+        git("-C", mirror, "config", "gc.auto", "0")
+        git("-C", mirror, "config", "maintenance.auto", "false")
         # A PR head (refs/pull/N/head) or the exact sha may not be on a mirrored ref yet.
         git("-C", mirror, "fetch", "--quiet", "origin", *wanted)
 
@@ -8025,6 +8029,10 @@ def self_test() -> int:
             shutil.rmtree(rd2, ignore_errors=True)
             hi.run_holds.close()
             check("reader/the cold tree leaves nothing registered on the master", wt_count(rd2) == 0)
+            mcfg = lambda k_: subprocess.run(["git", "--git-dir", master_path(wenv["MW_BUILD_CACHE"], "R"), "config", "--get", k_],
+                                             capture_output=True, text=True).stdout.strip()
+            check("reader/a master is never auto-gc'd (runs borrow its objects through alternates with no ref it knows)",
+                  mcfg("gc.auto") == "0" and mcfg("maintenance.auto") == "false", (mcfg("gc.auto"), mcfg("maintenance.auto")))
             # the writer rebuilds it (not built → advance in place → warmBuild → manifest)
             idt.unbuild(warm_key(hi.env, hi.identity), c3)
             check("warm-idle/a tree marked not built is rebuilt by the writer", hi._warm_deployment("R", warm_key(hi.env, hi.identity)) == "built"
