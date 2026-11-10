@@ -2175,11 +2175,113 @@ fleet_apply_buildhost() {
     || warn "build host: first-attach failed — re-run 'memex-local fleet join' or first-attach.sh by hand"
 }
 
+# THE HEARTBEAT, WAITED FOR (2026-11-10, the second Mac Studio). The back-lease heartbeat runs in the Hosting
+# package's MODULE, which the portal's default install lands from the registry AFTER the join's update — and a landed
+# module loads only at the NEXT process start ("[DefaultInstall] … MODULE SET proposed: sequence N — the landed
+# modules load at the next restart"). Nothing restarted the portal, so the join ended "done" on a Mac that never sent
+# a heartbeat until a person ran `kubectl rollout restart`. The join's tail now waits for it: Hosting in the default
+# install → ONE restart when the log says the landed modules load at the next restart → the first
+# "[BackLease] heartbeat posted to …: HTTP 2xx" (a Debug line; the local portal logs at $LOG_LEVEL). A plan tier that
+# refuses Hosting is a stop with its remedy, never a wait that cannot end.
+
+# The portal pod's log (the newest active pod of the deployment), never failing.
+portal_log() { kubectl -n "$NAMESPACE" logs "deploy/$PORTAL_DEPLOYMENT" --tail="${1:-6000}" 2>/dev/null || true; }
+
+# heartbeat_state — reads a portal log on stdin, prints "<state>|<detail>", the FIRST that holds:
+#   posted|<url> HTTP <code>      the heartbeat reached control
+#   tier|<tier>|<plan>            the registry's plan tier refuses Hosting to this instance
+#   restart|<sequence line>       Hosting is in the default install and its module loads at the next restart
+#   rejected|<detail>             a heartbeat went out and control did not accept it (the last such line)
+#   notarmed|<why>                the module is loaded but the heartbeat is not armed (the last such line)
+#   armed|<line>                  armed, nothing posted yet
+#   installed|<packages>          Hosting is in the default install, no restart pending
+#   failed|<summary>              the default install FAILED Hosting (a later wave may retry it)
+#   absent|<packages>             the default install reconciled without Hosting
+#   reconciling|                  no reconcile has reported yet
+heartbeat_state() {
+  local log l pk
+  log="$(cat)"
+  l="$(printf '%s\n' "$log" | grep -E '\[BackLease\] heartbeat posted to [^ ]+: HTTP 2[0-9][0-9]' | tail -1)" || true
+  [ -n "$l" ] && { printf 'posted|%s' "$(printf '%s' "$l" | sed -E 's/.*heartbeat posted to ([^ ]+): HTTP ([0-9]+).*/\1 HTTP \2/')"; return 0; }
+  l="$(printf '%s\n' "$log" | grep -E '(^|[ /])Hosting needs plan tier [^,]+, this instance is on ' | tail -1)" || true
+  [ -n "$l" ] && { printf 'tier|%s' "$(printf '%s' "$l" | sed -E 's/.*Hosting needs plan tier ([^,]+), this instance is on ([^.;]+).*/\1|\2/')"; return 0; }
+  local rec hosting="" restart=""
+  rec="$(printf '%s\n' "$log" | grep -F '[DefaultInstall] reconciled')" || true
+  # the package list is the first [...] after "<n> failed"; Hosting by its id, bare or under a source prefix
+  pk="$(printf '%s\n' "$rec" | sed -n -E 's/.* failed \[([^]]*)\].*/\1/p' | tr ',' '\n' | sed -E 's/^ +| +$//g' | grep -Ex '([A-Za-z0-9_.-]+/)?Hosting(@[^ ]*)?' | head -1)" || true
+  [ -n "$pk" ] && hosting=yes
+  restart="$(printf '%s\n' "$rec" | grep -F 'the landed modules load at the next restart' | tail -1 | sed -E 's/.*MODULE SET (proposed: sequence [0-9]+).*/\1/')" || true
+  if [ -n "$hosting" ] && [ -n "$restart" ]; then printf 'restart|%s' "$restart"; return 0; fi
+  l="$(printf '%s\n' "$log" | grep -F '[BackLease] heartbeat NOT accepted by' | tail -1)" || true
+  [ -n "$l" ] && { printf 'rejected|%s' "$(printf '%s' "$l" | sed -E 's/.*heartbeat NOT accepted by //')"; return 0; }
+  l="$(printf '%s\n' "$log" | grep -F '[BackLease] heartbeat not armed on' | tail -1)" || true
+  [ -n "$l" ] && { printf 'notarmed|%s' "$(printf '%s' "$l" | sed -E 's/.*heartbeat not armed on [^:]*: //')"; return 0; }
+  l="$(printf '%s\n' "$log" | grep -F '[BackLease] heartbeat armed on' | tail -1)" || true
+  [ -n "$l" ] && { printf 'armed|%s' "$(printf '%s' "$l" | sed -E 's/.*\[BackLease\] //')"; return 0; }
+  [ -n "$hosting" ] && { printf 'installed|%s' "$pk"; return 0; }
+  l="$(printf '%s\n' "$rec" | grep -E 'FAILED: \[[^]]*Hosting' | tail -1)" || true
+  [ -n "$l" ] && { printf 'failed|%s' "$(printf '%s' "$l" | sed -E 's/.*(FAILED: .*)/\1/' | cut -c1-300)"; return 0; }
+  [ -n "$rec" ] && { printf 'absent|%s' "$(printf '%s\n' "$rec" | tail -1 | sed -n -E 's/.* failed \[([^]]*)\].*/\1/p' | cut -c1-200)"; return 0; }
+  printf 'reconciling|'
+}
+
+# fleet_wait_heartbeat <minutes> — the join's tail (and `memex-local fleet heartbeat`). 0 = this Mac's heartbeat
+# reached control; dies naming the cause and the remedy otherwise. Restarts the portal at most ONCE.
+fleet_wait_heartbeat() {
+  local minutes="${1:-20}" poll="${MEMEX_HEARTBEAT_POLL_SEC:-15}" deadline start restarted=no st kind detail last="" lastsaid=0 now
+  case "$LOG_LEVEL" in Debug|Trace|debug|trace) local debug=yes ;; *) local debug=no ;; esac
+  start="$(date +%s)"; deadline=$(( start + minutes * 60 ))
+  step "Waiting for this Mac's first heartbeat (Hosting from the default install → '[BackLease] heartbeat posted … HTTP 200'; up to ${minutes} min)"
+  while :; do
+    st="$(portal_log | heartbeat_state)"; kind="${st%%|*}"; detail="${st#*|}"; now="$(date +%s)"
+    case "$kind" in
+      posted) ok "heartbeat posted to ${detail} — control now sees this Mac (Hosting/Heartbeats)"; return 0 ;;
+      tier) die "the registry REFUSES Hosting to this instance: Hosting needs plan tier ${detail%%|*}, this instance '$(registry_instance_id)' is on ${detail#*|}.
+     No heartbeat can start without it, so the join stops here instead of waiting.
+     Remedy: a platform admin of $(registry_url) raises instance '$(registry_instance_id)' to plan tier ${detail%%|*}
+     (Settings ▸ Administration ▸ Instance grants), or this Mac registers with a registration key minted for that
+     plan ('memex-local registry $(registry_url) --key mwr_…' then 'memex-local update'). Then: memex-local fleet heartbeat" ;;
+      restart)
+        if [ "$restarted" = no ]; then
+          step "Hosting is installed and its module loads at the next restart (${detail}) — restarting the portal once"
+          kubectl -n "$NAMESPACE" rollout restart "deploy/$PORTAL_DEPLOYMENT" >/dev/null \
+            || die "could not restart the portal — 'kubectl -n $NAMESPACE rollout restart deploy/$PORTAL_DEPLOYMENT', then 'memex-local fleet heartbeat'"
+          kubectl -n "$NAMESPACE" rollout status "deploy/$PORTAL_DEPLOYMENT" --timeout=600s >/dev/null \
+            || warn "the restarted portal is not ready after 600 s — still waiting for its heartbeat"
+          restarted=yes; last=""; continue
+        fi
+        detail="Hosting is installed; the new pod proposed another module set (${detail}) — not restarting a second time" ;;
+      armed) if [ "$debug" = no ]; then
+          ok "heartbeat ARMED (${detail}); its 'posted … HTTP 200' line is a Debug line this portal does not log at level ${LOG_LEVEL} — confirm on control (Hosting/Heartbeats)"; return 0
+        fi ;;
+    esac
+    if [ "$st" != "$last" ] || [ $(( now - lastsaid )) -ge 60 ]; then
+      case "$kind" in
+        reconciling) info "the default install has not reported yet ($(( (now - start) / 60 ))/${minutes} min)" ;;
+        absent)      info "the default install reconciled WITHOUT Hosting so far [${detail}] — waiting for a later wave ($(( (now - start) / 60 ))/${minutes} min)" ;;
+        failed)      warn "the default install FAILED Hosting: ${detail} — a later wave retries ($(( (now - start) / 60 ))/${minutes} min)" ;;
+        installed)   info "Hosting is installed (${detail}); waiting for the heartbeat to arm ($(( (now - start) / 60 ))/${minutes} min)" ;;
+        armed)       info "heartbeat armed (${detail}); waiting for the first post ($(( (now - start) / 60 ))/${minutes} min)" ;;
+        rejected)    warn "control did NOT accept a heartbeat: ${detail} ($(( (now - start) / 60 ))/${minutes} min)" ;;
+        notarmed)    warn "the heartbeat is NOT armed: ${detail} ($(( (now - start) / 60 ))/${minutes} min)" ;;
+        *)           info "${detail} ($(( (now - start) / 60 ))/${minutes} min)" ;;
+      esac
+      last="$st"; lastsaid="$now"
+    fi
+    if [ "$now" -ge "$deadline" ]; then
+      die "no heartbeat after ${minutes} min — last state: ${kind}${detail:+ (${detail})}.
+     Remedy: read why with 'memex-local logs --no-follow --tail 600 | grep -E \"DefaultInstall|BackLease\"'; once fixed,
+     'memex-local fleet heartbeat' waits again (it restarts the portal once if a landed module is pending)."
+    fi
+    sleep "$poll"
+  done
+}
+
 cmd_fleet() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
     join)
-      local control="" id="" open_link="yes" code_file="" do_update="yes" with_obs="yes" with_build="yes" wait_min=60
+      local control="" id="" open_link="yes" code_file="" do_update="yes" with_obs="yes" with_build="yes" wait_min=60 hb_min="${MEMEX_HEARTBEAT_WAIT_MIN:-20}"
       while [ $# -gt 0 ]; do
         case "$1" in
           --control)   shift; control="${1:?--control needs the control instance URL}" ;;
@@ -2188,6 +2290,7 @@ cmd_fleet() {
           --code-file) shift; code_file="${1:?--code-file needs a path}" ;;   # the paste fallback, read once present
           --wait) shift; wait_min="${1:?--wait needs minutes}"; case "$wait_min" in ''|*[!0-9]*) die "--wait: minutes, a whole number" ;; esac ;;
           --no-update) do_update="no" ;;
+          --heartbeat-wait) shift; hb_min="${1:?--heartbeat-wait needs minutes (0 = do not wait)}" ;;
           --no-observability) with_obs="no" ;;
           --no-buildhost) with_build="no" ;;
           --owner) shift; OWNER_ARG_ID="${1:?--owner needs the owner user id}" ;;
@@ -2223,6 +2326,7 @@ cmd_fleet() {
       info "macOS account: $user · host: $host · hardware id: $machine"
       for t in colima docker kubectl helm ollama tailscale; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
       [ -z "$missing" ] || warn "missing:$missing — 'brew install$missing' (tailscale joins the private network; the rest run the stack)"
+      kubelet_root_check
 
       step "A throw-away key for this join (step 2)"
       mkdir -p "$FLEET_DIR"; chmod 700 "$FLEET_DIR"
@@ -2316,7 +2420,20 @@ cmd_fleet() {
       else
         info "Apply it: memex-local update"
       fi
-      info "Progress: the control instance's Hosting/Heartbeats/Enrolments lists this join and its first heartbeat"
+      case "$hb_min" in ''|*[!0-9]*) die "--heartbeat-wait: minutes, a whole number (got '$hb_min')" ;; esac
+      if [ "$do_update" = "yes" ] && [ "$hb_min" -gt 0 ] && registry_mode && colima_running; then
+        fleet_wait_heartbeat "$hb_min"
+      else
+        info "Progress: the control instance's Hosting/Heartbeats/Enrolments lists this join and its first heartbeat ('memex-local fleet heartbeat' waits for it here)"
+      fi
+      ;;
+    heartbeat)
+      local hb_wait="${MEMEX_HEARTBEAT_WAIT_MIN:-20}"
+      while [ $# -gt 0 ]; do case "$1" in --wait) shift; hb_wait="${1:?--wait needs minutes}" ;; *) die "fleet heartbeat: unknown flag '$1'" ;; esac; shift; done
+      case "$hb_wait" in ''|*[!0-9]*|0) die "fleet heartbeat --wait: minutes, a whole number above 0 (got '$hb_wait')" ;; esac
+      require_tool kubectl kubernetes-cli
+      colima_running || die "Colima is not running — 'memex-local up' first"
+      fleet_wait_heartbeat "$hb_wait"
       ;;
     status)
       [ $# -eq 0 ] || die "fleet status: unknown flag '$1'"
@@ -2332,7 +2449,7 @@ cmd_fleet() {
         info "not joined — memex-local fleet join --control https://<control-instance> --id <id>"
       fi
       ;;
-    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--wait <min>] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] [--accept-jobs=<patterns> | --no-accept-jobs] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--residency <X>] | status}" ;;
+    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--wait <min>] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] [--accept-jobs=<patterns> | --no-accept-jobs] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--residency <X>] [--heartbeat-wait <min>] | heartbeat [--wait <min>] | status}" ;;
   esac
 }
 
@@ -3220,13 +3337,145 @@ cmd_relay() {
 # ---------------------------------------------------------------------------
 colima_running() { colima status >/dev/null 2>&1; }
 
+# KUBELET ROOT ON THE DATA DISK (2026-11-10, the second Mac Studio). A Colima VM has a ~19 GiB ROOT disk and a
+# large DATA disk mounted at /var/lib/rancher (k3s state, images, PVCs). k3s puts kubelet's root — kubelet's
+# "nodefs", what the node reports as its disk — at /var/lib/kubelet on the ROOT disk unless told otherwise, so the
+# Hosting heartbeat reported vm.diskFreeGi ≈ 15.7 and control's placement (minDiskGi 20) refused the machine. The
+# build profile has always passed root-dir; the portal's default profile now does too. Both args, because a
+# --k3s-arg REPLACES colima's default list (--disable=traefik) rather than adding to it.
+readonly KUBELET_ROOT_DIR="/var/lib/rancher/kubelet"
+readonly KUBELET_ROOT_ARG="--kubelet-arg=root-dir=${KUBELET_ROOT_DIR}"
+readonly COLIMA_K3S_ARGS=(--k3s-arg=--disable=traefik "--k3s-arg=${KUBELET_ROOT_ARG}")
+
+# The Colima profile's config file (colima resolves $COLIMA_HOME, then ~/.colima, then $XDG_CONFIG_HOME/colima).
+colima_profile_yaml() {
+  local profile="${1:-default}" d
+  for d in "${COLIMA_HOME:-}" "$HOME/.colima" "${XDG_CONFIG_HOME:-$HOME/.config}/colima"; do
+    [ -n "$d" ] && [ -f "$d/$profile/colima.yaml" ] && { printf '%s' "$d/$profile/colima.yaml"; return 0; }
+  done
+  return 1
+}
+
+# The k3sArgs of a colima.yaml, one per line (the block list under `kubernetes:` → `k3sArgs:`; an inline `[]` is
+# none). Reads the file colima itself writes; anything it does not recognise prints nothing.
+colima_k3s_args() {
+  awk '
+    /^[^ #]/ { kube = ($1 == "kubernetes:"); inargs = 0; next }
+    kube && /^[ ]+k3sArgs:/ {
+      inargs = 1; ind = match($0, /[^ ]/)
+      v = $0; sub(/^[ ]*k3sArgs:[ ]*/, "", v)
+      if (v ~ /^\[.*\]$/) { gsub(/\[|\]/, "", v); n = split(v, a, ","); for (i = 1; i <= n; i++) { gsub(/^[ "]+|[ "]+$/, "", a[i]); if (a[i] != "") print a[i] }; inargs = 0 }
+      next
+    }
+    inargs && /^[ ]*#/ { next }
+    inargs && /^[ ]*$/ { next }
+    inargs && /^[ ]*- / { if (match($0, /[^ ]/) > ind) { v = $0; sub(/^[ ]*- [ ]*/, "", v); gsub(/^["]|["]$/, "", v); print v; next } }
+    inargs { inargs = 0 }
+  ' "$1" 2>/dev/null
+}
+
+# 0 = the profile passes kubelet a root-dir on the data disk; 1 = it does not (kubelet on the root disk);
+# 2 = no such profile config (nothing to judge — a fresh Mac before `up`).
+kubelet_root_state() {
+  local y; y="$(colima_profile_yaml "${1:-default}")" || return 2
+  colima_k3s_args "$y" | grep -qE -- "^--kubelet-arg=\"?root-dir=${KUBELET_ROOT_DIR}/?\"?$" && return 0
+  return 1
+}
+
+# The warning fleet join's preflight, doctor and verify print — never fatal, it names the repair.
+kubelet_root_check() {
+  local rc=0; kubelet_root_state default || rc=$?
+  case "$rc" in
+    0) ok "kubelet's root is on the VM's data disk (${KUBELET_ROOT_DIR})" ;;
+    1) warn "the portal VM's kubelet root is on its ~19 GiB ROOT disk ($(colima_profile_yaml default) has no ${KUBELET_ROOT_ARG})
+     — the Hosting heartbeat reports that disk, and control's placement (minDiskGi 20) refuses this Mac.
+     Remedy: 'memex-local kubelet-root apply' (adds the arg and restarts the VM; the portal is down meanwhile)." ;;
+    *) info "no Colima profile 'default' yet — 'memex-local up' creates it with kubelet's root on the data disk" ;;
+  esac
+  return 0
+}
+
+# Add root-dir to an EXISTING profile's k3sArgs, in place (a backup beside it). Idempotent: a file that has it
+# is left byte-identical. Refuses a file whose shape it does not recognise rather than guessing.
+colima_yaml_add_kubelet_root() {
+  local y="$1" tmp
+  grep -q '^kubernetes:' "$y" || { warn "$y has no 'kubernetes:' section — not a k3s profile"; return 1; }
+  colima_k3s_args "$y" | grep -qE -- "^--kubelet-arg=\"?root-dir=" && {
+    colima_k3s_args "$y" | grep -qE -- "^--kubelet-arg=\"?root-dir=${KUBELET_ROOT_DIR}/?\"?$" && return 0
+    warn "$y already passes kubelet a DIFFERENT root-dir ($(colima_k3s_args "$y" | grep -- 'root-dir=' | head -1)) — left as it is; edit it by hand"; return 1; }
+  tmp="$(mktemp)"
+  awk -v arg="$KUBELET_ROOT_ARG" '
+    function emit() { if (!done) { printf "%s- %s\n", itemind, arg; done = 1 } }
+    /^[^ #]/ { if (inargs) emit(); kube = ($1 == "kubernetes:"); inargs = 0; print; next }
+    kube && /^[ ]+k3sArgs:/ {
+      ind = match($0, /[^ ]/); pre = substr($0, 1, ind - 1); itemind = pre "  "; seen = 1
+      v = $0; sub(/^[ ]*k3sArgs:[ ]*/, "", v)
+      if (v ~ /^\[[ ]*\]$/ || v == "") {
+        print pre "k3sArgs:"; if (v != "") { emit() } else { inargs = 1 }
+        next
+      }
+      if (v ~ /^\[.*\]$/) { sub(/\][ ]*$/, ", " arg "]", v); print pre "k3sArgs: " v; done = 1; next }
+      print; next
+    }
+    inargs && /^[ ]*- / && match($0, /[^ ]/) > ind { itemind = substr($0, 1, match($0, /[^ ]/) - 1); print; next }
+    inargs && (/^[ ]*#/ || /^[ ]*$/) { held = held $0 "\n"; next }
+    inargs { emit(); inargs = 0 }
+    { if (held != "") { printf "%s", held; held = "" } print }
+    END { if (inargs) emit(); if (held != "") printf "%s", held; if (!seen) exit 3 }
+  ' "$y" > "$tmp" || { rm -f "$tmp"; warn "$y has no kubernetes.k3sArgs key — not a shape this tool edits"; return 1; }
+  colima_k3s_args "$tmp" | grep -qxF -- "$KUBELET_ROOT_ARG" || { rm -f "$tmp"; warn "could not add the arg to $y (unrecognised k3sArgs shape) — left unchanged"; return 1; }
+  cp -p "$y" "$y.bak-$(date +%Y%m%d%H%M%S)" && cat "$tmp" > "$y"; rm -f "$tmp"
+}
+
+# memex-local kubelet-root [status | apply [--yes]]
+cmd_kubelet_root() {
+  local sub="${1:-status}" yes="no"; shift || true
+  while [ $# -gt 0 ]; do case "$1" in --yes|-y) yes="yes" ;; *) die "kubelet-root: unknown flag '$1'" ;; esac; shift; done
+  case "$sub" in
+    status) kubelet_root_check
+      if colima_running; then info "in the VM: $(colima ssh -- sh -c "df -h ${KUBELET_ROOT_DIR} /var/lib/kubelet 2>/dev/null | tail -n +2 | awk '{print \$6\": \"\$4\" free of \"\$2}' | paste -sd ';' -" 2>/dev/null </dev/null || echo unreadable)"; fi ;;
+    apply)
+      require_tool colima colima; require_tool kubectl kubernetes-cli
+      local y rc=0; kubelet_root_state default || rc=$?
+      [ "$rc" = 2 ] && die "kubelet-root apply: no Colima profile 'default' to repair — 'memex-local up' creates one with kubelet's root on the data disk"
+      y="$(colima_profile_yaml default)"
+      if [ "$rc" = 0 ]; then ok "nothing to do: $y already passes ${KUBELET_ROOT_ARG}"; return 0; fi
+      warn "this RESTARTS the portal VM (Colima profile 'default'): the portal and everything in it is DOWN for a few minutes.
+     Data is kept (the database volume lives under /var/lib/rancher, which does not move); pods restart."
+      if [ "$yes" != yes ]; then
+        [ -t 0 ] || die "kubelet-root apply: not a terminal — re-run with --yes to restart the VM unattended"
+        local a; printf 'Restart the portal VM now? [y/N] ' >&2; IFS= read -r a || a=""
+        case "$a" in y|Y|yes|YES) ;; *) die "kubelet-root apply: nothing changed" ;; esac
+      fi
+      step "Adding ${KUBELET_ROOT_ARG} to $y (a backup beside it)"
+      colima_yaml_add_kubelet_root "$y" || die "kubelet-root apply: $y was not changed — see the warning above"
+      kubelet_root_state default || die "kubelet-root apply: $y still does not carry the arg after the edit"
+      step "Restarting the portal VM so k3s re-installs with the arg (colima stop; colima start)"
+      if colima_running; then colima stop || die "kubelet-root apply: colima stop failed — the profile is edited; 'colima start' applies it"; fi
+      colima start || die "kubelet-root apply: colima start failed — the profile is edited ($y; the backup beside it); 'colima start' again"
+      kubectl --context colima wait --for=condition=Ready node --all --timeout=300s >/dev/null \
+        || warn "the k3s node is not Ready after 300 s — 'kubectl --context colima get nodes'"
+      local seen
+      seen="$(colima ssh -- sh -c "test -d ${KUBELET_ROOT_DIR}/pods && df -h ${KUBELET_ROOT_DIR} | tail -1 | awk '{print \$4\" free of \"\$2}'" 2>/dev/null </dev/null || true)"
+      [ -n "$seen" ] || die "kubelet-root apply: the VM restarted but ${KUBELET_ROOT_DIR}/pods does not exist — kubelet did not take the root-dir; 'colima ssh -- ps -ef | grep k3s' shows its args"
+      ok "kubelet's root is ${KUBELET_ROOT_DIR} on the data disk: ${seen}"
+      step "Waiting for the portal to come back"
+      kubectl -n "$NAMESPACE" rollout status "deploy/$PORTAL_DEPLOYMENT" --timeout=600s \
+        && ok "the portal is back; the next heartbeat reports the data disk as vm.diskFreeGi" \
+        || warn "the portal is not ready after 600 s — 'memex-local status'"
+      ;;
+    *) die "usage: memex-local kubelet-root [status | apply [--yes]]" ;;
+  esac
+}
+
 start_colima() {
   if colima_running; then
     info "Colima already running — leaving it as-is (resize needs a restart)"
   else
-    step "Starting Colima with k3s, ${COLIMA_CPU} CPU / ${COLIMA_MEM} GiB (§2)"
-    colima start --kubernetes --cpu "$COLIMA_CPU" --memory "$COLIMA_MEM"
+    step "Starting Colima with k3s, ${COLIMA_CPU} CPU / ${COLIMA_MEM} GiB, kubelet on the data disk (§2)"
+    colima start --kubernetes --cpu "$COLIMA_CPU" --memory "$COLIMA_MEM" ${COLIMA_K3S_ARGS[@]+"${COLIMA_K3S_ARGS[@]}"}
   fi
+  kubelet_root_check
   step "Verifying kubectl context + node (§2)"
   local ctx; ctx="$(kubectl config current-context 2>/dev/null || true)"
   [ "$ctx" = "colima" ] || warn "kubectl context is '$ctx' (expected 'colima')"
@@ -5666,6 +5915,7 @@ hand_into_setup() {
 cmd_verify() {
   require_tool colima colima; require_tool kubectl kubernetes-cli
   colima_running || die "Colima is not running — run 'memex-local up' first"
+  kubelet_root_check
   verify_usable "$@"
 }
 
@@ -6401,6 +6651,7 @@ cmd_doctor() {
   step "Cluster"
   if colima_running; then
     ok "colima running"; kubectl get nodes 2>&1 || warn "kubectl get nodes failed"
+    kubelet_root_check
   else
     warn "colima not running (run 'memex-local up')"
   fi
@@ -6458,7 +6709,7 @@ COMMANDS:
                   LOCAL MODEL: the Mac own Ollama also serves the portal utility tier (inbox
                   triage, reply drafts, calendar suggestions); apply with update. The default
                   chat model is the local one on every install (llm.auto.yaml, no command needed).
-  fleet join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] | status
+  fleet join --control <https url> --id <id> [--no-open] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] [--heartbeat-wait <min>] | heartbeat [--wait <min>] | status
                   JOIN THIS MAC TO THE FLEET in one command (MeshWeaver.Plugins Hosting/MacStudioFleet
                   §2b): prints a link to the control instance's approval page with this Mac's key
                   fingerprint; a global administrator approves it there and the page shows an
@@ -6469,6 +6720,10 @@ COMMANDS:
                   the observability stack sized for the VM (--no-observability skips it) and
                   the build VM sized from this host (buildhost apply) — only when the owner said
                   YES to fleet jobs (--accept-jobs=…); --no-buildhost skips it regardless.
+                  It then WAITS for this Mac's first heartbeat (--heartbeat-wait <min>, default 20,
+                  0 = no wait): Hosting from the default install, ONE portal restart when its module
+                  loads at the next restart, then '[BackLease] heartbeat posted … HTTP 200'; a plan
+                  tier that refuses Hosting stops it with the remedy. 'heartbeat' waits again.
                   'status' shows the fingerprints.
   ca adopt [--key-file <file> | --key-stdin] [--cert <pem>] [--sha256 <hex>] | status
                   The FLEET LOCAL CA: a fleet-wide CA name-constrained to localhost, *.localhost,
@@ -6490,9 +6745,17 @@ COMMANDS:
   net apply | measure | off | status [--profile default|build]
                   FLEET TRAFFIC YIELDS TO THE OWNER'S NETWORK: Linux tc inside the Colima VM caps its
                   internet traffic (up and down) at MEMEX_NET_SHARE_PCT (default 25) % of the link,
-                  measured once with networkQuality, and marks it DSCP CS1; traffic to the Mac is
+                  measured with networkQuality (3 runs per direction, the median; never capped below
+                  MEMEX_NET_MIN_KBIT, default 2000), and marks it DSCP CS1; traffic to the Mac is
                   exempt. MEMEX_NET_UP_KBIT / MEMEX_NET_DOWN_KBIT declare the caps (0 = none).
                   'up' and 'buildhost apply' apply it; 'measure' re-measures; 'off' removes it.
+  kubelet-root status | apply [--yes]
+                  KUBELET ON THE VM'S DATA DISK: 'up' creates the portal VM with kubelet's root at
+                  ${KUBELET_ROOT_DIR} (the 100 GiB data disk), as the build VM always had; an OLDER VM
+                  keeps it on the ~19 GiB root disk, which the Hosting heartbeat reports as vm.diskFreeGi
+                  and control's placement refuses. 'apply' adds the arg to ~/.colima/default/colima.yaml
+                  (a backup beside it) and RESTARTS the VM — the portal is down meanwhile; data is kept.
+                  Idempotent. fleet join, doctor and verify warn when it is missing.
   backlease enroll --control <https url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>]
             [--accept-jobs=<patterns> | --no-accept-jobs] [--job-channels <c>] [--job-repos <owner/repo>]
             [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--token-max-concurrency <n>|none]
@@ -7121,6 +7384,7 @@ main() {
     fleet)         cmd_fleet "$@" ;;
     buildhost)     cmd_buildhost "$@" ;;
     net)           cmd_net "$@" ;;
+    kubelet-root)  cmd_kubelet_root "$@" ;;
     llm)           cmd_llm "$@" ;;
     residency)     cmd_residency "$@" ;;
     publish)       cmd_publish "$@" ;;
