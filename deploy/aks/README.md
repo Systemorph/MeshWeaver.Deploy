@@ -1314,6 +1314,9 @@ az acr manifest show -r <acrName> -n memex-portal-ai:<tag> \
 #    `kubectl set image` bypasses the deployment record and the approval, and the next reconcile
 #    (or `helm upgrade`, which re-renders from `portal.image`) silently reverts it — see the ⚠️
 #    under "The keys that actually set the image" above. `az aks command invoke` / `kubectl` are break-glass only.
+#    🚨 Before ANY break-glass `helm upgrade` / `helm rollback` on the cluster that hosts the fleet
+#    registry, read the registry-maintenance lease on the control instance and run nothing while it
+#    is held (REGISTRY-MAINTENANCE.md → "Break glass").
 
 # c) Verify with REAL signals, looped. HTTP 200 is the Blazor shell and proves nothing.
 for i in $(seq 1 10); do curl -s -o /dev/null -w "%{http_code} " https://<host>/api/content/<space>/content/<file>; done

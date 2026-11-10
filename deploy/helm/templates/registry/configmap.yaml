@@ -55,6 +55,13 @@ data:
           age: 168h
           interval: 24h
           dryrun: false
+{{- if $r.readOnly }}
+        # THE MAINTENANCE WINDOW (registry.maintenance.readOnly): every push and every DELETE is
+        # refused, pulls keep working. Rendered only inside a window, so an installation outside
+        # one renders byte-identically to before the key existed.
+        readonly:
+          enabled: true
+{{- end }}
     http:
       addr: ":5000"
       headers:

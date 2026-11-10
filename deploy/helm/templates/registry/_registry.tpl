@@ -68,6 +68,33 @@ start. The one exception is deliberate and safe: `publisher.passwordBcrypt` is a
 {{- fail "registry.workloadIdentity.clientId is set but registry.serviceAccount is the portal's memex-portal-sa — a dedicated identity needs a dedicated account (leave serviceAccount blank for memex-registry-sa); annotating the portal's account would move the portal onto the registry's identity" -}}
 {{- end -}}
 {{- end -}}
+{{- /* THE MAINTENANCE WINDOW (MeshWeaver.Plugins#4370, slice 3; deploy/aks/REGISTRY-MAINTENANCE.md).
+       `readOnly` makes every registry pod refuse pushes and deletes (distribution's
+       storage.maintenance.readonly) — pulls keep working. `garbageCollect` names ONE run: it renders
+       the blob garbage-collect Job, and only inside a read-only window, because a collect beside a
+       read-write pod can delete the blobs of an upload in progress. Nothing here deletes untagged
+       manifests (no --delete-untagged): the fleet cleanup deletes manifests explicitly, by digest,
+       and the untagged per-platform manifests beneath a kept index must survive. Both are applied by
+       the maintenance run that holds the registry-maintenance lease (`hosting-registry-maintenance`),
+       never as a standing value of a record. */ -}}
+{{- $maintenance := ($r.maintenance | default dict) -}}
+{{- $readOnly := $maintenance.readOnly | default false -}}
+{{- if not (kindIs "bool" $readOnly) -}}
+{{- fail (printf "registry.maintenance.readOnly must be true or false, not %q" (toString $readOnly)) -}}
+{{- end -}}
+{{- $garbageCollect := (($maintenance.garbageCollect | default "") | toString | trim) -}}
+{{- if $garbageCollect -}}
+{{- if not $readOnly -}}
+{{- fail "registry.maintenance.garbageCollect needs registry.maintenance.readOnly: true — a garbage-collect beside a read-write registry pod can delete the blobs of an upload in progress" -}}
+{{- end -}}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]{0,38}[a-z0-9])?$" $garbageCollect) -}}
+{{- fail (printf "registry.maintenance.garbageCollect %q is not a run id — 1 to 40 lowercase letters, digits or '-', the suffix of the Job memex-registry-gc-<run>" $garbageCollect) -}}
+{{- end -}}
+{{- end -}}
+{{- $gcDeadline := int ($maintenance.gcDeadlineSeconds | default 1800) -}}
+{{- if or (lt $gcDeadline 60) (gt $gcDeadline 2400) -}}
+{{- fail (printf "registry.maintenance.gcDeadlineSeconds %d is outside 60..2400 — the collect runs inside one maintenance job, which is cut at 45 minutes" $gcDeadline) -}}
+{{- end -}}
 {{- $notificationUrl := ($notifications.url | default "") -}}
 {{- $notificationSecretObject := ($kv.notificationSecretObject | default "") -}}
 {{- if and $notificationUrl (not $notificationSecretObject) -}}
@@ -94,6 +121,9 @@ start. The one exception is deliberate and safe: `publisher.passwordBcrypt` is a
       "publisherPasswordBcrypt" $passwordBcrypt
       "validationUrl" $validationUrl
       "notificationUrl" $notificationUrl
+      "readOnly" $readOnly
+      "garbageCollect" $garbageCollect
+      "gcDeadlineSeconds" $gcDeadline
       "ingressClassName" ($ingress.className | default "nginx")
       "clusterIssuer" ($ingress.clusterIssuer | default "")
       "tlsSecret" ($ingress.tlsSecret | default "memex-registry-tls")

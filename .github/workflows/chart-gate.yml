@@ -256,6 +256,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: deploy/aks/scripts/test-registry-identity.sh
 
+      # The registry's maintenance window (registry.maintenance.*, MeshWeaver.Plugins#4370 slice 3): with no
+      # key the render is unchanged (the negative control); readOnly renders the read-only configuration and
+      # annotates the pod template; a collect renders ONE garbage-collect Job, never --delete-untagged, as the
+      # registry's own identity, without touching the registry pods; a collect outside a read-only window and
+      # malformed values are refused. No cluster, no network.
+      - name: Assert the registry maintenance window renders read-only and its collect only inside it
+        if: ${{ !cancelled() }}
+        run: deploy/aks/scripts/test-registry-maintenance.sh
+
       # The whisper and s1-extract service charts' top-level `enabled` switch (#38): ON by default with
       # a render byte-identical to an undeclared one (estates already run both), and `enabled: false`
       # renders nothing — not even s1-extract's cluster-wide auth-delegator binding — while the enabled

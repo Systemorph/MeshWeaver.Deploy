@@ -1,0 +1,66 @@
+{{- if eq (include "memex.portal.enabled" .) "true" -}}
+{{- if (.Values.registry).enabled }}
+{{- $r := include "memex.registry" . | fromYaml }}
+{{- if $r.garbageCollect }}
+# ---- distribution: the blob garbage-collect of ONE maintenance window ------------------------
+# Rendered only while `registry.maintenance.garbageCollect` names a run, and the helper refuses that
+# outside a read-only window (`registry.maintenance.readOnly`). The maintenance run that holds the
+# registry-maintenance lease (`hosting-registry-maintenance window`, MeshWeaver.Plugins#4370) renders
+# it only AFTER it has verified, pod by pod, that every live registry pod is read-only, and removes
+# it again when it restores read-write. Design: deploy/aks/REGISTRY-MAINTENANCE.md.
+#
+# 🚨 NO `--delete-untagged`. The fleet cleanup deletes manifests explicitly, by digest, and keeps the
+# untagged per-platform manifests beneath every kept index — exactly the children upstream's
+# --delete-untagged has been reported to remove. This collect frees only blobs no manifest references.
+#
+# Same image, same configuration, same ServiceAccount and workload identity as the registry pods: the
+# collect reads and deletes blobs in the one storage container, through the same credential.
+# backoffLimit 0: a collect that failed is a failure to read, never a reason to try again in the window.
+---
+apiVersion: "batch/v1"
+kind: "Job"
+metadata:
+  name: "memex-registry-gc-{{ $r.garbageCollect }}"
+  labels:
+    app.kubernetes.io/name: "{{ .Chart.Name }}"
+    app.kubernetes.io/component: "memex-registry-gc"
+    app.kubernetes.io/instance: "{{ .Release.Name }}"
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ $r.gcDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: "{{ .Chart.Name }}"
+        app.kubernetes.io/component: "memex-registry-gc"
+        app.kubernetes.io/instance: "{{ .Release.Name }}"
+        azure.workload.identity/use: "true"
+      annotations:
+        # The configuration this collect ran with — the read-only one, the same checksum the
+        # verified registry pods carry.
+        checksum/config: {{ include (print $.Template.BasePath "/registry/configmap.yaml") . | sha256sum }}
+    spec:
+      restartPolicy: "Never"
+      serviceAccountName: {{ $r.serviceAccount | quote }}
+      containers:
+        - name: "garbage-collect"
+          image: {{ $r.image | quote }}
+          imagePullPolicy: "IfNotPresent"
+          args: ["garbage-collect", "/etc/registry/config.yml"]
+          env:
+            - name: "OTEL_TRACES_EXPORTER"
+              value: "none"
+          volumeMounts:
+            - name: "config"
+              mountPath: "/etc/registry/config.yml"
+              subPath: "config.yml"
+              readOnly: true
+          resources:
+            {{- toYaml $r.registryResources | nindent 12 }}
+      volumes:
+        - name: "config"
+          configMap:
+            name: "memex-registry-config"
+{{- end }}
+{{- end }}
+{{- end }}

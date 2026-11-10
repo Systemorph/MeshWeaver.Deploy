@@ -1084,6 +1084,14 @@ registry:
   validationUrl: ""
   notifications:
     url: ""                       # registry events are POSTed here when set
+  # THE MAINTENANCE WINDOW (MeshWeaver.Plugins#4370; deploy/aks/REGISTRY-MAINTENANCE.md). Set ONLY by
+  # `hosting-registry-maintenance`, run by the fleet cleanup while it holds the registry-maintenance
+  # lease — never a standing value in a record or an overlay, and never by a hand `helm upgrade`.
+  maintenance:
+    readOnly: false               # true → storage.maintenance.readonly: pushes and DELETEs refused, pulls served
+    garbageCollect: ""            # a run id → the Job memex-registry-gc-<run> (`registry garbage-collect`,
+                                  #            no --delete-untagged); refused unless readOnly is true
+    gcDeadlineSeconds: 1800       # the collect Job's activeDeadlineSeconds (60..2400)
   ingress:
     className: "nginx"
     clusterIssuer: ""             # cert-manager ClusterIssuer; empty = tlsSecret is pre-created

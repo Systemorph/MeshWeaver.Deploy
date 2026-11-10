@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# A stand-in `helm` for hosting-registry-maintenance's behaviour tests. What is tested is what the SCRIPT
+# does with the answers — the order of its writes, what it refuses, and that it restores read-write —
+# never helm itself. The release is a minimal one: the registry ConfigMap, the registry Deployment, a
+# portal Deployment, and the collect Job while one is set.
+#
+#   HOSTING_RM_STATE       directory: helm.log / kubectl.log (one argv per call), mode (read-only|read-write),
+#                          gc (the collect run, empty for none)
+#   HOSTING_RM_DRIFT=1     the dry run renders a DIFFERENT portal image — the operator chart moved
+#   HOSTING_RM_DRIFT_RW=1  the same, but only for the read-write apply (the restore's own guard)
+set -uo pipefail
+state="${HOSTING_RM_STATE:?the registry-maintenance helm stub needs HOSTING_RM_STATE}"
+printf '%s\n' "$*" >> "$state/helm.log"
+[ -f "$state/mode" ] || echo read-write > "$state/mode"
+[ -f "$state/gc" ] || : > "$state/gc"
+
+manifest() {  # manifest <mode> <gc> <portal image>
+  local side="$1" gc="$2" image="$3" ro_block="" ro_note=""
+  if [ "$side" = read-only ]; then
+    ro_block=$'\n        readonly:\n          enabled: true'
+    ro_note=$'\n        memex-registry/maintenance: "read-only"'
+  fi
+  cat <<EOF
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: memex-registry-config
+  labels: {app.kubernetes.io/component: memex-registry}
+data:
+  config.yml: |
+    storage:
+      maintenance:
+        uploadpurging:
+          enabled: true${ro_block}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memex-registry-deployment
+  labels: {app.kubernetes.io/component: memex-registry}
+spec:
+  replicas: 2
+  template:
+    metadata:
+      annotations:
+        checksum/config: sum-${side}${ro_note}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memex-portal-deployment
+  labels: {app.kubernetes.io/component: memex-portal}
+spec:
+  template:
+    spec:
+      containers: [{name: portal, image: "${image}"}]
+EOF
+  if [ -n "$gc" ]; then
+    cat <<EOF
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: memex-registry-gc-${gc}
+  labels: {app.kubernetes.io/component: memex-registry-gc}
+EOF
+  fi
+}
+
+# The values a call asks for: readOnly and garbageCollect from its --set flags.
+wanted() {
+  local ro="" gc=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --set) case "$2" in registry.maintenance.readOnly=*) ro="${2#*=}" ;; esac; shift 2 ;;
+      --set-string) case "$2" in registry.maintenance.garbageCollect=*) gc="${2#*=}" ;; esac; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ "$ro" = true ] && echo "read-only ${gc}" || echo "read-write ${gc}"
+}
+
+case "$1 $2" in
+  "get manifest") manifest "$(cat "$state/mode")" "$(cat "$state/gc")" "portal:1" ;;
+  "upgrade "*)
+    read -r side gc <<< "$(wanted "$@")"
+    case " $* " in
+      *" --dry-run=server "*)
+        image="portal:1"
+        [ "${HOSTING_RM_DRIFT:-0}" = 1 ] && image="portal:2"
+        [ "${HOSTING_RM_DRIFT_RW:-0}" = 1 ] && [ "$side" = read-write ] && image="portal:2"
+        jq -n --arg m "$(manifest "$side" "$gc" "$image")" '{manifest: $m}' ;;
+      *)
+        echo "$side" > "$state/mode"; printf '%s' "$gc" > "$state/gc"
+        echo "Release \"$3\" has been upgraded." ;;
+    esac ;;
+  *) echo "helm stub (registry-maintenance): unexpected invocation: $*" >&2; exit 1 ;;
+esac
