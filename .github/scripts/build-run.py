@@ -859,7 +859,7 @@ def slice_cache_cap(env: dict) -> int:
         gib = float((env.get(SLICE_CACHE_MAX_ENV) or "").strip() or SLICE_CACHE_DEFAULT_GIB)
     except ValueError:
         gib = SLICE_CACHE_DEFAULT_GIB
-    if not gib > 0 or gib != gib:
+    if not 0 < gib <= 1 << 20:                                 # NaN, zero, negative and infinity alike: the default
         gib = SLICE_CACHE_DEFAULT_GIB
     return int(gib * (1 << 30))
 
@@ -1213,8 +1213,9 @@ class ModuleHubBroker:
         until = self.lease_until.get(module)
         if until is not None and self.utcnow() >= until - datetime.timedelta(seconds=MODULE_HUB_LEASE_MARGIN):
             return {"accepted": False, "succeeded": False, "why": f"the lease ended at {until.isoformat()} — nothing was handed over"}
-        body = {"holder": self.host, "seq": seq, "fingerprint": fp, "succeeded": False, "error": str(done.get("error") or "the stage reported a failure")[:2000],
-                **self.build_tag}
+        # the tag FIRST: a tag key can never override the host's identity fields; the success branch below only updates
+        body = {**self.build_tag, "holder": self.host, "seq": seq, "fingerprint": fp, "succeeded": False,
+                "error": str(done.get("error") or "the stage reported a failure")[:2000]}
         if done.get("succeeded") is True:
             staged = os.path.join(self.priv, f"stage-{module}")
             refused = self._copy_output_private(module, staged)
@@ -7980,7 +7981,7 @@ def self_test() -> int:
                   _try_lock(os.path.join(lru, ".bound.lock"), _fc.LOCK_EX | _fc.LOCK_NB)) == (0, -1))
         check("slices/the bound is MW_BUILD_SLICE_CACHE_MAX_GIB, else the default — never unbounded",
               slice_cache_cap({SLICE_CACHE_MAX_ENV: "2"}) == 2 << 30 and slice_cache_cap({}) == int(SLICE_CACHE_DEFAULT_GIB * (1 << 30))
-              and all(slice_cache_cap({SLICE_CACHE_MAX_ENV: v_}) == int(SLICE_CACHE_DEFAULT_GIB * (1 << 30)) for v_ in ("0", "-3", "x", "nan")))
+              and all(slice_cache_cap({SLICE_CACHE_MAX_ENV: v_}) == int(SLICE_CACHE_DEFAULT_GIB * (1 << 30)) for v_ in ("0", "-3", "x", "nan", "inf")))
         # an evicted slice is fetched again from the store by its hash (it is a cache of the store, never the only copy)
         shutil.rmtree(os.path.join(sc, "MeshWeaver.Plugins", "B", out_hex))
         brc.answered.discard("req:B")
