@@ -3424,10 +3424,81 @@ TREE_SAMPLE = 32
 PLATFORM_REPO = "MeshWeaver"
 
 
+# What in THIS runner changes a build's output is keyed MECHANICALLY: the source of the functions that decide how a warm
+# tree or a module output is built — the sandbox (argv, env, allow-list), the trees' layout and advance, the platform
+# views, the module fingerprints — hashed (`runner_build_code`), so a change to any of them re-keys without anyone
+# remembering to, and a change anywhere else in this file re-keys nothing. WARM_LAYOUT is for an output-shaping change
+# OUTSIDE those functions (rare; bump it then). Never the image digest — that moved on every merge to this repository and
+# threw every warm tree and module output away (eiger 2026-11-09: 50 rolls in a day, no warm run).
+WARM_LAYOUT = "2026-11-10.1"
+TOOLCHAIN_ENV = "MW_BUILD_TOOLCHAIN"
+RUNNER_BUILD_CODE = ("Sandbox.argv", "sandbox_env", "advance_deployment_tree", "advance_platform_tree", "cold_run_tree",
+                     "overlay_run_tree", "platform_source_view", "module_fingerprints", "Host._warm_one",
+                     "Host.stage_platform_binds")
+RUNNER_BUILD_CONSTANTS = ("ENV_ALLOW", "WARM_KEEP", "SANDBOX_CHECKOUT", "SANDBOX_NUGET", "PREPARED_ROOT")
+# The runner image's BUILD HELPERS — the only files under the prepared root a build executes or imports — hashed by
+# content, by an explicit list (never a walk: nothing else under the root, written at run time or not, can churn the key).
+TOOLCHAIN_HELPERS = ("plugin-build", "compose-gate-host.sh", "sandbox-postgres.sh", "module-build-key.py",
+                     "node-repo-scope.py", "ci-artifact-store.py", "compile-check.py", "host-postgres.sh")
+
+
+def runner_build_code() -> str:
+    """sha256 (16 hex) over the source of RUNNER_BUILD_CODE and the values of RUNNER_BUILD_CONSTANTS. A name that no longer
+    resolves is named in the hash input, so a rename still re-keys and the self-test pins that every name resolves."""
+    import inspect
+    h = hashlib.sha256()
+    for name in RUNNER_BUILD_CODE:
+        obj: object = globals()
+        try:
+            for part in name.split("."):
+                obj = obj[part] if isinstance(obj, dict) else getattr(obj, part)
+            h.update(name.encode() + b"\0" + inspect.getsource(obj).encode())   # type: ignore[arg-type]
+        except (KeyError, AttributeError, OSError, TypeError):
+            h.update(f"missing:{name}".encode())
+    for name in RUNNER_BUILD_CONSTANTS:
+        h.update(f"{name}={globals().get(name, 'missing')!r}".encode())
+    return h.hexdigest()[:16]
+
+
+def build_toolchain(root: str = PREPARED_ROOT, which: Callable[[str], Optional[str]] = shutil.which) -> str:
+    """The build toolchain this host runs, by CONTENT: WARM_LAYOUT, the runner's build-shaping code (`runner_build_code`),
+    the CPU architecture, the .NET SDKs installed (the floating `dotnet/sdk:10.0` base can move under an unchanged
+    Dockerfile) and a sha256 over the image's build helpers (TOOLCHAIN_HELPERS under `root`, each named, a missing one as
+    `absent`). Never the image digest. Never raises: what cannot be read is named in the value, so it keys distinctly."""
+    import platform as _platform
+    parts = [f"layout={WARM_LAYOUT}", f"code={runner_build_code()}", f"arch={_platform.machine()}"]
+    dn = which("dotnet")
+    try:
+        sdks = sorted(os.listdir(os.path.join(os.path.dirname(os.path.realpath(dn)), "sdk"))) if dn else ["no-dotnet"]
+    except OSError:
+        sdks = ["unreadable"]
+    parts.append("sdk=" + ",".join(sdks))
+    if not os.path.isdir(root):
+        parts.append(f"helpers=no-root:{root}")
+        return ";".join(parts)
+    h = hashlib.sha256()
+    for name in TOOLCHAIN_HELPERS:
+        top = os.path.join(root, name)
+        files = ([top] if os.path.isfile(top) else
+                 sorted(os.path.join(d, f) for d, _ds, fs in os.walk(top) for f in fs) if os.path.isdir(top) else [])
+        if not files:
+            h.update(f"absent:{name}".encode())
+        for path in files:
+            try:
+                with open(path, "rb") as fh:
+                    h.update(os.path.relpath(path, root).encode() + b"\0" + hashlib.sha256(fh.read()).digest())
+            except OSError:
+                h.update(f"unreadable:{os.path.relpath(path, root)}".encode())
+    parts.append(f"helpers={h.hexdigest()[:16]}")
+    return ";".join(parts)
+
+
 def warm_key(env: dict, identity: str) -> str:
-    """What invalidates a warm tree: the platform set, the framework identity and the images the host runs. Pure."""
+    """What invalidates a warm tree — what changes a BUILD'S OUTPUT: the platform set, the framework identity, the tester
+    and portal images a build compiles against, and the build toolchain (`build_toolchain`: SDK, helpers' content,
+    WARM_LAYOUT). Not the runner image's digest. Pure."""
     parts = [f"platform={env.get('MW_BUILD_PLATFORM_VERSION', '')}", f"identity={identity}"]
-    parts += [f"{k}={env.get(k, '')}" for k in ("MW_BUILD_TESTER_DIGEST", "MW_BUILD_PORTAL_DIGEST", "MW_BUILD_RUNNER_DIGEST")]
+    parts += [f"{k}={env.get(k, '')}" for k in ("MW_BUILD_TESTER_DIGEST", "MW_BUILD_PORTAL_DIGEST", TOOLCHAIN_ENV)]
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:32]
 
 
@@ -4465,6 +4536,9 @@ class Host:
                  capacity: Callable[[], "tuple[float, Optional[int]] | str"] = None,
                  nuget_feeds: Optional[NugetFeeds] = None) -> None:
         self.env = env
+        # the build toolchain by CONTENT, once per process (the warm key and the module fingerprints read it)
+        if TOOLCHAIN_ENV not in self.env:
+            self.env[TOOLCHAIN_ENV] = build_toolchain()
         # Where a package promoted into the warm NuGet cache is checked against its source feed (promote_nuget).
         self.nuget_feeds = nuget_feeds or NugetFeeds(trusted=nuget_trusted_sources(env))
         self.api = api
@@ -4599,7 +4673,7 @@ class Host:
                 if rc_ != 0:
                     raise Refusal(f"git ls-tree failed (exit {rc_}): {out_.strip()[-200:]}")
                 return out_
-            toolchain = f"{self.platform_version}|{self.identity}|{self.env.get('MW_BUILD_RUNNER_DIGEST', '')}"
+            toolchain = f"{self.platform_version}|{self.identity}|{self.env.get(TOOLCHAIN_ENV, '')}"
             fps = module_fingerprints(decl, ls_tree, toolchain)
             order = 0
             if trunk:
@@ -7410,9 +7484,55 @@ def self_test() -> int:
                     check(f"warm/{bad_w} is refused", False, "accepted")
                 except Refusal:
                     pass
-            check("warm/the key rides on the platform set, the identity and the images",
+            check("warm/the key rides on the platform set, the identity, the tester/portal images and the build toolchain",
                   warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.1"}, "c003") != warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.2"}, "c003")
-                  and warm_key({}, "a") != warm_key({}, "b") and warm_key({"MW_BUILD_RUNNER_DIGEST": "x"}, "a") != warm_key({}, "a"))
+                  and warm_key({}, "a") != warm_key({}, "b")
+                  and warm_key({"MW_BUILD_TESTER_DIGEST": "t"}, "a") != warm_key({}, "a")
+                  and warm_key({TOOLCHAIN_ENV: "sdk=10.0.403"}, "a") != warm_key({TOOLCHAIN_ENV: "sdk=10.0.404"}, "a"))
+            check("warm/the RUNNER IMAGE DIGEST keys nothing: a rebuilt runner with the same toolchain keeps every warm tree",
+                  warm_key({"MW_BUILD_RUNNER_DIGEST": "sha256:" + "a" * 64, TOOLCHAIN_ENV: "x"}, "a")
+                  == warm_key({"MW_BUILD_RUNNER_DIGEST": "sha256:" + "b" * 64, TOOLCHAIN_ENV: "x"}, "a"))
+            # the toolchain by CONTENT: the SDKs, the helpers' bytes (an explicit list), the runner's build-shaping code
+            tc_root = os.path.join(wroot, "tc-root"); tc_dn = os.path.join(wroot, "tc-dotnet")
+            os.makedirs(os.path.join(tc_root, "plugin-build")); os.makedirs(os.path.join(tc_dn, "sdk", "10.0.403"))
+            for sub in ("platform-src", "deploy-src", "browser", "state"):
+                os.makedirs(os.path.join(tc_root, sub))
+            open(os.path.join(tc_dn, "dotnet"), "w").close()
+            open(os.path.join(tc_root, "plugin-build", "Directory.Build.props"), "w").write("<Project/>")
+            open(os.path.join(tc_root, "compose-gate-host.sh"), "w").write("echo a")
+            open(os.path.join(tc_root, "build-run.py"), "w").write("v1")
+            tc_which = lambda n: os.path.join(tc_dn, "dotnet") if n == "dotnet" else None
+            tc0 = build_toolchain(tc_root, tc_which)
+            open(os.path.join(tc_root, "build-run.py"), "w").write("v2")
+            for sub in ("platform-src", "deploy-src", "browser", "state"):
+                open(os.path.join(tc_root, sub, "f"), "w").write("changed")
+            open(os.path.join(tc_root, "run.log"), "w").write("written at run time")
+            check("toolchain/a new copy of build-run.py, the platform source, the chart, the browser, or ANY file not on the "
+                  "helper list (state, a log written at run time) leaves it unchanged",
+                  build_toolchain(tc_root, tc_which) == tc0, (tc0, build_toolchain(tc_root, tc_which)))
+            open(os.path.join(tc_root, "plugin-build", "Directory.Build.props"), "w").write("<Project><x/></Project>")
+            tc1 = build_toolchain(tc_root, tc_which)
+            check("toolchain/a changed BUILD HELPER (plugin-build/, the composer) changes it", tc1 != tc0, (tc0, tc1))
+            os.remove(os.path.join(tc_root, "compose-gate-host.sh"))
+            check("toolchain/a helper that disappears changes it (named absent)", build_toolchain(tc_root, tc_which) != tc1)
+            os.makedirs(os.path.join(tc_dn, "sdk", "10.0.404"))
+            check("toolchain/another .NET SDK in the image changes it", "sdk=10.0.403,10.0.404" in build_toolchain(tc_root, tc_which))
+            no_root = build_toolchain(os.path.join(wroot, "nope"), lambda n: None)
+            check("toolchain/no dotnet and no prepared root are NAMED in the value (never an exception, never the empty digest)",
+                  "sdk=no-dotnet" in no_root and "helpers=no-root:" in no_root, no_root)
+            # the runner's build-shaping code: every listed name resolves, and a change to one of them re-keys
+            import inspect as _insp
+            check("toolchain/every RUNNER_BUILD_CODE name resolves (a rename must update the list, never go unkeyed)",
+                  all(_insp.getsource(eval(n.split(".")[0]) if "." not in n else getattr(eval(n.split(".")[0]), n.split(".")[1]))
+                      for n in RUNNER_BUILD_CODE))
+            rc0 = runner_build_code()
+            real_wk = globals()["WARM_KEEP"]
+            globals()["WARM_KEEP"] = real_wk + ("planted/",)
+            rc1 = runner_build_code()
+            globals()["WARM_KEEP"] = real_wk
+            check("toolchain/a changed build-shaping constant (WARM_KEEP) changes the runner's code hash, and restoring it "
+                  "restores the hash", rc1 != rc0 and runner_build_code() == rc0, (rc0, rc1))
+            check("toolchain/it is part of the toolchain value", f"code={rc0}" in build_toolchain(tc_root, tc_which))
             check("warm/opt-in only", warm_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}) and not warm_enabled({}))
             check("warm/sharedTree stays a switch, only with the warm workspace", shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true", "MW_BUILD_SHARED_TREE": "true"})
                   and not shared_tree_enabled({"MW_BUILD_SHARED_TREE": "true"}) and not shared_tree_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}))
