@@ -2840,7 +2840,7 @@ ns() { env -u MEMEX_NET_UP_KBIT -u MEMEX_NET_DOWN_KBIT -u MEMEX_NET_SHARE_PCT -u
 [ "$(ns caps 40000 200000 25 '' '')" = "10000 50000" ] && ok "the caps are the declared share of the measured link, each direction" || bad "share caps" "$(ns caps 40000 200000 25 '' '')"
 [ "$(ns caps 40000 200000 25 3000 0)" = "3000 0" ] && ok "a declared rate wins over the share; 0 means uncapped" || bad "declared caps" "$(ns caps 40000 200000 25 3000 0)"
 [ "$(ns caps 0 0 25 '' '')" = "4000 40000" ] && ok "an unknown link takes the fallback caps, never no cap" || bad "fallback caps" "$(ns caps 0 0 25 '' '')"
-[ "$(ns caps 500 800 10 '' '')" = "256 256" ] && ok "a share below 256 kbit/s is floored (keepalives must still pass)" || bad "floor" "$(ns caps 500 800 10 '' '')"
+[ "$(ns caps 500 800 10 '' '')" = "2000 2000" ] && ok "a share below the floor is floored (2000 kbit/s: a bad probe must not throttle the line)" || bad "floor" "$(ns caps 500 800 10 '' '')"
 R="$(env MEMEX_LOCAL_HOME="$NSHOME" MEMEX_NET_UP_KBIT=3000 MEMEX_NET_DOWN_KBIT=20000 bash "$NS" --render)"
 sh -n <<<"$R" && ok "the in-VM script parses as POSIX sh" || bad "render parse" ""
 case "$R" in *'UP_KBIT=3000'*'DOWN_KBIT=20000'*'match ip "$3" "$LOCALNET" flowid 1:10'*'stop) clear'*'mirred egress redirect dev "$IFB"'*'--set-dscp-class CS1'*) ok "the in-VM script caps both directions, exempts the Mac's subnet, marks DSCP CS1 and can remove itself" ;; *) bad "render content" "$R" ;; esac
@@ -2874,6 +2874,53 @@ netbare() { env NSS_DIR="$NSS" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; resolve_share(
 [ "$(netbare)" = "--status --profile build" ] \
   && ok "'net --profile build' with no subcommand runs status for that profile" || bad "net bare flag" "$(netbare)"
 rm -rf "$NSS"
+# The measurement (2026-11-10, the second Mac Studio: one combined run recorded 370 kbit/s up on a symmetric fibre
+# line and capped uploads at a trickle). networkQuality is stubbed: each run answers the next line of a script, per
+# direction (-d = upload only, -u = download only); "fail" answers nothing.
+NQ="$(mktemp -d)"; mkdir -p "$NQ/bin" "$NQ/home"
+cat > "$NQ/bin/networkQuality" <<'NQEOF'
+#!/bin/bash
+case " $* " in *" -d "*) dir=up ;; *" -u "*) dir=down ;; *) echo "combined run: $*" >> "$NQ_DIR/combined"; dir=down ;; esac
+n=$(( $(cat "$NQ_DIR/n.$dir" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$NQ_DIR/n.$dir"
+v="$(sed -n "${n}p" "$NQ_DIR/$dir")"
+[ "$v" = fail ] || [ -z "$v" ] && exit 1
+if [ "$dir" = up ]; then printf '{"ul_throughput": %s}' "$(( v * 1000 ))"; else printf '{"dl_throughput": %s}' "$(( v * 1000 ))"; fi
+NQEOF
+chmod +x "$NQ/bin/networkQuality"
+nq() { rm -f "$NQ"/n.* "$NQ/combined"; printf '%s\n' $1 > "$NQ/up"; printf '%s\n' $2 > "$NQ/down"; shift 2
+  env -u MEMEX_NET_LINK_UP_KBIT -u MEMEX_NET_LINK_DOWN_KBIT -u MEMEX_NET_MIN_KBIT PATH="$NQ/bin:$PATH" NQ_DIR="$NQ" MEMEX_LOCAL_HOME="$NQ/home" \
+    MEMEX_NETSHAPE_LIB=1 "$@" bash -c '. "$0"; measure_link' "$NS" 2>"$NQ/err"; }
+M="$(nq "370 980000 950000" "937000 940000 fail")"
+[ "$M" = "950000 938500" ] && [ ! -e "$NQ/combined" ] \
+  && ok "the link is the MEDIAN of per-direction runs: one bad upload probe (370 kbit/s) cannot set the cap" || bad "median of samples" "got '$M' $(cat "$NQ/combined" 2>/dev/null)"
+grep -q 'up 370 980000 950000 -> median 950000; down 937000 940000 -> median 938500' "$NQ/err" \
+  && ok "the raw samples are logged, per direction, with the median taken" || bad "samples logged" "$(cat "$NQ/err")"
+[ "$(cat "$NQ/n.up")" = 3 ] && [ "$(cat "$NQ/n.down")" = 3 ] \
+  && ok "three runs per direction by default (MEMEX_NET_SAMPLES)" || bad "sample count" "up=$(cat "$NQ/n.up") down=$(cat "$NQ/n.down")"
+M="$(nq "fail fail fail" "937000 940000 941000")"
+[ -z "$M" ] && grep -q 'up none -> median none' "$NQ/err" \
+  && ok "no upload run answered → no reading (the fallback caps apply), and the log says so" || bad "all upload runs fail" "got '$M' $(cat "$NQ/err")"
+M="$(nq "370 400 380" "237972 240000 239000")"
+[ "$M" = "380 239000" ] && grep -q 'WARN: the measured uplink 380 kbit/s is under 1/50' "$NQ/err" \
+  && ok "an implausible asymmetry (uplink < 1/50 of the downlink) is warned about by name" || bad "asymmetry warn" "got '$M' $(cat "$NQ/err")"
+[ "$(ns caps 380 239000 25 '' '')" = "2000 59750" ] && ok "a cap derived from a bad uplink is held at the floor (MEMEX_NET_MIN_KBIT, default 2000), never 95 kbit/s" || bad "floor on derived cap" "$(ns caps 380 239000 25 '' '')"
+[ "$(MEMEX_NET_MIN_KBIT=500 ns caps 380 239000 25 '' '')" = "500 59750" ] && ok "the floor is the owner's to set (MEMEX_NET_MIN_KBIT)" || bad "floor override" ""
+[ "$(ns caps 380 239000 25 300 '')" = "300 59750" ] && ok "a DECLARED rate is not raised by the floor (it is the owner's)" || bad "declared below floor" ""
+# the record the second Mac Studio carries (370/237972) is not reused: it is re-measured (and here, with measuring
+# off, it reads as no link → fallback), and a sibling profile's implausible record is not borrowed either
+[ "$(env MEMEX_NET_LINK_UP_KBIT=370 MEMEX_NET_LINK_DOWN_KBIT=237972 MEMEX_LOCAL_HOME="$NQ/home" MEMEX_NETSHAPE_LIB=1 MEMEX_NET_NO_MEASURE=1 bash -c '. "$0"; link_rates' "$NS" 2>"$NQ/err")" = "0 0" ] \
+  && grep -q 'implausible — measuring again' "$NQ/err" && ok "an implausible RECORD (370 up / 237972 down) is said and measured again, never reused" || bad "implausible record reused" "$(cat "$NQ/err")"
+printf '[ -n "${MEMEX_NET_LINK_UP_KBIT:-}" ] || MEMEX_NET_LINK_UP_KBIT=370\n[ -n "${MEMEX_NET_LINK_DOWN_KBIT:-}" ] || MEMEX_NET_LINK_DOWN_KBIT=237972\n' > "$NQ/home/netshape-build.env"
+[ "$(env -u MEMEX_NET_LINK_UP_KBIT -u MEMEX_NET_LINK_DOWN_KBIT MEMEX_LOCAL_HOME="$NQ/home" MEMEX_NET_PROFILE=default MEMEX_NETSHAPE_LIB=1 MEMEX_NET_NO_MEASURE=1 bash -c '. "$0"; link_rates' "$NS" 2>/dev/null)" = "0 0" ] \
+  && ok "another profile's implausible record is not borrowed" || bad "implausible sibling borrowed" ""
+# end to end through --measure: the record keeps the raw samples as a comment
+NQV="$NQ/vm"; mkdir -p "$NQV"; printf '#!/bin/bash\ncat >/dev/null; exit 0\n' > "$NQ/bin/colima"; chmod +x "$NQ/bin/colima"
+rm -f "$NQ"/n.*; printf '%s\n' 900000 920000 910000 > "$NQ/up"; printf '%s\n' 930000 940000 950000 > "$NQ/down"
+OUT="$(env -u MEMEX_NET_UP_KBIT -u MEMEX_NET_DOWN_KBIT -u MEMEX_NET_LINK_UP_KBIT -u MEMEX_NET_LINK_DOWN_KBIT PATH="$NQ/bin:$PATH" NQ_DIR="$NQ" MEMEX_LOCAL_HOME="$NQ/home" bash "$NS" --measure --profile build </dev/null 2>&1)"
+grep -q 'MEMEX_NET_LINK_UP_KBIT=910000' "$NQ/home/netshape-build.env" && grep -q '^# networkQuality samples .*up 900000 920000 910000 -> median 910000' "$NQ/home/netshape-build.env" \
+  && case "$OUT" in *"capped at 227500 kbit/s up, 235000 kbit/s down"*) true ;; *) false ;; esac \
+  && ok "--measure records the medians, keeps the raw samples in the record, and caps at the share of the medians" || bad "--measure record" "$OUT | $(cat "$NQ/home/netshape-build.env")"
+rm -rf "$NQ"
 rm -rf "$NSHOME"
 
 echo "── the second Mac Studio's defects, pinned (2026-11-09) ─────────────"
@@ -3075,6 +3122,112 @@ rm -f "$RK/home/.memex-local/registry.yaml"; printf 'mwr_fleet-coupon-NEVER-PRIN
   && ok "fleet join: outside registry mode the coupon is not kept, and that is said" || bad "not registry mode" "$RKO"
 grep -q '        fleet_apply_registry_key "$items"' "$CLI" && ok "fleet join applies the coupon with the other items" || bad "join applies r" "missing"
 rm -rf "$RK"
+echo "── kubelet's root on the portal VM's data disk (2026-11-10) ──────────"
+KR="$(mktemp -d)"; mkdir -p "$KR/stubs" "$KR/home/.memex-local" "$KR/colima/default"
+cat > "$KR/stubs/colima" <<'KEOF'
+#!/bin/bash
+echo "$*" >> "$KR_DIR/colima.log"
+case "$1" in
+  status) [ "${KR_RUNNING:-yes}" = yes ] ;;
+  ssh) cat >/dev/null; printf '%s' "${KR_SSH-81G free of 98G}" ;;
+  *) exit 0 ;;
+esac
+KEOF
+printf '#!/bin/bash\necho "$*" >> "$KR_DIR/kubectl.log"; exit 0\n' > "$KR/stubs/kubectl"; chmod +x "$KR/stubs/colima" "$KR/stubs/kubectl"
+kr() { env PATH="$KR/stubs:$PATH" HOME="$KR/home" COLIMA_HOME="$KR/colima" MEMEX_LOCAL_HOME="$KR/home/.memex-local" KR_DIR="$KR" MEMEX_LOCAL_LIB=1 "$@"; }
+printf 'cpu: 12\nkubernetes:\n  enabled: true\n  version: v1.35.0+k3s1\n  k3sArgs:\n    - --disable=traefik\n\n  port: 0\nnetwork:\n  address: false\n' > "$KR/old.yaml"
+# a NEW profile: both args, because a --k3s-arg replaces colima's default list (--disable=traefik)
+rm -f "$KR/colima.log"; OUT="$(kr KR_RUNNING=no bash -c '. "$0"; start_colima' "$CLI" 2>&1)"
+grep -q -- 'start --kubernetes --cpu .* --k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet$' "$KR/colima.log" \
+  && ok "a new portal VM starts with kubelet's root on the data disk (and traefik still disabled)" || bad "start_colima k3s args" "$(cat "$KR/colima.log")"
+# an EXISTING profile without root-dir is detected, and the warning names the repair
+cp "$KR/old.yaml" "$KR/colima/default/colima.yaml"
+OUT="$(kr bash -c '. "$0"; kubelet_root_check' "$CLI" 2>&1)"
+case "$OUT" in *"ROOT disk"*"memex-local kubelet-root apply"*) ok "an existing profile without root-dir is warned about, naming 'kubelet-root apply'" ;; *) bad "kubelet root warn" "$OUT" ;; esac
+for f in cmd_doctor cmd_verify; do fn_body "$f" | grep -q kubelet_root_check && ok "$f reports where kubelet's root is" || bad "$f kubelet check" "missing"; done
+sed -n '/^cmd_fleet() {/,/^}/p' "$CLI" | sed -n '/Preflight (MacStudioFleet/,/throw-away key for this join/p' | grep -q kubelet_root_check \
+  && ok "fleet join's preflight reports where kubelet's root is" || bad "fleet join preflight kubelet" "missing"
+# the repair refuses unattended without --yes, and changes nothing
+OUT="$(kr bash -c '. "$0"; cmd_kubelet_root apply' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" != 0 ] && cmp -s "$KR/old.yaml" "$KR/colima/default/colima.yaml" && case "$OUT" in *"--yes"*) true ;; *) false ;; esac \
+  && ok "kubelet-root apply without a terminal refuses unless --yes, and edits nothing" || bad "apply needs --yes" "rc=$RC $OUT"
+rm -f "$KR/colima.log" "$KR/kubectl.log"
+OUT="$(kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+A="$(kr bash -c '. "$0"; colima_k3s_args "$1"' "$CLI" "$KR/colima/default/colima.yaml")"
+{ [ "$RC" = 0 ] && [ "$A" = "$(printf -- '--disable=traefik\n--kubelet-arg=root-dir=/var/lib/rancher/kubelet')" ] \
+  && compgen -G "$KR/colima/default/colima.yaml.bak-*" >/dev/null && grep -q '^  port: 0$' "$KR/colima/default/colima.yaml" \
+  && [ "$(grep -c '' "$KR/colima/default/colima.yaml")" = "$(( $(grep -c '' "$KR/old.yaml") + 1 ))" ] \
+  && [ "$(grep -E '^(stop|start)' "$KR/colima.log" | tr '\n' ' ')" = "stop start " ]; } \
+  && case "$OUT" in *"portal and everything in it is DOWN"*"81G free of 98G"*) true ;; *) false ;; esac \
+  && ok "kubelet-root apply adds the arg (one line, the rest untouched, a backup beside it), says the portal is down, restarts the VM and proves the data disk" \
+  || bad "kubelet-root apply" "rc=$RC args=[$A] log=$(tr '\n' ' ' < "$KR/colima.log") $OUT"
+cp "$KR/colima/default/colima.yaml" "$KR/after.yaml"; rm -f "$KR/colima.log"
+OUT="$(kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" = 0 ] && cmp -s "$KR/after.yaml" "$KR/colima/default/colima.yaml" && ! grep -qE '^(stop|start)' "$KR/colima.log" 2>/dev/null \
+  && ok "kubelet-root apply is idempotent: a profile that has the arg is left alone and the VM is not restarted" || bad "apply idempotent" "rc=$RC $OUT"
+# the VM restarted but kubelet did not take the root-dir → loud, never a green line
+cp "$KR/old.yaml" "$KR/colima/default/colima.yaml"
+OUT="$(kr KR_SSH= bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" != 0 ] && case "$OUT" in *"did not take the root-dir"*) true ;; *) false ;; esac \
+  && ok "a restart after which kubelet's root is not on the data disk FAILS, naming it" || bad "apply unverified" "rc=$RC $OUT"
+cp "$KR/old.yaml" "$KR/colima/default/colima.yaml"; sed -i.x 's/    - --disable=traefik/    - --kubelet-arg=root-dir=\/var\/lib\/kubelet-elsewhere/' "$KR/colima/default/colima.yaml"; rm -f "$KR/colima/default/colima.yaml.x" "$KR/colima.log"
+OUT="$(kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" != 0 ] && grep -q 'kubelet-elsewhere' "$KR/colima/default/colima.yaml" && ! grep -qE '^stop' "$KR/colima.log" 2>/dev/null \
+  && ok "a profile with a DIFFERENT root-dir is not overwritten and the VM is not restarted" || bad "different root-dir" "rc=$RC $OUT"
+rm -rf "$KR"
+
+echo "── fleet join waits for this Mac's first heartbeat (2026-11-10) ────────"
+HB="$(mktemp -d)"; mkdir -p "$HB/stubs" "$HB/home/.memex-local"
+cat > "$HB/stubs/kubectl" <<'KEOF'
+#!/bin/bash
+r="$(cat "$HB_DIR/restarts" 2>/dev/null || echo 0)"
+case "$*" in
+  *"rollout restart"*) echo $(( r + 1 )) > "$HB_DIR/restarts" ;;
+  *" logs "*) f="$HB_DIR/log.$r"; [ -f "$f" ] || f="$HB_DIR/log.last"; cat "$f" 2>/dev/null ;;
+esac
+exit 0
+KEOF
+chmod +x "$HB/stubs/kubectl"
+REC='info: MeshWeaver.PluginCatalog.InstanceAutoRegistrationService[0]
+      [DefaultInstall] reconciled: 3 installed, 9 up to date, 0 failed [DefaultViews, GraphViews, Plugins/Hosting] — MODULES LANDED ahead of content: [MeshWeaver.Hosting] — MODULE SET proposed: sequence 4 — the landed modules load at the next restart'
+POSTED='dbug: Hosting[0]
+      [BackLease] heartbeat armed on mesh/x: every 00:00:30 to https://control.example.test/api/hooks/Hosting/Heartbeats, readings from /host-readings/readings.json
+dbug: Hosting[0]
+      [BackLease] heartbeat posted to https://control.example.test/api/hooks/Hosting/Heartbeats: HTTP 200'
+hbw() { rm -f "$HB/restarts" "$HB"/log.*; printf '%s\n' "$1" > "$HB/log.0"; printf '%s\n' "$2" > "$HB/log.1"; printf '%s\n' "$2" > "$HB/log.last"; shift 2
+  OUT="$(env PATH="$HB/stubs:$PATH" HOME="$HB/home" MEMEX_LOCAL_HOME="$HB/home/.memex-local" HB_DIR="$HB" MEMEX_HEARTBEAT_POLL_SEC=0 MEMEX_LOCAL_LIB=1 "$@" \
+    bash -c '. "$0"; fleet_wait_heartbeat "${HBW_MIN:-1}"' "$CLI" 2>&1)"; RC=$?; RESTARTS="$(cat "$HB/restarts" 2>/dev/null || echo 0)"; }
+hbw "$REC" "$REC
+$POSTED"
+[ "$RC" = 0 ] && [ "$RESTARTS" = 1 ] && case "$OUT" in *"restarting the portal once"*"heartbeat posted to https://control.example.test/api/hooks/Hosting/Heartbeats HTTP 200"*) true ;; *) false ;; esac \
+  && ok "Hosting landed for the next restart → ONE restart → ends ok naming the heartbeat's POST and its HTTP 200" || bad "restart then heartbeat" "rc=$RC restarts=$RESTARTS $OUT"
+hbw "$REC" "$(printf '%s\n' "$REC" | sed 's/sequence 4/sequence 5/')" HBW_MIN=0
+[ "$RC" != 0 ] && [ "$RESTARTS" = 1 ] && case "$OUT" in *"not restarting a second time"*"no heartbeat after 0 min"*"memex-local fleet heartbeat"*) true ;; *) false ;; esac \
+  && ok "the portal is restarted at most ONCE; a wait that runs out FAILS naming the last state and the way to resume" || bad "single restart + timeout" "rc=$RC restarts=$RESTARTS $OUT"
+TIER='warn: MeshWeaver.PluginCatalog.InstanceAutoRegistrationService[0]
+      [DefaultInstall] 1 package(s) the registry declares in this instance'"'"'s default set are REFUSED by its plan tier and are not installed: ⛔ Not installed on this instance: Hosting needs plan tier enterprise, this instance is on free.. Raise the instance'"'"'s plan on the registry to receive them; nothing on this instance can.
+      [DefaultInstall] reconciled: 0 installed, 9 up to date, 0 failed [DefaultViews, GraphViews]'
+hbw "$TIER" "$TIER"
+[ "$RC" != 0 ] && [ "$RESTARTS" = 0 ] && case "$OUT" in *"REFUSES Hosting"*"plan tier enterprise"*"is on free"*"Remedy:"*) true ;; *) false ;; esac \
+  && ok "a plan tier that refuses Hosting STOPS the wait at once, naming the tier, the plan and the remedy — no restart" || bad "tier refusal" "rc=$RC restarts=$RESTARTS $OUT"
+hbw "" "" HBW_MIN=0
+[ "$RC" != 0 ] && case "$OUT" in *"last state: reconciling"*) true ;; *) false ;; esac && ok "no reconcile at all: the bounded wait ends red, never hangs" || bad "no reconcile" "rc=$RC $OUT"
+hbw "$(printf '%s\n' "$REC" | sed 's/ — MODULE SET.*//')
+$POSTED" "" 
+[ "$RC" = 0 ] && [ "$RESTARTS" = 0 ] && ok "Hosting already loaded (no restart pending): no restart, ends at the heartbeat" || bad "no restart needed" "rc=$RC restarts=$RESTARTS $OUT"
+hbw "$(printf '%s\n' "$POSTED" | sed '$d' | sed '$d')" "" MEMEX_LOG_LEVEL=Information
+[ "$RC" = 0 ] && case "$OUT" in *"ARMED"*"Debug line"*"level Information"*) true ;; *) false ;; esac \
+  && ok "at a log level that hides the Debug 'posted' line, an armed heartbeat ends it and says to confirm on control" || bad "armed at Information" "rc=$RC $OUT"
+hs() { printf '%s\n' "$1" | env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; heartbeat_state' "$CLI"; }
+[ "$(hs '[DefaultInstall] reconciled: 1 installed, 0 up to date, 0 failed [HostingExtras] — MODULE SET proposed: sequence 2 — the landed modules load at the next restart' | cut -d'|' -f1)" = absent ] \
+  && ok "a package that merely starts with 'Hosting' is not Hosting" || bad "Hosting id match" "$(hs '[DefaultInstall] reconciled: 1 installed, 0 up to date, 0 failed [HostingExtras]')"
+[ "$(hs '[BackLease] heartbeat posted to https://c.example.test/x: HTTP 401' | cut -d'|' -f1)" != posted ] && ok "a POST answered 401 is not a heartbeat that reached control" || bad "401 counted" ""
+[ "$(hs '[BackLease] heartbeat NOT accepted by https://c.example.test/x: HTTP 401 unknown deployment' )" = "rejected|https://c.example.test/x: HTTP 401 unknown deployment" ] \
+  && ok "a heartbeat control did not accept is reported with control's answer" || bad "rejected detail" "$(hs '[BackLease] heartbeat NOT accepted by https://c.example.test/x: HTTP 401 unknown deployment')"
+sed -n '/^cmd_fleet() {/,/^}/p' "$CLI" | sed -n '/^    join)/,/^      ;;/p' | grep -q 'fleet_wait_heartbeat "\$hb_min"' \
+  && ok "fleet join's tail waits for the heartbeat" || bad "join tail wiring" "missing"
+OUT="$(env PATH="$HB/stubs:$PATH" HOME="$HB/home" MEMEX_LOCAL_HOME="$HB/home/.memex-local" "$CLI" fleet heartbeat --wait x 2>&1)" && bad "--wait x accepted" "$OUT" || ok "fleet heartbeat refuses a --wait that is not whole minutes"
+rm -rf "$HB"
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
