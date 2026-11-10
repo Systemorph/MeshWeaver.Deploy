@@ -5680,7 +5680,7 @@ class Host:
         if rc != 0:
             self.git_runner(["-C", checkout, "merge", "--abort"], genv)
             raise Refusal(f"the head does not merge onto {base[:12]} (exit {rc}) — a conflict is red, never a test of the unmerged head: {out.strip()[-200:]}")
-        if "up to date" in out.lower():
+        if re.search(r"up[ -]to[ -]date", out, re.I):   # "Already up to date." — older git hyphenates it
             self.log(f"the head already contains {base[:12]} — no merge commit; every stage sees the base as MW_BUILD_MERGE_BASE")
         else:
             self.log(f"merged the head onto {base[:12]} — every stage of this attempt tests that tree")
