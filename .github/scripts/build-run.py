@@ -4948,6 +4948,56 @@ class Host:
             broker.stop("the run ended before this module was handed over")
             self.bound_slices()
 
+    def disk_claims_dir(self) -> str:
+        return os.path.join(self.cache, ".disk-claims")
+
+    @contextlib.contextmanager
+    def disk_admission(self):
+        """The admission lock among this cache's replicas (exclusive, blocking: it is held only for one reading and one
+        claim call). A no-op when the guard is off or the lock cannot be set up — never a host that stops claiming."""
+        import fcntl
+        fh = _try_lock(os.path.join(self.disk_claims_dir(), ".lock"), fcntl.LOCK_EX) if self.run_disk > 0 else None
+        holder = contextlib.ExitStack()
+        if fh is not None:
+            holder.callback(fh.close)
+        try:
+            yield holder
+        finally:
+            holder.close()
+
+    def other_reservations(self) -> int:
+        """Bytes the OTHER replicas on this cache reserved for their runs in flight (a reservation older than the run
+        deadline is a replica that died without releasing: ignored). Never raises."""
+        total, now = 0, time.time()
+        for name in _listdir(self.disk_claims_dir()):
+            if name.startswith(".") or name == self.host:
+                continue
+            path = os.path.join(self.disk_claims_dir(), name)
+            try:
+                if now - os.lstat(path).st_mtime > self.run_deadline + 600:
+                    continue
+                with open(path) as fh:
+                    total += max(0, int(fh.read().strip() or 0))
+            except (OSError, ValueError):
+                pass
+        return total
+
+    def reserve_disk(self) -> None:
+        if self.run_disk <= 0:
+            return
+        try:
+            os.makedirs(self.disk_claims_dir(), exist_ok=True)
+            with open(os.path.join(self.disk_claims_dir(), self.host), "w") as fh:
+                fh.write(str(self.run_disk))
+        except OSError:
+            pass
+
+    def release_disk(self) -> None:
+        try:
+            os.remove(os.path.join(self.disk_claims_dir(), self.host))
+        except OSError:
+            pass
+
     def disk_refusal(self) -> Optional[str]:
         """Why this host must not claim now, or None: the filesystem under the work volume or the cache (each measured —
         an emptyDir and a hostPath/local-path claim share the node's disk on a Mac) would keep less than the eviction
@@ -4960,8 +5010,11 @@ class Host:
             if total <= 0:
                 continue
             keep = total * self.disk_headroom / 100.0
-            if free - self.run_disk < keep:
-                return (f"{what} ({path}) has {free / (1 << 30):.1f} GiB free of {total / (1 << 30):.1f} GiB; a run needs "
+            others = self.other_reservations()
+            if free - others - self.run_disk < keep:
+                return (f"{what} ({path}) has {free / (1 << 30):.1f} GiB free of {total / (1 << 30):.1f} GiB"
+                        + (f", {others / (1 << 30):.0f} GiB of it reserved by runs in flight on this cache" if others else "")
+                        + "; a run needs "
                         f"{self.run_disk / (1 << 30):.0f} GiB ({RUN_DISK_ENV}) and {self.disk_headroom:g} % must stay free "
                         f"for the kubelet's eviction threshold ({DISK_HEADROOM_ENV}) — retried every idle pass")
         return None
@@ -5232,17 +5285,24 @@ class Host:
             return "stopping"
         # DISK FIRST: a run that starts on a node without room for it is evicted mid-run for DiskPressure (moench and eiger
         # 2026-11-10: 17 and 18 build pods), which reads as a lost run, never as "the node was full"
-        tight = self.disk_refusal()
-        if tight is not None:
-            if tight != self.disk_said:
-                self.log(f"disk: claiming nothing — {tight}")
-                self.disk_said = tight
-            self.bound_slices()
-            return "idle"
-        if self.disk_said is not None:
-            self.log("disk: room again — claiming")
-            self.disk_said = None
-        claim = self.claim()
+        # The check and the claim are ONE step among the replicas sharing this cache: an exclusive lock spans the reading,
+        # the claim and the RESERVATION it leaves (`<cache>/.disk-claims/<host>`), and every reading subtracts the other
+        # replicas' live reservations — so two replicas can never both pass on the same free space.
+        with self.disk_admission() as admission:
+            tight = self.disk_refusal()
+            if tight is not None:
+                if tight != self.disk_said:
+                    self.log(f"disk: claiming nothing — {tight}")
+                    self.disk_said = tight
+                admission.close()
+                self.bound_slices()
+                return "idle"
+            if self.disk_said is not None:
+                self.log("disk: room again — claiming")
+                self.disk_said = None
+            claim = self.claim()
+            if claim is not None:
+                self.reserve_disk()
         if claim is None:
             if not self.drained and warm_enabled(self.env) and not (self.warm_thread and self.warm_thread.is_alive()):
                 # warming runs BESIDE the claim loop: the host keeps asking for work, and a claim stops it (stop_warming)
@@ -5252,7 +5312,10 @@ class Host:
             return "drained" if self.drained else "idle"
         self.stop_warming()
         self.assert_clean()      # the full survivor check, now that no warm sandbox is in flight
-        return self.run(claim)
+        try:
+            return self.run(claim)
+        finally:
+            self.release_disk()
 
     def stop_warming(self) -> None:
         """A claim (or SIGTERM) needs the host: stop the warm build in flight and wait for its sandbox to be gone, so no
@@ -7165,6 +7228,26 @@ def self_test() -> int:
     why_d = hd_.disk_refusal() or ""
     check("disk/no room: 30 GiB free of 100 → claims nothing, naming the free space, the run's need and the headroom",
           "30.0 GiB free of 100.0 GiB" in why_d and RUN_DISK_ENV in why_d and "15 %" in why_d, why_d)
+    dc_ = tempfile.mkdtemp(prefix="disk-claims-")
+    hr_ = Host({RUN_DISK_ENV: "20", DISK_HEADROOM_ENV: "15", "MW_BUILD_CACHE": dc_, "MW_BUILD_HOST": "a"}, None, log=lambda s: None)
+    hr_.disk_stat = lambda p_: (100 * G_, 40 * G_)
+    hb_ = Host({RUN_DISK_ENV: "20", DISK_HEADROOM_ENV: "15", "MW_BUILD_CACHE": dc_, "MW_BUILD_HOST": "b"}, None, log=lambda s: None)
+    hb_.disk_stat = lambda p_: (100 * G_, 40 * G_)
+    with hr_.disk_admission():
+        ok_a = hr_.disk_refusal() is None
+        hr_.reserve_disk()
+    why_b = hb_.disk_refusal() or ""
+    check("disk/a replica's RESERVATION counts against the others: on the same 40 GiB free, the second replica does not "
+          "also pass (the joint overcommit), and its message names the reserved space",
+          ok_a and "reserved by runs in flight" in why_b and hr_.disk_refusal() is None, (ok_a, why_b))
+    hr_.release_disk()
+    check("disk/a released reservation frees the room again", hb_.disk_refusal() is None)
+    with open(os.path.join(dc_, ".disk-claims", "dead"), "w") as fh_:
+        fh_.write(str(30 * G_))
+    old_ = time.time() - hb_.run_deadline - 3600
+    os.utime(os.path.join(dc_, ".disk-claims", "dead"), (old_, old_))
+    check("disk/a reservation older than the run deadline (a replica that died) is ignored", hb_.disk_refusal() is None)
+    shutil.rmtree(dc_, ignore_errors=True)
     hd_.disk_stat = lambda p_: (_ for _ in ()).throw(OSError("gone"))
     check("disk/an unreadable filesystem never blocks a claim", hd_.disk_refusal() is None)
     hz_ = Host({RUN_DISK_ENV: "0", DISK_HEADROOM_ENV: "0"}, None, log=lambda s: None)
