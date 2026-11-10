@@ -140,6 +140,9 @@ if [ -n "$per_machine" ] || [ -n "$domain" ] || [ -n "$seal_to" ] || [ -n "$item
     hosting::probe any az ad app show --id "$app_id" --query 'web.redirectUris' -o tsv; rc=$?
   done
   [ "$waited" -eq 0 ] || hosting::log "waited    ${waited} s for Graph to replicate the new app ${app_id}"
+  if [ "$rc" -ne 0 ] && [ "$waited" -ge "${HOSTING_GRAPH_REPLICATION_WAIT:-180}" ]; then
+    hosting::die "app ${app_id} was created but Graph still answers 'does not exist' after ${waited} s of replication wait — not a missing right; re-run (the next run finds the app) or raise HOSTING_GRAPH_REPLICATION_WAIT. It answered: ${HOSTING_PROBE_ERR:-nothing}"
+  fi
   [ "$rc" -eq 0 ] || hosting::die "could not read app ${app_id} back — ${right}. It answered: ${HOSTING_PROBE_ERR:-nothing}"
   have="$HOSTING_PROBE_OUT"
   missing=()
@@ -170,6 +173,13 @@ if [ -n "$per_machine" ] || [ -n "$domain" ] || [ -n "$seal_to" ] || [ -n "$item
        while [ "$rc" -ne 0 ] && [ "$outcome" = created ] && [ "$waited" -lt "${HOSTING_GRAPH_REPLICATION_WAIT:-180}" ] \
              && grep -qiE "does not exist|not found|Request_ResourceNotFound" <<< "${HOSTING_PROBE_ERR:-}"; do
          sleep 10; waited=$((waited + 10))
+         # A create is not a read: an earlier attempt may have LANDED although its answer was
+         # "not found". Re-read first, and create again only while the principal is still absent.
+         hosting::probe output az ad sp show --id "$app_id" --query id -o tsv
+         case "$?" in
+           0) rc=0; break ;;
+           2) hosting::die "REFUSED, not absent: Graph would not show the service principal of ${app_id} — ${right}. It answered: ${HOSTING_PROBE_ERR}" ;;
+         esac
          hosting::probe any az ad sp create --id "$app_id" --query id -o tsv; rc=$?
        done
        [ "$rc" -eq 0 ] || hosting::die "could not create the service principal of ${app_id} — ${right}. It answered: ${HOSTING_PROBE_ERR:-nothing}"
