@@ -92,7 +92,8 @@ apply() {
     esac
     out="$(mktemp)"
     while IFS= read -r line || [ -n "$line" ]; do
-      if [[ "$line" =~ ^URIs:[[:space:]]*(.*)$ ]]; then
+      # deb822 field names are case-insensitive (`uris:` is the same field).
+      if [[ "$line" =~ ^[Uu][Rr][Ii][Ss]:[[:space:]]*(.*)$ ]]; then
         uri="${BASH_REMATCH[1]}"
         uri="${uri%"${uri##*[![:space:]]}"}"
         if [[ "$uri" == mirror+file:* ]]; then
@@ -129,14 +130,14 @@ check() {
         mirror+file:*)
           path="$root${uri#mirror+file:}"
           if [ ! -f "$path" ]; then echo "apt-mirrors: $f names the mirror list $uri, which does not exist" >&2; bad=1; continue; fi
-          listed="$(grep -Ev '^[[:space:]]*(#|$)' "$path" | cut -f1 | sort -u | wc -l | tr -d ' ')"
+          listed="$({ grep -Ev '^[[:space:]]*(#|$)' "$path" || true; } | cut -f1 | sort -u | wc -l | tr -d ' ')"
           if [ "$listed" -lt 2 ]; then echo "apt-mirrors: $f: the mirror list $uri offers $listed mirror(s) — a single host again" >&2; bad=1; fi ;;
         *ubuntu.com*)
           echo "apt-mirrors: $f: Ubuntu source '$uri' names ONE host — the build stalls whenever it does (MeshWeaver.Deploy#235)" >&2; bad=1 ;;
       esac
     done < <(
       case "$f" in
-        *.sources) sed -n 's/^URIs:[[:space:]]*//p' "$f" | tr ' ' '\n' | grep -v '^$' || true ;;
+        *.sources) sed -n 's/^[Uu][Rr][Ii][Ss]:[[:space:]]*//p' "$f" | tr ' ' '\n' | grep -v '^$' || true ;;
         *) sed -n 's/^[[:space:]]*deb\(-src\)\{0,1\}[[:space:]]\{1,\}\(\[[^]]*\][[:space:]]\{1,\}\)\{0,1\}\([^[:space:]]*\).*/\3/p' "$f" ;;
       esac)
   done < <(source_files "$root")
@@ -166,7 +167,14 @@ prove_fallback() {
     n=$((n + 1))
   done
   [ "$n" -gt 0 ] || { echo "apt-mirrors: no mirror list under /etc/apt/mirrors — run apply first" >&2; return 1; }
-  sed "s#mirror+file:/etc/apt/mirrors/#mirror+file:$t/mirrors/#" /etc/apt/sources.list.d/ubuntu.sources > "$t/parts/ubuntu.sources"
+  # Every deb822 file `apply` rewrote is proven, whatever the base image names it.
+  local f proven=0
+  for f in /etc/apt/sources.list.d/*.sources; do
+    [ -f "$f" ] && grep -q 'mirror+file:/etc/apt/mirrors/' "$f" || continue
+    sed "s#mirror+file:/etc/apt/mirrors/#mirror+file:$t/mirrors/#" "$f" > "$t/parts/$(basename "$f")"
+    proven=$((proven + 1))
+  done
+  [ "$proven" -gt 0 ] || { echo "apt-mirrors: no deb822 source names a mirror list under /etc/apt/mirrors — run apply first" >&2; return 1; }
   set +e
   timeout 300 apt-get update -o Dir::Etc::sourcelist=/dev/null -o Dir::Etc::sourceparts="$t/parts" \
     -o Dir::State::Lists="$t/lists" -o APT::Sandbox::User=root > "$t/log" 2>&1
@@ -230,6 +238,17 @@ self_test() {
   expect 0 "amd64: apply writes the retry-delay drop-in" grep -qxF "$CONF_LINE" "$t/amd64/$CONF_FILE"
   fixture "$t/nodelay" amd64; apply "$t/nodelay" > /dev/null; rm -f "$t/nodelay/$CONF_FILE"
   expect 1 "mirror lists without the retry-delay drop-in are refused (the fallback would hang)" check "$t/nodelay"
+  # deb822 field names are case-insensitive: a lower-case `uris:` is rewritten, and refused while it is not.
+  fixture "$t/lower" amd64
+  sed 's/^URIs:/uris:/' "$t/lower/etc/apt/sources.list.d/ubuntu.sources" > "$t/l" && cat "$t/l" > "$t/lower/etc/apt/sources.list.d/ubuntu.sources"
+  expect 1 "a lower-case 'uris:' naming one host is refused by check" check "$t/lower"
+  expect 0 "a lower-case 'uris:' is rewritten by apply" apply "$t/lower"
+  # An empty or all-comment list still names its reason (no silent exit under set -e).
+  fixture "$t/empty-list" amd64; apply "$t/empty-list" > /dev/null
+  printf '# nothing\n' > "$t/empty-list/etc/apt/mirrors/ubuntu-archive.list"
+  expect 1 "an all-comment mirror list is refused" check "$t/empty-list"
+  cp "$t/out" "$t/why"
+  expect 0 "  ... and the refusal says why" grep -q 'offers 0 mirror' "$t/why"
   # A list cut back to one mirror is a single host again.
   fixture "$t/one" amd64; apply "$t/one" > /dev/null
   printf 'http://archive.ubuntu.com/ubuntu/\tpriority:1\n' > "$t/one/etc/apt/mirrors/ubuntu-archive.list"
