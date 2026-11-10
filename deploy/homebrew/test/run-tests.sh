@@ -3104,7 +3104,8 @@ rk_file | grep -q '^    PluginCatalog__BootstrapKey: "mwr_fleet-coupon-NEVER-PRI
   && ok "fleet join: the coupon (item r) is written as the registry file's bootstrap key" || bad "coupon written" "$(rk_file)"
 rk_file | grep -q 'registryUrl: "https://registry.example.test"' && rk_file | grep -q 'instanceId: "595714be-0000-4000-8000-000000000001"' \
   && ok "…keeping the registry URL and the pinned instance id" || bad "url and id kept" "$(rk_file)"
-[ "$(stat -f '%Lp' "$RK/home/.memex-local/registry.yaml" 2>/dev/null || stat -c '%a' "$RK/home/.memex-local/registry.yaml")" = "600" ] \
+# GNU first: GNU `stat -f` is the FILESYSTEM report and exits 0, so a BSD-first fallback never reaches `-c` on Linux
+[ "$(stat -c '%a' "$RK/home/.memex-local/registry.yaml" 2>/dev/null || stat -f '%Lp' "$RK/home/.memex-local/registry.yaml")" = "600" ] \
   && ok "…in a 0600 file" || bad "registry file mode" "$(ls -l "$RK/home/.memex-local/registry.yaml")"
 case "$RKO" in *NEVER-PRINTED*|*mwr_*) bad "…and the coupon is never printed" "said: $RKO" ;; *"registry plan:"*sha256:*) ok "…and the coupon is never printed (a fingerprint only)" ;; *) bad "coupon fingerprint said" "said: $RKO" ;; esac
 [ "$(printf '%s' "$RKO" | grep -o 'sha256:[0-9a-f]*')" = "$(printf 'sha256:%s' "$(printf '%s' 'mwr_fleet-coupon-NEVER-PRINTED' | shasum -a 256 | cut -c1-12)")" ] \
