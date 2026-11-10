@@ -3929,6 +3929,24 @@ def cold_worktree(cache: str, repo: str, sha: str, dest: str, git: Callable[...,
         git("--git-dir", mirror, "worktree", "add", "--detach", "--quiet", dest, sha)
 
 
+def cold_run_tree(cache: str, repo: str, sha: str, dest: str, base: str, git: Callable[..., None]) -> None:
+    """A RUN's cold tree (§7.3b's one fallback): `dest` with its OWN `.git` — `init`, objects borrowed from the master
+    through `alternates`, `origin` named, `read-tree -u <sha>` (git writes the files from its objects) and HEAD at `sha` —
+    exactly the git shape an overlay run's tree has (`overlay_run_tree`). Never a registered worktree of the master: a
+    stage sees the master READ-ONLY, so a ref a stage writes (MeshWeaver.Plugins host-affected.py names the admitted main
+    as `refs/remotes/origin/…` for the selector's diff) lands in the run's own repository instead of failing against the
+    master's shared refs (eiger 2026-11-09: "could not name the admitted main … as refs/remotes/origin/mw-host-modules-base",
+    every cold run red in its first seconds). Never a copy; removed with the run's workdir. Raises Refusal."""
+    mirror = master_path(cache, repo)
+    os.makedirs(dest, exist_ok=True)
+    git("init", "--quiet", dest)
+    with open(os.path.join(dest, ".git", "objects", "info", "alternates"), "w") as fh:
+        fh.write(os.path.join(mirror, "objects") + "\n")
+    git("-C", dest, "remote", "add", "origin", f"{base}/{repo}.git")
+    git("-C", dest, "read-tree", "-u", "--reset", sha)
+    git("-C", dest, "update-ref", "--no-deref", "HEAD", sha)
+
+
 def remove_cold_worktree(cache: str, repo: str, dest: str, git: Callable[..., None]) -> None:
     """`git worktree remove --force` and `prune`, under the master lock — so nothing stays registered. Never raises."""
     mirror = master_path(cache, repo)
@@ -5064,15 +5082,15 @@ class Host:
                         release_run_tree(dest)
                         for d in (dest, dest + ".upper", dest + ".ovlwork"):
                             shutil.rmtree(d, ignore_errors=True)
-        self.log(f"COLD WORKTREE: {repo}@{sha[:12]} — {why}; this run takes a cold `git worktree add` off the master "
-                 f"(no warm obj/ or bin/; nothing copied)")
+        self.log(f"COLD WORKTREE: {repo}@{sha[:12]} — {why}; this run takes a cold tree off the master "
+                 f"(its own .git, objects borrowed; no warm obj/ or bin/; nothing copied)")
         g = _git_runner(self.env, os.path.dirname(dest), token, deadline)
         base = self.env.get("MW_BUILD_GIT_BASE", "https://github.com/Systemorph").rstrip("/")
         mirror = master_path(self.cache, repo)
         wanted = [sha] + [r for r in (refs or []) if isinstance(r, str) and r]
         _update_mirror(repo, f"{base}/{repo}.git", os.path.dirname(mirror), mirror, wanted, g, self.log)
-        cold_worktree(self.cache, repo, sha, dest, g)
-        self.cold_tree = (repo, dest)
+        cold_run_tree(self.cache, repo, sha, dest, base, g)
+        self.cold_tree = None                            # its own .git, inside the workdir: gone with it, nothing registered
         return f"workspace: COLD worktree of the master at {sha[:12]} ({why}); bytes copied = {copied_bytes(dest, None)}"
 
     # -- step 3/4: run ----------------------------------------------------------------------
@@ -7994,10 +8012,19 @@ def self_test() -> int:
                   line2.startswith(f"workspace: COLD worktree of the master at {c1[:12]}") and "integrity check refused" in line2
                   and line2.endswith("bytes copied = 0") and any(m.startswith("COLD WORKTREE") for m in seen_log)
                   and len(mounted) == 1 and open(os.path.join(rd2, "a.cs")).read() == "v1"
-                  and hi.cold_tree == ("R", rd2) and wt_count(rd2) == 1, (line2, seen_log[-2:]))
-            remove_cold_worktree(wenv["MW_BUILD_CACHE"], "R", rd2, gw)
+                  and hi.cold_tree is None and wt_count(rd2) == 0, (line2, seen_log[-2:]))
+            # the cold tree has its OWN .git: a ref the run writes lands there, never in the master (read-only to a stage)
+            mref = subprocess.run(["git", "-C", rd2, "update-ref", "refs/remotes/origin/mw-host-modules-base", c1], capture_output=True, text=True)
+            check("reader/the cold tree is its OWN repository (objects borrowed from the master): HEAD at the run's sha, a ref "
+                  "a stage writes lands in it and never in the master, nothing registered on the master",
+                  mref.returncode == 0 and os.path.isdir(os.path.join(rd2, ".git"))
+                  and subprocess.run(["git", "-C", rd2, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip() == c1
+                  and subprocess.run(["git", "--git-dir", master_path(wenv["MW_BUILD_CACHE"], "R"), "rev-parse", "--verify", "-q",
+                                      "refs/remotes/origin/mw-host-modules-base"], capture_output=True).returncode != 0
+                  and "alternates" in os.listdir(os.path.join(rd2, ".git", "objects", "info")), mref.stderr)
+            shutil.rmtree(rd2, ignore_errors=True)
             hi.run_holds.close()
-            check("reader/the cold worktree is removed and pruned when the run ends", not os.path.exists(rd2) and wt_count(rd2) == 0)
+            check("reader/the cold tree leaves nothing registered on the master", wt_count(rd2) == 0)
             # the writer rebuilds it (not built → advance in place → warmBuild → manifest)
             idt.unbuild(warm_key(hi.env, hi.identity), c3)
             check("warm-idle/a tree marked not built is rebuilt by the writer", hi._warm_deployment("R", warm_key(hi.env, hi.identity)) == "built"
@@ -8009,8 +8036,8 @@ def self_test() -> int:
             with idt.writer() as w_busy:
                 line3 = hi.seed_run_tree("R", c1, [], rd3, None, None)
             check("reader/a tree its writer is advancing (lock busy) is never mounted: a COLD worktree, said",
-                  line3.startswith("workspace: COLD worktree") and "locked" in line3 and len(mounted) == 1 and hi.cold_tree == ("R", rd3), line3)
-            remove_cold_worktree(wenv["MW_BUILD_CACHE"], "R", rd3, gw)
+                  line3.startswith("workspace: COLD worktree") and "locked" in line3 and len(mounted) == 1 and hi.cold_tree is None, line3)
+            shutil.rmtree(rd3, ignore_errors=True)
             hi.run_holds.close()
             # a host that cannot overlay → COLD worktree, said
             hi.env.pop("MW_BUILD_IN_NS")
@@ -8019,7 +8046,7 @@ def self_test() -> int:
             line4 = hi.seed_run_tree("R", c1, [], rd4, None, None)
             check("reader/a host that cannot overlay takes a COLD worktree off the master, said (never a copy)",
                   line4.startswith("workspace: COLD worktree") and "cannot overlay" in line4 and len(mounted) == 1, line4)
-            remove_cold_worktree(wenv["MW_BUILD_CACHE"], "R", rd4, gw)
+            shutil.rmtree(rd4, ignore_errors=True)
             hi.run_holds.close()
             hi.env["MW_BUILD_IN_NS"] = "1"
             # an overlay refused by the kernel → COLD worktree, said, and the shared lock released at once
