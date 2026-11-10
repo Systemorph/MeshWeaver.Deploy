@@ -3107,6 +3107,19 @@ rk_file | grep -q 'registryUrl: "https://registry.example.test"' && rk_file | gr
 [ "$(stat -f '%Lp' "$RK/home/.memex-local/registry.yaml" 2>/dev/null || stat -c '%a' "$RK/home/.memex-local/registry.yaml")" = "600" ] \
   && ok "…in a 0600 file" || bad "registry file mode" "$(ls -l "$RK/home/.memex-local/registry.yaml")"
 case "$RKO" in *NEVER-PRINTED*|*mwr_*) bad "…and the coupon is never printed" "said: $RKO" ;; *"registry plan:"*sha256:*) ok "…and the coupon is never printed (a fingerprint only)" ;; *) bad "coupon fingerprint said" "said: $RKO" ;; esac
+[ "$(printf '%s' "$RKO" | grep -o 'sha256:[0-9a-f]*')" = "$(printf 'sha256:%s' "$(printf '%s' 'mwr_fleet-coupon-NEVER-PRINTED' | shasum -a 256 | cut -c1-12)")" ] \
+  && ok "…and the fingerprint said is the one of the key written" || bad "fingerprint of the written key" "said: $RKO"
+printf '  mwr_fleet-coupon-NEVER-PRINTED \n' > "$RK/items/r"; RKO="$(rk)"
+rk_file | grep -q '^    PluginCatalog__BootstrapKey: "mwr_fleet-coupon-NEVER-PRINTED"$' \
+  && [ "$(printf '%s' "$RKO" | grep -o 'sha256:[0-9a-f]*' | tail -n1)" = "$(printf 'sha256:%s' "$(printf '%s' 'mwr_fleet-coupon-NEVER-PRINTED' | shasum -a 256 | cut -c1-12)")" ] \
+  && ok "fleet join: a padded drop is trimmed, and the fingerprint is of the trimmed key" || bad "trimmed key" "$RKO / $(rk_file)"
+env HOME="$RK/home" MEMEX_LOCAL_HOME="$RK/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c ". \"$CLI\"; write_registry_file https://registry.example.test mwr_older-key-NEVER-PRINTED ''"
+printf 'mwr_fleet-coupon-NEVER-PRINTED' > "$RK/items/r"; RKO="$(rk)"
+rk_file | grep -q 'BootstrapKey: "mwr_fleet-coupon-NEVER-PRINTED"' && case "$RKO" in *"replacing the registration key already in"*) true ;; *) false ;; esac \
+  && case "$RKO" in *NEVER-PRINTED*|*mwr_*) false ;; *) true ;; esac \
+  && ok "fleet join: a key already in the file is replaced by the coupon, and that is SAID (fingerprints only)" || bad "replace said" "$RKO / $(rk_file)"
+RKO="$(rk)"
+case "$RKO" in *"replacing"*) bad "re-applying the same coupon is silent" "said: $RKO" ;; *) ok "…while re-applying the same coupon says nothing about replacing" ;; esac
 rk_open https://registry.example.test ""
 RKO="$(rk)"
 rk_file | grep -q 'PluginCatalog__BootstrapKey: "mwr_' && ! rk_file | grep -q 'instanceId:' \

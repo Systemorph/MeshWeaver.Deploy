@@ -2153,9 +2153,19 @@ fleet_apply_registry_key() {
     return 0
   fi
   url="$(registry_url)"
+  # A key already in the file is REPLACED, deliberately: the enrolment's coupon is the plan control declares for the
+  # fleet. Nothing is lost by it — a key the portal already presented is recorded on its stored credential, and a
+  # redemption never LOWERS a plan (a lower coupon is refused by the registry, plan unchanged). Said, never silent.
+  local held fp
+  held="$(awk '$1 == "PluginCatalog__BootstrapKey:" { gsub(/"/, "", $2); print $2; exit }' "$REGISTRY_FILE" 2>/dev/null)"
+  fp="$(fleet_value_fingerprint "$key")"
+  if [ -n "$held" ] && [ "$held" != "$key" ]; then
+    warn "registry plan: replacing the registration key already in $REGISTRY_FILE ($(fleet_value_fingerprint "$held")) with the enrolment's coupon — a coupon never lowers the plan the registry holds for this install"
+  fi
+  unset held
   write_registry_file "$url" "$key" "$(registry_instance_id)"
   unset key
-  ok "registry plan: the enrolment's coupon is this install's registration key ($(fleet_value_fingerprint "$(cat "$dir/r")")) — the portal presents it on its next boot (registers on, or redeems itself up to, the fleet's plan)"
+  ok "registry plan: the enrolment's coupon is this install's registration key ($fp) — the portal presents it on its next boot (registers on, or redeems itself up to, the fleet's plan)"
 }
 
 # The fleet CA (item a) — ONE path, the onboarding contract's §6 drop: the opened key goes to enrol/fleet-ca.key (0600)
