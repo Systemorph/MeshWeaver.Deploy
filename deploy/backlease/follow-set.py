@@ -20,12 +20,14 @@ Draining: nothing here waits or kills. The runners stop claiming on SIGTERM and 
 
 THE CHART AND THE MAC'S VALUES FOLLOW TOO (MeshWeaver.Plugins Hosting/OneBuildTree §7, "the follower re-applies only the
 set"). Before, a chart or values change reached a Mac only on a re-attach. Now each pass also reads this repository's
-`main` (public; `--source-repo`/`--source-ref`). When its newest commit is GREEN (every check run completed, none failed) and
+`main` (public; `--source-repo`/`--source-ref`). When its newest commit is GREEN (the chart gate's REQUIRED_CHECKS succeeded, no check failed) and
 changed `deploy/helm` or `deploy/backlease` (their git tree ids), the pass stages that commit's chart, `build-host-mac.values.yaml`
 and this script beside the agent (the next pass runs the new script), then applies them: a FULL `helm upgrade` — the
 chart's defaults, the Mac values, the estate values first-attach set (ESTATE_KEYS, read back from the release) and the set —
 never `--reuse-values`, which keeps the old values and ignores a new chart's defaults. A red or pending commit, or one
-GitHub cannot answer, changes nothing (said once per commit).
+GitHub cannot answer, changes nothing, said on every pass while it lasts. GitHub is asked ONE question per pass while
+main's head stays the same commit (the trees and the verdict are kept in `head.json`), so two Macs behind one address stay
+far under the unauthenticated limit (60 an hour).
 
 Fails CLOSED — nothing is changed when control cannot be read, answers a set that is not complete or not well-formed,
 the release cannot be read, or a helm operation on it is still pending. Every pass prints ONE line saying what it did.
@@ -62,7 +64,11 @@ FIELDS = ("platformVersion", "testerDigest", "portalDigest", "runnerDigest")
 ESTATE_KEYS = ("apiUrl", "testerRepository", "portalRepository", "runnerRepository", "pluginsRegistry", "registry")
 SOURCE_REPO = "Systemorph/MeshWeaver.Deploy"
 SOURCE_REF = "main"
-GREEN = ("success", "skipped", "neutral")
+# The checks that GATE the chart and this follower: chart-gate renders the Mac values and runs this self-test, the
+# chart guards check the chart against the platform. A commit is followed only when BOTH ran and succeeded and no check on
+# it failed; a check still running elsewhere (the macOS installer, the runner image) does not hold it.
+REQUIRED_CHECKS = ("Chart invariants", "Chart guards (vs platform)")
+RED = ("failure", "timed_out", "startup_failure", "action_required", "cancelled")
 VALUES_FILE = "build-host-mac.values.yaml"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 HOME = os.environ.get("MEMEX_LOCAL_HOME") or os.path.join(os.path.expanduser("~"), ".memex-local")
@@ -148,9 +154,11 @@ def deployed_set(release: str, ns: str, ctx: str, channel: str, sh: Runner, valu
     return {k: ch.get(k) for k in FIELDS}, "ok"
 
 
-def source_head(get: Fetcher, repo: str = SOURCE_REPO, ref: str = SOURCE_REF) -> "tuple[Optional[dict], str]":
+def source_head(get: Fetcher, repo: str = SOURCE_REPO, ref: str = SOURCE_REF, cache: Optional[str] = None
+                ) -> "tuple[Optional[dict], str]":
     """The newest commit of `ref` with the git tree ids of `deploy/helm` and `deploy/backlease`, when it is GREEN; (None,
-    why) otherwise. Read from GitHub's public API, unauthenticated."""
+    why) otherwise. Read from GitHub's public API, unauthenticated. `cache` (a JSON file) keeps the head's trees and its
+    green verdict, so an unchanged head costs ONE call per pass."""
     api = f"https://api.github.com/repos/{repo}"
     status, body = get(f"{api}/commits/{ref}")
     try:
@@ -160,17 +168,23 @@ def source_head(get: Fetcher, repo: str = SOURCE_REPO, ref: str = SOURCE_REF) ->
         return None, f"GitHub answered {status or 'nothing'} for {repo}@{ref}"
     if not (SHA.match(sha) and SHA.match(tree)):
         return None, f"{repo}@{ref} names no commit"
+    seen = read_json(cache) if cache else {}
+    if seen.get("sha") == sha and seen.get("green") is True and seen.get("helm") and seen.get("backlease"):
+        return {"sha": sha, "helm": seen["helm"], "backlease": seen["backlease"]}, "ok"
     ids: dict = {}
-    for path, want in (("", ("deploy",)), ("deploy", ("helm", "backlease"))):
-        status, body = get(f"{api}/git/trees/{tree if not path else ids['deploy']}")
-        try:
-            entries = {e["path"]: e["sha"] for e in json.loads(body)["tree"] if e.get("type") == "tree"} if status == 200 else {}
-        except (ValueError, TypeError, KeyError):
-            entries = {}
-        for w in want:
-            if w not in entries:
-                return None, f"{repo}@{sha[:12]} has no {('deploy/' if path else '') + w}"
-            ids[w] = entries[w]
+    if seen.get("sha") == sha and seen.get("helm") and seen.get("backlease"):
+        ids = {"helm": seen["helm"], "backlease": seen["backlease"]}
+    else:
+        for path, want in (("", ("deploy",)), ("deploy", ("helm", "backlease"))):
+            status, body = get(f"{api}/git/trees/{tree if not path else ids['deploy']}")
+            try:
+                entries = {e["path"]: e["sha"] for e in json.loads(body)["tree"] if e.get("type") == "tree"} if status == 200 else {}
+            except (ValueError, TypeError, KeyError):
+                entries = {}
+            for w in want:
+                if w not in entries:
+                    return None, f"{repo}@{sha[:12]} has no {('deploy/' if path else '') + w}"
+                ids[w] = entries[w]
     status, body = get(f"{api}/commits/{sha}/check-runs?per_page=100")
     try:
         runs = json.loads(body)["check_runs"] if status == 200 else None
@@ -178,12 +192,22 @@ def source_head(get: Fetcher, repo: str = SOURCE_REPO, ref: str = SOURCE_REF) ->
         runs = None
     if runs is None:
         return None, f"the checks of {repo}@{sha[:12]} cannot be read ({status})"
-    pending = [r.get("name") for r in runs if r.get("status") != "completed"]
-    red = [r.get("name") for r in runs if r.get("status") == "completed" and r.get("conclusion") not in GREEN]
-    if not runs or pending or red:
+    red = [r.get("name") for r in runs if r.get("status") == "completed" and r.get("conclusion") in RED]
+    by_name: dict = {}
+    for r in runs:
+        by_name.setdefault(r.get("name"), []).append(r)
+    missing = [n for n in REQUIRED_CHECKS
+               if not any(r.get("status") == "completed" and r.get("conclusion") == "success" for r in by_name.get(n, []))]
+    green = not red and not missing
+    if cache:
+        try:
+            write_json(cache, {"sha": sha, "helm": ids["helm"], "backlease": ids["backlease"], "green": green})
+        except OSError:
+            pass
+    if not green:
         return None, (f"{repo}@{sha[:12]} is not green yet — "
                       + (f"{len(red)} check(s) red ({', '.join(map(str, red[:3]))})" if red else
-                         f"{len(pending)} check(s) running" if pending else "no check has run"))
+                         f"the gate has not passed ({', '.join(missing)})"))
     return {"sha": sha, "helm": ids["helm"], "backlease": ids["backlease"]}, "ok"
 
 
@@ -294,7 +318,7 @@ def follow_once(api: str, follow: str, release: str, ns: str, ctx: str, chart: s
     notes = []
     source_changed = False
     if agent is not None and download is not None:
-        src, swhy = source_head(get, source_repo, source_ref)
+        src, swhy = source_head(get, source_repo, source_ref, cache=os.path.join(agent, "head.json"))
         staged = read_json(os.path.join(agent, "source.json"))
         if src is None:
             notes.append(f"chart/values held — {swhy}")
@@ -520,12 +544,12 @@ def self_test() -> int:
     import tarfile
     SHA_C, TREE, DEP, HELM, BL = "1" * 40, "2" * 40, "3" * 40, "4" * 40, "5" * 40
 
-    def github(checks: list, helm: str = HELM, status: int = 200) -> Fetcher:
+    def github(checks: list, helm: str = HELM, status: int = 200, sha: str = SHA_C) -> Fetcher:
         def get(url: str) -> "tuple[int, str]":
             if url.endswith("/channels/latest/set"):
                 return 200, json.dumps(good)
             if url.endswith(f"/commits/{SOURCE_REF}"):
-                return status, json.dumps({"sha": SHA_C, "commit": {"tree": {"sha": TREE}}})
+                return status, json.dumps({"sha": sha, "commit": {"tree": {"sha": TREE}}})
             if url.endswith(f"/git/trees/{TREE}"):
                 return 200, json.dumps({"tree": [{"path": "deploy", "type": "tree", "sha": DEP}]})
             if url.endswith(f"/git/trees/{DEP}"):
@@ -535,15 +559,31 @@ def self_test() -> int:
             return 404, ""
         return get
 
-    green = [{"name": "a", "status": "completed", "conclusion": "success"}, {"name": "b", "status": "completed", "conclusion": "skipped"}]
+    green = [{"name": n, "status": "completed", "conclusion": "success"} for n in REQUIRED_CHECKS] + [
+        {"name": "b", "status": "completed", "conclusion": "skipped"}, {"name": "macOS pkg", "status": "in_progress"}]
     src, why = source_head(github(green))
     check("source: a green main names its commit and the two tree ids", src == {"sha": SHA_C, "helm": HELM, "backlease": BL}, (src, why))
+    check("source: a check still running OUTSIDE the gate does not hold a commit whose gate passed", source_head(github(green))[0] is not None)
     for name, checks in (("a red check", green + [{"name": "chart", "status": "completed", "conclusion": "failure"}]),
-                         ("a running check", green + [{"name": "chart", "status": "in_progress"}]), ("no check at all", [])):
+                         ("a cancelled check", green + [{"name": "x", "status": "completed", "conclusion": "cancelled"}]),
+                         ("the gate still running", [{"name": REQUIRED_CHECKS[0], "status": "in_progress"},
+                                                     {"name": REQUIRED_CHECKS[1], "status": "completed", "conclusion": "success"}]),
+                         ("the gate skipped (never ran)", [{"name": n, "status": "completed", "conclusion": "skipped"} for n in REQUIRED_CHECKS]),
+                         ("only trivial checks", [{"name": "b", "status": "completed", "conclusion": "success"}]), ("no check at all", [])):
         src, why = source_head(github(checks))
         check(f"source: {name} holds the chart (nothing staged)", src is None and "not green" in why, why)
     src, why = source_head(github(green, status=403))
     check("source: GitHub refusing (a rate limit) holds it, said", src is None and "403" in why, why)
+    with tempfile.TemporaryDirectory() as hc:
+        calls: list = []
+        gh_ = github(green)
+        counting = lambda url: (calls.append(url), gh_(url))[1]
+        cache_f = os.path.join(hc, "head.json")
+        first = source_head(counting, cache=cache_f)[0]
+        n_first = len(calls)
+        again = source_head(counting, cache=cache_f)[0]
+        check("source: an UNCHANGED green head costs ONE call on the next pass (trees and verdict kept)",
+              first == again and n_first == 4 and len(calls) - n_first == 1, (n_first, calls[n_first:]))
 
     def tarball(files: dict) -> bytes:
         buf = io.BytesIO()
@@ -612,11 +652,11 @@ def self_test() -> int:
         check("values: the same green commit again changes nothing (applied is recorded)", hv2.upgrades() == [] and "current" in line2, line2)
         hv3 = HelmV(cur)
         line3, _ = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
-                               chart_a, "mac", github(green, helm="9" * 40), hv3, agent=ag, download=dl(tarball(full)), dry_run=True)
+                               chart_a, "mac", github(green, helm="9" * 40, sha="6" * 40), hv3, agent=ag, download=dl(tarball(full)), dry_run=True)
         check("values: --dry-run stages and applies nothing", hv3.upgrades() == [] and "would" in line3, line3)
         hv4 = HelmV(cur)
         line4, _ = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
-                               chart_a, "mac", github(green + [{"name": "x", "status": "completed", "conclusion": "failure"}], helm="9" * 40),
+                               chart_a, "mac", github(green + [{"name": "x", "status": "completed", "conclusion": "failure"}], helm="9" * 40, sha="7" * 40),
                                hv4, agent=ag, download=dl(tarball(full)))
         check("values: a RED main is never followed (the host stays as it is, said)", hv4.upgrades() == [] and "held" in line4, line4)
     # first-attach's estate --set-string keys are exactly what a full upgrade keeps
