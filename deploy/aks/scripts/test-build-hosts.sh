@@ -615,7 +615,10 @@ else:
     if vols.get("registry-key", {}).get("secret", {}).get("secretName") != "build-registry-key-mac": problems.append("no registry-key volume")
     builds = [c for c in spec["containers"] if c["name"] == "build"]
     if not builds or builds[0]["resources"]["requests"] != {"cpu": "4", "memory": "8Gi"}: problems.append(f"requests: {builds and builds[0]['resources']}")
-    if dep["spec"]["strategy"] != {"type": "Recreate"}: problems.append(f"strategy: {dep['spec']['strategy']}")
+    # one replica at a time, never all at once: drain-then-replace, no surge (a Recreate roll left the Macs at 0 ready)
+    if dep["spec"]["strategy"] != {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}}: problems.append(f"strategy: {dep['spec']['strategy']}")
+    if env.get("MW_BUILD_STAGE_NETWORK") != "open" or env.get("MW_BUILD_RUN_DISK_GIB") != "20" or env.get("MW_BUILD_DISK_HEADROOM_PERCENT") != "15":
+        problems.append(f"the stage network / disk guard defaults: {env.get('MW_BUILD_STAGE_NETWORK')!r} {env.get('MW_BUILD_RUN_DISK_GIB')!r} {env.get('MW_BUILD_DISK_HEADROOM_PERCENT')!r}")
 so = [d for d in docs if d["kind"] == "ScaledObject"]
 if len(so) != 1 or "channel=mac" not in str(so[0]): problems.append("the ScaledObject does not scale on channel=mac")
 pvc = by.get(("PersistentVolumeClaim", "build-cache-mac"))
@@ -822,6 +825,9 @@ for entry in \
   "values.build-hosts-stage-slots-fraction.yaml|buildHosts.stageSlots 2.9 must be a whole number" \
   "values.build-hosts-slice-cache-zero.yaml|buildHosts.sliceCacheMaxGi 0 must be within" \
   "values.build-hosts-slice-cache-fraction.yaml|buildHosts.sliceCacheMaxGi 1.5 must be a whole number" \
+  "values.build-hosts-stage-network-bad.yaml|buildHosts.stageNetwork \"none\" must be open or offline" \
+  "values.build-hosts-run-disk-fraction.yaml|buildHosts.runDiskGi 2.5 must be a whole number" \
+  "values.build-hosts-disk-headroom-high.yaml|buildHosts.diskHeadroomPercent 95 must be within" \
   "values.build-hosts-alias-twice.yaml|an alias is ONE version" \
   "values.build-hosts-version-twice.yaml|one deployment per version" \
   "values.build-hosts-bad-version.yaml|must be MAJOR.MINOR.PATCH" \

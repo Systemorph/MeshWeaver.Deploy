@@ -142,6 +142,34 @@ The refusals, and why each one exists:
 {{- if or (lt $sliceCacheMaxGi 1) (gt $sliceCacheMaxGi 4096) -}}
 {{- fail (printf "buildHosts.sliceCacheMaxGi %d must be within [1, 4096] — the bound of the host's module-slice cache" $sliceCacheMaxGi) -}}
 {{- end -}}
+{{- /* NO NETWORK DURING A RUN (MeshWeaver.Plugins Hosting/OneBuildTree.md): `offline` gives every run stage its own network
+       namespace and the prepared package folder as NuGet's only source; `open` keeps today's network. */ -}}
+{{- $stageNetwork := toString ($b.stageNetwork | default "open") -}}
+{{- if not (has $stageNetwork (list "open" "offline")) -}}
+{{- fail (printf "buildHosts.stageNetwork %q must be open or offline — whether a run's stages reach the network" $stageNetwork) -}}
+{{- end -}}
+{{- /* THE NODE'S DISK: a host claims a run only when one run's footprint (runDiskGi) still leaves diskHeadroomPercent of the
+       disk free for the kubelet's eviction threshold — measured on the node at claim time. Whole numbers. */ -}}
+{{- $runDiskGi := 20 -}}
+{{- if hasKey $b "runDiskGi" -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $b.runDiskGi)) -}}
+{{- fail (printf "buildHosts.runDiskGi %v must be a whole number of GiB within [0, 4096] — what one run may write on the node's disk (0 = no guard)" $b.runDiskGi) -}}
+{{- end -}}
+{{- $runDiskGi = int $b.runDiskGi -}}
+{{- end -}}
+{{- if gt $runDiskGi 4096 -}}
+{{- fail (printf "buildHosts.runDiskGi %d must be within [0, 4096]" $runDiskGi) -}}
+{{- end -}}
+{{- $diskHeadroom := 15 -}}
+{{- if hasKey $b "diskHeadroomPercent" -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $b.diskHeadroomPercent)) -}}
+{{- fail (printf "buildHosts.diskHeadroomPercent %v must be a whole percentage within [0, 90]" $b.diskHeadroomPercent) -}}
+{{- end -}}
+{{- $diskHeadroom = int $b.diskHeadroomPercent -}}
+{{- end -}}
+{{- if gt $diskHeadroom 90 -}}
+{{- fail (printf "buildHosts.diskHeadroomPercent %d must be within [0, 90]" $diskHeadroom) -}}
+{{- end -}}
 {{- $sb := ($b.sandbox | default dict) -}}
 {{- $sandbox := dict "seccompProfile" ($sb.seccompProfile | default "") "seccompLocalhostProfile" ($sb.seccompLocalhostProfile | default "")
       "appArmorProfile" ($sb.appArmorProfile | default "") "appArmorLocalhostProfile" ($sb.appArmorLocalhostProfile | default "")
@@ -337,6 +365,7 @@ The refusals, and why each one exists:
       "nodeSelector" $nodeSelector "tolerations" $tolerations
       "resources" ($b.resources | default dict) "workSizeLimit" ($b.workSizeLimit | default "60Gi")
       "runDeadline" $runDeadline "stageSlots" $stageSlots "sliceCacheMaxGi" $sliceCacheMaxGi
+      "stageNetwork" $stageNetwork "runDiskGi" $runDiskGi "diskHeadroomPercent" $diskHeadroom
       "warmWorkspace" (eq (toString ($b.warmWorkspace | default false)) "true")
       "moduleHub" (eq (toString ($b.moduleHub | default false)) "true")
       "sharedTree" (eq (toString ($b.sharedTree | default false)) "true")

@@ -17,7 +17,13 @@ buildHosts:
   # The plugins layer: as the cluster hosts take it — the sealed publication /hosts/inputs names, or none. The registry's
   # bundle index (H8, a READ-ONLY instance key) is opt-in through first-attach.sh's --plugins-registry/--instance-key-secret:
   # measured 2026-11-07 the registry served AI as an assemblies-only bundle, module-fetch refused it, and the host never claimed.
-  rolloutStrategy: "Recreate"
+  # ONE REPLICA AT A TIME, never all at once (2026-11-10: a Recreate roll with the 2 h run grace left both Macs at 0 ready
+  # while every old pod drained). RollingUpdate here is the chart's drain-then-replace (maxSurge 0, maxUnavailable 1): one
+  # old replica is told to stop claiming and finish its run, its replacement starts once it has gone, and the others keep
+  # serving meanwhile. It needs no room for a surge pod, so a single node rolls it. The one tree per host is safe across
+  # the mixed roll: a run holds the tree by a shared lock, the writer advances only when no reader holds it, and an older
+  # runner's tree directory is retired only once no lock on it is held.
+  rolloutStrategy: "RollingUpdate"
   nodeSelector: null
   tolerations: null
   # Sized for a 16 CPU / 100 GiB-memory / 300 GiB-disk build VM (the first Mac's `build` profile, 2026-11-07): up to four

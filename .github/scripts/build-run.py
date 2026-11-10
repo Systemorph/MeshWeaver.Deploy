@@ -845,6 +845,42 @@ def safe_extract(tar_file: str, dest: str) -> None:
 # Each entry records its size (`.bytes`) and its last use (the mtime of `.complete`, touched on every Hit); a reader holds
 # a SHARED flock on the entry's sibling lock (`<sha256>.lock`) while it copies, and the evictor takes it EXCLUSIVE and
 # non-blocking, so an entry being read is never removed under its reader.
+# The node's disk is shared by every replica's work volume, the cache and the images; the chart's per-replica work limit
+# times the replicas can exceed it (moench 2026-11-10: 3 × 52 GiB of work on a 98 GB disk, 17 pods evicted for
+# DiskPressure at 59 % used at rest). So a host claims a run only when the disk keeps the eviction headroom free AFTER one
+# run's footprint — measured on the node at claim time, never assumed from the chart.
+RUN_DISK_ENV = "MW_BUILD_RUN_DISK_GIB"
+# The defaults are what the chart renders (buildHosts.runDiskGi / diskHeadroomPercent), so a host whose chart copy predates
+# the values (a leased Mac's follower re-applies only the set) is guarded all the same; 15 % is above the kubelet's
+# default hard threshold, nodefs.available < 10 %. 0 / 0 turns the guard off.
+RUN_DISK_DEFAULT_GIB = 20.0
+DISK_HEADROOM_ENV = "MW_BUILD_DISK_HEADROOM_PERCENT"
+DISK_HEADROOM_DEFAULT_PERCENT = 15.0
+
+
+def disk_gib(text: Optional[str], default: float) -> int:
+    """A GiB value in [0, 2^20] as bytes; anything else the default. Pure."""
+    try:
+        v = float((text or "").strip() or default)
+    except ValueError:
+        v = default
+    return int((v if 0 <= v <= 1 << 20 else default) * (1 << 30))
+
+
+def disk_percent(text: Optional[str], default: float) -> float:
+    """A percentage in [0, 90]; anything else the default. Pure."""
+    try:
+        v = float((text or "").strip() or default)
+    except ValueError:
+        v = default
+    return v if 0 <= v <= 90 else default
+
+
+def _disk_free(path: str) -> "tuple[int, int]":
+    st = os.statvfs(path)
+    return st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
+
+
 SLICE_CACHE_MAX_ENV = "MW_BUILD_SLICE_CACHE_MAX_GIB"
 SLICE_CACHE_DEFAULT_GIB = 32.0
 SLICE_CACHE_MIN_AGE = 600.0          # seconds: an entry used this recently is never evicted (a run is about to read it)
@@ -3086,6 +3122,17 @@ def sandbox_env(host_env: dict, extra: dict, cache: str) -> dict:
     return env
 
 
+STAGE_NETWORK_ENV = "MW_BUILD_STAGE_NETWORK"
+STAGE_NETWORKS = ("open", "offline")
+
+
+def offline_restore_env(cache: str) -> dict:
+    """What an OFFLINE run stage restores from: the prepared package folder as NuGet's ONLY source. MSBuild reads an
+    environment variable as a property, so `RestoreSources` replaces every source a NuGet.Config names — a pull request
+    that adds a feed reaches nothing. The folder is the global-packages layout NuGet also reads as a local feed. Pure."""
+    return {"RestoreSources": os.path.join(cache, "nuget")}
+
+
 # ─── THE PREPARED HOST, not a prepared run (MeshWeaver.Plugins Hosting/StandingBuildHosts.md) ─────────
 # What the portal-host lane reads besides the reference set, installed in the image BY COMMIT
 # (deploy/build-host/Dockerfile) and bound read-only into every stage (/opt is system, /tester a staged
@@ -3174,15 +3221,18 @@ class Sandbox:
 
     def argv(self, command: str, checkout: str, outputs: str, env: dict,
              readonly: Iterable[str] = (), writable: Iterable[str] = (), mount: Optional[str] = None,
-             binds: Iterable[tuple[str, str]] = ()) -> list[str]:
+             binds: Iterable[tuple[str, str]] = (), network: bool = True) -> list[str]:
         """`readonly` are the cache entries THIS stage may read (its own repository's mirror and the
         dependency artifacts it declares) — never the cache root; `writable` the run's extra output
         directories (artifacts) beside the checkout and the outputs. `mount` is where the checkout appears
         inside the sandbox (SANDBOX_CHECKOUT for a run's stages and the warm build); absent, its own path. `binds` are
-        further WRITABLE (host path, path inside) pairs — the package folder at SANDBOX_NUGET."""
+        further WRITABLE (host path, path inside) pairs — the package folder at SANDBOX_NUGET. `network=False` gives the
+        stage its OWN network namespace (`--unshare-net`: loopback only, so a stage's own Postgres still answers), so a
+        download a run was not prepared for fails at once naming its host, never as a 60 s timeout mid-test."""
         inside = mount or checkout
         a = [self.bwrap, "--die-with-parent", "--new-session",
              "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try",
+             *([] if network else ["--unshare-net"]),
              "--clearenv"]
         if self.ids:
             a[a.index("--unshare-user") + 1:a.index("--unshare-user") + 1] = ["--uid", str(self.ids[0]), "--gid", str(self.ids[1])]
@@ -4824,6 +4874,17 @@ class Host:
         # repo -> (tip, key, monotonic time) of an advancement that FAILED: retried after WARM_RETRY_SECONDS, not every idle pass
         self.warm_failed: dict = {}
         self.module_broker: Optional[ModuleHubBroker] = None
+        # NO NETWORK DURING A RUN (Plugins Hosting/OneBuildTree.md): `offline` runs every stage in its own network
+        # namespace and restores only from the prepared cache; `open` (the default until the preparation covers a run's
+        # whole closure) keeps today's network and says what a run still had to fetch (MWPREP001)
+        self.stage_network = (env.get(STAGE_NETWORK_ENV) or "open").strip().lower()
+        self.stage_offline = self.stage_network == "offline"
+        # what ONE run may write on the node's disk (MW_BUILD_RUN_DISK_GIB), and the share of the disk the kubelet's
+        # eviction threshold needs kept free (MW_BUILD_DISK_HEADROOM_PERCENT): a claim is taken only when both fit
+        self.run_disk = disk_gib(env.get(RUN_DISK_ENV), RUN_DISK_DEFAULT_GIB)
+        self.disk_headroom = disk_percent(env.get(DISK_HEADROOM_ENV), DISK_HEADROOM_DEFAULT_PERCENT)
+        self.disk_stat: Callable[[str], "tuple[int, int]"] = _disk_free
+        self.disk_said: Optional[str] = None
 
     def start_module_broker(self, repo: str, sha: str, claim: dict, trunk: bool, checkout: str, workdir: str) -> None:
         """§7.4 wiring, the host's half: when the host is enabled for it and the DEFAULT BRANCH tip declares `moduleHub`,
@@ -4887,6 +4948,24 @@ class Host:
             broker.stop("the run ended before this module was handed over")
             self.bound_slices()
 
+    def disk_refusal(self) -> Optional[str]:
+        """Why this host must not claim now, or None: the filesystem under the work volume or the cache (each measured —
+        an emptyDir and a hostPath/local-path claim share the node's disk on a Mac) would keep less than the eviction
+        headroom free once one run's footprint is written. Never raises: an unreadable filesystem claims (said once)."""
+        for what, path in (("the work volume", self.work), ("the cache", self.cache)):
+            try:
+                total, free = self.disk_stat(path)
+            except OSError:
+                continue
+            if total <= 0:
+                continue
+            keep = total * self.disk_headroom / 100.0
+            if free - self.run_disk < keep:
+                return (f"{what} ({path}) has {free / (1 << 30):.1f} GiB free of {total / (1 << 30):.1f} GiB; a run needs "
+                        f"{self.run_disk / (1 << 30):.0f} GiB ({RUN_DISK_ENV}) and {self.disk_headroom:g} % must stay free "
+                        f"for the kubelet's eviction threshold ({DISK_HEADROOM_ENV}) — retried every idle pass")
+        return None
+
     def slice_cache_root(self) -> str:
         return os.path.join(self.cache, "module-slices")
 
@@ -4924,6 +5003,8 @@ class Host:
             missing.append("MW_BUILD_CHANNEL (latest | stable) or MW_BUILD_VERSION")
         if not self.platform_version:
             missing.append("MW_BUILD_PLATFORM_VERSION (the set this host runs)")
+        if self.stage_network not in STAGE_NETWORKS:
+            missing.append(f"{STAGE_NETWORK_ENV} as open or offline (got {self.stage_network!r})")
         if not self.identity:
             missing.append("MW_BUILD_FRAMEWORK_IDENTITY or a readable MW_BUILD_IDENTITY_FILE")
         if self.env.get("MW_BUILD_COMPILE_REFS"):
@@ -5149,6 +5230,18 @@ class Host:
         self.mark_ready()
         if self.stopping:
             return "stopping"
+        # DISK FIRST: a run that starts on a node without room for it is evicted mid-run for DiskPressure (moench and eiger
+        # 2026-11-10: 17 and 18 build pods), which reads as a lost run, never as "the node was full"
+        tight = self.disk_refusal()
+        if tight is not None:
+            if tight != self.disk_said:
+                self.log(f"disk: claiming nothing — {tight}")
+                self.disk_said = tight
+            self.bound_slices()
+            return "idle"
+        if self.disk_said is not None:
+            self.log("disk: room again — claiming")
+            self.disk_said = None
         claim = self.claim()
         if claim is None:
             if not self.drained and warm_enabled(self.env) and not (self.warm_thread and self.warm_thread.is_alive()):
@@ -5679,10 +5772,14 @@ class Host:
                     self.assert_clean()
                 restored = sorted(nuget_packages(nuget_dir) - nuget_before)
                 if restored:
-                    sink.add([{"kind": "diagnostic", "severity": "warning", "code": "MWPREP001",
+                    # OFFLINE, a package restored per run is a hole in the preparation and the stage's verdict says so
+                    # (an ERROR); open, it is said as a warning while the preparation is completed
+                    sink.add([{"kind": "diagnostic", "severity": "error" if self.stage_offline else "warning", "code": "MWPREP001",
                                "message": f"{len(restored)} NuGet package(s) restored PER RUN — the server's warm cache "
                                           f"did not hold them: {', '.join(restored[:10])}"
-                                          + ("" if trunk else " (a trunk build promotes them)")},
+                                          + (" — the run is OFFLINE (MW_BUILD_STAGE_NETWORK=offline): the preparation (the "
+                                             "warm restore of the default branch's tip) must fetch them" if self.stage_offline
+                                             else "" if trunk else " (a trunk build promotes them)")},
                               {"kind": "line", "text": f"prepared server: {len(restored)} package(s) restored per run"}])
                     self.deliver(sink)
                 # The folder accumulates what the prepared builds and earlier stages restored too (already present
@@ -6330,8 +6427,12 @@ class Host:
         sink.add([{"kind": "line", "text": f"[00:00:00] {st['kind']}/{name} on build-{self.lane} "
                                            f"({self.platform_version}, plugins {(self.plugins_digest or '-')[:19]})"}])
         try:
-            argv = self.sandbox.argv(st["command"], checkout, outputs, sandbox_env(self.env, extra, self.cache),
-                                     readonly=readonly, writable=writable, mount=SANDBOX_CHECKOUT, binds=binds)
+            # OFFLINE (MW_BUILD_STAGE_NETWORK=offline): no network namespace beyond loopback, and NuGet's ONLY source is the
+            # prepared package folder — a package the preparation did not fetch is NU1101 naming it, never a download
+            stage_extra = {**extra, **offline_restore_env(self.cache)} if self.stage_offline else extra
+            argv = self.sandbox.argv(st["command"], checkout, outputs, sandbox_env(self.env, stage_extra, self.cache),
+                                     readonly=readonly, writable=writable, mount=SANDBOX_CHECKOUT, binds=binds,
+                                     **({"network": False} if self.stage_offline else {}))
             proc = subprocess.Popen(argv, cwd=checkout, env={"PATH": self.env.get("PATH", "/usr/bin:/bin")},
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     start_new_session=True, text=True, errors="replace", bufsize=1)
@@ -6806,6 +6907,9 @@ class _EnvSandbox:
 
 def self_test() -> int:
     failures: list[str] = []
+    # the self-test's hosts run in temporary directories on whatever disk the test machine has: the disk guard reads no
+    # filesystem here (total 0 = unknown, never blocks); its own cases inject the readings they test
+    globals()["_disk_free"] = lambda path: (0, 0)
 
     def check(name: str, cond: bool, detail: object = "") -> None:
         if not cond:
@@ -7042,7 +7146,37 @@ def self_test() -> int:
         pe = sandbox_env({"PATH": "/usr/bin"}, platform_scripts_env(ps), "/cache")
         check("platform scripts/reach the stage through the allow-list", pe.get("MW_PLATFORM_SCRIPTS") == ps, pe)
     check("bwrap/command last", av[-4:] == ["--", "/bin/bash", "-c", "make test"], av[-4:])
-    check("bwrap/no network namespace (builds fetch packages)", "--unshare-net" not in av and "--unshare-all" not in av)
+    check("bwrap/no network namespace by default (an OPEN host: builds fetch packages)", "--unshare-net" not in av and "--unshare-all" not in av)
+    oav = Sandbox("bwrap", []).argv("make test", "/w/s", "/w/o", {"PATH": "/bin"}, network=False)
+    check("offline/a stage with network=False gets its OWN network namespace (loopback only), before the command",
+          "--unshare-net" in oav and oav.index("--unshare-net") < oav.index("--"), oav[:12])
+    check("offline/NuGet's ONLY source is the prepared package folder (RestoreSources replaces every NuGet.Config source)",
+          offline_restore_env("/cache") == {"RestoreSources": "/cache/nuget"}
+          and sandbox_env({"PATH": "/bin"}, offline_restore_env("/cache"), "/cache")["RestoreSources"] == "/cache/nuget")
+    ho_ = Host({STAGE_NETWORK_ENV: "offline"}, None, log=lambda s: None)
+    hn_ = Host({}, None, log=lambda s: None)
+    check("offline/the switch: `offline` is offline, unset is open", ho_.stage_offline and not hn_.stage_offline and hn_.stage_network == "open")
+    # the DISK guard: a claim is taken only when one run's footprint still leaves the eviction headroom free
+    hd_ = Host({RUN_DISK_ENV: "20", DISK_HEADROOM_ENV: "15"}, None, log=lambda s: None)
+    G_ = 1 << 30
+    hd_.disk_stat = lambda p_: (100 * G_, 40 * G_)
+    check("disk/room: 40 GiB free of 100, a 20 GiB run, 15 % kept → claims", hd_.disk_refusal() is None)
+    hd_.disk_stat = lambda p_: (100 * G_, 30 * G_)
+    why_d = hd_.disk_refusal() or ""
+    check("disk/no room: 30 GiB free of 100 → claims nothing, naming the free space, the run's need and the headroom",
+          "30.0 GiB free of 100.0 GiB" in why_d and RUN_DISK_ENV in why_d and "15 %" in why_d, why_d)
+    hd_.disk_stat = lambda p_: (_ for _ in ()).throw(OSError("gone"))
+    check("disk/an unreadable filesystem never blocks a claim", hd_.disk_refusal() is None)
+    hz_ = Host({RUN_DISK_ENV: "0", DISK_HEADROOM_ENV: "0"}, None, log=lambda s: None)
+    hz_.disk_stat = lambda p_: (100 * G_, 1)
+    check("disk/0 and 0 turn the guard off", hz_.disk_refusal() is None)
+    hu_ = Host({}, None, log=lambda s: None)
+    hu_.disk_stat = lambda p_: (100 * G_, 30 * G_)
+    check("disk/unset: the chart's defaults hold (20 GiB, 15 %) — a host on an older chart copy is guarded too",
+          hu_.disk_refusal() is not None and hu_.run_disk == 20 * G_ and hu_.disk_headroom == 15.0)
+    check("disk/values: whole and fractional GiB, 0 allowed, junk and out-of-range → the default",
+          disk_gib("2.5", 0) == int(2.5 * G_) and disk_gib("0", 7) == 0 and disk_gib("x", 7) == 7 * G_ and disk_gib("-1", 7) == 7 * G_
+          and disk_gib("nan", 7) == 7 * G_ and disk_percent("95", 15) == 15 and disk_percent("10", 15) == 10)
     # The host's OWN sandbox binds every staged image root read-only — /core-tests included: core's
     # shard and doc-gate stages run `python3 /core-tests/core-tests.py …` (core .github/build-stages.json).
     hav = " ".join(Host({}, None, log=lambda s: None).sandbox.argv("true", "/w/s", "/w/o", {}))
@@ -11466,7 +11600,8 @@ def self_test() -> int:
                              (dict(env_v, MW_BUILD_PLATFORM_VERSION="3.1.10500"), "equal to MW_BUILD_VERSION"),
                              (dict(env_v, MW_BUILD_VERSION="3.1", MW_BUILD_PLATFORM_VERSION="3.1"), "MAJOR.MINOR.PATCH"),
                              (dict(env_v, MW_BUILD_RUNNER_DIGEST=""), "MW_BUILD_RUNNER_DIGEST as a sha256"),
-                             (dict(env_v, MW_BUILD_TESTER_DIGEST="sha256:short"), "MW_BUILD_TESTER_DIGEST as a sha256")):
+                             (dict(env_v, MW_BUILD_TESTER_DIGEST="sha256:short"), "MW_BUILD_TESTER_DIGEST as a sha256"),
+                             (dict(env_v, MW_BUILD_STAGE_NETWORK="none"), "MW_BUILD_STAGE_NETWORK as open or offline")):
             try:
                 host(_FakeApi({}), env=bad_env).preflight()
                 check(f"version/refused: {why}", False, "started")
