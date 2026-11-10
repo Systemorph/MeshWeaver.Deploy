@@ -1309,9 +1309,10 @@ buildHosts:
   # `stage_slots_refusal`) — so lowering `resources` means lowering this too. 1 = every run serial.
   stageSlots: 8
   # The WARM WORKSPACE (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3b): ONE master per host (the bare mirrors under the cache,
-  # updated only by `git fetch`) and ONE persistent worktree per repository per DEPLOYMENT (the host's lane + its warm key),
-  # `<cache>/deploy/<deployment>/<repo>`, written only by its single writer — moved IN PLACE to the default branch's tip and
-  # built by the tip's declared `warmBuild` while idle, then hashed into an integrity manifest. NOTHING IS EVER COPIED: a
+  # updated only by `git fetch`) and ONE persistent tree per repository per host (MeshWeaver.Plugins Hosting/OneBuildTree.md),
+  # `<cache>/deploy/<channel>-tree/<repo>`, written only by its single writer — moved IN PLACE to the default branch's tip and
+  # built by the tip's declared `warmBuild` while idle, then hashed into an integrity manifest. A platform update (a new
+  # compiler) rebuilds that same tree WHOLE in place; a runner roll rebuilds nothing. NOTHING IS EVER COPIED: a
   # run overlays that tree (runOverlay, below) or takes a cold `git worktree add` off the master, said; every run's plan
   # states `bytes copied = 0`. Off by default; turned on per host once measured.
   warmWorkspace: false
@@ -1320,6 +1321,11 @@ buildHosts:
   # host uploads it by its hash). Identity is the host's: fingerprints from the pristine tree under the DEFAULT BRANCH's
   # `moduleHub` declaration, lane and commit from the run. Inert unless a repository declares `moduleHub`. Off by default.
   moduleHub: false
+  # The BOUND of the host's module-slice cache (`<cache>/module-slices`), whole GiB in [1, 4096]: above it the runner evicts the
+  # least-recently-used slices (never one a run is copying, never one used in the last 10 minutes). The slices are a cache of
+  # the control instance's content-addressed, append-only module store, so an evicted one is fetched again by its hash.
+  # Unbounded, it reached 117 GB on a Mac (2026-11-10) and put the node at DiskPressure (MeshWeaver.Plugins Hosting/OneBuildTree.md).
+  sliceCacheMaxGi: 32
   # The SHARED TREE switch — INERT since §7.3b, kept only so existing values still render (retire it in a later chart change).
   # The deployment trees always live on the cache volume, so the warm path is chosen by the two other switches alone:
   #   warmWorkspace  runOverlay  →  a run's tree
