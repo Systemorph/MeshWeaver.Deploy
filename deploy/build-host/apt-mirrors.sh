@@ -12,21 +12,31 @@
 # each with a `priority`. apt asks the lowest priority first and, when a file fails there, fetches that
 # file from the next mirror — integrity is unchanged, because every index is still verified against
 # the source's `Signed-By` keyring, whichever mirror served it. The FIRST mirror of the amd64 lists is
-# the cloud's regional Ubuntu mirror (`azure.archive.ubuntu.com`, the one GitHub's own Ubuntu runner VMs
-# and the operator's ACR Tasks — both in that cloud — are configured with), so the ordinary path no
-# longer touches Canonical's archive at all; Canonical's host and an independent mirror follow it.
+# the cloud's regional Ubuntu mirror (`azure.archive.ubuntu.com` — the one GitHub's own Ubuntu runner
+# VMs are configured with; the runners and the operator's ACR Tasks both run in that cloud), so the
+# ordinary path no longer touches Canonical's archive at all; Canonical's host and an independent
+# mirror follow it. arm64 keeps `ports.ubuntu.com` first (that cloud mirror carries no ports tree).
 # `check` then asserts what the build relies on: no Ubuntu source in the image names a single host, and
 # every mirror list it names offers at least two. A base image whose sources move to a shape this
 # script does not know is REFUSED, naming the line, never left on one host.
 #
-# What a mirror list cannot do: a mirror that BLACKHOLES (connects never answer) still costs its connect
-# timeout on each file before the next one is asked — which is why the first entry is the mirror inside
-# the runners' own network, and why a mirror that refuses or 404s is passed over at once.
+# The fallback is measured, not assumed (`prove-fallback`, run in the image build): with the first
+# mirror REFUSING, `apt-get update` is served by the next in ~10-20 s; with it BLACKHOLED (connects
+# never answer) in ~50 s. Both only with the retry-delay drop-in below — without it apt 2.8 hangs.
 #
 # Usage:  apt-mirrors.sh apply [ROOT]    rewrite ROOT/etc/apt (default /), then `check`
 #         apt-mirrors.sh check [ROOT]    exit 1 naming every Ubuntu source that has one host
+#         apt-mirrors.sh prove-fallback  (root, network) the first mirror refused, apt still updates
 #         apt-mirrors.sh --self-test
 set -euo pipefail
+
+# apt 2.8's DELAYED retry (Acquire::Retries::Delay, on by default) never re-queues a file the mirror
+# method moved to its next mirror: measured on the base image, with the first mirror refusing, every
+# `apt-get update` hung for good on the second mirror after its InRelease files, while the same lists
+# with the delay off fell over in ~10 s. The retries themselves stay (Acquire::Retries is untouched);
+# only the wait between them goes. `prove-fallback` is the regression test for exactly this.
+CONF_FILE=etc/apt/apt.conf.d/80-mirror-fallback
+CONF_LINE='Acquire::Retries::Delay "false";'
 
 # One list per base-image source. Each entry: URI <TAB> priority:N (lowest first).
 mirror_list() {
@@ -105,6 +115,8 @@ apply() {
     cat "$out" > "$f"
     rm -f "$out"
   done < <(source_files "$root")
+  mkdir -p "$root/etc/apt/apt.conf.d"
+  printf '%s\n' "$CONF_LINE" > "$root/$CONF_FILE"
   echo "apt-mirrors: $rewrote Ubuntu source(s) rewritten to mirror lists under ${root:-}/etc/apt/mirrors"
   check "$root"
 }
@@ -128,10 +140,44 @@ check() {
         *) sed -n 's/^[[:space:]]*deb\(-src\)\{0,1\}[[:space:]]\{1,\}\(\[[^]]*\][[:space:]]\{1,\}\)\{0,1\}\([^[:space:]]*\).*/\3/p' "$f" ;;
       esac)
   done < <(source_files "$root")
+  if ! grep -qxF "$CONF_LINE" "$root/$CONF_FILE" 2>/dev/null; then
+    echo "apt-mirrors: $root/$CONF_FILE does not say '$CONF_LINE' — the mirror method's fallback hangs on apt's delayed retry" >&2; bad=1
+  fi
   n="$(source_files "$root" | wc -l | tr -d ' ')"
   if [ "$n" -eq 0 ]; then echo "apt-mirrors: no apt source file under ${root:-}/etc/apt — nothing was checked" >&2; return 1; fi
   [ "$bad" -eq 0 ] || return 1
   echo "apt-mirrors: every Ubuntu source in $n source file(s) is a mirror list of at least two mirrors"
+}
+
+# The fallback, against the REAL mirrors, on the image being built (root, network): a copy of this
+# image's Ubuntu sources whose FIRST mirror refuses every connection must still update, served by the
+# next one, within a deadline. Without the drop-in above this hangs (the deadline turns it red).
+prove_fallback() {
+  local t list name n=0 rc
+  t="$(mktemp -d)"
+  trap 'rm -rf "$t"' RETURN
+  mkdir -p "$t/parts" "$t/mirrors" "$t/lists/partial"
+  chown _apt "$t/lists/partial" 2>/dev/null || true
+  for list in /etc/apt/mirrors/*.list; do
+    name="$(basename "$list")"
+    # The priority-1 entry becomes a port nothing listens on; the others stay as they are.
+    sed 's#^[^[:space:]]*\(\tpriority:1\)$#http://127.0.0.1:9/refused/\1#' "$list" > "$t/mirrors/$name"
+    grep -q '^http://127.0.0.1:9/refused/' "$t/mirrors/$name" || { echo "apt-mirrors: $list has no priority:1 entry to refuse" >&2; return 1; }
+    n=$((n + 1))
+  done
+  [ "$n" -gt 0 ] || { echo "apt-mirrors: no mirror list under /etc/apt/mirrors — run apply first" >&2; return 1; }
+  sed "s#mirror+file:/etc/apt/mirrors/#mirror+file:$t/mirrors/#" /etc/apt/sources.list.d/ubuntu.sources > "$t/parts/ubuntu.sources"
+  set +e
+  timeout 300 apt-get update -o Dir::Etc::sourcelist=/dev/null -o Dir::Etc::sourceparts="$t/parts" \
+    -o Dir::State::Lists="$t/lists" -o APT::Sandbox::User=root > "$t/log" 2>&1
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ] || ! grep -q '^Get:.*InRelease' "$t/log" || grep -q '^Get:[0-9]* http://127.0.0.1:9/' "$t/log"; then
+    echo "apt-mirrors: with the first mirror refusing, apt-get update did not fall over to the next one (exit $rc; 124 = still waiting after 300 s):" >&2
+    tail -n 15 "$t/log" >&2
+    return 1
+  fi
+  echo "apt-mirrors: fallback proven — the first mirror refused, $(grep -c '^Get:' "$t/log") file(s) were served by: $(grep '^Get:' "$t/log" | awk '{print $2}' | grep -v '^file:' | sort -u | tr '\n' ' ')"
 }
 
 # The base image's own files, verbatim in the lines that matter (amd64 and arm64).
@@ -181,6 +227,9 @@ self_test() {
   expect 0 "amd64: the archive list asks the cloud-regional mirror first" grep -q "^http://azure.archive.ubuntu.com/ubuntu/	priority:1$" "$t/amd64/etc/apt/mirrors/ubuntu-archive.list"
   expect 0 "amd64: the security list keeps Canonical's security host" grep -q "^http://security.ubuntu.com/ubuntu/	priority:2$" "$t/amd64/etc/apt/mirrors/ubuntu-security.list"
   expect 0 "arm64: the ports list keeps ports.ubuntu.com first" grep -q "^http://ports.ubuntu.com/ubuntu-ports/	priority:1$" "$t/arm64/etc/apt/mirrors/ubuntu-ports.list"
+  expect 0 "amd64: apply writes the retry-delay drop-in" grep -qxF "$CONF_LINE" "$t/amd64/$CONF_FILE"
+  fixture "$t/nodelay" amd64; apply "$t/nodelay" > /dev/null; rm -f "$t/nodelay/$CONF_FILE"
+  expect 1 "mirror lists without the retry-delay drop-in are refused (the fallback would hang)" check "$t/nodelay"
   # A list cut back to one mirror is a single host again.
   fixture "$t/one" amd64; apply "$t/one" > /dev/null
   printf 'http://archive.ubuntu.com/ubuntu/\tpriority:1\n' > "$t/one/etc/apt/mirrors/ubuntu-archive.list"
@@ -208,6 +257,7 @@ self_test() {
 case "${1:-}" in
   apply) apply "${2:-}" ;;
   check) check "${2:-}" ;;
+  prove-fallback) prove_fallback ;;
   --self-test) self_test ;;
-  *) echo "usage: $0 apply [ROOT] | check [ROOT] | --self-test" >&2; exit 2 ;;
+  *) echo "usage: $0 apply [ROOT] | check [ROOT] | prove-fallback | --self-test" >&2; exit 2 ;;
 esac

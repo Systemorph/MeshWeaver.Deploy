@@ -102,10 +102,12 @@ ARG PG_MAJOR=17
 # cloud's regional mirror first; every list falls back to Canonical's host and an independent mirror,
 # and every index is still verified against the image's Ubuntu keyring. The self-test's negative
 # control is the base image's own sources, refused; `apply` ends in `check`, so an image left on one
-# host fails its BUILD.
+# host fails its BUILD; `prove-fallback` then updates a copy whose first mirror refuses every
+# connection, so a fallback that does not work (apt 2.8's delayed retry hangs it) fails the BUILD too.
 COPY --from=sources /out/scripts/apt-mirrors.sh /opt/build-host/apt-mirrors.sh
 RUN bash /opt/build-host/apt-mirrors.sh --self-test \
- && bash /opt/build-host/apt-mirrors.sh apply
+ && bash /opt/build-host/apt-mirrors.sh apply \
+ && bash /opt/build-host/apt-mirrors.sh prove-fallback
 # jq: core's MeshWeaver.Documentation.Test runs the publication workflow's own `run:` steps
 # (PluginPublicationProvenanceTest), and those steps call jq exactly as they do on Actions' ubuntu
 # runner, which ships it. Without it a host's shard 7 was RED on 11 tests (`step.sh: jq: command not
