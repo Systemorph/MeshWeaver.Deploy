@@ -24,8 +24,27 @@ repo="$(cd "$here/../../.." && pwd)"
 mkdir -p "$(dirname "$out")"
 # `gzip -n` omits the timestamp so the same tree yields the same bytes — the sha256 the formula
 # pins is then a statement about CONTENT, and a re-run of the publish step is a no-op.
+# 🚨 The archived directories are READ FROM THE FORMULA's install lines, never listed here: a fixed
+# list (deploy/homebrew deploy/helm) silently dropped deploy/backlease when the formula started
+# installing it, so every tap install lacked first-attach.sh and `fleet join` skipped the build
+# host on the second Mac Studio (2026-11-10) — a warn line on a join that otherwise succeeded.
+# The list is read from the formula AT $ref — the tree being archived — so the extraction and the
+# archive agree by construction (a working-tree formula differing from $ref cannot drop a directory).
+formula_text="$(git -C "$repo" show "$ref:deploy/homebrew/Formula/memex-local.rb")"
+# Every install line that names a deploy/ path must name it as a quoted "deploy/<dir>…" (a Dir[] glob
+# or a plain path):
+# a line with another shape is RED here, never silently left out of the tarball (the blind spot the
+# assert loop below cannot see on its own).
+odd="$(grep -E '\.install' <<<"$formula_text" | grep -E 'deploy/' | grep -vE '"deploy/[A-Za-z0-9_.-]+' || true)"
+[ -z "$odd" ] || { echo "the formula installs from deploy/ in a shape make-tarball.sh does not read (expected a quoted \"deploy/<dir>…\"):" >&2; printf '%s\n' "$odd" >&2; exit 1; }
+# Seeded with the two the CLI cannot work without, so the array is never empty (bash 3.2 + set -u).
+dirs=(deploy/homebrew deploy/helm)
+while IFS= read -r d; do
+  [ -n "$d" ] || continue
+  printf '%s\n' "${dirs[@]}" | grep -qxF "$d" || dirs+=("$d")
+done < <(grep -E '\.install' <<<"$formula_text" | grep -oE '"deploy/[A-Za-z0-9_.-]+' | sed 's/^"//' | sort -u)
 git -C "$repo" archive --format=tar --prefix="memex-local-${version}/" "$ref" \
-  deploy/homebrew deploy/helm | gzip -n > "$out"
+  "${dirs[@]}" | gzip -n > "$out"
 
 # A tarball that does not carry the CLI is a green step that installs nothing — assert the one
 # file everything else depends on is inside, never "tar exited 0".
@@ -37,4 +56,10 @@ if ! grep -qxF "memex-local-${version}/deploy/homebrew/bin/memex-local" <<<"$ent
   echo "tarball $out does not contain deploy/homebrew/bin/memex-local" >&2
   exit 1
 fi
+# …and every directory the formula installs from is IN it (an empty Dir[] installs nothing, quietly).
+for d in "${dirs[@]}"; do
+  grep -qE "^memex-local-${version}/${d}/." <<<"$entries" || { echo "tarball $out carries nothing under $d, which the formula installs" >&2; exit 1; }
+done
+grep -qxF "memex-local-${version}/deploy/backlease/first-attach.sh" <<<"$entries" \
+  || { echo "tarball $out does not contain deploy/backlease/first-attach.sh (fleet join's build-host attach)" >&2; exit 1; }
 printf '%s\n' "$out"
