@@ -278,14 +278,38 @@ def self_test() -> int:
             check("retry: a refusal is not retried", False, "accepted")
         except SystemExit:
             check("retry: a refusal (401) is not retried, and no manifest is sent", calls and all("/blobs/" in c for c in calls) and len(calls) == 1, calls)
-        never = lambda method, url, body, headers: (0, b"timeout")
+        attempts: list = []
+        waits: list = []
+        never = lambda method, url, body, headers: (attempts.append(url), (0, b"timeout"))[1]
         try:
-            publish("https://ops.example/api/builds", "3.1.11", t2, "s3cret", never, lambda m: None, lambda s: None)
+            publish("https://ops.example/api/builds", "3.1.11", t2, "s3cret", never, lambda m: None, waits.append)
             check("retry: an instance that never answers ends red", False, "accepted")
         except SystemExit as e:
-            check("retry: an instance that never answers ends red after the last attempt, naming the blob", "demo.r/1.0.0" in str(e), e)
+            check("retry: an instance that never answers ends red after EVERY attempt (1 + one per backoff step), naming the blob",
+                  "demo.r/1.0.0" in str(e) and len(attempts) == 1 + len(RETRY_DELAYS) and waits == list(RETRY_DELAYS)
+                  and not any("/manifest" in a for a in attempts), (len(attempts), waits, e))
     check("http: a connection that cannot be made is a transport failure (0), never an exception",
           http("PUT", "http://127.0.0.1:9/never", b"x", {})[0] == 0)
+    # the MOTIVATING failure, through http.client itself: a server that announces chunked encoding and closes mid-chunk
+    # (run 43081471912: ValueError: invalid literal for int() with base 16: b'') — and the same while an ERROR body is read
+    import socket
+    import threading
+    for status_line, name in ((b"HTTP/1.1 200 OK", "a success"), (b"HTTP/1.1 503 Service Unavailable", "an error answer")):
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def serve(listener: socket.socket = srv, line: bytes = status_line) -> None:
+            conn, _ = listener.accept()
+            conn.recv(65536)
+            conn.sendall(line + b"\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n5\r\nhello\r\n")
+            conn.close()
+            listener.close()
+        threading.Thread(target=serve, daemon=True).start()
+        got = http("PUT", f"http://127.0.0.1:{port}/seeds/blobs/x", b"x", {})
+        check(f"http: {name} whose chunked body is cut off mid-chunk is a transport failure (0), never an exception",
+              got[0] == 0, got)
 
     if fails:
         for f in fails:
