@@ -212,8 +212,10 @@ def source_head(get: Fetcher, repo: str = SOURCE_REPO, ref: str = SOURCE_REF, ca
         return None, (f"{repo}@{sha[:12]} is not green yet — "
                       + (f"{len(gate_red)} gate check(s) red ({', '.join(map(str, gate_red[:3]))})" if gate_red else
                          f"the gate has not passed ({', '.join(missing)})"))
-    return {"sha": sha, "helm": ids["helm"], "backlease": ids["backlease"]}, (
-        "ok" if not other_red else f"ok — {len(set(other_red))} check(s) outside the chart gate red ({', '.join(sorted(set(map(str, other_red)))[:3])}), not a hold")
+    src = {"sha": sha, "helm": ids["helm"], "backlease": ids["backlease"]}
+    if other_red:
+        src["outsideRed"] = sorted(set(map(str, other_red)))   # named on the pass line, never a hold
+    return src, "ok"
 
 
 def source_key(src: Optional[dict]) -> Optional[str]:
@@ -325,10 +327,11 @@ def follow_once(api: str, follow: str, release: str, ns: str, ctx: str, chart: s
     if agent is not None and download is not None:
         src, swhy = source_head(get, source_repo, source_ref, cache=os.path.join(agent, "head.json"))
         staged = read_json(os.path.join(agent, "source.json"))
+        if src is not None and src.get("outsideRed"):
+            out = src["outsideRed"]
+            notes.append(f"{len(out)} check(s) outside the chart gate red ({', '.join(out[:3])}) — not a hold")
         if src is None:
             notes.append(f"chart/values held — {swhy}")
-        elif swhy != "ok":
-            notes.append(swhy[len("ok — "):] if swhy.startswith("ok — ") else swhy)
         elif source_key(src) != staged.get("key"):
             if dry_run:
                 notes.append(f"would stage the chart and Mac values of {source_repo}@{src['sha'][:12]}")
@@ -583,8 +586,8 @@ def self_test() -> int:
         check(f"source: {name} holds the chart (nothing staged)", src is None and "not green" in why, why)
     src, why = source_head(github(green + [{"name": "Package seed: publish", "status": "completed", "conclusion": "failure"},
                                            {"name": "x", "status": "completed", "conclusion": "cancelled"}]))
-    check("source: a red check OUTSIDE the gate (a publish job) does not hold the chart, and is named",
-          src is not None and "Package seed: publish" in why and "not a hold" in why, (src, why))
+    check("source: a red check OUTSIDE the gate (a publish job) does not hold the chart, and is named as data",
+          src is not None and src.get("outsideRed") == ["Package seed: publish", "x"] and why == "ok", (src, why))
     src, why = source_head(github(green, status=403))
     check("source: GitHub refusing (a rate limit) holds it, said", src is None and "403" in why, why)
     with tempfile.TemporaryDirectory() as hc:
@@ -672,6 +675,12 @@ def self_test() -> int:
                                chart_a, "mac", github([{"name": REQUIRED_CHECKS[0], "status": "completed", "conclusion": "failure"},
                                                         {"name": REQUIRED_CHECKS[1], "status": "completed", "conclusion": "success"}], helm="9" * 40, sha="7" * 40),
                                hv4, agent=ag, download=dl(tarball(full)))
+        hv5 = HelmV(cur)
+        line5, _ = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                               chart_a, "mac", github(green + [{"name": "Package seed: publish", "status": "completed", "conclusion": "failure"}],
+                                                      helm="8" * 40, sha="5" * 40), hv5, agent=ag, download=dl(tarball(full)))
+        check("values: a red check OUTSIDE the gate does not hold — the changed chart is staged AND applied, the red named on the line",
+              len(hv5.upgrades()) == 1 and "applied" in line5 and "Package seed: publish" in line5 and "not a hold" in line5, line5)
         check("values: a main whose chart GATE is red is never followed (the host stays as it is, said)", hv4.upgrades() == [] and "held" in line4, line4)
     # first-attach's estate --set-string keys are exactly what a full upgrade keeps
     attach = os.path.join(os.path.dirname(os.path.abspath(__file__)), "first-attach.sh")
