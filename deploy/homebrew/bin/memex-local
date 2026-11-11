@@ -7843,6 +7843,16 @@ autoupdate_default() {
   cmd_autoupdate on --quiet
 }
 
+# memex-local settle — the in-place repairs of THIS release that need no chart re-apply and no restart (idempotent; the
+# autoupdate agent runs it after every upgrade, `update` runs the same steps). Today: the local ingress's HSTS.
+cmd_settle() {
+  [ $# -eq 0 ] || die "settle: takes no arguments"
+  colima_running || { info "settle: Colima is not running — the next up/update applies it"; return 0; }
+  require_tool kubectl kubernetes-cli
+  ensure_ingress_no_hsts
+  ok "settle: done"
+}
+
 cmd_autoupdate() {
   local action="${1:-status}"; [ $# -gt 0 ] && shift
   case "$action" in
@@ -7926,6 +7936,17 @@ PLIST
         install -m 0755 "$keg/memex-local" "$AUTOROLL_TICK_SCRIPT" \
           && printf '%s autoupdate: auto-roll tick refreshed to %s\n' "$(date -u +%FT%TZ)" "$after"
       fi
+      # In-place repairs a NEW CLI carries that no chart change announces (2026-11-11: the local ingress's HSTS lived in
+      # the script, so "assets unchanged" skipped it and every existing Mac kept pinning localhost to https). Cheap and
+      # idempotent; run by the NEW binary, whatever the assets did.
+      if colima_running; then
+        # its output prefixed AFTER it ran, so the exit status is settle's own; a failed settle is said and never ends
+        # the tick (the chart re-apply below still runs)
+        local sout src=0
+        sout="$(MEMEX_IN_AUTOUPDATE=1 "$(brew --prefix)/bin/memex-local" settle 2>&1)" || src=$?
+        [ -z "$sout" ] || printf '%s\n' "$sout" | sed "s/^/$(date -u +%FT%TZ) autoupdate: settle: /"
+        [ "$src" = 0 ] || printf '%s autoupdate: settle FAILED (exit %s) on %s — its output is above; the next upgrade or update retries\n' "$(date -u +%FT%TZ)" "$src" "$after"
+      fi
       if [ "$abefore" = "$aafter" ]; then
         printf '%s autoupdate: chart and share assets unchanged — nothing to re-apply\n' "$(date -u +%FT%TZ)"
       elif ! colima_running; then
@@ -7973,6 +7994,7 @@ main() {
     port-forward)  cmd_port_forward "$@" ;;
     observability) cmd_observability "$@" ;;
     doctor)        cmd_doctor "$@" ;;
+    settle)        cmd_settle "$@" ;;
     owner)         cmd_owner "$@" ;;
     ca)            cmd_ca "$@" ;;
     profile)       cmd_profile "$@" ;;
