@@ -95,10 +95,20 @@ readonly FALLBACK_CHAT_MODEL="qwen3:8b"
 readonly DEFAULT_MODEL_HEADROOM_GIB=32
 # The Ollama release that first runs qwen3.8's MLX build (`ollama show qwen3.8:27b-mlx` → requires 0.32.12).
 readonly DEFAULT_MODEL_MIN_OLLAMA="0.32.12"
+# A Mac that takes BUILD JOBS also holds a build VM beside the model (at least one runner, 12 GiB): its line moves up by
+# that much, so a 48 GB Mac mini with jobs gets qwen3:8b and a build VM instead of a model that leaves the build VM 6 GiB
+# (2026-11-11). The answer is read from MEMEX_HOST_TAKES_JOBS, the Intune profile's AcceptJobs, or the recorded layer.
+host_takes_jobs() {
+  case "${MEMEX_HOST_TAKES_JOBS:-}" in 1|true|yes) return 0 ;; 0|false|no) return 1 ;; esac
+  local v; v="$(defaults read "/Library/Managed Preferences/com.memex.local" AcceptJobs 2>/dev/null | tr 'A-Z' 'a-z')" || v=""
+  case "$v" in 1|true|yes) return 0 ;; 0|false|no) return 1 ;; esac
+  grep -q '__Accept__Jobs__Enabled: "true"' "${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/backlease.yaml" 2>/dev/null
+}
 host_default_model() {
-  local gib="${MEMEX_HOST_MEM_GIB:-}" arch="${MEMEX_HOST_ARCH:-$(uname -m 2>/dev/null)}"
+  local gib="${MEMEX_HOST_MEM_GIB:-}" arch="${MEMEX_HOST_ARCH:-$(uname -m 2>/dev/null)}" jobs=0
   [ -n "$gib" ] || gib=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
-  if [ "$arch" = "arm64" ] && [ $(( gib - COLIMA_MEM )) -ge "$DEFAULT_MODEL_HEADROOM_GIB" ]; then
+  ! host_takes_jobs || jobs=12
+  if [ "$arch" = "arm64" ] && [ $(( gib - COLIMA_MEM - jobs )) -ge "$DEFAULT_MODEL_HEADROOM_GIB" ]; then
     printf '%s' "$DEFAULT_CHAT_MODEL"
   else
     printf '%s' "$FALLBACK_CHAT_MODEL"
@@ -169,7 +179,14 @@ readonly LOG_LEVEL="${MEMEX_LOG_LEVEL:-Debug}"
 # The version `memex-local version` reports. The Homebrew formula in the published tap carries the
 # same series plus a build number (0.3.<main commit count>, rendered by scripts/render-formula.sh),
 # so `brew upgrade` sees every merge to main as a newer release.
-readonly MEMEX_LOCAL_VERSION="0.3.0"
+# 🚨 The file itself says only the SERIES: an installed keg (…/Cellar/memex-local/<version>/libexec/memex-local) knows
+# its full build number from its path, so `version` and `fleet doctor` name the release actually installed (the second
+# Mac Studio reported "0.3.0" while it ran 0.3.550). A source checkout reports the series.
+_mlv="0.3.0"
+case "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)" in
+  */Cellar/memex-local/*/libexec|*/Cellar/memex-local/*/bin) _mlv="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"; _mlv="${_mlv#*/Cellar/memex-local/}"; _mlv="${_mlv%%/*}" ;;
+esac
+readonly MEMEX_LOCAL_VERSION="$_mlv"
 
 readonly LOCAL_HOME="${MEMEX_LOCAL_HOME:-$HOME/.memex-local}"
 # What the last `--channel` resolved to: `<label> <version> <utc>` — the immutable answer to "what
@@ -938,9 +955,62 @@ accept_validate() {
   if [ "$ACC_TOK_ENABLED" = true ]; then
     accept_check_patterns "$ACC_TOK_FROM" "tokens: --accept-tokens"
     [ -n "$ACC_TOK_MODELS" ] || die "tokens: name the models this Mac serves (--token-models qwen3.8:27b-mlx)"
+    token_models_fit
     # the machine's slots: a calibrated or saved value stands; otherwise the hardware's measured default
     [ -n "$ACC_TOK_SLOTS" ] || ACC_TOK_SLOTS="$(token_slots_default)"
   fi
+}
+
+# THE TOKEN MODELS MUST FIT THIS MAC (2026-11-11: the fleet profile declares qwen3.8:27b-mlx and qwen3.6 for every Mac,
+# and a Mac mini may not hold them). A model is kept when its weights fit in what is left of unified memory after the
+# portal VM, macOS headroom and — on a jobs YES — the smallest build VM (one runner); a model that does not fit is
+# DROPPED with a warning naming its size and the budget, never advertised for jobs it cannot answer. When none fits,
+# this Mac's own chat model (sized to the host by host_default_model) is served instead, said. A model whose size
+# is unknown (not pulled, not in the table) is kept and said as unchecked. MEMEX_TOKEN_MODELS_UNCHECKED=1 skips it.
+model_size_gib() {
+  local m="$1" v=""
+  if command -v ollama >/dev/null 2>&1; then
+    v="$(ollama list 2>/dev/null | awk -v m="$m" 'NR > 1 && ($1 == m || $1 == m ":latest") { for (i = 2; i < NF; i++) if ($(i+1) ~ /^(GB|MB)$/) { x = ($(i+1) == "GB") ? $i : $i / 1024; printf "%d", (x == int(x)) ? x : int(x) + 1; exit } }')"
+  fi
+  [ -n "$v" ] && { printf '%s' "$v"; return; }
+  case "$m" in   # the published weights (ollama.com), rounded up — only for a model not pulled yet
+    qwen3.8:27b-mlx) printf 18 ;; qwen3.8|qwen3.8:latest) printf 17 ;; qwen3.6|qwen3.6:latest|qwen3.6-code*) printf 22 ;;
+    qwen3.6:35b*) printf 38 ;; qwen3:8b) printf 6 ;; qwen3:14b) printf 10 ;; qwen3:32b) printf 21 ;; qwen-small*|qwen2.5:0.5b) printf 1 ;;
+  esac
+}
+# GiB of unified memory a served model may use here (pure over its inputs): host − portal VM − headroom − (jobs ? one runner's VM : 0).
+token_model_budget_gib() {
+  local b=$(( $1 - $2 - BUILD_HEADROOM_GIB_TOKENS )); [ "$3" = true ] && b=$(( b - BUILD_MIN_VM_GIB ))
+  [ "$b" -gt 0 ] || b=0; printf '%s' "$b"
+}
+readonly BUILD_HEADROOM_GIB_TOKENS=8   # = BUILD_HEADROOM_GIB (macOS, menu bar apps, file cache)
+readonly BUILD_MIN_VM_GIB=12           # one runner (8) + the VM's system share (4): the least a jobs YES needs
+token_models_fit() {
+  [ "${MEMEX_TOKEN_MODELS_UNCHECKED:-0}" = 1 ] && return 0
+  local mem budget m sz kept="" dropped=""
+  mem="$(host_mem_gib_early)"; case "$mem" in ''|*[!0-9]*|0) warn "tokens: this Mac's memory is unreadable — the token models are NOT checked against it"; return 0 ;; esac
+  budget="$(token_model_budget_gib "$mem" "$COLIMA_MEM" "${ACC_JOBS_ENABLED:-false}")"
+  set -f
+  for m in $ACC_TOK_MODELS; do
+    sz="$(model_size_gib "$m")"
+    if [ -z "$sz" ]; then kept="$kept $m"; warn "tokens: the size of '$m' is unknown (not pulled here) — kept unchecked against this Mac's ${budget} GiB budget"
+    elif [ "$sz" -le "$budget" ]; then kept="$kept $m"
+    else dropped="$dropped $m(${sz} GiB)"; fi
+  done
+  set +f
+  if [ -n "$dropped" ]; then
+    warn "tokens: this Mac (${mem} GiB; portal VM ${COLIMA_MEM}, headroom ${BUILD_HEADROOM_GIB_TOKENS}$( [ "${ACC_JOBS_ENABLED:-false}" = true ] && printf ', build VM at least %s' "$BUILD_MIN_VM_GIB") → ${budget} GiB for a model) cannot hold:${dropped} — not offered"
+  fi
+  if [ -z "$kept" ]; then
+    kept=" $OLLAMA_MODEL"
+    warn "tokens: none of the declared models fits — this Mac serves its own chat model '$OLLAMA_MODEL' instead (MEMEX_OLLAMA_MODEL picks another)"
+  fi
+  ACC_TOK_MODELS="${kept# }"
+}
+host_mem_gib_early() {
+  [ -n "${MEMEX_HOST_MEM_GIB:-}" ] && { printf '%s' "$MEMEX_HOST_MEM_GIB"; return; }
+  local b; b="$(sysctl -n hw.memsize 2>/dev/null || awk '/^MemTotal:/ { print $2 * 1024 }' /proc/meminfo 2>/dev/null)"
+  printf '%s' "$(( ${b:-0} / 1073741824 ))"
 }
 
 # The YAML lines of the layer's opt-in block (under config.memex_portal). Enabled is always written, so OFF is declared.
@@ -2320,6 +2390,132 @@ fleet_wait_heartbeat() {
   done
 }
 
+# FLEET DOCTOR — the readings that say a join is DONE (2026-11-11, "perfect the onboarding"): each line is a reading, green
+# or red, and a red names its remedy. Read-only; never prints a key. Exit 1 when any reading is red. The join ends with it.
+DOC_RED=0
+doc_ok()  { printf '%s  ✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+doc_red() { printf '%s  ✗%s %s\n' "$C_RED" "$C_RESET" "$1"; [ -z "${2:-}" ] || printf '      remedy: %s\n' "$2"; DOC_RED=$((DOC_RED + 1)); }
+doc_info(){ printf '  · %s\n' "$*"; }
+
+# Ask control how it sees this Mac: POST <control>/api/fleet/self-status, HMAC-signed with this Mac's OWN heartbeat key
+# (read from fleet.yaml by python, never on an argv or in the output). Prints the JSON, or "HTTP <code>" / "ERR <why>".
+fleet_self_status() {
+  local control="$1" id="$2"
+  MEMEX_FLEET_FILE="$FLEET_FILE" python3 - "$control" "$id" <<'PY' 2>/dev/null || printf 'ERR python3'
+import hashlib, hmac, json, os, re, sys, time, urllib.request, urllib.error
+control, dep = sys.argv[1].rstrip("/"), sys.argv[2]
+key = None
+for line in open(os.environ["MEMEX_FLEET_FILE"]):
+    m = re.match(r'\s*Hosting__ModuleReportSecret:\s*"?([^"\s]+)"?', line)
+    if m: key = m.group(1); break
+if not key: print("ERR no heartbeat key in fleet.yaml"); sys.exit(0)
+body = json.dumps({"deployment": dep, "ts": int(time.time())}, separators=(",", ":")).encode()
+sig = "sha256=" + hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
+req = urllib.request.Request(control + "/api/fleet/self-status", data=body, method="POST",
+      headers={"Content-Type": "application/json", "X-Hub-Signature-256": sig, "User-Agent": "memex-local-doctor"})
+try:
+    with urllib.request.urlopen(req, timeout=20) as r: print(r.read().decode())
+except urllib.error.HTTPError as e: print("HTTP %d" % e.code)
+except Exception as e: print("ERR %s" % (str(e)[:160]))
+PY
+}
+json_field() { python3 -c 'import json,sys
+try: d = json.loads(sys.stdin.read())
+except Exception: sys.exit(0)
+for k in sys.argv[1].split("."):
+    d = d.get(k) if isinstance(d, dict) else None
+print("" if d is None else (str(d).lower() if isinstance(d, bool) else d))' "$1" 2>/dev/null; }
+
+fleet_doctor() {
+  DOC_RED=0
+  local id control
+  id="$(fleet_value Hosting__Deployment)"; control="$(backlease_control)"
+  step "Fleet doctor — the readings that say this Mac's join is done"
+  if [ ! -f "$FLEET_FILE" ] || [ -z "$id" ]; then
+    doc_red "not joined (no $FLEET_FILE)" "memex-local fleet join --control https://<control-instance> --id <machine>"
+    return 1
+  fi
+  doc_ok "joined as '$id' (fleet.yaml, heartbeat key $(fleet_value_fingerprint "$(awk '$1 == "Hosting__ModuleReportSecret:" { gsub(/"/, "", $2); print $2; exit }' "$FLEET_FILE")"))"
+  [ -n "$control" ] || control="$(fleet_value Hosting__ControlInbox__Url | sed -E 's|^(https?://[^/]+).*|\1|')"
+
+  # 1. control's view: heartbeat age, the Deployments record, the enrolment, the host status
+  local st age rec enr open hs
+  st="$(fleet_self_status "$control" "$id")"
+  case "$st" in
+    "HTTP 404"*) doc_red "control ($control) does not answer /api/fleet/self-status yet — its view of this Mac is unread" "confirm on control: Hosting/Heartbeats → Machines lists '$id' with a fresh beat (the endpoint ships with the Hosting package)" ;;
+    "HTTP 401"*) doc_red "control REFUSED this Mac's signed status request (401): it does not verify this heartbeat key for '$id'" "the join's key was superseded or never landed — read the enrolment on control (Hosting/Heartbeats/Enrolments); re-join if it says superseded" ;;
+    HTTP*|ERR*)  doc_red "control's view is unread: ${st}" "check the network to $control, then 'memex-local fleet doctor' again" ;;
+    *)
+      age="$(printf '%s' "$st" | json_field heartbeat.ageSeconds)"
+      if [ -z "$age" ]; then doc_red "control has NO heartbeat from '$id'" "memex-local fleet heartbeat (waits for it, restarts the portal once if Hosting's module is pending)"
+      elif [ "$age" -le 180 ]; then doc_ok "control's last heartbeat from '$id': ${age} s ago"
+      else doc_red "control's last heartbeat from '$id' is ${age} s old (beats every 30 s)" "memex-local logs --no-follow --tail 600 | grep BackLease — then 'memex-local fleet heartbeat'"; fi
+      rec="$(printf '%s' "$st" | json_field record.present)"
+      [ "$rec" = true ] && doc_ok "Deployments/$id on control (kind $(printf '%s' "$st" | json_field record.kind))" \
+        || doc_red "control has no Deployments/$id record — no Ops/Status, the enrolment reads overdue" "the Approve opens it as a pull request on the deployments repository; merge that PR (control's enrolment Progress names it)"
+      enr="$(printf '%s' "$st" | json_field enrolment.state)"; open="$(printf '%s' "$st" | json_field enrolment.open)"
+      if [ -z "$open" ] && [ -n "$enr" ]; then doc_ok "enrolment: ${enr} ($(printf '%s' "$st" | json_field enrolment.path))"
+      else doc_red "enrolment: ${enr:-unknown}${open:+ — open: $open}" "read control's $(printf '%s' "$st" | json_field enrolment.path) Progress"; fi
+      hs="$(printf '%s' "$st" | json_field hostStatus.present)"
+      [ "$hs" = true ] && doc_ok "host status on the board (Ops/Status/$id, $(printf '%s' "$st" | json_field hostStatus.at))" \
+        || doc_red "no host status on control's board yet" "it is written by the first verified heartbeat once Deployments/$id exists"
+      ;;
+  esac
+
+  # 2. the build host — only on a jobs YES
+  if [ "$(participation_answer Jobs)" = true ]; then
+    local size ready total df free need
+    size="$(build_vm_size)"
+    case "$size" in *Running*) doc_ok "build VM '$BUILD_PROFILE' running ($(printf '%s' "$size" | awk '{ print $1 " CPU / " $2 " GiB" }'), disk $(build_vm_disk_gib) GiB)" ;;
+      '') doc_red "no build VM although the owner said YES to jobs" "memex-local buildhost apply" ;;
+      *) doc_red "build VM '$BUILD_PROFILE' is not running ($size)" "colima start -p $BUILD_PROFILE" ;; esac
+    if printf '%s' "$size" | grep -q Running; then
+      ready="$(build_kubectl -n "$BUILD_NS" get pods -l app.kubernetes.io/component=build-host --no-headers 2>/dev/null | awk '$3 == "Running" { split($2, a, "/"); if (a[1] == a[2]) r++; t++ } END { printf "%d %d", r, t }')"
+      total="${ready#* }"; ready="${ready% *}"
+      if [ "${total:-0}" -eq 0 ]; then doc_red "no build-host runner pod is running" "memex-local buildhost status; the first attach installs the release (memex-local fleet join, or deploy/backlease/first-attach.sh)"
+      elif [ "$ready" -eq "$total" ]; then doc_ok "build host: ${ready}/${total} runner(s) Ready"
+      else doc_red "build host: only ${ready}/${total} runner(s) Ready" "kubectl --context $(build_ctx) -n $BUILD_NS describe pods | grep -A3 Readiness (an exec probe fails under user namespaces — the chart's HTTP probe fixes it; the follower applies it)"; fi
+      df="$(buildhost_vm_df)"; free="$(printf '%s' "$df" | awk '{ print $1 }')"; total="$(printf '%s' "$df" | awk '{ print $5 }')"
+      if [ -n "$free" ] && [ -n "$total" ]; then
+        need=$(( BUILD_RUN_DISK_GIB + total * BUILD_DISK_HEADROOM_PCT / 100 ))
+        [ "$free" -ge "$need" ] && doc_ok "build disk: ${df} — a run (${BUILD_RUN_DISK_GIB} GiB + ${BUILD_DISK_HEADROOM_PCT} % kept) fits" \
+          || doc_red "build disk: ${df} — a run needs ${need} GiB free, so this host claims NOTHING" "memex-local buildhost gc (unused images, finished pods); memex-local buildhost disk shows what holds it; memex-local buildhost apply --resize grows the disk"
+      else doc_red "build disk unreadable" "colima ssh -p $BUILD_PROFILE -- df -h /var/lib/rancher"; fi
+      local claim
+      claim="$(build_kubectl -n "$BUILD_NS" logs -l app.kubernetes.io/component=build-host --tail=400 --prefix 2>/dev/null | grep -E 'claimed|NOT claiming|idle|warm' | tail -1 | cut -c1-220)"
+      [ -n "$claim" ] && doc_info "runner: ${claim}" || doc_info "runner: no claim line in the last 400 log lines"
+      local seed
+      seed="$(colima ssh -p "$BUILD_PROFILE" -- sudo sh -c 'ls -d /var/lib/rancher/k3s/storage/*build-cache*/nuget-seed 2>/dev/null | head -1 | xargs -r -I{} find {} -type f | wc -l' 2>/dev/null </dev/null | tr -d ' ')"
+      case "${seed:-}" in ''|0) doc_info "package seed: not installed yet (the seed pass fills <cache>/nuget-seed in preparation)" ;; *) doc_ok "package seed: ${seed} file(s) in the cache" ;; esac
+    fi
+    local fol="$HOME/.memex-local/buildhost-follow/$BUILD_PROFILE/follow-set.py" last
+    if [ ! -f "$fol" ]; then doc_red "no release follower installed — this host never moves to a new platform set" "re-run the first attach: memex-local fleet join (or deploy/backlease/first-attach.sh)"
+    elif grep -q 'def source_head' "$fol"; then
+      last="$(tail -1 "$HOME/.memex-local/buildhost-follow/$BUILD_PROFILE/follow.log" 2>/dev/null | cut -c1-200)"
+      doc_ok "release follower: self-updating (follows the chart, the Mac values and itself from a green main)${last:+ — last pass: $last}"
+    else doc_red "release follower predates self-update: chart and values changes never reach this host" "python3 $(resolve_share)/backlease/follow-set.py --install --profile $BUILD_PROFILE --follow latest --api <buildApi> --chart $(resolve_chart)"; fi
+  else
+    doc_info "build host: not installed — the owner said $(participation_said Jobs) to jobs"
+  fi
+
+  # 3. the models: the chat model and every token model this Mac offers must be installed and answer
+  local models m chat
+  chat="$(effective_chat_model 2>/dev/null || printf '%s' "$OLLAMA_MODEL")"
+  models="$chat"
+  [ "$(participation_answer Tokens)" = true ] && { accept_load; models="$models $ACC_TOK_MODELS"; }
+  for m in $(printf '%s\n' $models | awk 'NF && !seen[$0]++'); do
+    if ollama list 2>/dev/null | awk -v m="$m" 'NR > 1 && ($1 == m || $1 == m ":latest") { f = 1 } END { exit !f }'; then
+      if curl -fsS -m 180 http://127.0.0.1:11434/api/generate -d "{\"model\":\"$m\",\"prompt\":\"ok\",\"stream\":false,\"options\":{\"num_predict\":1}}" >/dev/null 2>&1; then
+        doc_ok "model ${m}: installed and answering"
+      else doc_red "model ${m}: installed but does not answer on 127.0.0.1:11434" "brew services restart ollama; memex-local doctor (Local model)"; fi
+    else doc_red "model ${m}: declared but not installed" "ollama pull ${m}   (or withdraw it: memex-local backlease accept tokens --models …)"; fi
+  done
+
+  printf '\n'
+  if [ "$DOC_RED" -eq 0 ]; then ok "fleet doctor: every reading is green"; return 0; fi
+  warn "fleet doctor: ${DOC_RED} reading(s) red — each names its remedy above"; return 1
+}
+
 cmd_fleet() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
@@ -2457,7 +2653,11 @@ cmd_fleet() {
         if participation_build_host "$with_build"; then
           step "Build runners (a build VM sized from this host, KEDA; the release on its first attach)"
           ( cmd_buildhost apply ) || warn "the build host did not finish — re-run 'memex-local buildhost apply'"
-          [ -d "$items" ] && fleet_apply_buildhost "$items"
+          if [ -d "$items" ]; then
+            fleet_apply_buildhost "$items"
+            # the release exists only now: size its runners to the plan (the apply above found no release to size)
+            ( cmd_buildhost apply ) >/dev/null 2>&1 && ok "build runners sized to the plan" || warn "the runners keep the chart's sizes — 'memex-local buildhost apply'"
+          fi
         elif [ "$with_build" = "yes" ]; then
           info "No build host: the owner has not said YES to fleet jobs ($(participation_said Jobs)) — no build VM, runners or priority agent"
         fi
@@ -2467,9 +2667,15 @@ cmd_fleet() {
       case "$hb_min" in ''|*[!0-9]*) die "--heartbeat-wait: minutes, a whole number (got '$hb_min')" ;; esac
       if [ "$do_update" = "yes" ] && [ "$hb_min" -gt 0 ] && registry_mode && colima_running; then
         fleet_wait_heartbeat "$hb_min"
+        # the readings that say the join is done; a red one is named with its remedy, and never undoes the join
+        fleet_doctor || warn "the join finished with red readings — 'memex-local fleet doctor' re-reads them"
       else
         info "Progress: the control instance's Hosting/Heartbeats/Enrolments lists this join and its first heartbeat ('memex-local fleet heartbeat' waits for it here)"
       fi
+      ;;
+    doctor)
+      [ $# -eq 0 ] || die "fleet doctor: takes no arguments"
+      fleet_doctor
       ;;
     heartbeat)
       local hb_wait="${MEMEX_HEARTBEAT_WAIT_MIN:-20}"
@@ -2493,7 +2699,7 @@ cmd_fleet() {
         info "not joined — memex-local fleet join --control https://<control-instance> --id <id>"
       fi
       ;;
-    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--wait <min>] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] [--accept-jobs=<patterns> | --no-accept-jobs] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--residency <X>] [--heartbeat-wait <min>] | heartbeat [--wait <min>] | status}" ;;
+    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--wait <min>] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] [--accept-jobs=<patterns> | --no-accept-jobs] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--residency <X>] [--heartbeat-wait <min>] | heartbeat [--wait <min>] | doctor | status}" ;;
   esac
 }
 
@@ -3447,8 +3653,17 @@ colima_yaml_add_kubelet_root() {
   colima_k3s_args "$y" | grep -qE -- "^--kubelet-arg=\"?root-dir=" && {
     colima_k3s_args "$y" | grep -qE -- "^--kubelet-arg=\"?root-dir=${KUBELET_ROOT_DIR}/?\"?$" && return 0
     warn "$y already passes kubelet a DIFFERENT root-dir ($(colima_k3s_args "$y" | grep -- 'root-dir=' | head -1)) — left as it is; edit it by hand"; return 1; }
+  colima_yaml_add_k3s_arg "$y" "$KUBELET_ROOT_ARG"
+}
+
+# Add ONE k3s argument to an existing profile's k3sArgs, in place (a backup beside it). Idempotent: a file that
+# already carries exactly that argument is left byte-identical. Refuses a shape it does not recognise.
+colima_yaml_add_k3s_arg() {
+  local y="$1" arg="$2" tmp
+  grep -q '^kubernetes:' "$y" || { warn "$y has no 'kubernetes:' section — not a k3s profile"; return 1; }
+  colima_k3s_args "$y" | grep -qxF -- "$arg" && return 0
   tmp="$(mktemp)"
-  awk -v arg="$KUBELET_ROOT_ARG" '
+  awk -v arg="$arg" '
     function emit() { if (!done) { printf "%s- %s\n", itemind, arg; done = 1 } }
     /^[^ #]/ { if (inargs) emit(); kube = ($1 == "kubernetes:"); inargs = 0; print; next }
     kube && /^[ ]+k3sArgs:/ {
@@ -3467,7 +3682,7 @@ colima_yaml_add_kubelet_root() {
     { if (held != "") { printf "%s", held; held = "" } print }
     END { if (inargs) emit(); if (held != "") printf "%s", held; if (!seen) exit 3 }
   ' "$y" > "$tmp" || { rm -f "$tmp"; warn "$y has no kubernetes.k3sArgs key — not a shape this tool edits"; return 1; }
-  colima_k3s_args "$tmp" | grep -qxF -- "$KUBELET_ROOT_ARG" || { rm -f "$tmp"; warn "could not add the arg to $y (unrecognised k3sArgs shape) — left unchanged"; return 1; }
+  colima_k3s_args "$tmp" | grep -qxF -- "$arg" || { rm -f "$tmp"; warn "could not add $arg to $y (unrecognised k3sArgs shape) — left unchanged"; return 1; }
   cp -p "$y" "$y.bak-$(date +%Y%m%d%H%M%S)" && cat "$tmp" > "$y"; rm -f "$tmp"
 }
 
@@ -6410,6 +6625,26 @@ readonly BUILD_MIN_WARM="${MEMEX_BUILD_MIN_WARM:-1}"               # KEDA floor:
 readonly BUILD_HEADROOM_GIB=8                                      # macOS, the menu bar apps, file cache
 readonly BUILD_SYSTEM_GIB=4                                        # k3s, KEDA and the kubelet inside the VM
 readonly BUILD_RUNNER_MAX_GIB=24                                   # one runner's memory limit, at most
+# THE BUILD VM'S DISK (2026-11-11, the second Mac Studio claimed nothing: 34 of 98 GiB free, a run needs 20 and 15 %
+# must stay free). Every run writes to the ONE data disk of the build VM, beside the shared cache and the images, so the
+# disk is sized from what this Mac can actually back, and the runners from what the disk can hold — the claim guard of
+# build-run.py (MW_BUILD_RUN_DISK_GIB + MW_BUILD_DISK_HEADROOM_PERCENT) is then satisfiable by construction:
+#   usable  = disk × (100 − headroom %) − cache − images − VM system
+#   runners ≤ usable / run            (and ≤ the CPU plan)
+#   disk    = min(BUILD_DISK_MAX_GIB, host free − host reserve − what the other VMs may still grow into)
+readonly BUILD_DISK_MAX_GIB="${MEMEX_BUILD_DISK_MAX_GIB:-200}"         # a bigger disk only holds more stale state
+readonly BUILD_HOST_DISK_RESERVE_GIB="${MEMEX_BUILD_HOST_DISK_RESERVE_GIB:-40}"  # macOS updates, model pulls, the owner
+readonly BUILD_CACHE_GIB="${MEMEX_BUILD_CACHE_GIB:-20}"               # the cache claim (build-host-mac.values.yaml cache.size)
+readonly BUILD_IMAGES_GIB="${MEMEX_BUILD_IMAGES_GIB:-12}"             # runner + tester + portal images, two generations
+readonly BUILD_VM_SYSTEM_DISK_GIB=4                                   # k3s, KEDA, logs inside the VM
+readonly BUILD_RUN_DISK_GIB="${MEMEX_BUILD_RUN_DISK_GIB:-20}"         # what ONE run may write (chart buildHosts.runDiskGi)
+readonly BUILD_DISK_HEADROOM_PCT="${MEMEX_BUILD_DISK_HEADROOM_PCT:-15}"  # kept free (chart buildHosts.diskHeadroomPercent)
+# IMAGE AND POD GARBAGE COLLECTION in the build VM (measured on the same Mac: four generations each of the portal, runner
+# and tester images, ~15 GiB, and 18 Evicted pod records). kubelet's defaults collect images only above 85 % disk use —
+# above the claim guard's own line, so the guard refused claims long before kubelet freed anything. These collect early
+# and age out an image no container has used for two days; the controller keeps at most 5 finished pod records.
+readonly BUILD_K3S_GC_ARGS=(--kubelet-arg=image-gc-high-threshold=60 --kubelet-arg=image-gc-low-threshold=45
+  --kubelet-arg=image-maximum-gc-age=48h --kube-controller-manager-arg=terminated-pod-gc-threshold=5)
 build_ctx() { if [ "$BUILD_PROFILE" = default ]; then printf colima; else printf 'colima-%s' "$BUILD_PROFILE"; fi; }
 build_kubectl() { kubectl --context "$(build_ctx)" "$@"; }
 
@@ -6444,11 +6679,61 @@ buildhost_plan() {
   lim=$(( (vmem - BUILD_SYSTEM_GIB) / runners )); [ "$lim" -le "$BUILD_RUNNER_MAX_GIB" ] || lim="$BUILD_RUNNER_MAX_GIB"
   [ "$lim" -ge 8 ] || { echo "error=only ${vmem} GiB left for the build VM (host ${mem} − portal VM ${pmem} − model ${model} − headroom ${BUILD_HEADROOM_GIB}); a runner needs at least 8 GiB"; return 1; }
   req=$(( lim - 4 ))
+  local disk="${6:-}" disk_runs=""
+  if [ -n "$disk" ]; then
+    disk_runs="$(buildhost_disk_runs "$disk")"
+    [ "$disk_runs" -ge 1 ] || { echo "error=the build VM's disk of ${disk} GiB holds no run: ${disk} × $(( 100 - BUILD_DISK_HEADROOM_PCT )) % − cache ${BUILD_CACHE_GIB} − images ${BUILD_IMAGES_GIB} − system ${BUILD_VM_SYSTEM_DISK_GIB} leaves less than one run's ${BUILD_RUN_DISK_GIB} GiB (it needs at least $(buildhost_disk_min) GiB)"; return 1; }
+    [ "$disk_runs" -ge "$runners" ] || runners="$disk_runs"
+    lim=$(( (vmem - BUILD_SYSTEM_GIB) / runners )); [ "$lim" -le "$BUILD_RUNNER_MAX_GIB" ] || lim="$BUILD_RUNNER_MAX_GIB"; req=$(( lim - 4 ))
+  fi
   local minw="$BUILD_MIN_WARM"; [ "$minw" -le "$runners" ] || minw="$runners"
   # The CPU REQUEST sits half a core under the limit: k3s, KEDA and the kubelet request CPU too, and N runners
   # requesting the VM's every core would leave the last one Pending. The limit still lets each use its 4.
   printf 'vm_cpu=%s\nvm_mem=%s\nrunners_min=%s\nrunners_max=%s\nrunner_cpu=%s\nrunner_cpu_request=%sm\nrunner_mem_request=%s\nrunner_mem_limit=%s\nstage_slots=%s\nstage_total=%s\n' \
     "$cpu" "$vmem" "$minw" "$runners" "$per" "$(( per * 1000 - 500 ))" "$req" "$lim" "$per" "$(( runners * per ))"
+  [ -z "$disk" ] || printf 'vm_disk=%s\ndisk_runs=%s\n' "$disk" "$disk_runs"
+}
+# How many runs at once the build VM's disk holds (whole runs; pure).
+buildhost_disk_runs() {
+  local usable=$(( $1 * (100 - BUILD_DISK_HEADROOM_PCT) / 100 - BUILD_CACHE_GIB - BUILD_IMAGES_GIB - BUILD_VM_SYSTEM_DISK_GIB ))
+  [ "$usable" -gt 0 ] || { printf 0; return; }
+  printf '%s' "$(( usable / BUILD_RUN_DISK_GIB ))"
+}
+# The least disk that holds one run (GiB, rounded up; pure).
+buildhost_disk_min() {
+  local need=$(( BUILD_CACHE_GIB + BUILD_IMAGES_GIB + BUILD_VM_SYSTEM_DISK_GIB + BUILD_RUN_DISK_GIB ))
+  printf '%s' "$(( (need * 100 + (100 - BUILD_DISK_HEADROOM_PCT) - 1) / (100 - BUILD_DISK_HEADROOM_PCT) ))"
+}
+# The disk a build VM may be given here (GiB; pure): $1 free on the host's volume, $2 what the OTHER VMs may still grow
+# into (their size minus what they hold), $3 what the build VM already holds on the host (0 for a new VM).
+buildhost_disk_plan() {
+  local d=$(( $1 + $3 - $2 - BUILD_HOST_DISK_RESERVE_GIB ))
+  [ "$d" -le "$BUILD_DISK_MAX_GIB" ] || d="$BUILD_DISK_MAX_GIB"
+  [ "$d" -gt 0 ] || d=0
+  printf '%s' "$d"
+}
+# Free GiB on the volume that holds the Colima disks (MEMEX_HOST_DISK_FREE_GIB overrides).
+host_disk_free_gib() {
+  [ -n "${MEMEX_HOST_DISK_FREE_GIB:-}" ] && { printf '%s' "$MEMEX_HOST_DISK_FREE_GIB"; return; }
+  local d="${COLIMA_HOME:-$HOME/.colima}"; [ -d "$d" ] || d="$HOME"
+  df -Pk "$d" 2>/dev/null | awk 'NR == 2 { printf "%d", $4 / 1048576 }'
+}
+# GiB a profile's data disk holds on the host (allocated, not its nominal size), or empty when unreadable.
+vm_disk_held_gib() {
+  local name="colima"; [ "$1" = default ] || name="colima-$1"
+  local f="${COLIMA_HOME:-$HOME/.colima}/_lima/_disks/$name/datadisk"
+  [ -f "$f" ] || return 0
+  du -k "$f" 2>/dev/null | awk '{ printf "%d", $1 / 1048576 }'
+}
+# "<nominal GiB> <held GiB>" of every Colima profile but the build one: what they may still grow into is the difference.
+# An unreadable allocation counts as empty (the whole nominal size may still be written — the safe reading).
+other_vms_disk_growth_gib() {
+  colima list --json 2>/dev/null | python3 -c 'import json,sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    d = json.loads(line)
+    if d.get("name") != sys.argv[1]: print(d.get("name"), int(int(d.get("disk", 0) or 0) / 1073741824))' "$BUILD_PROFILE" 2>/dev/null   | { local t=0 n size held; while read -r n size; do held="$(vm_disk_held_gib "$n")"; t=$(( t + size - ${held:-0} )); done; printf '%s' "$t"; }
 }
 plan_value() { awk -F= -v k="$1" '$1 == k { print $2; exit }' <<<"$2"; }
 
@@ -6495,6 +6780,59 @@ colima_keep_context() {
   return "$rc"
 }
 
+# The build VM's nominal disk (GiB) from colima, or empty when the profile does not exist.
+build_vm_disk_gib() {
+  colima list --json 2>/dev/null | python3 -c 'import json,sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    d = json.loads(line)
+    if d.get("name") == sys.argv[1] and d.get("disk"):
+        print(int(int(d["disk"]) / 1073741824)); break' "$BUILD_PROFILE" 2>/dev/null || true
+}
+
+# The GC args are k3s arguments, read once when the VM's k3s starts: an existing VM made before them keeps kubelet's
+# defaults until a restart. Said, never applied behind the owner's back (a restart re-queues running builds).
+buildhost_gc_args_check() {
+  local y a missing=""
+  y="$(colima_profile_yaml "$BUILD_PROFILE")" || return 0
+  for a in ${BUILD_K3S_GC_ARGS[@]+"${BUILD_K3S_GC_ARGS[@]}"}; do colima_k3s_args "$y" | grep -qxF -- "$a" || missing="$missing $a"; done
+  [ -z "$missing" ] && { ok "the build VM collects unused images early (kubelet image GC at 60 %, 48 h max age)"; return 0; }
+  warn "the build VM's k3s lacks the image/pod GC args (${missing# }) — kubelet only collects above 85 % disk, above the claim guard's line.
+     'memex-local buildhost gc' frees what it can now; 'memex-local buildhost apply --resize' adds the args (a VM restart)."
+}
+
+# Free the build VM's disk of what nothing uses: images no container references (crictl rmi --prune — a later pod
+# start pulls what it needs again) and the records of finished pods (Failed/Evicted; their volumes went with them).
+# Never the cache claim, never a running pod. Prints the disk before and after.
+buildhost_gc() {
+  build_vm_size | grep -q Running || { info "buildhost gc: the build VM is not running — nothing to collect"; return 0; }
+  local before after n
+  before="$(buildhost_vm_df)"
+  step "Collecting the build VM's unused images and finished pod records (disk: ${before:-unreadable})"
+  colima ssh -p "$BUILD_PROFILE" -- sudo k3s crictl rmi --prune >/dev/null 2>&1 </dev/null \
+    || warn "buildhost gc: 'crictl rmi --prune' failed in the build VM — images stay; 'colima ssh -p $BUILD_PROFILE -- sudo k3s crictl images'"
+  n="$(build_kubectl -n "$BUILD_NS" get pods --field-selector=status.phase=Failed --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${n:-0}" -gt 0 ]; then
+    build_kubectl -n "$BUILD_NS" delete pods --field-selector=status.phase=Failed --wait=false >/dev/null 2>&1 \
+      && info "removed ${n} finished (Failed/Evicted) pod record(s) in $BUILD_NS" || warn "buildhost gc: could not remove the Failed pod records in $BUILD_NS"
+  fi
+  after="$(buildhost_vm_df)"
+  ok "build VM disk after collection: ${after:-unreadable}"
+}
+# "<free> GiB free of <size> GiB" of the build VM's data disk, or nothing.
+buildhost_vm_df() {
+  colima ssh -p "$BUILD_PROFILE" -- sh -c "df -k /var/lib/rancher | awk 'NR == 2 { printf \"%d GiB free of %d GiB\", \$4 / 1048576, \$2 / 1048576 }'" 2>/dev/null </dev/null || true
+}
+# What holds the build VM's disk: images, the cache claim (by area), the rest — read-only.
+buildhost_disk_report() {
+  build_vm_size | grep -q Running || { info "the build VM is not running"; return 0; }
+  info "data disk: $(buildhost_vm_df)"
+  colima ssh -p "$BUILD_PROFILE" -- sudo sh -c 'cd /var/lib/rancher 2>/dev/null || exit 0
+    for d in /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs /var/lib/containerd/io.containerd.content.v1.content; do [ -d "$d" ] && du -sh "$d"; done
+    for c in k3s/storage/*; do [ -d "$c" ] || continue; du -sh "$c"; for a in "$c"/*; do [ -d "$a" ] && du -sh "$a"; done; done' 2>/dev/null </dev/null | sed 's/^/    /' || true
+}
+
 cmd_buildhost() {
   local sub="${1:-status}"; shift || true
   [ "$sub" = apply ] && [ "$(participation_answer Jobs)" = false ] \
@@ -6508,15 +6846,28 @@ cmd_buildhost() {
     case "$probe" in ''|*[!0-9]*) die "buildhost: a host probe returned '$probe' instead of a whole number (cores, memory, other VMs, largest model) — set MEMEX_HOST_CORES / MEMEX_HOST_MEM_GIB / MEMEX_MODEL_GIB to override" ;; esac
   done
   [ "$(host_mem_gib)" -gt 0 ] && [ "$(host_cores)" -gt 0 ] || die "buildhost: the host reported 0 cores or 0 GiB — refusing to size from it"
-  plan="$(buildhost_plan "$(host_cores)" "$(host_mem_gib)" "$COLIMA_CPU" "$others" "$(largest_model_gib)")" \
-    || die "buildhost: $(plan_value error "$plan")"
+  # The disk: a new (or --resize'd) VM gets what this Mac can back; an existing one is sized against what it has.
+  local free growth held have_disk want_disk disk
+  free="$(host_disk_free_gib)"; growth="$(other_vms_disk_growth_gib)"
+  have_disk="$(build_vm_disk_gib)"; held="$(vm_disk_held_gib "$BUILD_PROFILE")"
+  for probe in "${free:-x}" "${growth:-0}"; do
+    case "$probe" in *[!0-9]*) die "buildhost: a disk probe returned '$probe' instead of a whole number (host free GiB, other VMs' growth) — set MEMEX_HOST_DISK_FREE_GIB to override" ;; esac
+  done
+  want_disk="$(buildhost_disk_plan "$free" "${growth:-0}" "${held:-0}")"
+  disk="${have_disk:-$want_disk}"
+  case " $* " in *" --resize "*) [ -z "$have_disk" ] || [ "$want_disk" -le "$have_disk" ] || disk="$want_disk" ;; esac
+  plan="$(buildhost_plan "$(host_cores)" "$(host_mem_gib)" "$COLIMA_CPU" "$others" "$(largest_model_gib)" "$disk")" \
+    || die "buildhost: $(plan_value error "$plan")
+     host: ${free} GiB free on the Colima volume, ${BUILD_HOST_DISK_RESERVE_GIB} GiB kept for macOS and models, other VMs may still grow by ${growth:-0} GiB$( [ -n "$have_disk" ] && printf ' — the build VM has %s GiB' "$have_disk").
+     Remedy: free disk on this Mac (then 'memex-local buildhost apply --resize'), or answer NO to jobs ('memex-local backlease accept jobs --off')."
   local cpu vmem
   cpu="$(plan_value vm_cpu "$plan")"; vmem="$(plan_value vm_mem "$plan")"
   case "$sub" in
     plan)
       [ $# -eq 0 ] || die "buildhost plan: takes no arguments"
       info "host: $(host_cores) cores, $(host_mem_gib) GiB; other VMs ${others} GiB (the portal's included); largest model $(largest_model_gib) GiB"
-      info "build VM (profile $BUILD_PROFILE): ${cpu} CPU / ${vmem} GiB"
+      info "build VM (profile $BUILD_PROFILE): ${cpu} CPU / ${vmem} GiB / disk ${disk} GiB$( [ -n "$have_disk" ] && [ "$want_disk" -gt "$have_disk" ] && printf ' (this Mac could back %s — apply --resize grows it)' "$want_disk")"
+      info "disk: ${free} GiB free on this Mac; the disk holds $(plan_value disk_runs "$plan") run(s) of ${BUILD_RUN_DISK_GIB} GiB at once beside cache ${BUILD_CACHE_GIB}, images ${BUILD_IMAGES_GIB}, ${BUILD_DISK_HEADROOM_PCT} % kept free"
       info "runners: $(plan_value runners_min "$plan") warm … $(plan_value runners_max "$plan") (KEDA), each ${BUILD_CPU_PER_RUNNER} CPU / $(plan_value runner_mem_request "$plan")–$(plan_value runner_mem_limit "$plan") GiB, $(plan_value stage_slots "$plan") stage slots → up to $(plan_value stage_total "$plan") stage containers at once"
       ;;
     apply)
@@ -6525,9 +6876,10 @@ cmd_buildhost() {
       local size have_cpu have_mem
       size="$(build_vm_size)"
       if [ -z "$size" ]; then
-        step "Creating the build VM (Colima profile $BUILD_PROFILE: ${cpu} CPU / ${vmem} GiB, containerd, k3s)"
-        colima_keep_context colima start -p "$BUILD_PROFILE" --cpu "$cpu" --memory "$vmem" --disk 100 --runtime containerd --kubernetes \
-          --k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet \
+        step "Creating the build VM (Colima profile $BUILD_PROFILE: ${cpu} CPU / ${vmem} GiB / ${disk} GiB disk, containerd, k3s)"
+        local gc_args=() a; for a in ${BUILD_K3S_GC_ARGS[@]+"${BUILD_K3S_GC_ARGS[@]}"}; do gc_args+=("--k3s-arg=$a"); done
+        colima_keep_context colima start -p "$BUILD_PROFILE" --cpu "$cpu" --memory "$vmem" --disk "$disk" --runtime containerd --kubernetes \
+          --k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet ${gc_args[@]+"${gc_args[@]}"} \
           || die "buildhost: could not start the build VM (colima start -p $BUILD_PROFILE)"
       else
         local have_status
@@ -6536,16 +6888,19 @@ cmd_buildhost() {
           step "Starting the build VM (profile $BUILD_PROFILE is ${have_status:-not running})"
           colima_keep_context colima start -p "$BUILD_PROFILE" || die "buildhost: could not start the build VM (colima start -p $BUILD_PROFILE)"
         fi
-        if [ "${have_cpu:-0}" -lt "$cpu" ] || [ "${have_mem:-0}" -lt "$vmem" ]; then
+        if [ "${have_cpu:-0}" -lt "$cpu" ] || [ "${have_mem:-0}" -lt "$vmem" ] || { [ "$resize" = yes ] && [ "$disk" -gt "${have_disk:-0}" ]; }; then
           if [ "$resize" = "yes" ]; then
-            step "Resizing the build VM ${have_cpu} CPU / ${have_mem} GiB → ${cpu} / ${vmem} (a restart: running builds are re-queued by the build API; the disk is kept)"
+            step "Resizing the build VM ${have_cpu} CPU / ${have_mem} GiB / ${have_disk:-?} GiB disk → ${cpu} / ${vmem} / ${disk} (a restart: running builds are re-queued by the build API; the disk only grows, its data is kept; the GC args are added)"
             colima stop -p "$BUILD_PROFILE" || die "buildhost: could not stop the build VM for the resize"
-            colima_keep_context colima start -p "$BUILD_PROFILE" --cpu "$cpu" --memory "$vmem" \
+            local y; if y="$(colima_profile_yaml "$BUILD_PROFILE")"; then
+              local a; for a in ${BUILD_K3S_GC_ARGS[@]+"${BUILD_K3S_GC_ARGS[@]}"}; do colima_yaml_add_k3s_arg "$y" "$a" || warn "could not add $a to $y — kubelet keeps its default image GC"; done
+            fi
+            colima_keep_context colima start -p "$BUILD_PROFILE" --cpu "$cpu" --memory "$vmem" --disk "$disk" \
               || die "buildhost: the build VM stopped but did not start at ${cpu} CPU / ${vmem} GiB — 'colima start -p $BUILD_PROFILE' starts it again"
           else
             warn "the build VM is ${have_cpu} CPU / ${have_mem} GiB, the plan is ${cpu} / ${vmem} — 'memex-local buildhost apply --resize' restarts it at that size"
             cpu="$have_cpu"; vmem="$have_mem"
-            plan="$(buildhost_plan $(( cpu + 2 )) $(( vmem + others + $(largest_model_gib) + BUILD_HEADROOM_GIB )) "$COLIMA_CPU" "$others" "$(largest_model_gib)")" \
+            plan="$(buildhost_plan $(( cpu + 2 )) $(( vmem + others + $(largest_model_gib) + BUILD_HEADROOM_GIB )) "$COLIMA_CPU" "$others" "$(largest_model_gib)" "$disk")" \
               || die "buildhost: the current build VM is too small for one runner — 'memex-local buildhost apply --resize'"
           fi
         else
@@ -6555,6 +6910,8 @@ cmd_buildhost() {
       buildhost_keda
       buildhost_priority_install
       vm_netshape_apply "$BUILD_PROFILE"
+      buildhost_gc_args_check
+      buildhost_gc || true
       if helm --kube-context "$(build_ctx)" -n "$BUILD_NS" status "$BUILD_RELEASE" >/dev/null 2>&1; then
         step "Sizing the runners: $(plan_value runners_min "$plan")…$(plan_value runners_max "$plan") × ${BUILD_CPU_PER_RUNNER} CPU, $(plan_value stage_slots "$plan") stage slots"
         helm --kube-context "$(build_ctx)" -n "$BUILD_NS" upgrade "$BUILD_RELEASE" "$(resolve_chart)" --reuse-values \
@@ -6593,7 +6950,9 @@ print("  runners %s…%s, %s stage slots, requests %s, limits %s" % (m.get("minR
       esac
       ;;
     net) shift_net_cmd "$BUILD_PROFILE" "$@" ;;
-    *) die "usage: memex-local buildhost {plan | apply [--resize] | status | priority [install|off|status] | net [apply|measure|off|status]}" ;;
+    gc) [ $# -eq 0 ] || die "buildhost gc: takes no arguments"; buildhost_gc ;;
+    disk) [ $# -eq 0 ] || die "buildhost disk: takes no arguments"; buildhost_disk_report ;;
+    *) die "usage: memex-local buildhost {plan | apply [--resize] | status | gc | disk | priority [install|off|status] | net [apply|measure|off|status]}" ;;
   esac
 }
 
