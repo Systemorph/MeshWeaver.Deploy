@@ -175,7 +175,13 @@ Environment (rendered by the chart from `buildHosts.*`):
   MW_BUILD_IDLE_SECONDS        sleep after a 204                           default 15
   MW_BUILD_RUN_DEADLINE_SECONDS  the whole run's deadline (= the pod's grace) default 3600
   MW_BUILD_SLICE_CACHE_MAX_GIB  the bound of <cache>/module-slices, GiB; least-recently-used slices above it are
-                               evicted (a cache of control's append-only module store)   default 32
+                               evicted (a cache of control's append-only module store)   default 32 — with a
+                               cache budget, the slices' SHARE of it (default 20 % of the budget)
+  MW_BUILD_CACHE_MAX_GIB       the WHOLE cache's budget, GiB (chart: the declared cache.size less 10 %); unset = only
+                               the slice bound applies. Each area has a share of it — MW_BUILD_CACHE_TREE_GIB (the
+                               deployment trees, default 50 %), _NUGET_GIB (15 %), _REFSETS_GIB (5 %), _PREPARED_GIB (5 %)
+                               and the slices' above; shares summing above the budget are scaled down. An area over
+                               its share is evicted least recently used first, never an entry a run or a writer holds
   MW_BUILD_STAGE_SLOTS         how many of a `parallel` run's stages run at once  default 1 (serial); the host
                                refuses to START when its cgroup cannot give each slot 1 CPU and 2 GiB, or
                                when neither the cgroup v2 nor the v1 limits can be read (more than 1 slot)
@@ -1021,6 +1027,296 @@ def bound_slice_cache(root: str, cap: int, log: Callable[[str], None], now: Opti
         return evicted, total
     finally:
         guard.close()
+
+
+# ───────────── the host's cache is BUDGETED: ONE total, a share per area, least-recently-used eviction within each ─────────
+# The slice bound alone held one area of the cache: on a Mac whose cache claim is declared 20 GiB (local-path, which never
+# enforces a claim's capacity) the cache held 43 GiB on 2026-11-11 — the deployment tree 20, the slices 14 (under a bound of
+# 32, larger than the whole claim), NuGet 6.1, the reference sets 2.0, the prepared inputs 1.4, the masters 0.4 — and the
+# disk guard refused every claim with 34 GiB free of a 98 GiB disk. So the cache has ONE budget (MW_BUILD_CACHE_MAX_GIB, the
+# chart's `buildHosts.cache.maxGi`, by default the declared `cache.size` less 10 %) and every area a SHARE of it; the shares
+# can never sum above the budget (scaled down when declared so), so the cache honours the budget when every area honours its
+# share. Within an area the least recently used entries go first, down to CACHE_LOW_WATER of the share, and never one that a
+# run or a writer holds:
+#   * slices   — `bound_slice_cache` above, under the slices share (MW_BUILD_SLICE_CACHE_MAX_GIB);
+#   * tree     — a (deployment, repository) deployment tree, its platform tree and its host state, removed under its OWN
+#                writer lock (exclusive, non-blocking: no run reads it, no warm build writes it); a tree removed for its share
+#                is not rebuilt while the build identity and the share are unchanged (a day at most), and a share of 0 keeps
+#                no tree at all (no warm build is started — every run takes a cold worktree, said);
+#   * refsets  — a reference set the host's own images do not key, unused for a run's whole deadline;
+#   * prepared — an installed prepared input, unused for a run's whole deadline (every run that reads one touches it);
+#   * nuget    — a package of the warm NuGet cache, oldest first, only while NO run is in flight on this cache and no
+#                deployment tree is held; the warm-NuGet and package-seed markers go with it, so the closure is prepared again.
+# What no share covers (the masters, outputs, the plugins layer, markers) is measured and named, never evicted here.
+CACHE_MAX_ENV = "MW_BUILD_CACHE_MAX_GIB"
+CACHE_AREA_DIRS = {"tree": "deploy", "slices": "module-slices", "nuget": "nuget", "refsets": "refsets", "prepared": "prepared"}
+CACHE_SHARE_ENV = {"tree": "MW_BUILD_CACHE_TREE_GIB", "slices": SLICE_CACHE_MAX_ENV, "nuget": "MW_BUILD_CACHE_NUGET_GIB",
+                   "refsets": "MW_BUILD_CACHE_REFSETS_GIB", "prepared": "MW_BUILD_CACHE_PREPARED_GIB"}
+# the chart's defaults (templates/build-host/_build-hosts.tpl), percent of the budget: 95 % in all, 5 % for what no share covers
+CACHE_SHARE_DEFAULT_PERCENT = {"tree": 50, "slices": 20, "nuget": 15, "refsets": 5, "prepared": 5}
+CACHE_LOW_WATER = 0.9
+CACHE_BUDGET_INTERVAL = 600.0        # seconds between two budget passes of one host (each measures the whole cache)
+CACHE_OTHER_INTERVAL = 3600.0        # what no share covers is walked at most this often (it may be a slow share on a cluster)
+CACHE_TREE_HOLD_SECONDS = 86400.0    # a tree removed for its share is not rebuilt for this long at the same identity and share
+NUGET_EVICT_MIN_AGE = 3600.0
+CACHE_STATE_DIR = ".cache-budget"
+
+
+def cache_budget(env: dict) -> Optional[dict]:
+    """The cache's budget: {"total": bytes, "shares": {area: bytes}, "scaled": bool}, or None when no budget is declared
+    (MW_BUILD_CACHE_MAX_GIB unset or not a positive number — then only the slice bound applies, as before). Each share is its
+    variable (GiB, 0 = the area keeps nothing; the slices share is at least the smallest positive value), else the chart's
+    default percent; shares that sum above the total are scaled down proportionally, so they NEVER sum above it. Pure."""
+    try:
+        gib = float((env.get(CACHE_MAX_ENV) or "").strip() or "nan")
+    except ValueError:
+        return None
+    if not 0 < gib <= 1 << 20:
+        return None
+    total = int(gib * (1 << 30))
+    shares: dict = {}
+    for area, var in CACHE_SHARE_ENV.items():
+        share = total * CACHE_SHARE_DEFAULT_PERCENT[area] // 100
+        raw = (env.get(var) or "").strip()
+        if raw:
+            try:
+                v = float(raw)
+                if 0 <= v <= 1 << 20 and not (area == "slices" and v == 0):
+                    share = int(v * (1 << 30))
+            except ValueError:
+                pass
+        shares[area] = share
+    s = sum(shares.values())
+    scaled = s > total
+    if scaled:
+        shares = {a: v * total // s for a, v in shares.items()}
+    return {"total": total, "shares": shares, "scaled": scaled}
+
+
+def _gib(n: int) -> str:
+    return f"{n / (1 << 30):.1f}"
+
+
+class SizeIndex:
+    """Sizes of IMMUTABLE cache entries, measured once and kept host-side in `<cache>/.cache-budget/sizes.json` (never inside
+    an entry a stage reads), keyed by the entry and the stamp (mtime_ns) of its completion marker. Never raises."""
+
+    def __init__(self, cache: str) -> None:
+        self.path = os.path.join(cache, CACHE_STATE_DIR, "sizes.json")
+        try:
+            with open(self.path) as fh:
+                d = json.load(fh)
+            self.d = d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            self.d = {}
+        self.seen: set = set()
+
+    def size(self, entry: str, stamp: int, measure: Optional[Callable[[], Optional[int]]] = None) -> int:
+        self.seen.add(entry)
+        got = self.d.get(entry)
+        if isinstance(got, list) and len(got) == 2 and got[0] == stamp and isinstance(got[1], int):
+            return got[1]
+        n = (measure() if measure else None)
+        if n is None:
+            n = _tree_bytes(entry)
+        self.d[entry] = [stamp, n]
+        return n
+
+    def save(self) -> None:
+        keep = {k: v for k, v in self.d.items() if k in self.seen}
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + f".{os.getpid()}"
+            with open(tmp, "w") as fh:
+                json.dump(keep, fh)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+
+def touch_use(path: str) -> None:
+    """Stamp a cache entry's LAST USE (the budget evicts least recently used first): create or re-time `path`. Never raises."""
+    try:
+        with open(path, "a"):
+            pass
+        os.utime(path, None)
+    except OSError:
+        pass
+
+
+def _stamp(path: str) -> "tuple[float, int]":
+    st_ = os.stat(path)
+    return st_.st_mtime, st_.st_mtime_ns
+
+
+def _manifest_bytes(path: str) -> Optional[int]:
+    """The bytes a deployment tree's integrity manifest records (every file's size), or None when it has none."""
+    try:
+        with open(path) as fh:
+            m = json.load(fh)
+        return sum(int(e[2]) for e in m.get("entries", []) if isinstance(e, list) and len(e) > 2 and e[1] == "file")
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def nuget_cache_entries(root: str, sizes: SizeIndex) -> list:
+    """Every complete package of the warm NuGet cache as (last write, bytes, dir), oldest first. Never raises."""
+    out = []
+    for pv in sorted(nuget_packages(root)):
+        d = os.path.join(root, *pv.split("/", 1))
+        try:
+            used, ns = _stamp(os.path.join(d, ".nupkg.metadata"))
+        except OSError:
+            continue
+        out.append((used, sizes.size(d, ns), d))
+    out.sort()
+    return out
+
+
+def marked_cache_entries(root: str, depth: int, sizes: SizeIndex, keep: Callable[[str], bool] = lambda e: False) -> list:
+    """Every COMPLETE entry `depth` levels under `root` (a `.complete` marker, whose mtime is its last use) as (last use,
+    bytes, dir, kept), oldest first — `kept` marks one the caller must never evict. Never raises."""
+    level = [root]
+    for _ in range(depth):
+        level = [os.path.join(p, n) for p in level for n in _listdir(p) if not n.startswith(".")
+                 and os.path.isdir(os.path.join(p, n)) and not os.path.islink(os.path.join(p, n))]
+    out = []
+    for e in level:
+        try:
+            used, ns = _stamp(os.path.join(e, ".complete"))
+        except OSError:
+            continue
+        out.append((used, sizes.size(e, ns), e, keep(e)))
+    out.sort()
+    return out
+
+
+def deployment_tree_units(cache: str, sizes: SizeIndex) -> "tuple[list, int]":
+    """The tree area as evictable units — (last use, bytes, deployment, repository) per deployment tree, its platform tree
+    included — and the bytes of everything else under `<cache>/deploy` (host state, locks, a legacy keyed deployment the
+    migration has not retired yet). A tree's size is what its integrity manifest records (measured on the disk when it has
+    none); its last use is its newest use stamp or state. Never raises."""
+    root = os.path.join(cache, "deploy")
+    units, rest = [], 0
+    for dep in _listdir(root):
+        ddir = os.path.join(root, dep)
+        if dep.startswith(".") or not os.path.isdir(ddir) or os.path.islink(ddir):
+            rest += _tree_bytes(ddir) if os.path.isdir(ddir) and not os.path.islink(ddir) else 0
+            continue
+        repos = [r for r in _listdir(ddir) if REPO.match(r) and not r.startswith(".") and os.path.isdir(os.path.join(ddir, r))]
+        for repo in repos:
+            host = os.path.join(ddir, ".host", repo)
+            n = 0
+            for tree, manifest in ((os.path.join(ddir, repo), os.path.join(host, "manifest.json")),
+                                   (os.path.join(ddir, ".platform", repo), os.path.join(host, "platform-manifest.json"))):
+                if not os.path.isdir(tree):
+                    continue
+                try:
+                    _u, ns = _stamp(manifest)
+                    n += sizes.size(tree, ns, lambda m=manifest: _manifest_bytes(m))
+                except OSError:
+                    n += _tree_bytes(tree)                   # being built, or never built: measured as it stands
+            used = 0.0
+            for f in ("used", "state.json"):
+                try:
+                    used = max(used, os.stat(os.path.join(host, f)).st_mtime)
+                except OSError:
+                    pass
+            units.append((used, n, dep, repo))
+        for name in _listdir(ddir):
+            if name in repos or name in (".platform", ".host", ".locks"):
+                continue
+            rest += _tree_bytes(os.path.join(ddir, name))
+        for name in _listdir(os.path.join(ddir, ".platform")):
+            if name not in repos:
+                rest += _tree_bytes(os.path.join(ddir, ".platform", name))
+    units.sort()
+    return units, rest
+
+
+def evict_lru(entries: list, cap: int, now: float, min_age: float, remove: Callable[[tuple], bool]) -> "tuple[int, int, int]":
+    """Least-recently-used eviction over `entries` ((last use, bytes, …, kept?) oldest first): when they hold more than `cap`,
+    remove the oldest — none used in the last `min_age` seconds, none marked kept, none `remove` refuses (it returns False
+    for one held) — down to CACHE_LOW_WATER of the cap. Returns (evicted, bytes freed, bytes held afterwards). Pure but for
+    `remove`."""
+    total = sum(e[1] for e in entries)
+    if total <= cap:
+        return 0, 0, total
+    target = int(cap * CACHE_LOW_WATER)
+    evicted = freed = 0
+    for e in entries:
+        if total <= target:
+            break
+        if now - e[0] < min_age or (len(e) > 3 and e[-1] is True):
+            continue
+        if remove(e):
+            total -= e[1]
+            freed += e[1]
+            evicted += 1
+    return evicted, freed, total
+
+
+def _evict_dir(root: str, path: str) -> bool:
+    """Rename `path` out of its area (one atomic step: no reader ever sees half an entry), then delete it."""
+    gone = os.path.join(root, f".evicted-{os.getpid()}-{threading.get_ident()}-{time.monotonic_ns()}")
+    try:
+        os.rename(path, gone)
+    except OSError:
+        return False
+    _rm_tree(gone)
+    return True
+
+
+def tree_hold_path(cache: str, deployment: str, repo: str) -> str:
+    return os.path.join(cache, CACHE_STATE_DIR, "trees", f"{deployment}--{repo}.json")
+
+
+def tree_held_back(cache: str, deployment: str, repo: str, key: str, share: int, now: Optional[float] = None) -> bool:
+    """Whether `repo`'s tree was removed for its share at this build identity and share in the last day — then it is not
+    rebuilt (a rebuild would only be removed again). Never raises."""
+    now = time.time() if now is None else now
+    try:
+        with open(tree_hold_path(cache, deployment, repo)) as fh:
+            h = json.load(fh)
+        return h.get("key") == key and h.get("share") == share and now - float(h.get("at", 0)) < CACHE_TREE_HOLD_SECONDS
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def evict_deployment_tree(cache: str, deployment: str, repo: str, git: Callable[..., None]) -> bool:
+    """Remove ONE deployment tree — the repository's tree, its platform tree and its host state — under the tree's writer
+    lock (exclusive, non-blocking: False when a run reads it or a warm build writes it), then deregister both worktrees from
+    their masters (`worktree prune` under the master lock). A deletion, never a copy. Never raises."""
+    dt = DeploymentTree(cache, deployment, repo)
+    try:
+        with dt.writer() as w:
+            if w is None:
+                return False
+            for p in (dt.tree, dt.platform, dt.host):
+                _rm_tree(p)
+        for r in (repo, PLATFORM_REPO):
+            mirror = master_path(cache, r)
+            if os.path.isfile(os.path.join(mirror, "HEAD")):
+                try:
+                    with master_lock(os.path.dirname(mirror), r):
+                        git("--git-dir", mirror, "worktree", "prune")
+                except (Refusal, OSError, subprocess.SubprocessError):
+                    pass
+        return not os.path.exists(dt.tree)
+    except OSError:
+        return False
+
+
+def cache_usage_line(usage: Optional[dict]) -> str:
+    """What the cache holds, by area, against its budget — one clause for the disk guard's refusal and the budget line."""
+    if not usage:
+        return ""
+    areas = usage.get("areas", {})
+    b = usage.get("budget")
+    parts = ", ".join(f"{a} {_gib(areas.get(a, 0))}" + (f"/{_gib(b['shares'][a])}" if b else "") for a in CACHE_AREA_DIRS)
+    return (f"the cache holds {_gib(usage.get('total', 0))} GiB"
+            + (f" of its {_gib(b['total'])} GiB budget ({CACHE_MAX_ENV})" if b else " (no budget declared)")
+            + f" — {parts}, other {_gib(usage.get('other', 0))} GiB")
 
 
 class ModuleHubBroker:
@@ -4211,6 +4507,7 @@ class DeploymentTree:
                     self.last_refusal = f"the deployment tree's integrity check refused it: {why}"
                 else:
                     held = (self.tree, tip)
+                    touch_use(os.path.join(self.host, "used"))   # the cache budget keeps the most recently used trees
                     # the warm platform tree is OPTIONAL: a missing or refused one leaves the stages on the image's tree
                     self.platform_lower = None
                     pc = str(st.get("platform") or "")
@@ -5087,6 +5384,13 @@ class Host:
         self.disk_headroom = disk_percent(env.get(DISK_HEADROOM_ENV), DISK_HEADROOM_DEFAULT_PERCENT)
         self.disk_stat: Callable[[str], "tuple[int, int]"] = _disk_free
         self.disk_said: Optional[str] = None
+        # THE CACHE BUDGET (MW_BUILD_CACHE_MAX_GIB and the per-area shares): the last measurement, when it was taken, and
+        # what no share covers (walked at most every CACHE_OTHER_INTERVAL)
+        self.cache_budget = cache_budget(env)
+        self.cache_usage: Optional[dict] = None
+        self.cache_budget_at = float("-inf")
+        self.cache_other: "tuple[int, float]" = (0, float("-inf"))
+        self.cache_said: Optional[str] = None
         self.seed_done: Optional[str] = None
         self.seed_retry_at = 0.0
         self.seed_said: Optional[str] = None
@@ -5221,8 +5525,25 @@ class Host:
                         + (f", {others / (1 << 30):.0f} GiB of it reserved by runs in flight on this cache" if others else "")
                         + "; a run needs "
                         f"{self.run_disk / (1 << 30):.0f} GiB ({RUN_DISK_ENV}) and {self.disk_headroom:g} % must stay free "
-                        f"for the kubelet's eviction threshold ({DISK_HEADROOM_ENV}) — retried every idle pass")
+                        f"for the kubelet's eviction threshold ({DISK_HEADROOM_ENV}) — retried every idle pass"
+                        + self.disk_use_clause(path, total, free))
         return None
+
+    def disk_use_clause(self, path: str, total: int, free: int) -> str:
+        """What is USING the disk the guard measured: the cache by area against its budget (the last budget pass), and — when
+        the cache is on that same filesystem — the rest (the replicas' work volumes, the images, the system). Never raises."""
+        u = self.cache_usage
+        if not u:
+            return ""
+        same = False
+        try:
+            same = os.stat(path).st_dev == os.stat(self.cache).st_dev
+        except OSError:
+            pass
+        used = total - free
+        return (f"; {cache_usage_line(u)}"
+                + (f"; the rest of that disk (work volumes, images, system) holds {_gib(max(0, used - u['total']))} GiB"
+                   if same else ""))
 
     def ensure_nuget_seed(self) -> None:
         """PREPARATION, before a claim: the package seed of the platform version this host runs, installed once
@@ -5253,9 +5574,150 @@ class Host:
         """The slice cache back under its bound (`bound_slice_cache`), after every run that handed slices over and on every
         idle pass. Never raises: a bound that cannot be applied is said, the run's verdict is not touched."""
         try:
-            bound_slice_cache(self.slice_cache_root(), slice_cache_cap(self.env), self.log)
+            cap = self.cache_budget["shares"]["slices"] if self.cache_budget else slice_cache_cap(self.env)
+            bound_slice_cache(self.slice_cache_root(), cap, self.log)
         except Exception as e:      # the bound must never take a run or the idle loop down
             self.log(f"slice cache: not bounded this pass ({type(e).__name__}: {str(e)[:160]})")
+
+    def tree_share(self) -> Optional[int]:
+        """The deployment trees' share of the cache budget, or None when no budget is declared."""
+        return self.cache_budget["shares"]["tree"] if self.cache_budget else None
+
+    def bound_cache(self, force: bool = False) -> Optional[dict]:
+        """THE CACHE BUDGET, once per CACHE_BUDGET_INTERVAL (or `force`), while idle: the slices under their share, then
+        every other area measured and — when over its share — evicted least recently used first, never an entry a run or a
+        writer holds; the whole cache measured against the budget. Records the reading for the disk guard's refusal and says
+        one line when anything was evicted or anything is still over. Returns the reading. Never raises."""
+        self.bound_slices()                                # every pass: cheap (recorded sizes), as before the budget
+        now_m = time.monotonic()
+        if not force and now_m - self.cache_budget_at < CACHE_BUDGET_INTERVAL:
+            return self.cache_usage
+        self.cache_budget_at = now_m
+        import fcntl
+        guard = _try_lock(os.path.join(self.cache, CACHE_STATE_DIR, ".lock"), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if guard is None:
+            return self.cache_usage                        # another replica on this cache is at it
+        try:
+            return self._bound_cache(time.time())
+        except Exception as e:      # the budget must never take the idle loop down
+            self.log(f"cache budget: not applied this pass ({type(e).__name__}: {str(e)[:160]})")
+            return self.cache_usage
+        finally:
+            guard.close()
+
+    def _bound_cache(self, now: float) -> dict:
+        b = self.cache_budget
+        sizes = SizeIndex(self.cache)
+        areas: dict = {}
+        did: list = []
+        min_run = self.run_deadline + 600.0                # a run reads a prepared input or a reference set for its whole life
+        key = warm_key(self.env, self.identity)
+        # the slices: bounded by `bound_slices`, measured from their recorded sizes
+        areas["slices"] = sum(e[1] for e in slice_cache_entries(self.slice_cache_root()))
+        # the deployment trees
+        units, rest = deployment_tree_units(self.cache, sizes)
+        areas["tree"] = sum(u[1] for u in units) + rest
+        if b is not None and areas["tree"] > b["shares"]["tree"]:
+            git = _git_runner(self.env, self.work, None, time.monotonic() + 120)
+            share = b["shares"]["tree"]
+
+            def drop_tree(u: tuple) -> bool:
+                if not evict_deployment_tree(self.cache, u[2], u[3], git):
+                    return False
+                try:
+                    os.makedirs(os.path.dirname(tree_hold_path(self.cache, u[2], u[3])), exist_ok=True)
+                    with open(tree_hold_path(self.cache, u[2], u[3]), "w") as fh:
+                        json.dump({"key": key, "share": share, "bytes": u[1], "at": now}, fh)
+                except OSError:
+                    pass
+                return True
+            ev, freed, held = evict_lru(units, max(0, share - rest), now, 0.0, drop_tree)
+            areas["tree"] = held + rest
+            if ev:
+                did.append(f"tree: removed {ev} deployment tree{'s' if ev != 1 else ''} ({_gib(freed)} GiB) — not rebuilt while "
+                           f"the build identity and the share ({_gib(share)} GiB, {CACHE_SHARE_ENV['tree']}) stay as they are")
+        # the reference sets: never the one this host's own images key
+        own = ""
+        tester, portal = self.env.get("MW_BUILD_TESTER_DIGEST", ""), self.env.get("MW_BUILD_PORTAL_DIGEST", "")
+        if DIGEST.match(tester or "") and DIGEST.match(portal or ""):
+            own = refset_key(tester, portal)
+        for area, depth, keep in (("refsets", 1, lambda e: os.path.basename(e) == own), ("prepared", 3, lambda e: False)):
+            root = os.path.join(self.cache, CACHE_AREA_DIRS[area])
+            ents = marked_cache_entries(root, depth, sizes, keep)
+            areas[area] = sum(e[1] for e in ents)
+            if b is not None and areas[area] > b["shares"][area]:
+                ev, freed, areas[area] = evict_lru(ents, b["shares"][area], now, min_run, lambda e, r=root: _evict_dir(r, e[2]))
+                if ev:
+                    did.append(f"{area}: evicted the {ev} least recently used ({_gib(freed)} GiB)")
+        # the warm NuGet cache: only while nothing on this cache can read it — no run in flight, no tree held
+        nroot = os.path.join(self.cache, CACHE_AREA_DIRS["nuget"])
+        nents = nuget_cache_entries(nroot, sizes)
+        areas["nuget"] = sum(e[1] for e in nents)
+        if b is not None and areas["nuget"] > b["shares"]["nuget"]:
+            ev, freed, why = self._evict_nuget(nents, b["shares"]["nuget"], now)
+            if ev:
+                areas["nuget"] -= freed
+                did.append(f"nuget: evicted the {ev} oldest packages ({_gib(freed)} GiB) — the warm NuGet and package-seed "
+                           "markers went with them, so the closure is prepared again")
+            elif why:
+                did.append(f"nuget: over its share, not evicted now ({why})")
+        sizes.save()
+        # what no share covers
+        other, at = self.cache_other
+        if now - at >= CACHE_OTHER_INTERVAL:
+            other = sum(_tree_bytes(os.path.join(self.cache, n)) if os.path.isdir(os.path.join(self.cache, n))
+                        and not os.path.islink(os.path.join(self.cache, n)) else 0
+                        for n in _listdir(self.cache) if n not in CACHE_AREA_DIRS.values())
+            self.cache_other = (other, now)
+        total = sum(areas.values()) + other
+        self.cache_usage = {"areas": areas, "other": other, "total": total, "budget": b, "at": now}
+        over = [a for a in CACHE_AREA_DIRS if b is not None and areas[a] > b["shares"][a]]
+        line = None
+        if did or (b is not None and (over or total > b["total"])):
+            line = (f"cache budget: {cache_usage_line(self.cache_usage)}"
+                    + (f"; {'; '.join(did)}" if did else "")
+                    + (f"; STILL OVER in {', '.join(over)} (every remaining entry is in use or too recent)" if over else "")
+                    + (f"; the whole cache is over its budget — what no share covers holds {_gib(other)} GiB"
+                       if b is not None and total > b["total"] and not over else "")
+                    + (" — the declared shares summed above the budget and were scaled down" if b and b["scaled"] else ""))
+        elif b is None and self.cache_said is None:
+            line = (f"cache budget: none declared ({CACHE_MAX_ENV} unset — only the slice bound applies); "
+                    f"{cache_usage_line(self.cache_usage)}")
+        if line is not None and (did or line != self.cache_said):
+            self.log(line)
+            self.cache_said = line
+        return self.cache_usage
+
+    def _evict_nuget(self, entries: list, cap: int, now: float) -> "tuple[int, int, Optional[str]]":
+        """The warm NuGet cache's packages, oldest first, down to the low-water mark of `cap` — only under the disk admission
+        lock (no replica claims meanwhile), with no reservation by any replica (no run in flight) and every deployment tree's
+        lock taken (no run reads one, no warm build writes one). The warm-NuGet and package-seed markers are removed with them.
+        Returns (evicted, bytes freed, why nothing was evicted)."""
+        import fcntl
+        if self.warm_thread and self.warm_thread.is_alive():
+            return 0, 0, "a warm build is in flight"
+        with self.disk_admission(), contextlib.ExitStack() as held:
+            if self.other_reservations() > 0 or os.path.exists(os.path.join(self.disk_claims_dir(), self.host)):
+                return 0, 0, "a run is in flight on this cache"
+            droot = os.path.join(self.cache, DEPLOY_DIR)
+            for dep in _listdir(droot):
+                for ln in _listdir(os.path.join(droot, dep, ".locks")):
+                    fh = _try_lock(os.path.join(droot, dep, ".locks", ln), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if fh is None:
+                        return 0, 0, "a deployment tree is held"
+                    held.callback(fh.close)
+            root = os.path.join(self.cache, CACHE_AREA_DIRS["nuget"])
+            ev, freed, _left = evict_lru(entries, cap, now, NUGET_EVICT_MIN_AGE, lambda e: _evict_dir(root, e[2]))
+            if ev:
+                _rm_tree(os.path.join(self.cache, "nuget-warm"))
+                for n in _listdir(os.path.join(self.cache, "nuget-seed")):
+                    if n.endswith(".installed"):
+                        try:
+                            os.remove(os.path.join(self.cache, "nuget-seed", n))
+                        except OSError:
+                            pass
+                self.seed_done = None
+            return ev, freed, None if ev else "every package is younger than an hour"
 
     def preflight(self) -> None:
         missing = []
@@ -5518,6 +5980,9 @@ class Host:
         # The check and the claim are ONE step among the replicas sharing this cache: an exclusive lock spans the reading,
         # the claim and the RESERVATION it leaves (`<cache>/.disk-claims/<host>`), and every reading subtracts the other
         # replicas' live reservations — so two replicas can never both pass on the same free space.
+        # The cache budget first (throttled; never under the admission lock, which its NuGet eviction takes itself), so the
+        # cache is back under its shares before the disk is read and a refusal can say what holds the disk.
+        self.bound_cache()
         with self.disk_admission() as admission:
             tight = self.disk_refusal()
             if tight is not None:
@@ -5525,7 +5990,6 @@ class Host:
                     self.log(f"disk: claiming nothing — {tight}")
                     self.disk_said = tight
                 admission.close()
-                self.bound_slices()
                 return "idle"
             if self.disk_said is not None:
                 self.log("disk: room again — claiming")
@@ -5534,7 +5998,8 @@ class Host:
             if claim is not None:
                 self.reserve_disk()
         if claim is None:
-            if not self.drained and warm_enabled(self.env) and not (self.warm_thread and self.warm_thread.is_alive()):
+            if not self.drained and warm_enabled(self.env) and self.tree_share() != 0 \
+                    and not (self.warm_thread and self.warm_thread.is_alive()):
                 # warming runs BESIDE the claim loop: the host keeps asking for work, and a claim stops it (stop_warming)
                 self.warm_cancel.clear()
                 self.warm_thread = threading.Thread(target=self.warm_main_when_idle, daemon=True)
@@ -5579,6 +6044,8 @@ class Host:
         # every idle pass: the one-time migration — the lane's LEGACY keyed deployments (a tree per set and image), once unused and quiet
         retire_legacy_deployments(self.cache, self.lane, self.deployment(key), self.log,
                                  _git_runner(self.env, self.work, None, time.monotonic() + 120))
+        if self.tree_share() == 0:
+            return                                         # the tree share is 0: no deployment tree is kept (cold worktrees)
         repos = set(self.warm_repos)
         # every repository this deployment already holds a tree of is kept warm by whichever replica is idle, not only by
         # one that ran it since its own start (an unreadable listing only narrows this pass)
@@ -5605,6 +6072,9 @@ class Host:
         failed = self.warm_failed.get(repo)
         if failed is not None and failed[:2] == (tip, key) and time.monotonic() - failed[2] < WARM_RETRY_SECONDS:
             return "skipped"                               # cooling down: a failing tip is not rebuilt every pass
+        share = self.tree_share()
+        if share is not None and tree_held_back(self.cache, self.deployment(key), repo, key, share):
+            return "skipped"                               # removed for the cache budget: rebuilding it would only be removed again
         try:
             with dt.writer() as w:
                 if w is None:
@@ -6236,6 +6706,7 @@ class Host:
             except OSError:
                 shutil.rmtree(tmp, ignore_errors=True)
         staged = os.path.join(final, "host")
+        touch_use(os.path.join(final, ".complete"))         # its last use: the cache budget never evicts one a run just took
         self.env["MW_BUILD_GATE_HOST"] = staged
         self.env["MW_BUILD_REFSET_KEY"] = key
         if isinstance(self.sandbox, Sandbox):
@@ -6632,6 +7103,7 @@ class Host:
             key = source_key(p, checkout, "run")
             store = prepared_store(self.cache, repo, name, self.platform_version, key)
             if os.path.isfile(os.path.join(store, ".complete")):
+                touch_use(os.path.join(store, ".complete"))  # its last use: the cache budget never evicts one a run reads
                 env_add[p["env"]] = store
                 ro.append(store)
                 sink.add([{"kind": "line", "text": f"prepared {name}: installed on this server (key {key[:12]}) — nothing prepared for this run"}])
@@ -7495,6 +7967,134 @@ def self_test() -> int:
     check("disk/values: whole and fractional GiB, 0 allowed, junk and out-of-range → the default",
           disk_gib("2.5", 0) == int(2.5 * G_) and disk_gib("0", 7) == 0 and disk_gib("x", 7) == 7 * G_ and disk_gib("-1", 7) == 7 * G_
           and disk_gib("nan", 7) == 7 * G_ and disk_percent("95", 15) == 15 and disk_percent("10", 15) == 10)
+    # THE CACHE BUDGET: one total, a share per area that can never sum above it, LRU eviction within each area
+    check("budget/unset or not a positive number → no budget (only the slice bound applies)",
+          all(cache_budget(e_) is None for e_ in ({}, {CACHE_MAX_ENV: ""}, {CACHE_MAX_ENV: "0"}, {CACHE_MAX_ENV: "-1"},
+                                                   {CACHE_MAX_ENV: "x"}, {CACHE_MAX_ENV: "nan"}, {CACHE_MAX_ENV: "inf"})))
+    bd_ = cache_budget({CACHE_MAX_ENV: "18"}) or {}
+    check("budget/the defaults are the chart's percentages of the budget (tree 50, slices 20, nuget 15, refsets 5, prepared 5)",
+          bd_.get("total") == 18 * G_ and bd_["shares"] == {a_: 18 * G_ * p_ // 100 for a_, p_ in CACHE_SHARE_DEFAULT_PERCENT.items()}
+          and not bd_["scaled"], bd_)
+    bm_ = cache_budget({CACHE_MAX_ENV: "18", CACHE_SHARE_ENV["tree"]: "0", SLICE_CACHE_MAX_ENV: "5", CACHE_SHARE_ENV["nuget"]: "8",
+                        CACHE_SHARE_ENV["refsets"]: "2", CACHE_SHARE_ENV["prepared"]: "2"}) or {}
+    check("budget/declared shares are taken as given (0 = the area keeps nothing)",
+          bm_.get("shares") == {"tree": 0, "slices": 5 * G_, "nuget": 8 * G_, "refsets": 2 * G_, "prepared": 2 * G_}, bm_)
+    bo_ = cache_budget({CACHE_MAX_ENV: "20", SLICE_CACHE_MAX_ENV: "32", CACHE_SHARE_ENV["tree"]: "20"}) or {}
+    check("budget/shares that sum above the budget are SCALED DOWN — by construction they never sum above it (the slices' 32 "
+          "under a 20 GiB budget, the 2026-11-11 Mac)", bo_.get("scaled") is True and sum(bo_["shares"].values()) <= bo_["total"]
+          and bo_["shares"]["slices"] < 20 * G_, bo_)
+    check("budget/a slices share of 0 or junk is the default (a slice cache is never unbounded, never zero)",
+          (cache_budget({CACHE_MAX_ENV: "10", SLICE_CACHE_MAX_ENV: "0"}) or {}).get("shares", {}).get("slices") == 2 * G_
+          and (cache_budget({CACHE_MAX_ENV: "10", CACHE_SHARE_ENV["nuget"]: "x"}) or {}).get("shares", {}).get("nuget") == int(1.5 * G_))
+    gone_: list = []
+    ev_l = evict_lru([(0, 4, "a"), (1, 4, "b", True), (2, 4, "c"), (3, 4, "d"), (99, 4, "e")], 12, 100.0, 10.0,
+                     lambda e_: (gone_.append(e_[2]), e_[2] != "c")[1])
+    check("budget/LRU: the oldest go first, never one marked kept, used within the minimum age or refused by its remover "
+          "(held), down to the low-water mark", ev_l == (2, 8, 12) and gone_ == ["a", "c", "d"], (ev_l, gone_))
+    check("budget/LRU: at or under the cap nothing is touched", evict_lru([(0, 4, "a")], 4, 100.0, 0.0, lambda e_: 1 / 0) == (0, 0, 4))
+    # the MEASURED Mac of 2026-11-11 (98 GiB disk, 34 GiB free, the cache at 43 GiB) under the shipped Mac budget: what one
+    # budget pass evicts, and whether the disk guard then claims (sizes only; the files are exercised below)
+    mac_ = cache_budget({CACHE_MAX_ENV: "18", CACHE_SHARE_ENV["tree"]: "0", SLICE_CACHE_MAX_ENV: "5", CACHE_SHARE_ENV["nuget"]: "8",
+                         CACHE_SHARE_ENV["refsets"]: "2", CACHE_SHARE_ENV["prepared"]: "2"}) or {"shares": {}}
+    mac_held = {"tree": 20.0, "slices": 14.0, "nuget": 6.1, "refsets": 2.0, "prepared": 1.4}
+    mac_after = {}
+    for a_, gib_ in mac_held.items():
+        n_ = max(1, int(gib_ * 16))                                    # the area as 1/16-GiB entries, all old and free
+        mac_after[a_] = evict_lru([(0, int(gib_ * G_) // n_, i_) for i_ in range(n_)], mac_["shares"][a_], 1e9, 0, lambda e_: True)[2]
+    freed_mac = sum(int(g_ * G_) for g_ in mac_held.values()) - sum(mac_after.values())
+    hmac_ = Host({RUN_DISK_ENV: "20", DISK_HEADROOM_ENV: "15"}, None, log=lambda s: None)
+    hmac_.disk_stat = lambda p_: (int(97.9 * G_), int(34.0 * G_) + freed_mac)
+    check("budget/the measured Mac (43 GiB cache, 34 GiB free of 97.9): one pass frees ~28 GiB — the tree (share 0) and the "
+          "slices above the low water of their 5 GiB — and the disk guard claims again",
+          27 * G_ < freed_mac < 30 * G_ and mac_after["tree"] == 0 and mac_after["slices"] <= int(4.5 * G_)
+          and hmac_.disk_refusal() is None, (freed_mac / G_, {k_: v_ / G_ for k_, v_ in mac_after.items()}))
+    # one budget pass over a REAL cache: every area, its holders, and the refusal line that says what holds the disk
+    bc_ = tempfile.mkdtemp(prefix="cache-budget-")
+    K_ = 1 << 20
+    t0_ = time.time()
+
+    def blob_(path_: str, mib_: float, age_: float = 0.0, marker_: Optional[str] = None) -> None:
+        os.makedirs(os.path.dirname(path_), exist_ok=True)
+        with open(path_, "wb") as fh_b:
+            fh_b.write(b"x" * int(mib_ * K_))
+        if marker_:
+            with open(marker_, "w") as fh_b:
+                fh_b.write("1")
+            os.utime(marker_, (t0_ - age_, t0_ - age_))
+    for repo_, mib_, age_ in (("Old", 3, 5000), ("New", 3, 10)):
+        dep_ = os.path.join(bc_, "deploy", "mac-tree")
+        blob_(os.path.join(dep_, repo_, "bin", "a.dll"), mib_)
+        os.makedirs(os.path.join(dep_, ".host", repo_), exist_ok=True)
+        with open(os.path.join(dep_, ".host", repo_, "manifest.json"), "w") as fh_:
+            json.dump({"entries": [["bin/a.dll", "file", int(mib_ * K_), 0, 0, 0, "h"]]}, fh_)
+        with open(os.path.join(dep_, ".host", repo_, "state.json"), "w") as fh_:
+            json.dump({"key": "k", "tip": "t", "built": "t"}, fh_)
+        os.utime(os.path.join(dep_, ".host", repo_, "state.json"), (t0_ - age_, t0_ - age_))
+    tdig_, pdig_ = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+    own_ = refset_key(tdig_, pdig_)
+    blob_(os.path.join(bc_, "refsets", own_, "host", "a"), 1, 9e6, os.path.join(bc_, "refsets", own_, ".complete"))
+    blob_(os.path.join(bc_, "refsets", "f" * 40, "host", "a"), 1, 9e6, os.path.join(bc_, "refsets", "f" * 40, ".complete"))
+    blob_(os.path.join(bc_, "prepared", "R", "shelf", "a" * 32, "x"), 1, 9e6, os.path.join(bc_, "prepared", "R", "shelf", "a" * 32, ".complete"))
+    blob_(os.path.join(bc_, "prepared", "R", "shelf", "b" * 32, "x"), 1, 60, os.path.join(bc_, "prepared", "R", "shelf", "b" * 32, ".complete"))
+    for i_, age_ in enumerate((9e6, 8e6, 30)):
+        blob_(os.path.join(bc_, "nuget", f"p{i_}", "1.0.0", "p.nupkg"), 1, age_, os.path.join(bc_, "nuget", f"p{i_}", "1.0.0", ".nupkg.metadata"))
+    blob_(os.path.join(bc_, "nuget-warm", "R", "k" * 32), 0)
+    blob_(os.path.join(bc_, "nuget-seed", "3.1.1.installed"), 0)
+    blob_(os.path.join(bc_, "git", "R.git", "pack"), 0.5)
+    budget_env_ = {"MW_BUILD_CACHE": bc_, "MW_BUILD_WORK": bc_, "MW_BUILD_HOST": "h1", RUN_DISK_ENV: "20", DISK_HEADROOM_ENV: "15",
+                   "MW_BUILD_TESTER_DIGEST": tdig_, "MW_BUILD_PORTAL_DIGEST": pdig_,
+                   CACHE_MAX_ENV: str(8 / 1024), CACHE_SHARE_ENV["tree"]: str(4 / 1024), SLICE_CACHE_MAX_ENV: str(1 / 1024),
+                   CACHE_SHARE_ENV["nuget"]: str(1 / 1024), CACHE_SHARE_ENV["refsets"]: str(1 / 1024), CACHE_SHARE_ENV["prepared"]: str(1 / 1024)}
+    hbl_: list = []
+    hb2_ = Host(dict(budget_env_), None, log=hbl_.append)
+    import fcntl as _fcb
+    reserved_ = os.path.join(bc_, ".disk-claims", "other")
+    os.makedirs(os.path.dirname(reserved_), exist_ok=True)
+    with open(reserved_, "w") as fh_:
+        fh_.write(str(20 * G_))                                         # another replica's run is in flight on this cache
+    u1_ = hb2_.bound_cache(force=True) or {}
+    check("budget/tree: over its share the least recently USED deployment tree goes (with its host state), the newer stays, "
+          "and the removed one is held back from a rebuild at this identity and share",
+          not os.path.exists(os.path.join(bc_, "deploy", "mac-tree", "Old")) and not os.path.exists(os.path.join(bc_, "deploy", "mac-tree", ".host", "Old"))
+          and os.path.isdir(os.path.join(bc_, "deploy", "mac-tree", "New"))
+          and tree_held_back(bc_, "mac-tree", "Old", warm_key(hb2_.env, hb2_.identity), hb2_.tree_share())
+          and not tree_held_back(bc_, "mac-tree", "Old", "another-key", hb2_.tree_share()), (u1_, hbl_))
+    check("budget/refsets: the stale reference set goes, the one this host's own images key is kept (however old)",
+          os.path.isdir(os.path.join(bc_, "refsets", own_)) and not os.path.exists(os.path.join(bc_, "refsets", "f" * 40)), hbl_)
+    check("budget/prepared: an input unused for a run's whole deadline goes, one a run touched recently is kept",
+          not os.path.exists(os.path.join(bc_, "prepared", "R", "shelf", "a" * 32)) and os.path.isdir(os.path.join(bc_, "prepared", "R", "shelf", "b" * 32)))
+    check("budget/nuget: over its share but a run is in flight on this cache → nothing evicted, and the line says why",
+          len(nuget_packages(os.path.join(bc_, "nuget"))) == 3 and any("a run is in flight" in m_ for m_ in hbl_), hbl_)
+    os.remove(reserved_)
+    held_tree_ = _try_lock(os.path.join(bc_, "deploy", "mac-tree", ".locks", "New.lock"), _fcb.LOCK_SH | _fcb.LOCK_NB)
+    hb2_.bound_cache(force=True)
+    check("budget/nuget: a deployment tree a run holds also keeps every package", len(nuget_packages(os.path.join(bc_, "nuget"))) == 3)
+    held_tree_.close()
+    hb2_.seed_done = "3.1.1"
+    u2_ = hb2_.bound_cache(force=True) or {}
+    check("budget/nuget: with nothing in flight the OLDEST packages go (never one younger than an hour), and the warm-NuGet and "
+          "package-seed markers go with them so the closure is prepared again",
+          nuget_packages(os.path.join(bc_, "nuget")) == {"p2/1.0.0"} and not os.path.exists(os.path.join(bc_, "nuget-warm"))
+          and not os.path.exists(os.path.join(bc_, "nuget-seed", "3.1.1.installed")) and hb2_.seed_done is None, (u2_, hbl_))
+    check("budget/the reading names every area against its share and what no share covers (the masters)",
+          set(u2_.get("areas", {})) == set(CACHE_AREA_DIRS) and u2_.get("other", 0) >= int(0.5 * K_)
+          and u2_.get("total") == sum(u2_["areas"].values()) + u2_["other"], u2_)
+    check("budget/a second pass inside the interval does not walk the cache again", hb2_.bound_cache() is hb2_.cache_usage)
+    hb2_.disk_stat = lambda p_: (int(97.9 * G_), 34 * G_)
+    why_c = hb2_.disk_refusal() or ""
+    check("budget/the disk guard's refusal says what holds the disk: the cache by area against its budget, and the rest",
+          "34.0 GiB free of 97.9 GiB" in why_c and "the cache holds" in why_c and "tree " in why_c and "slices " in why_c
+          and CACHE_MAX_ENV in why_c and "the rest of that disk (work volumes, images, system) holds" in why_c, why_c)
+    hz2_ = Host({**budget_env_, CACHE_SHARE_ENV["tree"]: "0"}, None, log=lambda s: None)
+    hz2_.bound_cache(force=True)
+    check("budget/a tree share of 0 keeps no deployment tree and starts no warm build",
+          hz2_.tree_share() == 0 and not os.path.exists(os.path.join(bc_, "deploy", "mac-tree", "New"))
+          and hz2_.warm_main_when_idle() is None and not os.listdir(os.path.join(bc_, "deploy", "mac-tree", ".host")))
+    hn2_: list = []
+    Host({"MW_BUILD_CACHE": bc_, "MW_BUILD_WORK": bc_}, None, log=hn2_.append).bound_cache(force=True)
+    check("budget/no budget declared: said once, nothing outside the slices evicted",
+          any("none declared" in m_ and CACHE_MAX_ENV in m_ for m_ in hn2_) and nuget_packages(os.path.join(bc_, "nuget")) == {"p2/1.0.0"}, hn2_)
+    shutil.rmtree(bc_, ignore_errors=True)
     # The host's OWN sandbox binds every staged image root read-only — /core-tests included: core's
     # shard and doc-gate stages run `python3 /core-tests/core-tests.py …` (core .github/build-stages.json).
     hav = " ".join(Host({}, None, log=lambda s: None).sandbox.argv("true", "/w/s", "/w/o", {}))
