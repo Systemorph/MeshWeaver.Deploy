@@ -3438,6 +3438,32 @@ OUT="$(fd 404)"; RC=$?
 [ "$RC" = 1 ] && grep -q 'does not answer /api/fleet/self-status yet' <<<"$OUT" && ok "a control that does not serve the endpoint is RED (unread), never a pass" || bad "doctor 404" "rc=$RC $OUT"
 rm -rf "$FD"
 
+echo "── the local ingress never pins browsers to https for localhost: HSTS max-age=0 (2026-11-11) ──────"
+HS="$(mktemp -d)"; mkdir -p "$HS/stubs"
+cat > "$HS/stubs/helm" <<STUB
+#!/bin/bash
+echo "helm \$*" >> "$HS/log"; exit 0
+STUB
+cat > "$HS/stubs/kubectl" <<STUB
+#!/bin/bash
+echo "kubectl \$*" >> "$HS/log"
+case "\$*" in *"get configmap ingress-nginx-controller"*) cat "$HS/cm" 2>/dev/null || exit 1 ;; esac
+exit 0
+STUB
+chmod +x "$HS/stubs/"*
+hs() { env MEMEX_LOCAL_LIB=1 PATH="$HS/stubs:$PATH" bash -c '. "$0"; '"$1" "$CLI" 2>&1; }
+: > "$HS/log"; hs install_ingress_nginx >/dev/null
+grep -q -- '--set-string controller.config.hsts=true --set-string controller.config.hsts-max-age=0 --set-string controller.config.hsts-include-subdomains=true --set-string controller.config.hsts-preload=false' "$HS/log" \
+  && ok "a fresh install's ingress-nginx answers Strict-Transport-Security max-age=0; includeSubDomains (never the 1-year default that broke loopback OAuth)" || bad "install hsts" "$(cat "$HS/log")"
+printf 'allow-snippet-annotations=false\n' > "$HS/cm"; : > "$HS/log"
+OUT="$(hs ensure_ingress_no_hsts)"
+grep -q 'kubectl -n ingress-nginx patch configmap ingress-nginx-controller --type merge -p {"data":{"hsts":"true","hsts-max-age":"0","hsts-include-subdomains":"true","hsts-preload":"false"}}' "$HS/log" \
+  && ok "an EXISTING install gets the same keys patched into the controller's ConfigMap on update (no chart re-run)" || bad "update hsts patch" "$OUT / $(cat "$HS/log")"
+printf 'hsts=true\nhsts-include-subdomains=true\nhsts-max-age=0\nhsts-preload=false\n' > "$HS/cm"; : > "$HS/log"
+hs ensure_ingress_no_hsts >/dev/null; ! grep -q 'patch' "$HS/log" && ok "…and a ConfigMap that already says so is left alone (idempotent)" || bad "hsts idempotent" "$(cat "$HS/log")"
+grep -q 'ensure_ingress_no_hsts' <<<"$(sed -n '/^cmd_update() {/,/^}/p' "$CLI")" && ok "every update runs it (existing installs on eiger and the second Mac heal on their next update)" || bad "update calls hsts" ""
+rm -rf "$HS"
+
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
