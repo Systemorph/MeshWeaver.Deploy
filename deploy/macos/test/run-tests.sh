@@ -685,9 +685,14 @@ grep -q -- '--reset' "$NT/up.log" && [ ! -e "$NT/state/preauth.key" ] && grep -q
 # 5. the login server refuses the key (expired/used): removed, said, never a retry loop
 printf 'old' > "$NT/u/.memex-local/enrol/studio-2.preauth"; printf 'backend error: authkey expired\n' > "$NT/up.out"; echo 1 > "$NT/up.rc"
 OUT="$(nt "NeedsLogin")"
-[ ! -e "$NT/state/preauth.key" ] && grep -q 'REFUSED the pre-auth key (expired or already used)' <<<"$OUT" && grep -q 'RC=0' <<<"$OUT" \
+[ ! -e "$NT/state/preauth.key" ] && [ ! -e "$NT/u/.memex-local/enrol/studio-2.preauth" ] && grep -q 'REFUSED the pre-auth key (expired or already used)' <<<"$OUT" && grep -q 'RC=0' <<<"$OUT" \
   && ok "a refused (expired/used) key is removed and said, not retried every run" || bad "refused key" "$OUT"
-rm -f "$NT/up.out" "$NT/up.rc"
+# …and a failure that is NOT the key's (the network, the daemon) keeps the key for the next run
+printf 'fresh' > "$NT/u/.memex-local/enrol/studio-2.preauth"; printf 'connection refused: the key was not valid at that moment of the network\n' > "$NT/up.out"
+OUT="$(nt "NeedsLogin")"
+[ -e "$NT/state/preauth.key" ] && grep -q 'FAILED to join — the key file is kept' <<<"$OUT" \
+  && ok "an 'up' failure that is not a refusal of the key keeps the key (only the login server's key refusals remove it)" || bad "other failure" "$OUT"
+rm -f "$NT/up.out" "$NT/up.rc" "$NT/state/preauth.key"
 # 6. a daemon that never settles: nothing is changed
 printf 'fresh' > "$NT/u/.memex-local/enrol/studio-2.preauth"
 OUT="$(nt "Starting")"

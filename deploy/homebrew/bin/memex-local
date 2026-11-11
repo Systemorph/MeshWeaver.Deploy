@@ -2175,12 +2175,24 @@ fleet_apply_network() {
   [ -n "$login" ] || { warn "network: the code carries a pre-auth key but no login server — skipped"; return 0; }
   local ts=(tailscale --socket="${MEMEX_TAILSCALED_SOCKET:-/var/run/tailscaled.socket}")
   if [ "$(id -u)" = 0 ] && command -v tailscale >/dev/null 2>&1; then
-    # A node that is already Running is never re-keyed, and one that was ever logged in is never --reset (2026-11-11:
-    # a --reset up with a spent key logged the second Mac Studio out). The key's copies go once the node is joined.
-    local st reset=(--reset)
-    st="$(${ts[@]+"${ts[@]}"} status --json 2>/dev/null | sed -n 's/.*"BackendState"[[:space:]]*:[[:space:]]*"\([A-Za-z]*\)".*/\1/p' | head -1)"
+    # The same rules as the device bootstrap (fleet-bootstrap.sh 1.4.3, 2026-11-11: a --reset up with a spent key logged
+    # the second Mac Studio out): wait (bounded) for a settled BackendState; a Running node is never re-keyed; a node
+    # with a node key is never --reset and is only re-logged in from NeedsLogin; anything unsettled hands the key over.
+    local st="" j waited=0 reset=(--reset) have=no
+    while :; do
+      j="$(${ts[@]+"${ts[@]}"} status --json 2>/dev/null || true)"
+      st="$(printf '%s' "$j" | sed -n 's/.*"BackendState"[[:space:]]*:[[:space:]]*"\([A-Za-z]*\)".*/\1/p' | head -1)"
+      case "$st" in ''|NoState|Starting) ;; *) break ;; esac
+      [ "$waited" -ge "${MEMEX_TS_SETTLE_S:-90}" ] && { st=unsettled; break; }
+      sleep 2; waited=$((waited + 2))
+    done
+    printf '%s' "$j" | grep -q '"HaveNodeKey"[[:space:]]*:[[:space:]]*true' && { have=yes; reset=(); }
     if [ "$st" = Running ]; then ok "network: already joined (BackendState Running) — the issued key is not used"; rm -f "$dir/t" "$FLEET_DIR/$id.preauth"; return 0; fi
-    ${ts[@]+"${ts[@]}"} status --json 2>/dev/null | grep -q '"HaveNodeKey"[[:space:]]*:[[:space:]]*true' && reset=()
+    if [ "$st" = unsettled ] || { [ "$have" = yes ] && [ "$st" != NeedsLogin ]; }; then
+      ( umask 077; cp "$dir/t" "$FLEET_DIR/$id.preauth"; printf '%s\n' "$login" > "$FLEET_DIR/$id.login-server" )
+      warn "network: tailscaled is ${st} — the key is not used now; it is handed to the device bootstrap ($FLEET_DIR/$id.preauth), which joins once the daemon settles"
+      return 0
+    fi
     if ${ts[@]+"${ts[@]}"} up --login-server "$login" --hostname "$id" --auth-key="file:$dir/t" ${reset[@]+"${reset[@]}"} >/dev/null; then
       ok "network: joined $login as $id"; rm -f "$dir/t" "$FLEET_DIR/$id.preauth"
     else warn "network: 'tailscale up' failed — the bootstrap retries"; fi

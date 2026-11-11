@@ -439,7 +439,9 @@ ts_node_registered() {
 # A held or dropped key is single-use: once the node is joined — by whichever path — every copy goes.
 drop_preauth_keys() {
   local machine="$1" user="${2:-}" f
-  for f in "$TAILSCALED_STATE_DIR/preauth.key" ${user:+"$(user_home "$user")/.memex-local/enrol/$machine.preauth"}; do
+  local copies=("$TAILSCALED_STATE_DIR/preauth.key")
+  [ -z "$user" ] || copies+=("$(user_home "$user")/.memex-local/enrol/$machine.preauth")
+  for f in "${copies[@]}"; do
     if [ -e "$f" ] || [ -L "$f" ]; then run rm -f "$f"; log "network: removed the spent pre-auth key copy $f (never printed)"; fi
   done
 }
@@ -494,7 +496,8 @@ step_network() {
   [ -z "$out" ] || printf '%s\n' "$out" | grep -v -i 'key' | head -5 | while IFS= read -r l; do log "network: tailscale: $l"; done
   if [ "$rc" != 0 ]; then
     case "$out" in
-      *"authkey expired"*|*"invalid key"*|*"key has been used"*|*"already used"*|*"not valid"*)
+      # only the login server's own refusals of the KEY (headscale/tailscale wording) — any other failure keeps it
+      *"authkey expired"*|*"AuthKey expired"*|*"authkey already used"*|*"AuthKey already used"*|*"invalid key"*|*"AuthKey not found"*)
         run rm -f "$key_file"; log "network: the login server REFUSED the pre-auth key (expired or already used) — removed; a new single-use key is needed"; return 0 ;;
     esac
     log "network: FAILED to join — the key file is kept for the next run"; return 1
