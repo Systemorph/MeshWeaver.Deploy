@@ -21,11 +21,13 @@ import argparse
 import base64
 import hashlib
 import hmac
+import http.client as httpclient
 import json
 import os
 import re
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,15 +39,46 @@ NUGET_ORG = "https://api.nuget.org/v3/index.json"
 Http = Callable[[str, str, Optional[bytes], dict], "tuple[int, bytes]"]
 
 
+TRANSPORT_ERRORS = (urllib.error.URLError, OSError, ValueError, httpclient.HTTPException)
+
+
 def http(method: str, url: str, body: Optional[bytes], headers: dict) -> "tuple[int, bytes]":
+    """One exchange; (status, body), status 0 for a TRANSPORT failure. Never raises for one: a connection reset, a
+    timeout, an IncompleteRead or a chunked answer cut off mid-way (`ValueError: invalid literal for int() with base 16`,
+    run 43081471912) — including while reading an error answer's body — is status 0, which `exchange` retries."""
     req = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
             return r.status, r.read()
     except urllib.error.HTTPError as e:
-        return e.code, e.read() if e.fp else b""
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return 0, str(e).encode()
+        try:
+            return e.code, e.read() if e.fp else b""
+        except TRANSPORT_ERRORS:
+            return (e.code if e.code < 500 else 0), b""
+    except TRANSPORT_ERRORS as e:
+        return 0, f"{type(e).__name__}: {e}".encode()
+
+
+RETRY_DELAYS = (2, 5, 10, 20, 40, 60)                 # seconds before the 2nd … 7th attempt
+
+
+def retryable(status: int) -> bool:
+    """A transport failure (0), a timeout or throttle (408, 429) or a server error (5xx) — never a refusal (4xx)."""
+    return status == 0 or status in (408, 429) or status >= 500
+
+
+def exchange(call: Http, method: str, url: str, body: Optional[bytes], headers: dict,
+             sleep: Callable[[float], None] = time.sleep, log: Callable[[str], None] = print) -> "tuple[int, bytes]":
+    """`call` with retries and backoff on what a flaky control instance answers (`retryable`); an upload is idempotent —
+    the store is content-addressed and a manifest is written once, so a retry can never write anything twice."""
+    status, answer = call(method, url, body, headers)
+    for delay in RETRY_DELAYS:
+        if not retryable(status):
+            break
+        log(f"  {method} {urllib.parse.urlparse(url).path}: {status or 'no answer'} ({answer[:120]!r}) — retried in {delay} s")
+        sleep(delay)
+        status, answer = call(method, url, body, headers)
+    return status, answer
 
 
 def signature(secret: str, kind: str, name: str, sha256: str, size: int) -> str:
@@ -110,7 +143,8 @@ def packages(folder: str) -> list[dict]:
     return out
 
 
-def publish(api: str, version: str, folder: str, secret: str, call: Http, log: Callable[[str], None] = print) -> int:
+def publish(api: str, version: str, folder: str, secret: str, call: Http, log: Callable[[str], None] = print,
+            sleep: Callable[[float], None] = time.sleep) -> int:
     if not secret:
         raise SystemExit("::error::SEED_SECRET is empty — the seed cannot be signed")
     entries = packages(folder)
@@ -121,9 +155,11 @@ def publish(api: str, version: str, folder: str, secret: str, call: Http, log: C
     for e in entries:
         with open(e["file"], "rb") as fh:
             data = fh.read()
-        status, body = call("PUT", f"{base}/seeds/blobs/{e['sha256']}", data, {
-            "Content-Type": "application/octet-stream", "Expect": "100-continue",
-            "X-Seed-Signature": signature(secret, "blob", e["sha256"], e["sha256"], len(data))})
+        # RESUMABLE: a blob control already holds is answered "already held" (the store hashes nothing twice), so a run that
+        # follows one cut off mid-way only re-confirms the blobs it had sent
+        status, body = exchange(call, "PUT", f"{base}/seeds/blobs/{e['sha256']}", data, {
+            "Content-Type": "application/octet-stream",
+            "X-Seed-Signature": signature(secret, "blob", e["sha256"], e["sha256"], len(data))}, sleep, log)
         if status not in (200, 201):
             raise SystemExit(f"::error::the blob of {e['id']}/{e['version']} was refused ({status}: {body[:300]!r})")
         try:
@@ -136,8 +172,10 @@ def publish(api: str, version: str, folder: str, secret: str, call: Http, log: C
                            "packages": [{k: e[k] for k in ("id", "version", "sha256", "sha512", "bytes", "source")} for e in entries]},
                           separators=(",", ":"), sort_keys=True).encode()
     mhash = hashlib.sha256(manifest).hexdigest()
-    status, body = call("PUT", f"{base}/seeds/{urllib.parse.quote(version, safe='')}/manifest?sha256={mhash}", manifest, {
-        "Content-Type": "application/json", "X-Seed-Signature": signature(secret, "manifest", version, mhash, len(manifest))})
+    # LAST, and only now: every blob above was confirmed (stored or already held) — a host never reads a manifest that names
+    # a blob control does not have
+    status, body = exchange(call, "PUT", f"{base}/seeds/{urllib.parse.quote(version, safe='')}/manifest?sha256={mhash}", manifest, {
+        "Content-Type": "application/json", "X-Seed-Signature": signature(secret, "manifest", version, mhash, len(manifest))}, sleep, log)
     if status == 409:
         raise SystemExit(f"::error::the seed of {version} is published already with OTHER bytes — a published seed never changes")
     if status not in (200, 201):
@@ -214,6 +252,41 @@ def self_test() -> int:
             check("publish: a wrong secret is refused", False, "accepted")
         except SystemExit as e:
             check("publish: a wrong secret is refused", "refused (401" in str(e), e)
+    # ── a flaky control instance: transport failures and 5xx are retried, refusals are not ──
+    with tempfile.TemporaryDirectory() as t2:
+        d = os.path.join(t2, "demo.r", "1.0.0")
+        os.makedirs(d)
+        open(os.path.join(d, "demo.r.1.0.0.nupkg"), "wb").write(b"R")
+        open(os.path.join(d, ".nupkg.metadata"), "w").write(json.dumps({"version": 2}))
+        flaky_answers = [(0, b"ValueError: invalid literal for int() with base 16: b''"), (502, b""), (0, b"ConnectionResetError")]
+        calls: list = []
+
+        def flaky(method: str, url: str, body: Optional[bytes], headers: dict) -> "tuple[int, bytes]":
+            calls.append(url)
+            if flaky_answers and "/blobs/" in url:
+                return flaky_answers.pop(0)
+            return fake(method, url, body, headers)
+        store.clear()
+        slept: list = []
+        publish("https://ops.example/api/builds", "3.1.9", t2, "s3cret", flaky, lambda m: None, slept.append)
+        check("retry: a cut-off answer, a 502 and a reset are retried with backoff, then the blob and the manifest land",
+              "manifest:3.1.9" in store and slept == list(RETRY_DELAYS[:3]) and len([c for c in calls if "/blobs/" in c]) == 4, (slept, calls))
+        calls.clear()
+        refused = lambda method, url, body, headers: (calls.append(url), (401, b"{}"))[1]
+        try:
+            publish("https://ops.example/api/builds", "3.1.10", t2, "s3cret", refused, lambda m: None, lambda s: None)
+            check("retry: a refusal is not retried", False, "accepted")
+        except SystemExit:
+            check("retry: a refusal (401) is not retried, and no manifest is sent", calls and all("/blobs/" in c for c in calls) and len(calls) == 1, calls)
+        never = lambda method, url, body, headers: (0, b"timeout")
+        try:
+            publish("https://ops.example/api/builds", "3.1.11", t2, "s3cret", never, lambda m: None, lambda s: None)
+            check("retry: an instance that never answers ends red", False, "accepted")
+        except SystemExit as e:
+            check("retry: an instance that never answers ends red after the last attempt, naming the blob", "demo.r/1.0.0" in str(e), e)
+    check("http: a connection that cannot be made is a transport failure (0), never an exception",
+          http("PUT", "http://127.0.0.1:9/never", b"x", {})[0] == 0)
+
     if fails:
         for f in fails:
             print(f"SELF-TEST FAILED: {f}")
