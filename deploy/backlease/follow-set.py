@@ -305,7 +305,10 @@ def sizing_file(agent: Optional[str], chart: str) -> Optional[str]:
     f = os.path.join(agent, SIZING_FILE)
     tpl = os.path.join(chart, "templates", "build-host", "_build-hosts.tpl")
     try:
-        return f if os.path.isfile(f) and "sizeEnforced" in open(tpl).read() else None
+        if not os.path.isfile(f):
+            return None
+        with open(tpl) as fh:
+            return f if "sizeEnforced" in fh.read() else None
     except OSError:
         return None
 
