@@ -78,7 +78,14 @@ buildHosts:
     storageClass: "local-path"
     size: "20Gi"
     accessMode: "ReadWriteOnce"
-    shares: {treeGi: 0, slicesGi: 5, nugetGi: 8, refsetsGi: 2, preparedGi: 2}
+    # The 20Gi REQUEST is nominal: local-path enforces nothing and a bound claim cannot be expanded, so the BUDGET bounds
+    # the cache (sizeEnforced: false). 80 GiB holds the deployment tree (~20 GiB) warm beside the slices — a budget under
+    # it made every run COLD (2026-11-11). This is the default for a Mac whose disk was never sized; `memex-local buildhost
+    # apply` writes the Mac's own budget, sized from its build disk so one run (20 GiB + 15 %) always still fits, into
+    # ~/.memex-local/buildhost-follow/<profile>/sizing.yaml, which the follower layers over these values.
+    sizeEnforced: false
+    maxGi: 80
+    shares: {treeGi: 24, slicesGi: 30, nugetGi: 8, refsetsGi: 3, preparedGi: 2}
   # bwrap needs a fresh /proc per stage, which only an Unmasked /proc allows, and Kubernetes grants that only to a pod in
   # its own user namespace (hostUsers: false) — hence the dedicated containerd profile first-attach.sh checks for.
   sandbox: {appArmorProfile: "Localhost", appArmorLocalhostProfile: "mw-build-host", seccompProfile: "Unconfined", userNamespace: true}

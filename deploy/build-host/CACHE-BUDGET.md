@@ -112,26 +112,23 @@ The budget pass runs before the guard reads the disk, so this line appears only 
 
 ## The Mac (`deploy/backlease/build-host-mac.values.yaml`)
 
-The Mac's claim stays at 20Gi. A `local-path` claim cannot be resized, and raising `size` would only make the next
-`helm upgrade` fail. The budget is 18 GiB. The MeshWeaver.Plugins deployment tree does not fit in that, so the Mac keeps
-**no tree**:
+**Since 2026-11-11 (the owner's go): an 80 GiB budget over the unchanged 20Gi claim, with the warm tree back.**
+With the 18 GiB budget the claim allowed, the deployment tree (~20 GiB) could never be kept, and every run on the Macs
+built COLD ("workspace: COLD worktree … no deployment tree yet").
 
-- `treeGi: 0`: no warm build starts, and every run takes a cold worktree off the master, which the run says;
-- it spends the budget on what does fit: `nugetGi` 8 (6.1 measured), `slicesGi` 5, `refsetsGi` 2 and `preparedGi` 2. That
-  is 17 GiB, leaving 1 GiB plus the 2 GiB margin for the masters.
+A `local-path` claim's request is nominal: nothing enforces it, and a bound claim cannot be expanded (a changed
+`spec.resources` makes the next `helm upgrade` fail). So the budget is decoupled from the claim, not the claim raised:
 
-To bring the warm tree back, the cache must be declared large enough for it: a new claim, or `cache.medium: host` with an
-explicit `maxGi`. That is a decision about the disk, made in a pull request, never a silent overrun.
+- `cache.sizeEnforced: false` (only accepted for `storageClass: local-path`) lets `cache.maxGi` exceed `cache.size`;
+  the runner's budget is then the only bound;
+- the Mac values default to `maxGi: 80` with `treeGi 24, slicesGi 30, nugetGi 8, refsetsGi 3, preparedGi 2` (67 GiB,
+  13 GiB margin);
+- each Mac's OWN budget is sized from its build disk by `memex-local buildhost apply`: `min(80, disk × 85 % − images 12
+  − system 4 − one run 20)`, at least 10. One run, plus the 15 % the claim guard keeps free, always still fits. The tree
+  share is 24 GiB only when the budget is at least 45 GiB, otherwise 0: a small disk builds cold rather than thrash a tree it
+  cannot keep. Examples: a 197 GiB disk gets 80 (3 runs), 100 GiB gets 49 (1 run), 60 GiB gets 15 (1 run, no tree);
+- `buildhost apply` writes that sizing (runners, resources, stage slots, the budget and its shares) to
+  `~/.memex-local/buildhost-follow/<profile>/sizing.yaml`. The release follower layers that file over the Mac values on
+  every full upgrade. Before this, a follower upgrade reset a Mac to the values file's defaults.
 
-**The first budget pass on a host whose cache already holds the measured 43 GiB:**
-
-- the tree goes whole (its share is 0): 20 GiB;
-- the slices go down to the low-water mark of their 5 GiB share (4.5 GiB): about 9.5 GiB;
-- NuGet (6.1 of 8), the reference sets (2.0 of 2) and the prepared inputs (1.4 of 2) stay. A reference set the host's
-  images no longer key goes if it is past its deadline.
-
-That frees about 29.5 GiB. The cache drops to about 14.4 GiB and the disk to about 63.5 GiB free. The guard then passes:
-63.5 − 20 ≥ 14.7 for the first run, and 63.5 − 2 × 20 = 23.5 ≥ 14.7 for a second replica's run. A third replica's
-reservation does not fit (3.5 < 14.7), so two runs at a time is what this disk holds with the current images.
-
-The build-run.py self-test `budget/the measured Mac` pins this arithmetic.
+Previously (the 18 GiB budget, 2026-11-11 morning): The build-run.py self-test `budget/the measured Mac` pins this arithmetic.
