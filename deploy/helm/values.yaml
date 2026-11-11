@@ -1326,6 +1326,10 @@ buildHosts:
   # the control instance's content-addressed, append-only module store, so an evicted one is fetched again by its hash.
   # Unbounded, it reached 117 GB on a Mac (2026-11-10) and put the node at DiskPressure (MeshWeaver.Plugins Hosting/OneBuildTree.md).
   sliceCacheMaxGi: 32
+  # The port the runner answers the kubelet's readiness probe on (GET /ready: 200 once the host is staged, else 503), whole
+  # number in [1024, 65535]. An httpGet probe, never an exec: on the Mac hosts every exec into the user-namespaced build
+  # container fails (runc 1.4.0 + `hostUsers: false`), so an exec probe never passed. No Service exposes it.
+  readyPort: 8090
   # NO NETWORK DURING A RUN (MeshWeaver.Plugins Hosting/OneBuildTree.md): `offline` runs every stage in its own network
   # namespace (loopback only) with the prepared package folder as NuGet's ONLY source, and a package restored per run is an
   # ERROR (MWPREP001). `open` keeps today's network and says what a run still fetched. Turn `offline` on once a run's whole

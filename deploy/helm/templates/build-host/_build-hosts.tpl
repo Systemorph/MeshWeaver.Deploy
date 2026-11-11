@@ -142,6 +142,19 @@ The refusals, and why each one exists:
 {{- if or (lt $sliceCacheMaxGi 1) (gt $sliceCacheMaxGi 4096) -}}
 {{- fail (printf "buildHosts.sliceCacheMaxGi %d must be within [1, 4096] — the bound of the host's module-slice cache" $sliceCacheMaxGi) -}}
 {{- end -}}
+{{- /* The READINESS PORT: the runner answers the kubelet's httpGet probe on GET /ready itself (200 once staged, else 503).
+       An exec probe never passed on the Mac hosts (runc + user namespaces: "chown /dev/stdout: invalid argument"). A whole
+       number in [1024, 65535] — the pod runs unprivileged. hasKey, not `default`. */ -}}
+{{- $readyPort := 8090 -}}
+{{- if hasKey $b "readyPort" -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $b.readyPort)) -}}
+{{- fail (printf "buildHosts.readyPort %v must be a whole number within [1024, 65535] — the port the runner answers the readiness probe on" $b.readyPort) -}}
+{{- end -}}
+{{- $readyPort = int $b.readyPort -}}
+{{- end -}}
+{{- if or (lt $readyPort 1024) (gt $readyPort 65535) -}}
+{{- fail (printf "buildHosts.readyPort %d must be within [1024, 65535] — the port the runner answers the readiness probe on (the pod runs unprivileged)" $readyPort) -}}
+{{- end -}}
 {{- /* NO NETWORK DURING A RUN (MeshWeaver.Plugins Hosting/OneBuildTree.md): `offline` gives every run stage its own network
        namespace and the prepared package folder as NuGet's only source; `open` keeps today's network. */ -}}
 {{- $stageNetwork := toString ($b.stageNetwork | default "open") -}}
@@ -364,7 +377,7 @@ The refusals, and why each one exists:
       "orasImage" (required "buildHosts.orasImage is required" $b.orasImage)
       "nodeSelector" $nodeSelector "tolerations" $tolerations
       "resources" ($b.resources | default dict) "workSizeLimit" ($b.workSizeLimit | default "60Gi")
-      "runDeadline" $runDeadline "stageSlots" $stageSlots "sliceCacheMaxGi" $sliceCacheMaxGi
+      "runDeadline" $runDeadline "stageSlots" $stageSlots "sliceCacheMaxGi" $sliceCacheMaxGi "readyPort" $readyPort
       "stageNetwork" $stageNetwork "runDiskGi" $runDiskGi "diskHeadroomPercent" $diskHeadroom
       "warmWorkspace" (eq (toString ($b.warmWorkspace | default false)) "true")
       "moduleHub" (eq (toString ($b.moduleHub | default false)) "true")
