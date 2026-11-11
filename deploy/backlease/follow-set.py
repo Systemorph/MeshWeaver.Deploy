@@ -18,6 +18,17 @@ Why the Mac pulls, and why from `latest` (MeshWeaver.Plugins Hosting/StandingBui
 Draining: nothing here waits or kills. The runners stop claiming on SIGTERM and finish the run in hand
 (build-run.py `stop`; terminationGracePeriodSeconds = the run deadline), so the chart's own rollout IS the drain.
 
+THE CHART AND THE MAC'S VALUES FOLLOW TOO (MeshWeaver.Plugins Hosting/OneBuildTree §7, "the follower re-applies only the
+set"). Before, a chart or values change reached a Mac only on a re-attach. Now each pass also reads this repository's
+`main` (public; `--source-repo`/`--source-ref`). When its newest commit is GREEN (the chart gate's REQUIRED_CHECKS succeeded, no check failed) and
+changed `deploy/helm` or `deploy/backlease` (their git tree ids), the pass stages that commit's chart, `build-host-mac.values.yaml`
+and this script beside the agent (the next pass runs the new script), then applies them: a FULL `helm upgrade` — the
+chart's defaults, the Mac values, the estate values first-attach set (ESTATE_KEYS, read back from the release) and the set —
+never `--reuse-values`, which keeps the old values and ignores a new chart's defaults. A red or pending commit, or one
+GitHub cannot answer, changes nothing, said on every pass while it lasts. GitHub is asked ONE question per pass while
+main's head stays the same commit (the trees and the verdict are kept in `head.json`), so two Macs behind one address stay
+far under the unauthenticated limit (60 an hour).
+
 Fails CLOSED — nothing is changed when control cannot be read, answers a set that is not complete or not well-formed,
 the release cannot be read, or a helm operation on it is still pending. Every pass prints ONE line saying what it did.
 
@@ -48,6 +59,18 @@ LABEL = "com.memex.local.buildhost-follow"
 VERSION = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 FIELDS = ("platformVersion", "testerDigest", "portalDigest", "runnerDigest")
+# The estate values first-attach.sh sets with --set-string beside the values files (the self-test reads them out of the
+# script, so a new one there cannot be forgotten here): kept from the release on a full upgrade.
+ESTATE_KEYS = ("apiUrl", "testerRepository", "portalRepository", "runnerRepository", "pluginsRegistry", "registry")
+SOURCE_REPO = "Systemorph/MeshWeaver.Deploy"
+SOURCE_REF = "main"
+# The checks that GATE the chart and this follower: chart-gate renders the Mac values and runs this self-test, the
+# chart guards check the chart against the platform. A commit is followed only when BOTH ran and succeeded and no check on
+# it failed; a check still running elsewhere (the macOS installer, the runner image) does not hold it.
+REQUIRED_CHECKS = ("Chart invariants", "Chart guards (vs platform)")
+RED = ("failure", "timed_out", "startup_failure", "action_required", "cancelled")
+VALUES_FILE = "build-host-mac.values.yaml"
+SHA = re.compile(r"^[0-9a-f]{40}$")
 HOME = os.environ.get("MEMEX_LOCAL_HOME") or os.path.join(os.path.expanduser("~"), ".memex-local")
 
 Runner = Callable[[list], "tuple[int, str]"]
@@ -72,6 +95,17 @@ def fetch(url: str) -> "tuple[int, str]":
         return 0, str(e)
 
 
+def download_to(url: str, dest: str) -> int:
+    try:
+        with urllib.request.urlopen(url, timeout=120) as r, open(dest, "wb") as fh:
+            shutil.copyfileobj(r, fh)
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except (OSError, ValueError):
+        return 0
+
+
 def desired_set(api: str, follow: str, get: Fetcher) -> "tuple[Optional[dict], str]":
     """The complete set `follow` runs, as control's record hands it over; (None, why) for anything else."""
     status, body = get(f"{api.rstrip('/')}/channels/{follow}/set")
@@ -94,8 +128,10 @@ def desired_set(api: str, follow: str, get: Fetcher) -> "tuple[Optional[dict], s
     return s, "ok"
 
 
-def deployed_set(release: str, ns: str, ctx: str, channel: str, sh: Runner) -> "tuple[Optional[dict], str]":
-    """The set the release runs now ({} when it names none); None when the release cannot be read or is mid-operation."""
+def deployed_set(release: str, ns: str, ctx: str, channel: str, sh: Runner, values_out: Optional[dict] = None
+                 ) -> "tuple[Optional[dict], str]":
+    """The set the release runs now ({} when it names none); None when the release cannot be read or is mid-operation.
+    `values_out` receives the release's user-supplied values (for the estate keys of a full upgrade)."""
     rc, out = sh(["helm", "status", release, "-n", ns, "--kube-context", ctx, "-o", "json"])
     if rc != 0:
         return None, f"release {release} cannot be read (helm status exit {rc})"
@@ -112,8 +148,151 @@ def deployed_set(release: str, ns: str, ctx: str, channel: str, sh: Runner) -> "
         values = json.loads(out) or {}
     except ValueError:
         return None, "helm values are not JSON"
+    if values_out is not None:
+        values_out.update(values)
     ch = ((values.get("buildHosts") or {}).get(channel) or {})
     return {k: ch.get(k) for k in FIELDS}, "ok"
+
+
+def source_head(get: Fetcher, repo: str = SOURCE_REPO, ref: str = SOURCE_REF, cache: Optional[str] = None
+                ) -> "tuple[Optional[dict], str]":
+    """The newest commit of `ref` with the git tree ids of `deploy/helm` and `deploy/backlease`, when it is GREEN; (None,
+    why) otherwise. Read from GitHub's public API, unauthenticated. `cache` (a JSON file) keeps the head's trees and its
+    green verdict, so an unchanged head costs ONE call per pass."""
+    api = f"https://api.github.com/repos/{repo}"
+    status, body = get(f"{api}/commits/{ref}")
+    try:
+        doc = json.loads(body) if status == 200 else None
+        sha, tree = doc["sha"], doc["commit"]["tree"]["sha"]
+    except (ValueError, TypeError, KeyError):
+        return None, f"GitHub answered {status or 'nothing'} for {repo}@{ref}"
+    if not (SHA.match(sha) and SHA.match(tree)):
+        return None, f"{repo}@{ref} names no commit"
+    seen = read_json(cache) if cache else {}
+    if seen.get("sha") == sha and seen.get("green") is True and seen.get("helm") and seen.get("backlease"):
+        return {"sha": sha, "helm": seen["helm"], "backlease": seen["backlease"]}, "ok"
+    ids: dict = {}
+    if seen.get("sha") == sha and seen.get("helm") and seen.get("backlease"):
+        ids = {"helm": seen["helm"], "backlease": seen["backlease"]}
+    else:
+        for path, want in (("", ("deploy",)), ("deploy", ("helm", "backlease"))):
+            status, body = get(f"{api}/git/trees/{tree if not path else ids['deploy']}")
+            try:
+                entries = {e["path"]: e["sha"] for e in json.loads(body)["tree"] if e.get("type") == "tree"} if status == 200 else {}
+            except (ValueError, TypeError, KeyError):
+                entries = {}
+            for w in want:
+                if w not in entries:
+                    return None, f"{repo}@{sha[:12]} has no {('deploy/' if path else '') + w}"
+                ids[w] = entries[w]
+    status, body = get(f"{api}/commits/{sha}/check-runs?per_page=100")
+    try:
+        runs = json.loads(body)["check_runs"] if status == 200 else None
+    except (ValueError, TypeError, KeyError):
+        runs = None
+    if runs is None:
+        return None, f"the checks of {repo}@{sha[:12]} cannot be read ({status})"
+    red = [r.get("name") for r in runs if r.get("status") == "completed" and r.get("conclusion") in RED]
+    by_name: dict = {}
+    for r in runs:
+        by_name.setdefault(r.get("name"), []).append(r)
+    missing = [n for n in REQUIRED_CHECKS
+               if not any(r.get("status") == "completed" and r.get("conclusion") == "success" for r in by_name.get(n, []))]
+    green = not red and not missing
+    if cache:
+        try:
+            write_json(cache, {"sha": sha, "helm": ids["helm"], "backlease": ids["backlease"], "green": green})
+        except OSError:
+            pass
+    if not green:
+        return None, (f"{repo}@{sha[:12]} is not green yet — "
+                      + (f"{len(red)} check(s) red ({', '.join(map(str, red[:3]))})" if red else
+                         f"the gate has not passed ({', '.join(missing)})"))
+    return {"sha": sha, "helm": ids["helm"], "backlease": ids["backlease"]}, "ok"
+
+
+def source_key(src: Optional[dict]) -> Optional[str]:
+    return f"{src['helm']}/{src['backlease']}" if src else None
+
+
+def read_json(path: str) -> dict:
+    try:
+        with open(path) as fh:
+            doc = json.load(fh)
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_json(path: str, doc: dict) -> None:
+    tmp = path + ".part"
+    with open(tmp, "w") as fh:
+        json.dump(doc, fh)
+    os.replace(tmp, path)
+
+
+def stage_source(repo: str, src: dict, agent: str, download: "Callable[[str, str], int]") -> Optional[str]:
+    """Stage the chart, the Mac values and this script of commit `src['sha']` beside the agent (`<agent>/helm`,
+    `<agent>/build-host-mac.values.yaml`, `<agent>/follow-set.py`), each replaced atomically; why it failed, or None.
+    Only regular files under those three paths are taken from the archive, none through a link or `..`."""
+    import tarfile
+    work = tempfile.mkdtemp(prefix=".source-", dir=agent)
+    try:
+        tgz = os.path.join(work, "src.tar.gz")
+        status = download(f"https://codeload.github.com/{repo}/tar.gz/{src['sha']}", tgz)
+        if status != 200:
+            return f"the archive of {repo}@{src['sha'][:12]} could not be downloaded ({status})"
+        out = os.path.join(work, "x")
+        wanted = {"helm": "deploy/helm/", "values": f"deploy/backlease/{VALUES_FILE}", "script": "deploy/backlease/follow-set.py"}
+        got = set()
+        with tarfile.open(tgz, "r:gz") as tar:
+            for m in tar.getmembers():
+                parts = m.name.split("/", 1)
+                rel = parts[1] if len(parts) == 2 else ""
+                if ".." in rel.split("/") or not (rel.startswith(wanted["helm"]) or rel in (wanted["values"], wanted["script"])):
+                    continue
+                if m.isdir():
+                    continue
+                if not m.isfile():
+                    return f"the archive carries a non-file at {rel} — refused"
+                dest = os.path.join(out, rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with tar.extractfile(m) as src_fh, open(dest, "wb") as fh:
+                    shutil.copyfileobj(src_fh, fh)
+                got.add("helm" if rel.startswith(wanted["helm"]) else "values" if rel == wanted["values"] else "script")
+        if not os.path.isfile(os.path.join(out, "deploy", "helm", "Chart.yaml")) or got != {"helm", "values", "script"}:
+            return f"the archive of {repo}@{src['sha'][:12]} lacks the chart, the Mac values or the follower"
+        chart = os.path.join(agent, "helm")
+        shutil.rmtree(chart + ".old", ignore_errors=True)
+        if os.path.isdir(chart):
+            os.replace(chart, chart + ".old")
+        os.replace(os.path.join(out, "deploy", "helm"), chart)
+        shutil.rmtree(chart + ".old", ignore_errors=True)
+        os.replace(os.path.join(out, wanted["values"]), os.path.join(agent, VALUES_FILE))
+        script = os.path.join(agent, "follow-set.py")
+        os.replace(os.path.join(out, wanted["script"]), script)
+        os.chmod(script, 0o755)
+        return None
+    except (OSError, tarfile.TarError, ValueError) as e:
+        return f"staging {repo}@{src['sha'][:12]} failed ({type(e).__name__}: {str(e)[:160]})"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def estate_values(values: dict) -> dict:
+    """The estate values (ESTATE_KEYS) of the release's user-supplied values, as a values document."""
+    bh = values.get("buildHosts") or {}
+    return {"buildHosts": {k: bh[k] for k in ESTATE_KEYS if k in bh}}
+
+
+def full_upgrade_cmd(release: str, ns: str, ctx: str, chart: str, values_file: str, estate_file: str, channel: str,
+                     s: dict) -> list:
+    """A FULL upgrade: the chart's defaults, the Mac values, the estate values, then the set — never --reuse-values."""
+    cmd = ["helm", "upgrade", release, chart, "--kube-context", ctx, "-n", ns,
+           "-f", os.path.join(chart, "values.yaml"), "-f", values_file, "-f", estate_file]
+    for k in FIELDS:
+        cmd += ["--set-string", f"buildHosts.{channel}.{k}={s[k]}"]
+    return cmd + ["--wait=false"]
 
 
 def upgrade_cmd(release: str, ns: str, ctx: str, chart: str, channel: str, s: dict) -> list:
@@ -124,26 +303,60 @@ def upgrade_cmd(release: str, ns: str, ctx: str, chart: str, channel: str, s: di
 
 
 def follow_once(api: str, follow: str, release: str, ns: str, ctx: str, chart: str, channel: str,
-                get: Fetcher, sh: Runner, dry_run: bool = False) -> "tuple[str, int]":
-    """One pass: (the line it prints, exit code). Exit 0 for current/applied/nothing-to-follow, 1 for a failed apply."""
+                get: Fetcher, sh: Runner, dry_run: bool = False, agent: Optional[str] = None,
+                download: "Optional[Callable[[str, str], int]]" = None, source_repo: str = SOURCE_REPO,
+                source_ref: str = SOURCE_REF) -> "tuple[str, int]":
+    """One pass: (the line it prints, exit code). Exit 0 for current/applied/nothing-to-follow, 1 for a failed apply.
+    With `agent` (the agent's directory) and `download`, the chart and the Mac values follow `source_ref` too."""
     want, why = desired_set(api, follow, get)
     if want is None:
         return f"follow-set: nothing applied — {why}", 0
-    have, why = deployed_set(release, ns, ctx, channel, sh)
+    values: dict = {}
+    have, why = deployed_set(release, ns, ctx, channel, sh, values)
     if have is None:
         return f"follow-set: nothing applied — {why}", 0
-    if have == want:
-        return f"follow-set: current — {release} runs {follow}'s set {want['platformVersion']}", 0
+    notes = []
+    source_changed = False
+    if agent is not None and download is not None:
+        src, swhy = source_head(get, source_repo, source_ref, cache=os.path.join(agent, "head.json"))
+        staged = read_json(os.path.join(agent, "source.json"))
+        if src is None:
+            notes.append(f"chart/values held — {swhy}")
+        elif source_key(src) != staged.get("key"):
+            if dry_run:
+                notes.append(f"would stage the chart and Mac values of {source_repo}@{src['sha'][:12]}")
+            else:
+                err = stage_source(source_repo, src, agent, download)
+                if err is not None:
+                    return f"follow-set: nothing applied — {err}", 1
+                write_json(os.path.join(agent, "source.json"), {"key": source_key(src), "sha": src["sha"]})
+                staged = {"key": source_key(src), "sha": src["sha"]}
+                notes.append(f"staged the chart and Mac values of {source_repo}@{src['sha'][:12]}")
+        applied = read_json(os.path.join(agent, "applied.json"))
+        source_changed = bool(staged.get("key")) and staged.get("key") != applied.get("key")
+    note = f" ({'; '.join(notes)})" if notes else ""
+    if have == want and not source_changed:
+        return f"follow-set: current — {release} runs {follow}'s set {want['platformVersion']}{note}", 0
     if not os.path.isfile(os.path.join(chart, "Chart.yaml")):
         return f"follow-set: nothing applied — no chart at {chart}", 0
-    line = f"{have.get('platformVersion') or 'none'} → {want['platformVersion']} (runner {want['runnerDigest'][7:19]})"
+    line = (f"{have.get('platformVersion') or 'none'} → {want['platformVersion']} (runner {want['runnerDigest'][7:19]})"
+            + (" with the chart and Mac values of " + str(read_json(os.path.join(agent, "source.json")).get("sha", ""))[:12]
+               if source_changed and agent else ""))
     if dry_run:
-        return f"follow-set: would apply {line}", 0
-    rc, out = sh(upgrade_cmd(release, ns, ctx, chart, channel, want))
+        return f"follow-set: would apply {line}{note}", 0
+    values_file = os.path.join(agent, VALUES_FILE) if agent else ""
+    if agent and os.path.isfile(values_file):
+        estate = os.path.join(agent, "estate-values.json")
+        write_json(estate, estate_values(values))
+        rc, out = sh(full_upgrade_cmd(release, ns, ctx, chart, values_file, estate, channel, want))
+    else:
+        rc, out = sh(upgrade_cmd(release, ns, ctx, chart, channel, want))
     if rc != 0:
         tail = out.strip().splitlines()[-1][:300] if out.strip() else ""
-        return f"follow-set: FAILED to apply {line} (helm exit {rc}): {tail}", 1
-    return f"follow-set: applied {line} — the runners drain their run in hand, then the new set claims", 0
+        return f"follow-set: FAILED to apply {line} (helm exit {rc}): {tail}{note}", 1
+    if agent:
+        write_json(os.path.join(agent, "applied.json"), read_json(os.path.join(agent, "source.json")))
+    return f"follow-set: applied {line} — the runners drain their run in hand, then the new set claims{note}", 0
 
 
 def agent_dir(profile: str) -> str:
@@ -188,6 +401,10 @@ def install(a, sh: Runner) -> int:
     script = os.path.join(d, "follow-set.py")
     shutil.copyfile(os.path.abspath(__file__), script)
     os.chmod(script, 0o755)
+    # the Mac values beside the chart, so a pass can apply a FULL upgrade (chart defaults + Mac values + estate + set)
+    values_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), VALUES_FILE)
+    if os.path.isfile(values_src):
+        shutil.copyfile(values_src, os.path.join(d, VALUES_FILE))
     agents = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents")
     os.makedirs(agents, exist_ok=True)
     dst = os.path.join(agents, f"{LABEL}.{a.profile}.plist")
@@ -322,6 +539,133 @@ def self_test() -> int:
             parsed = repr(e)
         check("the escaped plist is well-formed XML", parsed is True, parsed)
 
+    # ── the chart and the Mac values follow the source repository's green main ──
+    import io
+    import tarfile
+    SHA_C, TREE, DEP, HELM, BL = "1" * 40, "2" * 40, "3" * 40, "4" * 40, "5" * 40
+
+    def github(checks: list, helm: str = HELM, status: int = 200, sha: str = SHA_C) -> Fetcher:
+        def get(url: str) -> "tuple[int, str]":
+            if url.endswith("/channels/latest/set"):
+                return 200, json.dumps(good)
+            if url.endswith(f"/commits/{SOURCE_REF}"):
+                return status, json.dumps({"sha": sha, "commit": {"tree": {"sha": TREE}}})
+            if url.endswith(f"/git/trees/{TREE}"):
+                return 200, json.dumps({"tree": [{"path": "deploy", "type": "tree", "sha": DEP}]})
+            if url.endswith(f"/git/trees/{DEP}"):
+                return 200, json.dumps({"tree": [{"path": "helm", "type": "tree", "sha": helm}, {"path": "backlease", "type": "tree", "sha": BL}]})
+            if "/check-runs" in url:
+                return 200, json.dumps({"check_runs": checks})
+            return 404, ""
+        return get
+
+    green = [{"name": n, "status": "completed", "conclusion": "success"} for n in REQUIRED_CHECKS] + [
+        {"name": "b", "status": "completed", "conclusion": "skipped"}, {"name": "macOS pkg", "status": "in_progress"}]
+    src, why = source_head(github(green))
+    check("source: a green main names its commit and the two tree ids", src == {"sha": SHA_C, "helm": HELM, "backlease": BL}, (src, why))
+    check("source: a check still running OUTSIDE the gate does not hold a commit whose gate passed", source_head(github(green))[0] is not None)
+    for name, checks in (("a red check", green + [{"name": "chart", "status": "completed", "conclusion": "failure"}]),
+                         ("a cancelled check", green + [{"name": "x", "status": "completed", "conclusion": "cancelled"}]),
+                         ("the gate still running", [{"name": REQUIRED_CHECKS[0], "status": "in_progress"},
+                                                     {"name": REQUIRED_CHECKS[1], "status": "completed", "conclusion": "success"}]),
+                         ("the gate skipped (never ran)", [{"name": n, "status": "completed", "conclusion": "skipped"} for n in REQUIRED_CHECKS]),
+                         ("only trivial checks", [{"name": "b", "status": "completed", "conclusion": "success"}]), ("no check at all", [])):
+        src, why = source_head(github(checks))
+        check(f"source: {name} holds the chart (nothing staged)", src is None and "not green" in why, why)
+    src, why = source_head(github(green, status=403))
+    check("source: GitHub refusing (a rate limit) holds it, said", src is None and "403" in why, why)
+    with tempfile.TemporaryDirectory() as hc:
+        calls: list = []
+        gh_ = github(green)
+        counting = lambda url: (calls.append(url), gh_(url))[1]
+        cache_f = os.path.join(hc, "head.json")
+        first = source_head(counting, cache=cache_f)[0]
+        n_first = len(calls)
+        again = source_head(counting, cache=cache_f)[0]
+        check("source: an UNCHANGED green head costs ONE call on the next pass (trees and verdict kept)",
+              first == again and n_first == 4 and len(calls) - n_first == 1, (n_first, calls[n_first:]))
+
+    def tarball(files: dict) -> bytes:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for name, data in files.items():
+                ti = tarfile.TarInfo(f"MeshWeaver.Deploy-{SHA_C}/{name}")
+                ti.size = len(data)
+                tar.addfile(ti, io.BytesIO(data))
+        return buf.getvalue()
+    full = {"deploy/helm/Chart.yaml": b"name: x", "deploy/helm/values.yaml": b"buildHosts: {}",
+            "deploy/helm/templates/a.yaml": b"kind: X", f"deploy/backlease/{VALUES_FILE}": b"buildHosts: {rolloutStrategy: Recreate}",
+            "deploy/backlease/follow-set.py": b"# new", "deploy/other/secret.txt": b"not taken"}
+
+    def dl(data: bytes, status: int = 200):
+        def do(url: str, dest: str) -> int:
+            with open(dest, "wb") as fh:
+                fh.write(data)
+            return status
+        return do
+
+    with tempfile.TemporaryDirectory() as ag:
+        os.makedirs(os.path.join(ag, "helm"))
+        open(os.path.join(ag, "helm", "Chart.yaml"), "w").write("old")
+        err = stage_source(SOURCE_REPO, {"sha": SHA_C, "helm": HELM, "backlease": BL}, ag, dl(tarball(full)))
+        check("stage: the chart, the Mac values and the follower are staged, nothing else",
+              err is None and open(os.path.join(ag, "helm", "Chart.yaml")).read() == "name: x"
+              and os.path.isfile(os.path.join(ag, "helm", "templates", "a.yaml"))
+              and "Recreate" in open(os.path.join(ag, VALUES_FILE)).read()
+              and open(os.path.join(ag, "follow-set.py")).read() == "# new" and not os.path.exists(os.path.join(ag, "deploy")), err)
+        bad = dict(full)
+        bad.pop("deploy/backlease/follow-set.py")
+        err2 = stage_source(SOURCE_REPO, {"sha": SHA_C, "helm": HELM, "backlease": BL}, ag, dl(tarball(bad)))
+        check("stage: an archive missing a part stages nothing", err2 is not None and "lacks" in err2, err2)
+
+    with tempfile.TemporaryDirectory() as ag:
+        chart_a = os.path.join(ag, "helm")
+        os.makedirs(chart_a)
+        open(os.path.join(chart_a, "Chart.yaml"), "w").write("old")
+        cur = {k: good[k] for k in FIELDS}
+
+        class HelmV(Helm):
+            def __call__(self, cmd: list) -> "tuple[int, str]":
+                if cmd[:3] == ["helm", "get", "values"]:
+                    self.calls.append(cmd)
+                    return 0, json.dumps({"buildHosts": {"mac": self.values, "apiUrl": "https://ops.example/api/builds",
+                                                         "runnerRepository": "cr.example/mw-build-host", "rolloutStrategy": "Recreate",
+                                                         "registry": {"url": "https://reg.example"}}})
+                return super().__call__(cmd)
+        hv = HelmV(cur)
+        line, rc = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                               chart_a, "mac", github(green), hv, agent=ag, download=dl(tarball(full)))
+        up = hv.upgrades()
+        check("values: a host ON its set whose chart/values changed on a green main is upgraded",
+              rc == 0 and len(up) == 1 and "with the chart and Mac values of 111111111111" in line, (line, hv.calls))
+        check("values: the upgrade is FULL — chart defaults, the Mac values, the estate values, then the set — never --reuse-values",
+              up and "--reuse-values" not in up[0] and up[0][up[0].index("-f") + 1] == os.path.join(chart_a, "values.yaml")
+              and os.path.join(ag, VALUES_FILE) in up[0] and os.path.join(ag, "estate-values.json") in up[0]
+              and f"buildHosts.mac.runnerDigest={R}" in up[0], up)
+        est = read_json(os.path.join(ag, "estate-values.json"))
+        check("values: the estate values are kept from the release, and nothing else of it (a stale rolloutStrategy is not)",
+              est == {"buildHosts": {"apiUrl": "https://ops.example/api/builds", "runnerRepository": "cr.example/mw-build-host",
+                                     "registry": {"url": "https://reg.example"}}}, est)
+        hv2 = HelmV(cur)
+        line2, rc2 = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                                 chart_a, "mac", github(green), hv2, agent=ag, download=dl(tarball(full)))
+        check("values: the same green commit again changes nothing (applied is recorded)", hv2.upgrades() == [] and "current" in line2, line2)
+        hv3 = HelmV(cur)
+        line3, _ = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                               chart_a, "mac", github(green, helm="9" * 40, sha="6" * 40), hv3, agent=ag, download=dl(tarball(full)), dry_run=True)
+        check("values: --dry-run stages and applies nothing", hv3.upgrades() == [] and "would" in line3, line3)
+        hv4 = HelmV(cur)
+        line4, _ = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                               chart_a, "mac", github(green + [{"name": "x", "status": "completed", "conclusion": "failure"}], helm="9" * 40, sha="7" * 40),
+                               hv4, agent=ag, download=dl(tarball(full)))
+        check("values: a RED main is never followed (the host stays as it is, said)", hv4.upgrades() == [] and "held" in line4, line4)
+    # first-attach's estate --set-string keys are exactly what a full upgrade keeps
+    attach = os.path.join(os.path.dirname(os.path.abspath(__file__)), "first-attach.sh")
+    if os.path.isfile(attach):
+        keys = set(re.findall(r"--set-string buildHosts\.([A-Za-z]+)[.=]", open(attach).read())) - {"mac"}
+        check("estate: every buildHosts key first-attach.sh sets is kept on a full upgrade (ESTATE_KEYS)",
+              keys and keys <= set(ESTATE_KEYS), (sorted(keys), ESTATE_KEYS))
+
     if fails:
         for f in fails:
             print(f"SELF-TEST FAILED: {f}")
@@ -329,7 +673,8 @@ def self_test() -> int:
     print("follow-set self-test: all cases passed (behind → upgraded with exactly the four set values and --reuse-values, "
           "pinned context; current → nothing; unreachable/503/incomplete/unnamed/malformed → nothing (fail closed); "
           "another channel's answer refused; pending release never overlapped; failed upgrade red; dry-run; no chart; the complete-set route; "
-          "the agent plist names its channel and escapes every value)")
+          "the agent plist names its channel and escapes every value; the chart and Mac values follow a GREEN main only, staged "
+          "whole and applied by a FULL upgrade keeping exactly the estate values)")
     return 0
 
 
@@ -347,6 +692,8 @@ def main() -> int:
     ap.add_argument("--chart", default=None)
     ap.add_argument("--interval", type=int, default=300)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--source-repo", default=SOURCE_REPO, help="where the chart and the Mac values are followed from (public)")
+    ap.add_argument("--source-ref", default=SOURCE_REF)
     a = ap.parse_args()
     if a.self_test:
         return self_test()
@@ -354,7 +701,8 @@ def main() -> int:
         return install(a, run)
     if a.uninstall:
         return uninstall(a, run)
-    chart = a.chart or os.path.join(agent_dir(a.profile), "helm")
+    agent = agent_dir(a.profile)
+    chart = a.chart or os.path.join(agent, "helm")
     os.makedirs(agent_dir(a.profile), exist_ok=True)
     # one pass at a time: launchd never overlaps a pass, but a hand-run one could
     with open(os.path.join(agent_dir(a.profile), ".lock"), "a+") as lock:
@@ -364,7 +712,10 @@ def main() -> int:
             print("follow-set: nothing applied — another pass is running")
             return 0
         line, rc = follow_once(a.api, a.follow, f"build-host-{a.channel}", f"build-{a.channel}", f"colima-{a.profile}",
-                               chart, a.channel, fetch, run, dry_run=a.dry_run)
+                               chart, a.channel, fetch, run, dry_run=a.dry_run,
+                               agent=agent if os.path.realpath(chart) == os.path.realpath(os.path.join(agent, "helm")) else None,
+                               download=download_to,
+                               source_repo=a.source_repo, source_ref=a.source_ref)
     print(line, flush=True)
     return rc
 

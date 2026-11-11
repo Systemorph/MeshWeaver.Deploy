@@ -320,6 +320,13 @@ rendered chart DOES contain an object of that kind, the run fails (a deploy of t
 succeed), it never skips. Every other failed read — Forbidden above all — stays fatal
 (MeshWeaver.Deploy#155; `scripts/test-check-chart-drift-unserved-kinds.sh`).
 
+The comparator reads the portal's own `PodDisruptionBudget` (`memex-portal-pdb`) and `ScaledObject`
+(`memex-portal-scaler`) **by name, on both sides**. The chart renders other objects of those kinds: each
+build-host channel has its own `build-host-<channel>-scaler`, rendered before the portal's. When the
+render side took "the first ScaledObject" instead, every namespace running build hosts reported the
+build host's min/max as `DIFFERS ScaledObject minReplicaCount/maxReplicaCount` against the live portal
+scaler (MeshWeaver#5844; `scripts/test-chart-drift-compare.sh` §8 pins it, with a negative control).
+
 > **Jumpbox + Azure Bastion** is the third option: the `AzureBastionSubnet` is
 > already carved out by `network.bicep`; deploy Bastion + a small VM in the VNet
 > and run kubectl from there. Not implemented in this sample.
