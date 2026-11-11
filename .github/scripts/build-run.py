@@ -7999,9 +7999,14 @@ def self_test() -> int:
     check("budget/shares that sum above the budget are SCALED DOWN — by construction they never sum above it (the slices' 32 "
           "under a 20 GiB budget, the 2026-11-11 Mac)", bo_.get("scaled") is True and sum(bo_["shares"].values()) <= bo_["total"]
           and bo_["shares"]["slices"] < 20 * G_, bo_)
-    bf_ = cache_budget({CACHE_MAX_ENV: "10", SLICE_CACHE_MAX_ENV: "1", CACHE_SHARE_ENV["tree"]: "19"}) or {}
-    check("budget/scaling never floors the slices share to zero (at least 1/64 of the budget), and the sum stays within it",
-          bf_.get("scaled") and bf_["shares"]["slices"] >= 10 * G_ // 64 and sum(bf_["shares"].values()) <= 10 * G_, bf_)
+    # a tree share 100× the budget scales the 1 GiB slices share to ~10 MiB — under the floor (1/64 of 10 GiB = 160 MiB),
+    # so the donor transfer must run: exactly the floor, taken from the tree, the sum still within the budget
+    bf_ = cache_budget({CACHE_MAX_ENV: "10", SLICE_CACHE_MAX_ENV: "1", CACHE_SHARE_ENV["tree"]: "1000"}) or {}
+    raw_slices_ = 1 * G_ * (10 * G_) // (1000 * G_ + G_ + 10 * G_ * 25 // 100)
+    check("budget/scaling never floors the slices share to zero: below 1/64 of the budget it is raised to exactly that, taken "
+          "from the largest share, and the sum stays within the budget",
+          bf_.get("scaled") and raw_slices_ < 10 * G_ // 64 and bf_["shares"]["slices"] == 10 * G_ // 64
+          and sum(bf_["shares"].values()) <= 10 * G_, (raw_slices_, bf_))
     os.makedirs(os.path.join(tempfile.gettempdir(), "ub-" + str(os.getpid()), "deploy"), exist_ok=True)
     ub_ = os.path.join(tempfile.gettempdir(), "ub-" + str(os.getpid()))
     open(os.path.join(ub_, "deploy", "stray"), "wb").write(b"x" * 4096)
