@@ -1090,6 +1090,14 @@ def cache_budget(env: dict) -> Optional[dict]:
     scaled = s > total
     if scaled:
         shares = {a: v * total // s for a, v in shares.items()}
+        # the slice cache is never zero (bound_slice_cache would evict every slice): at least 1/64 of the budget, taken
+        # from the largest other share so the sum stays within the total
+        floor = max(1, total // 64)
+        if shares["slices"] < floor:
+            donor = max((a for a in shares if a != "slices"), key=lambda a: shares[a])
+            give = min(floor - shares["slices"], shares[donor])
+            shares["slices"] += give
+            shares[donor] -= give
     return {"total": total, "shares": shares, "scaled": scaled}
 
 
@@ -1149,6 +1157,16 @@ def _stamp(path: str) -> "tuple[float, int]":
     return st_.st_mtime, st_.st_mtime_ns
 
 
+def _entry_bytes(path: str) -> int:
+    """A directory's bytes (never following a link), or a plain file's or a link's own size. Never raises."""
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            return _tree_bytes(path)
+        return os.lstat(path).st_size
+    except OSError:
+        return 0
+
+
 def _manifest_bytes(path: str) -> Optional[int]:
     """The bytes a deployment tree's integrity manifest records (every file's size), or None when it has none."""
     try:
@@ -1201,7 +1219,7 @@ def deployment_tree_units(cache: str, sizes: SizeIndex) -> "tuple[list, int]":
     for dep in _listdir(root):
         ddir = os.path.join(root, dep)
         if dep.startswith(".") or not os.path.isdir(ddir) or os.path.islink(ddir):
-            rest += _tree_bytes(ddir) if os.path.isdir(ddir) and not os.path.islink(ddir) else 0
+            rest += _entry_bytes(ddir)
             continue
         repos = [r for r in _listdir(ddir) if REPO.match(r) and not r.startswith(".") and os.path.isdir(os.path.join(ddir, r))]
         for repo in repos:
@@ -1226,10 +1244,10 @@ def deployment_tree_units(cache: str, sizes: SizeIndex) -> "tuple[list, int]":
         for name in _listdir(ddir):
             if name in repos or name in (".platform", ".host", ".locks"):
                 continue
-            rest += _tree_bytes(os.path.join(ddir, name))
+            rest += _entry_bytes(os.path.join(ddir, name))
         for name in _listdir(os.path.join(ddir, ".platform")):
             if name not in repos:
-                rest += _tree_bytes(os.path.join(ddir, ".platform", name))
+                rest += _entry_bytes(os.path.join(ddir, ".platform", name))
     units.sort()
     return units, rest
 
@@ -5665,9 +5683,7 @@ class Host:
         # what no share covers
         other, at = self.cache_other
         if now - at >= CACHE_OTHER_INTERVAL:
-            other = sum(_tree_bytes(os.path.join(self.cache, n)) if os.path.isdir(os.path.join(self.cache, n))
-                        and not os.path.islink(os.path.join(self.cache, n)) else 0
-                        for n in _listdir(self.cache) if n not in CACHE_AREA_DIRS.values())
+            other = sum(_entry_bytes(os.path.join(self.cache, n)) for n in _listdir(self.cache) if n not in CACHE_AREA_DIRS.values())
             self.cache_other = (other, now)
         total = sum(areas.values()) + other
         self.cache_usage = {"areas": areas, "other": other, "total": total, "budget": b, "at": now}
@@ -7983,6 +7999,15 @@ def self_test() -> int:
     check("budget/shares that sum above the budget are SCALED DOWN — by construction they never sum above it (the slices' 32 "
           "under a 20 GiB budget, the 2026-11-11 Mac)", bo_.get("scaled") is True and sum(bo_["shares"].values()) <= bo_["total"]
           and bo_["shares"]["slices"] < 20 * G_, bo_)
+    bf_ = cache_budget({CACHE_MAX_ENV: "10", SLICE_CACHE_MAX_ENV: "1", CACHE_SHARE_ENV["tree"]: "19"}) or {}
+    check("budget/scaling never floors the slices share to zero (at least 1/64 of the budget), and the sum stays within it",
+          bf_.get("scaled") and bf_["shares"]["slices"] >= 10 * G_ // 64 and sum(bf_["shares"].values()) <= 10 * G_, bf_)
+    os.makedirs(os.path.join(tempfile.gettempdir(), "ub-" + str(os.getpid()), "deploy"), exist_ok=True)
+    ub_ = os.path.join(tempfile.gettempdir(), "ub-" + str(os.getpid()))
+    open(os.path.join(ub_, "deploy", "stray"), "wb").write(b"x" * 4096)
+    check("budget/a stray file directly under <cache>/deploy is counted, not 0",
+          deployment_tree_units(ub_, SizeIndex(ub_))[1] == 4096)
+    shutil.rmtree(ub_, ignore_errors=True)
     check("budget/a slices share of 0 or junk is the default (a slice cache is never unbounded, never zero)",
           (cache_budget({CACHE_MAX_ENV: "10", SLICE_CACHE_MAX_ENV: "0"}) or {}).get("shares", {}).get("slices") == 2 * G_
           and (cache_budget({CACHE_MAX_ENV: "10", CACHE_SHARE_ENV["nuget"]: "x"}) or {}).get("shares", {}).get("nuget") == int(1.5 * G_))

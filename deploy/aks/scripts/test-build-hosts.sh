@@ -707,8 +707,11 @@ if helm template build-host-mac "$CHART" -f "$CHART/values.yaml" -f "$REPO/deplo
   if budget_check "$WORK/mac-shipped.yaml" 18 20 \
      && python3 - "$WORK/mac-shipped.yaml" <<'PYM'
 import sys, yaml
-env = {e["name"]: e.get("value") for d in yaml.safe_load_all(open(sys.argv[1])) if d and d.get("kind") == "Deployment"
-       for c in d["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
+hosts = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d and d.get("kind") == "Deployment"
+         and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "build-host"]
+if len(hosts) != 1:
+    print("   ", f"the shipped Mac values render {len(hosts)} build-host Deployments, want exactly 1"); sys.exit(1)
+env = {e["name"]: e.get("value") for c in hosts[0]["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
 want = {"MW_BUILD_CACHE_MAX_GIB": "18", "MW_BUILD_CACHE_TREE_GIB": "0", "MW_BUILD_SLICE_CACHE_MAX_GIB": "5",
         "MW_BUILD_CACHE_NUGET_GIB": "8", "MW_BUILD_CACHE_REFSETS_GIB": "2", "MW_BUILD_CACHE_PREPARED_GIB": "2"}
 bad = {k: (env.get(k), v) for k, v in want.items() if env.get(k) != v}
