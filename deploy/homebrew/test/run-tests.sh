@@ -25,6 +25,10 @@
 set -uo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CLI="$HERE/../bin/memex-local"
+# The machine the suite runs on must not decide what it asserts: a token model is checked against the HOST's memory and
+# the default chat model reads the host's jobs answer (an Intune profile on a developer Mac, none on a CI runner) —
+# pinned off here, exercised explicitly in their own section.
+export MEMEX_TOKEN_MODELS_UNCHECKED=1 MEMEX_HOST_TAKES_JOBS=0
 
 pass=0; fail=0; RC=0
 ok()  { printf '  ok    %s\n' "$1"; pass=$((pass+1)); }
@@ -1665,7 +1669,10 @@ sealed="$(seal "$P2" "$KEY")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/code.txt"
 OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/code.txt" --owner owner1 --owner-email owner1@example.com 2>&1)"; RC=$?
 grep -qx '    Auth__GlobalAdmins__0: "owner1"' "$FJ/home/.memex-local/values.local.yaml" && ok "fleet join --owner/--owner-email (executed) records the owner in the overlay" || bad "fleet join --owner flag" "$(grep -n Owner "$FJ/home/.memex-local/values.local.yaml")"
 case "$RC:$OUT" in 0:*"joined as 'studio-2'"*) ok "fleet join opens a code sealed to its key and joins" ;; *) bad "fleet join with a good code" "rc=$RC: $OUT" ;; esac
-OUT2="$(env PATH="$STUBS:$PATH" HOME="$FJ/home2" MEMEX_LOCAL_HOME="$FJ/home2/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/code.txt" 2>&1 </dev/null)"; RC2=$?
+# no managed preferences and no Platform SSO: on an Intune-enrolled developer Mac the real com.memex.local
+# profile carries an OwnerId, which would make this "ownerless" join find an owner and the test fail there only
+mkdir -p "$FJ/noprefs"; for t in defaults app-sso; do printf '#!/bin/bash\nexit 1\n' > "$FJ/noprefs/$t"; chmod +x "$FJ/noprefs/$t"; done
+OUT2="$(env PATH="$FJ/noprefs:$STUBS:$PATH" HOME="$FJ/home2" MEMEX_LOCAL_HOME="$FJ/home2/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/code.txt" 2>&1 </dev/null)"; RC2=$?
 case "$RC2:$OUT2" in 0:*) bad "an unattended fleet join without an owner joined" "$OUT2" ;; *"no OWNER"*) ok "an unattended fleet join without an owner FAILS before anything is joined" ;; *) bad "ownerless join" "rc=$RC2 $OUT2" ;; esac
 case "$OUT" in *"$M"*|*"$C"*) bad "fleet join never prints a key value" "a value is in the output" ;; *) ok "fleet join prints no key value (fingerprints only)" ;; esac
 case "$OUT" in *"Hosting/Heartbeats/Enrol/"*) ok "fleet join prints the control instance's approval link" ;; *) bad "approval link" "$OUT" ;; esac
@@ -2422,9 +2429,9 @@ done; chmod +x "$BH/stubs/"*
 # PATH holds the stubs and the system directories ONLY (no Homebrew), and MEMEX_PREFIX names an empty
 # prefix: the resolver can find no real colima, helm or kubectl — a test must never start a VM.
 mkdir -p "$BH/prefix"
-bh() { env PATH="$BH/stubs:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" MEMEX_PREFIX="$BH/prefix" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_NET_NO_MEASURE=1 MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
+bh() { env PATH="$BH/stubs:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" MEMEX_PREFIX="$BH/prefix" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_NET_NO_MEASURE=1 MEMEX_HOST_DISK_FREE_GIB="${BH_FREE:-240}" MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
 OUT="$(bh "$CLI" buildhost apply 2>&1)"
-grep -q 'colima start -p build --cpu 16 --memory 104 --disk 100 --runtime containerd --kubernetes' "$BH/log" && grep -q 'kubectl --context colima-build get crd scaledobjects.keda.sh' "$BH/log" \
+grep -q 'colima start -p build --cpu 16 --memory 104 --disk 200 --runtime containerd --kubernetes' "$BH/log" && grep -q 'kubectl --context colima-build get crd scaledobjects.keda.sh' "$BH/log" \
   && case "$OUT" in *"first attach installs it"*) true ;; *) false ;; esac \
   && ok "apply creates the build VM at the plan (containerd, k3s), checks KEDA in colima-build, and names the first attach for a missing release" || bad "apply create" "$OUT / $(cat "$BH/log")"
 grep -q 'colima ssh -p build -- sudo systemctl restart mw-netshape.service' "$BH/log" && [ -f "$BH/.memex-local/netshape-build.env" ] \
@@ -2451,6 +2458,32 @@ grep -q '^launchctl bootstrap gui/[0-9]* .*/Library/LaunchAgents/com.memex.local
   && [ -x "$BH/.memex-local/buildhost-priority.sh" ] \
   && ok "apply loads the priority governor (launchd agent for profile build, script copied to ~/.memex-local)" || bad "apply priority governor" "$(cat "$BH/log")"
 OUT="$(bh MEMEX_HOST_MEM_GIB=abc "$CLI" buildhost plan 2>&1)" && bad "a non-numeric probe was used" "$OUT" || { case "$OUT" in *"instead of a whole number"*) ok "a host probe that is not a whole number stops the plan (never sized from 0)" ;; *) bad "probe validation" "$OUT" ;; esac; }
+echo "── buildhost: the build VM's disk is sized from this Mac, the runners from the disk (2026-11-11) ──"
+: > "$BH/log"; bh "$CLI" buildhost apply >/dev/null 2>&1
+grep -q -- '--k3s-arg=--kubelet-arg=image-gc-high-threshold=60 --k3s-arg=--kubelet-arg=image-gc-low-threshold=45 --k3s-arg=--kubelet-arg=image-maximum-gc-age=48h --k3s-arg=--kube-controller-manager-arg=terminated-pod-gc-threshold=5' "$BH/log" \
+  && ok "a NEW build VM collects unused images early (GC at 60 %, 48 h max age) and keeps at most 5 finished pod records" || bad "gc args on create" "$(grep 'colima start' "$BH/log")"
+[ "$(lib buildhost_disk_runs 100)" = 2 ] && [ "$(lib buildhost_disk_runs 200)" = 6 ] && [ "$(lib buildhost_disk_runs 60)" = 0 ] \
+  && ok "runs a disk holds: 100 GiB → 2, 200 GiB → 6, 60 GiB → 0 (85 % − cache 20 − images 12 − system 4, over 20 per run)" || bad "disk runs" "$(lib buildhost_disk_runs 100) $(lib buildhost_disk_runs 200) $(lib buildhost_disk_runs 60)"
+[ "$(lib buildhost_disk_min)" = 66 ] && ok "the least disk that holds one run is 66 GiB" || bad "disk min" "$(lib buildhost_disk_min)"
+[ "$(lib buildhost_disk_plan 1600 0 0)" = 200 ] && [ "$(lib buildhost_disk_plan 150 84 0)" = 26 ] && [ "$(lib buildhost_disk_plan 150 0 30)" = 140 ] \
+  && ok "the disk: capped at 200; a 256 GB Mac with 150 GiB free and a portal VM that may grow 84 more gets 26 (too small — refused below); what the build VM already holds counts as its own" || bad "disk plan" "$(lib buildhost_disk_plan 1600 0 0) $(lib buildhost_disk_plan 150 84 0) $(lib buildhost_disk_plan 150 0 30)"
+P="$(lib buildhost_plan 18 128 8 16 0 100)"
+grep -q '^runners_max=2$' <<<"$P" && grep -q '^vm_disk=100$' <<<"$P" && grep -q '^runner_mem_limit=24$' <<<"$P" \
+  && ok "an 18-core Mac on a 100 GiB build disk gets 2 runners, not 4 (the second Mac Studio's 4 runners on 98 GiB could never claim)" || bad "plan disk cap" "$P"
+P="$(lib buildhost_plan 18 128 8 16 0 50 2>&1)" && bad "a 50 GiB disk was planned" "$P" || { grep -q 'holds no run' <<<"$P" && grep -q 'at least 66 GiB' <<<"$P" && ok "a disk that holds no run is refused, with the arithmetic" || bad "small disk reason" "$P"; }
+: > "$BH/log"
+OUT="$(BH_FREE=60 bh "$CLI" buildhost plan 2>&1)" && bad "a Mac with 60 GiB free planned a build VM" "$OUT" || { case "$OUT" in *"holds no run"*"free disk on this Mac"*) ok "a Mac without the disk for one run is REFUSED at plan time, naming the free disk and the remedy" ;; *) bad "low free disk" "$OUT" ;; esac; }
+mkdir -p "$BH/.colima/build"; printf 'kubernetes:\n  enabled: true\n  k3sArgs:\n    - --disable=traefik\n    - --kubelet-arg=root-dir=/var/lib/rancher/kubelet\n' > "$BH/.colima/build/colima.yaml"
+: > "$BH/log"
+bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400,"disk":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize >/dev/null 2>&1
+grep -q 'colima start -p build --cpu 16 --memory 104 --disk 200' "$BH/log" && grep -qxF -- '    - --kubelet-arg=image-maximum-gc-age=48h' "$BH/.colima/build/colima.yaml" && grep -qxF -- '    - --kubelet-arg=root-dir=/var/lib/rancher/kubelet' "$BH/.colima/build/colima.yaml" && grep -q 'maxReplicas=4 ' "$BH/log" \
+  && ok "--resize grows a 100 GiB build disk to what the Mac backs (200), adds the GC args to its profile (root-dir kept), and sizes 4 runners" || bad "resize disk+gc" "$(cat "$BH/log"; cat "$BH/.colima/build/colima.yaml")"
+: > "$BH/log"
+OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400,"disk":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
+! grep -q 'colima stop' "$BH/log" && grep -q 'maxReplicas=2 ' "$BH/log" \
+  && ok "without --resize an existing 100 GiB disk is kept and the runners sized to it (2)" || bad "existing disk" "$OUT / $(cat "$BH/log")"
+grep -q 'colima ssh -p build -- sudo k3s crictl rmi --prune' "$BH/log" && grep -q 'kubectl --context colima-build -n build-mac get pods --field-selector=status.phase=Failed' "$BH/log" \
+  && ok "apply collects unused images and finished pod records in the build VM" || bad "apply gc" "$(cat "$BH/log")"
 rm -rf "$BH"
 
 echo "── buildhost priority: fleet jobs at the lowest priority, every idle core otherwise ──"
@@ -3320,6 +3353,61 @@ else
   bad "make-tarball" "$out"
 fi
 rm -rf "$TB"
+
+echo "── the token models and the default chat model fit THIS Mac's memory (2026-11-11) ──────"
+tm() { env MEMEX_LOCAL_LIB=1 MEMEX_TOKEN_MODELS_UNCHECKED=0 PATH="$STUBS:$PATH" bash -c '. "$0"; ollama() { return 1; }; ACC_TOK_MODELS="$1"; ACC_JOBS_ENABLED="$2"; token_models_fit 2>/dev/null; printf "%s" "$ACC_TOK_MODELS"' "$CLI" "$@"; }
+[ "$(MEMEX_HOST_MEM_GIB=128 MEMEX_COLIMA_MEM=16 tm 'qwen3.8:27b-mlx qwen3.6' true)" = "qwen3.8:27b-mlx qwen3.6" ] \
+  && ok "a 128 GB Mac Studio with jobs keeps both fleet token models" || bad "128 keeps" "$(MEMEX_HOST_MEM_GIB=128 MEMEX_COLIMA_MEM=16 tm 'qwen3.8:27b-mlx qwen3.6' true)"
+[ "$(MEMEX_HOST_MEM_GIB=56 MEMEX_COLIMA_MEM=16 tm 'qwen3.8:27b-mlx qwen3.6' true)" = "qwen3.8:27b-mlx" ] \
+  && ok "a 56 GB Mac with jobs keeps qwen3.8 (18 GiB) and drops qwen3.6 (22 GiB > 56−16−8−12 = 20)" || bad "56 drops" "$(MEMEX_HOST_MEM_GIB=56 MEMEX_COLIMA_MEM=16 tm 'qwen3.8:27b-mlx qwen3.6' true)"
+[ "$(MEMEX_HOST_MEM_GIB=48 MEMEX_COLIMA_MEM=16 MEMEX_OLLAMA_MODEL=qwen3:8b tm 'qwen3.8:27b-mlx qwen3.6' true)" = "qwen3:8b" ] \
+  && ok "a 48 GB Mac mini with jobs holds neither fleet model (budget 12 GiB) and serves its own qwen3:8b" || bad "48 none" "$(MEMEX_HOST_MEM_GIB=48 MEMEX_COLIMA_MEM=16 MEMEX_OLLAMA_MODEL=qwen3:8b tm 'qwen3.8:27b-mlx qwen3.6' true)"
+OUT="$(env MEMEX_LOCAL_LIB=1 MEMEX_TOKEN_MODELS_UNCHECKED=0 MEMEX_HOST_MEM_GIB=24 MEMEX_COLIMA_MEM=12 MEMEX_OLLAMA_MODEL=qwen3:8b bash -c '. "$0"; ollama() { return 1; }; ACC_TOK_MODELS="qwen3.8:27b-mlx qwen3.6"; ACC_JOBS_ENABLED=false; token_models_fit; printf "MODELS=%s" "$ACC_TOK_MODELS"' "$CLI" 2>&1)"
+case "$OUT" in *"cannot hold: qwen3.8:27b-mlx(18 GiB) qwen3.6(22 GiB)"*"serves its own chat model 'qwen3:8b'"*"MODELS=qwen3:8b") ok "a 24 GB Mac mini serves its own chat model when no declared token model fits, and says why" ;; *) bad "24 fallback" "$OUT" ;; esac
+[ "$(MEMEX_HOST_MEM_GIB=128 MEMEX_COLIMA_MEM=16 tm 'my-own:model' false)" = "my-own:model" ] && ok "a model of unknown size is kept (said as unchecked), never silently dropped" || bad "unknown kept" ""
+d() { env MEMEX_LOCAL_LIB=1 MEMEX_PROFILE= MEMEX_OLLAMA_MODEL= MEMEX_HOST_ARCH=arm64 MEMEX_COLIMA_MEM=16 "$@" bash -c '. "$0"; host_default_model' "$CLI"; }
+[ "$(d MEMEX_HOST_MEM_GIB=48 MEMEX_HOST_TAKES_JOBS=0)" = "qwen3.8:27b-mlx" ] && [ "$(d MEMEX_HOST_MEM_GIB=48 MEMEX_HOST_TAKES_JOBS=1)" = "qwen3:8b" ] && [ "$(d MEMEX_HOST_MEM_GIB=64 MEMEX_HOST_TAKES_JOBS=1)" = "qwen3.8:27b-mlx" ] \
+  && ok "the default chat model leaves room for a build VM on a jobs YES: 48 GB → qwen3:8b with jobs, qwen3.8 without; 64 GB → qwen3.8 either way" || bad "jobs-aware default" "$(d MEMEX_HOST_MEM_GIB=48 MEMEX_HOST_TAKES_JOBS=1)"
+
+echo "── fleet doctor: control's view of this Mac, each reading green or red with a remedy (2026-11-11) ──────"
+FD="$(mktemp -d)"; mkdir -p "$FD/home/.memex-local" "$FD/stubs"
+printf 'config:\n  memex_portal:\n    Hosting__Deployment: "mini-1"\n    Hosting__ModuleReportSecret: "s3cr3t-heartbeat-key-value"\n    Hosting__ControlInbox__Url: "http://127.0.0.1:1/api/hooks/Hosting/PlatformBuilds"\n' > "$FD/home/.memex-local/fleet.yaml"
+cat > "$FD/srv.py" <<'PY'
+import hashlib, hmac, http.server, json, sys, time
+mode = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0)); body = self.rfile.read(n)
+        if mode == "404": self.send_response(404); self.end_headers(); return
+        want = "sha256=" + hmac.new(b"s3cr3t-heartbeat-key-value", body, hashlib.sha256).hexdigest()
+        d = json.loads(body)
+        if self.path != "/api/fleet/self-status" or self.headers.get("X-Hub-Signature-256") != want or d.get("deployment") != "mini-1" or abs(d["ts"] - time.time()) > 300:
+            self.send_response(401); self.end_headers(); return
+        out = {"deployment": "mini-1", "now": "2026-11-11T10:00:00Z", "heartbeat": {"lastAt": "2026-11-11T09:59:48Z", "ageSeconds": 12},
+               "record": {"present": mode != "norecord", "path": "Deployments/mini-1", "kind": "mac-host"},
+               "enrolment": {"path": "Admin/MachineEnrolments/mini-1-x", "state": "joined", "open": None},
+               "hostStatus": {"present": mode != "norecord", "at": "2026-11-11T09:59:48Z"}}
+        b = json.dumps(out).encode(); self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(b)
+s = http.server.HTTPServer(("127.0.0.1", 0), H); print(s.server_address[1], flush=True); s.serve_forever()
+PY
+printf '#!/bin/bash\nprintf "NAME ID SIZE MODIFIED\\nqwen3:8b abc 5.2 GB now\\n"\n' > "$FD/stubs/ollama"
+printf '#!/bin/bash\nexit 0\n' > "$FD/stubs/curl"; chmod +x "$FD/stubs/"*
+fd() { local port; rm -f "$FD/port"; python3 "$FD/srv.py" "$1" > "$FD/port" & local pid=$!; for _ in $(seq 1 50); do port="$(cat "$FD/port" 2>/dev/null)"; [ -n "$port" ] && break; sleep 0.2; done
+  printf 'config:\n  memex_portal:\n    Hosting__ReportTo: "http://127.0.0.1:%s"\n    Hosting__Deployment: "mini-1"\n    Hosting__BackLease__Accept__Jobs__Enabled: "false"\n    Hosting__BackLease__Accept__Tokens__Enabled: "false"\n' "$port" > "$FD/home/.memex-local/backlease.yaml"
+  env PATH="$FD/stubs:$STUBS:$PATH" HOME="$FD/home" MEMEX_LOCAL_HOME="$FD/home/.memex-local" MEMEX_OLLAMA_MODEL=qwen3:8b "$CLI" fleet doctor 2>&1; local rc=$?
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return "$rc"; }
+OUT="$(fd ok)"; RC=$?
+[ "$RC" = 0 ] && grep -q "control's last heartbeat from 'mini-1': 12 s ago" <<<"$OUT" && grep -q 'Deployments/mini-1 on control (kind mac-host)' <<<"$OUT" && grep -q 'enrolment: joined' <<<"$OUT" \
+  && grep -q 'model qwen3:8b: installed and answering' <<<"$OUT" && grep -q 'every reading is green' <<<"$OUT" \
+  && ok "fleet doctor reads control's signed view (heartbeat age, record, enrolment, host status) and the model, all green → exit 0" || bad "doctor green" "rc=$RC $OUT"
+case "$OUT" in *s3cr3t*) bad "fleet doctor printed the heartbeat key" "" ;; *) ok "fleet doctor never prints the heartbeat key (a fingerprint only)" ;; esac
+OUT="$(fd norecord)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'control has no Deployments/mini-1 record' <<<"$OUT" && grep -q 'remedy: the Approve opens it as a pull request' <<<"$OUT" \
+  && ok "a missing Deployments record is RED with its remedy, and the doctor exits 1" || bad "doctor no record" "rc=$RC $OUT"
+OUT="$(fd 404)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'does not answer /api/fleet/self-status yet' <<<"$OUT" && ok "a control that does not serve the endpoint is RED (unread), never a pass" || bad "doctor 404" "rc=$RC $OUT"
+rm -rf "$FD"
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
