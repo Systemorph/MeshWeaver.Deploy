@@ -6653,7 +6653,11 @@ readonly BUILD_RUNNER_MAX_GIB=24                                   # one runner'
 #   disk    = min(BUILD_DISK_MAX_GIB, host free − host reserve − what the other VMs may still grow into)
 readonly BUILD_DISK_MAX_GIB="${MEMEX_BUILD_DISK_MAX_GIB:-200}"         # a bigger disk only holds more stale state
 readonly BUILD_HOST_DISK_RESERVE_GIB="${MEMEX_BUILD_HOST_DISK_RESERVE_GIB:-40}"  # macOS updates, model pulls, the owner
-readonly BUILD_CACHE_GIB="${MEMEX_BUILD_CACHE_GIB:-20}"               # the cache claim (build-host-mac.values.yaml cache.size)
+# THE CACHE BUDGET is sized from the build disk too (2026-11-11, the owner's go): up to BUILD_CACHE_MAX_GIB, which holds the
+# deployment tree (~20 GiB) warm beside the slices — but never so much that ONE run (20 GiB + 15 %) no longer fits. The
+# Macs' claim is local-path (its 20Gi request is nominal and cannot be expanded), so the budget is what bounds the cache.
+readonly BUILD_CACHE_MAX_GIB="${MEMEX_BUILD_CACHE_MAX_GIB:-80}"
+readonly BUILD_CACHE_MIN_GIB=10
 readonly BUILD_IMAGES_GIB="${MEMEX_BUILD_IMAGES_GIB:-12}"             # runner + tester + portal images, two generations
 readonly BUILD_VM_SYSTEM_DISK_GIB=4                                   # k3s, KEDA, logs inside the VM
 readonly BUILD_RUN_DISK_GIB="${MEMEX_BUILD_RUN_DISK_GIB:-20}"         # what ONE run may write (chart buildHosts.runDiskGi)
@@ -6733,7 +6737,7 @@ buildhost_plan() {
   local disk="${6:-}" disk_runs=""
   if [ -n "$disk" ]; then
     disk_runs="$(buildhost_disk_runs "$disk")"
-    [ "$disk_runs" -ge 1 ] || { echo "error=the build VM's disk of ${disk} GiB holds no run: ${disk} × $(( 100 - BUILD_DISK_HEADROOM_PCT )) % − cache ${BUILD_CACHE_GIB} − images ${BUILD_IMAGES_GIB} − system ${BUILD_VM_SYSTEM_DISK_GIB} leaves less than one run's ${BUILD_RUN_DISK_GIB} GiB (it needs at least $(buildhost_disk_min) GiB)"; return 1; }
+    [ "$disk_runs" -ge 1 ] || { echo "error=the build VM's disk of ${disk} GiB holds no run: ${disk} × $(( 100 - BUILD_DISK_HEADROOM_PCT )) % − cache $(buildhost_cache_gib "$disk") − images ${BUILD_IMAGES_GIB} − system ${BUILD_VM_SYSTEM_DISK_GIB} leaves less than one run's ${BUILD_RUN_DISK_GIB} GiB (it needs at least $(buildhost_disk_min) GiB)"; return 1; }
     [ "$disk_runs" -ge "$runners" ] || runners="$disk_runs"
     lim=$(( (vmem - BUILD_SYSTEM_GIB) / runners )); [ "$lim" -le "$BUILD_RUNNER_MAX_GIB" ] || lim="$BUILD_RUNNER_MAX_GIB"; req=$(( lim - 4 ))
   fi
@@ -6745,14 +6749,34 @@ buildhost_plan() {
   [ -z "$disk" ] || printf 'vm_disk=%s\ndisk_runs=%s\n' "$disk" "$disk_runs"
 }
 # How many runs at once the build VM's disk holds (whole runs; pure).
+# The cache budget a build disk of $1 GiB gets (GiB; pure): what is left once images, the VM's system and ONE run are
+# kept beside the 15 % headroom, at most BUILD_CACHE_MAX_GIB, at least BUILD_CACHE_MIN_GIB.
+buildhost_cache_gib() {
+  local room=$(( $1 * (100 - BUILD_DISK_HEADROOM_PCT) / 100 - BUILD_IMAGES_GIB - BUILD_VM_SYSTEM_DISK_GIB - BUILD_RUN_DISK_GIB ))
+  [ "$room" -le "$BUILD_CACHE_MAX_GIB" ] || room="$BUILD_CACHE_MAX_GIB"
+  [ "$room" -ge "$BUILD_CACHE_MIN_GIB" ] || room="$BUILD_CACHE_MIN_GIB"
+  printf '%s' "$room"
+}
+# Each area's share of a budget of $1 GiB, as "tree slices nuget refsets prepared" (pure). The tree (~20 GiB, the warm
+# deployment tree) gets 24 only when the budget can hold it beside the rest (≥ 45) — below that a run builds COLD rather
+# than thrash a tree it cannot keep; the slices take what is left, at most 30, never 0; the shares stay under 90 %.
+buildhost_cache_shares() {
+  local c="$1" tree=0 nuget=4 refsets=2 prepared=2 slices
+  [ "$c" -ge 45 ] && { tree=24; refsets=3; }
+  [ "$c" -ge 30 ] && nuget=8
+  slices=$(( c * 90 / 100 - tree - nuget - refsets - prepared ))
+  [ "$slices" -le 30 ] || slices=30
+  [ "$slices" -ge 1 ] || slices=1
+  printf '%s %s %s %s %s' "$tree" "$slices" "$nuget" "$refsets" "$prepared"
+}
 buildhost_disk_runs() {
-  local usable=$(( $1 * (100 - BUILD_DISK_HEADROOM_PCT) / 100 - BUILD_CACHE_GIB - BUILD_IMAGES_GIB - BUILD_VM_SYSTEM_DISK_GIB ))
+  local usable=$(( $1 * (100 - BUILD_DISK_HEADROOM_PCT) / 100 - $(buildhost_cache_gib "$1") - BUILD_IMAGES_GIB - BUILD_VM_SYSTEM_DISK_GIB ))
   [ "$usable" -gt 0 ] || { printf 0; return; }
   printf '%s' "$(( usable / BUILD_RUN_DISK_GIB ))"
 }
 # The least disk that holds one run (GiB, rounded up; pure).
 buildhost_disk_min() {
-  local need=$(( BUILD_CACHE_GIB + BUILD_IMAGES_GIB + BUILD_VM_SYSTEM_DISK_GIB + BUILD_RUN_DISK_GIB ))
+  local need=$(( BUILD_CACHE_MIN_GIB + BUILD_IMAGES_GIB + BUILD_VM_SYSTEM_DISK_GIB + BUILD_RUN_DISK_GIB ))
   printf '%s' "$(( (need * 100 + (100 - BUILD_DISK_HEADROOM_PCT) - 1) / (100 - BUILD_DISK_HEADROOM_PCT) ))"
 }
 # The disk a build VM may be given here (GiB; pure): $1 free on the host's volume, $2 what the OTHER VMs may still grow
@@ -6859,6 +6883,27 @@ buildhost_profile_args() {
   done
 }
 
+# THIS MAC'S SIZING as a values file the release follower layers over the Mac values on every full upgrade
+# (<agent>/sizing.yaml): before it, a follower's full upgrade put the runners and the cache back to the values file's
+# defaults, sized for a 16-CPU / 100 GiB VM. Prints its path.
+buildhost_write_sizing() {
+  local plan="$1" disk="$2" dir f c t sl n r p
+  dir="$LOCAL_HOME/buildhost-follow/$BUILD_PROFILE"; f="$dir/sizing.yaml"; mkdir -p "$dir"
+  c="$(buildhost_cache_gib "$disk")"; read -r t sl n r p <<<"$(buildhost_cache_shares "$c")"
+  cat > "$f.tmp" <<YAML
+# Written by memex-local buildhost apply ($(date -u +%Y-%m-%dT%H:%M:%SZ)) from this Mac's plan — re-run it to change.
+buildHosts:
+  mac: {minReplicas: $(plan_value runners_min "$plan"), maxReplicas: $(plan_value runners_max "$plan")}
+  resources:
+    requests: {cpu: "$(plan_value runner_cpu_request "$plan")", memory: "$(plan_value runner_mem_request "$plan")Gi"}
+    limits: {cpu: "${BUILD_CPU_PER_RUNNER}", memory: "$(plan_value runner_mem_limit "$plan")Gi"}
+  stageSlots: $(plan_value stage_slots "$plan")
+  cache: {sizeEnforced: false, maxGi: $c, shares: {treeGi: $t, slicesGi: $sl, nugetGi: $n, refsetsGi: $r, preparedGi: $p}}
+YAML
+  mv -f "$f.tmp" "$f"
+  printf '%s' "$f"
+}
+
 buildhost_gc_args_check() {
   local y a missing=""
   y="$(colima_profile_yaml "$BUILD_PROFILE")" || return 0
@@ -6938,7 +6983,7 @@ cmd_buildhost() {
       [ $# -eq 0 ] || die "buildhost plan: takes no arguments"
       info "host: $(host_cores) cores, $(host_mem_gib) GiB; other VMs ${others} GiB (the portal's included); largest model $(largest_model_gib) GiB"
       info "build VM (profile $BUILD_PROFILE): ${cpu} CPU / ${vmem} GiB / disk ${disk} GiB$( [ -n "$have_disk" ] && [ "$want_disk" -gt "$have_disk" ] && printf ' (this Mac could back %s — apply --resize grows it)' "$want_disk")"
-      info "disk: ${free} GiB free on this Mac; the disk holds $(plan_value disk_runs "$plan") run(s) of ${BUILD_RUN_DISK_GIB} GiB at once beside cache ${BUILD_CACHE_GIB}, images ${BUILD_IMAGES_GIB}, ${BUILD_DISK_HEADROOM_PCT} % kept free"
+      info "disk: ${free} GiB free on this Mac; the disk holds $(plan_value disk_runs "$plan") run(s) of ${BUILD_RUN_DISK_GIB} GiB at once beside a cache budget of $(buildhost_cache_gib "$disk") GiB (shares tree/slices/nuget/refsets/prepared: $(buildhost_cache_shares "$(buildhost_cache_gib "$disk")" | tr ' ' '/')), images ${BUILD_IMAGES_GIB}, ${BUILD_DISK_HEADROOM_PCT} % kept free"
       info "runners: $(plan_value runners_min "$plan") warm … $(plan_value runners_max "$plan") (KEDA), each ${BUILD_CPU_PER_RUNNER} CPU / $(plan_value runner_mem_request "$plan")–$(plan_value runner_mem_limit "$plan") GiB, $(plan_value stage_slots "$plan") stage slots → up to $(plan_value stage_total "$plan") stage containers at once"
       ;;
     apply)
@@ -7000,15 +7045,10 @@ cmd_buildhost() {
       buildhost_gc || true
       if helm --kube-context "$(build_ctx)" -n "$BUILD_NS" status "$BUILD_RELEASE" >/dev/null 2>&1; then
         step "Sizing the runners: $(plan_value runners_min "$plan")…$(plan_value runners_max "$plan") × ${BUILD_CPU_PER_RUNNER} CPU, $(plan_value stage_slots "$plan") stage slots"
-        helm --kube-context "$(build_ctx)" -n "$BUILD_NS" upgrade "$BUILD_RELEASE" "$(resolve_chart)" --reuse-values \
-          --set "buildHosts.mac.minReplicas=$(plan_value runners_min "$plan")" \
-          --set "buildHosts.mac.maxReplicas=$(plan_value runners_max "$plan")" \
-          --set-string "buildHosts.resources.requests.cpu=$(plan_value runner_cpu_request "$plan")" \
-          --set-string "buildHosts.resources.requests.memory=$(plan_value runner_mem_request "$plan")Gi" \
-          --set-string "buildHosts.resources.limits.cpu=${BUILD_CPU_PER_RUNNER}" \
-          --set-string "buildHosts.resources.limits.memory=$(plan_value runner_mem_limit "$plan")Gi" \
-          --set "buildHosts.stageSlots=$(plan_value stage_slots "$plan")" >/dev/null \
+        local sizing; sizing="$(buildhost_write_sizing "$plan" "$disk")"
+        helm --kube-context "$(build_ctx)" -n "$BUILD_NS" upgrade "$BUILD_RELEASE" "$(resolve_chart)" --reuse-values -f "$sizing" >/dev/null \
           || die "buildhost: helm could not size the release $BUILD_RELEASE"
+        ok "cache budget $(buildhost_cache_gib "$disk") GiB on the ${disk} GiB build disk (one run of ${BUILD_RUN_DISK_GIB} GiB + ${BUILD_DISK_HEADROOM_PCT} % still fits) — $sizing, which the release follower layers over the Mac values"
         ok "runners sized: up to $(plan_value stage_total "$plan") stage containers at once"
       else
         warn "no build-host release yet: the first attach installs it with this Mac's worker token (MeshWeaver.Deploy deploy/backlease/first-attach.sh --profile $BUILD_PROFILE …); then re-run 'memex-local buildhost apply' to size it. Target: the token arrives through the enrolment channel (Hosting/MacStudioFleet §2b.5)"

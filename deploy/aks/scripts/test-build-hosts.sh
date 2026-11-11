@@ -704,7 +704,7 @@ if helm template build-host-mac "$CHART" -f "$CHART/values.yaml" -f "$REPO/deplo
      --set-string buildHosts.portalRepository=cr.example.com/memex-portal-ai --set-string buildHosts.runnerRepository=cr.example.com/mw-build-host \
      --set-string buildHosts.mac.platformVersion=3.1.11641 --set-string "buildHosts.mac.testerDigest=$H1" \
      --set-string "buildHosts.mac.portalDigest=$H2" --set-string "buildHosts.mac.runnerDigest=$H3" > "$WORK/mac-shipped.yaml" 2> "$WORK/mac-shipped.err"; then
-  if budget_check "$WORK/mac-shipped.yaml" 18 20 \
+  if budget_check "$WORK/mac-shipped.yaml" 80 - \
      && python3 - "$WORK/mac-shipped.yaml" <<'PYM'
 import sys, yaml
 hosts = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d and d.get("kind") == "Deployment"
@@ -712,13 +712,16 @@ hosts = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d and d.get("kind")
 if len(hosts) != 1:
     print("   ", f"the shipped Mac values render {len(hosts)} build-host Deployments, want exactly 1"); sys.exit(1)
 env = {e["name"]: e.get("value") for c in hosts[0]["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
-want = {"MW_BUILD_CACHE_MAX_GIB": "18", "MW_BUILD_CACHE_TREE_GIB": "0", "MW_BUILD_SLICE_CACHE_MAX_GIB": "5",
-        "MW_BUILD_CACHE_NUGET_GIB": "8", "MW_BUILD_CACHE_REFSETS_GIB": "2", "MW_BUILD_CACHE_PREPARED_GIB": "2"}
+want = {"MW_BUILD_CACHE_MAX_GIB": "80", "MW_BUILD_CACHE_TREE_GIB": "24", "MW_BUILD_SLICE_CACHE_MAX_GIB": "30",
+        "MW_BUILD_CACHE_NUGET_GIB": "8", "MW_BUILD_CACHE_REFSETS_GIB": "3", "MW_BUILD_CACHE_PREPARED_GIB": "2"}
+pvc = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d and d.get("kind") == "PersistentVolumeClaim"]
+if [p["spec"]["resources"]["requests"]["storage"] for p in pvc] != ["20Gi"]:
+    print("   ", "the Mac claim's REQUEST must stay 20Gi (a bound local-path claim cannot be expanded):", [p["spec"] for p in pvc]); sys.exit(1)
 bad = {k: (env.get(k), v) for k, v in want.items() if env.get(k) != v}
 if bad: print("   ", "the shipped Mac budget (got, want):", bad)
 sys.exit(1 if bad else 0)
 PYM
-  then ok "the SHIPPED Mac values render an 18 GiB budget on the 20Gi claim — no tree, slices 5 (not 32), nuget 8, refsets 2, prepared 2 — every share and their sum within it"
+  then ok "the SHIPPED Mac values render an 80 GiB budget over the UNCHANGED 20Gi local-path claim (sizeEnforced: false) — tree 24 (warm again), slices 30, nuget 8, refsets 3, prepared 2 — every share and their sum within it"
   else report "the shipped Mac values' cache budget is wrong (above)"
   fi
 else
@@ -930,6 +933,8 @@ for entry in \
   "values.build-hosts-cache-slice-bound-above-budget.yaml|the slices share 32 GiB exceeds the cache budget 18 GiB" \
   "values.build-hosts-cache-shares-sum-above-budget.yaml|the shares sum to 21 GiB, above the cache budget 18 GiB" \
   "values.build-hosts-cache-max-above-size.yaml|buildHosts.cache.maxGi 30 exceeds the declared cache.size 20Gi" \
+  "values.build-hosts-cache-unenforced-not-local-path.yaml|buildHosts.cache.sizeEnforced: false is only for a local-path claim" \
+  "values.build-hosts-cache-unenforced-not-bool.yaml|buildHosts.cache.sizeEnforced no must be true or false" \
   "values.build-hosts-cache-size-unit.yaml|buildHosts.cache.size \"20000Mi\" must be whole Gi, Ti, G or T" \
   "values.build-hosts-cache-shares-no-budget.yaml|buildHosts.cache.shares.treeGi needs a cache budget" \
   "values.build-hosts-ready-port-low.yaml|buildHosts.readyPort 80 must be within [1024, 65535]" \
