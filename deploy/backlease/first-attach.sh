@@ -51,8 +51,11 @@
 #      VM) at a share of the link measured once with networkQuality, and marks it DSCP CS1.
 #   6. FOLLOWS the sealed set from then on (follow-set.py, launchd com.memex.local.buildhost-follow.<profile>): every 5 min
 #      it reads the complete set channel `--follow` (default latest) runs from control and, when the release runs another,
-#      re-applies THIS chart with that set (--reuse-values) — so the host never falls behind what main needs and nobody
-#      re-runs this script to move it. The runners drain their run in hand on the roll. `--follow off` attaches pinned.
+#      re-applies the chart with that set — so the host never falls behind what main needs and nobody re-runs this script
+#      to move it. The chart, build-host-mac.values.yaml and the follower itself follow this repository's GREEN main too:
+#      a change to deploy/helm or deploy/backlease is staged beside the agent and applied by a FULL upgrade (chart
+#      defaults + Mac values + the estate values set below + the set), so a values change needs no re-attach. The runners
+#      drain their run in hand on the roll. `--follow off` attaches pinned.
 # The set (version + tester/portal/runner digests) is the one the operations record names for `latest`; it is passed,
 # never committed. The runner digest must be a multi-arch index carrying linux/arm64.
 set -euo pipefail
