@@ -22,6 +22,9 @@
 #      the release-named ServiceAccount + NetworkPolicy and NOTHING of the portal, and two such
 #      releases and the portal's own never name one object twice;
 #   3f. artifactStore.upload renders MW_BUILD_ARTIFACT_STORE=api: and mounts no store; beside a claim it is refused;
+#   3h. THE CACHE BUDGET (deploy/build-host/CACHE-BUDGET.md): every render whose cache has a declared size carries
+#      MW_BUILD_CACHE_MAX_GIB (the size less 10 %, never above it) and a share per area, no share above the budget and the
+#      shares not summing above it — the shipped Mac values included (18 GiB on its 20Gi claim, the slices 5, not 32);
 #   4. the refusals hold: a tag instead of a digest, plain http to a public host, and a registry
 #      credential for the host, fail
 #      `helm template` naming why.
@@ -235,6 +238,9 @@ for ch, (tester, portal, runner, mx, pv, mn) in want.items():
         problems.append(f"{ch}: MW_BUILD_STAGE_SLOTS is not the chart's default 8 (fan-out): {env.get('MW_BUILD_STAGE_SLOTS')}")
     if env.get("MW_BUILD_SLICE_CACHE_MAX_GIB", {}).get("value") != "32":
         problems.append(f"{ch}: MW_BUILD_SLICE_CACHE_MAX_GIB is not the chart's default bound 32 (the slice cache): {env.get('MW_BUILD_SLICE_CACHE_MAX_GIB')}")
+    if any(k.startswith("MW_BUILD_CACHE_") for k in env if k != "MW_BUILD_CACHE"):
+        problems.append(f"{ch}: a cache budget rendered although the fixture's claim declares no size (made elsewhere): "
+                        f"{sorted(k for k in env if k.startswith('MW_BUILD_CACHE_'))}")
     if pod.get("terminationGracePeriodSeconds") != 7200 or env.get("MW_BUILD_RUN_DEADLINE_SECONDS", {}).get("value") != "7200":
         problems.append(f"{ch}: terminationGracePeriodSeconds / the run deadline are not the same 7200 s (the default run budget)")
     if build.get("securityContext", {}).get("seccompProfile", {}) != {"type": "Unconfined"}:
@@ -633,6 +639,86 @@ else
   report "the mac first-attach values did not render:"; sed 's/^/    /' "$WORK/mac.err"
 fi
 
+# 3h. THE CACHE BUDGET: one total per cache, a share per area, none above it and together never above it — checked on every
+#     render below whose cache declares a size, the SHIPPED Mac values included. budget_check <render> <want budget|-> <claim size Gi|->
+budget_check() {
+  python3 - "$@" <<'PYB'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+want, size = sys.argv[2], sys.argv[3]
+problems, seen = [], 0
+AREAS = {"tree": "MW_BUILD_CACHE_TREE_GIB", "slices": "MW_BUILD_SLICE_CACHE_MAX_GIB", "nuget": "MW_BUILD_CACHE_NUGET_GIB",
+         "refsets": "MW_BUILD_CACHE_REFSETS_GIB", "prepared": "MW_BUILD_CACHE_PREPARED_GIB"}
+for d in docs:
+    if d.get("kind") != "Deployment" or (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") != "build-host":
+        continue
+    seen += 1
+    name = d["metadata"]["name"]
+    env = {e["name"]: e.get("value") for c in d["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
+    if env.get("MW_BUILD_CACHE_MAX_GIB") is None:
+        problems.append(f"{name}: no MW_BUILD_CACHE_MAX_GIB although the cache declares a size")
+        continue
+    budget = int(env["MW_BUILD_CACHE_MAX_GIB"])
+    shares = {a: int(env.get(v) or -1) for a, v in AREAS.items()}
+    if want != "-" and budget != int(want):
+        problems.append(f"{name}: the cache budget is {budget} GiB, want {want}")
+    if size != "-" and budget > int(size):
+        problems.append(f"{name}: the cache budget {budget} GiB exceeds the declared claim size {size}Gi")
+    for a, v in shares.items():
+        if v < 0 or v > budget:
+            problems.append(f"{name}: the {a} share {v} GiB is missing or above the cache budget {budget} GiB")
+    if sum(shares.values()) > budget:
+        problems.append(f"{name}: the shares sum to {sum(shares.values())} GiB, above the cache budget {budget} GiB: {shares}")
+    if shares["slices"] < 1:
+        problems.append(f"{name}: the slice cache share is {shares['slices']} (never zero)")
+if not seen:
+    problems.append("no build-host Deployment rendered")
+for p in problems: print("   ", p)
+sys.exit(1 if problems else 0)
+PYB
+}
+if [ -s "$WORK/mac.yaml" ]; then
+  budget_check "$WORK/mac.yaml" 54 60 && ok "the Mac fixture's 60Gi cache renders a 54 GiB budget (the size less 10 %) with every share within it and their sum too" \
+    || report "the Mac fixture's cache budget is wrong (above)"
+fi
+if [ -s "$WORK/cache.yaml" ]; then
+  budget_check "$WORK/cache.yaml" 90 100 && ok "a created 100Gi cache claim renders a 90 GiB budget with every share within it" \
+    || report "the created cache claim's budget is wrong (above)"
+fi
+# the SHIPPED Mac values (deploy/backlease/build-host-mac.values.yaml), with the estate values first-attach.sh supplies
+H1="sha256:$(printf '1%.0s' $(seq 64))"; H2="sha256:$(printf '2%.0s' $(seq 64))"; H3="sha256:$(printf '3%.0s' $(seq 64))"
+if helm template build-host-mac "$CHART" -f "$CHART/values.yaml" -f "$REPO/deploy/backlease/build-host-mac.values.yaml" --namespace memex \
+     --set-string buildHosts.apiUrl=https://control.example.com/api/builds --set-string buildHosts.testerRepository=cr.example.com/mw-plugin-test \
+     --set-string buildHosts.portalRepository=cr.example.com/memex-portal-ai --set-string buildHosts.runnerRepository=cr.example.com/mw-build-host \
+     --set-string buildHosts.mac.platformVersion=3.1.11641 --set-string "buildHosts.mac.testerDigest=$H1" \
+     --set-string "buildHosts.mac.portalDigest=$H2" --set-string "buildHosts.mac.runnerDigest=$H3" > "$WORK/mac-shipped.yaml" 2> "$WORK/mac-shipped.err"; then
+  if budget_check "$WORK/mac-shipped.yaml" 18 20 \
+     && python3 - "$WORK/mac-shipped.yaml" <<'PYM'
+import sys, yaml
+env = {e["name"]: e.get("value") for d in yaml.safe_load_all(open(sys.argv[1])) if d and d.get("kind") == "Deployment"
+       for c in d["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
+want = {"MW_BUILD_CACHE_MAX_GIB": "18", "MW_BUILD_CACHE_TREE_GIB": "0", "MW_BUILD_SLICE_CACHE_MAX_GIB": "5",
+        "MW_BUILD_CACHE_NUGET_GIB": "8", "MW_BUILD_CACHE_REFSETS_GIB": "2", "MW_BUILD_CACHE_PREPARED_GIB": "2"}
+bad = {k: (env.get(k), v) for k, v in want.items() if env.get(k) != v}
+if bad: print("   ", "the shipped Mac budget (got, want):", bad)
+sys.exit(1 if bad else 0)
+PYM
+  then ok "the SHIPPED Mac values render an 18 GiB budget on the 20Gi claim — no tree, slices 5 (not 32), nuget 8, refsets 2, prepared 2 — every share and their sum within it"
+  else report "the shipped Mac values' cache budget is wrong (above)"
+  fi
+else
+  report "the shipped Mac values did not render:"; sed 's/^/    /' "$WORK/mac-shipped.err"
+fi
+# NEGATIVE CONTROL: the check refuses a render whose shares exceed the budget (the fixture's default render, its budget patched)
+if [ -s "$WORK/mac.yaml" ]; then
+  sed 's/{ name: MW_BUILD_CACHE_MAX_GIB, value: "54" }/{ name: MW_BUILD_CACHE_MAX_GIB, value: "20" }/' "$WORK/mac.yaml" > "$WORK/mac-over.yaml"
+  if ! budget_check "$WORK/mac-over.yaml" - - > "$WORK/mac-over.out" 2>&1 && grep -q "above the cache budget 20 GiB" "$WORK/mac-over.out"; then
+    ok "negative control: the budget check refuses a render whose tree share (27) and share sum exceed a 20 GiB budget"
+  else
+    report "negative control: the budget check did not refuse shares above the budget:"; sed 's/^/    /' "$WORK/mac-over.out"
+  fi
+fi
+
 # 3d. the opt-in user-namespace sandbox: hostUsers false on the pod, procMount Unmasked on the build container, and on a
 #     node pool the selector narrowed to kernel-userns nodes. Off (the default), none of it renders.
 if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.sandbox.userNamespace=true \
@@ -825,6 +911,12 @@ for entry in \
   "values.build-hosts-stage-slots-fraction.yaml|buildHosts.stageSlots 2.9 must be a whole number" \
   "values.build-hosts-slice-cache-zero.yaml|buildHosts.sliceCacheMaxGi 0 must be within" \
   "values.build-hosts-slice-cache-fraction.yaml|buildHosts.sliceCacheMaxGi 1.5 must be a whole number" \
+  "values.build-hosts-cache-share-above-budget.yaml|the slices share 32 GiB exceeds the cache budget 18 GiB" \
+  "values.build-hosts-cache-slice-bound-above-budget.yaml|the slices share 32 GiB exceeds the cache budget 18 GiB" \
+  "values.build-hosts-cache-shares-sum-above-budget.yaml|the shares sum to 21 GiB, above the cache budget 18 GiB" \
+  "values.build-hosts-cache-max-above-size.yaml|buildHosts.cache.maxGi 30 exceeds the declared cache.size 20Gi" \
+  "values.build-hosts-cache-size-unit.yaml|buildHosts.cache.size \"20000Mi\" must be whole Gi, Ti, G or T" \
+  "values.build-hosts-cache-shares-no-budget.yaml|buildHosts.cache.shares.treeGi needs a cache budget" \
   "values.build-hosts-stage-network-bad.yaml|buildHosts.stageNetwork \"none\" must be open or offline" \
   "values.build-hosts-run-disk-fraction.yaml|buildHosts.runDiskGi 2.5 must be a whole number" \
   "values.build-hosts-disk-headroom-high.yaml|buildHosts.diskHeadroomPercent 95 must be within" \

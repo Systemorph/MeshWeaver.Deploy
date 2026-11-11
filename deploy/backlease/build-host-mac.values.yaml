@@ -46,6 +46,7 @@ buildHosts:
   stageSlots: 4
   # The warm workspace (Hosting/BuildQueue.md §7.3b): one master per host (the cache's bare mirrors) and one persistent
   # worktree per repository for this host's deployment, advanced in place by its single writer — nothing is ever copied.
+  # MOOT while `cache.shares.treeGi` is 0 (below): the 20Gi cache cannot hold the tree, so no tree is kept or warmed.
   warmWorkspace: true
   # The module-hub broker (Hosting/BuildQueue.md §7.4): the host asks control's per-module build hubs for each module a
   # `modules` stage names — a Hit is fetched and verified instead of built, a Grant is built once and handed back by its
@@ -66,7 +67,19 @@ buildHosts:
   # until the new runner's first idle pass deletes them — a transient inside the 230 GiB free on the data disk. `size` is
   # NOT raised here: local-path does not enforce a claim's capacity and cannot expand one, so editing it would only make
   # the upgrade try (and fail) to resize a bound claim; the data disk is the real bound.
-  cache: {create: true, storageClass: "local-path", size: "20Gi", accessMode: "ReadWriteOnce"}
+  # THE CACHE BUDGET (deploy/build-host/CACHE-BUDGET.md) makes the runner honour that declared size: 20Gi less 10 % = 18 GiB,
+  # which local-path never enforced — the cache held 43 GiB on 2026-11-11 (tree 20, slices 14 under a bound of 32, NuGet 6.1,
+  # reference sets 2.0, prepared 1.4, masters 0.4) and the disk guard refused every claim with 34 GiB free of 98. The one
+  # MeshWeaver.Plugins deployment tree alone (~18-20 GiB, obj/ and bin/) does not fit 18 GiB, so the Mac keeps NO tree
+  # (treeGi 0: no warm build starts, every run takes a cold worktree off the master, said) and spends the budget on what
+  # does fit: the warm NuGet cache (8, measured 6.1), the module slices (5), the reference sets and prepared inputs (2 each);
+  # 1 GiB of the budget and the 2 GiB margin hold the masters. Shares above the budget, or summing above it, are refused.
+  cache:
+    create: true
+    storageClass: "local-path"
+    size: "20Gi"
+    accessMode: "ReadWriteOnce"
+    shares: {treeGi: 0, slicesGi: 5, nugetGi: 8, refsetsGi: 2, preparedGi: 2}
   # bwrap needs a fresh /proc per stage, which only an Unmasked /proc allows, and Kubernetes grants that only to a pod in
   # its own user namespace (hostUsers: false) — hence the dedicated containerd profile first-attach.sh checks for.
   sandbox: {appArmorProfile: "Localhost", appArmorLocalhostProfile: "mw-build-host", seccompProfile: "Unconfined", userNamespace: true}

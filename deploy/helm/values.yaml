@@ -1263,6 +1263,18 @@ buildHosts:
     medium: "claim"
     # cache.medium host only: the node directory (e.g. /var/lib/mw-build-cache). Refused with any other medium.
     path: ""
+    # THE CACHE BUDGET (deploy/build-host/CACHE-BUDGET.md): the whole cache's total in whole GiB, never above `size`. Unset
+    # (null) = the declared `size` less 10 % (the margin holds the masters, outputs and markers no share covers); with no
+    # size and no maxGi (a claim made elsewhere, cache.medium host) there is no budget and only `sliceCacheMaxGi` applies.
+    # The runner keeps every area under its share, least recently used first, never an entry a run or a writer holds — a
+    # local-path claim never enforces its capacity itself (a Mac's 20Gi claim held 43 GiB on 2026-11-11).
+    maxGi: null
+    # Each area's share of the budget, whole GiB (null = the default percentage of the budget). The chart REFUSES a share
+    # above the budget and shares that sum above it. treeGi: the deployment trees (warm workspace; 0 = no tree is kept and
+    # no warm build starts), default 50 %; slicesGi: the module-slice cache (at least 1; `sliceCacheMaxGi` is its older
+    # name), 20 %; nugetGi: the warm NuGet cache, 15 %; refsetsGi: the staged reference sets, 5 %; preparedGi: the
+    # prepared inputs, 5 %.
+    shares: {treeGi: null, slicesGi: null, nugetGi: null, refsetsGi: null, preparedGi: null}
   # Opt-in channels beyond latest/stable, each configured like them under `buildHosts.<name>` (e.g. a leased-back
   # Mac's `mac`: only jobs routed to that channel land there).
   extraChannels: []
@@ -1325,7 +1337,9 @@ buildHosts:
   # least-recently-used slices (never one a run is copying, never one used in the last 10 minutes). The slices are a cache of
   # the control instance's content-addressed, append-only module store, so an evicted one is fetched again by its hash.
   # Unbounded, it reached 117 GB on a Mac (2026-11-10) and put the node at DiskPressure (MeshWeaver.Plugins Hosting/OneBuildTree.md).
-  sliceCacheMaxGi: 32
+  # null = 32 without a cache budget; with one, the slices' share (cache.shares.slicesGi, default 20 % of the budget) — and
+  # a value set here is that share, refused above the budget.
+  sliceCacheMaxGi: null
   # NO NETWORK DURING A RUN (MeshWeaver.Plugins Hosting/OneBuildTree.md): `offline` runs every stage in its own network
   # namespace (loopback only) with the prepared package folder as NuGet's ONLY source, and a package restored per run is an
   # ERROR (MWPREP001). `open` keeps today's network and says what a run still fetched. Turn `offline` on once a run's whole
