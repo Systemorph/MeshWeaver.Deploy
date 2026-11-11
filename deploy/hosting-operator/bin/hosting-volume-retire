@@ -184,12 +184,16 @@ while [ "$i" -lt "${#volumes[@]}" ]; do
 $mounts
 EOF_MOUNTS
 
+  # The path as a WHOLE path: itself, or a file under it — never a sibling that merely starts with it
+  # (/x/hosting-operator-2 is not /x/hosting-operator). Bounded on both sides by anything that cannot
+  # continue a path segment. The path's alphabet is closed above, so '.' is the one character to escape.
+  path_re="(^|[^A-Za-z0-9._/-])${path//./\\.}(\$|/|[^A-Za-z0-9._-])"
   # Does any container still READ the path? Its own spec first — everything but the mounts of this
   # volume — then every ConfigMap and Secret it reads configuration from. Names of the hits only.
-  readers="$(jq -r --arg v "$vol" --arg p "$path" "
+  readers="$(jq -r --arg v "$vol" --arg re "$path_re" "
       ${CONTAINERS}[] | .name as \$c
       | (.volumeMounts |= [.[]? | select(.name != \$v)])
-      | (paths(strings) as \$at | getpath(\$at) | select(contains(\$p))
+      | (paths(strings) as \$at | getpath(\$at) | select(test(\$re))
          | \"container \\(\$c) \\(\$at | map(tostring) | join(\".\"))\")" "$work/dep.json")" \
     || hosting::die "could not search the containers of deployment/${deployment} for ${path}"
   if [ -n "$readers" ]; then
@@ -212,9 +216,9 @@ EOF_MOUNTS
       hosting::die "could not read ${kind}/${name}, a configuration source of container ${c} ($(tr -d '\n' < "$work/err")) — whether it names ${path} is UNKNOWN, so nothing is removed"
     fi
     # A Secret's values are decoded only to be TESTED; the key's name is all that is ever printed.
-    hits="$(jq -r --arg k "$kind" --arg p "$path" '
+    hits="$(jq -r --arg k "$kind" --arg re "$path_re" '
         (.data // {}) | to_entries[]
-        | select((if $k == "secret" then (.value | @base64d) else .value end) | contains($p)) | .key' "$work/src.json" 2>"$work/err")" \
+        | select((if $k == "secret" then (.value | @base64d) else .value end) | test($re)) | .key' "$work/src.json" 2>"$work/err")" \
       || hosting::die "could not search ${kind}/${name} for ${path} ($(tr -d '\n' < "$work/err")) — UNKNOWN, so nothing is removed"
     rm -f "$work/src.json"
     if [ -n "$hits" ]; then

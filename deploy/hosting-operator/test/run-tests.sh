@@ -2193,6 +2193,10 @@ vr readsecret "$VR_TOKEN"
   && ok "a path read through a Secret the container reads (envFrom) refuses, naming the Secret and the KEY" || bad "a path read via a Secret is refused" "rc ${_vr_rc}: ${_vr_out}"
 case "${_vr_out}${_vr_log}" in *NEVER-PRINTED*) bad "a Secret's value is never printed" "out: ${_vr_out}" ;; *) ok "…never its value" ;; esac
 vr_no_patch "…and writes nothing"
+vr sibling "$VR_TOKEN"
+[ "$_vr_rc" -eq 0 ] && case "$_vr_out" in *"READS"*) false ;; *"::hosting:: volume_retired=1"*) true ;; *) false ;; esac \
+  && ok "negative control: a SIBLING path (…/hosting-operator-2, /mnt/…/hosting-operator) is not a read of the path — only the path itself or a file under it is" \
+  || bad "sibling paths are not reads" "rc ${_vr_rc}: ${_vr_out}"
 vr base "hosting-jobrunner-token=/var/run/secrets/elsewhere"
 [ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"container memex-portal mounts it at /var/run/secrets/hosting-operator"*) true ;; *) false ;; esac \
   && ok "a record whose mount path is not where the pod mounts it describes a different volume — refused" || bad "a mismatched path is refused" "rc ${_vr_rc}: ${_vr_out}"
@@ -3621,6 +3625,24 @@ md_fixture opsns '{"kind":"Namespace","metadata":{"name":"memex-ops"}}'
 md 'namespaces - memex-ops' MW_MD_WORKLOADS="$MD_FIX/workloads-runner.json" -- check --manifest demo/opsns.yaml
 [ "$_md_rc" -ne 0 ] && case "$_md_out" in *"IN USE    Namespace memex-ops — Pod memex-ops/hosting-op-live runs in it"*) true ;; *) false ;; esac \
   && ok "a Namespace a live pod still runs in is in use" || bad "namespace in use" "rc ${_md_rc}; ${_md_out}"
+# A volume's own CREDENTIAL is a use too: the kubelet needs it to mount (CSI nodePublishSecretRef, azureFile
+# secretName) — deleting it wedges new pods in ContainerCreating exactly as the incident did. So is a Secret the
+# ServiceAccount a pod runs as carries as imagePullSecrets: admission copies it into every NEW pod.
+md $'secrets memex kv-creds\nsecrets memex files-creds\nsecrets memex registry-pull' \
+  MW_MD_WORKLOADS="$MD_FIX/workloads-csi.json" MW_MD_SERVICEACCOUNTS="$MD_FIX/serviceaccounts.json" \
+  -- check --object Secret/memex/kv-creds --object Secret/memex/files-creds --object Secret/memex/registry-pull
+if [ "$_md_rc" -ne 0 ] && case "$_md_out" in *"deletion_in_use=3"*) true ;; *) false ;; esac \
+   && case "$_md_out" in *"IN USE    Secret memex/kv-creds — Deployment memex/memex-portal-deployment mounts volume memex-kv-secrets with it (CSI nodePublishSecretRef)"*) true ;; *) false ;; esac \
+   && case "$_md_out" in *"IN USE    Secret memex/files-creds — Deployment memex/memex-portal-deployment mounts volume files with it (azureFile secretName)"*) true ;; *) false ;; esac \
+   && case "$_md_out" in *"IN USE    Secret memex/registry-pull — Deployment memex/memex-portal-deployment pulls its image with it through ServiceAccount memex/memex-portal, which it runs as"*) true ;; *) false ;; esac; then
+  ok "a volume's mount credential (CSI, azureFile) and the pull secret of the ServiceAccount a pod runs as are in use"
+else bad "volume credential / ServiceAccount pull secret in use" "rc ${_md_rc}; ${_md_out}"; fi
+md 'secrets memex idle-pull' MW_MD_WORKLOADS="$MD_FIX/workloads-csi.json" MW_MD_SERVICEACCOUNTS="$MD_FIX/serviceaccounts.json" -- check --object Secret/memex/idle-pull
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"deletion_in_use=0"*) true ;; *) false ;; esac \
+  && ok "negative control: the pull secret of a ServiceAccount NO live pod runs as is not in use" || bad "idle SA pull secret" "rc ${_md_rc}; ${_md_out}"
+md "$_md_jr_live" MW_MD_REFUSE_READ=serviceaccounts -- check --object Secret/memex/hosting-jobrunner-token
+[ "$_md_rc" -ne 0 ] && case "$_md_out" in *"could not list the cluster's ServiceAccounts"*"UNKNOWN"*) true ;; *) false ;; esac \
+  && ok "a refused ServiceAccount read is UNKNOWN too" || bad "refused SA read" "rc ${_md_rc}; ${_md_out}"
 md "$_md_jr_live" MW_MD_REFUSE_READ=pods -- delete --manifest demo/jobrunner.yaml --sha256 "$_md_jr_digest"
 [ "$_md_rc" -ne 0 ] && [ "$_md_live" = "$_md_jr_live" ] && case "$_md_out" in *"could not list the cluster's pods and workloads"*"UNKNOWN"*) true ;; *) false ;; esac \
   && ok "a refused workload read is UNKNOWN, never 'nobody uses it' — and nothing is deleted" || bad "refused workload read" "rc ${_md_rc}; live: ${_md_live}; ${_md_out}"

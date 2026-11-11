@@ -276,7 +276,10 @@ hosting::say deletion_present "$present"
 # stuck in FailedMount — every roll since. So before anything is deleted, both modes read every live
 # Pod and every workload TEMPLATE in the cluster and refuse a PRESENT object of the plan that one of
 # them still references, naming the workload and how:
-#   * Secret     — a volume (secret or projected), envFrom, env valueFrom.secretKeyRef, imagePullSecrets;
+#   * Secret     — a volume (secret or projected), a volume's own credential (a CSI nodePublishSecretRef,
+#                  an azureFile secretName, any volume source's secretRef — the kubelet needs it to MOUNT),
+#                  envFrom, env valueFrom.secretKeyRef, imagePullSecrets — the pod's own, and those of the
+#                  ServiceAccount it runs as (admission copies them into every NEW pod);
 #   * ConfigMap / PersistentVolumeClaim — a volume, envFrom, env valueFrom (computed, though this lane
 #                  deletes neither kind today: the check is total, so adding a kind cannot reopen it);
 #   * ServiceAccount — the identity a pod runs as (serviceAccountName; unset means `default`);
@@ -291,12 +294,15 @@ hosting::say deletion_present "$present"
 # A refused or failed read is UNKNOWN and fails: "nobody uses it" is never assumed.
 WORKLOAD_RES="pods,deployments.apps,statefulsets.apps,daemonsets.apps,replicasets.apps,jobs.batch,cronjobs.batch"
 BINDING_RES="rolebindings.rbac.authorization.k8s.io,clusterrolebindings.rbac.authorization.k8s.io"
+SA_RES="serviceaccounts"
 kubectl get "$WORKLOAD_RES" --all-namespaces -o json > "$work/workloads.json" 2>"$work/err" \
   || hosting::die "could not list the cluster's pods and workloads ($(head -1 "$work/err")) — whether a live workload still uses an object of the plan is UNKNOWN, so nothing was decided"
 kubectl get "$BINDING_RES" --all-namespaces -o json > "$work/bindings.json" 2>"$work/err" \
   || hosting::die "could not list the cluster's role bindings ($(head -1 "$work/err")) — whether a live workload still uses an object of the plan is UNKNOWN, so nothing was decided"
+kubectl get "$SA_RES" --all-namespaces -o json > "$work/serviceaccounts.json" 2>"$work/err" \
+  || hosting::die "could not list the cluster's ServiceAccounts ($(head -1 "$work/err")) — whether a live workload still pulls with a Secret of the plan is UNKNOWN, so nothing was decided"
 # One `<Kind>|<namespace>|<name>|<who> <how>` line per reference to an object of the plan.
-if ! jq -rn --slurpfile w "$work/workloads.json" --slurpfile b "$work/bindings.json" --rawfile plan "$work/canonical" '
+if ! jq -rn --slurpfile w "$work/workloads.json" --slurpfile b "$work/bindings.json" --slurpfile sa "$work/serviceaccounts.json" --rawfile plan "$work/canonical" '
   def live:
     if .kind == "Pod" then ((.status.phase // "") | . != "Succeeded" and . != "Failed")
     elif .kind == "ReplicaSet" then ((.spec.replicas // 1) > 0)
@@ -315,6 +321,9 @@ if ! jq -rn --slurpfile w "$work/workloads.json" --slurpfile b "$work/bindings.j
         | (.secret.secretName // empty | ["Secret", $ns, ., $who, "mounts it as volume \($v)"]),
           (.configMap.name // empty | ["ConfigMap", $ns, ., $who, "mounts it as volume \($v)"]),
           (.persistentVolumeClaim.claimName // empty | ["PersistentVolumeClaim", $ns, ., $who, "mounts it as volume \($v)"]),
+          (.csi.nodePublishSecretRef.name // empty | ["Secret", $ns, ., $who, "mounts volume \($v) with it (CSI nodePublishSecretRef)"]),
+          (.azureFile.secretName // empty | ["Secret", $ns, ., $who, "mounts volume \($v) with it (azureFile secretName)"]),
+          ([.[]? | objects | .secretRef.name? // empty][] | ["Secret", $ns, ., $who, "mounts volume \($v) with it (secretRef)"]),
           (.projected.sources[]?
             | (.secret.name // empty | ["Secret", $ns, ., $who, "projects it into volume \($v)"]),
               (.configMap.name // empty | ["ConfigMap", $ns, ., $who, "projects it into volume \($v)"]))),
@@ -327,6 +336,9 @@ if ! jq -rn --slurpfile w "$work/workloads.json" --slurpfile b "$work/bindings.j
               (.valueFrom.configMapKeyRef.name // empty | ["ConfigMap", $ns, ., $who, "reads env \($e) of container \($c) from it"])));
   [ $w[0].items[]? | select(live) | refs ] as $direct
   | ($direct | map(select(.[0] == "ServiceAccount"))) as $sas
+  | [ $sa[0].items[]? | (.metadata.namespace // "") as $sns | .metadata.name as $san | .imagePullSecrets[]? | .name // empty | . as $sec
+      | $sas[] | select(.[1] == $sns and .[2] == $san)
+      | ["Secret", $sns, $sec, .[3], "pulls its image with it through ServiceAccount \($sns)/\($san), which it runs as"] ] as $sapull
   | [ $b[0].items[]? | . as $bind | (.metadata.namespace // "") as $bns
       | .subjects[]? | select(.kind == "ServiceAccount") | (.namespace // $bns) as $sns | .name as $san
       | $sas[] | select(.[1] == $sns and .[2] == $san) | .[3] as $who
@@ -334,7 +346,7 @@ if ! jq -rn --slurpfile w "$work/workloads.json" --slurpfile b "$work/bindings.j
         [$bind.roleRef.kind, (if $bind.roleRef.kind == "Role" then $bns else "" end), $bind.roleRef.name, $who,
          "is granted it through \($bind.kind) \(if $bns == "" then "" else "\($bns)/" end)\($bind.metadata.name) to ServiceAccount \($sns)/\($san), which it runs as"] ] as $granted
   | ($plan | split("\n") | map(select(length > 0))) as $wanted
-  | ($direct + $granted)[] | select((.[0:3] | join("|")) as $id | $wanted | index($id))
+  | ($direct + $granted + $sapull)[] | select((.[0:3] | join("|")) as $id | $wanted | index($id))
   | "\(.[0])|\(.[1])|\(.[2])|\(.[3]) \(.[4])"' > "$work/refs" 2>"$work/err"; then
   hosting::die "could not compute which workloads reference the plan's objects: $(head -1 "$work/err") — UNKNOWN, so nothing was decided"
 fi
