@@ -7847,8 +7847,8 @@ autoupdate_default() {
 # autoupdate agent runs it after every upgrade, `update` runs the same steps). Today: the local ingress's HSTS.
 cmd_settle() {
   [ $# -eq 0 ] || die "settle: takes no arguments"
-  require_tool kubectl kubernetes-cli
   colima_running || { info "settle: Colima is not running — the next up/update applies it"; return 0; }
+  require_tool kubectl kubernetes-cli
   ensure_ingress_no_hsts
   ok "settle: done"
 }
@@ -7940,7 +7940,12 @@ PLIST
       # the script, so "assets unchanged" skipped it and every existing Mac kept pinning localhost to https). Cheap and
       # idempotent; run by the NEW binary, whatever the assets did.
       if colima_running; then
-        MEMEX_IN_AUTOUPDATE=1 "$(brew --prefix)/bin/memex-local" settle 2>&1 | sed "s/^/$(date -u +%FT%TZ) autoupdate: settle: /"
+        # its output prefixed AFTER it ran, so the exit status is settle's own; a failed settle is said and never ends
+        # the tick (the chart re-apply below still runs)
+        local sout src=0
+        sout="$(MEMEX_IN_AUTOUPDATE=1 "$(brew --prefix)/bin/memex-local" settle 2>&1)" || src=$?
+        [ -z "$sout" ] || printf '%s\n' "$sout" | sed "s/^/$(date -u +%FT%TZ) autoupdate: settle: /"
+        [ "$src" = 0 ] || printf '%s autoupdate: settle FAILED (exit %s) on %s — its output is above; the next upgrade or update retries\n' "$(date -u +%FT%TZ)" "$src" "$after"
       fi
       if [ "$abefore" = "$aafter" ]; then
         printf '%s autoupdate: chart and share assets unchanged — nothing to re-apply\n' "$(date -u +%FT%TZ)"
