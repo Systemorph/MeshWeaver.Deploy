@@ -3389,11 +3389,16 @@ class H(http.server.BaseHTTPRequestHandler):
                "enrolment": {"path": "Admin/MachineEnrolments/mini-1-x", "state": "joined", "open": None},
                "hostStatus": {"present": mode != "norecord", "at": "2026-11-11T09:59:48Z"}}
         b = json.dumps(out).encode(); self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(b)
-s = http.server.HTTPServer(("127.0.0.1", 0), H); print(s.server_address[1], flush=True); s.serve_forever()
+import os
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+with open(sys.argv[2] + ".tmp", "w") as f: f.write(str(s.server_address[1]))
+os.replace(sys.argv[2] + ".tmp", sys.argv[2])
+s.serve_forever()
 PY
 printf '#!/bin/bash\nprintf "NAME ID SIZE MODIFIED\\nqwen3:8b abc 5.2 GB now\\n"\n' > "$FD/stubs/ollama"
 printf '#!/bin/bash\nexit 0\n' > "$FD/stubs/curl"; chmod +x "$FD/stubs/"*
-fd() { local port; rm -f "$FD/port"; python3 "$FD/srv.py" "$1" > "$FD/port" & local pid=$!; for _ in $(seq 1 50); do port="$(cat "$FD/port" 2>/dev/null)"; [ -n "$port" ] && break; sleep 0.2; done
+fd() { local port=""; rm -f "$FD/port" "$FD/port.tmp"; python3 "$FD/srv.py" "$1" "$FD/port" 2>"$FD/srv.err" & local pid=$!; for _ in $(seq 1 150); do [ -s "$FD/port" ] && port="$(cat "$FD/port")" && break; sleep 0.2; done
+  [ -n "$port" ] || { echo "the test server did not start: $(tail -c 400 "$FD/srv.err" 2>/dev/null)"; kill "$pid" 2>/dev/null; return 2; }
   printf 'config:\n  memex_portal:\n    Hosting__ReportTo: "http://127.0.0.1:%s"\n    Hosting__Deployment: "mini-1"\n    Hosting__BackLease__Accept__Jobs__Enabled: "false"\n    Hosting__BackLease__Accept__Tokens__Enabled: "false"\n' "$port" > "$FD/home/.memex-local/backlease.yaml"
   env PATH="$FD/stubs:$STUBS:$PATH" HOME="$FD/home" MEMEX_LOCAL_HOME="$FD/home/.memex-local" MEMEX_OLLAMA_MODEL=qwen3:8b "$CLI" fleet doctor 2>&1; local rc=$?
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return "$rc"; }
