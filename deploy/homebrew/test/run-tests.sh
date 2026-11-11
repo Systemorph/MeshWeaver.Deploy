@@ -3281,6 +3281,23 @@ grep -q -- "--plugins-registry https://reg.example.test" "$JH/args" && grep -qx 
   && ok "…and MEMEX_BUILDHOST_REGISTRY_BUNDLES=1 opts in (key file + --plugins-registry)" || bad "join h8 opt-in" "args=$(cat "$JH/args") $OUT"
 rm -rf "$JH"
 
+echo "── the tap tarball carries every directory the formula installs (2026-11-10) ──────"
+TB="$(mktemp -d)"
+if out="$(bash "$HERE/../../../deploy/homebrew/scripts/make-tarball.sh" 0.0.0-test "$TB/t.tar.gz" HEAD 2>&1)"; then
+  E="$(tar -tzf "$TB/t.tar.gz")"
+  grep -qxF "memex-local-0.0.0-test/deploy/backlease/first-attach.sh" <<<"$E" \
+    && ok "the tarball ships deploy/backlease/first-attach.sh (fleet join's build-host attach skipped without it on the second Mac Studio)" \
+    || bad "tarball backlease" "$(grep -c '' <<<"$E") entries, no first-attach.sh"
+  miss=""
+  for d in $(grep -oE 'Dir\["deploy/[A-Za-z0-9_.-]+' "$HERE/../../../deploy/homebrew/Formula/memex-local.rb" | sed 's/^Dir\["//' | sort -u); do
+    grep -qE "^memex-local-0.0.0-test/$d/." <<<"$E" || miss="$miss $d"
+  done
+  [ -z "$miss" ] && ok "every Dir[] the formula installs from is in the tarball" || bad "tarball dirs" "missing:$miss"
+else
+  bad "make-tarball" "$out"
+fi
+rm -rf "$TB"
+
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
