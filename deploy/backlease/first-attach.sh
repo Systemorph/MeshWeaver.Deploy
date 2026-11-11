@@ -66,8 +66,8 @@ attach_venv="${MEMEX_ATTACH_VENV:-$HOME/.mw-attach-venv}"
 if ! python3 -c 'import yaml' >/dev/null 2>&1; then
   if ! "$attach_venv/bin/python3" -c 'import yaml' >/dev/null 2>&1; then
     echo "== PyYAML for the attach: a private venv at $attach_venv (python3 here has no 'yaml')"
-    python3 -m venv "$attach_venv" && "$attach_venv/bin/pip" install -q --disable-pip-version-check pyyaml \
-      || { echo "ERROR: could not create $attach_venv with PyYAML — 'python3 -m venv $attach_venv && $attach_venv/bin/pip install pyyaml', then re-run. Nothing was changed." >&2; exit 1; }
+    python3 -m venv "$attach_venv" && "$attach_venv/bin/pip" install -q --disable-pip-version-check 'pyyaml>=6.0.2,<7' \
+      || { echo "ERROR: could not create $attach_venv with PyYAML — 'python3 -m venv $attach_venv && $attach_venv/bin/pip install "pyyaml>=6.0.2,<7"', then re-run. The attach did not start; a partial $attach_venv may remain and is reused or rebuilt on the next run." >&2; exit 1; }
   fi
   PATH="$attach_venv/bin:$PATH"; export PATH
 fi
