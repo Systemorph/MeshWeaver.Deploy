@@ -17,14 +17,13 @@ buildHosts:
   # The plugins layer: as the cluster hosts take it — the sealed publication /hosts/inputs names, or none. The registry's
   # bundle index (H8, a READ-ONLY instance key) is opt-in through first-attach.sh's --plugins-registry/--instance-key-secret:
   # measured 2026-11-07 the registry served AI as an assemblies-only bundle, module-fetch refused it, and the host never claimed.
-  # Recreate, KEPT on purpose (2026-11-10). One replica at a time (RollingUpdate, maxSurge 0 / maxUnavailable 1) is the
-  # target, because Recreate with the 2 h run grace leaves the Mac at 0 ready while every old pod drains. But a
-  # RollingUpdate step waits for the new pod to be READY, and on the Macs' runtime (Colima, containerd 2.3, hostUsers:
-  # false) every exec into the build container fails — "OCI runtime exec failed: … unable to setup user: chown
-  # /dev/stdout: invalid argument", measured on eiger 2026-11-10 22:30Z — so the exec readiness probe never passes. A
-  # rolling roll would replace ONE pod and then stall for good, leaving the rest on the old runner. Switch to
-  # RollingUpdate once a probe passes there.
-  rolloutStrategy: "Recreate"
+  # ONE REPLICA AT A TIME (2026-11-11): RollingUpdate with maxSurge 0 / maxUnavailable 1 — the old pod drains its run in
+  # hand while the others keep claiming, so a roll never takes the Mac to 0 ready (Recreate did, for up to the 2 h run
+  # grace: eiger, 2026-11-11 18:16Z, 0/3 while one old pod drained). It waits for each new pod to be READY, which the
+  # Macs now pass: readiness is the runner's HTTP endpoint (#252), not an exec (an exec into the build container fails
+  # under hostUsers:false on Colima/containerd 2.3 — "unable to setup user: chown /dev/stdout"). Measured: the second
+  # Mac's three runners 1/1 Ready on the HTTP probe, 2026-11-11 18:15Z.
+  rolloutStrategy: "RollingUpdate"
   nodeSelector: null
   tolerations: null
   # Sized for a 16 CPU / 100 GiB-memory / 300 GiB-disk build VM (the first Mac's `build` profile, 2026-11-07): up to four
