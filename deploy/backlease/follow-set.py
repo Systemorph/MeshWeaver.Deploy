@@ -20,7 +20,7 @@ Draining: nothing here waits or kills. The runners stop claiming on SIGTERM and 
 
 THE CHART AND THE MAC'S VALUES FOLLOW TOO (MeshWeaver.Plugins Hosting/OneBuildTree §7, "the follower re-applies only the
 set"). Before, a chart or values change reached a Mac only on a re-attach. Now each pass also reads this repository's
-`main` (public; `--source-repo`/`--source-ref`). When its newest commit is GREEN (the chart gate's REQUIRED_CHECKS succeeded, no check failed) and
+`main` (public; `--source-repo`/`--source-ref`). When its newest commit is GREEN (the chart gate's REQUIRED_CHECKS succeeded; a red check OUTSIDE the gate is named, never a hold — 2026-11-11: an unrelated publish job red for hours held both Macs off the chart that fixed their readiness) and
 changed `deploy/helm` or `deploy/backlease` (their git tree ids), the pass stages that commit's chart, `build-host-mac.values.yaml`
 and this script beside the agent (the next pass runs the new script), then applies them: a FULL `helm upgrade` — the
 chart's defaults, the Mac values, the estate values first-attach set (ESTATE_KEYS, read back from the release) and the set —
@@ -198,7 +198,11 @@ def source_head(get: Fetcher, repo: str = SOURCE_REPO, ref: str = SOURCE_REF, ca
         by_name.setdefault(r.get("name"), []).append(r)
     missing = [n for n in REQUIRED_CHECKS
                if not any(r.get("status") == "completed" and r.get("conclusion") == "success" for r in by_name.get(n, []))]
-    green = not red and not missing
+    # Only the GATE decides: the checks that render the chart and run this follower's self-test. A red elsewhere (a
+    # publish job, an image lane) says nothing about the chart and must not hold the hosts on an older one.
+    gate_red = [n for n in red if n in REQUIRED_CHECKS]
+    other_red = [n for n in red if n not in REQUIRED_CHECKS]
+    green = not gate_red and not missing
     if cache:
         try:
             write_json(cache, {"sha": sha, "helm": ids["helm"], "backlease": ids["backlease"], "green": green})
@@ -206,9 +210,10 @@ def source_head(get: Fetcher, repo: str = SOURCE_REPO, ref: str = SOURCE_REF, ca
             pass
     if not green:
         return None, (f"{repo}@{sha[:12]} is not green yet — "
-                      + (f"{len(red)} check(s) red ({', '.join(map(str, red[:3]))})" if red else
+                      + (f"{len(gate_red)} gate check(s) red ({', '.join(map(str, gate_red[:3]))})" if gate_red else
                          f"the gate has not passed ({', '.join(missing)})"))
-    return {"sha": sha, "helm": ids["helm"], "backlease": ids["backlease"]}, "ok"
+    return {"sha": sha, "helm": ids["helm"], "backlease": ids["backlease"]}, (
+        "ok" if not other_red else f"ok — {len(set(other_red))} check(s) outside the chart gate red ({', '.join(sorted(set(map(str, other_red)))[:3])}), not a hold")
 
 
 def source_key(src: Optional[dict]) -> Optional[str]:
@@ -322,6 +327,8 @@ def follow_once(api: str, follow: str, release: str, ns: str, ctx: str, chart: s
         staged = read_json(os.path.join(agent, "source.json"))
         if src is None:
             notes.append(f"chart/values held — {swhy}")
+        elif swhy != "ok":
+            notes.append(swhy[len("ok — "):] if swhy.startswith("ok — ") else swhy)
         elif source_key(src) != staged.get("key"):
             if dry_run:
                 notes.append(f"would stage the chart and Mac values of {source_repo}@{src['sha'][:12]}")
@@ -564,14 +571,20 @@ def self_test() -> int:
     src, why = source_head(github(green))
     check("source: a green main names its commit and the two tree ids", src == {"sha": SHA_C, "helm": HELM, "backlease": BL}, (src, why))
     check("source: a check still running OUTSIDE the gate does not hold a commit whose gate passed", source_head(github(green))[0] is not None)
-    for name, checks in (("a red check", green + [{"name": "chart", "status": "completed", "conclusion": "failure"}]),
-                         ("a cancelled check", green + [{"name": "x", "status": "completed", "conclusion": "cancelled"}]),
+    for name, checks in (("a red GATE check", [{"name": REQUIRED_CHECKS[0], "status": "completed", "conclusion": "failure"},
+                                                {"name": REQUIRED_CHECKS[1], "status": "completed", "conclusion": "success"}]),
+                         ("a cancelled GATE check", [{"name": REQUIRED_CHECKS[0], "status": "completed", "conclusion": "success"},
+                                                     {"name": REQUIRED_CHECKS[1], "status": "completed", "conclusion": "cancelled"}]),
                          ("the gate still running", [{"name": REQUIRED_CHECKS[0], "status": "in_progress"},
                                                      {"name": REQUIRED_CHECKS[1], "status": "completed", "conclusion": "success"}]),
                          ("the gate skipped (never ran)", [{"name": n, "status": "completed", "conclusion": "skipped"} for n in REQUIRED_CHECKS]),
                          ("only trivial checks", [{"name": "b", "status": "completed", "conclusion": "success"}]), ("no check at all", [])):
         src, why = source_head(github(checks))
         check(f"source: {name} holds the chart (nothing staged)", src is None and "not green" in why, why)
+    src, why = source_head(github(green + [{"name": "Package seed: publish", "status": "completed", "conclusion": "failure"},
+                                           {"name": "x", "status": "completed", "conclusion": "cancelled"}]))
+    check("source: a red check OUTSIDE the gate (a publish job) does not hold the chart, and is named",
+          src is not None and "Package seed: publish" in why and "not a hold" in why, (src, why))
     src, why = source_head(github(green, status=403))
     check("source: GitHub refusing (a rate limit) holds it, said", src is None and "403" in why, why)
     with tempfile.TemporaryDirectory() as hc:
@@ -636,7 +649,7 @@ def self_test() -> int:
         line, rc = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
                                chart_a, "mac", github(green), hv, agent=ag, download=dl(tarball(full)))
         up = hv.upgrades()
-        check("values: a host ON its set whose chart/values changed on a green main is upgraded",
+        check("values: a host ON its set whose chart/values changed on a green main is upgraded — and a FRESH install (no applied.json) counts as changed, so it applies the current chart once",
               rc == 0 and len(up) == 1 and "with the chart and Mac values of 111111111111" in line, (line, hv.calls))
         check("values: the upgrade is FULL — chart defaults, the Mac values, the estate values, then the set — never --reuse-values",
               up and "--reuse-values" not in up[0] and up[0][up[0].index("-f") + 1] == os.path.join(chart_a, "values.yaml")
@@ -656,9 +669,10 @@ def self_test() -> int:
         check("values: --dry-run stages and applies nothing", hv3.upgrades() == [] and "would" in line3, line3)
         hv4 = HelmV(cur)
         line4, _ = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
-                               chart_a, "mac", github(green + [{"name": "x", "status": "completed", "conclusion": "failure"}], helm="9" * 40, sha="7" * 40),
+                               chart_a, "mac", github([{"name": REQUIRED_CHECKS[0], "status": "completed", "conclusion": "failure"},
+                                                        {"name": REQUIRED_CHECKS[1], "status": "completed", "conclusion": "success"}], helm="9" * 40, sha="7" * 40),
                                hv4, agent=ag, download=dl(tarball(full)))
-        check("values: a RED main is never followed (the host stays as it is, said)", hv4.upgrades() == [] and "held" in line4, line4)
+        check("values: a main whose chart GATE is red is never followed (the host stays as it is, said)", hv4.upgrades() == [] and "held" in line4, line4)
     # first-attach's estate --set-string keys are exactly what a full upgrade keeps
     attach = os.path.join(os.path.dirname(os.path.abspath(__file__)), "first-attach.sh")
     if os.path.isfile(attach):
