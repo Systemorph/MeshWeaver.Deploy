@@ -10,7 +10,7 @@
 #      estate changes until its record turns the hosts on;
 #   3. the fixture renders, per enabled channel, a Deployment with no `replicas` (KEDA owns it),
 #      images by DIGEST, the ci-build toleration + nodeSelector, the worker token from a Secret, the
-#      build-cache claim, readiness on the staged marker, and a ScaledObject with minReplicaCount = the
+#      build-cache claim, readiness on the runner's GET /ready (httpGet on the named port `ready`, never exec), and a ScaledObject with minReplicaCount = the
 #      channel's declared floor (minReplicas, default 0),
 #      the channel's maxReplicaCount and a metrics-api trigger on <apiUrl>/queue?channel=<c> with
 #      valueLocation demand and a scale-down stabilization window, the worker token as a mounted
@@ -253,8 +253,20 @@ for ch, (tester, portal, runner, mx, pv, mn) in want.items():
         problems.append(f"{ch}: BUILD_API not the trimmed apiUrl: {env.get('BUILD_API')}")
     if "exec python3 /opt/build-host/build-run.py --host" not in " ".join(build.get("command", [])):
         problems.append(f"{ch}: the runner is not exec'd (SIGTERM would not reach it)")
-    if "test -f /tmp/build-host-ready" not in " ".join(build.get("readinessProbe", {}).get("exec", {}).get("command", [])):
-        problems.append(f"{ch}: readiness is not the staged marker")
+    # READINESS = staged, answered by the runner over HTTP on its named port — never an exec probe: on the Mac hosts
+    # (runc 1.4.0 + `hostUsers: false`) every exec into the container fails, so an exec probe never passed (2026-11-11).
+    rp = build.get("readinessProbe", {})
+    _ports = {p.get("name"): p for p in build.get("ports", [])}
+    if rp.get("httpGet") != {"path": "/ready", "port": "ready"} or "exec" in rp:
+        problems.append(f"{ch}: readiness is not the runner's GET /ready on the named port `ready` (an exec probe fails on the Macs): {rp}")
+    if _ports.get("ready", {}).get("containerPort") != 8090 or _ports.get("ready", {}).get("protocol") != "TCP" \
+            or env.get("MW_BUILD_READY_PORT", {}).get("value") != "8090":
+        problems.append(f"{ch}: the readiness port is not 8090 on both the container port `ready` and MW_BUILD_READY_PORT: "
+                        f"{build.get('ports')} / {env.get('MW_BUILD_READY_PORT')}")
+    if any(d.get("kind") == "Service" and (d["spec"].get("selector") or {}).get("app.kubernetes.io/component") == "build-host" for d in docs):
+        problems.append(f"{ch}: a Service selects the build hosts — the readiness port is the kubelet's alone")
+    if env.get("MW_BUILD_READY_FILE", {}).get("value") != "/tmp/build-host-ready":
+        problems.append(f"{ch}: the staged marker file is no longer named to the runner (kept for older readers)")
     cmd = " ".join(build.get("command", []))
     if "compose-gate-host.sh /portal/app /tester /host/app" not in cmd or env.get("MW_BUILD_GATE_HOST", {}).get("value") != "/host/app":
         problems.append(f"{ch}: the gate host must be composed into /host/app (the composer removes its output; /host is a mount point)")
@@ -917,6 +929,8 @@ for entry in \
   "values.build-hosts-cache-max-above-size.yaml|buildHosts.cache.maxGi 30 exceeds the declared cache.size 20Gi" \
   "values.build-hosts-cache-size-unit.yaml|buildHosts.cache.size \"20000Mi\" must be whole Gi, Ti, G or T" \
   "values.build-hosts-cache-shares-no-budget.yaml|buildHosts.cache.shares.treeGi needs a cache budget" \
+  "values.build-hosts-ready-port-low.yaml|buildHosts.readyPort 80 must be within [1024, 65535]" \
+  "values.build-hosts-ready-port-fraction.yaml|buildHosts.readyPort 8090.5 must be a whole number" \
   "values.build-hosts-stage-network-bad.yaml|buildHosts.stageNetwork \"none\" must be open or offline" \
   "values.build-hosts-run-disk-fraction.yaml|buildHosts.runDiskGi 2.5 must be a whole number" \
   "values.build-hosts-disk-headroom-high.yaml|buildHosts.diskHeadroomPercent 95 must be within" \

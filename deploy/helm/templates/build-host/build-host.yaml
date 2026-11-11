@@ -222,6 +222,11 @@ spec:
           # The composer REPLACES its output directory (rm -rf), so it writes a SUBDIRECTORY of the
           # emptyDir — the mount point itself cannot be removed.
           command: ["/bin/bash", "-c", "set -euo pipefail; bash /opt/build-host/compose-gate-host.sh /portal/app /tester /host/app; exec python3 /opt/build-host/build-run.py --host"]
+          # The runner's readiness endpoint (GET /ready) — read by the kubelet only. No Service selects this
+          # port and the NetworkPolicy admits no ingress; the kubelet's probe comes from the node, which a
+          # NetworkPolicy does not filter (Kubernetes: traffic from the pod's own node is always allowed).
+          ports:
+            - { name: "ready", containerPort: {{ $b.readyPort }}, protocol: "TCP" }
           env:
             - { name: BUILD_API, value: {{ $b.apiUrl | quote }} }
             # The worker token is a FILE read into the host process — never an environment variable
@@ -276,6 +281,7 @@ spec:
             - { name: MW_BUILD_CACHE, value: "/cache" }
             - { name: MW_BUILD_WORK, value: "/work" }
             - { name: MW_BUILD_READY_FILE, value: "/tmp/build-host-ready" }
+            - { name: MW_BUILD_READY_PORT, value: {{ $b.readyPort | quote }} }
             - { name: MW_BUILD_GATE_HOST, value: "/host/app" }
             - { name: MW_BUILD_PORTAL_DOTNET, value: "/portal/dotnet/dotnet" }
             - { name: MeshWeaverRefs, value: "/portal/app" }
@@ -298,8 +304,12 @@ spec:
             - { name: MW_REGISTRY_URL, value: {{ $b.registry.url | quote }} }
             - { name: MW_REGISTRY_KEY_FILE, value: "/run/registry-key/key" }
             {{- end }}
+          # readiness = staged, answered by the runner over HTTP — NEVER an exec probe: on the Mac hosts (k3s, runc 1.4.0,
+          # `hostUsers: false`) every exec into this container fails ("unable to setup user: chown /dev/stdout: invalid
+          # argument"), so `test -f <marker>` never passed and the pods sat 0/1 Ready forever (2026-11-11). The marker
+          # file is still written, for a reader that tests it.
           readinessProbe:
-            exec: { command: ["/bin/sh", "-c", "test -f /tmp/build-host-ready"] }
+            httpGet: { path: "/ready", port: "ready" }
             periodSeconds: 10
             failureThreshold: 3
           resources:

@@ -1340,6 +1340,10 @@ buildHosts:
   # null = 32 without a cache budget; with one, the slices' share (cache.shares.slicesGi, default 20 % of the budget) — and
   # a value set here is that share, refused above the budget.
   sliceCacheMaxGi: null
+  # The port the runner answers the kubelet's readiness probe on (GET /ready: 200 once the host is staged, else 503), whole
+  # number in [1024, 65535]. An httpGet probe, never an exec: on the Mac hosts every exec into the user-namespaced build
+  # container fails (runc 1.4.0 + `hostUsers: false`), so an exec probe never passed. No Service exposes it.
+  readyPort: 8090
   # NO NETWORK DURING A RUN (MeshWeaver.Plugins Hosting/OneBuildTree.md): `offline` runs every stage in its own network
   # namespace (loopback only) with the prepared package folder as NuGet's ONLY source, and a package restored per run is an
   # ERROR (MWPREP001). `open` keeps today's network and says what a run still fetched. Turn `offline` on once a run's whole

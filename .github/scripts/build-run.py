@@ -164,6 +164,8 @@ Environment (rendered by the chart from `buildHosts.*`):
   MW_BUILD_CACHE               the shared cache volume                    default /cache
   MW_BUILD_WORK                the per-run work root                       default /work
   MW_BUILD_READY_FILE          written once the host is staged (readiness) default /tmp/build-host-ready
+  MW_BUILD_READY_PORT          `--host` serves GET /ready on this port: 200 once staged (the marker's moment), else 503;
+                               any other path 404. Unset = no endpoint (the marker file alone); outside [1024, 65535] = refused
   MW_BUILD_COMPILE_REFS        the compile-check's reference set, prepared once per roll: the portal's
                                /app + shared-frameworks/ (CI's refs/ shape); handed to stages; the host
                                refuses to START when it carries no System.Private.CoreLib.dll or Rx
@@ -5174,6 +5176,82 @@ def _run_capture(argv: list[str]) -> tuple[int, str]:
     return r.returncode, (r.stderr or "") + (r.stdout or "")      # stdout LAST: callers read its final line
 
 
+# ─── readiness over HTTP: the kubelet probes the pod without an exec ─────────────────────────────────────────────────
+# On the Mac build hosts (k3s v1.35.0+k3s1, bundled runc 1.4.0, `hostUsers: false`) EVERY exec into the build container
+# fails — "unable to setup user: chown /dev/stdout: invalid argument" — so an exec probe (`test -f <marker>`) never passed
+# and the pods sat 0/1 Ready forever (2026-11-11). The kubelet's httpGet probe needs no process in the container: the
+# runner answers it itself. ONE path, `/ready`: 200 once the host is staged (the same moment the marker file is written),
+# 503 before; every other path 404, every other method 501. The answer carries one word — no run, no set, no secret.
+READY_PORT_ENV = "MW_BUILD_READY_PORT"
+
+
+def ready_port(env: dict) -> Optional[int]:
+    """The readiness port from MW_BUILD_READY_PORT: None when unset (no endpoint — the marker file alone, as before);
+    a value that is not a whole number in [1024, 65535] — the chart's range: the pod runs unprivileged, so a port below
+    1024 cannot be bound — is REFUSED, never defaulted: a pod probed on a port nothing
+    listens on is never Ready, and says nothing about why."""
+    text = str(env.get(READY_PORT_ENV, "") or "").strip()
+    if not text:
+        return None
+    if not re.fullmatch(r"[0-9]+", text) or not 1024 <= int(text) <= 65535:
+        raise Refusal(f"{READY_PORT_ENV}={text!r} is not a port in [1024, 65535] (the pod runs unprivileged) — the "
+                      f"kubelet's readiness probe reads it")
+    return int(text)
+
+
+class ReadinessServer:
+    """A daemon-thread HTTP server answering the kubelet's readiness probe from `is_ready()`."""
+
+    def __init__(self, is_ready: Callable[[], bool], port: int, bind: str = "0.0.0.0"):
+        import http.server
+
+        class _Ready(http.server.BaseHTTPRequestHandler):
+            server_version = "build-host"
+            sys_version = ""
+
+            def _answer(self, body: bool) -> None:
+                path = self.path.split("?", 1)[0]
+                if path != "/ready":
+                    code, text = 404, "not found\n"
+                elif is_ready():
+                    code, text = 200, "ready\n"
+                else:
+                    code, text = 503, "not ready\n"
+                payload = text.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                if body:
+                    self.wfile.write(payload)
+
+            def do_GET(self):
+                self._answer(True)
+
+            def do_HEAD(self):
+                self._answer(False)
+
+            def log_message(self, *a):
+                pass          # a probe every 10 s is not news
+
+        try:
+            self.server = http.server.ThreadingHTTPServer((bind, port), _Ready)
+        except OSError as e:
+            raise Refusal(f"the readiness endpoint cannot listen on {bind}:{port} ({READY_PORT_ENV}): {e}")
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, name="readiness", daemon=True)
+
+    def start(self) -> "ReadinessServer":
+        self.thread.start()
+        return self
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
 class Host:
     def __init__(self, env: dict, api: Api, *, log: Callable[[str], None] = None,
                  pull: Callable[[list[str]], int] = None, checkout: Callable = None,
@@ -5254,6 +5332,8 @@ class Host:
             except OSError:
                 self.identity = ""
         self.ready_file = env.get("MW_BUILD_READY_FILE", "/tmp/build-host-ready")
+        # set by mark_ready, read by the readiness endpoint (ReadinessServer) — the same condition as the marker file
+        self.ready = threading.Event()
         try:
             self.run_deadline = float(env.get("MW_BUILD_RUN_DEADLINE_SECONDS", str(DEFAULT_RUN_DEADLINE)) or DEFAULT_RUN_DEADLINE)
         except ValueError:
@@ -5819,6 +5899,8 @@ class Host:
         return True
 
     def mark_ready(self) -> None:
+        # The endpoint answers 200 from here on; the marker file stays for a reader that still tests it.
+        self.ready.set()
         try:
             with open(self.ready_file, "w") as fh:
                 fh.write(f"{self.platform_version} {self.plugins_digest or '-'}\n")
@@ -7503,6 +7585,11 @@ def main(argv: list[str]) -> int:
         enter_run_namespace(argv, env, lambda m: print(f"build-run: {m}", flush=True))
     try:
         host = Host(env, Api(env.get("BUILD_API", ""), read_worker_token(env)))
+        if a.host:
+            port = ready_port(env)
+            if port is not None:
+                # listening from the start: 503 while the host prepares, 200 once it is staged (mark_ready)
+                ReadinessServer(host.ready.is_set, port).start()
         host.preflight()
         host.sandbox.probe(_run_capture)
         boundary_check(host.sandbox, env, _run_capture)
@@ -12681,11 +12768,59 @@ def self_test() -> int:
     finally:
         shutil.rmtree(seed_tmp, ignore_errors=True)
 
+    # ── readiness over HTTP (the kubelet's httpGet probe; an exec probe fails on the Macs' user-namespaced pods) ──────────
+    check("ready/unset port = no endpoint", ready_port({}) is None and ready_port({READY_PORT_ENV: " "}) is None)
+    check("ready/a port is read", ready_port({READY_PORT_ENV: "8090"}) == 8090 and ready_port({READY_PORT_ENV: "1024"}) == 1024)
+    for bad_ in ("0", "80", "1023", "65536", "80a", "-1", "8090.0"):
+        try:
+            ready_port({READY_PORT_ENV: bad_})
+            check(f"ready/{bad_!r} is refused", False, "accepted")
+        except Refusal:
+            pass
+    flag_ = threading.Event()
+    rs_ = ReadinessServer(flag_.is_set, 0, bind="127.0.0.1").start()
+    try:
+        def _probe(path_: str, method_: str = "GET") -> "tuple[int, bytes]":
+            c_ = http.client.HTTPConnection("127.0.0.1", rs_.port, timeout=10)
+            try:
+                c_.request(method_, path_)
+                r_ = c_.getresponse()
+                return r_.status, r_.read()
+            finally:
+                c_.close()
+        check("ready/not staged → 503", _probe("/ready") == (503, b"not ready\n"), _probe("/ready"))
+        flag_.set()
+        check("ready/staged → 200", _probe("/ready") == (200, b"ready\n"), _probe("/ready"))
+        check("ready/a query string does not change the answer", _probe("/ready?x=1")[0] == 200)
+        check("ready/HEAD answers the same code", _probe("/ready", "HEAD")[0] == 200)
+        for other_ in ("/", "/readyz", "/ready/x", "/health", "/runs"):
+            check(f"ready/{other_} → 404 (nothing else is served)", _probe(other_) == (404, b"not found\n"), _probe(other_))
+        check("ready/POST is not served", _probe("/ready", "POST")[0] == 501)
+        flag_.clear()
+        check("ready/the answer follows the condition live", _probe("/ready")[0] == 503)
+        try:
+            ReadinessServer(flag_.is_set, rs_.port, bind="127.0.0.1")
+            check("ready/a port already taken is refused, naming it", False, "bound twice")
+        except Refusal as r_:
+            check("ready/a port already taken is refused, naming it", READY_PORT_ENV in str(r_), r_)
+    finally:
+        rs_.stop()
+    ready_tmp = tempfile.mkdtemp(prefix="ready-")
+    try:
+        hr_ = Host({"MW_BUILD_PLATFORM_VERSION": "3.1.1", "MW_BUILD_CACHE": os.path.join(ready_tmp, "c"),
+                    "MW_BUILD_READY_FILE": os.path.join(ready_tmp, "ready")}, _FakeApi({}), log=lambda m_: None)
+        check("ready/a fresh host is not ready", not hr_.ready.is_set() and not os.path.exists(hr_.ready_file))
+        hr_.mark_ready()
+        check("ready/mark_ready sets the endpoint's condition AND writes the marker file (kept for older readers)",
+              hr_.ready.is_set() and os.path.exists(hr_.ready_file))
+    finally:
+        shutil.rmtree(ready_tmp, ignore_errors=True)
+
     if failures:
         for f in failures:
             print(f"SELF-TEST FAILED: {f}")
         return 1
-    print("build-run self-test: all cases passed (diagnostics, dedup, vstest + xunit results, structured events, "
+    print("build-run self-test: all cases passed (the readiness endpoint, diagnostics, dedup, vstest + xunit results, structured events, "
           "stage declaration, the bwrap argv, the env allow-list, the token file, the startup sandbox probe, "
           "pid-namespace leftovers, one merged tree per PR attempt, the network-boundary self-check, trunk-only BUILD-stage cache promotion under recomputed keys, the plan, batch seq, the lease heartbeat, the claimId, the git mirror, the module-hub broker (host-computed fingerprints from a default-branch declaration, host-decided lane, hash-verified hand-over both ways), the warm workspace (main-only, advanced by the host from the tip; every run an incremental COPY it can never write back; wiped on a key change; a fresh clone on failure; never swept), cache scoping per stage, the NuGet fallback folder bound for every stage, the warm NuGet cache filled from the default branch's tip once per key (and never from a PR), the refset key, the H9 artifact hand-over (a file: store and the build API), the workload-identity pull, the registry bundle index (H8), plugins refresh BEFORE claim, fresh process per "
           "stage, fail-fast, channel + publish, 409, undeclared stages, stage timeout, run deadline)")
