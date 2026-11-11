@@ -1752,7 +1752,7 @@ ARGV="$(cd "$FJ/globdir" && fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="contro
 ARGV="$(fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="a.example b.example"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=true; ACC_TOK_FROM="*.example.test"; ACC_TOK_MODELS="qwen3.6 qwen3.8:27b-mlx"; ACC_TOK_RES=CH; fleet_accept_argv; printf "[%s]\n" "${FLEET_ACCEPT_ARGV[@]}"')"
 [ "$(printf '%s\n' "$ARGV" | wc -l | tr -d ' ')" = 5 ] && printf '%s' "$ARGV" | grep -qx '\[--token-models=qwen3.6 qwen3.8:27b-mlx\]' \
   && ok "backlease enroll gets every answer as one word per flag" || bad "accept argv for backlease" "$ARGV"
-grep -q 'if \[ -s "$dir/k" \] && \[ -n "$preg" \]; then cp "$dir/k"' "$CLI" && ok "a registry key without the registry URL is left out (first-attach stays pass-both-or-neither)" || bad "k without pluginsRegistry" "missing"
+grep -q 'if \[ "${MEMEX_BUILDHOST_REGISTRY_BUNDLES:-0}" = 1 \] && \[ -s "$dir/k" \] && \[ -n "$preg" \]; then h8=1' "$CLI" && ok "the registry bundle index (H8) is opt-in: the key goes to first-attach only with MEMEX_BUILDHOST_REGISTRY_BUNDLES=1 AND the registry URL" || bad "H8 opt-in gate" "missing"
 ! grep -q 'SC2046' "$CLI" || bad "no unquoted accept substitution remains" "$(grep -n SC2046 "$CLI")"
 grep -q -- '--auth-key="file:$dir/t"' "$CLI" && ok "as root the pre-auth key goes to tailscale by FILE reference on the root daemon's socket" || bad "tailscale auth by file" "missing"
 grep -q 'cmd_internal on --tenant "$tenant" --client-id "$cid" < "$dir/e"' "$CLI" && grep -q '< "$dir/n" )' "$CLI" \
@@ -3264,6 +3264,22 @@ sed -n '/^cmd_fleet() {/,/^}/p' "$CLI" | sed -n '/^    join)/,/^      ;;/p' | gr
   && ok "fleet join's tail waits for the heartbeat" || bad "join tail wiring" "missing"
 OUT="$(env PATH="$HB/stubs:$PATH" HOME="$HB/home" MEMEX_LOCAL_HOME="$HB/home/.memex-local" "$CLI" fleet heartbeat --wait x 2>&1)" && bad "--wait x accepted" "$OUT" || ok "fleet heartbeat refuses a --wait that is not whole minutes"
 rm -rf "$HB"
+
+echo "── fleet join attaches the build host WITHOUT the registry bundle index by default (2026-11-10) ──────"
+JH="$(mktemp -d)"; mkdir -p "$JH/code"
+printf '{"f":{"buildApi":"https://ops.example.test/api/builds","buildRegistry":"r.example.test","pullUser":"u","pluginsRegistry":"https://reg.example.test"}}' > "$JH/code/code.json"
+printf 'w' > "$JH/code/w"; printf 'p' > "$JH/code/p"; printf 'mwi_k' > "$JH/code/k"
+printf '#!/bin/bash\necho "$*" > "%s/args"\nls "%s/code/build" > "%s/files"\n' "$JH" "$JH" "$JH" > "$JH/fa.sh"
+fja() { env MEMEX_LOCAL_LIB=1 MEMEX_FIRST_ATTACH="$JH/fa.sh" "$@" bash -c '. "$0"; ACC_JOBS_ENABLED=true; ACC_TOK_ENABLED=false; fleet_apply_buildhost "$1"' "$CLI" "$JH/code" 2>&1; }
+OUT="$(fja)"
+! grep -q -- "--plugins-registry" "$JH/args" && ! grep -qx instance-key "$JH/files" && grep -q "bundle index stays off" <<<"$OUT" \
+  && ok "fleet join's build-host attach leaves the registry bundle index OFF by default (an H8 host never claims on the assemblies-only AI bundle)" \
+  || bad "join h8 default" "args=$(cat "$JH/args") files=$(tr '\n' ' ' < "$JH/files") $OUT"
+rm -rf "$JH/code/build"
+OUT="$(fja MEMEX_BUILDHOST_REGISTRY_BUNDLES=1)"
+grep -q -- "--plugins-registry https://reg.example.test" "$JH/args" && grep -qx instance-key "$JH/files" \
+  && ok "…and MEMEX_BUILDHOST_REGISTRY_BUNDLES=1 opts in (key file + --plugins-registry)" || bad "join h8 opt-in" "args=$(cat "$JH/args") $OUT"
+rm -rf "$JH"
 
 echo "── the tap tarball carries every directory the formula installs (2026-11-10) ──────"
 TB="$(mktemp -d)"

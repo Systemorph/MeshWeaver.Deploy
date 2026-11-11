@@ -674,3 +674,11 @@ tailnet name is still published beside it when tailscale reports one (without on
 published alone, and the command says so); each name gets its own marked site and needs its own redirect
 URI. A public name is never the default.
 
+
+## `fleet join`: environment switches
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MEMEX_BUILDHOST_REGISTRY_BUNDLES` | `0` | `1` attaches the build host with the registry bundle index (H8): the registry key and the `pluginsRegistry` URL are passed to `first-attach.sh`. It stays off by default because the registry serves the mixed AI package as an assemblies-only bundle, which module-fetch refuses, so an H8 host never claims a run (measured 2026-11-07 and 2026-11-10). |
+| `MEMEX_KUBELET_ROOT_WAIT_TRIES` / `MEMEX_KUBELET_ROOT_WAIT_S` | `12` / `5` | How often and how long `kubelet-root apply` re-reads the kubelet's pods directory (as root) before it reports it missing. |
+| `MEMEX_ATTACH_VENV` | `~/.mw-attach-venv` | Where `first-attach.sh` keeps its private PyYAML interpreter when `python3` has none. |
