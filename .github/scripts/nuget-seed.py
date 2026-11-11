@@ -59,7 +59,12 @@ def http(method: str, url: str, body: Optional[bytes], headers: dict) -> "tuple[
         return 0, f"{type(e).__name__}: {e}".encode()
 
 
-RETRY_DELAYS = (2, 5, 10, 20, 40, 60)                 # seconds before the 2nd … 7th attempt
+RETRY_DELAYS = (2, 5, 10, 20, 40, 60)
+# A package larger than this goes up in PARTS: control's ingress admits bodies up to 100m (deploy/helm/values.yaml
+# proxy-body-size), and microsoft.playwright 1.63.0 alone is 213 MB (run 43090920090, a 413 from nginx). Each part is an
+# ordinary content-addressed blob; the manifest lists them in order beside the WHOLE package's sha256 and sha512, which a host
+# verifies after joining them. No route changes: the store holds bytes by hash, whole or part.
+PART_BYTES = 64 << 20                 # seconds before the 2nd … 7th attempt
 
 
 def retryable(status: int) -> bool:
@@ -155,21 +160,27 @@ def publish(api: str, version: str, folder: str, secret: str, call: Http, log: C
     for e in entries:
         with open(e["file"], "rb") as fh:
             data = fh.read()
-        # RESUMABLE: a blob control already holds is answered "already held" (the store hashes nothing twice), so a run that
-        # follows one cut off mid-way only re-confirms the blobs it had sent
-        status, body = exchange(call, "PUT", f"{base}/seeds/blobs/{e['sha256']}", data, {
-            "Content-Type": "application/octet-stream",
-            "X-Seed-Signature": signature(secret, "blob", e["sha256"], e["sha256"], len(data))}, sleep, log)
-        if status not in (200, 201):
-            raise SystemExit(f"::error::the blob of {e['id']}/{e['version']} was refused ({status}: {body[:300]!r})")
-        try:
-            existed = json.loads(body).get("existed") is True
-        except ValueError:
-            existed = False
-        held += existed
-        uploaded += not existed
+        chunks = [data] if len(data) <= PART_BYTES else [data[i:i + PART_BYTES] for i in range(0, len(data), PART_BYTES)]
+        if len(chunks) > 1:
+            e["parts"] = [{"sha256": hashlib.sha256(c).hexdigest(), "bytes": len(c)} for c in chunks]
+        for chunk in chunks:
+            h = hashlib.sha256(chunk).hexdigest()
+            # RESUMABLE: a blob control already holds is answered "already held" (the store hashes nothing twice), so a run
+            # that follows one cut off mid-way only re-confirms the blobs it had sent
+            status, body = exchange(call, "PUT", f"{base}/seeds/blobs/{h}", chunk, {
+                "Content-Type": "application/octet-stream",
+                "X-Seed-Signature": signature(secret, "blob", h, h, len(chunk))}, sleep, log)
+            if status not in (200, 201):
+                raise SystemExit(f"::error::the blob of {e['id']}/{e['version']} was refused ({status}: {body[:300]!r})")
+            try:
+                existed = json.loads(body).get("existed") is True
+            except ValueError:
+                existed = False
+            held += existed
+            uploaded += not existed
     manifest = json.dumps({"platformVersion": version,
-                           "packages": [{k: e[k] for k in ("id", "version", "sha256", "sha512", "bytes", "source")} for e in entries]},
+                           "packages": [{**{k: e[k] for k in ("id", "version", "sha256", "sha512", "bytes", "source")},
+                                         **({"parts": e["parts"]} if "parts" in e else {})} for e in entries]},
                           separators=(",", ":"), sort_keys=True).encode()
     mhash = hashlib.sha256(manifest).hexdigest()
     # LAST, and only now: every blob above was confirmed (stored or already held) — a host never reads a manifest that names
@@ -288,6 +299,28 @@ def self_test() -> int:
             check("retry: an instance that never answers ends red after EVERY attempt (1 + one per backoff step), naming the blob",
                   "demo.r/1.0.0" in str(e) and len(attempts) == 1 + len(RETRY_DELAYS) and waits == list(RETRY_DELAYS)
                   and not any("/manifest" in a for a in attempts), (len(attempts), waits, e))
+    # ── a package above the ingress limit goes up in PARTS, each its own content-addressed blob ──
+    global PART_BYTES
+    real_part = PART_BYTES
+    PART_BYTES = 4
+    try:
+        with tempfile.TemporaryDirectory() as t3:
+            d = os.path.join(t3, "big.pkg", "1.0.0")
+            os.makedirs(d)
+            open(os.path.join(d, "big.pkg.1.0.0.nupkg"), "wb").write(b"0123456789")
+            open(os.path.join(d, ".nupkg.metadata"), "w").write(json.dumps({"version": 2}))
+            store.clear()
+            puts: list = []
+            spy = lambda method, url, body, headers: (puts.append((url, body)), fake(method, url, body, headers))[1]
+            publish("https://ops.example/api/builds", "3.1.12", t3, "s3cret", spy, lambda m: None, lambda s: None)
+            entry = json.loads(store["manifest:3.1.12"])["packages"][0]
+            blobs = [b for u, b in puts if "/blobs/" in u]
+            check("parts: a package over PART_BYTES is uploaded as ordered parts, none above the limit, and the manifest lists them "
+                  "beside the WHOLE package's hashes",
+                  blobs == [b"0123", b"4567", b"89"] and [p["sha256"] for p in entry["parts"]] == [hashlib.sha256(b).hexdigest() for b in blobs]
+                  and entry["sha256"] == hashlib.sha256(b"0123456789").hexdigest() and entry["bytes"] == 10, (entry, blobs))
+    finally:
+        PART_BYTES = real_part
     check("http: a connection that cannot be made is a transport failure (0), never an exception",
           http("PUT", "http://127.0.0.1:9/never", b"x", {})[0] == 0)
     # the MOTIVATING failure, through http.client itself: a server that announces chunked encoding and closes mid-chunk
