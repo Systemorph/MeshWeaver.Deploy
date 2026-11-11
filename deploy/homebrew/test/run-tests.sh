@@ -1752,7 +1752,7 @@ ARGV="$(cd "$FJ/globdir" && fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="contro
 ARGV="$(fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="a.example b.example"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=true; ACC_TOK_FROM="*.example.test"; ACC_TOK_MODELS="qwen3.6 qwen3.8:27b-mlx"; ACC_TOK_RES=CH; fleet_accept_argv; printf "[%s]\n" "${FLEET_ACCEPT_ARGV[@]}"')"
 [ "$(printf '%s\n' "$ARGV" | wc -l | tr -d ' ')" = 5 ] && printf '%s' "$ARGV" | grep -qx '\[--token-models=qwen3.6 qwen3.8:27b-mlx\]' \
   && ok "backlease enroll gets every answer as one word per flag" || bad "accept argv for backlease" "$ARGV"
-grep -q 'if \[ "${MEMEX_BUILDHOST_REGISTRY_BUNDLES:-0}" = 1 \] && \[ -s "$dir/k" \] && \[ -n "$preg" \]; then h8=1' "$CLI" && ok "a registry key without the registry URL is left out (first-attach stays pass-both-or-neither)" || bad "k without pluginsRegistry" "missing"
+grep -q 'if \[ "${MEMEX_BUILDHOST_REGISTRY_BUNDLES:-0}" = 1 \] && \[ -s "$dir/k" \] && \[ -n "$preg" \]; then h8=1' "$CLI" && ok "the registry bundle index (H8) is opt-in: the key goes to first-attach only with MEMEX_BUILDHOST_REGISTRY_BUNDLES=1 AND the registry URL" || bad "H8 opt-in gate" "missing"
 ! grep -q 'SC2046' "$CLI" || bad "no unquoted accept substitution remains" "$(grep -n SC2046 "$CLI")"
 grep -q -- '--auth-key="file:$dir/t"' "$CLI" && ok "as root the pre-auth key goes to tailscale by FILE reference on the root daemon's socket" || bad "tailscale auth by file" "missing"
 grep -q 'cmd_internal on --tenant "$tenant" --client-id "$cid" < "$dir/e"' "$CLI" && grep -q '< "$dir/n" )' "$CLI" \

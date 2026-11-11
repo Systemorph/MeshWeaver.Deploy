@@ -2210,7 +2210,7 @@ fleet_apply_buildhost() {
   if [ -s "$dir/k" ] && [ -z "$h8" ]; then
     info "build host: the registry bundle index stays off (assemblies-only AI bundle; MEMEX_BUILDHOST_REGISTRY_BUNDLES=1 opts in) — plugins layer as the cluster hosts take it"
   fi
-  if [ "${MEMEX_BUILDHOST_REGISTRY_BUNDLES:-0}" = 1 ] && [ -s "$dir/k" ] && [ -z "$preg" ]; then
+  if [ -s "$dir/k" ] && [ -z "$preg" ]; then
     warn "build host: the code carries a registry key but no pluginsRegistry fact — the key is left out and the host attaches with the plain plugins contract (declare Hosting:Enrolment:Facts:pluginsRegistry on control)"
   fi
   fleet_accept_argv first-attach
