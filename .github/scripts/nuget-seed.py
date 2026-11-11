@@ -92,16 +92,20 @@ def packages(folder: str) -> list[dict]:
             nupkg = os.path.join(d, f"{pid}.{ver}.nupkg")
             if not (os.path.isfile(os.path.join(d, ".nupkg.metadata")) and os.path.isfile(nupkg)):
                 continue
-            with open(nupkg, "rb") as fh:
-                data = fh.read()
+            h256, h512, size = hashlib.sha256(), hashlib.sha512(), 0
+            with open(nupkg, "rb") as fh:            # streamed: a large closure is never held in memory twice
+                for block in iter(lambda: fh.read(1 << 20), b""):
+                    h256.update(block)
+                    h512.update(block)
+                    size += len(block)
             try:
                 with open(os.path.join(d, ".nupkg.metadata")) as fh:
                     source = json.load(fh).get("source")
             except (OSError, ValueError, AttributeError):
                 source = None
-            out.append({"id": pid, "version": ver, "file": nupkg, "bytes": len(data),
-                        "sha256": hashlib.sha256(data).hexdigest(),
-                        "sha512": base64.b64encode(hashlib.sha512(data).digest()).decode(),
+            out.append({"id": pid, "version": ver, "file": nupkg, "bytes": size,
+                        "sha256": h256.hexdigest(),
+                        "sha512": base64.b64encode(h512.digest()).decode(),
                         "source": source if isinstance(source, str) else NUGET_ORG})
     return out
 
