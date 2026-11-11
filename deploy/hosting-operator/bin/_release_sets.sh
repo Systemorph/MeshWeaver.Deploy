@@ -25,15 +25,7 @@
 
 # Per-instance identity, derived from the record. Everything else comes from the template.
 host="${HOSTING_HOST:-}"
-tls_secret="${HOSTING_TLS_SECRET:-${namespace}-tls}"
 pg_host="${HOSTING_PG_HOST:-}"
-
-sets=(
-  --set "ingress.tlsSecret=${tls_secret}"
-  --set "config.memex_migration.MEMEX_DATABASENAME=${database}"
-  --set "config.memex_portal.MEMEX_DATABASENAME=${database}"
-)
-[ -n "$host" ] && sets+=( --set "ingress.host=${host}" )
 
 # 🚨 A DEPLOY MUST NOT ROLL THE BUILD. Two things write the portal image: this upgrade (from
 # portal.image) and the in-portal self-updater, which patches the live Deployment on every
@@ -55,8 +47,8 @@ sets=(
 # does not count as an image. Pure bash on purpose: an awk regex with POSIX classes passed on the
 # macOS awk and matched NOTHING on the ubuntu runner's mawk — a guard whose answer depends on which
 # awk the image happens to ship is not a guard.
-values_block_image() { # <block> <file> → prints <block>.image when set and non-empty
-  local block="$1" line value in_block=false
+values_block_key() { # <block> <key> <file> → prints <block>.<key> when set and non-empty
+  local block="$1" key="$2" line value in_block=false
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       ''|' '*|$'\t'*|'#'*) ;;
@@ -65,14 +57,39 @@ values_block_image() { # <block> <file> → prints <block>.image when set and no
          if [[ "$line" == "${block}:"* && -z "$value" ]]; then in_block=true; else in_block=false; fi
          continue ;;
     esac
-    if $in_block && [[ "$line" == '  image:'* ]]; then
-      value="${line#  image:}"; value="${value//[[:space:]]/}"; value="${value//\"/}"
+    if $in_block && [[ "$line" == "  ${key}:"* ]]; then
+      value="${line#"  ${key}:"}"; value="${value//[[:space:]]/}"; value="${value//\"/}"
       [ -n "$value" ] && { printf '%s' "$value"; return 0; }
     fi
-  done < "$2"
+  done < "$3"
   return 1
 }
+values_block_image() { values_block_key "$1" image "$2"; } # <block> <file> → <block>.image
 values_carry_portal_image() { values_block_image portal "$1" >/dev/null; }
+
+# ── the ingress TLS Secret — the RECORD's, never a name invented over it ──
+# 🚨 `--set` beats every `-f`, so a flag composed here OVERRIDES what the record rendered. It used to
+# be `${HOSTING_TLS_SECRET:-${namespace}-tls}` unconditionally, which replaced a record's own
+# `ingress.tlsSecret` with `<namespace>-tls`. Measured on partnerre-esl, 2026-11-11 from 09:02Z: the
+# record (and its overlay) name `keyvault-memex-portal`, the Secret the Key Vault CSI driver creates
+# from the instance's certificate; the first green Roll set `memex-tls`, a Secret that did not
+# exist, and nginx served "Kubernetes Ingress Controller Fake Certificate" on all three ingresses
+# (portal, grpc, mcp) — "local SSL certificate memex/memex-tls was not found". So, in order:
+#   HOSTING_TLS_SECRET   an explicit operator override (a hand-run, a behaviour test) — still wins;
+#   ingress.tlsSecret    what the record rendered (HelmValues.TlsSecret: stated, else {namespace}-tls);
+#   {namespace}-tls      only for values that carry no ingress block at all (a pre-record values file).
+# A record that names no secret renders `{namespace}-tls` itself, so for it nothing changes.
+tls_secret="${HOSTING_TLS_SECRET:-}"
+[ -n "$tls_secret" ] || tls_secret="$(values_block_key ingress tlsSecret "$values" || true)"
+[ -n "$tls_secret" ] || tls_secret="${namespace}-tls"
+hosting::safe_name tls-secret "$tls_secret"
+
+sets=(
+  --set "ingress.tlsSecret=${tls_secret}"
+  --set "config.memex_migration.MEMEX_DATABASENAME=${database}"
+  --set "config.memex_portal.MEMEX_DATABASENAME=${database}"
+)
+[ -n "$host" ] && sets+=( --set "ingress.host=${host}" )
 
 # migration_image_for <portal image> — the memex-migration image paired with a portal image: the SAME
 # tag, on the values' own migration repository when the record rendered one, else `memex-migration`
