@@ -2421,6 +2421,8 @@ case "\$*" in *version*) case "$t" in colima) echo "colima version 0.10.3" ;; ku
 echo "$t \$*" >> "$BH/log"
 case "$t \$*" in
   "colima list"*) printf '%s' "\${FAKE_COLIMA_LIST:-}" ;;
+  "colima ssh"*"NRestarts"*) n=\$(cat "$BH/nr" 2>/dev/null || echo 0); echo \$n; [ -n "\${FAKE_NR_GROWS:-}" ] && echo \$((n+1)) > "$BH/nr"; true ;;
+  "kubectl --context colima-build get --raw /readyz"*) echo ok ;;
   "helm "*" status build-host-mac"*) exit "\${FAKE_RELEASE_RC:-1}" ;;
 esac
 exit 0
@@ -2429,7 +2431,7 @@ done; chmod +x "$BH/stubs/"*
 # PATH holds the stubs and the system directories ONLY (no Homebrew), and MEMEX_PREFIX names an empty
 # prefix: the resolver can find no real colima, helm or kubectl — a test must never start a VM.
 mkdir -p "$BH/prefix"
-bh() { env PATH="$BH/stubs:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" MEMEX_PREFIX="$BH/prefix" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_NET_NO_MEASURE=1 MEMEX_HOST_DISK_FREE_GIB="${BH_FREE:-240}" MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
+bh() { env PATH="$BH/stubs:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" MEMEX_PREFIX="$BH/prefix" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_NET_NO_MEASURE=1 MEMEX_K3S_STABLE_S=0 MEMEX_K3S_POLL_S=0 MEMEX_K3S_HEALTH_S=2 MEMEX_HOST_DISK_FREE_GIB="${BH_FREE:-240}" MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
 OUT="$(bh "$CLI" buildhost apply 2>&1)"
 grep -q 'colima start -p build --cpu 16 --memory 104 --disk 200 --runtime containerd --kubernetes' "$BH/log" && grep -q 'kubectl --context colima-build get crd scaledobjects.keda.sh' "$BH/log" \
   && case "$OUT" in *"first attach installs it"*) true ;; *) false ;; esac \
@@ -2460,7 +2462,7 @@ grep -q '^launchctl bootstrap gui/[0-9]* .*/Library/LaunchAgents/com.memex.local
 OUT="$(bh MEMEX_HOST_MEM_GIB=abc "$CLI" buildhost plan 2>&1)" && bad "a non-numeric probe was used" "$OUT" || { case "$OUT" in *"instead of a whole number"*) ok "a host probe that is not a whole number stops the plan (never sized from 0)" ;; *) bad "probe validation" "$OUT" ;; esac; }
 echo "── buildhost: the build VM's disk is sized from this Mac, the runners from the disk (2026-11-11) ──"
 : > "$BH/log"; bh "$CLI" buildhost apply >/dev/null 2>&1
-grep -q -- '--k3s-arg=--kubelet-arg=image-gc-high-threshold=60 --k3s-arg=--kubelet-arg=image-gc-low-threshold=45 --k3s-arg=--kubelet-arg=image-maximum-gc-age=48h --k3s-arg=--kube-controller-manager-arg=terminated-pod-gc-threshold=5' "$BH/log" \
+grep -q -- '--k3s-arg=--kubelet-arg=image-gc-high-threshold=60 --k3s-arg=--kubelet-arg=image-gc-low-threshold=45 --k3s-arg=--kube-controller-manager-arg=terminated-pod-gc-threshold=5' "$BH/log" \
   && ok "a NEW build VM collects unused images early (GC at 60 %, 48 h max age) and keeps at most 5 finished pod records" || bad "gc args on create" "$(grep 'colima start' "$BH/log")"
 [ "$(lib buildhost_disk_runs 100)" = 2 ] && [ "$(lib buildhost_disk_runs 200)" = 6 ] && [ "$(lib buildhost_disk_runs 60)" = 0 ] \
   && ok "runs a disk holds: 100 GiB → 2, 200 GiB → 6, 60 GiB → 0 (85 % − cache 20 − images 12 − system 4, over 20 per run)" || bad "disk runs" "$(lib buildhost_disk_runs 100) $(lib buildhost_disk_runs 200) $(lib buildhost_disk_runs 60)"
@@ -2476,7 +2478,7 @@ OUT="$(BH_FREE=60 bh "$CLI" buildhost plan 2>&1)" && bad "a Mac with 60 GiB free
 mkdir -p "$BH/.colima/build"; printf 'kubernetes:\n  enabled: true\n  k3sArgs:\n    - --disable=traefik\n    - --kubelet-arg=root-dir=/var/lib/rancher/kubelet\n' > "$BH/.colima/build/colima.yaml"
 : > "$BH/log"
 bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400,"disk":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize >/dev/null 2>&1
-grep -q 'colima start -p build --cpu 16 --memory 104 --disk 200' "$BH/log" && grep -qxF -- '    - --kubelet-arg=image-maximum-gc-age=48h' "$BH/.colima/build/colima.yaml" && grep -qxF -- '    - --kubelet-arg=root-dir=/var/lib/rancher/kubelet' "$BH/.colima/build/colima.yaml" && grep -q 'maxReplicas=4 ' "$BH/log" \
+grep -q 'colima start -p build --cpu 16 --memory 104 --disk 200' "$BH/log" && grep -qxF -- '    - --kubelet-arg=image-gc-high-threshold=60' "$BH/.colima/build/colima.yaml" && ! grep -q 'image-maximum-gc-age' "$BH/.colima/build/colima.yaml" && grep -qxF -- '    - --kubelet-arg=root-dir=/var/lib/rancher/kubelet' "$BH/.colima/build/colima.yaml" && grep -q 'maxReplicas=4 ' "$BH/log" \
   && ok "--resize grows a 100 GiB build disk to what the Mac backs (200), adds the GC args to its profile (root-dir kept), and sizes 4 runners" || bad "resize disk+gc" "$(cat "$BH/log"; cat "$BH/.colima/build/colima.yaml")"
 : > "$BH/log"
 OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400,"disk":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
@@ -2484,6 +2486,24 @@ OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory
   && ok "without --resize an existing 100 GiB disk is kept and the runners sized to it (2)" || bad "existing disk" "$OUT / $(cat "$BH/log")"
 grep -q 'colima ssh -p build -- sudo k3s crictl rmi --prune' "$BH/log" && grep -q 'kubectl --context colima-build -n build-mac get pods --field-selector=status.phase=Failed' "$BH/log" \
   && ok "apply collects unused images and finished pod records in the build VM" || bad "apply gc" "$(cat "$BH/log")"
+echo "── buildhost: only k3s arguments measured on this k3s are written; a resize that breaks k3s is rolled back (2026-11-11) ──"
+V="$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; for a in "${BUILD_K3S_GC_ARGS[@]}" "$KUBELET_ROOT_ARG"; do k3s_arg_verified "$a" || echo "UNVERIFIED $a"; done; for a in "${K3S_ARGS_REFUSED[@]}"; do k3s_arg_verified "$a" && echo "REFUSED-BUT-LISTED $a"; for b in "${BUILD_K3S_GC_ARGS[@]}"; do [ "$a" = "$b" ] && echo "REFUSED-IN-GC $a"; done; done' "$CLI")"
+[ -z "$V" ] && ok "every k3s argument the CLI writes is in K3S_ARGS_VERIFIED, and no refused one (image-maximum-gc-age: a config field, not a flag) is written" || bad "k3s arg allowlist" "$V"
+grep -q 'image-maximum-gc-age' <<<"$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; printf "%s\n" "${BUILD_K3S_GC_ARGS[@]}"' "$CLI")" && bad "image-maximum-gc-age still written" "" || ok "image-maximum-gc-age is not among the written args (k3s v1.35's kubelet refused it and crash-looped 195 times)"
+printf 'kubernetes:\n  enabled: true\n  k3sArgs:\n    - --disable=traefik\n    - --kubelet-arg=root-dir=/var/lib/rancher/kubelet\n    - --kubelet-arg=image-maximum-gc-age=48h\n' > "$BH/.colima/build/colima.yaml"
+: > "$BH/log"; rm -f "$BH/nr"
+bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":111669149696,"disk":214748364800}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply >/dev/null 2>&1
+! grep -q 'image-maximum-gc-age' "$BH/.colima/build/colima.yaml" && compgen -G "$BH/.colima/build/colima.yaml.bak-*" >/dev/null \
+  && ok "an apply removes a refused argument an earlier release wrote (backup beside it), before the VM's next start crash-loops on it" || bad "refused arg repair" "$(cat "$BH/.colima/build/colima.yaml")"
+printf 'kubernetes:\n  enabled: true\n  k3sArgs:\n    - --disable=traefik\n    - --kubelet-arg=root-dir=/var/lib/rancher/kubelet\n' > "$BH/.colima/build/colima.yaml"
+: > "$BH/log"; rm -f "$BH/nr"
+OUT="$(bh FAKE_NR_GROWS=1 FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400,"disk":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize 2>&1)"; RC=$?
+[ "$RC" != 0 ] && grep -qi 'rolled back' <<<"$OUT" && ! grep -q 'image-gc-high-threshold' "$BH/.colima/build/colima.yaml" && [ "$(grep -c '^colima start -p build' "$BH/log")" -ge 2 ] && ! grep -q 'upgrade build-host-mac' "$BH/log" \
+  && ok "a resize after which k3s keeps restarting is ROLLED BACK: the profile restored, the VM restarted on it, nothing sized, and the run fails naming it" || bad "resize rollback" "rc=$RC $OUT / $(cat "$BH/.colima/build/colima.yaml")"
+: > "$BH/log"; rm -f "$BH/nr"
+OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400,"disk":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize 2>&1)"
+grep -q "k3s is healthy: API ready, k3s NRestarts 0 (stable)" <<<"$OUT" && grep -q 'upgrade build-host-mac' "$BH/log" \
+  && ok "a resize whose k3s comes back and stays up (API ready, NRestarts stable) goes on to size the runners" || bad "resize healthy" "$OUT"
 rm -rf "$BH"
 
 echo "── buildhost priority: fleet jobs at the lowest priority, every idle core otherwise ──"
