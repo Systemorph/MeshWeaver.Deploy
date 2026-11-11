@@ -3711,6 +3711,7 @@ class Sandbox:
         try:
             rc, err = run(self.argv("test \"$$\" -le 3 && test ! -e /run/build-worker", d, d, {"PATH": "/usr/bin:/bin"}))
             if rc == 0 and offline:
+                # network=False is what adds --unshare-net: the stage's own, loopback-only network namespace
                 rc, err = run(self.argv("test \"$$\" -le 3", d, d, {"PATH": "/usr/bin:/bin"}, network=False))
                 if rc != 0:
                     err = f"the offline stage network (--unshare-net): {err}"
