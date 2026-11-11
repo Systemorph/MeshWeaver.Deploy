@@ -1,0 +1,258 @@
+{
+ "kind": "List",
+ "items": [
+  {
+   "kind": "Deployment",
+   "metadata": {
+    "name": "memex-portal-deployment",
+    "namespace": "memex"
+   },
+   "spec": {
+    "replicas": 3,
+    "template": {
+     "spec": {
+      "serviceAccountName": "memex-portal",
+      "containers": [
+       {
+        "name": "memex-portal",
+        "image": "cr.example.invalid/memex-portal:1",
+        "envFrom": [
+         {
+          "configMapRef": {
+           "name": "memex-portal-config"
+          }
+         },
+         {
+          "secretRef": {
+           "name": "memex-portal-keyvault"
+          }
+         }
+        ],
+        "volumeMounts": [
+         {
+          "name": "data",
+          "mountPath": "/data"
+         }
+        ]
+       }
+      ],
+      "volumes": [
+       {
+        "name": "data",
+        "persistentVolumeClaim": {
+         "claimName": "memex-data"
+        }
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "kind": "ReplicaSet",
+   "metadata": {
+    "name": "memex-portal-deployment-77aa77aa77",
+    "namespace": "memex"
+   },
+   "spec": {
+    "replicas": 3,
+    "template": {
+     "spec": {
+      "serviceAccountName": "memex-portal",
+      "containers": [
+       {
+        "name": "memex-portal",
+        "image": "cr.example.invalid/memex-portal:1",
+        "envFrom": [
+         {
+          "configMapRef": {
+           "name": "memex-portal-config"
+          }
+         },
+         {
+          "secretRef": {
+           "name": "memex-portal-keyvault"
+          }
+         }
+        ],
+        "volumeMounts": [
+         {
+          "name": "data",
+          "mountPath": "/data"
+         }
+        ]
+       }
+      ],
+      "volumes": [
+       {
+        "name": "data",
+        "persistentVolumeClaim": {
+         "claimName": "memex-data"
+        }
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "kind": "ReplicaSet",
+   "metadata": {
+    "name": "memex-portal-deployment-5d79dc75b6",
+    "namespace": "memex"
+   },
+   "spec": {
+    "replicas": 0,
+    "template": {
+     "spec": {
+      "serviceAccountName": "memex-portal",
+      "containers": [
+       {
+        "name": "memex-portal",
+        "image": "cr.example.invalid/memex-portal:1",
+        "envFrom": [
+         {
+          "configMapRef": {
+           "name": "memex-portal-config"
+          }
+         },
+         {
+          "secretRef": {
+           "name": "memex-portal-keyvault"
+          }
+         }
+        ],
+        "volumeMounts": [
+         {
+          "name": "data",
+          "mountPath": "/data"
+         },
+         {
+          "name": "hosting-jobrunner-token",
+          "mountPath": "/var/run/secrets/hosting-operator",
+          "readOnly": true
+         }
+        ]
+       }
+      ],
+      "volumes": [
+       {
+        "name": "data",
+        "persistentVolumeClaim": {
+         "claimName": "memex-data"
+        }
+       },
+       {
+        "name": "hosting-jobrunner-token",
+        "secret": {
+         "secretName": "hosting-jobrunner-token"
+        }
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "kind": "Pod",
+   "metadata": {
+    "name": "memex-portal-deployment-77aa77aa77-aaaaa",
+    "namespace": "memex"
+   },
+   "spec": {
+    "serviceAccountName": "memex-portal",
+    "containers": [
+     {
+      "name": "memex-portal",
+      "image": "cr.example.invalid/memex-portal:1",
+      "envFrom": [
+       {
+        "configMapRef": {
+         "name": "memex-portal-config"
+        }
+       },
+       {
+        "secretRef": {
+         "name": "memex-portal-keyvault"
+        }
+       }
+      ],
+      "volumeMounts": [
+       {
+        "name": "data",
+        "mountPath": "/data"
+       }
+      ]
+     }
+    ],
+    "volumes": [
+     {
+      "name": "data",
+      "persistentVolumeClaim": {
+       "claimName": "memex-data"
+      }
+     }
+    ]
+   },
+   "status": {
+    "phase": "Running"
+   }
+  },
+  {
+   "kind": "Pod",
+   "metadata": {
+    "name": "memex-portal-deployment-5d79dc75b6-zzzzz",
+    "namespace": "memex"
+   },
+   "spec": {
+    "serviceAccountName": "memex-portal",
+    "containers": [
+     {
+      "name": "memex-portal",
+      "image": "cr.example.invalid/memex-portal:1",
+      "envFrom": [
+       {
+        "configMapRef": {
+         "name": "memex-portal-config"
+        }
+       },
+       {
+        "secretRef": {
+         "name": "memex-portal-keyvault"
+        }
+       }
+      ],
+      "volumeMounts": [
+       {
+        "name": "data",
+        "mountPath": "/data"
+       },
+       {
+        "name": "hosting-jobrunner-token",
+        "mountPath": "/var/run/secrets/hosting-operator",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "volumes": [
+     {
+      "name": "data",
+      "persistentVolumeClaim": {
+       "claimName": "memex-data"
+      }
+     },
+     {
+      "name": "hosting-jobrunner-token",
+      "secret": {
+       "secretName": "hosting-jobrunner-token"
+      }
+     }
+    ]
+   },
+   "status": {
+    "phase": "Failed"
+   }
+  }
+ ]
+}

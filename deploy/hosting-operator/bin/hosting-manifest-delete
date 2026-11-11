@@ -29,6 +29,10 @@
 #            (`kubectl delete --dry-run=server`, persisted nowhere). For a Namespace it names what else
 #            still lives in it, because deleting a namespace deletes everything inside. Deletes nothing.
 #            With --sha256, refuses a plan whose digest differs.
+#            🚨 And it REFUSES a present object a live Pod or workload template still uses — a mounted or
+#            env-read Secret, the ServiceAccount a pod runs as, a binding (and its role) whose subject is
+#            that ServiceAccount, a namespace something still runs in — naming the workload and how
+#            (`IN USE` lines, `::hosting:: deletion_in_use=<n>`). See "IN USE?" below for why and how.
 #   delete — REQUIRES --sha256 and refuses a mismatch, runs every check above on the same bytes, deletes
 #            in dependency order (bindings, roles, tokens, accounts, cluster bindings and roles,
 #            admission bindings and policies, namespaces LAST), then READS EACH OBJECT BACK and fails
@@ -264,6 +268,91 @@ while IFS='|' read -r k ns n; do
   fi
 done < "$work/ordered"
 hosting::say deletion_present "$present"
+
+# ── IN USE? Nothing a live workload still needs is deleted (memex stuck rolls, 2026-11-10) ───────────
+# 🚨 WHY. Present-or-absent is not the question a delete has to answer. deletemanifest-jobrunner-20261110
+# deleted Secret memex/hosting-jobrunner-token, which every memex portal pod still mounted as a volume
+# (a live-only volume no record rendered): the serving pods kept their mounted copy, and every NEW pod
+# stuck in FailedMount — every roll since. So before anything is deleted, both modes read every live
+# Pod and every workload TEMPLATE in the cluster and refuse a PRESENT object of the plan that one of
+# them still references, naming the workload and how:
+#   * Secret     — a volume (secret or projected), envFrom, env valueFrom.secretKeyRef, imagePullSecrets;
+#   * ConfigMap / PersistentVolumeClaim — a volume, envFrom, env valueFrom (computed, though this lane
+#                  deletes neither kind today: the check is total, so adding a kind cannot reopen it);
+#   * ServiceAccount — the identity a pod runs as (serviceAccountName; unset means `default`);
+#   * RoleBinding / ClusterRoleBinding — a subject that is a ServiceAccount some live workload runs as;
+#   * Role / ClusterRole — granted through such a binding;
+#   * Namespace  — a live Pod or a workload still in it.
+# "Live" is: a Pod not Succeeded/Failed; any Deployment, StatefulSet, DaemonSet or CronJob (a template
+# is a pod waiting to happen, scaled to zero or suspended alike); a ReplicaSet with replicas > 0 (a
+# Deployment's history at zero is not, or a fixed mount would read as in use until it is pruned); a Job
+# that has not finished. An ABSENT object that is still referenced is named too — that is exactly the
+# state that wedges a roll — but deleting it deletes nothing, so it does not refuse.
+# A refused or failed read is UNKNOWN and fails: "nobody uses it" is never assumed.
+WORKLOAD_RES="pods,deployments.apps,statefulsets.apps,daemonsets.apps,replicasets.apps,jobs.batch,cronjobs.batch"
+BINDING_RES="rolebindings.rbac.authorization.k8s.io,clusterrolebindings.rbac.authorization.k8s.io"
+kubectl get "$WORKLOAD_RES" --all-namespaces -o json > "$work/workloads.json" 2>"$work/err" \
+  || hosting::die "could not list the cluster's pods and workloads ($(head -1 "$work/err")) — whether a live workload still uses an object of the plan is UNKNOWN, so nothing was decided"
+kubectl get "$BINDING_RES" --all-namespaces -o json > "$work/bindings.json" 2>"$work/err" \
+  || hosting::die "could not list the cluster's role bindings ($(head -1 "$work/err")) — whether a live workload still uses an object of the plan is UNKNOWN, so nothing was decided"
+# One `<Kind>|<namespace>|<name>|<who> <how>` line per reference to an object of the plan.
+if ! jq -rn --slurpfile w "$work/workloads.json" --slurpfile b "$work/bindings.json" --rawfile plan "$work/canonical" '
+  def live:
+    if .kind == "Pod" then ((.status.phase // "") | . != "Succeeded" and . != "Failed")
+    elif .kind == "ReplicaSet" then ((.spec.replicas // 1) > 0)
+    elif .kind == "Job" then ([.status.conditions[]? | select((.type == "Complete" or .type == "Failed") and .status == "True")] | length == 0)
+    else true end;
+  def podspec:
+    if .kind == "Pod" then .spec
+    elif .kind == "CronJob" then .spec.jobTemplate.spec.template.spec
+    else .spec.template.spec end;
+  def refs:
+    (.metadata.namespace // "") as $ns | "\(.kind) \($ns)/\(.metadata.name)" as $who | (podspec // {}) as $s
+    | ["Namespace", "", $ns, $who, "runs in it"],
+      ["ServiceAccount", $ns, ($s.serviceAccountName // $s.serviceAccount // "default"), $who, "runs as it"],
+      ($s.imagePullSecrets[]? | .name // empty | ["Secret", $ns, ., $who, "pulls its image with it"]),
+      ($s.volumes[]? | .name as $v
+        | (.secret.secretName // empty | ["Secret", $ns, ., $who, "mounts it as volume \($v)"]),
+          (.configMap.name // empty | ["ConfigMap", $ns, ., $who, "mounts it as volume \($v)"]),
+          (.persistentVolumeClaim.claimName // empty | ["PersistentVolumeClaim", $ns, ., $who, "mounts it as volume \($v)"]),
+          (.projected.sources[]?
+            | (.secret.name // empty | ["Secret", $ns, ., $who, "projects it into volume \($v)"]),
+              (.configMap.name // empty | ["ConfigMap", $ns, ., $who, "projects it into volume \($v)"]))),
+      ((($s.containers // []) + ($s.initContainers // []) + ($s.ephemeralContainers // []))[] | .name as $c
+        | (.envFrom[]?
+            | (.secretRef.name // empty | ["Secret", $ns, ., $who, "reads it as envFrom of container \($c)"]),
+              (.configMapRef.name // empty | ["ConfigMap", $ns, ., $who, "reads it as envFrom of container \($c)"])),
+          (.env[]? | .name as $e
+            | (.valueFrom.secretKeyRef.name // empty | ["Secret", $ns, ., $who, "reads env \($e) of container \($c) from it"]),
+              (.valueFrom.configMapKeyRef.name // empty | ["ConfigMap", $ns, ., $who, "reads env \($e) of container \($c) from it"])));
+  [ $w[0].items[]? | select(live) | refs ] as $direct
+  | ($direct | map(select(.[0] == "ServiceAccount"))) as $sas
+  | [ $b[0].items[]? | . as $bind | (.metadata.namespace // "") as $bns
+      | .subjects[]? | select(.kind == "ServiceAccount") | (.namespace // $bns) as $sns | .name as $san
+      | $sas[] | select(.[1] == $sns and .[2] == $san) | .[3] as $who
+      | ["\($bind.kind)", $bns, $bind.metadata.name, $who, "binds ServiceAccount \($sns)/\($san), which it runs as"],
+        [$bind.roleRef.kind, (if $bind.roleRef.kind == "Role" then $bns else "" end), $bind.roleRef.name, $who,
+         "is granted it through \($bind.kind) \(if $bns == "" then "" else "\($bns)/" end)\($bind.metadata.name) to ServiceAccount \($sns)/\($san), which it runs as"] ] as $granted
+  | ($plan | split("\n") | map(select(length > 0))) as $wanted
+  | ($direct + $granted)[] | select((.[0:3] | join("|")) as $id | $wanted | index($id))
+  | "\(.[0])|\(.[1])|\(.[2])|\(.[3]) \(.[4])"' > "$work/refs" 2>"$work/err"; then
+  hosting::die "could not compute which workloads reference the plan's objects: $(head -1 "$work/err") — UNKNOWN, so nothing was decided"
+fi
+LC_ALL=C sort -u "$work/refs" -o "$work/refs"
+in_use=0
+while IFS='|' read -r k ns n; do
+  grep -F -- "${k}|${ns}|${n}|" "$work/refs" > "$work/these" || true
+  [ -s "$work/these" ] || continue
+  if grep -q -x -F -- "${k}|${ns}|${n}" "$work/present"; then
+    in_use=$((in_use+1))
+    while IFS='|' read -r _ _ _ why; do hosting::log "IN USE    ${k} ${ns:+${ns}/}${n} — ${why}"; done < "$work/these"
+  else
+    while IFS='|' read -r _ _ _ why; do hosting::log "dangling  ${k} ${ns:+${ns}/}${n} is ABSENT, yet ${why} — a new pod of that workload cannot start until the reference goes"; done < "$work/these"
+  fi
+done < "$work/ordered"
+hosting::say deletion_in_use "$in_use"
+[ "$in_use" -eq 0 ] \
+  || hosting::die "${in_use} present object(s) of the plan are still used by a live workload (listed above as IN USE, with who uses them and how). Deleting one would break every new pod of that workload — it starts, cannot mount or run as what it names, and waits forever. Remove the reference first (a live-only volume or env entry: declare it retired on the Deployment record and run Reconcile), then re-run. Nothing was deleted."
 
 if [ "$mode" = check ]; then
   hosting::say deletion_check "sha256:${digest}"

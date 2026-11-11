@@ -1,0 +1,10 @@
+{
+ "kind": "ConfigMap",
+ "metadata": {
+  "name": "memex-portal-config"
+ },
+ "data": {
+  "Hosting__Mode": "portal",
+  "Storage__Root": "/data"
+ }
+}

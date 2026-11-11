@@ -9,6 +9,15 @@
 > delete.** `secret-writer.yaml` is KEPT, and `hosting-manifest-delete` refuses every object it names
 > (a hard deny list, tested in `deploy/hosting-operator/test/run-tests.sh`). `operator-rbac.yaml` is also
 > what `check-rbac-coverage.sh` reads; its removal is a separate, later change.
+>
+> 🚨 **Present is not the question — IN USE is.** `jobrunner.yaml`'s delete removed Secret
+> `memex/hosting-jobrunner-token` while every memex portal pod still mounted it through a live-only
+> volume, and every roll after it stuck in `FailedMount`. `hosting-manifest-delete` now reads every live
+> Pod and workload template first and refuses a present object one of them still uses — a mounted or
+> env-read Secret, the ServiceAccount a pod runs as, a binding (and its role) whose subject a pod runs as,
+> a namespace something still runs in — naming the workload and how (`IN USE`, `deletion_in_use=<n>`). A
+> dry run shows it. A live-only volume that keeps such a reference leaves through the Reconcile's
+> `RetireLiveOnlyVolume` remedy (`hosting-volume-retire`), never a hand patch.
 
 Applied on the **control instance's** cluster only. Three principals, deliberately separate:
 
