@@ -1,0 +1,42 @@
+{
+ "kind": "List",
+ "items": [
+  {
+   "kind": "RoleBinding",
+   "metadata": {
+    "name": "hosting-jobrunner",
+    "namespace": "memex-ops"
+   },
+   "subjects": [
+    {
+     "kind": "ServiceAccount",
+     "name": "hosting-jobrunner",
+     "namespace": "memex"
+    }
+   ],
+   "roleRef": {
+    "kind": "Role",
+    "name": "hosting-jobrunner",
+    "apiGroup": "rbac.authorization.k8s.io"
+   }
+  },
+  {
+   "kind": "ClusterRoleBinding",
+   "metadata": {
+    "name": "hosting-operator"
+   },
+   "subjects": [
+    {
+     "kind": "ServiceAccount",
+     "name": "hosting-operator",
+     "namespace": "memex-ops"
+    }
+   ],
+   "roleRef": {
+    "kind": "ClusterRole",
+    "name": "hosting-operator",
+    "apiGroup": "rbac.authorization.k8s.io"
+   }
+  }
+ ]
+}

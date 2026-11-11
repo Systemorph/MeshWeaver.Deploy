@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# A stand-in `helm` for hosting-volume-retire: `helm get manifest <release> -n <ns>` answers a placeholder —
+# the kubectl stub's `apply --dry-run=client` turns it into the fixture's manifest.json. MW_VR_HELM_FAIL makes
+# the read fail, as a missing release does.
+set -uo pipefail
+printf 'helm %s\n' "$*" >> "${HOSTING_VR_STATE:?}/log"
+[ -z "${MW_VR_HELM_FAIL:-}" ] || { echo "Error: release: not found" >&2; exit 1; }
+case "${1:-} ${2:-}" in
+  "get manifest") echo "# the release manifest (the kubectl stub answers its objects)" ;;
+  *) echo "helm stub (volume-retire): unexpected invocation: $*" >&2; exit 1 ;;
+esac

@@ -1,0 +1,44 @@
+{
+ "kind": "List",
+ "items": [
+  {
+   "kind": "Deployment",
+   "metadata": {
+    "name": "memex-portal-deployment",
+    "namespace": "memex"
+   },
+   "spec": {
+    "replicas": 3,
+    "template": {
+     "spec": {
+      "serviceAccountName": "memex-portal",
+      "containers": [
+       {
+        "name": "memex-portal",
+        "image": "x"
+       }
+      ],
+      "volumes": [
+       {
+        "name": "memex-kv-secrets",
+        "csi": {
+         "driver": "secrets-store.csi.k8s.io",
+         "nodePublishSecretRef": {
+          "name": "kv-creds"
+         }
+        }
+       },
+       {
+        "name": "files",
+        "azureFile": {
+         "secretName": "files-creds",
+         "shareName": "s"
+        }
+       }
+      ]
+     }
+    }
+   }
+  }
+ ]
+}

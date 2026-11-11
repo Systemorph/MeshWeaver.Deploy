@@ -2112,6 +2112,124 @@ case "$_ie_out" in *"::hosting:: inline_env_retire=dry-run"*) ok "…and never c
 ie_no_value "…still printing no value"
 
 echo
+echo "── hosting-volume-retire: a retired LIVE-ONLY volume leaves, once nothing renders it or reads its path ──"
+# The volume twin of hosting-inline-env-retire (memex stuck rolls, 2026-11-10: a live-only Secret volume
+# `hosting-jobrunner-token` that every roll copied forward after its Secret was deleted). The stub answers the
+# Deployment, the release manifest and the configuration sources from a per-scenario fixture (falling back to
+# fixtures/volume-retire/base) and RECORDS the patch, so the decisions — refuse a volume the chart renders,
+# refuse a path a container still reads (its own spec, or a ConfigMap/Secret it reads), refuse a mount the
+# record does not describe, refuse mid-rollout unless folded, remove the volume and EVERY mount in one guarded
+# patch, read it back — are asserted without a cluster. Every invocation runs with the stubs FIRST on PATH.
+VR_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/volume-retire" && pwd)"
+VR_FIXTURES="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/fixtures/volume-retire" && pwd)"
+VR_TOKEN="hosting-jobrunner-token=/var/run/secrets/hosting-operator"
+_vr_args_state="$(mktemp -d)"
+VR_ENV=(env "PATH=$VR_STUBS:$PATH" "HOSTING_VR_FIXTURE=$VR_FIXTURES/base" "HOSTING_VR_BASE=$VR_FIXTURES/base" "HOSTING_VR_STATE=$_vr_args_state")
+vr() {  # vr <scenario> "<volume=path> […]" [env…] — sets $_vr_out $_vr_rc $_vr_log $_vr_patch
+  local scenario="$1" pairs="$2" pair
+  shift 2
+  local retire=()
+  for pair in $pairs; do retire+=(--retire "$pair"); done
+  _vr_state="$(mktemp -d)"
+  _vr_out="$(env "$@" PATH="$VR_STUBS:$PATH" HOSTING_VR_FIXTURE="$VR_FIXTURES/$scenario" HOSTING_VR_BASE="$VR_FIXTURES/base" \
+    HOSTING_VR_STATE="$_vr_state" hosting-volume-retire --namespace memex --release memex "${retire[@]}" ${VR_FLAGS:-} 2>&1)"; _vr_rc=$?
+  _vr_log="$(cat "$_vr_state/log" 2>/dev/null || true)"
+  _vr_patch="$(cat "$_vr_state/patch" 2>/dev/null || true)"
+  rm -rf "$_vr_state"
+}
+vr_no_patch() {  # the run wrote nothing to the Deployment
+  case "$_vr_log" in *" patch deployment "*) bad "$1" "kubectl saw a patch: ${_vr_log}" ;; *) ok "$1" ;; esac
+}
+
+refuses "volume-retire needs --namespace" "missing required flag --namespace" \
+  "${VR_ENV[@]}" hosting-volume-retire --release memex --retire "$VR_TOKEN"
+refuses "volume-retire needs --release (the chart's truth it measures against)" "missing required flag --release" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --retire "$VR_TOKEN"
+refuses "volume-retire needs a --retire" "missing required flag --retire" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --release memex
+refuses "volume-retire needs <volume>=<mount path>" "is not <volume>=<mount path>" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --release memex --retire hosting-jobrunner-token
+refuses "volume-retire refuses a volume named twice" "named twice" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --release memex --retire "$VR_TOKEN" --retire "$VR_TOKEN"
+refuses "volume-retire refuses the root as a mount path" "is '/'" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --release memex --retire hosting-jobrunner-token=/
+refuses_hard "volume-retire volume with a metacharacter" "is not a DNS label" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --release memex --retire 'v;kubectl delete deploy --all=/x'
+refuses_hard "volume-retire path with a metacharacter or '..'" "is not a plain absolute path" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --release memex --retire 'hosting-jobrunner-token=/var/../etc'
+refuses_hard "volume-retire relative path" "is not a plain absolute path" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --release memex --retire 'hosting-jobrunner-token=var/run'
+case "$(cat "$_vr_args_state/log" 2>/dev/null)" in
+  "") ok "…and no argument refusal ever reached kubectl or helm" ;;
+  *) bad "argument refusals reach no cluster" "saw: $(cat "$_vr_args_state/log")" ;;
+esac
+rm -rf "$_vr_args_state"
+
+# The exact incident shape: the live-only Secret volume, mounted by the portal AND an init container.
+vr base "$VR_TOKEN"
+[ "$_vr_rc" -eq 0 ] && case "$_vr_out" in *"::hosting:: volume_retired=1"*"::hosting:: volume_absent=0"*) true ;; *) false ;; esac \
+  && ok "a live-only volume the record retires, read by nothing, is removed and READ BACK (volume_retired=1)" \
+  || bad "live-only volume retired" "rc ${_vr_rc}: ${_vr_out}"
+case "$_vr_out" in *"hosting-jobrunner-token  live-only (release memex does not render it), mounted at /var/run/secrets/hosting-operator on: memex-portal, wait-for-db; no container reads"*) ok "…naming what it measured: live-only, where, by whom, read by nothing" ;;
+  *) bad "the measurement is narrated" "said: ${_vr_out}" ;; esac
+_vr_ops="$(printf '%s' "$_vr_patch" | jq -r '.[] | "\(.op) \(.path)"' 2>/dev/null | tr '\n' ';')"
+case "$_vr_ops" in "test /metadata/resourceVersion;test /spec/template/spec/containers/0/volumeMounts/1/name;remove /spec/template/spec/containers/0/volumeMounts/1;test /spec/template/spec/initContainers/0/volumeMounts/0/name;remove /spec/template/spec/initContainers/0/volumeMounts/0;test /spec/template/spec/volumes/1/name;remove /spec/template/spec/volumes/1;")
+  ok "…in ONE patch guarded on resourceVersion and every entry's name: both mounts, then the volume" ;;
+  *) bad "the patch removes every mount and the volume, guarded" "ops: ${_vr_ops} patch: ${_vr_patch}" ;; esac
+case "$_vr_patch" in *"/data"*|*"memex-kv-secrets"*) bad "only the retired volume is touched" "patch: ${_vr_patch}" ;;
+  *) ok "…and touches nothing else (the data claim and the CSI volume stay)" ;; esac
+
+# Negative control: each refusal below is the SAME run with one fact changed — and each writes nothing.
+vr rendered "$VR_TOKEN"
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"is RENDERED by release memex"*) true ;; *) false ;; esac \
+  && ok "a volume the release's manifest renders is the chart's, not live-only — refused" || bad "a rendered volume is refused" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…and writes nothing"
+vr readenv "$VR_TOKEN"
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"READS     /var/run/secrets/hosting-operator: container memex-portal env.0.value"*"still reads /var/run/secrets/hosting-operator"*) true ;; *) false ;; esac \
+  && ok "a container whose own env still names the path refuses, naming the container and where" || bad "a path read by env is refused" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…and writes nothing"
+vr readsecret "$VR_TOKEN"
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"READS     /var/run/secrets/hosting-operator: container memex-portal through secret/memex-portal-keyvault key Hosting__JobRunner__TokenFile"*) true ;; *) false ;; esac \
+  && ok "a path read through a Secret the container reads (envFrom) refuses, naming the Secret and the KEY" || bad "a path read via a Secret is refused" "rc ${_vr_rc}: ${_vr_out}"
+case "${_vr_out}${_vr_log}" in *NEVER-PRINTED*) bad "a Secret's value is never printed" "out: ${_vr_out}" ;; *) ok "…never its value" ;; esac
+vr_no_patch "…and writes nothing"
+vr sibling "$VR_TOKEN"
+[ "$_vr_rc" -eq 0 ] && case "$_vr_out" in *"READS"*) false ;; *"::hosting:: volume_retired=1"*) true ;; *) false ;; esac \
+  && ok "negative control: a SIBLING path (…/hosting-operator-2, /mnt/…/hosting-operator) is not a read of the path — only the path itself or a file under it is" \
+  || bad "sibling paths are not reads" "rc ${_vr_rc}: ${_vr_out}"
+vr base "hosting-jobrunner-token=/var/run/secrets/elsewhere"
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"container memex-portal mounts it at /var/run/secrets/hosting-operator"*) true ;; *) false ;; esac \
+  && ok "a record whose mount path is not where the pod mounts it describes a different volume — refused" || bad "a mismatched path is refused" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…and writes nothing"
+vr base "$VR_TOKEN" MW_VR_HELM_FAIL=1
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"could not read the manifest of release 'memex'"*"UNKNOWN"*) true ;; *) false ;; esac \
+  && ok "no release manifest means 'live-only' is UNKNOWN — refused, never assumed" || bad "no manifest refused" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…and writes nothing"
+vr rolling "$VR_TOKEN"
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"a rollout is in progress"*) true ;; *) false ;; esac \
+  && ok "a rollout in flight is refused — a removal would supersede it" || bad "mid-rollout refused" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…and writes nothing"
+VR_FLAGS="--fold-into-rollout" vr rolling "$VR_TOKEN"
+[ "$_vr_rc" -eq 0 ] && case "$_vr_out" in *"::hosting:: volume_folded_generation=13"*"::hosting:: volume_retired=1"*) true ;; *) false ;; esac \
+  && ok "…unless the plan folds it into its OWN handed-off rollout (--fold-into-rollout)" || bad "fold into own rollout" "rc ${_vr_rc}: ${_vr_out}"
+VR_FLAGS="--fold-into-rollout" vr paused "$VR_TOKEN"
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"is PAUSED"*) true ;; *) false ;; esac \
+  && ok "a PAUSED Deployment is refused, even folded" || bad "paused refused" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…and writes nothing"
+
+vr stuck "$VR_TOKEN"
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"still carries volume hosting-jobrunner-token"*) true ;; *) false ;; esac \
+  && ok "a patch the API accepted but that did not take is a FAILED step, naming what is left" || bad "an ineffective patch fails" "rc ${_vr_rc}: ${_vr_out}"
+vr absent "$VR_TOKEN"
+[ "$_vr_rc" -eq 0 ] && case "$_vr_out" in *"::hosting:: volume_retired=0"*"::hosting:: volume_absent=1"*) true ;; *) false ;; esac \
+  && ok "a volume the template no longer carries is a successful no-op (idempotent plan step)" || bad "already retired is a no-op" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…that writes nothing, so it rolls nothing"
+vr base "$VR_TOKEN" HOSTING_DRY_RUN=true
+[ "$_vr_rc" -eq 0 ] && case "$_vr_out" in *"DRY-RUN would run"*"patch deployment"*"::hosting:: volume_retire=dry-run"*) true ;; *) false ;; esac \
+  && ok "a dry run measures for real, narrates the patch and never claims a retirement" || bad "dry run" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…and writes nothing"
+
+echo
 echo "── hosting-kv-synced: a newly mapped vault key reaches the PROCESS, not only the Secret ──"
 # MeshWeaver.Plugins#2778 — the CSI driver adds a key to an EXISTING synced Secret only on a rotation
 # pass, after the re-apply's pods resolved envFrom: a Reconcile reported Healthy while the key it was
@@ -3343,6 +3461,16 @@ ma_refuses() {  # ma_refuses <what> <phrase> <parsed json>
 ma_refuses "a kind outside the lane's set is refused (a Deployment)" "kind Deployment is not one this lane applies" '{"kind":"Deployment","metadata":{"name":"d","namespace":"n"}}'
 ma_refuses "a Secret carrying data is refused" "carries data" '{"kind":"Secret","type":"kubernetes.io/service-account-token","metadata":{"name":"s"},"data":{"k":"dg=="}}'
 ma_refuses "an Opaque Secret is refused" "may only be an empty kubernetes.io/service-account-token" '{"kind":"Secret","type":"Opaque","metadata":{"name":"s"}}'
+# The one Opaque Secret admitted: an EMPTY placeholder, labelled as one, naming no service account — it lets a
+# pod that still names a retired Secret as a volume mount it, and carries nothing.
+ma_refuses "an Opaque placeholder carrying data is refused" "carries data" '{"kind":"Secret","type":"Opaque","metadata":{"name":"s","labels":{"hosting.meshweaver.io/placeholder":"true"}},"stringData":{"token":"x"}}'
+ma_refuses "an Opaque placeholder naming a service account is refused" "must authenticate as nobody" '{"kind":"Secret","type":"Opaque","metadata":{"name":"s","labels":{"hosting.meshweaver.io/placeholder":"true"},"annotations":{"kubernetes.io/service-account.name":"x"}}}'
+ma_refuses "an Opaque Secret labelled anything but placeholder=true is refused" "may only be an empty kubernetes.io/service-account-token" '{"kind":"Secret","type":"Opaque","metadata":{"name":"s","labels":{"hosting.meshweaver.io/placeholder":"yes"}}}'
+ma_fixture placeholder-ok 'kind: Secret # fixture' '{"apiVersion":"v1","kind":"Secret","type":"Opaque","metadata":{"name":"s","namespace":"acme","labels":{"hosting.meshweaver.io/placeholder":"true"}}}'
+ma check --manifest demo/placeholder-ok.yaml
+if [ "$_ma_rc" -eq 0 ] && case "$_ma_out" in *"object    Secret acme/s"*"::hosting:: manifest_check=sha256:"*) true ;; *) false ;; esac \
+   && ! grep_in "$_ma_log" -q '^kubectl apply -f'; then ok "an EMPTY labelled Opaque placeholder is admitted (negative control for the three refusals above)"
+else bad "empty Opaque placeholder" "rc ${_ma_rc}; kubectl: ${_ma_log}; ${_ma_out}"; fi
 ma_refuses "a wildcard rule is refused" "with * in its verbs" '{"kind":"ClusterRole","metadata":{"name":"c"},"rules":[{"apiGroups":[""],"resources":["*"],"verbs":["get"]}]}'
 ma_refuses "the escalate verb is refused" "verb escalate is refused" '{"kind":"Role","metadata":{"name":"c","namespace":"n"},"rules":[{"apiGroups":["rbac.authorization.k8s.io"],"resources":["roles"],"verbs":["escalate"]}]}'
 ma_refuses "an aggregated ClusterRole is refused" "aggregated ClusterRole" '{"kind":"ClusterRole","metadata":{"name":"c"},"aggregationRule":{"clusterRoleSelectors":[]}}'
@@ -3463,6 +3591,95 @@ md "" -- check --manifest demo/writer.yaml
 md $'serviceaccounts memex hosting-jobrunner\nsecrets control hosting-jobrunner-token-old' -- check --object ServiceAccount/memex/hosting-jobrunner --object Secret/control/hosting-jobrunner-token-old
 [ "$_md_rc" -eq 0 ] && case "$_md_out" in *"deletion_present=2"*) true ;; *) false ;; esac \
   && ok "negative control: objects outside the kept set (memex/hosting-jobrunner, a differently named control token) are admitted" || bad "deny list too wide" "rc ${_md_rc}; ${_md_out}"
+
+# 🚨 IN USE: nothing a live workload still needs is deleted. The EXACT incident: deletemanifest-jobrunner-20261110
+# deleted Secret memex/hosting-jobrunner-token while every memex portal pod mounted it as a live-only volume, and
+# every roll since stuck in FailedMount. The workloads fixture is that state as measured (the Deployment template,
+# three serving pods' ReplicaSet, the Pending new pod, a zero-replica ReplicaSet and a finished Job beside them).
+MD_FIX="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/fixtures/manifest-delete" && pwd)"
+md_fixture jobrunner \
+  '{"kind":"ServiceAccount","metadata":{"name":"hosting-jobrunner","namespace":"memex"}}
+{"kind":"Secret","type":"kubernetes.io/service-account-token","metadata":{"name":"hosting-jobrunner-token","namespace":"memex"}}
+{"kind":"Role","metadata":{"name":"hosting-jobrunner","namespace":"memex-ops"}}
+{"kind":"RoleBinding","metadata":{"name":"hosting-jobrunner","namespace":"memex-ops"}}
+{"kind":"ValidatingAdmissionPolicy","metadata":{"name":"hosting-jobrunner-no-privileged-identity"}}
+{"kind":"ValidatingAdmissionPolicyBinding","metadata":{"name":"hosting-jobrunner-no-privileged-identity"}}'
+_md_jr_live='serviceaccounts memex hosting-jobrunner
+secrets memex hosting-jobrunner-token
+roles.rbac.authorization.k8s.io memex-ops hosting-jobrunner
+rolebindings.rbac.authorization.k8s.io memex-ops hosting-jobrunner'
+md "$_md_jr_live" MW_MD_WORKLOADS="$MD_FIX/workloads-mounted.json" MW_MD_BINDINGS="$MD_FIX/bindings.json" -- check --manifest demo/jobrunner.yaml
+if [ "$_md_rc" -ne 0 ] && [ "$_md_live" = "$_md_jr_live" ] && case "$_md_out" in
+     *"IN USE    Secret memex/hosting-jobrunner-token — Deployment memex/memex-portal-deployment mounts it as volume hosting-jobrunner-token"*"::hosting:: deletion_in_use=1"*"still used by a live workload"*) true ;; *) false ;; esac; then
+  ok "the jobrunner-token case: a dry run refuses the Secret the portal Deployment still mounts, naming the Deployment and the volume"
+else bad "jobrunner-token in use (check)" "rc ${_md_rc}; ${_md_out}"; fi
+case "$_md_out" in *"IN USE    Secret memex/hosting-jobrunner-token — Pod memex/memex-portal-deployment-5d79dc75b6-fwtkc mounts it"*"IN USE    Secret memex/hosting-jobrunner-token — Pod memex/memex-portal-deployment-cf468fdd4-r289s mounts it"*) ok "…and every live pod that mounts it, the Pending one included" ;;
+  *) bad "jobrunner-token pods named" "${_md_out}" ;; esac
+case "$_md_out" in *"0ld0000000"*|*"hosting-op-old"*) bad "history is not a use" "a zero-replica ReplicaSet or a finished Job was named: ${_md_out}" ;;
+  *) ok "…but not a zero-replica ReplicaSet or a finished Job: history is not a use" ;; esac
+_md_jr_digest="$(md_sha_of "$(printf '%s\n' 'Role|memex-ops|hosting-jobrunner' 'RoleBinding|memex-ops|hosting-jobrunner' 'Secret|memex|hosting-jobrunner-token' \
+  'ServiceAccount|memex|hosting-jobrunner' 'ValidatingAdmissionPolicy||hosting-jobrunner-no-privileged-identity' \
+  'ValidatingAdmissionPolicyBinding||hosting-jobrunner-no-privileged-identity' | LC_ALL=C sort -u)"$'\n')"
+md "$_md_jr_live" MW_MD_WORKLOADS="$MD_FIX/workloads-mounted.json" MW_MD_BINDINGS="$MD_FIX/bindings.json" -- delete --manifest demo/jobrunner.yaml --sha256 "$_md_jr_digest"
+if [ "$_md_rc" -ne 0 ] && [ "$_md_live" = "$_md_jr_live" ] && ! grep_in "$_md_log" -q -- '--wait=true' \
+   && case "$_md_out" in *"IN USE    Secret memex/hosting-jobrunner-token"*"Nothing was deleted"*) true ;; *) false ;; esac; then
+  ok "…and the APPROVED delete refuses too, before deleting anything — an approval cannot release an object in use"
+else bad "jobrunner-token in use (delete)" "rc ${_md_rc}; kubectl: ${_md_log}; ${_md_out}"; fi
+# Negative control: the same plan once the volume is retired — nothing live references the token (a Failed pod of
+# the old ReplicaSet still names it, and is not live), so the check passes and the delete deletes.
+md "$_md_jr_live" MW_MD_WORKLOADS="$MD_FIX/workloads-fixed.json" MW_MD_BINDINGS="$MD_FIX/bindings.json" -- check --manifest demo/jobrunner.yaml
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"IN USE"*) false ;; *"::hosting:: deletion_in_use=0"*"::hosting:: deletion_check="*) true ;; *) false ;; esac \
+  && ok "negative control: with the volume retired the same plan is not in use (deletion_in_use=0) and the check passes" || bad "jobrunner-token not in use" "rc ${_md_rc}; ${_md_out}"
+md "$_md_jr_live" MW_MD_WORKLOADS="$MD_FIX/workloads-fixed.json" MW_MD_BINDINGS="$MD_FIX/bindings.json" -- delete --manifest demo/jobrunner.yaml --sha256 "$_md_jr_digest"
+[ "$_md_rc" -eq 0 ] && [ -z "$_md_live" ] && case "$_md_out" in *"deletion_absent=6"*) true ;; *) false ;; esac \
+  && ok "…and its delete runs and reads every object back absent" || bad "jobrunner delete after retirement" "rc ${_md_rc}; live: ${_md_live}; ${_md_out}"
+# An ABSENT object something still mounts is NAMED (that state is what wedges a roll), but deletes nothing, so it
+# does not refuse — the re-run of an already-executed plan is how the stuck state is diagnosed.
+md 'serviceaccounts memex hosting-jobrunner' MW_MD_WORKLOADS="$MD_FIX/workloads-mounted.json" -- check --object Secret/memex/hosting-jobrunner-token
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"dangling  Secret memex/hosting-jobrunner-token is ABSENT, yet Deployment memex/memex-portal-deployment mounts it as volume hosting-jobrunner-token"*"deletion_in_use=0"*) true ;; *) false ;; esac \
+  && ok "an absent object a live workload still mounts is named as DANGLING (the stuck-roll state), without refusing a no-op" || bad "dangling reference" "rc ${_md_rc}; ${_md_out}"
+# The identity edges: the ServiceAccount a live pod runs as, the RoleBinding whose subject it is, the Role that
+# binding grants — and, cluster-wide, a ClusterRoleBinding/ClusterRole reached the same way; a Namespace a live pod runs in.
+md "$_md_jr_live" MW_MD_WORKLOADS="$MD_FIX/workloads-runner.json" MW_MD_BINDINGS="$MD_FIX/bindings.json" -- check --manifest demo/jobrunner.yaml
+if [ "$_md_rc" -ne 0 ] && case "$_md_out" in
+     *"IN USE    RoleBinding memex-ops/hosting-jobrunner — Pod memex/hosting-jobrunner-live binds ServiceAccount memex/hosting-jobrunner, which it runs as"*) true ;; *) false ;; esac \
+   && case "$_md_out" in *"IN USE    Role memex-ops/hosting-jobrunner — Pod memex/hosting-jobrunner-live is granted it through RoleBinding memex-ops/hosting-jobrunner"*) true ;; *) false ;; esac \
+   && case "$_md_out" in *"IN USE    ServiceAccount memex/hosting-jobrunner — Pod memex/hosting-jobrunner-live runs as it"*"deletion_in_use=3"*) true ;; *) false ;; esac; then
+  ok "a ServiceAccount a live pod runs as is in use — and so are the RoleBinding naming it as subject and the Role it grants"
+else bad "identity in use" "rc ${_md_rc}; ${_md_out}"; fi
+md $'clusterroles.rbac.authorization.k8s.io - hosting-operator\nclusterrolebindings.rbac.authorization.k8s.io - hosting-operator' \
+  MW_MD_WORKLOADS="$MD_FIX/workloads-runner.json" MW_MD_BINDINGS="$MD_FIX/bindings.json" -- check --object ClusterRole/hosting-operator --object ClusterRoleBinding/hosting-operator
+[ "$_md_rc" -ne 0 ] && case "$_md_out" in *"IN USE    ClusterRoleBinding hosting-operator — Pod memex-ops/hosting-op-live binds ServiceAccount memex-ops/hosting-operator"*"deletion_in_use=2"*) true ;; *) false ;; esac \
+  && ok "…cluster-wide too: a ClusterRoleBinding (and its ClusterRole) whose subject a live pod runs as" || bad "cluster identity in use" "rc ${_md_rc}; ${_md_out}"
+md $'clusterroles.rbac.authorization.k8s.io - hosting-operator\nclusterrolebindings.rbac.authorization.k8s.io - hosting-operator' \
+  MW_MD_WORKLOADS="$MD_FIX/workloads-fixed.json" MW_MD_BINDINGS="$MD_FIX/bindings.json" -- check --object ClusterRole/hosting-operator --object ClusterRoleBinding/hosting-operator
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"deletion_in_use=0"*) true ;; *) false ;; esac \
+  && ok "negative control: the same binding is NOT in use when no live pod runs as its subject" || bad "cluster identity not in use" "rc ${_md_rc}; ${_md_out}"
+md_fixture opsns '{"kind":"Namespace","metadata":{"name":"memex-ops"}}'
+md 'namespaces - memex-ops' MW_MD_WORKLOADS="$MD_FIX/workloads-runner.json" -- check --manifest demo/opsns.yaml
+[ "$_md_rc" -ne 0 ] && case "$_md_out" in *"IN USE    Namespace memex-ops — Pod memex-ops/hosting-op-live runs in it"*) true ;; *) false ;; esac \
+  && ok "a Namespace a live pod still runs in is in use" || bad "namespace in use" "rc ${_md_rc}; ${_md_out}"
+# A volume's own CREDENTIAL is a use too: the kubelet needs it to mount (CSI nodePublishSecretRef, azureFile
+# secretName) — deleting it wedges new pods in ContainerCreating exactly as the incident did. So is a Secret the
+# ServiceAccount a pod runs as carries as imagePullSecrets: admission copies it into every NEW pod.
+md $'secrets memex kv-creds\nsecrets memex files-creds\nsecrets memex registry-pull' \
+  MW_MD_WORKLOADS="$MD_FIX/workloads-csi.json" MW_MD_SERVICEACCOUNTS="$MD_FIX/serviceaccounts.json" \
+  -- check --object Secret/memex/kv-creds --object Secret/memex/files-creds --object Secret/memex/registry-pull
+if [ "$_md_rc" -ne 0 ] && case "$_md_out" in *"deletion_in_use=3"*) true ;; *) false ;; esac \
+   && case "$_md_out" in *"IN USE    Secret memex/kv-creds — Deployment memex/memex-portal-deployment mounts volume memex-kv-secrets with it (CSI nodePublishSecretRef)"*) true ;; *) false ;; esac \
+   && case "$_md_out" in *"IN USE    Secret memex/files-creds — Deployment memex/memex-portal-deployment mounts volume files with it (azureFile secretName)"*) true ;; *) false ;; esac \
+   && case "$_md_out" in *"IN USE    Secret memex/registry-pull — Deployment memex/memex-portal-deployment pulls its image with it through ServiceAccount memex/memex-portal, which it runs as"*) true ;; *) false ;; esac; then
+  ok "a volume's mount credential (CSI, azureFile) and the pull secret of the ServiceAccount a pod runs as are in use"
+else bad "volume credential / ServiceAccount pull secret in use" "rc ${_md_rc}; ${_md_out}"; fi
+md 'secrets memex idle-pull' MW_MD_WORKLOADS="$MD_FIX/workloads-csi.json" MW_MD_SERVICEACCOUNTS="$MD_FIX/serviceaccounts.json" -- check --object Secret/memex/idle-pull
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"deletion_in_use=0"*) true ;; *) false ;; esac \
+  && ok "negative control: the pull secret of a ServiceAccount NO live pod runs as is not in use" || bad "idle SA pull secret" "rc ${_md_rc}; ${_md_out}"
+md "$_md_jr_live" MW_MD_REFUSE_READ=serviceaccounts -- check --object Secret/memex/hosting-jobrunner-token
+[ "$_md_rc" -ne 0 ] && case "$_md_out" in *"could not list the cluster's ServiceAccounts"*"UNKNOWN"*) true ;; *) false ;; esac \
+  && ok "a refused ServiceAccount read is UNKNOWN too" || bad "refused SA read" "rc ${_md_rc}; ${_md_out}"
+md "$_md_jr_live" MW_MD_REFUSE_READ=pods -- delete --manifest demo/jobrunner.yaml --sha256 "$_md_jr_digest"
+[ "$_md_rc" -ne 0 ] && [ "$_md_live" = "$_md_jr_live" ] && case "$_md_out" in *"could not list the cluster's pods and workloads"*"UNKNOWN"*) true ;; *) false ;; esac \
+  && ok "a refused workload read is UNKNOWN, never 'nobody uses it' — and nothing is deleted" || bad "refused workload read" "rc ${_md_rc}; live: ${_md_live}; ${_md_out}"
 
 refuses_hard "a typed Namespace is refused (only a committed manifest may name one)" "a Namespace is deleted only when a committed manifest names it" hosting-manifest-delete check --object Namespace/memex
 refuses_hard "a cluster-scoped kind with a namespace is refused" "is cluster-scoped" hosting-manifest-delete check --object ClusterRole/ns/x

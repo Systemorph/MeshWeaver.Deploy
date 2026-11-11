@@ -2175,8 +2175,27 @@ fleet_apply_network() {
   [ -n "$login" ] || { warn "network: the code carries a pre-auth key but no login server — skipped"; return 0; }
   local ts=(tailscale --socket="${MEMEX_TAILSCALED_SOCKET:-/var/run/tailscaled.socket}")
   if [ "$(id -u)" = 0 ] && command -v tailscale >/dev/null 2>&1; then
-    ${ts[@]+"${ts[@]}"} up --login-server "$login" --hostname "$id" --auth-key="file:$dir/t" --reset >/dev/null \
-      && ok "network: joined $login as $id" || warn "network: 'tailscale up' failed — the bootstrap retries"
+    # The same rules as the device bootstrap (fleet-bootstrap.sh 1.4.3, 2026-11-11: a --reset up with a spent key logged
+    # the second Mac Studio out): wait (bounded) for a settled BackendState; a Running node is never re-keyed; a node
+    # with a node key is never --reset and is only re-logged in from NeedsLogin; anything unsettled hands the key over.
+    local st="" j waited=0 reset=(--reset) have=no
+    while :; do
+      j="$(${ts[@]+"${ts[@]}"} status --json 2>/dev/null || true)"
+      st="$(printf '%s' "$j" | sed -n 's/.*"BackendState"[[:space:]]*:[[:space:]]*"\([A-Za-z]*\)".*/\1/p' | head -1)"
+      case "$st" in ''|NoState|Starting) ;; *) break ;; esac
+      [ "$waited" -ge "${MEMEX_TS_SETTLE_S:-90}" ] && { st=unsettled; break; }
+      sleep 2; waited=$((waited + 2))
+    done
+    printf '%s' "$j" | grep -q '"HaveNodeKey"[[:space:]]*:[[:space:]]*true' && { have=yes; reset=(); }
+    if [ "$st" = Running ]; then ok "network: already joined (BackendState Running) — the issued key is not used"; rm -f "$dir/t" "$FLEET_DIR/$id.preauth"; return 0; fi
+    if [ "$st" = unsettled ] || { [ "$have" = yes ] && [ "$st" != NeedsLogin ]; }; then
+      ( umask 077; cp "$dir/t" "$FLEET_DIR/$id.preauth"; printf '%s\n' "$login" > "$FLEET_DIR/$id.login-server" )
+      warn "network: tailscaled is ${st} — the key is not used now; it is handed to the device bootstrap ($FLEET_DIR/$id.preauth), which joins once the daemon settles"
+      return 0
+    fi
+    if ${ts[@]+"${ts[@]}"} up --login-server "$login" --hostname "$id" --auth-key="file:$dir/t" ${reset[@]+"${reset[@]}"} >/dev/null; then
+      ok "network: joined $login as $id"; rm -f "$dir/t" "$FLEET_DIR/$id.preauth"
+    else warn "network: 'tailscale up' failed — the bootstrap retries"; fi
   else
     ( umask 077; cp "$dir/t" "$FLEET_DIR/$id.preauth"; printf '%s\n' "$login" > "$FLEET_DIR/$id.login-server" )
     ok "network: pre-auth key handed to the device bootstrap ($FLEET_DIR/$id.preauth, 0600) — it joins on the root daemon's socket"
@@ -6642,9 +6661,41 @@ readonly BUILD_DISK_HEADROOM_PCT="${MEMEX_BUILD_DISK_HEADROOM_PCT:-15}"  # kept 
 # IMAGE AND POD GARBAGE COLLECTION in the build VM (measured on the same Mac: four generations each of the portal, runner
 # and tester images, ~15 GiB, and 18 Evicted pod records). kubelet's defaults collect images only above 85 % disk use —
 # above the claim guard's own line, so the guard refused claims long before kubelet freed anything. These collect early
-# and age out an image no container has used for two days; the controller keeps at most 5 finished pod records.
+# early; the controller keeps at most 5 finished pod records.
+# 🚨 ONLY ARGUMENTS THIS k3s IS KNOWN TO ACCEPT (2026-11-11): `--kubelet-arg=image-maximum-gc-age=48h` is a kubelet CONFIG
+# field (imageMaximumGCAge), not a flag — k3s v1.35.0+k3s1's kubelet refused it ("unknown flag"), k3s crash-looped 195
+# times and the second Mac Studio took no jobs for ~35 min after an `apply --resize`. Every argument written to a
+# profile must be in K3S_ARGS_VERIFIED (each measured running on that k3s), and a resize is verified and rolled back.
 readonly BUILD_K3S_GC_ARGS=(--kubelet-arg=image-gc-high-threshold=60 --kubelet-arg=image-gc-low-threshold=45
-  --kubelet-arg=image-maximum-gc-age=48h --kube-controller-manager-arg=terminated-pod-gc-threshold=5)
+  --kube-controller-manager-arg=terminated-pod-gc-threshold=5)
+# The k3s arguments measured RUNNING (k3s healthy, NRestarts stable) on k3s v1.35.0+k3s1, the release colima 0.10.3
+# installs — both fleet Macs, 2026-11-11. A new argument is added here only after it was measured on that release.
+readonly K3S_ARGS_VERIFIED=(--disable=traefik --kubelet-arg=root-dir=/var/lib/rancher/kubelet
+  --kubelet-arg=image-gc-high-threshold=60 --kubelet-arg=image-gc-low-threshold=45
+  --kube-controller-manager-arg=terminated-pod-gc-threshold=5)
+k3s_arg_verified() { local a; for a in ${K3S_ARGS_VERIFIED[@]+"${K3S_ARGS_VERIFIED[@]}"}; do [ "$a" = "$1" ] && return 0; done; return 1; }
+# Arguments an earlier release wrote that this k3s REFUSES: removed from a profile by every apply (a VM that has one
+# crash-loops at its next start).
+readonly K3S_ARGS_REFUSED=(--kubelet-arg=image-maximum-gc-age=48h)
+
+# Is the build VM's k3s HEALTHY: its API answers /readyz, and k3s is not restarting (NRestarts read twice,
+# MEMEX_K3S_STABLE_S apart, unchanged)? Waits up to MEMEX_K3S_HEALTH_S (default 300). Prints the last reading.
+buildhost_k3s_healthy() {
+  local deadline=$(( $(date +%s) + ${MEMEX_K3S_HEALTH_S:-300} )) r1 r2 ready
+  while :; do
+    ready="$(build_kubectl get --raw /readyz 2>/dev/null || true)"
+    if [ "$ready" = ok ]; then
+      r1="$(colima ssh -p "$BUILD_PROFILE" -- systemctl show k3s -p NRestarts --value 2>/dev/null </dev/null | tr -dc 0-9)"
+      sleep "${MEMEX_K3S_STABLE_S:-20}"
+      r2="$(colima ssh -p "$BUILD_PROFILE" -- systemctl show k3s -p NRestarts --value 2>/dev/null </dev/null | tr -dc 0-9)"
+      ready="$(build_kubectl get --raw /readyz 2>/dev/null || true)"
+      if [ -n "$r1" ] && [ "$r1" = "$r2" ] && [ "$ready" = ok ]; then printf 'API ready, k3s NRestarts %s (stable)' "$r2"; return 0; fi
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then printf 'API %s, k3s NRestarts %s → %s' "${ready:-unanswered}" "${r1:-?}" "${r2:-?}"; return 1; fi
+    sleep "${MEMEX_K3S_POLL_S:-5}"
+  done
+}
+
 build_ctx() { if [ "$BUILD_PROFILE" = default ]; then printf colima; else printf 'colima-%s' "$BUILD_PROFILE"; fi; }
 build_kubectl() { kubectl --context "$(build_ctx)" "$@"; }
 
@@ -6793,11 +6844,31 @@ for line in sys.stdin:
 
 # The GC args are k3s arguments, read once when the VM's k3s starts: an existing VM made before them keeps kubelet's
 # defaults until a restart. Said, never applied behind the owner's back (a restart re-queues running builds).
+# Bring a profile's k3sArgs to the verified set: every REFUSED argument removed, every GC argument added — and nothing
+# written that is not in K3S_ARGS_VERIFIED. Backups beside the file (colima_yaml_add_k3s_arg's, and the caller's).
+buildhost_profile_args() {
+  local y="$1" a
+  for a in ${K3S_ARGS_REFUSED[@]+"${K3S_ARGS_REFUSED[@]}"}; do
+    colima_k3s_args "$y" | grep -qxF -- "$a" || continue
+    grep -vxF -- "    - $a" "$y" > "$y.tmp" && cat "$y.tmp" > "$y"; rm -f "$y.tmp"
+    colima_k3s_args "$y" | grep -qxF -- "$a" && warn "could not remove the refused $a from $y — remove it by hand" || ok "removed $a from $y (this k3s refuses it)"
+  done
+  for a in ${BUILD_K3S_GC_ARGS[@]+"${BUILD_K3S_GC_ARGS[@]}"}; do
+    k3s_arg_verified "$a" || { warn "$a is not a verified k3s argument — not written"; continue; }
+    colima_yaml_add_k3s_arg "$y" "$a" || warn "could not add $a to $y — kubelet keeps its default image GC"
+  done
+}
+
 buildhost_gc_args_check() {
   local y a missing=""
   y="$(colima_profile_yaml "$BUILD_PROFILE")" || return 0
   for a in ${BUILD_K3S_GC_ARGS[@]+"${BUILD_K3S_GC_ARGS[@]}"}; do colima_k3s_args "$y" | grep -qxF -- "$a" || missing="$missing $a"; done
-  [ -z "$missing" ] && { ok "the build VM collects unused images early (kubelet image GC at 60 %, 48 h max age)"; return 0; }
+  for a in ${K3S_ARGS_REFUSED[@]+"${K3S_ARGS_REFUSED[@]}"}; do
+    colima_k3s_args "$y" | grep -qxF -- "$a" || continue
+    cp -p "$y" "$y.bak-$(date +%Y%m%d%H%M%S)"; grep -vxF -- "    - $a" "$y" > "$y.tmp" && cat "$y.tmp" > "$y"; rm -f "$y.tmp"
+    warn "removed $a from $y — this k3s refuses it and would crash-loop at the VM's next start (a backup beside it)"
+  done
+  [ -z "$missing" ] && { ok "the build VM collects unused images early (kubelet image GC at 60 %)"; return 0; }
   warn "the build VM's k3s lacks the image/pod GC args (${missing# }) — kubelet only collects above 85 % disk, above the claim guard's line.
      'memex-local buildhost gc' frees what it can now; 'memex-local buildhost apply --resize' adds the args (a VM restart)."
 }
@@ -6877,10 +6948,12 @@ cmd_buildhost() {
       size="$(build_vm_size)"
       if [ -z "$size" ]; then
         step "Creating the build VM (Colima profile $BUILD_PROFILE: ${cpu} CPU / ${vmem} GiB / ${disk} GiB disk, containerd, k3s)"
-        local gc_args=() a; for a in ${BUILD_K3S_GC_ARGS[@]+"${BUILD_K3S_GC_ARGS[@]}"}; do gc_args+=("--k3s-arg=$a"); done
+        local gc_args=() a; for a in ${BUILD_K3S_GC_ARGS[@]+"${BUILD_K3S_GC_ARGS[@]}"}; do k3s_arg_verified "$a" && gc_args+=("--k3s-arg=$a"); done
         colima_keep_context colima start -p "$BUILD_PROFILE" --cpu "$cpu" --memory "$vmem" --disk "$disk" --runtime containerd --kubernetes \
           --k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet ${gc_args[@]+"${gc_args[@]}"} \
           || die "buildhost: could not start the build VM (colima start -p $BUILD_PROFILE)"
+        local nh; nh="$(buildhost_k3s_healthy)" && ok "the new build VM's k3s is healthy: $nh" \
+          || die "buildhost: the new build VM's k3s is NOT healthy ($nh) — read 'colima ssh -p $BUILD_PROFILE -- sudo journalctl -u k3s -n 50'"
       else
         local have_status
         read -r have_cpu have_mem have_status <<<"$size"
@@ -6892,11 +6965,24 @@ cmd_buildhost() {
           if [ "$resize" = "yes" ]; then
             step "Resizing the build VM ${have_cpu} CPU / ${have_mem} GiB / ${have_disk:-?} GiB disk → ${cpu} / ${vmem} / ${disk} (a restart: running builds are re-queued by the build API; the disk only grows, its data is kept; the GC args are added)"
             colima stop -p "$BUILD_PROFILE" || die "buildhost: could not stop the build VM for the resize"
-            local y; if y="$(colima_profile_yaml "$BUILD_PROFILE")"; then
-              local a; for a in ${BUILD_K3S_GC_ARGS[@]+"${BUILD_K3S_GC_ARGS[@]}"}; do colima_yaml_add_k3s_arg "$y" "$a" || warn "could not add $a to $y — kubelet keeps its default image GC"; done
+            local y="" saved=""
+            if y="$(colima_profile_yaml "$BUILD_PROFILE")"; then
+              saved="$y.pre-resize-$(date +%Y%m%d%H%M%S)"; cp -p "$y" "$saved"
+              buildhost_profile_args "$y"
             fi
             colima_keep_context colima start -p "$BUILD_PROFILE" --cpu "$cpu" --memory "$vmem" --disk "$disk" \
               || die "buildhost: the build VM stopped but did not start at ${cpu} CPU / ${vmem} GiB — 'colima start -p $BUILD_PROFILE' starts it again"
+            # 🚨 A resize must never leave the Mac down: k3s must come back and STAY up, or the profile change is undone.
+            local health
+            if health="$(buildhost_k3s_healthy)"; then ok "the resized build VM's k3s is healthy: $health"
+            elif [ -n "$saved" ]; then
+              warn "the resized build VM's k3s is NOT healthy ($health) — restoring the profile as it was ($saved) and restarting"
+              cp -p "$saved" "$y"; colima stop -p "$BUILD_PROFILE" || true
+              colima_keep_context colima start -p "$BUILD_PROFILE" || true
+              health="$(buildhost_k3s_healthy)" \
+                && die "buildhost: the resize was ROLLED BACK — k3s did not stay up with the new profile; it runs again on the previous one ($health). Nothing else was changed; read 'colima ssh -p $BUILD_PROFILE -- sudo journalctl -u k3s -n 50'" \
+                || die "buildhost: the resize was rolled back but k3s is STILL not healthy ($health) — read 'colima ssh -p $BUILD_PROFILE -- sudo journalctl -u k3s -n 50'; the previous profile is $saved"
+            else die "buildhost: the resized build VM's k3s is NOT healthy ($health) and there was no profile to restore"; fi
           else
             warn "the build VM is ${have_cpu} CPU / ${have_mem} GiB, the plan is ${cpu} / ${vmem} — 'memex-local buildhost apply --resize' restarts it at that size"
             cpu="$have_cpu"; vmem="$have_mem"

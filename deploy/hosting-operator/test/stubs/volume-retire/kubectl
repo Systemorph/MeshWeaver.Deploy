@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# A stand-in `kubectl` for test/run-tests.sh — answers hosting-volume-retire's read/patch shapes from a
+# fixture directory and records every invocation in $HOSTING_VR_STATE/log. Not a mock of kubectl: what is
+# asserted is the command's DECISIONS — refuse a volume the chart renders, a path a container still reads,
+# a mount the record does not describe, a rollout in flight; patch once; read it back. Every value in the
+# fixtures is an obviously fake placeholder.
+#
+#   kubectl -n <ns> get deployment <name> -o json → deployment.json; after a patch, deployment.after.json
+#   kubectl -n <ns> get secret|configmap <name> -o json → <kind>_<name>.json, else NotFound, exit 1
+#   kubectl apply --dry-run=client -o json -f -   → manifest.json (the release's objects), as a List
+#   kubectl -n <ns> patch deployment <name> --type json -p <patch> → the patch lands in $HOSTING_VR_STATE/patch
+#
+# Each file is read from $HOSTING_VR_FIXTURE, falling back to $HOSTING_VR_BASE — so a scenario carries
+# only the file(s) that make it different.
+set -uo pipefail
+fixture="${HOSTING_VR_FIXTURE:?the volume-retire kubectl stub needs HOSTING_VR_FIXTURE}"
+base="${HOSTING_VR_BASE:-$fixture}"
+state="${HOSTING_VR_STATE:?the volume-retire kubectl stub needs HOSTING_VR_STATE}"
+printf 'kubectl %s\n' "$*" >> "$state/log"
+
+pick() {
+  if [ -f "$fixture/$1" ]; then cat "$fixture/$1"
+  elif [ -f "$base/$1" ]; then cat "$base/$1"
+  else return 1
+  fi
+}
+
+[ "${1:-}" = "-n" ] && shift 2
+verb="${1:-}" kind="${2:-}" name="${3:-}"
+case "$verb $kind" in
+  "apply --dry-run=client")
+    cat > /dev/null
+    pick manifest.json | jq '{kind: "List", items: .}' ;;
+  "get deployment")
+    if [ -f "$state/patched" ] && pick deployment.after.json; then exit 0; fi
+    pick deployment.json \
+      || { echo "Error from server (NotFound): deployments.apps \"${name}\" not found" >&2; exit 1; } ;;
+  "get secret"|"get configmap")
+    pick "${kind}_${name}.json" \
+      || { echo "Error from server (NotFound): ${kind}s \"${name}\" not found" >&2; exit 1; } ;;
+  "patch deployment")
+    shift 3
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -p) printf '%s\n' "${2:-}" > "$state/patch"; shift 2 ;;
+        *)  shift ;;
+      esac
+    done
+    touch "$state/patched"
+    echo "deployment.apps/${name} patched" ;;
+  *) echo "kubectl stub (volume-retire): unexpected invocation: $*" >&2; exit 1 ;;
+esac

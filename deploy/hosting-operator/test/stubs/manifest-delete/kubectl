@@ -8,10 +8,17 @@
 #   MW_MD_STUCK        a name whose `delete` reports success but leaves the object in place (a finalizer
 #                      that never runs) — the read-back must catch it
 #   MW_MD_DENY_DELETE  a name whose server-side dry-run delete is refused
+#   MW_MD_WORKLOADS    a JSON file: the cluster's pods and workloads (`get <pods,…> --all-namespaces -o json`);
+#                      unset → an empty List
+#   MW_MD_BINDINGS     a JSON file: the cluster's role bindings (`get <rolebindings,…> --all-namespaces -o json`);
+#                      unset → an empty List
+#   MW_MD_SERVICEACCOUNTS  a JSON file: the cluster's ServiceAccounts (`get serviceaccounts --all-namespaces -o json`);
+#                      unset → an empty List
 #
 #   kubectl create --dry-run=client -f <file> -o json   → <file>.json
 #   kubectl [-n <ns>] get <res> <name> --ignore-not-found -o name → "<res>/<name>" when live, nothing otherwise
 #   kubectl -n <ns> get <res> -o name                   → every live <res> in <ns>
+#   kubectl get <res,…> --all-namespaces -o json        → $MW_MD_WORKLOADS / $MW_MD_BINDINGS (the in-use read)
 #   kubectl [-n <ns>] delete <res> <name> --dry-run=server → "<res> "<name>" deleted (server dry run)"
 #   kubectl [-n <ns>] delete <res> <name> --ignore-not-found --wait=true --timeout=…  → removes it
 set -uo pipefail
@@ -30,6 +37,18 @@ case "$verb" in
     res="$1"; shift
     if [ -n "${MW_MD_REFUSE_READ:-}" ] && [ "$res" = "$MW_MD_REFUSE_READ" ]; then
       echo "Error from server (Forbidden): ${res} is forbidden: User \"x\" cannot get resource" >&2; exit 1
+    fi
+    if [ "${1:-}" = "--all-namespaces" ]; then   # the in-use read: every live pod/workload, or every binding
+      if [ -n "${MW_MD_REFUSE_READ:-}" ] && [ "${res%%,*}" = "$MW_MD_REFUSE_READ" ]; then
+        echo "Error from server (Forbidden): ${res%%,*} is forbidden: User \"x\" cannot list resource" >&2; exit 1
+      fi
+      case "$res" in
+        pods,*)         if [ -n "${MW_MD_WORKLOADS:-}" ]; then cat "$MW_MD_WORKLOADS"; else echo '{"kind":"List","items":[]}'; fi ;;
+        rolebindings.*) if [ -n "${MW_MD_BINDINGS:-}" ]; then cat "$MW_MD_BINDINGS"; else echo '{"kind":"List","items":[]}'; fi ;;
+        serviceaccounts) if [ -n "${MW_MD_SERVICEACCOUNTS:-}" ]; then cat "$MW_MD_SERVICEACCOUNTS"; else echo '{"kind":"List","items":[]}'; fi ;;
+        *) echo "kubectl stub: unexpected all-namespaces read: ${res}" >&2; exit 1 ;;
+      esac
+      exit 0
     fi
     if [ "${1:-}" = "-o" ]; then   # a list of every <res> in the namespace
       while read -r r n name || [ -n "${r:-}" ]; do [ "$r" = "$res" ] && [ "$n" = "$ns" ] && echo "${res%%.*}/${name}"; done < "$state/live"

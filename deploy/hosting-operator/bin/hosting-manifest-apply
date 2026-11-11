@@ -21,7 +21,11 @@
 #   * a kind outside Namespace, ServiceAccount, Secret, Role, RoleBinding, ClusterRole, ClusterRoleBinding,
 #     ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding;
 #   * a Secret that is not an EMPTY `kubernetes.io/service-account-token` (a credential never lives in a
-#     committed manifest; the token controller fills that one in-cluster);
+#     committed manifest; the token controller fills that one in-cluster) — or an EMPTY `Opaque` PLACEHOLDER:
+#     no data, no stringData, labelled `hosting.meshweaver.io/placeholder: "true"`, and naming no service
+#     account. It carries nothing and authenticates as nobody; it exists only so a pod spec that still names
+#     the Secret as a volume can mount it while that live-only volume is retired (a stopgap — the file says
+#     what retires it). Any other Opaque Secret is refused;
 #   * a rule with `*` in its verbs, resources or apiGroups, or the verbs escalate / bind / impersonate,
 #     or an aggregated ClusterRole;
 #   * a binding to cluster-admin, admin, edit or any system: role, or to a subject that is not a
@@ -117,7 +121,11 @@ problems="$(jq -r '
       (if ($kinds | index($k)) == null then "\($id): kind \($k) is not one this lane applies" else empty end),
       (if (.metadata.name // "") == "" then "\($id): no metadata.name" else empty end),
       (if $k == "Secret" and (.type // "") != "kubernetes.io/service-account-token"
-         then "\($id): a Secret here may only be an empty kubernetes.io/service-account-token" else empty end),
+            and ((.type // "") != "Opaque" or (.metadata.labels["hosting.meshweaver.io/placeholder"] // "") != "true")
+         then "\($id): a Secret here may only be an empty kubernetes.io/service-account-token, or an empty Opaque placeholder labelled hosting.meshweaver.io/placeholder=true" else empty end),
+      (if $k == "Secret" and (.type // "") == "Opaque"
+            and (.metadata.annotations["kubernetes.io/service-account.name"] // "") != ""
+         then "\($id): an Opaque placeholder names a service account — it must authenticate as nobody" else empty end),
       (if $k == "Secret" and ((.data // {}) != {} or (.stringData // {}) != {})
          then "\($id): carries data — a credential never lives in a committed manifest" else empty end),
       (if $k == "ClusterRole" and has("aggregationRule") then "\($id): an aggregated ClusterRole is refused" else empty end),
