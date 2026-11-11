@@ -133,7 +133,8 @@ The refusals, and why each one exists:
        runner evicts least-recently-used slices above it (they are a cache of control's append-only store). hasKey, not
        `default`: an explicit 0 is refused, never turned into the default and never "unbounded". */ -}}
 {{- $sliceCacheMaxGi := 32 -}}
-{{- if hasKey $b "sliceCacheMaxGi" -}}
+{{- $sliceSet := and (hasKey $b "sliceCacheMaxGi") (not (kindIs "invalid" $b.sliceCacheMaxGi)) -}}
+{{- if $sliceSet -}}
 {{- if not (regexMatch "^[0-9]+$" (toString $b.sliceCacheMaxGi)) -}}
 {{- fail (printf "buildHosts.sliceCacheMaxGi %v must be a whole number of GiB within [1, 4096] — the bound of the host's module-slice cache" $b.sliceCacheMaxGi) -}}
 {{- end -}}
@@ -141,6 +142,75 @@ The refusals, and why each one exists:
 {{- end -}}
 {{- if or (lt $sliceCacheMaxGi 1) (gt $sliceCacheMaxGi 4096) -}}
 {{- fail (printf "buildHosts.sliceCacheMaxGi %d must be within [1, 4096] — the bound of the host's module-slice cache" $sliceCacheMaxGi) -}}
+{{- end -}}
+{{- /* THE CACHE BUDGET (MeshWeaver.Plugins Hosting/OneBuildTree.md; deploy/build-host/CACHE-BUDGET.md): ONE total for the whole
+       cache, by default the declared cache.size less 10 % (the margin holds what no share covers: the masters, the
+       outputs, the markers), or cache.maxGi — never above the declared size. Every area the runner evicts has a SHARE of
+       it (cache.shares.<area>Gi, whole GiB; default a percentage of the budget), and the chart refuses any share above
+       the budget and shares that sum above it, so the cache honours its declared size by construction. A claim of
+       local-path never enforces its capacity (a Mac's 20Gi claim held 43 GiB on 2026-11-11): the runner does. No size
+       and no maxGi (a claim made elsewhere, or cache.medium host): no budget — only the slice bound, as before. */ -}}
+{{- $sizeGi := 0 -}}
+{{- $sz := toString ($cc.size | default "") -}}
+{{- if $sz -}}
+{{- if regexMatch "^[0-9]+Gi$" $sz -}}{{- $sizeGi = int (trimSuffix "Gi" $sz) -}}
+{{- else if regexMatch "^[0-9]+Ti$" $sz -}}{{- $sizeGi = mul (int (trimSuffix "Ti" $sz)) 1024 -}}
+{{- else if regexMatch "^[0-9]+G$" $sz -}}{{- $sizeGi = div (mul (int (trimSuffix "G" $sz)) 1000000000) 1073741824 -}}
+{{- else if regexMatch "^[0-9]+T$" $sz -}}{{- $sizeGi = div (mul (int (trimSuffix "T" $sz)) 1000000000000) 1073741824 -}}
+{{- else -}}
+{{- fail (printf "buildHosts.cache.size %q must be whole Gi, Ti, G or T (e.g. 20Gi) — the cache budget is derived from it" $sz) -}}
+{{- end -}}
+{{- end -}}
+{{- $budgetGi := 0 -}}
+{{- if and (hasKey $cc "maxGi") (not (kindIs "invalid" $cc.maxGi)) -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $cc.maxGi)) -}}
+{{- fail (printf "buildHosts.cache.maxGi %v must be a whole number of GiB within [1, 4096] — the budget of the whole build cache" $cc.maxGi) -}}
+{{- end -}}
+{{- $budgetGi = int $cc.maxGi -}}
+{{- if or (lt $budgetGi 1) (gt $budgetGi 4096) -}}
+{{- fail (printf "buildHosts.cache.maxGi %d must be within [1, 4096] — the budget of the whole build cache" $budgetGi) -}}
+{{- end -}}
+{{- if and (gt $sizeGi 0) (gt $budgetGi $sizeGi) -}}
+{{- fail (printf "buildHosts.cache.maxGi %d exceeds the declared cache.size %s — the cache's budget can never be larger than its declared size" $budgetGi $sz) -}}
+{{- end -}}
+{{- else if gt $sizeGi 0 -}}
+{{- $budgetGi = max 1 (div (mul $sizeGi 90) 100) | int -}}
+{{- end -}}
+{{- $shares := dict -}}
+{{- if gt $budgetGi 0 -}}
+{{- $sh := ($cc.shares | default dict) -}}
+{{- $pct := dict "tree" 50 "slices" 20 "nuget" 15 "refsets" 5 "prepared" 5 -}}
+{{- $sum := 0 -}}
+{{- range $area := list "tree" "slices" "nuget" "refsets" "prepared" -}}
+{{- $k := printf "%sGi" $area -}}
+{{- $v := max (ternary 1 0 (eq $area "slices")) (div (mul $budgetGi (get $pct $area)) 100) | int -}}
+{{- if and (hasKey $sh $k) (not (kindIs "invalid" (get $sh $k))) -}}
+{{- if not (regexMatch "^[0-9]+$" (toString (get $sh $k))) -}}
+{{- fail (printf "buildHosts.cache.shares.%s %v must be a whole number of GiB — the %s area's share of the cache budget" $k (get $sh $k) $area) -}}
+{{- end -}}
+{{- $v = int (get $sh $k) -}}
+{{- else if and (eq $area "slices") $sliceSet -}}
+{{- $v = $sliceCacheMaxGi -}}
+{{- end -}}
+{{- if and (eq $area "slices") (lt $v 1) -}}
+{{- fail (printf "buildHosts.cache.shares.slicesGi %d must be at least 1 — the slice cache is never unbounded and never zero" $v) -}}
+{{- end -}}
+{{- if gt $v $budgetGi -}}
+{{- fail (printf "buildHosts.cache: the %s share %d GiB exceeds the cache budget %d GiB (cache.maxGi, or the declared cache.size %q less 10 %%) — no area may be larger than the whole cache" $area $v $budgetGi $sz) -}}
+{{- end -}}
+{{- $_ := set $shares $area $v -}}
+{{- $sum = add $sum $v | int -}}
+{{- end -}}
+{{- if gt $sum $budgetGi -}}
+{{- fail (printf "buildHosts.cache: the shares sum to %d GiB, above the cache budget %d GiB (tree %d, slices %d, nuget %d, refsets %d, prepared %d) — the areas together may never exceed the whole cache" $sum $budgetGi (get $shares "tree") (get $shares "slices") (get $shares "nuget") (get $shares "refsets") (get $shares "prepared")) -}}
+{{- end -}}
+{{- $sliceCacheMaxGi = get $shares "slices" -}}
+{{- else if kindIs "map" $cc.shares -}}
+{{- range $k, $v := $cc.shares -}}
+{{- if not (kindIs "invalid" $v) -}}
+{{- fail (printf "buildHosts.cache.shares.%s needs a cache budget — a cache.size (claim or node) or cache.maxGi; without one only the slice bound (sliceCacheMaxGi) applies" $k) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- /* The READINESS PORT: the runner answers the kubelet's httpGet probe on GET /ready itself (200 once staged, else 503).
        An exec probe never passed on the Mac hosts (runc + user namespaces: "chown /dev/stdout: invalid argument"). A whole
@@ -377,7 +447,7 @@ The refusals, and why each one exists:
       "orasImage" (required "buildHosts.orasImage is required" $b.orasImage)
       "nodeSelector" $nodeSelector "tolerations" $tolerations
       "resources" ($b.resources | default dict) "workSizeLimit" ($b.workSizeLimit | default "60Gi")
-      "runDeadline" $runDeadline "stageSlots" $stageSlots "sliceCacheMaxGi" $sliceCacheMaxGi "readyPort" $readyPort
+      "runDeadline" $runDeadline "stageSlots" $stageSlots "sliceCacheMaxGi" $sliceCacheMaxGi "cacheBudgetGi" $budgetGi "cacheShares" $shares "readyPort" $readyPort
       "stageNetwork" $stageNetwork "runDiskGi" $runDiskGi "diskHeadroomPercent" $diskHeadroom
       "warmWorkspace" (eq (toString ($b.warmWorkspace | default false)) "true")
       "moduleHub" (eq (toString ($b.moduleHub | default false)) "true")

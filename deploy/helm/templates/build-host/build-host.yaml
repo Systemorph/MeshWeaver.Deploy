@@ -244,6 +244,15 @@ spec:
             # The BOUND of the host's module-slice cache (<cache>/module-slices), in GiB: least-recently-used slices above it are
             # evicted — a cache of control's append-only store, re-fetched by hash (MeshWeaver.Plugins Hosting/OneBuildTree.md §4, Deviations).
             - { name: MW_BUILD_SLICE_CACHE_MAX_GIB, value: {{ $b.sliceCacheMaxGi | quote }} }
+            {{- if gt (int $b.cacheBudgetGi) 0 }}
+            # THE CACHE BUDGET (deploy/build-host/CACHE-BUDGET.md): the whole cache's total and each area's share of it (the slices'
+            # is MW_BUILD_SLICE_CACHE_MAX_GIB above); the chart refuses shares above the budget or summing above it.
+            - { name: MW_BUILD_CACHE_MAX_GIB, value: {{ $b.cacheBudgetGi | quote }} }
+            - { name: MW_BUILD_CACHE_TREE_GIB, value: {{ $b.cacheShares.tree | quote }} }
+            - { name: MW_BUILD_CACHE_NUGET_GIB, value: {{ $b.cacheShares.nuget | quote }} }
+            - { name: MW_BUILD_CACHE_REFSETS_GIB, value: {{ $b.cacheShares.refsets | quote }} }
+            - { name: MW_BUILD_CACHE_PREPARED_GIB, value: {{ $b.cacheShares.prepared | quote }} }
+            {{- end }}
             # NO NETWORK DURING A RUN (MeshWeaver.Plugins Hosting/OneBuildTree.md): open | offline.
             - { name: MW_BUILD_STAGE_NETWORK, value: {{ $b.stageNetwork | quote }} }
             # The node's disk: claim only when one run's footprint leaves the eviction headroom free (measured at claim time).
