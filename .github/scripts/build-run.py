@@ -165,7 +165,7 @@ Environment (rendered by the chart from `buildHosts.*`):
   MW_BUILD_WORK                the per-run work root                       default /work
   MW_BUILD_READY_FILE          written once the host is staged (readiness) default /tmp/build-host-ready
   MW_BUILD_READY_PORT          `--host` serves GET /ready on this port: 200 once staged (the marker's moment), else 503;
-                               any other path 404. Unset = no endpoint (the marker file alone); not a port = refused
+                               any other path 404. Unset = no endpoint (the marker file alone); outside [1024, 65535] = refused
   MW_BUILD_COMPILE_REFS        the compile-check's reference set, prepared once per roll: the portal's
                                /app + shared-frameworks/ (CI's refs/ shape); handed to stages; the host
                                refuses to START when it carries no System.Private.CoreLib.dll or Rx
@@ -4890,13 +4890,15 @@ READY_PORT_ENV = "MW_BUILD_READY_PORT"
 
 def ready_port(env: dict) -> Optional[int]:
     """The readiness port from MW_BUILD_READY_PORT: None when unset (no endpoint — the marker file alone, as before);
-    a value that is not a whole number in [1, 65535] is REFUSED, never defaulted: a pod probed on a port nothing
+    a value that is not a whole number in [1024, 65535] — the chart's range: the pod runs unprivileged, so a port below
+    1024 cannot be bound — is REFUSED, never defaulted: a pod probed on a port nothing
     listens on is never Ready, and says nothing about why."""
     text = str(env.get(READY_PORT_ENV, "") or "").strip()
     if not text:
         return None
-    if not re.fullmatch(r"[0-9]+", text) or not 1 <= int(text) <= 65535:
-        raise Refusal(f"{READY_PORT_ENV}={text!r} is not a port in [1, 65535] — the kubelet's readiness probe reads it")
+    if not re.fullmatch(r"[0-9]+", text) or not 1024 <= int(text) <= 65535:
+        raise Refusal(f"{READY_PORT_ENV}={text!r} is not a port in [1024, 65535] (the pod runs unprivileged) — the "
+                      f"kubelet's readiness probe reads it")
     return int(text)
 
 
@@ -12168,8 +12170,8 @@ def self_test() -> int:
 
     # ── readiness over HTTP (the kubelet's httpGet probe; an exec probe fails on the Macs' user-namespaced pods) ──────────
     check("ready/unset port = no endpoint", ready_port({}) is None and ready_port({READY_PORT_ENV: " "}) is None)
-    check("ready/a port is read", ready_port({READY_PORT_ENV: "8081"}) == 8081)
-    for bad_ in ("0", "65536", "80a", "-1", "8081.0"):
+    check("ready/a port is read", ready_port({READY_PORT_ENV: "8090"}) == 8090 and ready_port({READY_PORT_ENV: "1024"}) == 1024)
+    for bad_ in ("0", "80", "1023", "65536", "80a", "-1", "8090.0"):
         try:
             ready_port({READY_PORT_ENV: bad_})
             check(f"ready/{bad_!r} is refused", False, "accepted")
