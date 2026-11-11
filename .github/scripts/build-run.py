@@ -3702,19 +3702,26 @@ class Sandbox:
         a += ["--chdir", inside, "--", "/bin/bash", "-c", command]
         return a
 
-    def probe(self, run: Callable[[list[str]], tuple[int, str]]) -> None:
+    def probe(self, run: Callable[[list[str]], tuple[int, str]], offline: bool = False) -> None:
         """Create the namespaces once at startup. If the node does not allow them, the host REFUSES
-        to start, naming why — it never runs a stage unsandboxed."""
+        to start, naming why — it never runs a stage unsandboxed. `offline` (MW_BUILD_STAGE_NETWORK=offline)
+        also creates the stage's own NETWORK namespace, so a node that cannot make one refuses here,
+        once, instead of failing every stage of every run."""
         d = tempfile.mkdtemp(prefix="bwrap-probe-")
         try:
             rc, err = run(self.argv("test \"$$\" -le 3 && test ! -e /run/build-worker", d, d, {"PATH": "/usr/bin:/bin"}))
+            if rc == 0 and offline:
+                rc, err = run(self.argv("test \"$$\" -le 3", d, d, {"PATH": "/usr/bin:/bin"}, network=False))
+                if rc != 0:
+                    err = f"the offline stage network (--unshare-net): {err}"
         except OSError as e:
             rc, err = 127, str(e)
         finally:
             shutil.rmtree(d, ignore_errors=True)
         if rc != 0:
             raise Fatal(f"the sandbox cannot be created on this node (bwrap exit {rc}: {err.strip()[-300:]}) — "
-                        f"user/PID/mount namespaces are required; the host refuses to run any stage unsandboxed")
+                        f"user/PID/mount namespaces are required (and a network namespace when stages run offline); "
+                        f"the host refuses to run any stage unsandboxed")
 
 
 # The places PR code must NOT reach from a stage, probed from INSIDE a sandbox at host start
@@ -7617,7 +7624,7 @@ def main(argv: list[str]) -> int:
                 # listening from the start: 503 while the host prepares, 200 once it is staged (mark_ready)
                 ReadinessServer(host.ready.is_set, port).start()
         host.preflight()
-        host.sandbox.probe(_run_capture)
+        host.sandbox.probe(_run_capture, offline=host.stage_offline)
         boundary_check(host.sandbox, env, _run_capture)
         host.stage_refset()
         scoping_check(host, _run_capture)
@@ -8190,6 +8197,17 @@ def self_test() -> int:
     check("probe/uses the same sandbox argv", probe_calls and probe_calls[0][0] == "/usr/bin/bwrap"
           and "--unshare-pid" in probe_calls[0], probe_calls)
     sb.probe(lambda argv: (0, ""))      # a node that allows them starts
+    seen: list[list[str]] = []
+    sb.probe(lambda argv: (seen.append(argv) or (0, "")))
+    check("probe/open makes no network namespace", len(seen) == 1 and "--unshare-net" not in seen[0], seen)
+    seen.clear()
+    sb.probe(lambda argv: (seen.append(argv) or (0, "")), offline=True)
+    check("probe/offline also makes the stage's network namespace", len(seen) == 2 and "--unshare-net" in seen[1], seen)
+    try:
+        sb.probe(lambda argv: (1, "bwrap: loopback: Failed RTM_NEWADDR") if "--unshare-net" in argv else (0, ""), offline=True)
+        check("probe/offline without a network namespace is FATAL at startup", False, "accepted")
+    except Fatal as e:
+        check("probe/offline names the network namespace", "--unshare-net" in str(e) and "RTM_NEWADDR" in str(e), e)
 
     # the boundary self-check, with injected results
     sbx = Sandbox("/usr/bin/bwrap", [])
