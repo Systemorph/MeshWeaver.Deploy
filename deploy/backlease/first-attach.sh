@@ -61,6 +61,19 @@
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 chart="$here/../helm"
+# host-fits-node.py (and the follow agent, which runs under the SAME interpreter — follow-set.py records
+# sys.executable in its launchd plist) need PyYAML, which macOS's python3 does not ship. On the second Mac
+# Studio (2026-11-10) the attach died at 0/6 with `ModuleNotFoundError: No module named 'yaml'`, and
+# `fleet join` reported only "first-attach failed". Bring a private interpreter that has it, once.
+attach_venv="${MEMEX_ATTACH_VENV:-$HOME/.mw-attach-venv}"
+if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+  if ! "$attach_venv/bin/python3" -c 'import yaml' >/dev/null 2>&1; then
+    echo "== PyYAML for the attach: a private venv at $attach_venv (python3 here has no 'yaml')"
+    python3 -m venv "$attach_venv" && "$attach_venv/bin/pip" install -q --disable-pip-version-check 'pyyaml>=6.0.2,<7' \
+      || { echo "ERROR: could not create $attach_venv with PyYAML — 'python3 -m venv $attach_venv && $attach_venv/bin/pip install "pyyaml>=6.0.2,<7"', then re-run. The attach did not start; a partial $attach_venv may remain and is reused or rebuilt on the next run." >&2; exit 1; }
+  fi
+  PATH="$attach_venv/bin:$PATH"; export PATH
+fi
 profile=build api= registry= vault= worker= pull= pulluser= version= tester= portal= runner= pluginsreg= instkey= secrets_from= set_from=
 acc_jobs='' acc_tokens='' acc_models='' acc_res=''   # empty = not answered by a flag; "off" = declined
 owner_id='' owner_email='' follow=latest
