@@ -512,10 +512,18 @@ def named(path, obj_name):
             return item
     return None
 
-d_pdb = next((d for d in yaml.safe_load_all(open(desired_path))
-              if d and d.get("kind") == "PodDisruptionBudget"), None)
-d_so = next((d for d in yaml.safe_load_all(open(desired_path))
-             if d and d.get("kind") == "ScaledObject"), None)
+# Both sides are picked BY NAME. The chart renders other objects of these kinds — the build-host
+# channels each render a ScaledObject (`build-host-<channel>-scaler`) — and "the first ScaledObject
+# in the render" was the build host's on every namespace that runs one, so its min/max was reported
+# as the portal scaler's DIFFERS (MeshWeaver#5844: control, `chart 4 vs live 11`, `chart 0 vs
+# live 3`). The live side was always read by name; the desired side now matches it.
+def rendered(kind, obj_name):
+    return next((d for d in yaml.safe_load_all(open(desired_path))
+                 if d and d.get("kind") == kind
+                 and (d.get("metadata") or {}).get("name") == obj_name), None)
+
+d_pdb = rendered("PodDisruptionBudget", "memex-portal-pdb")
+d_so = rendered("ScaledObject", "memex-portal-scaler")
 l_pdb = named(live_pdb_path, "memex-portal-pdb")
 l_so = named(live_so_path, "memex-portal-scaler")
 
