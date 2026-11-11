@@ -611,6 +611,52 @@ else
 fi
 rm -rf "$TMPF"
 
+# ---- 8. the portal's ScaledObject is picked BY NAME, never "the first one rendered" -----------
+# A namespace that runs build hosts renders a ScaledObject per channel (`build-host-<channel>-scaler`)
+# BEFORE the portal's. The comparator used to take the first ScaledObject in the render, so the
+# build host's min/max was reported as the portal scaler's DIFFERS (MeshWeaver#5844, control:
+# `chart 4 vs live 11`, `chart 0 vs live 3`). The negative control keeps it honest: a real
+# difference on the portal's own scaler is still DIFFERS.
+echo "case: the portal ScaledObject is compared by name beside a build-host ScaledObject"
+TMPS="$(mktemp -d)"
+two_scalers_case() {  # two_scalers_case <name> <live portal maxReplicaCount>
+  python3 - "$DATA/desired.yaml" "$TMPS/$1" "$2" <<'PYEOF'
+import json, os, sys, yaml
+desired, out, live_max = sys.argv[1], sys.argv[2], int(sys.argv[3])
+os.makedirs(out, exist_ok=True)
+docs = [d for d in yaml.safe_load_all(open(desired)) if d]
+for doc in docs:
+    if doc.get("kind") == "Deployment":
+        doc["spec"].pop("replicas", None)  # under KEDA the chart renders no replicas
+def scaler(name, target, mn, mx):
+    return {"apiVersion": "keda.sh/v1alpha1", "kind": "ScaledObject", "metadata": {"name": name},
+            "spec": {"scaleTargetRef": {"name": target}, "minReplicaCount": mn, "maxReplicaCount": mx}}
+build = scaler("build-host-latest-scaler", "build-host-latest", 0, 4)
+portal = scaler("memex-portal-scaler", "memex-portal-deployment", 3, 11)
+yaml.safe_dump_all(docs + [build, portal], open(os.path.join(out, "desired.yaml"), "w"))
+live_portal = json.loads(json.dumps(portal)); live_portal["spec"]["maxReplicaCount"] = live_max
+json.dump({"items": [build, live_portal]}, open(os.path.join(out, "live-scaledobjects.json"), "w"))
+PYEOF
+  python3 "$CMP" "$TMPS/$1/desired.yaml" "$DATA/clean/live-configmap.json" "$DATA/clean/live-deployment.json" \
+    "$DATA/clean/expect-patch.json" "$DATA/clean/live-poddisruptionbudgets.json" \
+    "$TMPS/$1/live-scaledobjects.json" "$DATA/clean/envfrom-source-keys.txt" \
+    "$DATA/clean/release-manifest.yaml" "$DATA/clean/record.json" 2>&1
+}
+o="$(two_scalers_case same 11)"; rc=$?
+if [ "$rc" -eq 0 ] && echo "$o" | grep -q 'No drift'; then
+  echo "  ok   build-host scaler rendered first, portal scaler equal → no drift"
+else
+  echo "::error::the portal ScaledObject was not compared by name (rc=$rc):"; echo "$o" | grep '::error::' | sed 's/^/      /'; fail=1
+fi
+o="$(two_scalers_case differs 12)"; rc=$?
+if [ "$rc" -ne 0 ] && echo "$o" | grep -qE '^::error::DIFFERS +ScaledObject maxReplicaCount$' \
+   && echo "$o" | grep -q 'chart 11 vs live 12'; then
+  echo "  ok   NEGATIVE CONTROL: the portal scaler's own difference is still DIFFERS (chart 11 vs live 12)"
+else
+  echo "::error::a real difference on the portal ScaledObject was not reported (rc=$rc):"; echo "$o" | grep '::error::' | sed 's/^/      /'; fail=1
+fi
+rm -rf "$TMPS"
+
 if [ "$fail" -eq 0 ]; then
   echo ""
   echo "chart-drift comparator: all classification assertions passed."
