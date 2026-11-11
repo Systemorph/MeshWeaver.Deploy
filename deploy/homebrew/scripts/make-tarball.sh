@@ -28,13 +28,21 @@ mkdir -p "$(dirname "$out")"
 # list (deploy/homebrew deploy/helm) silently dropped deploy/backlease when the formula started
 # installing it, so every tap install lacked first-attach.sh and `fleet join` skipped the build
 # host on the second Mac Studio (2026-11-10) — a warn line on a join that otherwise succeeded.
-formula="$repo/deploy/homebrew/Formula/memex-local.rb"
-dirs=()
-while IFS= read -r d; do [ -n "$d" ] && dirs+=("$d"); done \
-  < <(grep -oE 'Dir\["deploy/[A-Za-z0-9_.-]+' "$formula" | sed 's/^Dir\["//' | sort -u)
-for d in deploy/homebrew deploy/helm; do
+# The list is read from the formula AT $ref — the tree being archived — so the extraction and the
+# archive agree by construction (a working-tree formula differing from $ref cannot drop a directory).
+formula_text="$(git -C "$repo" show "$ref:deploy/homebrew/Formula/memex-local.rb")"
+# Every install line that names a deploy/ path must name it as a quoted "deploy/<dir>…" (a Dir[] glob
+# or a plain path):
+# a line with another shape is RED here, never silently left out of the tarball (the blind spot the
+# assert loop below cannot see on its own).
+odd="$(grep -E '\.install' <<<"$formula_text" | grep -E 'deploy/' | grep -vE '"deploy/[A-Za-z0-9_.-]+' || true)"
+[ -z "$odd" ] || { echo "the formula installs from deploy/ in a shape make-tarball.sh does not read (expected a quoted \"deploy/<dir>…\"):" >&2; printf '%s\n' "$odd" >&2; exit 1; }
+# Seeded with the two the CLI cannot work without, so the array is never empty (bash 3.2 + set -u).
+dirs=(deploy/homebrew deploy/helm)
+while IFS= read -r d; do
+  [ -n "$d" ] || continue
   printf '%s\n' "${dirs[@]}" | grep -qxF "$d" || dirs+=("$d")
-done
+done < <(grep -E '\.install' <<<"$formula_text" | grep -oE '"deploy/[A-Za-z0-9_.-]+' | sed 's/^"//' | sort -u)
 git -C "$repo" archive --format=tar --prefix="memex-local-${version}/" "$ref" \
   "${dirs[@]}" | gzip -n > "$out"
 
