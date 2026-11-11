@@ -3461,6 +3461,8 @@ grep -q 'kubectl -n ingress-nginx patch configmap ingress-nginx-controller --typ
   && ok "an EXISTING install gets the same keys patched into the controller's ConfigMap on update (no chart re-run)" || bad "update hsts patch" "$OUT / $(cat "$HS/log")"
 printf 'hsts=true\nhsts-include-subdomains=true\nhsts-max-age=0\nhsts-preload=false\n' > "$HS/cm"; : > "$HS/log"
 hs ensure_ingress_no_hsts >/dev/null; ! grep -q 'patch' "$HS/log" && ok "…and a ConfigMap that already says so is left alone (idempotent)" || bad "hsts idempotent" "$(cat "$HS/log")"
+rm -f "$HS/cm"; OUT="$(hs ensure_ingress_no_hsts)"
+grep -q 'no ConfigMap ingress-nginx/ingress-nginx-controller to set HSTS on' <<<"$OUT" && ok "a missing controller ConfigMap is SAID (a warning naming it), never a silent skip" || bad "hsts not found" "$OUT"
 grep -q 'ensure_ingress_no_hsts' <<<"$(sed -n '/^cmd_update() {/,/^}/p' "$CLI")" && ok "every update runs it (existing installs on eiger and the second Mac heal on their next update)" || bad "update calls hsts" ""
 rm -rf "$HS"
 

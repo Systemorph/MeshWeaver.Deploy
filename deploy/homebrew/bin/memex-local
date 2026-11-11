@@ -4066,9 +4066,11 @@ install_ingress_nginx() {
 # place — ingress-nginx reloads it by itself — without re-running the chart (an `update` never upgrades ingress-nginx).
 # Idempotent: nothing is written when the ConfigMap already says so.
 ensure_ingress_no_hsts() {
+  # The controller ConfigMap's name follows the release name install_ingress_nginx uses (`ingress-nginx` →
+  # `ingress-nginx-controller`); a missing one is SAID, never a silent skip.
   local cm=ingress-nginx-controller have kv k v patch=""
   have="$(kubectl -n "$INGRESS_NS" get configmap "$cm" -o go-template='{{range $k, $v := .data}}{{$k}}={{$v}}{{"\n"}}{{end}}' 2>/dev/null)" \
-    || { info "ingress-nginx ConfigMap not found — 'memex-local up' installs the controller without HSTS"; return 0; }
+    || { warn "local ingress: no ConfigMap $INGRESS_NS/$cm to set HSTS on — 'memex-local up' installs the controller with max-age=0"; return 0; }
   for kv in ${INGRESS_HSTS_CONFIG[@]+"${INGRESS_HSTS_CONFIG[@]}"}; do
     k="${kv%%=*}"; v="${kv#*=}"
     grep -qxF -- "$kv" <<<"$have" || patch="${patch:+$patch,}\"$k\":\"$v\""
