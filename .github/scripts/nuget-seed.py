@@ -59,12 +59,12 @@ def http(method: str, url: str, body: Optional[bytes], headers: dict) -> "tuple[
         return 0, f"{type(e).__name__}: {e}".encode()
 
 
-RETRY_DELAYS = (2, 5, 10, 20, 40, 60)
+RETRY_DELAYS = (2, 5, 10, 20, 40, 60)                 # seconds before the 2nd … 7th attempt
 # A package larger than this goes up in PARTS: control's ingress admits bodies up to 100m (deploy/helm/values.yaml
 # proxy-body-size), and microsoft.playwright 1.63.0 alone is 213 MB (run 43090920090, a 413 from nginx). Each part is an
 # ordinary content-addressed blob; the manifest lists them in order beside the WHOLE package's sha256 and sha512, which a host
 # verifies after joining them. No route changes: the store holds bytes by hash, whole or part.
-PART_BYTES = 64 << 20                 # seconds before the 2nd … 7th attempt
+PART_BYTES = 64 << 20                 # 64 MiB per part, under the 100m ingress body limit
 
 
 def retryable(status: int) -> bool:
