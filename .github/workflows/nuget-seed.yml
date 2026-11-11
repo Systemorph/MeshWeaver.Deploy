@@ -1,0 +1,128 @@
+name: Package seed — the NuGet closure of the core version latest runs
+# THE PACKAGE SEED (MeshWeaver.Plugins Hosting/OneBuildTree §6.3). Once per published core version — the version the
+# control instance's `latest` channel runs — this job restores the COMPLETE package closure a build host's stages
+# restore, in BOTH modes they build in (MeshWeaver.Plugins#5323: the reference set — MeshWeaver Refs = the portal's
+# /app — and the platform source), inside that version's own runner image, and publishes it to the control instance's
+# build API: one blob per `.nupkg` (content-addressed: a new version uploads only what changed), then the manifest,
+# written once (.github/scripts/nuget-seed.py). A host then fills its cache from the seed during preparation, with no
+# feed asked (build-run.py install_nuget_seed). Signed with the secret the platform-build hand-over is signed with.
+#
+# The repository the closure is restored from is MeshWeaver.Plugins' default branch (its declared `restore` — the
+# same command a host's warm restore runs), which references core at the version's commit (the runner image's
+# platform source).
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: nuget-seed
+  cancel-in-progress: false
+
+env:
+  ACR: meshweaver.azurecr.io
+
+jobs:
+  seed:
+    name: "Package seed: restore the closure and publish it to the control instance"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: deploy
+      - name: The build API, and whether the version latest runs has its seed
+        id: plan
+        env:
+          HOOK: ${{ vars.CONTROL_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          case "$HOOK" in
+            https://*/api/hooks/Hosting/PlatformBuilds) api="${HOOK%/api/hooks/Hosting/PlatformBuilds}/api/builds" ;;
+            *) echo "::error::vars.CONTROL_WEBHOOK_URL is not the control instance's Hosting/PlatformBuilds inbox — the build API cannot be derived"; exit 1 ;;
+          esac
+          echo "api=$api" >> "$GITHUB_OUTPUT"
+          python3 deploy/.github/scripts/nuget-seed.py plan --api "$api" | tee -a "$GITHUB_OUTPUT"
+      - name: Nothing to publish
+        if: steps.plan.outputs.build != 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          WHY: ${{ steps.plan.outputs.why }}
+        run: echo "- package seed $VERSION — $WHY" >> "$GITHUB_STEP_SUMMARY"
+      - name: Ensure Azure CLI
+        if: steps.plan.outputs.build == 'true'
+        run: command -v az >/dev/null || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+      - name: Azure login (OIDC)
+        if: steps.plan.outputs.build == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: ACR login (data plane)
+        if: steps.plan.outputs.build == 'true'
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: python3 deploy/.github/scripts/acr-data-plane.py login --registry "$ACR" --tenant "$AZURE_TENANT_ID"
+      - name: Mint the App token (MeshWeaver.Plugins, read)
+        if: steps.plan.outputs.build == 'true'
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.MESHWEAVER_APP_ID }}
+          private-key: ${{ secrets.MESHWEAVER_APP_PRIVATE_KEY }}
+          owner: Systemorph
+          repositories: MeshWeaver.Plugins
+      - name: Check out MeshWeaver.Plugins (default branch)
+        if: steps.plan.outputs.build == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: Systemorph/MeshWeaver.Plugins
+          ref: main
+          token: ${{ steps.app.outputs.token }}
+          path: plugins
+          persist-credentials: false
+      - name: Restore the closure in both modes, inside the version's runner image
+        if: steps.plan.outputs.build == 'true'
+        env:
+          RUNNER: ${{ steps.plan.outputs.runner }}
+          PORTAL: ${{ steps.plan.outputs.portal }}
+        run: |
+          set -euo pipefail
+          w="$RUNNER_TEMP/seed-work"
+          mkdir -p "$w/portal" "$w/packages"
+          # the portal's /app (the reference set the compile and gate stages build against), copied out of its image
+          id=$(docker create --platform linux/amd64 "$ACR/memex-portal-ai@$PORTAL")
+          docker cp "$id:/app" "$w/portal/app"
+          docker rm "$id" >/dev/null
+          # the declared restore of the default branch, run exactly as a host's warm restore runs it: core at the version's
+          # commit (the image's platform source, copied writable — restore writes core's obj/), the reference set as
+          # MeshWeaverRefs, and a FRESH package folder that becomes the seed
+          docker run --rm --platform linux/amd64 --user 0 --entrypoint /bin/bash \
+            -v "$GITHUB_WORKSPACE/plugins:/src" -v "$w/portal/app:/portal/app:ro" -v "$w/packages:/seed" \
+            "$ACR/mw-build-host@$RUNNER" -c '
+              set -euo pipefail
+              cp -a /opt/build-host/platform-src /tmp/core
+              cd /src
+              cmd=$(python3 -c "import json; print(json.load(open(\".github/build-stages.json\"))[\"restore\"][\"command\"])")
+              MW_PLATFORM_SOURCE=/tmp/core MeshWeaverRefs=/portal/app NUGET_PACKAGES=/seed TMPDIR=/tmp \
+                DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 bash -c "$cmd"
+              chmod -R a+rX /seed'
+          n=$(find "$w/packages" -name .nupkg.metadata | wc -l)
+          echo "- package seed ${{ steps.plan.outputs.version }}: $n package(s) restored (both modes)" >> "$GITHUB_STEP_SUMMARY"
+          echo "packages=$w/packages" >> "$GITHUB_ENV"
+      - name: Publish the seed to the control instance (blobs, then the manifest, once)
+        if: steps.plan.outputs.build == 'true'
+        env:
+          SEED_SECRET: ${{ secrets.CONTROL_WEBHOOK_SECRET }}
+          API: ${{ steps.plan.outputs.api }}
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 deploy/.github/scripts/nuget-seed.py publish --api "$API" --version "$VERSION" --packages "$packages" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
