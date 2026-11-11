@@ -43,7 +43,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.4.2"
+readonly FLEET_BOOTSTRAP_VERSION="1.4.3"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -411,31 +411,99 @@ take_preauth_key() {
   chown root:wheel "$held" 2>/dev/null || true; chmod 600 "$held"
 }
 
+# THE NODE'S STATE, settled (2026-11-11, the second Mac Studio went OFFLINE): right after the daemon is (re)loaded —
+# an upgraded tailscale reinstalls and restarts it — `tailscale status` FAILS while the backend is still starting
+# (NoState / Starting), and the old step read that as "not joined", ran `up --auth-key … --reset` with a single-use
+# key it still held from the original join, got "authkey expired" — and --reset had already logged the working node
+# out. So: wait (bounded) for a settled BackendState, and decide from it AND from whether the node was ever logged in.
+# Prints the BackendState (Running, NeedsLogin, NeedsMachineAuth, Stopped, …), "unsettled" or "absent" (no CLI).
+ts_backend_state() {
+  local ts=("$TS_DIR/bin/tailscale" --socket="$TAILSCALED_SOCKET") j st waited=0 max="${FLEET_TS_SETTLE_S:-90}"
+  [ -x "$TS_DIR/bin/tailscale" ] || { printf 'absent'; return 0; }
+  case "$max" in ''|*[!0-9]*) max=90 ;; esac
+  while :; do
+    # the JSON is read whatever the exit status: a logged-out node answers its state with a non-zero exit on some releases
+    j="$("${ts[@]}" status --json 2>/dev/null || true)"
+    st="$(printf '%s' "$j" | sed -n 's/.*"BackendState"[[:space:]]*:[[:space:]]*"\([A-Za-z]*\)".*/\1/p' | head -1)"
+    case "$st" in ''|NoState|Starting) ;; *) printf '%s' "$st"; return 0 ;; esac
+    [ "$waited" -ge "$max" ] && { printf 'unsettled'; return 0; }
+    sleep 2; waited=$((waited + 2))
+  done
+}
+# Whether this node was EVER logged in: tailscaled persists a login profile (and its node key) in its state file, and
+# `status --json` reports HaveNodeKey. A node that has either must never be re-keyed with --reset.
+ts_node_registered() {
+  grep -q '"_profiles"\|"profile-' "$TAILSCALED_STATE_DIR/tailscaled.state" 2>/dev/null && return 0
+  "$TS_DIR/bin/tailscale" --socket="$TAILSCALED_SOCKET" status --json 2>/dev/null | grep -q '"HaveNodeKey"[[:space:]]*:[[:space:]]*true'
+}
+# A held or dropped key is single-use: once the node is joined — by whichever path — every copy goes.
+drop_preauth_keys() {
+  local machine="$1" user="${2:-}" f
+  local copies=("$TAILSCALED_STATE_DIR/preauth.key")
+  [ -z "$user" ] || copies+=("$(user_home "$user")/.memex-local/enrol/$machine.preauth")
+  for f in "${copies[@]}"; do
+    if [ -e "$f" ] || [ -L "$f" ]; then run rm -f "$f"; log "network: removed the spent pre-auth key copy $f (never printed)"; fi
+  done
+}
+
 step_network() {
-  local machine="$1" user="${2:-}" ts=("$TS_DIR/bin/tailscale" --socket="$TAILSCALED_SOCKET")
-  if "${ts[@]}" status >/dev/null 2>&1; then log "network: joined"; return 0; fi
-  local held="$TAILSCALED_STATE_DIR/preauth.key" key_file="" login; login="$(setting FLEET_LOGIN_SERVER LoginServer)"
+  local machine="$1" user="${2:-}" ts=("$TS_DIR/bin/tailscale" --socket="$TAILSCALED_SOCKET") state
+  state="$(ts_backend_state)"
+  case "$state" in
+    Running) log "network: joined (BackendState Running)"; drop_preauth_keys "$machine" "$user"; return 0 ;;
+    unsettled) log "network: WAITING — tailscaled did not settle within ${FLEET_TS_SETTLE_S:-90} s (still starting); nothing is changed, the next run reads it again"; return 0 ;;
+  esac
+  local registered=no; [ "$state" != absent ] && ts_node_registered && registered=yes
+  if [ "$registered" = yes ] && [ "$state" != NeedsLogin ]; then
+    # Stopped, NeedsMachineAuth, …: a node with an identity that is not running is never re-keyed by this script
+    log "network: WAITING — this node is registered but its BackendState is $state; no key is used on a node that has an identity ('tailscale --socket=$TAILSCALED_SOCKET up' by a person, or approve it on the login server)"
+    return 0
+  fi
+  local held="$TAILSCALED_STATE_DIR/preauth.key" key_file="" fresh="" login; login="$(setting FLEET_LOGIN_SERVER LoginServer)"
   # the login server the enrolment code named (`fleet join` leaves it beside the key) when the profile names none
   if [ -z "$login" ] && [ -n "$user" ]; then
     local named; named="$(user_home "$user")/.memex-local/enrol/$machine.login-server"
     [ -f "$named" ] && [ ! -L "$named" ] && login="$(head -1 "$named" | tr -d '[:space:]')"
     case "$login" in https://*) ;; *) login="" ;; esac
   fi
-  if [ -n "${FLEET_PREAUTH_KEY_FILE:-}" ]; then key_file="$FLEET_PREAUTH_KEY_FILE"
+  if [ -n "${FLEET_PREAUTH_KEY_FILE:-}" ]; then key_file="$FLEET_PREAUTH_KEY_FILE"; fresh=yes
   else
+    # a key HELD since an earlier run on a node that was already logged in is the original join's spent key: it is
+    # removed, never presented (it would answer "authkey expired")
+    if [ "$registered" = yes ] && [ -f "$held" ]; then run rm -f "$held"; log "network: removed a pre-auth key held since an earlier run — this node was already logged in, so it is spent"; fi
     # Intune sets no environment: the key is dropped at ~<console user>/.memex-local/enrol/<machine>.preauth
-    [ -n "$user" ] && { take_preauth_key "$(user_home "$user")/.memex-local/enrol/$machine.preauth" "$held" "$user" || return 1; }
+    if [ -n "$user" ]; then
+      local drop; drop="$(user_home "$user")/.memex-local/enrol/$machine.preauth"
+      if [ -e "$drop" ] || [ -L "$drop" ]; then take_preauth_key "$drop" "$held" "$user" || return 1; fresh=yes; fi
+    fi
     [ -f "$held" ] && key_file="$held"
   fi
   if [ -z "$key_file" ] || [ ! -f "$key_file" ] || [ -z "$login" ]; then
-    log "network: WAITING for a single-use pre-auth key and the login server (control mints the key at enrolment — Hosting/MacStudioFleet §2b.1 target 2)"
+    if [ "$registered" = yes ]; then
+      log "network: OFFLINE — this node was logged in before and is logged out now (BackendState $state); it needs a NEW single-use pre-auth key at ~<console user>/.memex-local/enrol/$machine.preauth (the next run uses it, never with --reset)"
+    else
+      log "network: WAITING for a single-use pre-auth key and the login server (control mints the key at enrolment — Hosting/MacStudioFleet §2b.1 target 2)"
+    fi
     return 0
   fi
-  log "network: joining $login as $machine with the provided pre-auth key (read from its file, never printed)"
+  if [ "$registered" = yes ] && [ -z "$fresh" ]; then log "network: WAITING — no fresh key for a registered node"; return 0; fi
+  # --reset only on a node that was NEVER logged in: on one that was, it would wipe its prefs before the server answers
+  local reset=(); [ "$registered" = no ] && reset=(--reset)
+  log "network: joining $login as $machine with the provided pre-auth key (read from its file, never printed${reset[0]:+, fresh node}${reset[0]:-, re-login without --reset})"
+  local out rc
   # by FILE reference: the key never appears in an argument, a process listing or a dry-run line
-  run "${ts[@]}" up --login-server "$login" --hostname "$machine" --auth-key="file:$key_file" --reset \
-    || { log "network: FAILED to join — the key file is kept for the next run"; return 1; }
+  out="$(run "${ts[@]}" up --login-server "$login" --hostname "$machine" --auth-key="file:$key_file" ${reset[@]+"${reset[@]}"} 2>&1)"; rc=$?
+  [ -z "$out" ] || printf '%s\n' "$out" | grep -v -i 'key' | head -5 | while IFS= read -r l; do log "network: tailscale: $l"; done
+  if [ "$rc" != 0 ]; then
+    case "$out" in
+      # only the login server's own refusals of the KEY (headscale/tailscale wording) — any other failure keeps it
+      *"authkey expired"*|*"AuthKey expired"*|*"authkey already used"*|*"AuthKey already used"*|*"invalid key"*|*"AuthKey not found"*)
+        run rm -f "$key_file"; log "network: the login server REFUSED the pre-auth key (expired or already used) — removed; a new single-use key is needed"; return 0 ;;
+    esac
+    log "network: FAILED to join — the key file is kept for the next run"; return 1
+  fi
   run rm -f "$key_file"
+  drop_preauth_keys "$machine" "$user"
 }
 
 # The INSTALLED CLI behind Homebrew's bin/ wrapper (a write_env_script that execs libexec/memex-local — sourcing
