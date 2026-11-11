@@ -2175,8 +2175,15 @@ fleet_apply_network() {
   [ -n "$login" ] || { warn "network: the code carries a pre-auth key but no login server — skipped"; return 0; }
   local ts=(tailscale --socket="${MEMEX_TAILSCALED_SOCKET:-/var/run/tailscaled.socket}")
   if [ "$(id -u)" = 0 ] && command -v tailscale >/dev/null 2>&1; then
-    ${ts[@]+"${ts[@]}"} up --login-server "$login" --hostname "$id" --auth-key="file:$dir/t" --reset >/dev/null \
-      && ok "network: joined $login as $id" || warn "network: 'tailscale up' failed — the bootstrap retries"
+    # A node that is already Running is never re-keyed, and one that was ever logged in is never --reset (2026-11-11:
+    # a --reset up with a spent key logged the second Mac Studio out). The key's copies go once the node is joined.
+    local st reset=(--reset)
+    st="$(${ts[@]+"${ts[@]}"} status --json 2>/dev/null | sed -n 's/.*"BackendState"[[:space:]]*:[[:space:]]*"\([A-Za-z]*\)".*/\1/p' | head -1)"
+    if [ "$st" = Running ]; then ok "network: already joined (BackendState Running) — the issued key is not used"; rm -f "$dir/t" "$FLEET_DIR/$id.preauth"; return 0; fi
+    ${ts[@]+"${ts[@]}"} status --json 2>/dev/null | grep -q '"HaveNodeKey"[[:space:]]*:[[:space:]]*true' && reset=()
+    if ${ts[@]+"${ts[@]}"} up --login-server "$login" --hostname "$id" --auth-key="file:$dir/t" ${reset[@]+"${reset[@]}"} >/dev/null; then
+      ok "network: joined $login as $id"; rm -f "$dir/t" "$FLEET_DIR/$id.preauth"
+    else warn "network: 'tailscale up' failed — the bootstrap retries"; fi
   else
     ( umask 077; cp "$dir/t" "$FLEET_DIR/$id.preauth"; printf '%s\n' "$login" > "$FLEET_DIR/$id.login-server" )
     ok "network: pre-auth key handed to the device bootstrap ($FLEET_DIR/$id.preauth, 0600) — it joins on the root daemon's socket"

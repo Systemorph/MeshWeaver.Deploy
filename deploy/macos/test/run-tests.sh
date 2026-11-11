@@ -641,6 +641,65 @@ sed 's/"AcceptTokens": false,//; s/"AcceptTokens": true,//' "$MACOS/intune/fleet
 OUT="$(python3 "$RECON" --validate --spec "$T/no-answer.spec.json" 2>&1)"; RC=$?
 case "$RC:$OUT" in 1:*"keys.AcceptTokens must be an explicit true/false"*) ok "a spec without the owner's token answer is refused (participation is never implied)" ;; *) bad "missing AcceptTokens accepted" "rc=$RC: $OUT" ;; esac
 
+echo "── network: a restarted daemon is never re-keyed; a spent key never logs a working node out (2026-11-11) ──"
+NT="$(mktemp -d)"; mkdir -p "$NT/ts/bin" "$NT/state" "$NT/u/.memex-local/enrol"
+# A fake tailscale CLI: `status --json` answers the next state of $NT/states (one per line, the last repeats);
+# `up` records its argv (never a key value — the key is a file reference) and answers $NT/up.out with $NT/up.rc.
+cat > "$NT/ts/bin/tailscale" <<STUB
+#!/bin/bash
+shift   # --socket=…
+case "\$1" in
+  status) n=\$(cat "$NT/n" 2>/dev/null || echo 0); n=\$((n+1)); echo \$n > "$NT/n"
+    st=\$(sed -n "\${n}p" "$NT/states"); [ -n "\$st" ] || st=\$(tail -1 "$NT/states")
+    [ "\$st" = FAIL ] && { echo "Tailscale is starting" >&2; exit 1; }
+    printf '{"BackendState": "%s", "HaveNodeKey": %s}\n' "\$st" "\$(cat "$NT/havekey" 2>/dev/null || echo false)"; [ "\$st" = Running ] ;;
+  up) echo "\$*" >> "$NT/up.log"; cat "$NT/up.out" 2>/dev/null; exit "\$(cat "$NT/up.rc" 2>/dev/null || echo 0)" ;;
+esac
+STUB
+chmod +x "$NT/ts/bin/tailscale"
+nt() {  # $1 = states (space-separated); rest = extra env
+  local st="$1"; shift; printf '%s\n' $st > "$NT/states"; rm -f "$NT/n" "$NT/up.log"
+  env FLEET_BOOTSTRAP_LIB=1 FLEET_TS_DIR="$NT/ts" FLEET_TAILSCALED_SOCKET="$NT/sock" FLEET_TAILSCALED_STATE_DIR="$NT/state" \
+    FLEET_USER_HOME="$NT/u" FLEET_LOG_DIR="$NT/log" FLEET_MANAGED_PREFS="$NT/none" FLEET_LOGIN_SERVER=https://hs.example.test FLEET_TS_SETTLE_S=4 "$@" \
+    bash -c '. "$0"; step_network studio-2 "$(id -un)"; echo "RC=$?"' "$FB" 2>&1; }
+# 1. THE RESTART RACE: status fails while the daemon starts, then Running — a held (spent) key is NOT presented, and goes
+printf 'spent' > "$NT/state/preauth.key"; printf '{"_profiles":"x"}' > "$NT/state/tailscaled.state"
+OUT="$(nt "FAIL Starting Running")"
+[ ! -s "$NT/up.log" ] && grep -q 'network: joined (BackendState Running)' <<<"$OUT" && [ ! -e "$NT/state/preauth.key" ] \
+  && ok "after a daemon restart the step WAITS for a settled state: Running → joined, no 'up', the held spent key removed (the second Mac Studio was logged out here)" || bad "restart race" "$OUT / up: $(cat "$NT/up.log" 2>/dev/null)"
+# 2. a registered node that IS logged out, with only the spent key held: the key is removed, never presented
+printf 'spent' > "$NT/state/preauth.key"
+OUT="$(nt "NeedsLogin")"
+[ ! -s "$NT/up.log" ] && [ ! -e "$NT/state/preauth.key" ] && grep -q 'network: OFFLINE — this node was logged in before' <<<"$OUT" \
+  && ok "a logged-out registered node with only a spent held key: removed, no 'up', OFFLINE said with where a new key goes" || bad "stale key" "$OUT / $(cat "$NT/up.log" 2>/dev/null)"
+# 3. …and a NEW key dropped by a person: used, WITHOUT --reset, and every copy removed after
+printf 'fresh' > "$NT/u/.memex-local/enrol/studio-2.preauth"
+OUT="$(nt "NeedsLogin")"
+grep -q -- '--auth-key=file:' "$NT/up.log" && ! grep -q -- '--reset' "$NT/up.log" && [ ! -e "$NT/state/preauth.key" ] && [ ! -e "$NT/u/.memex-local/enrol/studio-2.preauth" ] \
+  && ok "a NEW key on a registered node re-logs it in WITHOUT --reset, by file reference, and no copy remains" || bad "re-login" "$OUT / $(cat "$NT/up.log" 2>/dev/null)"
+# 4. a node never logged in: --reset, the key removed after
+rm -f "$NT/state/tailscaled.state"; printf 'fresh' > "$NT/u/.memex-local/enrol/studio-2.preauth"
+OUT="$(nt "NeedsLogin")"
+grep -q -- '--reset' "$NT/up.log" && [ ! -e "$NT/state/preauth.key" ] && grep -q 'RC=0' <<<"$OUT" \
+  && ok "a fresh node joins with --reset and its key is removed" || bad "fresh join" "$OUT / $(cat "$NT/up.log" 2>/dev/null)"
+# 5. the login server refuses the key (expired/used): removed, said, never a retry loop
+printf 'old' > "$NT/u/.memex-local/enrol/studio-2.preauth"; printf 'backend error: authkey expired\n' > "$NT/up.out"; echo 1 > "$NT/up.rc"
+OUT="$(nt "NeedsLogin")"
+[ ! -e "$NT/state/preauth.key" ] && grep -q 'REFUSED the pre-auth key (expired or already used)' <<<"$OUT" && grep -q 'RC=0' <<<"$OUT" \
+  && ok "a refused (expired/used) key is removed and said, not retried every run" || bad "refused key" "$OUT"
+rm -f "$NT/up.out" "$NT/up.rc"
+# 6. a daemon that never settles: nothing is changed
+printf 'fresh' > "$NT/u/.memex-local/enrol/studio-2.preauth"
+OUT="$(nt "Starting")"
+[ ! -s "$NT/up.log" ] && grep -q 'did not settle' <<<"$OUT" && [ -e "$NT/u/.memex-local/enrol/studio-2.preauth" ] \
+  && ok "a daemon that does not settle in the bounded wait: WAITING, no 'up', the dropped key untouched" || bad "unsettled" "$OUT"
+# 7. a registered node that is Stopped: never re-keyed
+printf '{"_profiles":"x"}' > "$NT/state/tailscaled.state"; echo true > "$NT/havekey"
+OUT="$(nt "Stopped")"
+[ ! -s "$NT/up.log" ] && grep -q 'registered but its BackendState is Stopped' <<<"$OUT" \
+  && ok "a registered node that is Stopped is never re-keyed by the script" || bad "stopped" "$OUT"
+rm -rf "$NT"
+
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
