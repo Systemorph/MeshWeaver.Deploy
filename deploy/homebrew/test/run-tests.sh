@@ -3463,8 +3463,8 @@ fdj() { local port; rm -f "$FD/port"; python3 "$FD/srv.py" ok "$FD/port" 2>"$FD/
   env PATH="$FD/stubs:$STUBS:$PATH" HOME="$FD/home" MEMEX_LOCAL_HOME="$FD/home/.memex-local" MEMEX_OLLAMA_MODEL=qwen3:8b "$CLI" fleet doctor 2>&1; local rc=$?
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return "$rc"; }
 OUT="$(fdj)"; RC=$?
-grep -q 'runner: no claim line in the last 400 log lines' <<<"$OUT" && grep -q 'package seed: not installed yet' <<<"$OUT" && grep -q 'model qwen3:8b' <<<"$OUT" && grep -q 'fleet doctor:' <<<"$OUT" \
-  && ok "fleet doctor on a jobs-YES Mac reads to the END when the runner logs carry no claim line (rc=$RC; never a silent stop after the disk reading)" || bad "doctor jobs path" "rc=$RC $OUT"
+[ "$RC" = 1 ] && grep -q 'no release follower installed' <<<"$OUT" && grep -q 'reading(s) red' <<<"$OUT" && grep -q 'runner: no claim line in the last 400 log lines' <<<"$OUT" && grep -q 'package seed: not installed yet' <<<"$OUT" && grep -q 'model qwen3:8b' <<<"$OUT" && grep -q 'fleet doctor:' <<<"$OUT" \
+  && ok "fleet doctor on a jobs-YES Mac reads to the END when the runner logs carry no claim line (exit 1 for exactly its one red reading — no follower in the fixture — never a silent stop after the disk reading)" || bad "doctor jobs path" "rc=$RC $OUT"
 rm -rf "$FD"
 
 echo "── the local ingress never pins browsers to https for localhost: HSTS max-age=0 (2026-11-11) ──────"
