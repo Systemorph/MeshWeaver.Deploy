@@ -3358,8 +3358,10 @@ echo "── the token models and the default chat model fit THIS Mac's memory (
 tm() { env MEMEX_LOCAL_LIB=1 MEMEX_TOKEN_MODELS_UNCHECKED=0 PATH="$STUBS:$PATH" bash -c '. "$0"; ollama() { return 1; }; ACC_TOK_MODELS="$1"; ACC_JOBS_ENABLED="$2"; token_models_fit 2>/dev/null; printf "%s" "$ACC_TOK_MODELS"' "$CLI" "$@"; }
 [ "$(MEMEX_HOST_MEM_GIB=128 MEMEX_COLIMA_MEM=16 tm 'qwen3.8:27b-mlx qwen3.6' true)" = "qwen3.8:27b-mlx qwen3.6" ] \
   && ok "a 128 GB Mac Studio with jobs keeps both fleet token models" || bad "128 keeps" "$(MEMEX_HOST_MEM_GIB=128 MEMEX_COLIMA_MEM=16 tm 'qwen3.8:27b-mlx qwen3.6' true)"
-[ "$(MEMEX_HOST_MEM_GIB=48 MEMEX_COLIMA_MEM=16 tm 'qwen3.8:27b-mlx qwen3.6' true)" = "qwen3.8:27b-mlx" ] \
-  && ok "a 48 GB Mac mini with jobs keeps qwen3.8 (18 GiB) and drops qwen3.6 (22 GiB > 48−16−8−12)" || bad "48 drops" "$(MEMEX_HOST_MEM_GIB=48 MEMEX_COLIMA_MEM=16 tm 'qwen3.8:27b-mlx qwen3.6' true)"
+[ "$(MEMEX_HOST_MEM_GIB=56 MEMEX_COLIMA_MEM=16 tm 'qwen3.8:27b-mlx qwen3.6' true)" = "qwen3.8:27b-mlx" ] \
+  && ok "a 56 GB Mac with jobs keeps qwen3.8 (18 GiB) and drops qwen3.6 (22 GiB > 56−16−8−12 = 20)" || bad "56 drops" "$(MEMEX_HOST_MEM_GIB=56 MEMEX_COLIMA_MEM=16 tm 'qwen3.8:27b-mlx qwen3.6' true)"
+[ "$(MEMEX_HOST_MEM_GIB=48 MEMEX_COLIMA_MEM=16 MEMEX_OLLAMA_MODEL=qwen3:8b tm 'qwen3.8:27b-mlx qwen3.6' true)" = "qwen3:8b" ] \
+  && ok "a 48 GB Mac mini with jobs holds neither fleet model (budget 12 GiB) and serves its own qwen3:8b" || bad "48 none" "$(MEMEX_HOST_MEM_GIB=48 MEMEX_COLIMA_MEM=16 MEMEX_OLLAMA_MODEL=qwen3:8b tm 'qwen3.8:27b-mlx qwen3.6' true)"
 OUT="$(env MEMEX_LOCAL_LIB=1 MEMEX_TOKEN_MODELS_UNCHECKED=0 MEMEX_HOST_MEM_GIB=24 MEMEX_COLIMA_MEM=12 MEMEX_OLLAMA_MODEL=qwen3:8b bash -c '. "$0"; ollama() { return 1; }; ACC_TOK_MODELS="qwen3.8:27b-mlx qwen3.6"; ACC_JOBS_ENABLED=false; token_models_fit; printf "MODELS=%s" "$ACC_TOK_MODELS"' "$CLI" 2>&1)"
 case "$OUT" in *"cannot hold: qwen3.8:27b-mlx(18 GiB) qwen3.6(22 GiB)"*"serves its own chat model 'qwen3:8b'"*"MODELS=qwen3:8b") ok "a 24 GB Mac mini serves its own chat model when no declared token model fits, and says why" ;; *) bad "24 fallback" "$OUT" ;; esac
 [ "$(MEMEX_HOST_MEM_GIB=128 MEMEX_COLIMA_MEM=16 tm 'my-own:model' false)" = "my-own:model" ] && ok "a model of unknown size is kept (said as unchecked), never silently dropped" || bad "unknown kept" ""
@@ -3391,7 +3393,7 @@ s = http.server.HTTPServer(("127.0.0.1", 0), H); print(s.server_address[1], flus
 PY
 printf '#!/bin/bash\nprintf "NAME ID SIZE MODIFIED\\nqwen3:8b abc 5.2 GB now\\n"\n' > "$FD/stubs/ollama"
 printf '#!/bin/bash\nexit 0\n' > "$FD/stubs/curl"; chmod +x "$FD/stubs/"*
-fd() { local port; python3 "$FD/srv.py" "$1" > "$FD/port" & local pid=$!; for _ in 1 2 3 4 5 6 7 8 9 10; do port="$(cat "$FD/port" 2>/dev/null)"; [ -n "$port" ] && break; sleep 0.3; done
+fd() { local port; rm -f "$FD/port"; python3 "$FD/srv.py" "$1" > "$FD/port" & local pid=$!; for _ in $(seq 1 50); do port="$(cat "$FD/port" 2>/dev/null)"; [ -n "$port" ] && break; sleep 0.2; done
   printf 'config:\n  memex_portal:\n    Hosting__ReportTo: "http://127.0.0.1:%s"\n    Hosting__Deployment: "mini-1"\n    Hosting__BackLease__Accept__Jobs__Enabled: "false"\n    Hosting__BackLease__Accept__Tokens__Enabled: "false"\n' "$port" > "$FD/home/.memex-local/backlease.yaml"
   env PATH="$FD/stubs:$STUBS:$PATH" HOME="$FD/home" MEMEX_LOCAL_HOME="$FD/home/.memex-local" MEMEX_OLLAMA_MODEL=qwen3:8b "$CLI" fleet doctor 2>&1; local rc=$?
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return "$rc"; }
