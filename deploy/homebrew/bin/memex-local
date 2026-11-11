@@ -2501,10 +2501,10 @@ fleet_doctor() {
           || doc_red "build disk: ${df} — a run needs ${need} GiB free, so this host claims NOTHING" "memex-local buildhost gc (unused images, finished pods); memex-local buildhost disk shows what holds it; memex-local buildhost apply --resize grows the disk"
       else doc_red "build disk unreadable" "colima ssh -p $BUILD_PROFILE -- df -h /var/lib/rancher"; fi
       local claim
-      claim="$(build_kubectl -n "$BUILD_NS" logs -l app.kubernetes.io/component=build-host --tail=400 --prefix 2>/dev/null | grep -E 'claimed|NOT claiming|idle|warm' | tail -1 | cut -c1-220)"
+      claim="$(build_kubectl -n "$BUILD_NS" logs -l app.kubernetes.io/component=build-host --tail=400 --prefix 2>/dev/null | grep -E 'claimed|NOT claiming|idle|warm' | tail -1 | cut -c1-220 || true)"
       [ -n "$claim" ] && doc_info "runner: ${claim}" || doc_info "runner: no claim line in the last 400 log lines"
       local seed
-      seed="$(colima ssh -p "$BUILD_PROFILE" -- sudo sh -c 'ls -d /var/lib/rancher/k3s/storage/*build-cache*/nuget-seed 2>/dev/null | head -1 | xargs -r -I{} find {} -type f | wc -l' 2>/dev/null </dev/null | tr -d ' ')"
+      seed="$(colima ssh -p "$BUILD_PROFILE" -- sudo sh -c 'ls -d /var/lib/rancher/k3s/storage/*build-cache*/nuget-seed 2>/dev/null | head -1 | xargs -r -I{} find {} -type f | wc -l' 2>/dev/null </dev/null | tr -d ' ' || true)"
       case "${seed:-}" in ''|0) doc_info "package seed: not installed yet (the seed pass fills <cache>/nuget-seed in preparation)" ;; *) doc_ok "package seed: ${seed} file(s) in the cache" ;; esac
     fi
     local fol="$HOME/.memex-local/buildhost-follow/$BUILD_PROFILE/follow-set.py" last
