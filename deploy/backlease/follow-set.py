@@ -292,11 +292,32 @@ def estate_values(values: dict) -> dict:
     return {"buildHosts": {k: bh[k] for k in ESTATE_KEYS if k in bh}}
 
 
+SIZING_FILE = "sizing.yaml"
+
+
+def sizing_file(agent: Optional[str], chart: str) -> Optional[str]:
+    """THIS MAC'S SIZING (`memex-local buildhost apply` writes `<agent>/sizing.yaml`: runners, resources, stage slots, the
+    cache budget from its build disk), when present and the chart can read it (a chart that predates
+    `buildHosts.cache.sizeEnforced` would refuse a budget above the claim) — else None. Without it, every full upgrade
+    put the Mac back to the values file's defaults (2026-11-11)."""
+    if not agent:
+        return None
+    f = os.path.join(agent, SIZING_FILE)
+    tpl = os.path.join(chart, "templates", "build-host", "_build-hosts.tpl")
+    try:
+        return f if os.path.isfile(f) and "sizeEnforced" in open(tpl).read() else None
+    except OSError:
+        return None
+
+
 def full_upgrade_cmd(release: str, ns: str, ctx: str, chart: str, values_file: str, estate_file: str, channel: str,
-                     s: dict) -> list:
-    """A FULL upgrade: the chart's defaults, the Mac values, the estate values, then the set — never --reuse-values."""
+                     s: dict, sizing: Optional[str] = None) -> list:
+    """A FULL upgrade: the chart's defaults, the Mac values, the estate values, this Mac's sizing, then the set — never
+    --reuse-values."""
     cmd = ["helm", "upgrade", release, chart, "--kube-context", ctx, "-n", ns,
            "-f", os.path.join(chart, "values.yaml"), "-f", values_file, "-f", estate_file]
+    if sizing:
+        cmd += ["-f", sizing]
     for k in FIELDS:
         cmd += ["--set-string", f"buildHosts.{channel}.{k}={s[k]}"]
     return cmd + ["--wait=false"]
@@ -358,7 +379,7 @@ def follow_once(api: str, follow: str, release: str, ns: str, ctx: str, chart: s
     if agent and os.path.isfile(values_file):
         estate = os.path.join(agent, "estate-values.json")
         write_json(estate, estate_values(values))
-        rc, out = sh(full_upgrade_cmd(release, ns, ctx, chart, values_file, estate, channel, want))
+        rc, out = sh(full_upgrade_cmd(release, ns, ctx, chart, values_file, estate, channel, want, sizing_file(agent, chart)))
     else:
         rc, out = sh(upgrade_cmd(release, ns, ctx, chart, channel, want))
     if rc != 0:
@@ -682,6 +703,20 @@ def self_test() -> int:
         check("values: a red check OUTSIDE the gate does not hold — the changed chart is staged AND applied, the red named on the line",
               len(hv5.upgrades()) == 1 and "applied" in line5 and "Package seed: publish" in line5 and "not a hold" in line5, line5)
         check("values: a main whose chart GATE is red is never followed (the host stays as it is, said)", hv4.upgrades() == [] and "held" in line4, line4)
+    with tempfile.TemporaryDirectory() as sz:
+        ch = os.path.join(sz, "helm"); os.makedirs(os.path.join(ch, "templates", "build-host"))
+        tpl = os.path.join(ch, "templates", "build-host", "_build-hosts.tpl")
+        open(tpl, "w").write("old chart")
+        open(os.path.join(sz, SIZING_FILE), "w").write("buildHosts: {cache: {maxGi: 80}}")
+        check("sizing: a chart that cannot read sizeEnforced gets NO sizing file (it would refuse a budget above the claim)",
+              sizing_file(sz, ch) is None)
+        open(tpl, "w").write("... cache.sizeEnforced ...")
+        cmd = full_upgrade_cmd("r", "n", "c", ch, "v.yaml", "e.json", "mac", good, sizing_file(sz, ch))
+        check("sizing: this Mac's sizing.yaml is layered AFTER the Mac and estate values, BEFORE the set",
+              cmd[cmd.index("e.json") + 1:cmd.index("e.json") + 3] == ["-f", os.path.join(sz, SIZING_FILE)]
+              and cmd.index(os.path.join(sz, SIZING_FILE)) < cmd.index("--set-string"), cmd)
+        os.remove(os.path.join(sz, SIZING_FILE))
+        check("sizing: no sizing.yaml (a Mac never sized) → the Mac values alone", sizing_file(sz, ch) is None)
     # first-attach's estate --set-string keys are exactly what a full upgrade keeps
     attach = os.path.join(os.path.dirname(os.path.abspath(__file__)), "first-attach.sh")
     if os.path.isfile(attach):
