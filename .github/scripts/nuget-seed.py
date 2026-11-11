@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""
+THE PACKAGE SEED — the NuGet closure of a core version, published to the control instance's build API
+(MeshWeaver.Plugins Hosting/OneBuildTree §6.3; the routes: MeshWeaver.Plugins src/MeshWeaver.Fleet.Control/
+BuildSeedEndpoints.cs). Run by .github/workflows/nuget-seed.yml.
+
+  nuget-seed.py plan    --api <…/api/builds> [--channel latest]       which version, and whether its seed is published
+  nuget-seed.py publish --api <…/api/builds> --version V --packages DIR [--source URL]
+                        every complete package in the global-packages folder DIR: its `.nupkg` uploaded as a blob
+                        (content-addressed — a blob the store holds is answered "already held"), then the manifest
+                        (id, version, sha256, sha512, bytes, source), LAST and once. Signed with $SEED_SECRET
+                        (HMAC-SHA256 of `seed-<kind>:<name>:<sha256>:<bytes>` — the build API's
+                        BuildHostEndpoints.SeedSigningInput), the secret the platform-build hand-over is signed with.
+  nuget-seed.py --self-test
+
+`plan` prints GitHub output lines: version=…, build=true|false, why=….
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Callable, Optional
+
+VERSION = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$")
+NUGET_ORG = "https://api.nuget.org/v3/index.json"
+
+Http = Callable[[str, str, Optional[bytes], dict], "tuple[int, bytes]"]
+
+
+def http(method: str, url: str, body: Optional[bytes], headers: dict) -> "tuple[int, bytes]":
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=600) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read() if e.fp else b""
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return 0, str(e).encode()
+
+
+def signature(secret: str, kind: str, name: str, sha256: str, size: int) -> str:
+    msg = f"seed-{kind}:{name}:{sha256}:{size}".encode()
+    return "sha256=" + hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
+
+
+def plan(api: str, channel: str, call: Http, digests: Optional[dict] = None) -> "tuple[str, bool, str]":
+    """(version, build?, why) for the set `channel` runs; `digests` receives its runner and portal digests. Raises
+    SystemExit naming what cannot be read."""
+    status, body = call("GET", f"{api.rstrip('/')}/channels/{channel}/set", None, {"Accept": "application/json"})
+    try:
+        doc = json.loads(body) if status == 200 else None
+    except ValueError:
+        doc = None
+    version = doc.get("platformVersion") if isinstance(doc, dict) and doc.get("complete") is True else None
+    if not isinstance(version, str) or not VERSION.match(version):
+        raise SystemExit(f"::error::the control instance names no complete set for channel {channel} ({status})")
+    if digests is not None:
+        for k in ("runnerDigest", "portalDigest"):
+            d = doc.get(k)
+            if not (isinstance(d, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", d)):
+                raise SystemExit(f"::error::channel {channel}'s {k} {d!r} is not sha256:<64 hex>")
+            digests[k] = d
+    status, body = call("GET", f"{api.rstrip('/')}/seeds/{version}/status", None, {"Accept": "application/json"})
+    try:
+        published = json.loads(body).get("published") if status == 200 else None
+    except ValueError:
+        published = None
+    if published is None:
+        raise SystemExit(f"::error::the seed status of {version} cannot be read ({status}) — is the seed route deployed on control?")
+    return version, not published, ("published already" if published else "not published yet")
+
+
+def packages(folder: str) -> list[dict]:
+    """Every COMPLETE package of a global-packages folder (its `.nupkg.metadata` written), as manifest entries."""
+    out = []
+    for pid in sorted(os.listdir(folder)):
+        pdir = os.path.join(folder, pid)
+        if pid.startswith(".") or not os.path.isdir(pdir):
+            continue
+        for ver in sorted(os.listdir(pdir)):
+            d = os.path.join(pdir, ver)
+            nupkg = os.path.join(d, f"{pid}.{ver}.nupkg")
+            if not (os.path.isfile(os.path.join(d, ".nupkg.metadata")) and os.path.isfile(nupkg)):
+                continue
+            with open(nupkg, "rb") as fh:
+                data = fh.read()
+            try:
+                with open(os.path.join(d, ".nupkg.metadata")) as fh:
+                    source = json.load(fh).get("source")
+            except (OSError, ValueError, AttributeError):
+                source = None
+            out.append({"id": pid, "version": ver, "file": nupkg, "bytes": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "sha512": base64.b64encode(hashlib.sha512(data).digest()).decode(),
+                        "source": source if isinstance(source, str) else NUGET_ORG})
+    return out
+
+
+def publish(api: str, version: str, folder: str, secret: str, call: Http, log: Callable[[str], None] = print) -> int:
+    if not secret:
+        raise SystemExit("::error::SEED_SECRET is empty — the seed cannot be signed")
+    entries = packages(folder)
+    if not entries:
+        raise SystemExit(f"::error::{folder} holds no complete package — the restore restored nothing")
+    base = api.rstrip("/")
+    uploaded = held = 0
+    for e in entries:
+        with open(e["file"], "rb") as fh:
+            data = fh.read()
+        status, body = call("PUT", f"{base}/seeds/blobs/{e['sha256']}", data, {
+            "Content-Type": "application/octet-stream", "Expect": "100-continue",
+            "X-Seed-Signature": signature(secret, "blob", e["sha256"], e["sha256"], len(data))})
+        if status not in (200, 201):
+            raise SystemExit(f"::error::the blob of {e['id']}/{e['version']} was refused ({status}: {body[:300]!r})")
+        try:
+            existed = json.loads(body).get("existed") is True
+        except ValueError:
+            existed = False
+        held += existed
+        uploaded += not existed
+    manifest = json.dumps({"platformVersion": version,
+                           "packages": [{k: e[k] for k in ("id", "version", "sha256", "sha512", "bytes", "source")} for e in entries]},
+                          separators=(",", ":"), sort_keys=True).encode()
+    mhash = hashlib.sha256(manifest).hexdigest()
+    status, body = call("PUT", f"{base}/seeds/{urllib.parse.quote(version, safe='')}/manifest?sha256={mhash}", manifest, {
+        "Content-Type": "application/json", "X-Seed-Signature": signature(secret, "manifest", version, mhash, len(manifest))})
+    if status == 409:
+        raise SystemExit(f"::error::the seed of {version} is published already with OTHER bytes — a published seed never changes")
+    if status not in (200, 201):
+        raise SystemExit(f"::error::the manifest of {version} was refused ({status}: {body[:300]!r})")
+    log(f"package seed {version}: {len(entries)} package(s) — {uploaded} blob(s) uploaded, {held} already held; "
+        f"manifest {mhash[:12]} published")
+    return 0
+
+
+def self_test() -> int:
+    fails = []
+
+    def check(name: str, ok: bool, detail: object = "") -> None:
+        if not ok:
+            fails.append(f"{name}: {detail}")
+
+    store: dict = {}
+
+    def fake(method: str, url: str, body: Optional[bytes], headers: dict) -> "tuple[int, bytes]":
+        path = urllib.parse.urlparse(url).path
+        if method == "GET" and path.endswith("/channels/latest/set"):
+            return 200, json.dumps({"channel": "latest", "platformVersion": "3.1.7", "complete": True,
+                                    "runnerDigest": "sha256:" + "a" * 64, "portalDigest": "sha256:" + "b" * 64}).encode()
+        if method == "GET" and path.endswith("/status"):
+            return 200, json.dumps({"published": "manifest:3.1.7" in store}).encode()
+        if method == "PUT":
+            sha = (urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("sha256") or [path.rsplit("/", 1)[-1]])[0]
+            kind, name = ("manifest", path.split("/")[-2]) if path.endswith("/manifest") else ("blob", sha)
+            if headers.get("X-Seed-Signature") != signature("s3cret", kind, name, sha, len(body or b"")):
+                return 401, b"{}"
+            if hashlib.sha256(body or b"").hexdigest() != sha:
+                return 400, b"{}"
+            key = f"{kind}:{name}"
+            if key in store and store[key] != body:
+                return 409, b"{}"
+            existed = key in store
+            store[key] = body
+            return (200 if existed else 201), json.dumps({"existed": existed}).encode()
+        return 404, b""
+
+    dg: dict = {}
+    v, build, why = plan("https://ops.example/api/builds", "latest", fake, dg)
+    check("plan: the version latest runs, not published → build, with its runner and portal digests",
+          (v, build) == ("3.1.7", True) and dg == {"runnerDigest": "sha256:" + "a" * 64, "portalDigest": "sha256:" + "b" * 64}, (v, build, why, dg))
+    with tempfile.TemporaryDirectory() as t:
+        for pid, ver, data in (("demo.a", "1.0.0", b"A"), ("demo.b", "2.0.0", b"B")):
+            d = os.path.join(t, pid, ver)
+            os.makedirs(d)
+            open(os.path.join(d, f"{pid}.{ver}.nupkg"), "wb").write(data)
+            open(os.path.join(d, ".nupkg.metadata"), "w").write(json.dumps({"version": 2, "source": NUGET_ORG}))
+        os.makedirs(os.path.join(t, "demo.c", "1.0.0"))       # incomplete: no metadata
+        open(os.path.join(t, "demo.c", "1.0.0", "demo.c.1.0.0.nupkg"), "wb").write(b"C")
+        lines: list = []
+        publish("https://ops.example/api/builds", "3.1.7", t, "s3cret", fake, lines.append)
+        man = json.loads(store["manifest:3.1.7"])
+        check("publish: every COMPLETE package becomes a blob and a manifest entry (an incomplete one is not)",
+              sorted(p["id"] for p in man["packages"]) == ["demo.a", "demo.b"] and len([k for k in store if k.startswith("blob:")]) == 2, man)
+        check("publish: an entry carries id, version, sha256, sha512, bytes and source",
+              set(man["packages"][0]) == {"id", "version", "sha256", "sha512", "bytes", "source"}
+              and man["packages"][0]["sha256"] == hashlib.sha256(b"A").hexdigest(), man["packages"][0])
+        check("plan: once published, nothing to build", plan("https://ops.example/api/builds", "latest", fake)[1] is False)
+        lines2: list = []
+        publish("https://ops.example/api/builds", "3.1.7", t, "s3cret", fake, lines2.append)
+        check("publish: a second run uploads no new blob (already held) and the same manifest is accepted",
+              "0 blob(s) uploaded, 2 already held" in lines2[0], lines2)
+        open(os.path.join(t, "demo.a", "1.0.0", "demo.a.1.0.0.nupkg"), "wb").write(b"A2")
+        try:
+            publish("https://ops.example/api/builds", "3.1.7", t, "s3cret", fake, lambda m: None)
+            check("publish: other bytes under a published version are refused", False, "accepted")
+        except SystemExit as e:
+            check("publish: other bytes under a published version are refused (409)", "never changes" in str(e), e)
+        try:
+            publish("https://ops.example/api/builds", "3.1.8", t, "wrong", fake, lambda m: None)
+            check("publish: a wrong secret is refused", False, "accepted")
+        except SystemExit as e:
+            check("publish: a wrong secret is refused", "refused (401" in str(e), e)
+    if fails:
+        for f in fails:
+            print(f"SELF-TEST FAILED: {f}")
+        return 1
+    print("nuget-seed self-test: all cases passed (plan; complete packages only; manifest fields; idempotent re-run; "
+          "write-once manifest; signature)")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", choices=["plan", "publish"], nargs="?")
+    ap.add_argument("--api", default="")
+    ap.add_argument("--channel", default="latest")
+    ap.add_argument("--version", default="")
+    ap.add_argument("--packages", default="")
+    ap.add_argument("--self-test", action="store_true")
+    a = ap.parse_args()
+    if a.self_test:
+        return self_test()
+    if not a.api.startswith("https://"):
+        raise SystemExit("::error::--api must be the control instance's https …/api/builds")
+    if a.command == "plan":
+        dg: dict = {}
+        v, build, why = plan(a.api, a.channel, http, dg)
+        print(f"version={v}\nbuild={'true' if build else 'false'}\nwhy={why}\nrunner={dg['runnerDigest']}\nportal={dg['portalDigest']}")
+        return 0
+    if a.command == "publish":
+        if not VERSION.match(a.version) or not os.path.isdir(a.packages):
+            raise SystemExit("::error::publish needs --version MAJOR.MINOR.PATCH and an existing --packages folder")
+        return publish(a.api, a.version, a.packages, os.environ.get("SEED_SECRET", ""), http)
+    ap.error("a command is required")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

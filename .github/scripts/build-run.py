@@ -2030,31 +2030,32 @@ def promote_nuget(restored: str, cache: str, log: Callable[[str], None],
     return promoted, kept, refused
 
 
-# ─── THE PACKAGE SEED (Plugins Hosting/OneBuildTree §6.3): the NuGet closure of a core version, as ONE OCI artifact ───
-# `<registry>/nuget-seed:<platform version>`, written once per version by this repository's CD (.github/workflows/
-# nuget-seed.yml): ONE blob per package — the `.nupkg` exactly as its feed serves it, so a new version transfers only the
-# packages that changed — and `seed-manifest.json` naming each blob's id, version, SHA-512 and source feed. The host pulls
-# it during PREPARATION (before it claims), verifies every archive against the manifest, rebuilds each package from its
-# archive (`promote_nuget(expected=…)`, the warm cache's own path) and records the version as installed. This is cache
-# SEEDING from a hash-verified artifact — packages, never a build tree.
-NUGET_SEED_ENV = "MW_BUILD_NUGET_SEED"           # the seed's repository, `<registry>/nuget-seed`; unset = no seed
-PULL_CONFIG_ENV = "MW_BUILD_PULL_CONFIG"         # a docker config the host pulls with (the chart's pull Secret), optional
+# ─── THE PACKAGE SEED (Plugins Hosting/OneBuildTree §6.3): the NuGet closure of a core version, through the BUILD API ───
+# The control instance serves it (MeshWeaver.Plugins src/MeshWeaver.Fleet.Control/BuildSeedEndpoints.cs) to the worker
+# token the host already holds — the one network a run keeps — so no registry credential ever reaches a host:
+#   GET /seeds/<version>/manifest  → `seed-manifest.json`: each package's id, version, sha256, sha512, bytes, source feed;
+#   GET /seeds/blobs/<sha256>      → one `.nupkg`, exactly as its feed serves it (content-addressed, shared across versions).
+# Written once per version by this repository's CD (.github/workflows/nuget-seed.yml). During PREPARATION (before it
+# claims) the host fetches the blobs its cache lacks, verifies each against the manifest (sha256 and sha512), rebuilds
+# each package from its archive (`promote_nuget(expected=…)`, the warm cache's own path) and records the version as
+# installed. No feed is asked. This is cache SEEDING from a hash-verified artifact — packages, never a build tree.
 NUGET_SEED_MANIFEST = "seed-manifest.json"
 NUGET_SEED_MAX_PACKAGES = 20000
+NUGET_SEED_ENV = "MW_BUILD_NUGET_SEED"          # "false" turns the seed off (default on)
 
 
 def nuget_seed_marker(cache: str, version: str) -> str:
     return os.path.join(cache, "nuget-seed", re.sub(r"[^A-Za-z0-9._-]", "_", version) + ".installed")
 
 
-def read_seed_manifest(folder: str, version: str) -> list[dict]:
-    """The seed's package list, validated: every entry an id, a version, a file in `folder` and a base64 SHA-512.
+def read_seed_manifest(path: str, version: str) -> list[dict]:
+    """The seed's package list, validated: every entry an id, a version, a sha256 (64 hex) and a base64 SHA-512.
     Raises Refusal naming what is wrong."""
     try:
-        with open(os.path.join(folder, NUGET_SEED_MANIFEST)) as fh:
+        with open(path) as fh:
             doc = json.load(fh)
     except (OSError, ValueError) as e:
-        raise Refusal(f"the seed carries no readable {NUGET_SEED_MANIFEST} ({e})")
+        raise Refusal(f"the seed's manifest is not readable JSON ({e})")
     if not isinstance(doc, dict) or doc.get("platformVersion") != version:
         raise Refusal(f"the seed's manifest is for {doc.get('platformVersion') if isinstance(doc, dict) else None!r}, not {version!r}")
     pkgs = doc.get("packages")
@@ -2062,51 +2063,51 @@ def read_seed_manifest(folder: str, version: str) -> list[dict]:
         raise Refusal("the seed's manifest lists no packages")
     out = []
     for e in pkgs:
-        ok = (isinstance(e, dict) and all(isinstance(e.get(k), str) and e[k] for k in ("id", "version", "file", "sha512"))
+        ok = (isinstance(e, dict) and all(isinstance(e.get(k), str) and e[k] for k in ("id", "version", "sha256", "sha512"))
               and re.fullmatch(r"[A-Za-z0-9._-]+", e["id"]) and re.fullmatch(r"[A-Za-z0-9._+-]+", e["version"])
-              and e["file"] == os.path.basename(e["file"]) and re.fullmatch(r"[A-Za-z0-9+/]{86}==", e["sha512"]))
+              and re.fullmatch(r"[0-9a-f]{64}", e["sha256"]) and re.fullmatch(r"[A-Za-z0-9+/]{86}==", e["sha512"]))
         if not ok:
             raise Refusal(f"the seed's manifest carries an unusable entry ({str(e)[:160]})")
         out.append(e)
     return out
 
 
-def install_nuget_seed(cache: str, ref: str, version: str, env: dict, pull: Callable[[list[str]], int],
-                       log: Callable[[str], None], post: Callable[[str, dict], dict] = None) -> str:
-    """Install the package seed `ref:version` into `<cache>/nuget` once per version. Returns what happened (one line);
-    raises Refusal when the seed cannot be pulled or verified — nothing is then marked, so a later pass retries."""
+def install_nuget_seed(cache: str, api: "Api", version: str, log: Callable[[str], None],
+                       clock: Callable[[], float] = time.monotonic) -> str:
+    """Install the package seed of `version` into `<cache>/nuget` once. Returns what happened (one line), "held" when the
+    version is installed already; raises Refusal when the seed is not published yet or cannot be verified — nothing is
+    then marked, so a later pass retries."""
     marker = nuget_seed_marker(cache, version)
     if os.path.isfile(marker):
         return "held"
     root = os.path.join(cache, "nuget-seed")
     os.makedirs(root, exist_ok=True)
-    tmp = tempfile.mkdtemp(prefix=".pull-", dir=root)
-    auth_dir = tempfile.mkdtemp(prefix=".auth-", dir=root)
+    tmp = tempfile.mkdtemp(prefix=".fetch-", dir=root)
+    started = clock()
     try:
-        cmd = [env.get("ORAS", "oras"), "pull", f"{ref}:{version}", "-o", os.path.join(tmp, "blobs")]
-        cfg = env.get(PULL_CONFIG_ENV, "")
-        if cfg and os.path.isfile(cfg):
-            cmd += ["--registry-config", cfg]
-        else:
-            config = acr_registry_config(ref.split("/", 1)[0], env, post or _post_form, auth_dir)
-            if config:
-                cmd += ["--registry-config", config]
-        started = time.monotonic()
-        rc = pull(cmd)
-        if rc != 0:
-            raise Refusal(f"pulling the package seed {ref}:{version} failed (oras exit {rc}) — not published yet, or no pull right")
-        blobs = os.path.join(tmp, "blobs")
-        entries = read_seed_manifest(blobs, version)
+        mpath = os.path.join(tmp, NUGET_SEED_MANIFEST)
+        status, why = api.download(f"/seeds/{urllib.parse.quote(version, safe='')}/manifest", mpath, timeout=120)
+        if status == 404:
+            raise Refusal(f"the control instance holds no package seed for {version} yet")
+        if status != 200:
+            raise Refusal(f"the package seed's manifest for {version} could not be read ({status}: {why})")
+        entries = read_seed_manifest(mpath, version)
         staging = os.path.join(tmp, "packages")
         expected: dict = {}
+        fetched = held = 0
         for e in entries:
             pid, ver = e["id"].lower(), e["version"].lower()
-            try:
-                with open(os.path.join(blobs, e["file"]), "rb") as fh:
-                    data = fh.read()
-            except OSError as ex:
-                raise Refusal(f"the seed lists {pid}/{ver} but carries no {e['file']} ({ex})")
-            if base64.b64encode(hashlib.sha512(data).digest()).decode() != e["sha512"]:
+            if os.path.isfile(os.path.join(cache, "nuget", pid, ver, ".nupkg.metadata")):
+                held += 1                                  # a NuGet id/version is immutable: the cache's copy stands
+                continue
+            blob = os.path.join(tmp, e["sha256"])
+            status, why = api.download(f"/seeds/blobs/{e['sha256']}", blob, timeout=600)
+            if status != 200:
+                raise Refusal(f"the seed's {pid}/{ver} could not be fetched ({status}: {why})")
+            with open(blob, "rb") as fh:
+                data = fh.read()
+            os.remove(blob)
+            if hashlib.sha256(data).hexdigest() != e["sha256"] or base64.b64encode(hashlib.sha512(data).digest()).decode() != e["sha512"]:
                 raise Refusal(f"the seed's {pid}/{ver} does not hash to its manifest — refused whole")
             content = nupkg_content_hash(data)
             if content is None:
@@ -2121,15 +2122,16 @@ def install_nuget_seed(cache: str, ref: str, version: str, env: dict, pull: Call
                 json.dump({"version": 2, "contentHash": content,
                            **({"source": e["source"]} if isinstance(e.get("source"), str) else {})}, fh)
             expected[f"{pid}/{ver}"] = e["sha512"]
-        promoted, kept, refused = promote_nuget(staging, cache, log, expected=expected)
+            fetched += 1
+        promoted, kept, refused = promote_nuget(staging, cache, log, expected=expected) if expected else (0, 0, [])
         if refused:
             raise Refusal(f"the package seed {version}: {len(refused)} package(s) refused ({refused[:3]})")
         write_marker(root, os.path.basename(marker), f"{version} {len(entries)} packages")
-        return (f"package seed {ref}:{version}: {len(entries)} package(s) verified against its manifest — {promoted} "
-                f"installed, {kept} already held, 0 fetched from a feed ({time.monotonic() - started:.0f} s)")
+        return (f"package seed {version}: {len(entries)} package(s) in its manifest — {promoted} installed from the control "
+                f"instance (verified against the manifest), {held + kept} already held, 0 fetched from a feed "
+                f"({clock() - started:.0f} s)")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-        shutil.rmtree(auth_dir, ignore_errors=True)
 
 
 def validate_stages(doc: object) -> list[dict]:
@@ -5133,19 +5135,20 @@ class Host:
 
     def ensure_nuget_seed(self) -> None:
         """PREPARATION, before a claim: the package seed of the platform version this host runs, installed once
-        (`install_nuget_seed`). Never raises: a seed that is not there yet (or cannot be verified) is said once per
-        version and retried every few minutes; open runs still restore what they lack."""
-        ref = (self.env.get(NUGET_SEED_ENV) or "").strip()
-        if not ref or not self.platform_version or self.seed_done == self.platform_version:
+        (`install_nuget_seed`, through the build API). Never raises: a seed that is not there yet (or cannot be verified)
+        is said once per reason and retried every 5 minutes; open runs still restore what they lack."""
+        if (self.env.get(NUGET_SEED_ENV) or "").strip().lower() in ("0", "false", "no", "off"):
+            return
+        if not self.platform_version or self.seed_done == self.platform_version or self.api is None:
             return
         if time.monotonic() < self.seed_retry_at:
             return
         try:
-            line = install_nuget_seed(self.cache, ref, self.platform_version, self.env, self.pull, self.log)
+            line = install_nuget_seed(self.cache, self.api, self.platform_version, self.log)
             if line != "held":
                 self.log(line)
             self.seed_done = self.platform_version
-        except (Refusal, OSError, subprocess.SubprocessError) as e:
+        except (Refusal, OSError) as e:
             self.seed_retry_at = time.monotonic() + 300
             why = str(e)[:300]
             if why != self.seed_said:
@@ -11981,7 +11984,7 @@ def self_test() -> int:
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    # ── THE PACKAGE SEED: pulled in preparation, every archive verified against its manifest, no feed asked ──
+    # ── THE PACKAGE SEED: read through the build API in preparation, every archive verified, no feed asked ──
     seed_tmp = tempfile.mkdtemp(prefix="seed-")
     try:
         def seed_pkg(name_: str) -> bytes:
@@ -11991,67 +11994,66 @@ def self_test() -> int:
                                ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
                     z_.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_)
             return buf_.getvalue()
-        published_ = os.path.join(seed_tmp, "published")
-        os.makedirs(published_)
+        blobs_: dict = {}
         pkgs_ = []
         for pid_, ver_ in (("Demo.A", "1.0.0"), ("Demo.B", "10.0.9")):
             data_ = seed_pkg(pid_)
-            fn_ = f"{pid_.lower()}.{ver_}.nupkg"
-            open(os.path.join(published_, fn_), "wb").write(data_)
-            pkgs_.append({"id": pid_, "version": ver_, "file": fn_, "source": "https://api.nuget.org/v3/index.json",
+            h_ = hashlib.sha256(data_).hexdigest()
+            blobs_[h_] = data_
+            pkgs_.append({"id": pid_, "version": ver_, "sha256": h_, "bytes": len(data_), "source": "https://api.nuget.org/v3/index.json",
                           "sha512": base64.b64encode(hashlib.sha512(data_).digest()).decode()})
 
-        def write_manifest(version_: str, entries_: list) -> None:
-            with open(os.path.join(published_, NUGET_SEED_MANIFEST), "w") as fh_:
-                json.dump({"platformVersion": version_, "packages": entries_}, fh_)
-        write_manifest("3.1.1", pkgs_)
-        pulls_: list = []
-
-        def fake_oras(cmd_: list) -> int:
-            pulls_.append(cmd_)
-            dest_ = cmd_[cmd_.index("-o") + 1]
-            shutil.copytree(published_, dest_)
-            return 0
+        def seed_api(manifest_: Optional[dict], blob_override_: Optional[dict] = None) -> "_FakeApi":
+            def serve(path_: str):
+                if path_.endswith("/manifest"):
+                    return (404, b"") if manifest_ is None else (200, json.dumps(manifest_).encode())
+                h_ = path_.rsplit("/", 1)[-1]
+                src_ = (blob_override_ or {}).get(h_, blobs_.get(h_))
+                return (200, src_) if src_ is not None else (404, b"")
+            return _FakeApi({("GET-BYTES", "/seeds/"): serve})
         fresh_ = os.path.join(seed_tmp, "fresh-cache")
-        senv_ = {"ORAS": "oras", PULL_CONFIG_ENV: os.path.join(seed_tmp, "pull.json")}
-        open(senv_[PULL_CONFIG_ENV], "w").write("{}")
-        line_ = install_nuget_seed(fresh_, "cr.example.com/nuget-seed", "3.1.1", senv_, fake_oras, lambda m_: None,
-                                   post=lambda u_, f_: (_ for _ in ()).throw(AssertionError("no token exchange with a pull config")))
-        check("seed/a FRESH cache is filled from the seed: every package rebuilt into <cache>/nuget, 0 fetched from a feed, said",
+        api_s = seed_api({"platformVersion": "3.1.1", "packages": pkgs_})
+        line_ = install_nuget_seed(fresh_, api_s, "3.1.1", lambda m_: None)
+        check("seed/a FRESH cache is filled from the control instance's seed: every package rebuilt into <cache>/nuget, 0 fetched from a feed, said",
               nuget_packages(os.path.join(fresh_, "nuget")) == {"demo.a/1.0.0", "demo.b/10.0.9"}
-              and "2 installed" in line_ and "0 fetched from a feed" in line_
+              and "2 installed from the control instance" in line_ and "0 fetched from a feed" in line_
               and os.path.isfile(os.path.join(fresh_, "nuget", "demo.b", "10.0.9", ".nupkg.metadata")), line_)
-        check("seed/it is pulled by tag `<repo>:<platform version>` with the host's pull config",
-              pulls_ and pulls_[0][:3] == ["oras", "pull", "cr.example.com/nuget-seed:3.1.1"]
-              and "--registry-config" in pulls_[0] and senv_[PULL_CONFIG_ENV] in pulls_[0], pulls_)
-        check("seed/once installed for a version, a later pass pulls nothing (held)",
-              install_nuget_seed(fresh_, "cr.example.com/nuget-seed", "3.1.1", senv_, fake_oras, lambda m_: None) == "held"
-              and len(pulls_) == 1)
-        for why_, mutate_ in (("an archive that does not hash to the manifest", lambda: write_manifest("3.1.2", [dict(pkgs_[0], sha512=pkgs_[1]["sha512"])])),
-                              ("a manifest for another version", lambda: write_manifest("3.1.9", pkgs_)),
-                              ("a manifest entry naming a path", lambda: write_manifest("3.1.2", [dict(pkgs_[0], file="../x.nupkg")])),
-                              ("an empty package list", lambda: write_manifest("3.1.2", []))):
-            mutate_()
-            other_ = os.path.join(seed_tmp, "c-" + str(len(pulls_)))
+        reads_ = [c_[1] for c_ in api_s.calls if c_[0] == "GET-BYTES"]
+        check("seed/it reads the version's manifest, then each blob by its sha256 — through the build API (worker token)",
+              reads_[0] == "/seeds/3.1.1/manifest" and sorted(reads_[1:]) == sorted(f"/seeds/blobs/{p_['sha256']}" for p_ in pkgs_), reads_)
+        check("seed/once installed for a version, a later pass reads nothing (held)",
+              install_nuget_seed(fresh_, api_s, "3.1.1", lambda m_: None) == "held" and len(api_s.calls) == 3)
+        partial_ = os.path.join(seed_tmp, "partial")
+        os.makedirs(os.path.join(partial_, "nuget", "demo.a", "1.0.0"))
+        open(os.path.join(partial_, "nuget", "demo.a", "1.0.0", ".nupkg.metadata"), "w").write("{}")
+        api_p = seed_api({"platformVersion": "3.1.1", "packages": pkgs_})
+        line_p = install_nuget_seed(partial_, api_p, "3.1.1", lambda m_: None)
+        check("seed/a package the cache already holds is not fetched again (a NuGet id/version is immutable)",
+              [c_[1] for c_ in api_p.calls].count(f"/seeds/blobs/{pkgs_[0]['sha256']}") == 0 and "1 installed" in line_p and "1 already held" in line_p, (line_p, api_p.calls))
+        for why_, manifest_, override_ in (
+                ("a blob that does not hash to the manifest", {"platformVersion": "3.1.2", "packages": pkgs_}, {pkgs_[1]["sha256"]: b"planted"}),
+                ("a manifest for another version", {"platformVersion": "3.1.9", "packages": pkgs_}, None),
+                ("a manifest entry with no sha256", {"platformVersion": "3.1.2", "packages": [dict(pkgs_[0], sha256="x")]}, None),
+                ("an empty package list", {"platformVersion": "3.1.2", "packages": []}, None)):
+            other_ = os.path.join(seed_tmp, "c-" + why_[:6].replace(" ", "_"))
             try:
-                install_nuget_seed(other_, "cr.example.com/nuget-seed", "3.1.2", senv_, fake_oras, lambda m_: None)
+                install_nuget_seed(other_, seed_api(manifest_, override_), "3.1.2", lambda m_: None)
                 check(f"seed/{why_} is REFUSED whole", False, "installed")
             except Refusal as e_:
                 check(f"seed/{why_} is REFUSED whole, nothing marked or installed",
                       not os.path.exists(nuget_seed_marker(other_, "3.1.2")) and nuget_packages(os.path.join(other_, "nuget")) == set(), e_)
         try:
-            install_nuget_seed(os.path.join(seed_tmp, "nopull"), "cr.example.com/nuget-seed", "3.1.3", senv_, lambda c_: 1, lambda m_: None)
-            check("seed/a seed that cannot be pulled (not published yet) is a Refusal", False, "no refusal")
+            install_nuget_seed(os.path.join(seed_tmp, "none"), seed_api(None), "3.1.3", lambda m_: None)
+            check("seed/a version with no seed yet is a Refusal", False, "no refusal")
         except Refusal as e_:
-            check("seed/a seed that cannot be pulled (not published yet) is a Refusal naming it", "3.1.3" in str(e_), e_)
-        hs_ = Host({NUGET_SEED_ENV: "cr.example.com/nuget-seed", "MW_BUILD_PLATFORM_VERSION": "3.1.1",
-                    "MW_BUILD_CACHE": fresh_}, None, log=lambda m_: None, pull=fake_oras)
+            check("seed/a version with no seed yet is a Refusal naming it", "no package seed for 3.1.3" in str(e_), e_)
+        hs_ = Host({"MW_BUILD_PLATFORM_VERSION": "3.1.1", "MW_BUILD_CACHE": fresh_}, api_s, log=lambda m_: None)
         hs_.ensure_nuget_seed()
         check("seed/the host's preparation installs (here: finds held) the seed of the version it runs", hs_.seed_done == "3.1.1")
-        hz_ = Host({"MW_BUILD_PLATFORM_VERSION": "3.1.1", "MW_BUILD_CACHE": os.path.join(seed_tmp, "z")}, None,
-                   log=lambda m_: None, pull=lambda c_: (_ for _ in ()).throw(AssertionError("pulled")))
+        hz_ = Host({"MW_BUILD_PLATFORM_VERSION": "3.1.1", "MW_BUILD_CACHE": os.path.join(seed_tmp, "z"), NUGET_SEED_ENV: "false"},
+                   api_s, log=lambda m_: None)
         hz_.ensure_nuget_seed()
-        check("seed/no seed repository configured: nothing is pulled", hz_.seed_done is None)
+        check("seed/MW_BUILD_NUGET_SEED=false: nothing is read", hz_.seed_done is None)
     finally:
         shutil.rmtree(seed_tmp, ignore_errors=True)
 
