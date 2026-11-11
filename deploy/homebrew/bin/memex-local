@@ -4040,14 +4040,45 @@ image_pull_acr() {                                     # §3 Option A
 # ---------------------------------------------------------------------------
 # §5 — ingress-nginx
 # ---------------------------------------------------------------------------
+# 🚨 NO HSTS FROM A LOCAL INSTALL (2026-11-11, the maintainer's laptop): ingress-nginx sends
+# `Strict-Transport-Security: max-age=31536000; includeSubDomains` by default, and HSTS is per HOST, not per port — after
+# one visit to https://localhost:8443 Safari upgraded EVERY http://localhost:<port> to https for a year, which broke every
+# loopback OAuth redirect on the machine (`az login` died at "Safari can't open https://localhost:65217/"). A local install
+# therefore sends `max-age=0; includeSubDomains` (no preload): the directive that tells a browser to DROP the cached entry
+# for localhost and its subdomains, so the next https visit heals a browser the old default poisoned ("off" would leave
+# it broken for the rest of the year). Decided for EVERY host this controller serves,
+# including a fleet Mac's internal name (<machine>.net.<domain>): it is reached only over the private network with a
+# trusted certificate and the sign-in is Microsoft's, so HSTS there protects nothing, while the same controller answers
+# localhost.
+readonly INGRESS_HSTS_CONFIG=(hsts=true hsts-max-age=0 hsts-include-subdomains=true hsts-preload=false)
 install_ingress_nginx() {
   step "Installing ingress-nginx (no Traefik on k3s here) (§5)"
   helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx >/dev/null 2>&1 || true
   helm repo update ingress-nginx >/dev/null 2>&1 || helm repo update >/dev/null 2>&1 || true
+  local cfg=() kv; for kv in ${INGRESS_HSTS_CONFIG[@]+"${INGRESS_HSTS_CONFIG[@]}"}; do cfg+=(--set-string "controller.config.${kv}"); done
   helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
     -n "$INGRESS_NS" --create-namespace \
     --set controller.service.type=ClusterIP \
-    --set controller.admissionWebhooks.enabled=false
+    --set controller.admissionWebhooks.enabled=false \
+    ${cfg[@]+"${cfg[@]}"}
+}
+# An EXISTING install (made before the above) carries the default HSTS: set the same keys on the controller's ConfigMap in
+# place — ingress-nginx reloads it by itself — without re-running the chart (an `update` never upgrades ingress-nginx).
+# Idempotent: nothing is written when the ConfigMap already says so.
+ensure_ingress_no_hsts() {
+  # The controller ConfigMap's name follows the release name install_ingress_nginx uses (`ingress-nginx` →
+  # `ingress-nginx-controller`); a missing one is SAID, never a silent skip.
+  local cm=ingress-nginx-controller have kv k v patch=""
+  have="$(kubectl -n "$INGRESS_NS" get configmap "$cm" -o go-template='{{range $k, $v := .data}}{{$k}}={{$v}}{{"\n"}}{{end}}' 2>/dev/null)" \
+    || { warn "local ingress: no ConfigMap $INGRESS_NS/$cm to set HSTS on — 'memex-local up' installs the controller with max-age=0"; return 0; }
+  for kv in ${INGRESS_HSTS_CONFIG[@]+"${INGRESS_HSTS_CONFIG[@]}"}; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    grep -qxF -- "$kv" <<<"$have" || patch="${patch:+$patch,}\"$k\":\"$v\""
+  done
+  [ -n "$patch" ] || return 0
+  kubectl -n "$INGRESS_NS" patch configmap "$cm" --type merge -p "{\"data\":{$patch}}" >/dev/null \
+    && ok "local ingress: HSTS answered max-age=0; includeSubDomains (a browser drops its cached localhost entry) — loopback OAuth redirects (az login, …) work again" \
+    || warn "could not turn HSTS off on the local ingress (kubectl -n $INGRESS_NS patch configmap $cm) — a browser may keep upgrading http://localhost to https"
 }
 
 # ---------------------------------------------------------------------------
@@ -6514,6 +6545,7 @@ cmd_update() {
   # change to the portal's :latest tag, so it does NOT restart the portal — that is forced
   # separately below. (There is no memex-migration *Deployment* — it was converted to a
   # run-once Job in dd49cd1bf; rolling a Deployment here is what used to break `update`.)
+  ensure_ingress_no_hsts                          # §5 — an install made before 2026-11-11 sent HSTS for localhost
   helm_deploy                                     # §4 — bumps revision → fresh migration Job
 
   step "Waiting for the migration Job to finish (§4)"
