@@ -3309,6 +3309,16 @@ ma_refuses() {  # ma_refuses <what> <phrase> <parsed json>
 ma_refuses "a kind outside the lane's set is refused (a Deployment)" "kind Deployment is not one this lane applies" '{"kind":"Deployment","metadata":{"name":"d","namespace":"n"}}'
 ma_refuses "a Secret carrying data is refused" "carries data" '{"kind":"Secret","type":"kubernetes.io/service-account-token","metadata":{"name":"s"},"data":{"k":"dg=="}}'
 ma_refuses "an Opaque Secret is refused" "may only be an empty kubernetes.io/service-account-token" '{"kind":"Secret","type":"Opaque","metadata":{"name":"s"}}'
+# The one Opaque Secret admitted: an EMPTY placeholder, labelled as one, naming no service account — it lets a
+# pod that still names a retired Secret as a volume mount it, and carries nothing.
+ma_refuses "an Opaque placeholder carrying data is refused" "carries data" '{"kind":"Secret","type":"Opaque","metadata":{"name":"s","labels":{"hosting.meshweaver.io/placeholder":"true"}},"stringData":{"token":"x"}}'
+ma_refuses "an Opaque placeholder naming a service account is refused" "must authenticate as nobody" '{"kind":"Secret","type":"Opaque","metadata":{"name":"s","labels":{"hosting.meshweaver.io/placeholder":"true"},"annotations":{"kubernetes.io/service-account.name":"x"}}}'
+ma_refuses "an Opaque Secret labelled anything but placeholder=true is refused" "may only be an empty kubernetes.io/service-account-token" '{"kind":"Secret","type":"Opaque","metadata":{"name":"s","labels":{"hosting.meshweaver.io/placeholder":"yes"}}}'
+ma_fixture placeholder-ok 'kind: Secret # fixture' '{"apiVersion":"v1","kind":"Secret","type":"Opaque","metadata":{"name":"s","namespace":"acme","labels":{"hosting.meshweaver.io/placeholder":"true"}}}'
+ma check --manifest demo/placeholder-ok.yaml
+if [ "$_ma_rc" -eq 0 ] && case "$_ma_out" in *"object    Secret acme/s"*"::hosting:: manifest_check=sha256:"*) true ;; *) false ;; esac \
+   && ! grep_in "$_ma_log" -q '^kubectl apply -f'; then ok "an EMPTY labelled Opaque placeholder is admitted (negative control for the three refusals above)"
+else bad "empty Opaque placeholder" "rc ${_ma_rc}; kubectl: ${_ma_log}; ${_ma_out}"; fi
 ma_refuses "a wildcard rule is refused" "with * in its verbs" '{"kind":"ClusterRole","metadata":{"name":"c"},"rules":[{"apiGroups":[""],"resources":["*"],"verbs":["get"]}]}'
 ma_refuses "the escalate verb is refused" "verb escalate is refused" '{"kind":"Role","metadata":{"name":"c","namespace":"n"},"rules":[{"apiGroups":["rbac.authorization.k8s.io"],"resources":["roles"],"verbs":["escalate"]}]}'
 ma_refuses "an aggregated ClusterRole is refused" "aggregated ClusterRole" '{"kind":"ClusterRole","metadata":{"name":"c"},"aggregationRule":{"clusterRoleSelectors":[]}}'
