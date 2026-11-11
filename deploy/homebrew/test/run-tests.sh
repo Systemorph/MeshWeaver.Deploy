@@ -2002,12 +2002,12 @@ case "$OUT" in *"is current"*|"") ok "the poll is throttled (a second tick insid
 rm -f "$AU/home/.memex-local/autoupdate.checked"
 AU_CALL=(cmd_autoupdate _tick); au "$KEG/memex-local" FAKE_NEW_VERSION=0.3.2
 case "$OUT" in *"upgraded 0.3.1 -> 0.3.2"*"chart and share assets unchanged"*) ok "a script-only release upgrades without re-applying the chart" ;; *) bad "script-only release" "$OUT" ;; esac
-[ ! -s "$AU/update.log" ] && ok "… and restarts nothing" || bad "script-only release restarts nothing" "$(cat "$AU/update.log")"
+[ "$(cat "$AU/update.log")" = "settle|1" ] && ok "… and restarts nothing: only the in-place 'settle' runs (no update, no restart)" || bad "script-only release restarts nothing" "$(cat "$AU/update.log")"
 
 rm -f "$AU/home/.memex-local/autoupdate.checked"
 mkdir -p "$AU/home/.memex-local"; : > "$AU/home/.memex-local/autoroll-tick"
 AU_CALL=(cmd_autoupdate _tick); au "$KEG/memex-local" FAKE_NEW_VERSION=0.3.3 FAKE_NEW_CHART="chart v2"
-case "$(cat "$AU/update.log")" in "update --skip-image|1") ok "a release that changed the chart re-applies it once with update --skip-image, flagged as the agent" ;;
+case "$(cat "$AU/update.log")" in "settle|1"$'\n'"update --skip-image|1") ok "a release that changed the chart re-applies it once with update --skip-image, flagged as the agent" ;;
   *) bad "a changed chart is re-applied" "update.log=$(cat "$AU/update.log") out=$OUT" ;; esac
 cmp -s "$AU/home/.memex-local/autoroll-tick" "$AU/prefix/opt/memex-local/libexec/memex-local" \
   && ok "the auto-roll's tick copy is refreshed from the new keg" || bad "the auto-roll tick copy is refreshed" "$OUT"
