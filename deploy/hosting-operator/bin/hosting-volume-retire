@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# hosting-volume-retire --namespace <ns> --release <name> --retire <volume>=<mount path> [--retire …]
+#                       [--deployment memex-portal-deployment] [--fold-into-rollout]
+#
+# Remove LIVE-ONLY volumes — and every mount of them — from the portal Deployment's pod template: the
+# volumes a Hosting/Deployment record marks RETIRED (`liveOnlyVolumes[].retiredBy`), and only after
+# proving, in the cluster and immediately before the write, that no chart renders them and no
+# container still reads the path they are mounted at.
+#
+# 🚨 WHY THIS EXISTS. A pod-spec field the chart never rendered SURVIVES EVERY ROLL: `helm upgrade`'s
+# three-way merge removes only what helm previously OWNED, and a strategic merge patch keeps a list
+# entry it does not name (Doc/Architecture/ChartDriftSemantics). memex carried a volume
+# `hosting-jobrunner-token` — a Secret mounted at /var/run/secrets/hosting-operator, from the retired
+# Job-runner path — on its live Deployment only. When DeleteClusterManifest deleted that Secret
+# (deletemanifest-jobrunner-20261110), every roll copied the volume into the new ReplicaSet and every
+# new pod stuck in FailedMount: the serving pods kept their already-mounted copy, the new ones never
+# got a sandbox. The Audit named it (`volumes live-only`, `mounts live-only`); nothing could take it
+# off but a `kubectl patch` from a laptop — the break-glass write the operations rule retired. This
+# is the cluster half of the Reconcile's `RetireLiveOnlyVolume` remedy, the volume twin of
+# hosting-inline-env-retire. WHICH volumes, and the record-side refusals (a name or path that is not
+# plain), are the Hosting plugin's RepairPlan, unit-tested without a cluster; this script holds the
+# checks only the cluster can answer.
+#
+# 🚨 WHAT IS RE-MEASURED HERE, for every volume, before anything is written:
+#   * the chart does NOT render it. The truth is the release's manifest (`helm get manifest`, turned
+#     into objects by `kubectl apply --dry-run=client`, exactly as hosting-audit reads it): a volume
+#     the release's Deployment carries is helm's, and removing it live would be undone by the next
+#     roll and break the pods until then — change the record instead. Refused.
+#   * every live mount of it is at the path the record names. A mount elsewhere means the record
+#     describes a different volume than the pod carries. Refused.
+#   * NO CONTAINER STILL READS THE PATH. Every container and init container of the template is
+#     searched — command, args, working directory, every env value, probes and lifecycle hooks, every
+#     OTHER mount — and so is every ConfigMap and Secret they read through envFrom or env valueFrom,
+#     for the mount path (a value that names the path or a file under it). One hit is a refusal naming
+#     the container and the key — NEVER a value: a Secret's value is only ever tested, not printed.
+#     What this cannot see — a path compiled into a program and read from no configuration — is why
+#     the record must name what retires it (`retiredBy`): retiring a volume is a decision someone made
+#     about the program, which this measures the configuration against.
+#
+# 🚨 IT REFUSES DURING A ROLLOUT, and folds into the plan's own one — exactly as
+# hosting-inline-env-retire does, for the same reasons (MeshWeaver#3201, MeshWeaver.Plugins#2776):
+# removing a volume rewrites the pod template and starts a NEW rollout that would supersede one in
+# flight, unless the plan passes `--fold-into-rollout` because the rollout in flight is the one its
+# own re-apply just handed to the control plane. A PAUSED Deployment is refused even then.
+#
+# ONE guarded patch: JSON-patch `test` ops on the Deployment's resourceVersion and on each removed
+# entry's NAME, so a concurrent edit makes the patch fail instead of removing the wrong entry. One
+# refused volume refuses the whole run — nothing is retired halfway. IDEMPOTENT: a volume the
+# template no longer carries is reported absent and nothing is written; a run with nothing to remove
+# does not roll the Deployment. The rollout this starts is waited for by the plan step that follows.
+#
+# Output contract (the ::hosting:: lines):
+#   volume_retired=<n>          volumes removed from the pod template — read back, not assumed
+#   volume_absent=<n>           retired volumes the template no longer carried
+#   volume_retire=dry-run       a rehearsal: every check ran, nothing was written
+#   volume_folded_generation=<n>  --fold-into-rollout met the plan's own rollout in flight at
+#                               generation <n> and wrote the removal into it
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
+# shellcheck disable=SC2034  # read by hosting::die in _common.sh, which shellcheck does not follow here
+HOSTING_CMD="hosting-volume-retire"
+
+namespace="" release="" deployment="memex-portal-deployment"
+fold=false
+volumes=() paths=()
+while [ $# -gt 0 ]; do
+  # A boolean flag takes no value, so it is matched before the flag/value pair is shifted.
+  if [ "$1" = "--fold-into-rollout" ]; then fold=true; shift; continue; fi
+  flag="$1" value="${2:-}"
+  # Shift the value only when there is one: a trailing flag with no value must reach the
+  # need_flag refusal below, not spin on a `shift 2` that cannot shift.
+  if [ $# -gt 1 ]; then shift 2; else shift; fi
+  case "$flag" in
+    --namespace)  namespace="$value" ;;
+    --release)    release="$value" ;;
+    --deployment) deployment="$value" ;;
+    --retire)
+      [[ "$value" == *=* ]] \
+        || hosting::die "--retire '${value}' is not <volume>=<mount path> — the record names where every retired volume is mounted"
+      volumes+=("${value%%=*}")
+      paths+=("${value#*=}") ;;
+    *) hosting::die "unknown argument '${flag}'" ;;
+  esac
+done
+
+hosting::need_flag namespace "$namespace"
+hosting::need_flag release "$release"
+hosting::safe_name namespace "$namespace"
+hosting::safe_name release "$release"
+hosting::safe_name deployment "$deployment"
+[ "${#volumes[@]}" -gt 0 ] \
+  || hosting::die "missing required flag --retire — name at least one <volume>=<mount path>: the record's liveOnlyVolumes entries that carry retiredBy"
+
+i=0
+while [ "$i" -lt "${#volumes[@]}" ]; do
+  v="${volumes[$i]}" p="${paths[$i]}"
+  [[ "$v" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]] \
+    || hosting::die "volume '${v}' is not a DNS label (a pod volume name) — refusing to interpolate it"
+  [[ "$p" =~ ^/[A-Za-z0-9._/-]*$ ]] && [[ "$p" != *"/../"* ]] && [[ "$p" != *"/.." ]] && [[ "$p" != *"//"* ]] \
+    || hosting::die "mount path '${p}' of ${v} is not a plain absolute path (letters, digits, . _ - and /, no '..') — refusing to interpolate it"
+  [ "$p" != "/" ] || hosting::die "mount path of ${v} is '/' — every path is under it, so 'no container reads it' could never be shown"
+  j=0
+  while [ "$j" -lt "$i" ]; do
+    [ "${volumes[$j]}" != "$v" ] || hosting::die "volume '${v}' is named twice — one --retire per volume"
+    j=$((j + 1))
+  done
+  i=$((i + 1))
+done
+
+command -v jq >/dev/null 2>&1 \
+  || hosting::die "jq is not installed in this image — the Deployment and its sources are JSON and cannot be measured without it"
+
+work="$(mktemp -d)" || hosting::die "could not create a working directory"
+trap 'hosting::on_exit; rm -rf "$work"' EXIT
+
+# ── the Deployment as it is, and whether it is settled ─────────────────────────────────────────
+hosting::read kubectl -n "$namespace" get deployment "$deployment" -o json > "$work/dep.json" 2>"$work/err" \
+  || hosting::die "could not read deployment/${deployment} in ${namespace} ($(tr -d '\n' < "$work/err"))"
+
+rollout="$(jq -r '[
+    (.metadata.generation // 0), (.status.observedGeneration // 0), (.spec.replicas // 1),
+    (.status.replicas // 0), (.status.updatedReplicas // 0), (.status.availableReplicas // 0),
+    (.status.unavailableReplicas // 0), (if .spec.paused == true then 1 else 0 end)
+  ] | map(tostring) | join(" ")' "$work/dep.json")" \
+  || hosting::die "could not read the rollout state of deployment/${deployment}"
+read -r gen observed want total updated available unavailable paused <<<"$rollout"
+if [ "$paused" -ne 0 ]; then
+  hosting::die "deployment/${deployment} in ${namespace} is PAUSED (generation ${gen}) — a paused Deployment is a deliberate hold, and a volume removal written under it would roll the moment someone resumes it. Resume it deliberately (or not), then re-run. Nothing was changed."
+fi
+settled=true
+if [ "$observed" -lt "$gen" ] || [ "$total" -ne "$want" ] || [ "$updated" -ne "$want" ] \
+   || [ "$available" -ne "$want" ] || [ "$unavailable" -ne 0 ]; then
+  settled=false
+fi
+if $settled; then
+  hosting::log "rollout   deployment/${deployment} is settled (generation ${gen}, ${available}/${want} available)"
+elif $fold; then
+  hosting::log "rollout   deployment/${deployment} is mid-rollout (generation ${gen}, observed ${observed}; ${updated}/${want} updated, ${available} available) — the plan's own re-apply started it and handed it to the control plane, so this removal is FOLDED into it (--fold-into-rollout): one rollout carries both changes"
+  hosting::say volume_folded_generation "$gen"
+else
+  hosting::die "a rollout is in progress on deployment/${deployment} in ${namespace} (generation ${gen}, observed ${observed}; ${want} desired, ${total} running, ${updated} updated, ${available} available, ${unavailable} unavailable). Removing a volume rewrites the pod template, which starts a NEW rollout and supersedes this one. Hold until it settles (a rollout stuck on the very volume this retires is unstuck by giving the pods what they mount, then retiring it), then re-run. Nothing was changed."
+fi
+
+# ── the chart's truth: the release's own Deployment ────────────────────────────────────────────
+hosting::read helm get manifest "$release" -n "$namespace" > "$work/manifest.yaml" 2>"$work/err" \
+  || hosting::die "could not read the manifest of release '${release}' in ${namespace} ($(tr -d '\n' < "$work/err")) — whether the chart renders the volume is UNKNOWN, so nothing is removed"
+if ! kubectl apply --dry-run=client -o json -f - < "$work/manifest.yaml" 2>"$work/err" \
+     | jq -s '[.[] | if .kind == "List" then (.items // [])[] else . end]' > "$work/manifest.json"; then
+  hosting::die "could not turn the manifest of '${release}' into objects ($(tr -d '\n' < "$work/err")) — whether the chart renders the volume is UNKNOWN, so nothing is removed"
+fi
+jq -e --arg d "$deployment" 'any(.[]; .kind == "Deployment" and .metadata.name == $d)' "$work/manifest.json" >/dev/null \
+  || hosting::die "release '${release}' renders no Deployment '${deployment}' — the volume cannot be shown to be live-only against a release that does not own the Deployment, so nothing is removed"
+
+# Every container of the template, init containers included, as one array.
+CONTAINERS='((.spec.template.spec.containers // []) + (.spec.template.spec.initContainers // []))'
+
+# ── every volume is measured before anything is written ────────────────────────────────────────
+remove=() absent=0
+i=0
+while [ "$i" -lt "${#volumes[@]}" ]; do
+  vol="${volumes[$i]}" path="${paths[$i]}"
+  i=$((i + 1))
+
+  on_template="$(jq -r --arg v "$vol" 'any(.spec.template.spec.volumes[]?; .name == $v)' "$work/dep.json")"
+  mounts="$(jq -r --arg v "$vol" "[${CONTAINERS}[] | .name as \$c | .volumeMounts[]? | select(.name == \$v) | \"\\(\$c)|\\(.mountPath)\"] | .[]" "$work/dep.json")"
+  if [ "$on_template" != "true" ] && [ -z "$mounts" ]; then
+    hosting::log "${vol}  not on the pod template — already retired, nothing to remove"
+    absent=$((absent + 1))
+    continue
+  fi
+
+  jq -e --arg d "$deployment" --arg v "$vol" '
+      [.[] | select(.kind == "Deployment" and .metadata.name == $d)][0]
+      | ( any(.spec.template.spec.volumes[]?; .name == $v)
+          or any(((.spec.template.spec.containers // []) + (.spec.template.spec.initContainers // []))[] | .volumeMounts[]?; .name == $v) )' \
+      "$work/manifest.json" >/dev/null \
+    && hosting::die "${vol} is RENDERED by release ${release} — it is the chart's, not live-only. Removing it live would break the pods until the next roll puts it back; change what the record renders instead. Nothing was changed."
+
+  while IFS='|' read -r c mp; do
+    [ -n "$c" ] || continue
+    [ "$mp" = "$path" ] \
+      || hosting::die "the record says ${vol} is mounted at ${path}, but container ${c} mounts it at ${mp} — the record describes a different volume than the pod carries. Correct liveOnlyVolumes[].mountPath on the record and re-run. Nothing was changed."
+  done <<EOF_MOUNTS
+$mounts
+EOF_MOUNTS
+
+  # The path as a WHOLE path: itself, or a file under it — never a sibling that merely starts with it
+  # (/x/hosting-operator-2 is not /x/hosting-operator). Bounded on both sides by anything that cannot
+  # continue a path segment. The path's alphabet is closed above, so '.' is the one character to escape.
+  path_re="(^|[^A-Za-z0-9._/-])${path//./\\.}(\$|/|[^A-Za-z0-9._-])"
+  # Does any container still READ the path? Its own spec first — everything but the mounts of this
+  # volume — then every ConfigMap and Secret it reads configuration from. Names of the hits only.
+  readers="$(jq -r --arg v "$vol" --arg re "$path_re" "
+      ${CONTAINERS}[] | .name as \$c
+      | (.volumeMounts |= [.[]? | select(.name != \$v)])
+      | (paths(strings) as \$at | getpath(\$at) | select(test(\$re))
+         | \"container \\(\$c) \\(\$at | map(tostring) | join(\".\"))\")" "$work/dep.json")" \
+    || hosting::die "could not search the containers of deployment/${deployment} for ${path}"
+  if [ -n "$readers" ]; then
+    printf '%s\n' "$readers" | while IFS= read -r r; do hosting::log "READS     ${path}: ${r}"; done
+    hosting::die "a container of deployment/${deployment} still reads ${path} (listed above as READS) — removing ${vol} would take a file from under it. Retire that reference first, then re-run. Nothing was changed."
+  fi
+  jq -r "[${CONTAINERS}[] | .name as \$c |
+      (.envFrom[]? | if .configMapRef then [\"configmap\", .configMapRef.name, (.configMapRef.optional // false | tostring), \$c]
+                     elif .secretRef then [\"secret\", .secretRef.name, (.secretRef.optional // false | tostring), \$c] else empty end),
+      (.env[]?.valueFrom | select(. != null) |
+         if .configMapKeyRef then [\"configmap\", .configMapKeyRef.name, (.configMapKeyRef.optional // false | tostring), \$c]
+         elif .secretKeyRef then [\"secret\", .secretKeyRef.name, (.secretKeyRef.optional // false | tostring), \$c] else empty end)
+    ] | unique[] | join(\"|\")" "$work/dep.json" > "$work/sources" \
+    || hosting::die "could not list the configuration sources of deployment/${deployment}"
+  while IFS='|' read -r kind name optional c; do
+    [ -n "$kind" ] || continue
+    hosting::safe_name "configuration source" "$name"
+    if ! hosting::read kubectl -n "$namespace" get "$kind" "$name" -o json > "$work/src.json" 2>"$work/err"; then
+      [ "$optional" = "true" ] && continue
+      hosting::die "could not read ${kind}/${name}, a configuration source of container ${c} ($(tr -d '\n' < "$work/err")) — whether it names ${path} is UNKNOWN, so nothing is removed"
+    fi
+    # A Secret's values are decoded only to be TESTED; the key's name is all that is ever printed.
+    hits="$(jq -r --arg k "$kind" --arg re "$path_re" '
+        (.data // {}) | to_entries[]
+        | select((if $k == "secret" then (.value | @base64d) else .value end) | test($re)) | .key' "$work/src.json" 2>"$work/err")" \
+      || hosting::die "could not search ${kind}/${name} for ${path} ($(tr -d '\n' < "$work/err")) — UNKNOWN, so nothing is removed"
+    rm -f "$work/src.json"
+    if [ -n "$hits" ]; then
+      printf '%s\n' "$hits" | while IFS= read -r key; do hosting::log "READS     ${path}: container ${c} through ${kind}/${name} key ${key}"; done
+      hosting::die "container ${c} still reads ${path} through ${kind}/${name} (listed above as READS) — removing ${vol} would take a file from under it. Retire that configuration first, then re-run. Nothing was changed."
+    fi
+  done < "$work/sources"
+
+  carriers="$(jq -r --arg v "$vol" "[${CONTAINERS}[] | select(any(.volumeMounts[]?; .name == \$v)) | .name] | join(\", \")" "$work/dep.json")"
+  hosting::log "${vol}  live-only (release ${release} does not render it), mounted at ${path} on: ${carriers:-no container}; no container reads ${path}"
+  remove+=("$vol")
+done
+
+if [ "${#remove[@]}" -eq 0 ]; then
+  hosting::log "nothing to remove — the Deployment is not rolled"
+  hosting::say volume_retired 0
+  hosting::say volume_absent "$absent"
+  exit 0
+fi
+
+# ── one guarded patch ───────────────────────────────────────────────────────────────────────────
+vols_json="$(printf '%s\n' "${remove[@]}" | jq -R . | jq -s -c .)"
+rv="$(jq -r '.metadata.resourceVersion // ""' "$work/dep.json")"
+[ -n "$rv" ] \
+  || hosting::die "deployment/${deployment} reports no resourceVersion — the patch is guarded on it, so it is refused rather than written unguarded"
+# Descending index within each list, so an earlier removal never shifts a later path; the mounts
+# first, then the volumes they name.
+patch="$(jq -c --argjson vols "$vols_json" --arg rv "$rv" '
+  def mounts($list):
+    [ (.spec.template.spec[$list] // []) | to_entries[] | .key as $ci | (.value.volumeMounts // []) | to_entries[]
+      | select(.value.name as $n | any($vols[]; . == $n))
+      | {list: $list, ci: $ci, mi: .key, name: .value.name} ];
+  (mounts("containers") + mounts("initContainers")) as $m
+  | [ (.spec.template.spec.volumes // []) | to_entries[] | select(.value.name as $n | any($vols[]; . == $n))
+      | {vi: .key, name: .value.name} ] as $v
+  | [{op: "test", path: "/metadata/resourceVersion", value: $rv}]
+    + ($m | sort_by(.list, .ci, -.mi)
+        | map({op: "test", path: "/spec/template/spec/\(.list)/\(.ci)/volumeMounts/\(.mi)/name", value: .name},
+              {op: "remove", path: "/spec/template/spec/\(.list)/\(.ci)/volumeMounts/\(.mi)"}))
+    + ($v | sort_by(-.vi)
+        | map({op: "test", path: "/spec/template/spec/volumes/\(.vi)/name", value: .name},
+              {op: "remove", path: "/spec/template/spec/volumes/\(.vi)"}))' "$work/dep.json")" \
+  || hosting::die "could not compose the patch for deployment/${deployment}"
+
+hosting::do kubectl -n "$namespace" patch deployment "$deployment" --type json -p "$patch" >/dev/null \
+  || hosting::die "could not patch deployment/${deployment} — a failed 'test' op means the Deployment changed after it was measured (resourceVersion ${rv}); re-run to measure it again"
+
+if hosting::dry; then
+  hosting::say volume_retired 0
+  hosting::say volume_absent "$absent"
+  hosting::say volume_retire dry-run
+  exit 0
+fi
+
+# ── read it back: the patch is not the outcome, the pod template is ────────────────────────────
+hosting::read kubectl -n "$namespace" get deployment "$deployment" -o json > "$work/after.json" 2>"$work/err" \
+  || hosting::die "lost deployment/${deployment} after patching it ($(tr -d '\n' < "$work/err"))"
+left="$(jq -r --argjson vols "$vols_json" "
+  [ (.spec.template.spec.volumes[]? | select(.name as \$n | any(\$vols[]; . == \$n)) | \"volume \\(.name)\"),
+    (${CONTAINERS}[] | .name as \$c | .volumeMounts[]? | select(.name as \$n | any(\$vols[]; . == \$n)) | \"\\(\$c)/\\(.name)\") ]
+  | join(\", \")" "$work/after.json")"
+[ -z "$left" ] \
+  || hosting::die "the patch was accepted but deployment/${deployment} still carries ${left} — refusing to report a retirement that did not happen"
+
+hosting::log "retired   ${remove[*]} and every mount of it from the pod template (read back); the rollout this started is waited for by the next step"
+hosting::say volume_retired "${#remove[@]}"
+hosting::say volume_absent "$absent"

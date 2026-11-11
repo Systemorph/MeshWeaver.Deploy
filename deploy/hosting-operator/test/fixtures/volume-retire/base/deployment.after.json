@@ -1,0 +1,86 @@
+{
+ "apiVersion": "apps/v1",
+ "kind": "Deployment",
+ "metadata": {
+  "name": "memex-portal-deployment",
+  "namespace": "memex",
+  "generation": 12,
+  "resourceVersion": "4711"
+ },
+ "spec": {
+  "replicas": 3,
+  "paused": false,
+  "template": {
+   "spec": {
+    "initContainers": [
+     {
+      "name": "wait-for-db",
+      "image": "cr.example.invalid/wait:1",
+      "volumeMounts": []
+     }
+    ],
+    "containers": [
+     {
+      "name": "memex-portal",
+      "image": "cr.example.invalid/memex-portal:1",
+      "envFrom": [
+       {
+        "configMapRef": {
+         "name": "memex-portal-config"
+        }
+       },
+       {
+        "secretRef": {
+         "name": "memex-portal-keyvault"
+        }
+       }
+      ],
+      "env": [
+       {
+        "name": "MESH_GRPC_URL",
+        "value": "http://127.0.0.1:5005"
+       }
+      ],
+      "volumeMounts": [
+       {
+        "name": "data",
+        "mountPath": "/data"
+       }
+      ]
+     },
+     {
+      "name": "gate-python",
+      "image": "cr.example.invalid/gate-python:1",
+      "env": [
+       {
+        "name": "MESH_GATE_ADDRESS",
+        "value": "127.0.0.1:5006"
+       }
+      ]
+     }
+    ],
+    "volumes": [
+     {
+      "name": "data",
+      "persistentVolumeClaim": {
+       "claimName": "memex-data"
+      }
+     },
+     {
+      "name": "memex-kv-secrets",
+      "csi": {
+       "driver": "secrets-store.csi.k8s.io"
+      }
+     }
+    ]
+   }
+  }
+ },
+ "status": {
+  "observedGeneration": 12,
+  "replicas": 3,
+  "updatedReplicas": 3,
+  "availableReplicas": 3,
+  "unavailableReplicas": 0
+ }
+}
