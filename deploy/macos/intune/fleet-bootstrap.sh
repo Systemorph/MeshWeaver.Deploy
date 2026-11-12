@@ -31,7 +31,7 @@
 #      posted, and a root LaunchDaemon (com.meshweaver.fleet.join-poller) polls control every 30 s for at most 24 h — the
 #      Approve is collected within half a minute and the run continues at once. It removes itself when done.
 #   Readings the person can read without root: /Library/MeshWeaver/fleet-state/ — one file per step (operator-ssh,
-#      bootstrap-token, energy, join-poller, participation, homebrew, devtools, tools, tailscale, tailscaled, network, up, setup, join, doctor,
+#      version, bootstrap-token, energy, join-poller, participation, homebrew, devtools, tools, tailscale, tailscaled, network, up, setup, join, doctor,
 #      heartbeat, buildhost) and `stage`: the step the onboarding is stuck on, since when and why (1.7.0). A join that
 #      failed or was skipped for a missing prerequisite also reaches the person as a notification, naming it.
 #
@@ -61,7 +61,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.11.0"
+readonly FLEET_BOOTSTRAP_VERSION="1.11.1"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -1272,6 +1272,9 @@ main() {
   check_password "$user"
   machine="$(machine_id)"
   log "run for console user $user, machine $machine"
+  # which bootstrap ran — readable without root (the Intune agent runs a CACHED copy until its full sync, so the pinned
+  # version and the running one can differ for hours; measured on the first Mac mini, 2026-11-12)
+  write_reading version "$FLEET_BOOTSTRAP_VERSION" "run started"
   # 75 (EX_TEMPFAIL): a give-up is never read as a finished run by anything that calls main
   acquire_run_lock 900 || { log "another bootstrap run (the join poller's continuation) holds the run lock for over 15 min — this run stops; the next one retries"; exit 75; }
   # the operator's way in comes before everything that can fail: a Mac whose later steps fail is still reachable
