@@ -3303,6 +3303,41 @@ TIER='warn: MeshWeaver.PluginCatalog.InstanceAutoRegistrationService[0]
 hbw "$TIER" "$TIER"
 [ "$RC" != 0 ] && [ "$RESTARTS" = 0 ] && case "$OUT" in *"REFUSES Hosting"*"plan tier enterprise"*"is on free"*"Remedy:"*) true ;; *) false ;; esac \
   && ok "a plan tier that refuses Hosting STOPS the wait at once, naming the tier, the plan and the remedy — no restart" || bad "tier refusal" "rc=$RC restarts=$RESTARTS $OUT"
+hs() { printf '%s\n' "$1" | env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; heartbeat_state' "$CLI"; }
+# the registry does not LIST Hosting to this instance (2026-11-12: a fleet Mac on plan free waited 13 days on "absent")
+printf 'plugins:\n  registry:\n    registryUrl: "https://registry.example.test"\n    instanceId: "mini-7"\n' > "$HB/home/.memex-local/registry.yaml"
+NOTLISTED_OLD='warn: MeshWeaver.PluginCatalog.InstanceAutoRegistrationService[0]
+      The default install matched no packages for the operator'"'"'s patterns (wanted [Plugins/Hosting]; 40 pre-installed package(s) were still selected). Check PluginCatalog:InstallByDefault against the registry listing.
+      [DefaultInstall] reconciled: 0 installed, 40 up to date, 0 failed [DefaultViews, GraphViews]'
+hbw "$NOTLISTED_OLD" "$NOTLISTED_OLD"
+[ "$RC" != 0 ] && [ "$RESTARTS" = 0 ] && case "$OUT" in *"does not LIST Hosting"*"'mini-7'"*"plan unknown"*"Instance grants"*"memex-local registry https://registry.example.test --key mwr_"*"memex-local update"*"memex-local fleet heartbeat"*) true ;; *) false ;; esac \
+  && ok "platform ≤ 3.1.13051's 'matched no packages (wanted [Plugins/Hosting])' STOPS the wait at once: not listed, instance id, plan unknown, the tier remedy" || bad "not listed (old line)" "rc=$RC restarts=$RESTARTS $OUT"
+NOTLISTED_NEW='fail: MeshWeaver.PluginCatalog.InstanceAutoRegistrationService[0]
+      [DefaultInstall] PluginCatalog:InstallByDefault names Plugins/Hosting exactly, and the default install selects NOTHING for it: the registry'"'"'s listing for this instance does not carry that package (this instance is on plan free; listing complete: True). Raise the plan on the registry.
+      [DefaultInstall] reconciled: 0 installed, 40 up to date, 0 failed [DefaultViews, GraphViews]'
+hbw "$NOTLISTED_NEW" "$NOTLISTED_NEW"
+[ "$RC" != 0 ] && [ "$RESTARTS" = 0 ] && case "$OUT" in *"does not LIST Hosting"*"'mini-7'"*"plan free"*"Instance grants"*"--key mwr_"*"memex-local fleet heartbeat"*) true ;; *) false ;; esac \
+  && ok "MeshWeaver#8128's 'selects NOTHING for it' Error line STOPS the wait at once, naming the instance, the plan read from the line and the remedy" || bad "not listed (new line)" "rc=$RC restarts=$RESTARTS $OUT"
+[ "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's/on plan free;/on plan unknown (the registry'"'"'s answer named no plan);/')")" = "notlisted|unknown" ] \
+  && ok "…a plan the registry did not name reads 'unknown'" || bad "not listed unknown plan" "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's/on plan free;/on plan unknown (the registry answer named no plan);/')")"
+[ "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's|names Plugins/Hosting|names Hosting|')")" = "notlisted|free" ] \
+  && ok "…and Hosting is matched bare as well as under a source prefix" || bad "not listed bare id" "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's|names Plugins/Hosting|names Hosting|')")"
+REFUSED_NEW='fail: MeshWeaver.PluginCatalog.InstanceAutoRegistrationService[0]
+      [DefaultInstall] PluginCatalog:InstallByDefault names Plugins/Hosting exactly, and the registry REFUSES it by plan tier: Hosting needs plan tier enterprise, this instance is on free. Raise the plan on the registry.'
+[ "$(hs "$REFUSED_NEW")" = "tier|enterprise|free" ] && ok "MeshWeaver#8128's 'REFUSES it by plan tier' line is the tier state (tier enterprise, plan free)" || bad "refused new line" "$(hs "$REFUSED_NEW")"
+hbw "$REFUSED_NEW" "$REFUSED_NEW"
+[ "$RC" != 0 ] && case "$OUT" in *"REFUSES Hosting"*"plan tier enterprise"*"is on free"*"Instance grants"*) true ;; *) false ;; esac \
+  && ok "…and it STOPS the wait with the tier remedy" || bad "refused new line wait" "rc=$RC $OUT"
+[ "$(hs 'The default install matched no packages for the operator'"'"'s patterns (wanted [Plugins/*]; 40 pre-installed package(s) were still selected).
+[DefaultInstall] reconciled: 0 installed, 40 up to date, 0 failed [DefaultViews]' | cut -d'|' -f1)" = absent ] \
+  && ok "a 'matched no packages' line whose wanted list names no Hosting (a wildcard) stays absent" || bad "wildcard not Hosting" ""
+[ "$(hs 'The default install matched no packages for the operator'"'"'s patterns (wanted [Plugins/HostingExtras]; 1 pre-installed package(s) were still selected).
+[DefaultInstall] reconciled: 0 installed, 1 up to date, 0 failed [DefaultViews]' | cut -d'|' -f1)" = absent ] \
+  && ok "…nor one wanting a package that merely starts with 'Hosting'" || bad "HostingExtras wanted" ""
+[ "$(hs "$NOTLISTED_OLD
+$REC" | cut -d'|' -f1)" = restart ] && ok "a later reconcile that DID select Hosting wins over an earlier not-listed line" || bad "not listed then installed" "$(hs "$NOTLISTED_OLD
+$REC")"
+rm -f "$HB/home/.memex-local/registry.yaml"
 hbw "" "" HBW_MIN=0
 [ "$RC" != 0 ] && case "$OUT" in *"last state: reconciling"*) true ;; *) false ;; esac && ok "no reconcile at all: the bounded wait ends red, never hangs" || bad "no reconcile" "rc=$RC $OUT"
 hbw "$(printf '%s\n' "$REC" | sed 's/ — MODULE SET.*//')
@@ -3311,7 +3346,6 @@ $POSTED" ""
 hbw "$(printf '%s\n' "$POSTED" | sed '$d' | sed '$d')" "" MEMEX_LOG_LEVEL=Information
 [ "$RC" = 0 ] && case "$OUT" in *"ARMED"*"Debug line"*"level Information"*) true ;; *) false ;; esac \
   && ok "at a log level that hides the Debug 'posted' line, an armed heartbeat ends it and says to confirm on control" || bad "armed at Information" "rc=$RC $OUT"
-hs() { printf '%s\n' "$1" | env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; heartbeat_state' "$CLI"; }
 [ "$(hs '[DefaultInstall] reconciled: 1 installed, 0 up to date, 0 failed [HostingExtras] — MODULE SET proposed: sequence 2 — the landed modules load at the next restart' | cut -d'|' -f1)" = absent ] \
   && ok "a package that merely starts with 'Hosting' is not Hosting" || bad "Hosting id match" "$(hs '[DefaultInstall] reconciled: 1 installed, 0 up to date, 0 failed [HostingExtras]')"
 [ "$(hs '[BackLease] heartbeat posted to https://c.example.test/x: HTTP 401' | cut -d'|' -f1)" != posted ] && ok "a POST answered 401 is not a heartbeat that reached control" || bad "401 counted" ""
@@ -3452,6 +3486,15 @@ mv "$FD/fleet.yaml.kept" "$FD/home/.memex-local/fleet.yaml"; rm -f "$FD/state/st
 OUT="$(fd norecord)"; RC=$?
 [ "$RC" = 1 ] && grep -q 'control has no Deployments/mini-1 record' <<<"$OUT" && grep -q 'remedy: the Approve opens it as a pull request' <<<"$OUT" \
   && ok "a missing Deployments record is RED with its remedy, and the doctor exits 1" || bad "doctor no record" "rc=$RC $OUT"
+NL='[DefaultInstall] PluginCatalog:InstallByDefault names Plugins/Hosting exactly, and the default install selects NOTHING for it: the registry'"'"'s listing for this instance does not carry that package (this instance is on plan free; listing complete: True).'
+OUT="$(FAKE_MODULE_LOAD="$NL" fd ok)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'the registry does not LIST Hosting to this instance.*(plan free)' <<<"$OUT" && grep -q 'remedy: a platform admin of .*Instance grants.*--key mwr_.*memex-local update.*memex-local fleet heartbeat' <<<"$OUT" \
+  && ok "fleet doctor is RED when the portal log says the registry does not list Hosting, with the plan remedy" || bad "doctor not listed" "rc=$RC $OUT"
+OUT="$(FAKE_MODULE_LOAD='The default install matched no packages for the operator'"'"'s patterns (wanted [Plugins/Hosting]; 40 pre-installed package(s) were still selected).' fd ok)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'does not LIST Hosting.*(plan unknown)' <<<"$OUT" && ok "…also for platform ≤ 3.1.13051's 'matched no packages' line (plan unknown)" || bad "doctor not listed old" "rc=$RC $OUT"
+OUT="$(FAKE_MODULE_LOAD='[DefaultInstall] PluginCatalog:InstallByDefault names Plugins/Hosting exactly, and the registry REFUSES it by plan tier: Hosting needs plan tier enterprise, this instance is on free.' fd ok)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'REFUSES Hosting.*plan tier enterprise, this instance is on free' <<<"$OUT" && grep -q 'remedy: .*plan tier enterprise.*Instance grants' <<<"$OUT" \
+  && ok "…and RED with the tier named when the registry refuses Hosting by plan tier" || bad "doctor tier" "rc=$RC $OUT"
 OUT="$(fd 404)"; RC=$?
 [ "$RC" = 1 ] && grep -q 'does not answer /api/fleet/self-status yet' <<<"$OUT" && ok "a control that does not serve the endpoint is RED (unread), never a pass" || bad "doctor 404" "rc=$RC $OUT"
 # a jobs-YES Mac whose runner logs carry no claim line (and no seed): the doctor still reads to the END — a grep that matches

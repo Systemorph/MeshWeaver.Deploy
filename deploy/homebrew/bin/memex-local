@@ -2324,6 +2324,8 @@ portal_log() { kubectl -n "$NAMESPACE" logs "deploy/$PORTAL_DEPLOYMENT" --tail="
 # heartbeat_state — reads a portal log on stdin, prints "<state>|<detail>", the FIRST that holds:
 #   posted|<url> HTTP <code>      the heartbeat reached control
 #   tier|<tier>|<plan>            the registry's plan tier refuses Hosting to this instance
+#   notlisted|<plan>              the registry does not LIST Hosting to this instance at all (plan below Hosting's
+#                                 tier); <plan> is read from the line, or "unknown"
 #   restart|<sequence line>       Hosting is in the default install and its module loads at the next restart
 #   rejected|<detail>             a heartbeat went out and control did not accept it (the last such line)
 #   notarmed|<why>                the module is loaded but the heartbeat is not armed (the last such line)
@@ -2344,6 +2346,19 @@ heartbeat_state() {
   # the package list is the first [...] after "<n> failed"; Hosting by its id, bare or under a source prefix
   pk="$(printf '%s\n' "$rec" | sed -n -E 's/.* failed \[([^]]*)\].*/\1/p' | tr ',' '\n' | sed -E 's/^ +| +$//g' | grep -Ex '([A-Za-z0-9_.-]+/)?Hosting(@[^ ]*)?' | head -1)" || true
   [ -n "$pk" ] && hosting=yes
+  # The registry does not LIST Hosting to this instance (2026-11-12: a fleet Mac on plan free waited 13 days on
+  # "absent"). Two shapes: the platform's Error line from MeshWeaver#8128 on, and the older "matched no packages"
+  # warning whose wanted [...] names Hosting. A reconcile that did select Hosting wins over either.
+  if [ -z "$hosting" ]; then
+    l="$(printf '%s\n' "$log" | grep -E 'names ([A-Za-z0-9_.-]+/)?Hosting(@[^ ]*)? exactly, and the default install selects NOTHING for it' | tail -1)" || true
+    if [ -n "$l" ]; then
+      pk="$(printf '%s' "$l" | sed -n -E 's/.*this instance is on plan ([^;]*);.*/\1/p' | sed -E 's/ +$//')"
+      case "$pk" in ''|unknown*) pk=unknown ;; esac
+      printf 'notlisted|%s' "$pk"; return 0
+    fi
+    l="$(printf '%s\n' "$log" | grep -F 'The default install matched no packages for the operator' | sed -n -E 's/.*wanted \[([^]]*)\].*/\1/p' | tr ',' '\n' | sed -E 's/^ +| +$//g' | grep -Ex '([A-Za-z0-9_.-]+/)?Hosting(@[^ ]*)?' | tail -1)" || true
+    [ -n "$l" ] && { printf 'notlisted|unknown'; return 0; }
+  fi
   restart="$(printf '%s\n' "$rec" | grep -F 'the landed modules load at the next restart' | tail -1 | sed -E 's/.*MODULE SET (proposed: sequence [0-9]+).*/\1/')" || true
   if [ -n "$hosting" ] && [ -n "$restart" ]; then printf 'restart|%s' "$restart"; return 0; fi
   l="$(printf '%s\n' "$log" | grep -F '[BackLease] heartbeat NOT accepted by' | tail -1)" || true
@@ -2359,6 +2374,13 @@ heartbeat_state() {
   printf 'reconciling|'
 }
 
+# hosting_plan_remedy [tier] — the ONE remedy for a registry that withholds Hosting by plan (refused or not listed).
+hosting_plan_remedy() {
+  printf '%s' "Remedy: a platform admin of $(registry_url) raises instance '$(registry_instance_id)' to plan tier ${1:-the one Hosting needs}
+     (Settings ▸ Administration ▸ Instance grants), or this Mac registers with a registration key minted for that
+     plan ('memex-local registry $(registry_url) --key mwr_…' then 'memex-local update'). Then: memex-local fleet heartbeat"
+}
+
 # fleet_wait_heartbeat <minutes> — the join's tail (and `memex-local fleet heartbeat`). 0 = this Mac's heartbeat
 # reached control; dies naming the cause and the remedy otherwise. Restarts the portal at most ONCE.
 fleet_wait_heartbeat() {
@@ -2372,9 +2394,10 @@ fleet_wait_heartbeat() {
       posted) ok "heartbeat posted to ${detail} — control now sees this Mac (Hosting/Heartbeats)"; return 0 ;;
       tier) die "the registry REFUSES Hosting to this instance: Hosting needs plan tier ${detail%%|*}, this instance '$(registry_instance_id)' is on ${detail#*|}.
      No heartbeat can start without it, so the join stops here instead of waiting.
-     Remedy: a platform admin of $(registry_url) raises instance '$(registry_instance_id)' to plan tier ${detail%%|*}
-     (Settings ▸ Administration ▸ Instance grants), or this Mac registers with a registration key minted for that
-     plan ('memex-local registry $(registry_url) --key mwr_…' then 'memex-local update'). Then: memex-local fleet heartbeat" ;;
+     $(hosting_plan_remedy "${detail%%|*}")" ;;
+      notlisted) die "the registry does not LIST Hosting to this instance '$(registry_instance_id)' (plan ${detail}) — the default install selects nothing for it.
+     No heartbeat can start without it, so the join stops here instead of waiting.
+     $(hosting_plan_remedy)" ;;
       restart)
         if [ "$restarted" = no ]; then
           step "Hosting is installed and its module loads at the next restart (${detail}) — restarting the portal once"
@@ -2486,6 +2509,16 @@ fleet_doctor() {
       [ "$hs" = true ] && doc_ok "host status on the board (Ops/Status/$id, $(printf '%s' "$st" | json_field hostStatus.at))" \
         || doc_red "no host status on control's board yet" "it is written by the first verified heartbeat once Deployments/$id exists"
       ;;
+  esac
+
+  # 1b. the portal's own log: a registry that withholds Hosting by plan means no heartbeat can ever start
+  local hbs hbk hbd
+  hbs="$(portal_log | heartbeat_state)" || true; hbk="${hbs%%|*}"; hbd="${hbs#*|}"
+  case "$hbk" in
+    tier) doc_red "the registry REFUSES Hosting to this instance '$(registry_instance_id)': Hosting needs plan tier ${hbd%%|*}, this instance is on ${hbd#*|}" \
+      "$(hosting_plan_remedy "${hbd%%|*}" | sed -E 's/^Remedy: //' | tr -s ' \n' ' ')" ;;
+    notlisted) doc_red "the registry does not LIST Hosting to this instance '$(registry_instance_id)' (plan ${hbd}) — the default install selects nothing for it" \
+      "$(hosting_plan_remedy | sed -E 's/^Remedy: //' | tr -s ' \n' ' ')" ;;
   esac
 
   # 2. the build host — only on a jobs YES
