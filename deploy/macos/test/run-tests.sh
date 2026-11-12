@@ -799,6 +799,43 @@ awk '/^main\(\) \{/{on=1} on' "$FB" | grep -n 'step_operator_ssh\|read_participa
   && ok "main runs the operator SSH step before the participation answers (a Mac that fails later is still reachable); sshd_config is never touched" || bad "ssh step order" "$(awk '/^main\(\) \{/{on=1} on' "$FB")"
 rm -rf "$OT"
 
+echo "── bootstrap token: escrowed, or said every run until it is — never a password (bootstrap 1.6.0, 2026-11-12) ──"
+BT="$(mktemp -d)"; mkdir -p "$BT/st"; ME="$(id -un)"
+printf 'profiles: Bootstrap Token supported on server: YES\nprofiles: Bootstrap Token escrowed to server: YES\n' > "$BT/yes.txt"
+printf 'profiles: Bootstrap Token supported on server: YES\nprofiles: Bootstrap Token escrowed to server: NO\n' > "$BT/no.txt"
+printf 'profiles: Bootstrap Token supported on server: NO\nprofiles: Bootstrap Token escrowed to server: NO\n' > "$BT/unsup.txt"
+printf 'Must be running as root\n' > "$BT/garbage.txt"
+btv() { env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; bootstrap_token_verdict "$(cat "$1")"' "$FB" "$1"; }
+[ "$(btv "$BT/yes.txt")" = escrowed ] && [ "$(btv "$BT/no.txt")" = not-escrowed ] && [ "$(btv "$BT/unsup.txt")" = unsupported ] && [ "$(btv "$BT/garbage.txt")" = unknown ] \
+  && ok "profiles' bootstrap-token status reads as escrowed / not-escrowed / unsupported / unknown (never a guess)" || bad "bootstrap token verdicts" "$(btv "$BT/yes.txt") $(btv "$BT/no.txt") $(btv "$BT/unsup.txt") $(btv "$BT/garbage.txt")"
+bts() { env FLEET_BOOTSTRAP_LIB=1 FLEET_STATE_DIR="$BT/st" FLEET_LOG_DIR="$BT/log" FLEET_PROFILES_STATUS_FILE="$1" "${@:2}" bash -c '. "$0"; step_bootstrap_token "$(id -un)"; echo "RC=$?"' "$FB" 2>&1; }
+# escrowed: said, a green reading, no notification
+OUT="$(env FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_BOOTSTRAP_LIB=1 FLEET_STATE_DIR="$BT/st" FLEET_LOG_DIR="$BT/log" FLEET_PROFILES_STATUS_FILE="$BT/yes.txt" bash -c '. "$0"; step_bootstrap_token "$(id -un)"; echo "RC=$?"' "$FB" 2>&1)"
+case "$OUT" in *"bootstrap token: escrowed to the MDM"*"reading $BT/st/bootstrap-token = escrowed"*"RC=0"*) case "$OUT" in *osascript*) bad "escrowed: no notification" "$OUT" ;; *) ok "escrowed: said, a green reading, no notification" ;; esac ;; *) bad "escrowed" "$OUT" ;; esac
+# not escrowed, FIRST run: sign out and back in first — logged, a reading, a notification AS the person; never the command yet
+OUT="$(bts "$BT/no.txt" FLEET_BOOTSTRAP_DRY_RUN=1)"
+case "$OUT" in *"NOT ESCROWED"*"Sign out and back in to finish fleet setup"*"DRY-RUN: launchctl asuser $(id -u) sudo -u $ME /usr/bin/osascript"*"RC=0"*) case "$OUT" in *"profiles install"*) bad "first run names sign-in only" "$OUT" ;; *) ok "not escrowed, first run: 'sign out and back in' in the log and a notification posted AS the person; exit 0" ;; esac ;; *) bad "not escrowed first run" "$OUT" ;; esac
+# real run (the notification stubbed): the marker and the reading are written, root-owned 0644 in production
+mkdir -p "$BT/bin"; printf '#!/bin/bash\necho "launchctl $*" >> "%s/calls"\n' "$BT" > "$BT/bin/launchctl"; chmod +x "$BT/bin/launchctl"
+OUT="$(bts "$BT/no.txt" PATH="$BT/bin:$PATH")"
+[ -f "$BT/st/bootstrap-token.first-seen" ] && grep -q '^not-escrowed .* signin since ' "$BT/st/bootstrap-token" && [ "$(stat -f%Lp "$BT/st/bootstrap-token")" = 644 ] && grep -q 'asuser' "$BT/calls" \
+  && ok "…the first-seen marker and a world-readable reading (0644) are written, and the notification is posted" || bad "first run writes" "$OUT / $(cat "$BT/st/bootstrap-token" 2>/dev/null)"
+# a LATER run still un-escrowed: the command is named
+OUT="$(bts "$BT/no.txt" PATH="$BT/bin:$PATH")"
+case "$OUT" in *"still not finished"*"sudo profiles install -type bootstraptoken"*"RC=0"*) grep -q '^not-escrowed .* command since ' "$BT/st/bootstrap-token" && ok "a later run still un-escrowed names 'sudo profiles install -type bootstraptoken' (every run, until escrowed)" || bad "later reading" "$(cat "$BT/st/bootstrap-token")" ;; *) bad "later run" "$OUT" ;; esac
+# escrowed after that: the marker goes, the reading turns green
+OUT="$(bts "$BT/yes.txt" PATH="$BT/bin:$PATH")"
+[ ! -e "$BT/st/bootstrap-token.first-seen" ] && grep -q '^escrowed ' "$BT/st/bootstrap-token" && ok "once escrowed the marker is removed and the reading is green" || bad "escrowed after" "$OUT"
+# not supported, and unreadable: said, never a failure, never a notification
+rm -f "$BT/calls"; OUT="$(bts "$BT/unsup.txt" PATH="$BT/bin:$PATH")"
+case "$OUT" in *"does not support a bootstrap token"*"RC=0"*) [ ! -e "$BT/calls" ] && grep -q '^unsupported ' "$BT/st/bootstrap-token" && ok "an MDM without bootstrap-token support: said, reading 'unsupported', no notification, exit 0" || bad "unsupported side effects" "$(cat "$BT/calls" 2>/dev/null)" ;; *) bad "unsupported" "$OUT" ;; esac
+OUT="$(bts "$BT/garbage.txt" PATH="$BT/bin:$PATH")"
+case "$OUT" in *"bootstrap token: UNREAD"*"Must be running as root"*"RC=0"*) ok "an unreadable status is UNREAD with what profiles said, never read as escrowed" ;; *) bad "unknown" "$OUT" ;; esac
+# never a password
+! grep -qiE 'read -s|-passin|password *=|stdin.*pass' <(sed -n '/^# BOOTSTRAP TOKEN/,/^# PARTICIPATION/p' "$FB") && grep -q 'step_bootstrap_token "\$user"' "$FB" \
+  && ok "the step never reads or handles a password, and main runs it every run" || bad "bootstrap token wiring" "missing"
+rm -rf "$BT"
+
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

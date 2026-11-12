@@ -3395,6 +3395,7 @@ d() { env MEMEX_LOCAL_LIB=1 MEMEX_PROFILE= MEMEX_OLLAMA_MODEL= MEMEX_HOST_ARCH=a
 
 echo "── fleet doctor: control's view of this Mac, each reading green or red with a remedy (2026-11-11) ──────"
 FD="$(mktemp -d)"; mkdir -p "$FD/home/.memex-local" "$FD/stubs"
+mkdir -p "$FD/state"; echo "escrowed 2026-11-12T09:00:00Z" > "$FD/state/bootstrap-token"; echo "ok 2026-11-12T09:00:00Z mini-owner" > "$FD/state/operator-ssh"
 printf 'config:\n  memex_portal:\n    Hosting__Deployment: "mini-1"\n    Hosting__ModuleReportSecret: "s3cr3t-heartbeat-key-value"\n    Hosting__ControlInbox__Url: "http://127.0.0.1:1/api/hooks/Hosting/PlatformBuilds"\n' > "$FD/home/.memex-local/fleet.yaml"
 cat > "$FD/srv.py" <<'PY'
 import hashlib, hmac, http.server, json, sys, time
@@ -3424,13 +3425,23 @@ printf '#!/bin/bash\nexit 0\n' > "$FD/stubs/curl"; chmod +x "$FD/stubs/"*
 fd() { local port=""; rm -f "$FD/port" "$FD/port.tmp"; python3 "$FD/srv.py" "$1" "$FD/port" 2>"$FD/srv.err" & local pid=$!; for _ in $(seq 1 150); do [ -s "$FD/port" ] && port="$(cat "$FD/port")" && break; sleep 0.2; done
   [ -n "$port" ] || { echo "the test server did not start: $(tail -c 400 "$FD/srv.err" 2>/dev/null)"; kill "$pid" 2>/dev/null; return 2; }
   printf 'config:\n  memex_portal:\n    Hosting__ReportTo: "http://127.0.0.1:%s"\n    Hosting__Deployment: "mini-1"\n    Hosting__BackLease__Accept__Jobs__Enabled: "false"\n    Hosting__BackLease__Accept__Tokens__Enabled: "false"\n' "$port" > "$FD/home/.memex-local/backlease.yaml"
-  env PATH="$FD/stubs:$STUBS:$PATH" HOME="$FD/home" MEMEX_LOCAL_HOME="$FD/home/.memex-local" MEMEX_OLLAMA_MODEL=qwen3:8b "$CLI" fleet doctor 2>&1; local rc=$?
+  env PATH="$FD/stubs:$STUBS:$PATH" HOME="$FD/home" MEMEX_LOCAL_HOME="$FD/home/.memex-local" MEMEX_OLLAMA_MODEL=qwen3:8b MEMEX_FLEET_STATE_DIR="$FD/state" "$CLI" fleet doctor 2>&1; local rc=$?
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return "$rc"; }
 OUT="$(fd ok)"; RC=$?
 [ "$RC" = 0 ] && grep -q "control's last heartbeat from 'mini-1': 12 s ago" <<<"$OUT" && grep -q 'Deployments/mini-1 on control (kind mac-host)' <<<"$OUT" && grep -q 'enrolment: joined' <<<"$OUT" \
   && grep -q 'model qwen3:8b: installed and answering' <<<"$OUT" && grep -q 'every reading is green' <<<"$OUT" \
   && ok "fleet doctor reads control's signed view (heartbeat age, record, enrolment, host status) and the model, all green → exit 0" || bad "doctor green" "rc=$RC $OUT"
 case "$OUT" in *s3cr3t*) bad "fleet doctor printed the heartbeat key" "" ;; *) ok "fleet doctor never prints the heartbeat key (a fingerprint only)" ;; esac
+grep -q 'bootstrap token: escrowed to the MDM' <<<"$OUT" && grep -q "operator SSH: Remote Login on, the operator's keys installed" <<<"$OUT" \
+  && ok "fleet doctor reads the bootstrap's own readings: bootstrap token escrowed and operator SSH green" || bad "doctor bootstrap readings" "$OUT"
+echo "not-escrowed 2026-11-12T09:00:00Z command since 2026-11-12T08:00:00Z" > "$FD/state/bootstrap-token"
+OUT="$(fd ok)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'bootstrap token: NOT escrowed' <<<"$OUT" && grep -q 'remedy: sign out and back in.*sudo profiles install -type bootstraptoken' <<<"$OUT" \
+  && ok "an un-escrowed bootstrap token is RED: sign out and back in first, then 'sudo profiles install -type bootstraptoken'" || bad "doctor bootstrap token red" "rc=$RC $OUT"
+rm -f "$FD/state/bootstrap-token"
+OUT="$(fd ok)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'bootstrap token: no reading' <<<"$OUT" && ok "no bootstrap-token reading at all is RED (the bootstrap has not run here), never a pass" || bad "doctor no reading" "rc=$RC $OUT"
+echo "escrowed 2026-11-12T09:00:00Z" > "$FD/state/bootstrap-token"
 OUT="$(fd norecord)"; RC=$?
 [ "$RC" = 1 ] && grep -q 'control has no Deployments/mini-1 record' <<<"$OUT" && grep -q 'remedy: the Approve opens it as a pull request' <<<"$OUT" \
   && ok "a missing Deployments record is RED with its remedy, and the doctor exits 1" || bad "doctor no record" "rc=$RC $OUT"
@@ -3460,7 +3471,7 @@ STUB
 chmod +x "$FD/stubs/colima" "$FD/stubs/kubectl"
 fdj() { local port; rm -f "$FD/port"; python3 "$FD/srv.py" ok "$FD/port" 2>"$FD/srv.err" & local pid=$!; for _ in $(seq 1 150); do [ -s "$FD/port" ] && port="$(cat "$FD/port")" && break; sleep 0.2; done
   printf 'config:\n  memex_portal:\n    Hosting__ReportTo: "http://127.0.0.1:%s"\n    Hosting__Deployment: "mini-1"\n    Hosting__BackLease__Accept__Jobs__Enabled: "true"\n    Hosting__BackLease__Accept__Tokens__Enabled: "false"\n' "$port" > "$FD/home/.memex-local/backlease.yaml"
-  env PATH="$FD/stubs:$STUBS:$PATH" HOME="$FD/home" MEMEX_LOCAL_HOME="$FD/home/.memex-local" MEMEX_OLLAMA_MODEL=qwen3:8b "$CLI" fleet doctor 2>&1; local rc=$?
+  env PATH="$FD/stubs:$STUBS:$PATH" HOME="$FD/home" MEMEX_LOCAL_HOME="$FD/home/.memex-local" MEMEX_OLLAMA_MODEL=qwen3:8b MEMEX_FLEET_STATE_DIR="$FD/state" "$CLI" fleet doctor 2>&1; local rc=$?
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return "$rc"; }
 OUT="$(fdj)"; RC=$?
 [ "$RC" = 1 ] && grep -q 'no release follower installed' <<<"$OUT" && grep -q 'reading(s) red' <<<"$OUT" && grep -q 'runner: no claim line in the last 400 log lines' <<<"$OUT" && grep -q 'package seed: not installed yet' <<<"$OUT" && grep -q 'model qwen3:8b' <<<"$OUT" && grep -q 'fleet doctor:' <<<"$OUT" \

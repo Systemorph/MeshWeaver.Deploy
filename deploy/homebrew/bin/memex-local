@@ -2530,6 +2530,26 @@ fleet_doctor() {
     else doc_red "model ${m}: declared but not installed" "ollama pull ${m}   (or withdraw it: memex-local backlease accept tokens --models …)"; fi
   done
 
+  # 4. what the fleet bootstrap (root, hourly, via Intune) last read — its own readings, world-readable (the log is root-only)
+  local rd="${MEMEX_FLEET_STATE_DIR:-/Library/MeshWeaver/fleet-state}" bt bt_v ss
+  bt="$(head -1 "$rd/bootstrap-token" 2>/dev/null || true)"; bt_v="${bt%% *}"
+  case "$bt_v" in
+    escrowed) doc_ok "bootstrap token: escrowed to the MDM (read by the fleet bootstrap ${bt#* })" ;;
+    unsupported) doc_info "bootstrap token: the MDM does not support one (read ${bt#* })" ;;
+    not-escrowed) doc_red "bootstrap token: NOT escrowed to the MDM — macOS updates need an admin password at this Mac (${bt#* })" \
+      "sign out and back in (a secure-token user's sign-in may escrow it); if a later bootstrap run still reads it un-escrowed: sudo profiles install -type bootstraptoken" ;;
+    '') doc_red "bootstrap token: no reading at $rd/bootstrap-token — the fleet bootstrap (≥ 1.6.0, hourly via Intune) has not run here" \
+      "confirm the Mac is in the Intune fleet group and its bootstrap runs (/Library/Logs/MeshWeaver/fleet-bootstrap.log, root-only)" ;;
+    *) doc_red "bootstrap token: unread by the bootstrap (${bt})" "sudo profiles status -type bootstraptoken" ;;
+  esac
+  ss="$(head -1 "$rd/operator-ssh" 2>/dev/null || true)"
+  case "${ss%% *}" in
+    ok) doc_ok "operator SSH: Remote Login on, the operator's keys installed (${ss#* })" ;;
+    not-configured) doc_info "operator SSH: not configured in the profile (OperatorSshKeys)" ;;
+    failed) doc_red "operator SSH: the bootstrap's step FAILED (${ss#* })" "read /Library/Logs/MeshWeaver/fleet-bootstrap.log (root-only) for the 'operator ssh:' lines" ;;
+    *) doc_info "operator SSH: no reading yet (the fleet bootstrap ≥ 1.6.0 writes it)" ;;
+  esac
+
   printf '\n'
   if [ "$DOC_RED" -eq 0 ]; then ok "fleet doctor: every reading is green"; return 0; fi
   warn "fleet doctor: ${DOC_RED} reading(s) red — each names its remedy above"; return 1
