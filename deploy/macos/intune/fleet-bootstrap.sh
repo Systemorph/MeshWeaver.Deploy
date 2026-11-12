@@ -23,6 +23,9 @@
 #   0. (right after the console user) Operator SSH: when OperatorSshKeys is configured, Remote Login is turned on
 #      and each declared PUBLIC key is appended to ~<console user>/.ssh/authorized_keys (written AS that user;
 #      only when absent; nothing else in the file is touched; sshd_config never). Not configured: nothing changes.
+#   0b. Bootstrap token: when it is not escrowed to the MDM, the log, a reading and a notification to the person say so
+#      (sign out and back in first; a later run names `sudo profiles install -type bootstraptoken`). Never a password.
+#   Readings the person can read without root: /Library/MeshWeaver/fleet-state/{operator-ssh,bootstrap-token}.
 #
 # Configuration — the managed preference domain com.memex.local (a configuration profile; memex-local reads
 # the same keys): ControlUrl, DeploymentId, RegistryUrl, FleetCaSha256 (the fleet local CA's certificate), and for the
@@ -50,7 +53,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.5.0"
+readonly FLEET_BOOTSTRAP_VERSION="1.6.0"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -70,6 +73,9 @@ readonly MEMEX_FORMULA="systemorph/memex/memex-local"
 readonly CLT_DIR="${FLEET_CLT_DIR:-/Library/Developer/CommandLineTools}"
 # Where a profile-deployed trusted root lives (the fleet local CA's certificate).
 readonly SYSTEM_KEYCHAIN="${FLEET_SYSTEM_KEYCHAIN:-/Library/Keychains/System.keychain}"
+# READINGS the console user (and `memex-local fleet doctor`) may read without root — the run log is root-only. One
+# root-owned 0644 file per reading, one line: "<verdict> <UTC time> <detail>". Nothing secret is ever written here.
+readonly STATE_DIR="${FLEET_STATE_DIR:-/Library/MeshWeaver/fleet-state}"
 
 log() {
   local line; line="$(date -u +%Y-%m-%dT%H:%M:%SZ) fleet-bootstrap ${FLEET_BOOTSTRAP_VERSION}: $*"
@@ -316,6 +322,7 @@ step_operator_ssh() {
   keys="$(operator_ssh_keys)"
   if [ -z "$keys" ]; then
     log "operator ssh: not configured (no OperatorSshKeys in the com.memex.local profile) — Remote Login and authorized_keys left as they are"
+    OPSSH_VERDICT="not-configured"
     return 0
   fi
   while IFS= read -r line; do
@@ -341,6 +348,82 @@ step_operator_ssh() {
   done
   log "operator ssh: $user — $added key(s) added, $present already present, $refused refused"
   [ "$refused" = 0 ]
+}
+
+# Writes one reading (above), atomically, root-owned 0644. Dry run: printed. A reading that cannot be written is
+# said and never fails the run.
+write_reading() {
+  local name="$1" verdict="$2" detail="${3:-}" line
+  line="$verdict $(date -u +%Y-%m-%dT%H:%M:%SZ)${detail:+ $detail}"
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then printf 'DRY-RUN: reading %s/%s = %s\n' "$STATE_DIR" "$name" "$line"; return 0; fi
+  { mkdir -p "$STATE_DIR" && chmod 755 "$STATE_DIR" && printf '%s\n' "$line" > "$STATE_DIR/.$name.tmp" \
+      && chmod 644 "$STATE_DIR/.$name.tmp" && mv -f "$STATE_DIR/.$name.tmp" "$STATE_DIR/$name"; } 2>/dev/null \
+    || log "readings: could not write $STATE_DIR/$name"
+}
+
+# A notification in the console user's session (Notification Center), posted AS that user. The text reaches osascript
+# as an argument, never as script source. A notification that cannot be posted is said and never fails the run.
+notify_user() {
+  local user="$1" title="$2" msg="$3" uid
+  uid="$(id -u "$user" 2>/dev/null)" || { log "notify: no uid for $user"; return 0; }
+  run launchctl asuser "$uid" sudo -u "$user" /usr/bin/osascript -e 'on run argv' \
+    -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' "$title" "$msg" 2>/dev/null \
+    || log "notify: could not post the notification to $user (the log line above says the same)"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# BOOTSTRAP TOKEN (owner, 2026-11-12: "i'll forget for sure"). Without a bootstrap token escrowed to the MDM, Intune's
+# macOS updates cannot install without an admin password at the Mac. Escrow takes a secure-token user's password, so the
+# bootstrap can never do it and never asks for, reads or handles a password. It makes it impossible to forget instead:
+# every run that finds it un-escrowed says so in the log, in a reading, and in a notification to the person. The first
+# instruction is to sign out and back in (a supervised Mac may escrow at a secure-token user's next sign-in — NOT yet
+# established on these user-enrolled Macs); a later run that still finds it un-escrowed names the command.
+readonly BT_COMMAND="sudo profiles install -type bootstraptoken"
+
+# The verdict from `profiles status -type bootstraptoken` (its text as $1): escrowed | not-escrowed | unsupported |
+# unknown. Pure.
+bootstrap_token_verdict() {
+  local sup esc
+  sup="$(printf '%s\n' "$1" | sed -n 's/.*[Ss]upported on server: *\([A-Za-z]*\).*/\1/p' | head -1 | tr 'a-z' 'A-Z')"
+  esc="$(printf '%s\n' "$1" | sed -n 's/.*[Ee]scrowed to server: *\([A-Za-z]*\).*/\1/p' | head -1 | tr 'a-z' 'A-Z')"
+  if [ "$esc" = YES ]; then printf 'escrowed'
+  elif [ "$sup" = NO ]; then printf 'unsupported'
+  elif [ "$esc" = NO ]; then printf 'not-escrowed'
+  else printf 'unknown'; fi
+}
+
+step_bootstrap_token() {
+  local user="$1" out verdict seen="$STATE_DIR/bootstrap-token.first-seen" since msg
+  if [ -n "${FLEET_PROFILES_STATUS_FILE:-}" ]; then out="$(cat "$FLEET_PROFILES_STATUS_FILE" 2>/dev/null)"
+  else out="$(profiles status -type bootstraptoken 2>&1)"; fi
+  verdict="$(bootstrap_token_verdict "$out")"
+  case "$verdict" in
+    escrowed)
+      log "bootstrap token: escrowed to the MDM (macOS updates install without an admin password)"
+      write_reading bootstrap-token escrowed
+      [ -e "$seen" ] && run rm -f "$seen"
+      return 0 ;;
+    unsupported)
+      log "bootstrap token: the MDM does not support a bootstrap token (profiles: supported on server NO) — nothing to escrow"
+      write_reading bootstrap-token unsupported; return 0 ;;
+    unknown)
+      log "bootstrap token: UNREAD — 'profiles status -type bootstraptoken' said: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+      write_reading bootstrap-token unknown; return 0 ;;
+  esac
+  if [ ! -f "$seen" ]; then
+    since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then printf 'DRY-RUN: mark %s (first seen un-escrowed)\n' "$seen"
+    else mkdir -p "$STATE_DIR" 2>/dev/null && printf '%s\n' "$since" > "$seen" 2>/dev/null; fi
+    msg="Sign out and back in to finish fleet setup: this Mac's bootstrap token is not escrowed to Intune yet, so macOS updates would need an admin password."
+    write_reading bootstrap-token not-escrowed "signin since $since"
+  else
+    since="$(head -1 "$seen" 2>/dev/null)"
+    msg="Fleet setup is still not finished (bootstrap token not escrowed since ${since:-earlier}). If signing out and back in has not done it, run in Terminal: $BT_COMMAND (it asks for your admin password)."
+    write_reading bootstrap-token not-escrowed "command since ${since:-unknown}"
+  fi
+  log "🚨 bootstrap token: NOT ESCROWED to the MDM — $msg"
+  notify_user "$user" "Fleet setup" "$msg"
+  return 0
 }
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -786,7 +869,10 @@ main() {
   log "run for console user $user, machine $machine"
   # the operator's way in comes before everything that can fail: a Mac whose later steps fail is still reachable
   local ssh_failed=0
-  step_operator_ssh "$user" || ssh_failed=1
+  if step_operator_ssh "$user"; then write_reading operator-ssh "${OPSSH_VERDICT:-ok}" "$user"
+  else ssh_failed=1; write_reading operator-ssh failed "$user"; fi
+  # never fails the run: it says, every run, what only a person can do (escrow takes their password)
+  step_bootstrap_token "$user"
   # the owner's answers are required BEFORE anything is installed — an unanswered one fails the run, loudly
   read_participation || { log "a step FAILED — the profile must carry the owner's answers (AcceptJobs, AcceptTokens); the next run retries"; exit 1; }
   step_homebrew "$user" || failed=1
