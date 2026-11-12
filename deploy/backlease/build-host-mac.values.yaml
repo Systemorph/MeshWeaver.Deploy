@@ -58,6 +58,9 @@ buildHosts:
   # a busy, unbuilt or refused tree gives a cold worktree off the master, said — never a copy (measured 2026-11-08: 32 s → 3 s,
   # 18 GiB → 20 KiB).
   runOverlay: true
+  # No network during a run (Plugins Hosting/OneBuildTree.md §6): loopback-only stages, NuGet from the prepared folder only.
+  # Flipped on measured 0 x MWPREP001 on a normal Mac run (readings in MeshWeaver.Deploy#272); the host probes it at start (#271).
+  stageNetwork: "offline"
   cacheClaimName: "build-cache-mac"
   # The Mac's only class is node-local; the replicas share it on the one node (ReadWriteOnce is per node).
   # The cache's real footprint under §7.3b (measured 29 GiB on 2026-11-08 before it): the bare mirrors (the master), the warm
