@@ -349,7 +349,7 @@ def full_upgrade_cmd(release: str, ns: str, ctx: str, chart: str, values_file: s
         cmd += ["-f", sizing]
     for k in FIELDS:
         cmd += ["--set-string", f"buildHosts.{channel}.{k}={s[k]}"]
-    if machine:
+    if machine is not None:
         cmd += ["--set-string", f"buildHosts.machine={machine}"]
     return cmd + ["--wait=false"]
 
@@ -358,7 +358,8 @@ def upgrade_cmd(release: str, ns: str, ctx: str, chart: str, channel: str, s: di
     cmd = ["helm", "upgrade", release, chart, "--kube-context", ctx, "-n", ns, "--reuse-values"]
     for k in FIELDS:
         cmd += ["--set-string", f"buildHosts.{channel}.{k}={s[k]}"]
-    if machine:
+    # None leaves the release's value alone; "" CLEARS it (--reuse-values would otherwise keep a stale machine name)
+    if machine is not None:
         cmd += ["--set-string", f"buildHosts.machine={machine}"]
     return cmd + ["--wait=false"]
 
@@ -399,13 +400,18 @@ def follow_once(api: str, follow: str, release: str, ns: str, ctx: str, chart: s
         applied = read_json(os.path.join(agent, "applied.json"))
         source_changed = bool(staged.get("key")) and staged.get("key") != applied.get("key")
     note = f" ({'; '.join(notes)})" if notes else ""
-    # `home` is the Mac's memex-local home (main passes it; a test passes its own, or none for no machine name)
-    machine = machine_of(home, chart) if home else None
-    # a release that does not yet carry this Mac's machine name is applied once, even on an unchanged set
-    machine_changed = machine is not None and ((values.get("buildHosts") or {}).get("machine") or None) != machine
+    # `home` is the Mac's memex-local home (main passes it; a test passes its own, or none: then the follower leaves the
+    # machine name as the release has it). `values` are the RELEASE's current user values (deployed_set), so a release
+    # that already carries the name reads current; one without it is applied once; one whose name no longer holds (the Mac
+    # un-enrolled, or its id is no DNS label) is cleared once, back to claiming as its pod.
+    carried = ((values.get("buildHosts") or {}).get("machine") or None)
+    machine = (machine_of(home, chart) or "") if home else None
+    machine_changed = machine is not None and (machine or None) != carried
     if machine_changed:
-        notes.append(f"the hosts claim as {machine}-<pod>")
+        notes.append(f"the hosts claim as {machine}-<pod>" if machine else "the hosts claim as their pod again (no machine name)")
         note = f" ({'; '.join(notes)})"
+    elif machine == "":
+        machine = None   # nothing carried, nothing to clear: leave the value alone
     if have == want and not source_changed and not machine_changed:
         return f"follow-set: current — {release} runs {follow}'s set {want['platformVersion']}{note}", 0
     if not os.path.isfile(os.path.join(chart, "Chart.yaml")):
@@ -782,12 +788,40 @@ def self_test() -> int:
         check("machine: a release without the machine is applied once on an unchanged set",
               rc_m == 0 and len(hm.upgrades()) == 1 and "buildHosts.machine=studio-1" in hm.upgrades()[0] and "studio-1-<pod>" in line_m,
               (line_m, hm.upgrades()))
+        class Carried(Helm):
+            def __init__(self, values: dict, machine: str):
+                super().__init__(values)
+                self.machine = machine
+
+            def __call__(self, cmd: list) -> "tuple[int, str]":
+                if cmd[:3] == ["helm", "get", "values"]:
+                    self.calls.append(cmd)
+                    return 0, json.dumps({"buildHosts": {"mac": self.values, "machine": self.machine}})
+                return super().__call__(cmd)
+        hs = Carried(dict(good), "studio-1")
+        line_s, rc_s = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                                   mchart, "mac", control(good), hs, home=mh)
+        check("machine: a release that already carries the name reads current — applied ONCE, not every pass",
+              rc_s == 0 and hs.upgrades() == [] and line_s.startswith("follow-set: current"), (line_s, hs.upgrades()))
+        hr = Carried(dict(good), "studio-9")
+        line_r, _ = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                                mchart, "mac", control(good), hr, home=mh)
+        check("machine: a renamed machine is applied once", len(hr.upgrades()) == 1 and "buildHosts.machine=studio-1" in hr.upgrades()[0], line_r)
         line_n, _ = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
                                 mchart, "mac", control(good), Helm(dict(good)))
         check("machine: without a home nothing changes on an unchanged set", line_n.startswith("follow-set: current"), line_n)
         with open(os.path.join(mh, BACKLEASE_FILE), "w") as fh:
             fh.write('Hosting__Deployment: "Studio_1"\n')
         check("machine: a deployment that is not a DNS label names no machine", machine_of(mh, mchart) is None)
+        hc = Carried(dict(good), "studio-1")
+        line_c, _ = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                                mchart, "mac", control(good), hc, home=mh)
+        check("machine: a name that no longer holds is CLEARED once (the short form would keep it)",
+              len(hc.upgrades()) == 1 and "buildHosts.machine=" in hc.upgrades()[0] and "their pod again" in line_c, (line_c, hc.upgrades()))
+        hq = Helm(dict(good))
+        line_q, _ = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                                mchart, "mac", control(good), hq, home=mh)
+        check("machine: nothing carried and nothing named → current, nothing applied", hq.upgrades() == [] and line_q.startswith("follow-set: current"), line_q)
         with open(tplf, "w") as fh:
             fh.write("{{- /* an older chart */ -}}")
         with open(os.path.join(mh, BACKLEASE_FILE), "w") as fh:
