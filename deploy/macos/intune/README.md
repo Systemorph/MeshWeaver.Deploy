@@ -73,7 +73,13 @@ finishes (back-lease enrolment + update). The earlier Macs passed this step beca
 wizard before the join. Since 1.10.0 a pre-setup join that is collected goes straight on in the SAME run: the setup
 is answered (the sign-in is installed by then), the bootstrap waits up to `FLEET_SETUP_WAIT_S` (600 s) for the portal to
 restart configured, and the finalisation (back-lease enrolment + update) follows — on the first Mac mini that was an
-hour's wait for nothing. Every step rewrites its own reading whoever runs it (the network step's reading had stayed at a
+hour's wait for nothing. **The sign-in reaches the Mac even when the join comes first** (1.11.0): a bootstrap-run join has no private-network name
+yet (the root daemon takes the key by file only after the join), so memex-local (FLEET_SIGNIN_HANDOVER) hands the
+sign-in over by file (`~/.memex-local/enrol/<id>.signin`, 0600, with `<id>.signin-facts`), and the bootstrap installs it
+with `memex-local internal on` once the network is up, before the setup (reading `signin`). A memex-local that predates
+the hand-over is upgraded from the tap. A Mac that JOINED but whose sign-in never landed (no `internal.yaml`, no
+hand-over, the portal still in setup) sets the join aside and files a FRESH join by itself — the first Mac mini lost its
+sign-in this way (2026-11-12). Every step rewrites its own reading whoever runs it (the network step's reading had stayed at a
 stale WAITING after the join's own call brought the tailnet up).
 
 **Operator SSH — optional**: `OperatorSshKeys`, a list of OpenSSH PUBLIC keys (a profile array, one key per

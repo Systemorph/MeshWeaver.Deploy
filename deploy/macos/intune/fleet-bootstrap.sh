@@ -61,7 +61,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.10.0"
+readonly FLEET_BOOTSTRAP_VERSION="1.11.0"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -648,7 +648,16 @@ step_tools() {
   local user="$1" missing=() t
   for t in "${BREW_TOOLS[@]}"; do [ -x "$BREW_PREFIX/bin/$t" ] || missing+=("$t"); done
   [ -x "$BREW_PREFIX/bin/memex-local" ] || missing+=("$MEMEX_FORMULA")
-  if [ "${#missing[@]}" -eq 0 ]; then log "tools: all present"; return 0; fi
+  if [ "${#missing[@]}" -eq 0 ]; then
+    # a memex-local that predates the sign-in hand-over (FLEET_SIGNIN_HANDOVER) drops a fleet Mac's sign-in during a
+    # bootstrap-run join (the first Mac mini, 2026-11-12): it is upgraded from the tap, never left as it is
+    if ! grep -q 'FLEET_SIGNIN_HANDOVER' "$(memex_libexec)/memex-local" 2>/dev/null; then
+      log "tools: memex-local predates the sign-in hand-over — upgrading it from the tap"
+      as_user "$user" "$BREW_PREFIX/bin/brew" upgrade "$MEMEX_FORMULA" >/dev/null 2>&1 || log "tools: 'brew upgrade $MEMEX_FORMULA' did not upgrade it (no newer release in the tap yet?) — retried next run"
+      return 0
+    fi
+    log "tools: all present"; return 0
+  fi
   log "tools: installing ${missing[*]}"
   # a third-party tap's formulae are refused until the tap is tapped AND trusted (deploy/homebrew/README.md)
   as_user "$user" "$BREW_PREFIX/bin/brew" tap systemorph/memex >/dev/null 2>&1 \
@@ -925,6 +934,32 @@ wait_setup_applied() {
   return 0
 }
 
+# The sign-in the join HANDED OVER (memex-local FLEET_SIGNIN_HANDOVER: ~/.memex-local/enrol/<id>.signin, 0600, with
+# <id>.signin-facts naming tenant and clientId) is installed with `memex-local internal on` as the person once the
+# private network is up — the secret on stdin from its file, never an argument or a log line — and then removed.
+step_signin_install() {
+  local user="$1" machine="$2" mlocal="$3" home f facts tenant cid out
+  home="$(user_home "$user")"; f="$home/.memex-local/enrol/$machine.signin"; facts="$f-facts"
+  [ -e "$f" ] || [ -L "$f" ] || return 0
+  if [ -L "$f" ] || [ ! -f "$f" ] || [ "$(stat -f%Su "$f" 2>/dev/null)" != "$user" ]; then
+    log "memex: REFUSED the handed-over sign-in ($f is not a regular file owned by $user)"; write_reading signin failed "the hand-over file is not $user's regular file"; return 1
+  fi
+  tenant="$(sed -n 's/^tenant=//p' "$facts" 2>/dev/null | head -1)"; cid="$(sed -n 's/^clientId=//p' "$facts" 2>/dev/null | head -1)"
+  case "$tenant$cid" in *[!A-Za-z0-9._-]*|'') log "memex: the handed-over sign-in has no valid tenant/client id ($facts)"; write_reading signin failed "no valid tenant/client id beside the hand-over"; return 1 ;; esac
+  if [ "$(ts_backend_state)" != Running ]; then
+    log "memex: WAITING for the private network before installing the handed-over sign-in ($cid)"; write_reading signin waiting "the network is not up yet"; return 0
+  fi
+  log "memex: installing the handed-over sign-in ($cid) with 'memex-local internal on' (the secret from its file, never printed)"
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then printf 'DRY-RUN: memex-local internal on --tenant %s --client-id %s < %s\n' "$tenant" "$cid" "$f"; return 0; fi
+  if out="$(as_user "$user" /bin/sh -c 'exec "$0" internal on --tenant "$1" --client-id "$2" < "$3"' "$mlocal" "$tenant" "$cid" "$f" 2>&1)"; then
+    as_user "$user" /bin/rm -f "$f" "$facts"
+    log "memex: sign-in installed ($cid); the hand-over removed"; write_reading signin ok "this Mac's own sign-in app $cid"
+    return 0
+  fi
+  log "memex: 'internal on' FAILED for the handed-over sign-in — $(last_said "$out") (the file is kept; retried next run)"
+  write_reading signin failed "internal on: $(last_said "$out")"; return 1
+}
+
 step_memex() {
   local user="$1" machine="$2" control registry home mlocal
   control="$(setting FLEET_CONTROL_URL ControlUrl)"; registry="$(setting FLEET_REGISTRY_URL RegistryUrl)"
@@ -990,6 +1025,19 @@ step_memex() {
     # on the first Mac mini (2026-11-12): every run answered the setup, was refused, and the join was never filed. So on
     # a fleet Mac that has not joined, the join runs FIRST — it files the request, and on the Approve installs the
     # sign-in as host configuration, which the setup then accepts. The setup is answered on a later run.
+    # joined, the setup still pending: a sign-in the join HANDED OVER (no network name at the time) is installed now
+    if [ -f "$home/.memex-local/fleet.yaml" ]; then
+      step_signin_install "$user" "$machine" "$mlocal" || return 1
+      if [ ! -f "$home/.memex-local/internal.yaml" ] && [ ! -f "$home/.memex-local/enrol/$machine.signin" ]; then
+        # joined, but its sign-in never landed (a memex-local before the hand-over dropped it) — the setup can never pass
+        # and the issued secret is gone with the join's throw-away key: a FRESH join issues a new one (owner, 2026-11-12)
+        log "memex: joined but this Mac's SIGN-IN is missing (no internal.yaml) — filing a fresh join for a new one"
+        as_user "$user" /bin/mv -f "$home/.memex-local/fleet.yaml" "$home/.memex-local/fleet.yaml.no-signin-$(date -u +%Y%m%dT%H%M%SZ)" \
+          || { log "memex: FAILED to set the sign-in-less join aside"; return 1; }
+        as_user "$user" /bin/rm -f "$home/.memex-local/fleet.finalized"
+        write_reading join refiling "joined at an earlier run but the sign-in was never installed — a fresh join is filed"
+      fi
+    fi
     if [ ! -f "$home/.memex-local/fleet.yaml" ]; then
       log "memex: the portal is in first-run setup and this Mac has not joined — a fleet Mac's sign-in arrives with the enrolment, so the join runs BEFORE the setup"
       run_join "$user" "$machine" "$control" "$mlocal" pre-setup || return
@@ -997,6 +1045,8 @@ step_memex() {
       [ -f "$home/.memex-local/fleet.yaml" ] || [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] || return 0
       # collected — the sign-in is installed now: the setup and the finalisation follow in THIS run (1.10.0), never an
       # hour later (the first Mac mini waited a full run for nothing, 2026-11-12)
+      # the join's sign-in, when it was handed over (the network came up only with the join): installed before the setup
+      step_signin_install "$user" "$machine" "$mlocal" || return 1
       log "memex: joined before the setup — answering the setup now (the sign-in is installed)"
     fi
     answer_setup "$user" "$machine" "$mlocal" || return
