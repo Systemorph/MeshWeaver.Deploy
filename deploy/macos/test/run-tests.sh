@@ -999,6 +999,16 @@ kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 OUT="$(env FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_USER_HOME="$JP/home" FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" \
   bash -c '. "$0"; id() { [ "$1" = -u ] && [ $# = 1 ] && echo 0 || command id "$@"; }; '"$PJL" "$FB" 2>&1)"
 case "$OUT" in *"taking over a stale lock"*POLLED*) [ ! -d "$JP/st/.run.lock" ] && ok "a lock whose holder is gone is taken over, and released when the tick ends" || bad "lock not released" "$(ls -la "$JP/st")" ;; *) bad "stale lock" "$OUT" ;; esac
+# 7b. joined while a run holds the lock: the tick neither runs main nor removes the poller (review on #280)
+mkdir -p "$JP/st/.run.lock"; sleep 300 & HOLDER=$!; echo "$HOLDER" > "$JP/st/.run.lock/pid"; : > "$JP/home/.memex-local/fleet.yaml"
+printf 'x' > "$JP/ld/com.meshweaver.fleet.join-poller.plist"; rm -f "$JP/lcalls"
+PJH='console_user() { printf jroe; }; machine_id() { printf studio-2; }; main() { echo MAIN-RAN; exit 0; }
+    poll_join_main'
+OUT="$(env FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_USER_HOME="$JP/home" FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" \
+  bash -c '. "$0"; id() { [ "$1" = -u ] && [ $# = 1 ] && echo 0 || command id "$@"; }; '"$PJH" "$FB" 2>&1)"
+case "$OUT" in *MAIN-RAN*|*"removing the join poller"*) bad "a held lock: the joined fast path does nothing" "$OUT" ;; *) [ -f "$JP/ld/com.meshweaver.fleet.join-poller.plist" ] && [ ! -s "$JP/lcalls" ] && ok "joined while another run holds the lock: the tick runs nothing and removes nothing (the holder is never booted out)" || bad "held-lock removal" "$(cat "$JP/lcalls" 2>/dev/null)" ;; esac
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; rm -rf "$JP/st/.run.lock" "$JP/home/.memex-local/fleet.yaml"
+grep -q 'exit 75; }' "$FB" && ok "main's lock give-up exits 75 (EX_TEMPFAIL), never a success" || bad "give-up status" ""
 # 8. a tick does ONLY the setup probe and ONE poll — no up, no verify
 : > "$JP/calls"
 OUT="$(env $FCA_ENV FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$T/secb:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_MANAGED_PREFS="$JP/none" FLEET_USER_HOME="$JP/home" FLEET_BREW_PREFIX="$JP/brew" \

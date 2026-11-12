@@ -1146,6 +1146,10 @@ poll_join_main() {
   FLEET_IN_POLLER=1
   user="$(console_user)" || exit 0
   home="$(user_home "$user")"; machine="$(machine_id)"
+  # the lock FIRST, before either fast path (review on #280): while any run holds it this tick does nothing at all — it
+  # never waits inside main, never mistakes a lock give-up for a finished run, never removes the poller. The next tick
+  # (launchd starts it only after this one ended) tries again.
+  acquire_run_lock 0 || exit 0
   # joined: the full run continues FIRST (in a subshell — main exits), then the poller goes: booting it out ends this
   # process, so it must be the last thing done
   if [ -f "$home/.memex-local/fleet.yaml" ]; then ( FLEET_POLL_MODE="" main ); remove_join_poller "joined"; exit 0; fi
@@ -1154,8 +1158,6 @@ poll_join_main() {
   if [ $((now - since)) -ge "$POLLER_MAX_S" ]; then
     remove_join_poller "not approved within $((POLLER_MAX_S / 3600)) h — the hourly run keeps polling"; exit 0
   fi
-  # a full run holds the lock: skip this tick (the next is 30 s away)
-  acquire_run_lock 0 || exit 0
   read_participation >/dev/null || exit 0
   FLEET_POLL_MODE=1 track memex poll_join_once "$user" "$machine"
   if [ -f "$home/.memex-local/fleet.yaml" ]; then
@@ -1174,7 +1176,8 @@ main() {
   check_password "$user"
   machine="$(machine_id)"
   log "run for console user $user, machine $machine"
-  acquire_run_lock 900 || { log "another bootstrap run (the join poller's continuation) holds the run lock for over 15 min — this run stops; the next one retries"; exit 0; }
+  # 75 (EX_TEMPFAIL): a give-up is never read as a finished run by anything that calls main
+  acquire_run_lock 900 || { log "another bootstrap run (the join poller's continuation) holds the run lock for over 15 min — this run stops; the next one retries"; exit 75; }
   # the operator's way in comes before everything that can fail: a Mac whose later steps fail is still reachable
   # failures that must not stop the rest of the run (operator SSH, the energy enabler): exit 1 at the end
   local deferred_failed=0
