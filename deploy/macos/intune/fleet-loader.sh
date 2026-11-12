@@ -55,23 +55,28 @@ embedded_to() {
 }
 
 choose() {
-  local commit want tmp got
+  local commit want tmp="" got
   commit="$(pref FLEET_BOOTSTRAP_COMMIT BootstrapCommit)"; want="$(pref FLEET_BOOTSTRAP_SHA256 BootstrapSha256)"
   if printf '%s' "$commit" | grep -Eq '^[0-9a-f]{40}$' && printf '%s' "$want" | grep -Eq '^[0-9a-f]{64}$'; then
     if [ -f "$VERIFIED" ] && [ "$(sha_of "$VERIFIED")" = "$want" ]; then
       CHOSEN="$VERIFIED"; WHY="the pinned bootstrap (${commit:0:7}, verified copy)"; return 0
     fi
-    tmp="$(mktemp)" || return 1
-    if curl -fsSL --max-time 60 -o "$tmp" "$BASE_URL/$BOOTSTRAP_REPO/$commit/$BOOTSTRAP_PATH" 2>/dev/null; then
+    # a staging file that cannot be made is a failed fetch: the fallbacks below still apply (review on #288)
+    if ! tmp="$(mktemp 2>/dev/null)"; then
+      llog "could not create a staging file for the pinned bootstrap — falling back"
+    elif curl -fsSL --max-time 60 -o "$tmp" "$BASE_URL/$BOOTSTRAP_REPO/$commit/$BOOTSTRAP_PATH" 2>/dev/null; then
       got="$(sha_of "$tmp")"
-      if [ "$got" = "$want" ] && place "$tmp" "$VERIFIED"; then
+      if [ "$got" != "$want" ]; then
+        llog "REFUSED the fetched bootstrap at ${commit:0:7}: it hashes to ${got:0:12}, the profile pins ${want:0:12}"
+      elif place "$tmp" "$VERIFIED"; then
         rm -f "$tmp"; CHOSEN="$VERIFIED"; WHY="the pinned bootstrap (${commit:0:7}, fetched and verified)"; return 0
+      else
+        llog "the pinned bootstrap ${commit:0:7} verified (${got:0:12}) but could not be placed in $LOADER_DIR — falling back"
       fi
-      llog "REFUSED the fetched bootstrap at ${commit:0:7}: it hashes to ${got:0:12}, the profile pins ${want:0:12}"
     else
       llog "could not fetch the pinned bootstrap ${commit:0:7} from $BOOTSTRAP_REPO"
     fi
-    rm -f "$tmp"
+    [ -z "$tmp" ] || rm -f "$tmp"
   else
     llog "no bootstrap pin in the com.memex.local profile (BootstrapCommit / BootstrapSha256)"
   fi

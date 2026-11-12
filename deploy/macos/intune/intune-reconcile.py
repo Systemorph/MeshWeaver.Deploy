@@ -50,6 +50,8 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 # The line after which the fleet loader carries its embedded bootstrap (deploy/macos/intune/fleet-loader.sh).
 EMBED_MARK = b"__FLEET_EMBEDDED_BOOTSTRAP__"
+# The loader's last line: what makes the bytes appended after it inert. Only a host that ends in it may embed (#288).
+EMBED_GUARD = b"return 0 2>/dev/null || exit 0"
 SPECIAL_TARGETS = {
     "allDevices": "#microsoft.graph.allDevicesAssignmentTarget",
     "allLicensedUsers": "#microsoft.graph.allLicensedUsersAssignmentTarget",
@@ -236,6 +238,8 @@ def validate(spec, spec_dir):
             if not isinstance(emb, dict) or not HEX40.match(emb.get("commit", "")) or not HEX64.match(emb.get("sha256", "")) \
                     or not emb.get("repo") or not emb.get("path"):
                 p.append(f"{w}: source.embed needs repo, path, a 40-hex commit and a 64-hex sha256 (the loader's embedded bootstrap)")
+            if not str(src.get("path", "")).endswith("fleet-loader.sh"):
+                p.append(f"{w}: source.embed is for the fleet loader only (its exit guard keeps the appended bootstrap inert)")
         targets(w, s.get("assign"))
     for c in spec.get("customProfiles", []):
         w = f"customProfiles.{c.get('key')}"
@@ -623,10 +627,20 @@ class Reconcile:
 
     def source(self, s):
         """The script's uploaded content: the pinned source, and — with `source.embed` (the fleet loader) — the pinned
-        EMBEDDED copy appended after the marker line the loader reads it from (deploy/macos/intune/fleet-loader.sh)."""
+        EMBEDDED copy appended after the marker line the loader reads it from (deploy/macos/intune/fleet-loader.sh).
+        Fetched ONCE per run and reused (review on #288)."""
+        cache = self.__dict__.setdefault("_sources", {})
+        if s["key"] in cache:
+            return cache[s["key"]]
         content = self.pinned(s["source"])
         if s["source"].get("embed"):
+            # only a host whose LAST line is the loader's exit guard keeps the appended bytes inert — any other script
+            # would run them inline, as root
+            if content.rstrip(b"\n").rsplit(b"\n", 1)[-1].strip() != EMBED_GUARD:
+                raise GraphError(0, "FETCH", s["source"]["path"], "source.embed on a script that does not end in the loader's "
+                                 "exit guard — the appended bytes would execute; refusing to upload it")
             content = content.rstrip(b"\n") + b"\n" + EMBED_MARK + b"\n" + self.pinned(s["source"]["embed"])
+        cache[s["key"]] = content
         return content
 
     def expected_sha(self, s):
@@ -1403,6 +1417,25 @@ def self_test():
     rc9 = Reconcile(copy.deepcopy(ld), tempfile.gettempdir(), FakeGraph(st9), fetch=fetch2, token=tok, out=lines9b.append).run()
     expect("…and the next check of the combined upload is clean (no drift forever on the combined sha256)",
            not any(ln.startswith("DRIFT") and "script" in ln for ln in lines9b), lines9b)
+    noguard = copy.deepcopy(ld)
+    lines10 = []
+    st10 = tenant()
+    bad_loader = b"#!/bin/bash\necho loader\n"
+    noguard["scripts"][0]["source"]["sha256"] = hashlib.sha256(bad_loader).hexdigest()
+    g10 = FakeGraph(st10)
+    Reconcile(noguard, tempfile.gettempdir(), g10, apply=True, fetch=lambda src: bad_loader if src["path"] == "fleet-loader.sh" else boot,
+              token=tok, out=lines10.append).run()
+    expect("a host script that does not end in the loader's exit guard is never uploaded with an embed (it would run the bytes)",
+           not any(w[1] == "beta/deviceManagement/deviceShellScripts" for w in g10.writes) and any("exit guard" in ln for ln in lines10), lines10)
+    other = copy.deepcopy(ld)
+    other["scripts"][0]["source"]["path"] = "some-other-script.sh"
+    expect("validate: source.embed on a script other than the fleet loader is refused", any("fleet loader only" in x for x in validate(other, ".")), validate(other, "."))
+    calls = []
+    def counting(src):
+        calls.append(src["path"]); return fetch2(src)
+    r11 = Reconcile(copy.deepcopy(ld), tempfile.gettempdir(), FakeGraph(st9), fetch=counting, token=tok, out=lambda _l: None)
+    r11.run()
+    expect("the combined upload is fetched ONCE per run (the loader and the bootstrap one fetch each)", sorted(calls) == ["fleet-bootstrap.sh", "fleet-loader.sh"], [repr(calls)])
     half = copy.deepcopy(ld)
     del half["customProfiles"][0]["keys"]["BootstrapSha256"]
     expect("validate: a BootstrapCommit without its BootstrapSha256 is refused", any("go together" in x for x in validate(half, ".")), validate(half, "."))
