@@ -54,6 +54,27 @@ EXCLUDE_T = "#microsoft.graph.exclusionGroupAssignmentTarget"
 PARTICIPATION_BOOL = ("AcceptJobs", "AcceptTokens")
 PARTICIPATION_LIST = ("AcceptJobsFrom", "AcceptJobsChannels", "AcceptJobsRepos", "AcceptTokensFrom", "AcceptTokensModels")
 PARTICIPATION_STR = ("AcceptTokensResidency",)
+# Keys kept as a real plist ARRAY (never comma-joined: an SSH key's comment may hold a comma). The bootstrap reads
+# OperatorSshKeys element by element (fleet-bootstrap.sh operator_ssh_keys).
+ARRAY_KEYS = ("OperatorSshKeys",)
+# One OpenSSH public key line, as the bootstrap accepts it (fleet-bootstrap.sh ssh_key_core): an accepted type, the
+# base64 blob, an optional comment — no options prefix, no private key material.
+SSH_PUBKEY = re.compile(r"^(ssh-ed25519|ecdsa-sha2-nistp(?:256|384|521)|ssh-rsa) ([A-Za-z0-9+/]+={0,3})( [^\x00-\x1f\x7f]*)?\Z")
+
+
+def ssh_pubkey_problem(line):
+    """Why `line` is not one accepted OpenSSH public key, or None."""
+    m = SSH_PUBKEY.match(line) if isinstance(line, str) else None
+    if not m:
+        return "not one single-line ssh-ed25519 / ecdsa-sha2-* / ssh-rsa public key without options"
+    try:
+        blob = base64.b64decode(m.group(2), validate=True)
+    except Exception:  # noqa: BLE001 — malformed base64 is a refusal, not a crash
+        return "its key blob is not base64"
+    n = int.from_bytes(blob[:4], "big") if len(blob) >= 4 else -1
+    if blob[4:4 + n].decode("latin-1") != m.group(1):
+        return f"its key blob is not a {m.group(1)} key"
+    return None
 
 
 class GraphError(Exception):
@@ -231,6 +252,15 @@ def validate(spec, spec_dir):
                 p.append(f"{w}: a fleet CA is declared but keys.FleetCaSha256 is absent (memex-local ca adopt reads it)")
             if "AcceptTokensResidency" in keys and not isinstance(keys["AcceptTokensResidency"], str):
                 p.append(f"{w}: keys.AcceptTokensResidency must be a string")
+            if "OperatorSshKeys" in keys:
+                ks = keys["OperatorSshKeys"]
+                if not isinstance(ks, list) or not ks:
+                    p.append(f"{w}: keys.OperatorSshKeys must be a non-empty list of OpenSSH public keys (omit it to leave SSH alone)")
+                else:
+                    for i, k in enumerate(ks):
+                        why = ssh_pubkey_problem(k)
+                        if why:
+                            p.append(f"{w}: keys.OperatorSshKeys[{i}] is refused — {why} (the bootstrap refuses it too)")
         targets(w, c.get("assign"))
     for t in spec.get("trustedRootCertificates", []):
         w = f"trustedRootCertificates.{t.get('key')}"
@@ -258,12 +288,13 @@ def validate(spec, spec_dir):
 
 
 def build_plist(c):
-    """The custom profile's mobileconfig, built from the spec. Lists become ONE comma-separated string."""
+    """The custom profile's mobileconfig, built from the spec. Lists become ONE comma-separated string, except the
+    ARRAY_KEYS, which stay a plist array."""
     pl = c["plist"]
     inner = {"PayloadType": pl["payloadType"], "PayloadVersion": 1, "PayloadIdentifier": pl["innerIdentifier"],
              "PayloadUUID": pl["innerUuid"], "PayloadDisplayName": pl["displayName"]}
     for k, v in c.get("keys", {}).items():
-        inner[k] = ",".join(v) if isinstance(v, list) else v
+        inner[k] = ",".join(v) if isinstance(v, list) and k not in ARRAY_KEYS else v
     return {"PayloadContent": [inner], "PayloadDisplayName": pl["displayName"], "PayloadIdentifier": pl["identifier"],
             "PayloadOrganization": pl.get("organization", ""), "PayloadRemovalDisallowed": False,
             "PayloadScope": "System", "PayloadType": "Configuration", "PayloadUUID": pl["uuid"], "PayloadVersion": 1}
@@ -981,6 +1012,22 @@ def self_test():
     expect("validate: tokens on without models is refused, as the bootstrap refuses it", any("AcceptTokensModels" in x for x in v), v)
     tok_on["customProfiles"][0]["keys"]["AcceptTokensModels"] = ["model-a"]
     expect("validate: tokens on with models passes", not validate(tok_on, "."), validate(tok_on, "."))
+    op = "ssh-ed25519 " + base64.b64encode(len(b"ssh-ed25519").to_bytes(4, "big") + b"ssh-ed25519" + (32).to_bytes(4, "big") + bytes(32)).decode() + " operator, laptop"
+    ssh = copy.deepcopy(spec)
+    ssh["customProfiles"][0]["keys"]["OperatorSshKeys"] = [op]
+    expect("validate: OperatorSshKeys with one public key (a comma in its comment) passes", not validate(ssh, "."), validate(ssh, "."))
+    inner = build_plist(ssh["customProfiles"][0])["PayloadContent"][0]
+    expect("OperatorSshKeys stays a plist ARRAY in the profile (never comma-joined), the participation lists still a string",
+           inner["OperatorSshKeys"] == [op] and inner["AcceptJobsFrom"] == "control.example.com", [repr(inner)])
+    for label, k in (("an options prefix", 'from="10.0.0.1" ' + op), ("private key material", "-----BEGIN OPENSSH PRIVATE KEY-----"),
+                     ("an ed25519 blob labelled ssh-rsa", "ssh-rsa " + op.split(" ")[1]), ("two lines", op + "\n" + op)):
+        bad_ssh = copy.deepcopy(spec)
+        bad_ssh["customProfiles"][0]["keys"]["OperatorSshKeys"] = [k]
+        v = validate(bad_ssh, ".")
+        expect(f"validate: an OperatorSshKeys entry with {label} is refused", any("OperatorSshKeys[0] is refused" in x for x in v), v)
+    bad_ssh["customProfiles"][0]["keys"]["OperatorSshKeys"] = op
+    v = validate(bad_ssh, ".")
+    expect("validate: OperatorSshKeys as a bare string is refused (a list, or omitted)", any("must be a non-empty list" in x for x in v), v)
 
     wrong = copy.deepcopy(spec)
     wrong["scripts"][0]["source"]["sha256"] = "0" * 64
