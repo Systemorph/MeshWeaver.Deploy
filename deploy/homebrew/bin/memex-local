@@ -2209,9 +2209,20 @@ fleet_apply_signin() {
   local dir="$1" tenant cid
   [ -s "$dir/e" ] || { info "sign-in: no client secret in the code"; return 0; }
   tenant="$(fleet_fact_of "$dir" tenant)"; cid="$(fleet_fact_of "$dir" clientId)"
-  [ -n "$tenant" ] && [ -n "$cid" ] || { warn "sign-in: the code carries a secret but no tenant/clientId — skipped"; return 0; }
-  ( cmd_internal on --tenant "$tenant" --client-id "$cid" < "$dir/e" ) && ok "sign-in: this Mac's own app ($cid) configured" \
-    || warn "sign-in: 'internal on' failed — re-run it with the same values"
+  [ -n "$tenant" ] && [ -n "$cid" ] || { warn "sign-in: the code carries a secret but no tenant/clientId — NOT installed"; return 1; }
+  # FLEET_SIGNIN_HANDOVER: on a join run by the device bootstrap the private network comes up only AFTER the join (the
+  # root daemon takes the key by file), and `internal on` needs the Mac's private-network name. Measured on the first
+  # Mac mini (2026-11-12): the sign-in was issued, `internal on` refused for want of the name, and the secret was deleted
+  # with the other items — the setup was then refused for want of a sign-in. So without a name the secret is HANDED
+  # OVER by file (0600, beside the pre-auth key) with its tenant and client id, and the bootstrap runs `internal on`
+  # from it once the network is up. Never printed, never an argument.
+  if [ -z "$(tailnet_name 2>/dev/null)" ]; then
+    ( umask 077; cp "$dir/e" "$FLEET_DIR/${id:-machine}.signin" && printf 'tenant=%s\nclientId=%s\n' "$tenant" "$cid" > "$FLEET_DIR/${id:-machine}.signin-facts" ) \
+      && { info "sign-in: this Mac has no private-network name yet — the sign-in ($cid) is handed to the device bootstrap ($FLEET_DIR/${id:-machine}.signin), which installs it once the network is up"; return 0; } \
+      || { warn "sign-in: could not hand the sign-in over — NOT installed"; return 1; }
+  fi
+  ( cmd_internal on --tenant "$tenant" --client-id "$cid" < "$dir/e" ) && { ok "sign-in: this Mac's own app ($cid) configured"; return 0; }
+  warn "sign-in: 'internal on' failed — NOT installed"; return 1
 }
 
 # The certificate: `cert config` with the DNS-01 secret on stdin, then `cert issue`.
@@ -2629,7 +2640,7 @@ cmd_fleet() {
       printf '\n%s\n\n' "$url"
       [ "$open_link" = "yes" ] && command -v open >/dev/null 2>&1 && open "$url" >/dev/null 2>&1 || true
 
-      local code="" got="$FLEET_DIR/$id.code.collected" rc=0
+      local code="" got="$FLEET_DIR/$id.code.collected" rc=0 signin_failed=0
       printf '%s\n' "$url" > "$FLEET_DIR/$id.link"
       rm -f "$got"
       if [ -n "$code_file" ] && [ -s "$code_file" ]; then
@@ -2671,7 +2682,8 @@ cmd_fleet() {
       if [ -d "$items" ]; then
         step "The items control issued (each opened from the code, handed over by file or stdin, never printed)"
         fleet_apply_network "$id" "$items"
-        fleet_apply_signin "$items"
+        # a join whose sign-in did not land must not read ok: the first-run setup refuses an instance without one
+        fleet_apply_signin "$items" || signin_failed=1
         fleet_apply_cert "$id" "$items" "$owner_email"
         fleet_apply_ca "$items" "$(fleet_fact_of "$items" caCertSha256)"
         fleet_apply_registry_key "$items"
@@ -2717,6 +2729,10 @@ cmd_fleet() {
         fleet_doctor || warn "the join finished with red readings — 'memex-local fleet doctor' re-reads them"
       else
         info "Progress: the control instance's Hosting/Heartbeats/Enrolments lists this join and its first heartbeat ('memex-local fleet heartbeat' waits for it here)"
+      fi
+      if [ "$signin_failed" != 0 ]; then
+        warn "fleet join: joined, but this Mac's SIGN-IN was NOT installed (above) — the first-run setup will refuse an instance without one; a fresh join issues a new one"
+        exit 4
       fi
       ;;
     doctor)
