@@ -28,7 +28,7 @@
 #   0c. Energy enabler (1.8.0): until the Intune Energy Saver profile is installed, only `pmset -c sleep 0`, so the
 #      Mac is awake to receive it (a sleeping Mac answers MDM commands NotNow during DarkWake).
 #   Readings the person can read without root: /Library/MeshWeaver/fleet-state/ — one file per step (operator-ssh,
-#      bootstrap-token, participation, homebrew, devtools, tools, tailscale, tailscaled, network, up, setup, join, doctor,
+#      bootstrap-token, energy, participation, homebrew, devtools, tools, tailscale, tailscaled, network, up, setup, join, doctor,
 #      heartbeat, buildhost) and `stage`: the step the onboarding is stuck on, since when and why (1.7.0). A join that
 #      failed or was skipped for a missing prerequisite also reaches the person as a notification, naming it.
 #
@@ -395,7 +395,9 @@ ac_sleep_minutes() {
 step_energy_enabler() {
   local custom ac
   # the key's dots are part of its NAME (plutil -extract would read them as a key path): searched in the XML form
-  if [ -f "$MCX_PREFS" ] && plutil -convert xml1 -o - "$MCX_PREFS" 2>/dev/null | grep -qF '<key>com.apple.EnergySaver.desktop.ACPower</key>'; then
+  # read into a variable first: `plutil … | grep -q` could SIGPIPE plutil under pipefail and read a large plist as absent
+  local mcx=""; [ -f "$MCX_PREFS" ] && mcx="$(plutil -convert xml1 -o - "$MCX_PREFS" 2>/dev/null)"
+  if case "$mcx" in *'<key>com.apple.EnergySaver.desktop.ACPower</key>'*) true ;; *) false ;; esac; then
     log "energy: the Energy Saver profile is installed (Intune) — it decides; nothing set here"
     write_reading energy ok "the Energy Saver profile is installed"; return 0
   fi
@@ -1020,13 +1022,14 @@ main() {
   machine="$(machine_id)"
   log "run for console user $user, machine $machine"
   # the operator's way in comes before everything that can fail: a Mac whose later steps fail is still reachable
-  local ssh_failed=0
+  # failures that must not stop the rest of the run (operator SSH, the energy enabler): exit 1 at the end
+  local deferred_failed=0
   if step_operator_ssh "$user"; then write_reading operator-ssh "${OPSSH_VERDICT:-ok}" "$user"
-  else ssh_failed=1; write_reading operator-ssh failed "$user"; fi
+  else deferred_failed=1; write_reading operator-ssh failed "$user"; fi
   # never fails the run: it says, every run, what only a person can do (escrow takes their password)
   step_bootstrap_token "$user"
   # before anything that can fail or wait: a sleeping Mac receives no profile at all
-  step_energy_enabler || ssh_failed=1
+  step_energy_enabler || deferred_failed=1
   # the owner's answers are required BEFORE anything is installed — an unanswered one fails the run, loudly
   if ! track participation read_participation; then
     log "a step FAILED — the profile must carry the owner's answers (AcceptJobs, AcceptTokens); the next run retries"
@@ -1040,7 +1043,7 @@ main() {
   [ "$failed" = 0 ] && { track network step_network "$machine" "$user" || failed=1; }
   [ "$failed" = 0 ] && { track memex step_memex "$user" "$machine" || failed=1; }
   finish_stage "$user"
-  [ "$ssh_failed" = 0 ] || failed=1
+  [ "$deferred_failed" = 0 ] || failed=1
   [ "$failed" = 0 ] && log "done (everything this run could do)" || log "a step FAILED — the next run retries from it"
   exit "$failed"
 }
