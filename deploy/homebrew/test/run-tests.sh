@@ -3442,6 +3442,13 @@ rm -f "$FD/state/bootstrap-token"
 OUT="$(fd ok)"; RC=$?
 [ "$RC" = 1 ] && grep -q 'bootstrap token: no reading' <<<"$OUT" && ok "no bootstrap-token reading at all is RED (the bootstrap has not run here), never a pass" || bad "doctor no reading" "rc=$RC $OUT"
 echo "escrowed 2026-11-12T09:00:00Z" > "$FD/state/bootstrap-token"
+mv "$FD/home/.memex-local/fleet.yaml" "$FD/fleet.yaml.kept"
+printf 'failed 2026-11-12T11:00:00Z exit 1: err  setup --apply: the portal refused the answers — signIn: Choose at least one way to sign in\n' > "$FD/state/stage"
+printf 'skipped 2026-11-12T11:00:00Z the setup comes first\n' > "$FD/state/join"
+OUT="$(env PATH="$FD/stubs:$STUBS:$PATH" HOME="$FD/home" MEMEX_LOCAL_HOME="$FD/home/.memex-local" MEMEX_FLEET_STATE_DIR="$FD/state" "$CLI" fleet doctor 2>&1)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'not joined' <<<"$OUT" && grep -q "the fleet bootstrap is stuck at: failed .*signIn: Choose at least one way to sign in" <<<"$OUT" && grep -q "the fleet bootstrap's join: skipped" <<<"$OUT" \
+  && ok "not joined on a fleet Mac: fleet doctor names the bootstrap's join reading and the stage it is stuck at, with why" || bad "doctor not joined stage" "rc=$RC $OUT"
+mv "$FD/fleet.yaml.kept" "$FD/home/.memex-local/fleet.yaml"; rm -f "$FD/state/stage" "$FD/state/join"
 OUT="$(fd norecord)"; RC=$?
 [ "$RC" = 1 ] && grep -q 'control has no Deployments/mini-1 record' <<<"$OUT" && grep -q 'remedy: the Approve opens it as a pull request' <<<"$OUT" \
   && ok "a missing Deployments record is RED with its remedy, and the doctor exits 1" || bad "doctor no record" "rc=$RC $OUT"

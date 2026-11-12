@@ -794,7 +794,7 @@ cmd_registry() {
 # prints the THREE declarations control needs for this machine — which an operator makes, never this
 # tool: a credential is minted by a person. `backlease status` reads both halves back; `backlease off`
 # removes the layer and the agent (the next `memex-local update` stops the heartbeat).
-backlease_value() { awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$BACKLEASE_FILE" 2>/dev/null; }
+backlease_value() { [ -f "$BACKLEASE_FILE" ] || return 0; awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$BACKLEASE_FILE" 2>/dev/null || true; }
 backlease_control()    { backlease_value "Hosting__ReportTo"; }
 backlease_deployment() { backlease_value "Hosting__Deployment"; }
 backlease_interval()   { local v; v="$(backlease_value "Hosting__BackLease__Interval")"; printf '%s' "${v:-30}"; }
@@ -1883,7 +1883,9 @@ YAML
 # the enrolment code a global admin's Approve shows, opened with the key (RSA-OAEP-SHA256 — macOS's own
 # LibreSSL does it); the fleet layer with the two keys; back-lease, Ollama, and `update`. No secret value
 # is ever printed: the CLI prints FINGERPRINTS (sha256:<12 hex>, the control instance's own format).
-fleet_value() { awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$FLEET_FILE" 2>/dev/null; }
+# No fleet.yaml (not joined) is an EMPTY value, never awk's exit 2 — which under set -e ended `fleet doctor` on a Mac
+# that had not joined before it printed a word (found 2026-11-12 with the bootstrap 1.7.0 readings).
+fleet_value() { [ -f "$FLEET_FILE" ] || return 0; awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$FLEET_FILE" 2>/dev/null || true; }
 
 # A fact for the request: printable, at most 96 characters, of the shape the control instance admits.
 fleet_fact() { printf '%s' "$1" | LC_ALL=C tr -cd 'A-Za-z0-9 ._@()+-' | cut -c1-96; }
@@ -2450,8 +2452,13 @@ fleet_doctor() {
   local id control
   id="$(fleet_value Hosting__Deployment)"; control="$(backlease_control)"
   step "Fleet doctor — the readings that say this Mac's join is done"
+  local fs_dir="${MEMEX_FLEET_STATE_DIR:-/Library/MeshWeaver/fleet-state}" fs_stage fs_join
   if [ ! -f "$FLEET_FILE" ] || [ -z "$id" ]; then
     doc_red "not joined (no $FLEET_FILE)" "memex-local fleet join --control https://<control-instance> --id <machine>"
+    # on a fleet Mac the bootstrap (root, via Intune) runs the join — its own readings say why it is not filed yet
+    fs_join="$(head -1 "$fs_dir/join" 2>/dev/null || true)"; fs_stage="$(head -1 "$fs_dir/stage" 2>/dev/null || true)"
+    [ -z "$fs_join" ] || doc_red "the fleet bootstrap's join: ${fs_join}" "the reason is named in the reading; the bootstrap retries every hour"
+    [ -z "$fs_stage" ] || doc_red "the fleet bootstrap is stuck at: ${fs_stage}" "fix what it names — every step's reading is in $fs_dir"
     return 1
   fi
   doc_ok "joined as '$id' (fleet.yaml, heartbeat key $(fleet_value_fingerprint "$(awk '$1 == "Hosting__ModuleReportSecret:" { gsub(/"/, "", $2); print $2; exit }' "$FLEET_FILE")"))"
@@ -2531,7 +2538,7 @@ fleet_doctor() {
   done
 
   # 4. what the fleet bootstrap (root, hourly, via Intune) last read — its own readings, world-readable (the log is root-only)
-  local rd="${MEMEX_FLEET_STATE_DIR:-/Library/MeshWeaver/fleet-state}" bt bt_v ss
+  local rd="$fs_dir" bt bt_v ss
   bt="$(head -1 "$rd/bootstrap-token" 2>/dev/null || true)"; bt_v="${bt%% *}"
   case "$bt_v" in
     escrowed) doc_ok "bootstrap token: escrowed to the MDM (read by the fleet bootstrap ${bt#* })" ;;

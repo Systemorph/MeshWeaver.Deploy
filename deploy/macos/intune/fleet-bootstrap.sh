@@ -25,7 +25,10 @@
 #      only when absent; nothing else in the file is touched; sshd_config never). Not configured: nothing changes.
 #   0b. Bootstrap token: when it is not escrowed to the MDM, the log, a reading and a notification to the person say so
 #      (sign out and back in first; a later run names `sudo profiles install -type bootstraptoken`). Never a password.
-#   Readings the person can read without root: /Library/MeshWeaver/fleet-state/{operator-ssh,bootstrap-token}.
+#   Readings the person can read without root: /Library/MeshWeaver/fleet-state/ — one file per step (operator-ssh,
+#      bootstrap-token, participation, homebrew, devtools, tools, tailscale, tailscaled, network, up, setup, join, doctor,
+#      heartbeat, buildhost) and `stage`: the step the onboarding is stuck on, since when and why (1.7.0). A join that
+#      failed or was skipped for a missing prerequisite also reaches the person as a notification, naming it.
 #
 # Configuration — the managed preference domain com.memex.local (a configuration profile; memex-local reads
 # the same keys): ControlUrl, DeploymentId, RegistryUrl, FleetCaSha256 (the fleet local CA's certificate), and for the
@@ -53,7 +56,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.6.0"
+readonly FLEET_BOOTSTRAP_VERSION="1.7.0"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -82,6 +85,7 @@ log() {
   # 🚨 a token-bearing URL (the setup wizard's ?token=) never reaches the output or the log
   case "$line" in *token=*) line="$(printf '%s' "$line" | sed -E 's/token=[^[:space:]&"]+/token=<withheld>/g')" ;; esac
   printf '%s\n' "$line"
+  LAST_LOG="${line#* fleet-bootstrap "$FLEET_BOOTSTRAP_VERSION": }"
   if mkdir -p "$LOG_DIR" 2>/dev/null; then
     ( umask 077; printf '%s\n' "$line" >> "$LOG_DIR/fleet-bootstrap.log" ) 2>/dev/null || true
   fi
@@ -427,6 +431,61 @@ step_bootstrap_token() {
 }
 
 # ---------------------------------------------------------------------------------------------------------------
+# STEP READINGS (owner, 2026-11-12: "put this in intune onboarding"). The second Mac mini ran 1.6.0 to a verified stack
+# and filed no join, and the reason was only in the root-only log. Every step now leaves its outcome as a reading, and
+# `stage` names the step the onboarding is stuck on, since when and why. Readings carry log text only — the log never
+# holds a secret (keys are files, token-bearing URLs are withheld above).
+strip_ansi() { tr -d '\033' | sed -E 's/\[[0-9;]*[A-Za-z]//g'; }
+# The last non-empty line a command printed: colour codes removed, a token withheld, one line, bounded.
+last_said() {
+  printf '%s\n' "$1" | strip_ansi | sed -E 's/token=[^[:space:]&"]+/token=<withheld>/g' | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-300
+}
+STUCK_NAME=""; STUCK_VERDICT=""; STUCK_WHY=""; WAIT_NAME=""; WAIT_VERDICT=""; WAIT_WHY=""
+# Runs one step and records its reading: ok, waiting (the step said WAITING) or failed — with the step's last log line.
+# A step may name a finer stage (STEP_STAGE: up, setup, join) and write that reading itself.
+track() {
+  local name="$1" rc v why; shift
+  STEP_STAGE=""; LAST_LOG=""
+  "$@"; rc=$?
+  why="$LAST_LOG"
+  if [ "$rc" != 0 ]; then v=failed; else case "$why" in *WAITING*) v=waiting ;; *) v=ok ;; esac; fi
+  [ -n "$STEP_STAGE" ] && name="$STEP_STAGE"
+  case "$name" in up|setup|join) ;; *) write_reading "$name" "$v" "$why" ;; esac
+  case "$why" in *"WAITING for the approval on control"*) v=waiting-approval ;; esac
+  if [ "$v" = failed ] && [ -z "$STUCK_NAME" ]; then STUCK_NAME="$name"; STUCK_VERDICT=failed; STUCK_WHY="$why"; fi
+  # the network waits for its key until the join delivers it: that wait is expected, never the stuck stage
+  if [ "$v" != ok ] && [ "$v" != failed ] && [ "$name" != network ] && [ -z "$WAIT_NAME" ]; then WAIT_NAME="$name"; WAIT_VERDICT="$v"; WAIT_WHY="$why"; fi
+  return "$rc"
+}
+
+# `stage`: the first failed step, else the first step still waiting, else done. A join that is not filed or not
+# finished for any reason but the Approve (which is control's to give) reaches the person too.
+finish_stage() {
+  local user="$1" home v n why
+  home="$(user_home "$user")"
+  if [ -n "$STUCK_NAME" ]; then v="$STUCK_VERDICT"; n="$STUCK_NAME"; why="$STUCK_WHY"
+  elif [ -n "$WAIT_NAME" ]; then v="$WAIT_VERDICT"; n="$WAIT_NAME"; why="$WAIT_WHY"
+  else write_reading stage "done" "every step this run could do is done"; return 0; fi
+  write_reading stage "$v" "$n: $why"
+  [ -f "$home/.memex-local/fleet.yaml" ] && return 0
+  [ "$v" = waiting-approval ] && return 0
+  notify_user "$user" "Fleet join not filed" "This Mac has not joined the fleet: the step '$n' is $v — $why"
+}
+
+# After a finished join, what memex-local fleet doctor reads (as the person; read-only): the verdict, the
+# heartbeat line and the build-host line, as readings.
+record_doctor() {
+  local user="$1" mlocal="$2" out rc hb bh
+  [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] && { printf 'DRY-RUN: (read) memex-local fleet doctor as %s\n' "$user"; return 0; }
+  out="$(sudo -n -u "$user" -H env HOME="$(user_home "$user")" PATH="$(user_path)" "$mlocal" fleet doctor 2>&1 | strip_ansi)"; rc=$?
+  hb="$(printf '%s\n' "$out" | grep -E "heartbeat" | head -1 | sed -E 's/^[[:space:]]*//' | cut -c1-300)"
+  bh="$(printf '%s\n' "$out" | grep -E "build host|build VM" | head -1 | sed -E 's/^[[:space:]]*//' | cut -c1-300)"
+  write_reading doctor "$( [ "$rc" = 0 ] && echo ok || echo red )" "$(printf '%s\n' "$out" | grep 'fleet doctor:' | tail -1 | sed -E 's/^[[:space:]]*//')"
+  [ -z "$hb" ] || write_reading heartbeat "$(case "$hb" in ✓*) echo ok ;; *) echo red ;; esac)" "$hb"
+  [ -z "$bh" ] || write_reading buildhost "$(case "$bh" in ✓*|·*) echo ok ;; *) echo red ;; esac)" "$bh"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
 # PARTICIPATION — the owner's two answers (contract §5), read from the profile, never defaulted.
 # A list preference as `defaults read` prints it (an array "( a, b )" or a plain string) → "a,b".
 pref_list() {
@@ -758,22 +817,40 @@ answer_setup() {
   owner_email="$(setting FLEET_OWNER_EMAIL OwnerEmail)"; accept="$(setting FLEET_ACCEPT_TERMS AcceptTerms)"
   case "$accept" in 1|true|TRUE|True|yes) accept=yes ;; *) accept=no ;; esac
   if [ -z "$org" ] || [ -z "$owner_name" ] || [ -z "$owner_email" ] || [ "$accept" != "yes" ]; then
-    log "memex: WAITING for the first-run setup answers in the com.memex.local profile (Organisation, OwnerName, OwnerEmail, AcceptTerms=true) — nothing is answered without them"
+    STEP_STAGE=setup
+    log "memex: WAITING for the first-run setup answers in the com.memex.local profile — missing: $( [ -n "$org" ] || printf 'Organisation '; [ -n "$owner_name" ] || printf 'OwnerName '; [ -n "$owner_email" ] || printf 'OwnerEmail '; [ "$accept" = yes ] || printf 'AcceptTerms=true ')— nothing is answered without them"
+    write_reading setup skipped "${LAST_LOG#memex: }"
     return 0
   fi
+  local answered="$STATE_DIR/setup.answered" out rc last
   log "memex: answering the first-run setup through the setup API (instance $machine, organisation $org, owner $owner_email)"
-  as_user "$user" "$mlocal" setup --apply --name "$machine" --company "$org" --owner-name "$owner_name" \
-    --owner-email "$owner_email" --accept-terms 2>&1 | while IFS= read -r l; do log "memex:   $l"; done
-  [ "${PIPESTATUS[0]}" = "0" ] || { log "memex: the setup API refused or failed (above) — retried next run"; return 1; }
-  log "memex: setup answered — the portal restarts configured; the join follows on the next run"
+  out="$(as_user "$user" "$mlocal" setup --apply --name "$machine" --company "$org" --owner-name "$owner_name" \
+    --owner-email "$owner_email" --accept-terms 2>&1)"; rc=$?
+  printf '%s\n' "$out" | while IFS= read -r l; do log "memex:   $l"; done
+  last="$(last_said "$out")"
+  if [ "$rc" != 0 ]; then
+    STEP_STAGE=setup; log "memex: the setup API refused or failed — ${last:-no output} — retried next run"
+    write_reading setup failed "exit $rc: ${last:-no output}"; return 1
+  fi
+  if [ -f "$answered" ] && [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" != "1" ]; then
+    # a previous run's answers were ACCEPTED and the portal is still serving the first-run setup: the join can never
+    # follow this way — said as a failure, every run, never as another "answered"
+    STEP_STAGE=setup
+    log "memex: setup FAILED — the setup API accepted the answers at $(head -1 "$answered") but the portal is STILL in first-run setup; it said now: ${last:-nothing}"
+    write_reading setup failed "answered at $(head -1 "$answered"), still in first-run setup: ${last:-no output}"; return 1
+  fi
+  [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] || { mkdir -p "$STATE_DIR" 2>/dev/null; date -u +%Y-%m-%dT%H:%M:%SZ > "$answered" 2>/dev/null; }
+  STEP_STAGE=setup
+  log "memex: setup answered (${last:-done}) — WAITING for the portal to restart configured; the join follows on the next run"
+  write_reading setup waiting "answered: ${last:-done}; the join follows on the next run"
   return 0
 }
 
 step_memex() {
-  local user="$1" machine="$2" control registry home code_file out rc mlocal
+  local user="$1" machine="$2" control registry home mlocal
   control="$(setting FLEET_CONTROL_URL ControlUrl)"; registry="$(setting FLEET_REGISTRY_URL RegistryUrl)"
   home="$(user_home "$user")"; mlocal="$BREW_PREFIX/bin/memex-local"
-  [ -n "$control" ] || { log "memex: WAITING for ControlUrl (the com.memex.local configuration profile)"; return 0; }
+  [ -n "$control" ] || { STEP_STAGE="join"; log "memex: WAITING for ControlUrl (the com.memex.local configuration profile) — the join is not filed without it"; write_reading join skipped "no ControlUrl in the com.memex.local profile"; return 0; }
   # registry mode is initialised ONCE: re-running `registry <url>` would rewrite registry.yaml without the
   # bootstrap key or pinned id an existing registration was made with
   if [ -n "$registry" ] && [ ! -f "$home/.memex-local/registry.yaml" ]; then
@@ -819,15 +896,29 @@ step_memex() {
   # the stack is provisioned when it VERIFIES usable, not when the VM merely runs — `up` is retried until it does
   if ! probe_as_user "$user" "$mlocal" verify; then
     log "memex: provisioning the local stack (memex-local up)"
-    as_user "$user" ${ca_env[@]+"${ca_env[@]}"} "$mlocal" up >/dev/null 2>&1 || { log "memex: 'memex-local up' FAILED — retried next run"; return 1; }
+    local up_out
+    up_out="$(as_user "$user" ${ca_env[@]+"${ca_env[@]}"} "$mlocal" up 2>&1)" \
+      || { STEP_STAGE=up; log "memex: 'memex-local up' FAILED — $(last_said "$up_out") — retried next run"; write_reading up failed "$(last_said "$up_out")"; return 1; }
     [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] && { log "memex: (dry run) the join follows once the stack verifies"; return 0; }
   fi
+  write_reading up ok "the local stack verifies"
   # A portal still serving its FIRST-RUN SETUP passes `verify` but has no database: nothing is joined or
   # finalised until the console user has configured it.
   if probe_as_user "$user" env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(memex_libexec)/share" MEMEX_CHART_DIR="$(memex_libexec)/share/helm" \
        /bin/bash -c '. "$0"; awaiting_setup' "$(memex_libexec)/memex-local"; then
+    # 🚨 A FLEET Mac's sign-in (its own Entra app → `internal on`) is DELIVERED by the enrolment, and the setup refuses
+    # an instance with no sign-in route ("Choose at least one way to sign in" — right for every other install). Measured
+    # on the first Mac mini (2026-11-12): every run answered the setup, was refused, and the join was never filed. So on
+    # a fleet Mac that has not joined, the join runs FIRST — it files the request, and on the Approve installs the
+    # sign-in as host configuration, which the setup then accepts. The setup is answered on a later run.
+    if [ ! -f "$home/.memex-local/fleet.yaml" ]; then
+      log "memex: the portal is in first-run setup and this Mac has not joined — a fleet Mac's sign-in arrives with the enrolment, so the join runs BEFORE the setup"
+      run_join "$user" "$machine" "$control" "$mlocal" pre-setup; return
+    fi
     answer_setup "$user" "$machine" "$mlocal"; return
   fi
+  [ -e "$STATE_DIR/setup.answered" ] && run rm -f "$STATE_DIR/setup.answered"
+  write_reading setup ok "the portal is configured"
   if [ -f "$home/.memex-local/fleet.yaml" ]; then
     # joined: resume a finalisation an earlier run did not finish, from the stored credentials (no new code).
     # Completion is a MARKER written only after BOTH steps succeeded — backlease.yaml alone proves nothing.
@@ -837,25 +928,48 @@ step_memex() {
       as_user "$user" "$mlocal" update >/dev/null 2>&1 || { log "memex: 'memex-local update' FAILED — retried next run"; return 1; }
       as_user "$user" /usr/bin/touch "$home/.memex-local/fleet.finalized" || return 1
     fi
-    log "memex: joined as $machine, finished"; return 0
+    log "memex: joined as $machine, finished"; write_reading join ok "joined as $machine, finished"
+    record_doctor "$user" "$mlocal"; return 0
   fi
+  run_join "$user" "$machine" "$control" "$mlocal" full
+}
+
+# `memex-local fleet join`, polling control for this Mac's code. Mode `full` (a configured portal): the join's whole
+# tail — update, heartbeat wait — and the finalisation marker. Mode `pre-setup` (the portal still in first-run setup):
+# the request, the Approve, the items (network, sign-in, certificate, CA, registry key) and the back-lease enrolment,
+# but no update and no heartbeat wait (a portal in setup cannot beat) and NO finalisation marker: once the setup is
+# answered, a later run's finalisation (back-lease enrolment + update) completes it.
+run_join() {
+  local user="$1" machine="$2" control="$3" mlocal="$4" mode="$5" home code_file out rc extra=()
+  home="$(user_home "$user")"
+  [ "$mode" = pre-setup ] && extra=(--no-update --heartbeat-wait 0)
   code_file="$home/.memex-local/enrol/$machine.code"
   # The POLLING join (enrolment v2): it asks control for its own code, signed with its throw-away key, for a bounded
   # wait per run; the next run resumes with the same key. A code dropped at $code_file is the fallback.
   local wait_min; wait_min="$(setting FLEET_JOIN_WAIT_MIN JoinWaitMinutes 10)"
   case "$wait_min" in ''|*[!0-9]*) wait_min=10 ;; esac
   log "memex: fleet join as $machine (control $control) — polling control for the code up to $wait_min min this run (fallback: $code_file)"
-  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then log "memex: (dry run) would run 'memex-local fleet join --wait $wait_min ${PART_ARGS[*]-}' and poll control for the code"; return 0; fi
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then STEP_STAGE="join"; log "memex: (dry run) would run 'memex-local fleet join --wait $wait_min${extra[*]:+ ${extra[*]}} ${PART_ARGS[*]-}' and poll control for the code"; return 0; fi
   # the owner's answers (read_participation): jobs NO also means --no-buildhost, so nothing of the build host is installed
-  out="$(as_user "$user" "$mlocal" fleet join --control "$control" --id "$machine" --no-open --wait "$wait_min" --code-file "$code_file" ${PART_ARGS[@]+"${PART_ARGS[@]}"} 2>&1)"; rc=$?
+  out="$(as_user "$user" "$mlocal" fleet join --control "$control" --id "$machine" --no-open --wait "$wait_min" --code-file "$code_file" ${extra[@]+"${extra[@]}"} ${PART_ARGS[@]+"${PART_ARGS[@]}"} 2>&1)"; rc=$?
   # the approval link and the fingerprints only — never a token-bearing setup URL
   printf '%s\n' "$out" | grep -E 'Hosting/Heartbeats/Enrol/|fingerprint|joined as|WAITING|waiting|approved|REFUSED|network:|sign-in:|certificate:|build host:' | grep -v 'token=' | while IFS= read -r l; do log "memex: $l"; done
   case "$rc" in
-    0) as_user "$user" /usr/bin/touch "$home/.memex-local/fleet.finalized" || true; log "memex: joined as $machine"
+    0) if [ "$mode" = pre-setup ]; then
+         STEP_STAGE="setup"; log "memex: joined as $machine before the setup — WAITING for the next run to answer the setup (the sign-in is now installed) and finish"
+         write_reading join ok "joined as $machine (before the setup; the setup and the finalisation follow)"
+       else
+         as_user "$user" /usr/bin/touch "$home/.memex-local/fleet.finalized" || true; log "memex: joined as $machine"
+         write_reading join ok "joined as $machine"
+       fi
        # the join handed the private-network key over by file: join the network now, not at the next run
        step_network "$machine" "$user" || true ;;
-    3) log "memex: WAITING for the approval on control — the next run polls again" ;;
-    *) log "memex: fleet join FAILED (exit $rc)"; return 1 ;;
+    3) local link; link="$(printf '%s\n' "$out" | grep -o 'https://[^[:space:]]*Hosting/Heartbeats/Enrol/[^[:space:]]*' | grep -v 'token=' | tail -1)"
+       STEP_STAGE="join"; log "memex: WAITING for the approval on control${link:+ ($link)} — the next run polls again"
+       write_reading join waiting-approval "request filed; waiting for the Approve on control${link:+: $link}" ;;
+    *) local refused; refused="$(printf '%s\n' "$out" | grep -E 'REFUSED|refused' | grep -v 'token=' | tail -1 | strip_ansi | cut -c1-300)"
+       STEP_STAGE="join"; log "memex: fleet join FAILED (exit $rc) — ${refused:-$(last_said "$out")}"
+       write_reading join failed "exit $rc: ${refused:-$(last_said "$out")}"; return 1 ;;
   esac
 }
 
@@ -874,14 +988,18 @@ main() {
   # never fails the run: it says, every run, what only a person can do (escrow takes their password)
   step_bootstrap_token "$user"
   # the owner's answers are required BEFORE anything is installed — an unanswered one fails the run, loudly
-  read_participation || { log "a step FAILED — the profile must carry the owner's answers (AcceptJobs, AcceptTokens); the next run retries"; exit 1; }
-  step_homebrew "$user" || failed=1
-  [ "$failed" = 0 ] && { step_devtools || failed=1; }
-  [ "$failed" = 0 ] && { step_tools "$user" || failed=1; }
-  [ "$failed" = 0 ] && { step_tailscale_binaries || failed=1; }
-  [ "$failed" = 0 ] && { step_tailscaled || failed=1; }
-  [ "$failed" = 0 ] && { step_network "$machine" "$user" || failed=1; }
-  [ "$failed" = 0 ] && { step_memex "$user" "$machine" || failed=1; }
+  if ! track participation read_participation; then
+    log "a step FAILED — the profile must carry the owner's answers (AcceptJobs, AcceptTokens); the next run retries"
+    finish_stage "$user"; exit 1
+  fi
+  track homebrew step_homebrew "$user" || failed=1
+  [ "$failed" = 0 ] && { track devtools step_devtools || failed=1; }
+  [ "$failed" = 0 ] && { track tools step_tools "$user" || failed=1; }
+  [ "$failed" = 0 ] && { track tailscale step_tailscale_binaries || failed=1; }
+  [ "$failed" = 0 ] && { track tailscaled step_tailscaled || failed=1; }
+  [ "$failed" = 0 ] && { track network step_network "$machine" "$user" || failed=1; }
+  [ "$failed" = 0 ] && { track memex step_memex "$user" "$machine" || failed=1; }
+  finish_stage "$user"
   [ "$ssh_failed" = 0 ] || failed=1
   [ "$failed" = 0 ] && log "done (everything this run could do)" || log "a step FAILED — the next run retries from it"
   exit "$failed"
