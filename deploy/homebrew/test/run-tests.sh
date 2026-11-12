@@ -3436,6 +3436,35 @@ OUT="$(fd norecord)"; RC=$?
   && ok "a missing Deployments record is RED with its remedy, and the doctor exits 1" || bad "doctor no record" "rc=$RC $OUT"
 OUT="$(fd 404)"; RC=$?
 [ "$RC" = 1 ] && grep -q 'does not answer /api/fleet/self-status yet' <<<"$OUT" && ok "a control that does not serve the endpoint is RED (unread), never a pass" || bad "doctor 404" "rc=$RC $OUT"
+# a jobs-YES Mac whose runner logs carry no claim line (and no seed): the doctor still reads to the END — a grep that matches
+# nothing must never end it under set -e (the second Mac's first doctor stopped silently after "build disk", exit 1)
+cat > "$FD/stubs/colima" <<'STUB'
+#!/bin/bash
+case "$*" in
+  *version*) echo "colima version 0.10.3" ;;
+  "list --json") echo '{"name":"build","status":"Running","cpus":16,"memory":92341796864,"disk":214748364800}' ;;
+  ssh*df*) echo "155 GiB free of 196 GiB" ;;
+  *) : ;;
+esac
+exit 0
+STUB
+cat > "$FD/stubs/kubectl" <<'STUB'
+#!/bin/bash
+case "$*" in
+  *version*) echo "Client Version: v1.37.1" ;;
+  *"get pods"*) printf 'build-host-mac-a 1/1 Running 0 1m\nbuild-host-mac-b 1/1 Running 0 1m\n' ;;
+  *logs*) echo "build-run: nothing relevant" ;;
+esac
+exit 0
+STUB
+chmod +x "$FD/stubs/colima" "$FD/stubs/kubectl"
+fdj() { local port; rm -f "$FD/port"; python3 "$FD/srv.py" ok "$FD/port" 2>"$FD/srv.err" & local pid=$!; for _ in $(seq 1 150); do [ -s "$FD/port" ] && port="$(cat "$FD/port")" && break; sleep 0.2; done
+  printf 'config:\n  memex_portal:\n    Hosting__ReportTo: "http://127.0.0.1:%s"\n    Hosting__Deployment: "mini-1"\n    Hosting__BackLease__Accept__Jobs__Enabled: "true"\n    Hosting__BackLease__Accept__Tokens__Enabled: "false"\n' "$port" > "$FD/home/.memex-local/backlease.yaml"
+  env PATH="$FD/stubs:$STUBS:$PATH" HOME="$FD/home" MEMEX_LOCAL_HOME="$FD/home/.memex-local" MEMEX_OLLAMA_MODEL=qwen3:8b "$CLI" fleet doctor 2>&1; local rc=$?
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return "$rc"; }
+OUT="$(fdj)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'no release follower installed' <<<"$OUT" && grep -q 'reading(s) red' <<<"$OUT" && grep -q 'runner: no claim line in the last 400 log lines' <<<"$OUT" && grep -q 'package seed: not installed yet' <<<"$OUT" && grep -q 'model qwen3:8b' <<<"$OUT" && grep -q 'fleet doctor:' <<<"$OUT" \
+  && ok "fleet doctor on a jobs-YES Mac reads to the END when the runner logs carry no claim line (exit 1 for exactly its one red reading — no follower in the fixture — never a silent stop after the disk reading)" || bad "doctor jobs path" "rc=$RC $OUT"
 rm -rf "$FD"
 
 echo "── the local ingress never pins browsers to https for localhost: HSTS max-age=0 (2026-11-11) ──────"
