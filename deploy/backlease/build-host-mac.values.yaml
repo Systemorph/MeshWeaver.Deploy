@@ -58,6 +58,13 @@ buildHosts:
   # a busy, unbuilt or refused tree gives a cold worktree off the master, said — never a copy (measured 2026-11-08: 32 s → 3 s,
   # 18 GiB → 20 KiB).
   runOverlay: true
+  # NO NETWORK DURING A RUN (Plugins Hosting/OneBuildTree.md §6): every stage gets its own loopback-only network namespace
+  # and NuGet's only source is the prepared package folder, so a package the run was not prepared for fails as NU1101
+  # naming it (MWPREP001 is an error), never as a timeout mid-test. Preparation (warm restore, package seed) keeps its
+  # network; the run keeps the build API and the start-of-run git fetch. Flipped once a normal Mac pull-request run
+  # restored nothing per run: 4 x MWPREP001 on #5357, 1 after Plugins #5364 (the NativeAOT toolchain), 0 after #5367 (core's
+  # resolver fixture packages) on #5358, 2026-11-12, platform 3.1.13015. The host probes the network namespace at start and refuses, naming it, where it cannot be made (#271).
+  stageNetwork: "offline"
   cacheClaimName: "build-cache-mac"
   # The Mac's only class is node-local; the replicas share it on the one node (ReadWriteOnce is per node).
   # The cache's real footprint under §7.3b (measured 29 GiB on 2026-11-08 before it): the bare mirrors (the master), the warm
