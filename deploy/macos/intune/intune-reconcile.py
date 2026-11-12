@@ -937,9 +937,15 @@ class Reconcile:
                 # a user or service principal in the group: no device to sync (review on #278)
                 self.line("INFO", what, f"directory object {short(oid)} is not a device — nothing to sync")
                 continue
-            md = [m for m in self.g.list("v1.0/deviceManagement/managedDevices?$filter="
-                                         + urllib.parse.quote(f"azureADDeviceId eq '{aad}'") + "&$select=id,deviceName,operatingSystem")
-                  if (m.get("operatingSystem") or "macOS") == "macOS"]   # the fleet's Macs only, as the device step
+            try:
+                md = [m for m in self.g.list("v1.0/deviceManagement/managedDevices?$filter="
+                                             + urllib.parse.quote(f"azureADDeviceId eq '{aad}'") + "&$select=id,deviceName,operatingSystem")
+                      if (m.get("operatingSystem") or "macOS") == "macOS"]   # the fleet's Macs only, as the device step
+            except GraphError as e:
+                # ONE Mac's lookup failing (a transient 503, measured 2026-11-12) never costs the other Macs their sync
+                self.errors += 1
+                self.line("ERROR", what, f"managed-device lookup failed: {e} — not synced (--sync retries)")
+                continue
             if len(md) != 1:
                 self.pending += 1
                 self.line("PENDING", what, f"{len(md)} managed macOS devices for directory device {short(oid)} — not synced")
@@ -1442,6 +1448,22 @@ def self_test():
     badpin = copy.deepcopy(ld)
     badpin["customProfiles"][0]["keys"]["BootstrapCommit"] = "main"
     expect("validate: a bootstrap pin that is a branch, not a commit, is refused", any("BootstrapCommit must be a full 40-hex" in x for x in validate(badpin, ".")), validate(badpin, "."))
+
+    # one Mac's managed-device lookup failing never stops the others' sync
+    st12 = copy.deepcopy(st5)
+    st12["managedDevices"]["mx"] = {"id": "mx", "serialNumber": "X", "azureADDeviceId": "aad-x", "operatingSystem": "macOS"}
+    st12["groups"][G1]["_members"] = ["d1", "dx"]
+    class Flaky(FakeGraph):
+        def list(self, path):
+            if "managedDevices" in path and "aad-1" in urllib.parse.unquote(path):
+                raise GraphError(503, "GET", "v1.0/deviceManagement/managedDevices", "transient")
+            return super().list(path)
+    g12, lines12 = Flaky(st12), []
+    r12 = Reconcile(copy.deepcopy(spec), tempfile.gettempdir(), g12, token=tok, out=lines12.append, sync_only=True)
+    r12.run()
+    synced12 = [w[1].split("/")[3] for w in g12.writes if w[1].endswith("/syncDevice")]
+    expect("device sync: one Mac's lookup failing (503) is an ERROR for THAT Mac and the others are still synced",
+           synced12 == ["mx"] and any(ln.startswith("ERROR") and "lookup failed" in ln for ln in lines12), lines12)
 
     print(f"self-test: {'FAILED ' + str(len(fails)) if fails else 'passed'}")
     return 1 if fails else 0
