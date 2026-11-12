@@ -444,9 +444,9 @@ grep -q 'installondemand.in-progress' "$FB" && grep -q 'rm -f "$flag"' "$FB" && 
 grep -q -- '--auth-key="file:$key_file"' "$FB" && ! grep -q -- '--auth-key "\$key"' "$FB" \
   && ok "the pre-auth key is passed by FILE reference (never an argument)" || bad "auth key by file" "missing"
 # Enrolment v2: the join POLLS control for its own code (bounded per run), and a successful join joins the network at once.
-grep -q -- 'fleet join --control "$control" --id "$machine" --no-open --wait "$wait_min" --code-file "$code_file" ${PART_ARGS' "$FB" \
+grep -q -- 'fleet join --control "$control" --id "$machine" --no-open --wait "$wait_min" --code-file "$code_file" ${extra\[@\]+"${extra\[@\]}"} ${PART_ARGS' "$FB" \
   && ok "the bootstrap runs the POLLING join (bounded wait per run; the code file stays the fallback)" || bad "polling join" "missing"
-grep -A3 '^    0) as_user' "$FB" | grep -q 'step_network "$machine" "$user"' \
+awk '/^run_join\(\)/{on=1} on' "$FB" | grep -A10 '^    0) ' | grep -q 'step_network "$machine" "$user"' \
   && ok "a successful join hands its pre-auth key straight to the network step (no wait for the next run)" || bad "network after join" "missing"
 mkdir -p "$T/lh/u/.memex-local/enrol" && printf 'https://hs.example.test\n' > "$T/lh/u/.memex-local/enrol/studio-9.login-server"
 LS="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_USER_HOME="$T/lh/u" FLEET_MANAGED_PREFS="$T/none" FLEET_LOG_DIR="$T/lslog" FLEET_TAILSCALED_SOCKET="$T/no.sock" FLEET_TS_DIR="$T/nots" \
@@ -486,7 +486,7 @@ awk '/^main\(\) \{/{on=1} on' "$FB" | grep -n 'step_devtools\|step_tools "\$user
 # Defect 5: Homebrew on every PATH the bootstrap hands the person's commands (the login shell: ensure_shellenv, #217).
 up="$(FB_EVAL='user_path' fb)"
 case ":$up:" in *":/opt/homebrew/bin:"*"/usr/local/bin:"*) ok "commands run as the console user get /opt/homebrew/bin and /usr/local/bin on PATH (defect 5)" ;; *) bad "user_path" "$up" ;; esac
-grep -q 'PATH="\$(user_path)"' "$FB" && [ "$(grep -c 'PATH="\$(user_path)"' "$FB")" = 2 ] && ! grep -q 'PATH="\$BREW_PREFIX/bin:\$TS_DIR' "$FB" \
+grep -q 'PATH="\$(user_path)"' "$FB" && [ "$(grep -c 'PATH="\$(user_path)"' "$FB")" -ge 2 ] && grep -A1 '^as_user()' "$FB" >/dev/null && ! grep -q 'PATH="\$BREW_PREFIX/bin:\$TS_DIR' "$FB" \
   && ok "as_user and probe_as_user both use that PATH" || bad "as_user PATH" "$(grep -n 'PATH=' "$FB")"
 # Defect 1: an expired console password is the FIRST line of the run, with the remedy.
 mkpol() { cat > "$1" <<PL
@@ -835,6 +835,59 @@ case "$OUT" in *"bootstrap token: UNREAD"*"Must be running as root"*"RC=0"*) ok 
 ! grep -qiE 'read -s|-passin|password *=|stdin.*pass' <(sed -n '/^# BOOTSTRAP TOKEN/,/^# PARTICIPATION/p' "$FB") && grep -q 'step_bootstrap_token "\$user"' "$FB" \
   && ok "the step never reads or handles a password, and main runs it every run" || bad "bootstrap token wiring" "missing"
 rm -rf "$BT"
+
+echo "── a fleet Mac joins BEFORE its first-run setup; every step leaves a reading; a stuck join is said (bootstrap 1.7.0) ──"
+# The first Mac mini (2026-11-12): every run answered the setup, the portal refused it ("signIn: Choose at least one way to
+# sign in") — a fleet Mac's sign-in arrives WITH the enrolment — and the join was never filed; the reason was root-only.
+RS="$(mktemp -d)"; mkdir -p "$RS/home/.memex-local" "$RS/st"
+SMW='as_user() { shift; printf "%s\n" "$*" >> "$SM_CALLS"
+      case "$*" in *-CAROOT*) printf "%s" "$SM_CAROOT" ;;
+        *"fleet join"*) printf "%b\n" "${SM_JOIN_OUT:-}"; return "${SM_JOIN_RC:-0}" ;;
+        *"setup --apply"*) printf "%b\n" "${SM_SETUP_OUT:-}"; return "${SM_SETUP_RC:-0}" ;; esac; return 0; }
+    probe_as_user() { case "$*" in *verify*) return 0 ;; *awaiting_setup*) [ "${SM_AWAIT:-0}" = 1 ] ;; *) return 1 ;; esac; }
+    notify_user() { printf "NOTIFY %s | %s\n" "$2" "$3"; }
+    read_participation >/dev/null; track memex step_memex jroe studio-2; rc=$?; finish_stage jroe; echo "rc=$rc"'
+rsrun() { : > "$RS/calls"; OUT="$(env $FCA_ENV FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$RS/log" FLEET_MANAGED_PREFS="$RS/none" FLEET_USER_HOME="$RS/home" FLEET_BREW_PREFIX="$RS/brew" \
+  FLEET_STATE_DIR="$RS/st" FLEET_CONTROL_URL=https://control.example.test SM_CALLS="$RS/calls" SM_CAROOT="$T/sm/caroot" FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=false \
+  FLEET_ORGANISATION=Acme FLEET_OWNER_NAME="Jane Roe" FLEET_OWNER_EMAIL=jane.roe@example.com FLEET_ACCEPT_TERMS=true FLEET_CA_SHA256="$FSHA" "$@" bash -c '. "$0"; '"$SMW" "$FB" 2>&1)"; }
+rd() { head -1 "$RS/st/$1" 2>/dev/null; }
+# 1. in first-run setup, not joined: the join runs FIRST (no update, no heartbeat wait); the setup is NOT answered
+rsrun SM_AWAIT=1 SM_JOIN_RC=3 SM_JOIN_OUT='open https://control.example.test/Hosting/Heartbeats/Enrol/studio-2-abc to approve'
+grep -q 'fleet join --control https://control.example.test --id studio-2 --no-open --wait 10 --code-file .* --no-update --heartbeat-wait 0 ' "$RS/calls" && ! grep -q 'setup --apply' "$RS/calls" \
+  && ok "portal in first-run setup, Mac not joined: 'fleet join --no-update --heartbeat-wait 0' runs BEFORE the setup, and the setup is not answered" || bad "join before setup" "$(cat "$RS/calls") / $OUT"
+case "$(rd join)" in "waiting-approval "*"request filed; waiting for the Approve on control: https://control.example.test/Hosting/Heartbeats/Enrol/studio-2-abc") ok "…reading join = waiting-approval, with the approval link" ;; *) bad "join reading" "$(rd join)" ;; esac
+case "$(rd stage)" in "waiting-approval "*"join: "*) ok "…reading stage names the join, waiting for the Approve" ;; *) bad "stage approval" "$(rd stage)" ;; esac
+case "$OUT" in *NOTIFY*) bad "waiting for the Approve is control's to give: no notification" "$OUT" ;; *) ok "…and no notification (the Approve is control's to give, not the person's)" ;; esac
+# 2. the pre-setup join succeeds: joined, but NOT finalised (the setup and the finalisation follow)
+rsrun SM_AWAIT=1 SM_JOIN_RC=0 SM_JOIN_OUT='joined as studio-2'
+case "$(rd join)" in "ok "*"before the setup"*) ! grep -q 'fleet.finalized' "$RS/calls" && ok "a join before the setup is recorded (join ok) and never marked finalised" || bad "pre-setup finalized" "$(cat "$RS/calls")" ;; *) bad "pre-setup join ok" "$(rd join) / $OUT" ;; esac
+case "$(rd stage)" in "waiting "*"setup: memex: joined as studio-2 before the setup — WAITING for the next run to answer the setup"*) ok "…and stage reads waiting at the setup — never 'done' while the setup and the finalisation are pending (review on #276: the network step's log must not overwrite it)" ;; *) bad "pre-setup stage" "$(rd stage)" ;; esac
+# 3. joined, the setup refused — its own words reach the reading, the stage, and the person
+printf 'x' > "$RS/home/.memex-local/fleet.yaml"
+rsrun SM_AWAIT=1 SM_SETUP_RC=1 SM_SETUP_OUT='\033[31merr\033[0m  setup --apply: the portal refused the answers — signIn: Choose at least one way to sign in'
+case "$(rd setup)" in "failed "*"exit 1: err  setup --apply: the portal refused the answers — signIn: Choose at least one way to sign in") ok "a refused setup: reading setup = failed with the portal's own words (colour stripped)" ;; *) bad "setup failed reading" "$(rd setup)" ;; esac
+case "$(rd stage)" in "failed "*"setup: memex: the setup API refused or failed — err  setup --apply: the portal refused"*) ok "…stage names the setup and why" ;; *) bad "stage setup" "$(rd stage)" ;; esac
+grep -q 'rc=1' <<<"$OUT" && ok "…and the step fails (exit 1)" || bad "setup refused rc" "$OUT"
+# 4. answered and ACCEPTED, but the portal is still in first-run setup on the next run: a failure, never another "answered"
+rm -f "$RS/st/setup.answered"; rsrun SM_AWAIT=1 SM_SETUP_RC=0 SM_SETUP_OUT='ok setup applied (completed)'
+case "$(rd setup)" in "waiting "*"answered: ok setup applied (completed)"*) ok "an accepted setup: reading setup = waiting (the portal restarts configured)" ;; *) bad "setup answered" "$(rd setup)" ;; esac
+rsrun SM_AWAIT=1 SM_SETUP_RC=0 SM_SETUP_OUT='ok setup applied (completed)'
+case "$(rd setup)" in "failed "*"still in first-run setup"*) grep -q 'rc=1' <<<"$OUT" && ok "accepted earlier and STILL in first-run setup: failed, said every run" || bad "still-in-setup rc" "$OUT" ;; *) bad "still in setup" "$(rd setup) / $OUT" ;; esac
+# 5. configured, not joined: the join control REFUSES — the refusal text reaches the reading and the person
+rm -f "$RS/home/.memex-local/fleet.yaml" "$RS/st/setup.answered"
+rsrun SM_AWAIT=0 SM_JOIN_RC=1 SM_JOIN_OUT='line one\nREFUSED by control: Hosting:Enrolment:RegistryPlan is not declared\nerr  fleet join: stopped'
+case "$(rd join)" in "failed "*"exit 1: REFUSED by control: Hosting:Enrolment:RegistryPlan is not declared") ok "a refused join: reading join = failed with control's refusal text" ;; *) bad "join refused reading" "$(rd join)" ;; esac
+case "$OUT" in *"NOTIFY Fleet join not filed | This Mac has not joined the fleet: the step 'join' is failed — memex: fleet join FAILED (exit 1) — REFUSED by control"*) ok "…and the person is notified, naming the reason" ;; *) bad "join refused notify" "$OUT" ;; esac
+case "$(rd setup):$(rd up)" in "ok "*":ok "*) ok "the earlier steps leave their readings (up ok, setup ok)" ;; *) bad "up/setup readings" "$(rd up) / $(rd setup)" ;; esac
+# 6. a missing prerequisite is NAMED: no ControlUrl → the join is skipped, said, and the person told
+rsrun FLEET_CONTROL_URL= SM_AWAIT=0
+case "$(rd join):$(rd stage)" in "skipped "*"no ControlUrl in the com.memex.local profile:waiting "*"join: memex: WAITING for ControlUrl"*) case "$OUT" in *"NOTIFY Fleet join not filed"*"ControlUrl"*) ok "no ControlUrl: the join is skipped, the stage names ControlUrl, and the person is notified" ;; *) bad "no ControlUrl notify" "$OUT" ;; esac ;; *) bad "no ControlUrl" "$(rd join) / $(rd stage)" ;; esac
+# 7. the readings: world-readable, no secrets
+[ "$(stat -f%Lp "$RS/st/join")" = 644 ] && ! grep -rqiE 'secret|password|token=[^<]' "$RS/st" && ok "every reading is 0644 and carries no secret" || bad "readings mode/secret" "$(ls -l "$RS/st")"
+# 8. a run that ends with every step done says so
+FB_EVAL='STUCK_NAME=""; WAIT_NAME=""; finish_stage jroe' fb FLEET_STATE_DIR="$RS/st" FLEET_USER_HOME="$RS/home" FLEET_LOG_DIR="$RS/log" >/dev/null
+case "$(rd stage)" in "done "*) ok "a run with nothing stuck writes stage = done" ;; *) bad "stage done" "$(rd stage)" ;; esac
+rm -rf "$RS"
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"

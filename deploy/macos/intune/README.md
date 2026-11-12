@@ -52,7 +52,23 @@ placed on issuing CA"*. Re-measure on the first profile-trusted fleet Mac (Safar
 **Readings** — the run log is root-only, so the bootstrap also leaves one world-readable line per reading in
 `/Library/MeshWeaver/fleet-state/` (root-owned, 0644, `<verdict> <UTC time> <detail>`, nothing secret):
 `operator-ssh` (`ok` / `not-configured` / `failed`) and `bootstrap-token` (`escrowed` / `not-escrowed signin|command
-since …` / `unsupported` / `unknown`). `memex-local fleet doctor` reads both.
+since …` / `unsupported` / `unknown`). Since 1.7.0 EVERY step leaves one: `participation`, `homebrew`, `devtools`,
+`tools`, `tailscale`, `tailscaled`, `network`, `up`, `setup`, `join` (`waiting-approval` with the approval link /
+`failed` with control's refusal or the last error line / `skipped` naming the missing prerequisite / `ok`), and once
+joined `doctor`, `heartbeat`, `buildhost` (from `memex-local fleet doctor`, run as the person). **`stage`** names the step
+the onboarding is stuck on — the first failed one, else the first still waiting — with when and why, or `done`. A join
+that is not filed or not finished for any reason but the Approve (which is control's to give) also reaches the person as
+a notification naming it. `memex-local fleet doctor` reads them: on a Mac not joined yet it prints the `join` and
+`stage` readings.
+
+**A fleet Mac joins BEFORE its first-run setup** (1.7.0). The setup refuses an instance with no sign-in route —
+right for every other install — but a fleet Mac's sign-in (its own Entra app, `internal on`) is delivered BY the
+enrolment. Measured on the first Mac mini (2026-11-12): every run answered the setup, was refused (*"signIn: Choose at
+least one way to sign in"*), and the join was never filed. So when the portal is still in first-run setup and the Mac
+has not joined, the bootstrap runs `fleet join --no-update --heartbeat-wait 0` first; the Approve's items install the
+sign-in as host configuration (which the setup accepts — `configuredElsewhere`), and a later run answers the setup and
+finishes (back-lease enrolment + update). The earlier Macs passed this step because a person answered the browser
+wizard before the join.
 
 **Operator SSH — optional**: `OperatorSshKeys`, a list of OpenSSH PUBLIC keys (a profile array, one key per
 element; the reconcile writes it as an array, never comma-joined; a newline-separated string is read too; environment
