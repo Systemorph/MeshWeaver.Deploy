@@ -1077,6 +1077,39 @@ rm -rf "$JP"
 
 grep -q 'write_reading version "$FLEET_BOOTSTRAP_VERSION"' "$FB" && awk '/^main\(\) \{/{on=1} on' "$FB" | grep -n 'write_reading version\|step_operator_ssh\|acquire_run_lock 900' | head -2 | tail -1 | grep -q 'write_reading version' \
   && ok "every run that gets past the run lock names its own bootstrap version in the reading 'version' (the agent may run a cached copy)" || bad "version reading" ""
+echo "── the fleet loader: the bootstrap's pin travels in the PROFILE (minutes), not in the Intune script (8 h) — 2026-11-12 ──"
+FL="$MACOS/intune/fleet-loader.sh"
+bash -n "$FL" && ok "fleet-loader.sh parses" || bad "loader parses" ""
+LD="$(mktemp -d)"; C1="$(printf 'a%.0s' $(seq 1 40))"
+mkdir -p "$LD/web/Systemorph/MeshWeaver.Deploy/$C1/deploy/macos/intune"
+printf '#!/bin/bash\necho "BOOTSTRAP-A $*"\n' > "$LD/web/Systemorph/MeshWeaver.Deploy/$C1/deploy/macos/intune/fleet-bootstrap.sh"
+S1="$(shasum -a 256 "$LD/web/Systemorph/MeshWeaver.Deploy/$C1/deploy/macos/intune/fleet-bootstrap.sh" | cut -d' ' -f1)"
+{ cat "$FL"; printf '\n__FLEET_EMBEDDED_BOOTSTRAP__\n'; printf '#!/bin/bash\necho "EMBEDDED-B $*"\n'; } > "$LD/uploaded.sh"
+lrun() { env FLEET_BOOTSTRAP_BASE_URL="file://$LD/web" FLEET_LOADER_DIR="$LD/dir" FLEET_LOG_DIR="$LD/log" FLEET_STATE_DIR="$LD/st" FLEET_MANAGED_PREFS="$LD/none" "$@" bash "${LSCRIPT:-$LD/uploaded.sh}" first-arg 2>&1; }
+OUT="$(lrun FLEET_BOOTSTRAP_COMMIT="$C1" FLEET_BOOTSTRAP_SHA256="$S1")"; RC=$?
+case "$RC:$OUT" in 0:*"fetched and verified"*"BOOTSTRAP-A first-arg"*) case "$OUT" in *EMBEDDED-B*) bad "a pinned run never runs the embedded copy" "$OUT" ;; *) [ -f "$LD/dir/fleet-bootstrap.sh" ] && grep -q '^ok .*fetched and verified' "$LD/st/loader" && ok "a pin in the profile: the bootstrap at that commit is fetched, verified by its sha256, kept and run (with the arguments); reading loader = ok" || bad "pinned fetch side effects" "$(ls -la "$LD/dir")" ;; esac ;; *) bad "pinned fetch" "rc=$RC $OUT" ;; esac
+mv "$LD/web" "$LD/web.gone"
+OUT="$(lrun FLEET_BOOTSTRAP_COMMIT="$C1" FLEET_BOOTSTRAP_SHA256="$S1")"
+case "$OUT" in *"verified copy"*"BOOTSTRAP-A"*) ok "the next run with the same pin uses the verified copy — no fetch needed (the network may be down)" ;; *) bad "verified copy reuse" "$OUT" ;; esac
+mv "$LD/web.gone" "$LD/web"; rm -rf "$LD/dir"
+OUT="$(lrun FLEET_BOOTSTRAP_COMMIT="$C1" FLEET_BOOTSTRAP_SHA256="$(printf 'b%.0s' $(seq 1 64))")"
+case "$OUT" in *"REFUSED the fetched bootstrap"*"EMBEDDED-B first-arg"*) case "$OUT" in *BOOTSTRAP-A*) bad "mismatched bytes never run" "$OUT" ;; *) ok "bytes that do not match the pinned sha256 are REFUSED (said), and the embedded copy runs instead" ;; esac ;; *) bad "sha mismatch" "$OUT" ;; esac
+rm -rf "$LD/dir"
+OUT="$(lrun)"
+case "$OUT" in *"no bootstrap pin in the com.memex.local profile"*"EMBEDDED-B first-arg"*) ok "no pin in the profile: the embedded copy runs" ;; *) bad "no pin" "$OUT" ;; esac
+# the pin from the managed profile itself
+python3 -c 'import plistlib,sys; plistlib.dump({"BootstrapCommit": sys.argv[1], "BootstrapSha256": sys.argv[2]}, open(sys.argv[3], "wb"), fmt=plistlib.FMT_BINARY)' "$C1" "$S1" "$LD/prefs.plist"
+rm -rf "$LD/dir"
+OUT="$(env FLEET_BOOTSTRAP_BASE_URL="file://$LD/web" FLEET_LOADER_DIR="$LD/dir" FLEET_LOG_DIR="$LD/log" FLEET_STATE_DIR="$LD/st" FLEET_MANAGED_PREFS="$LD/prefs" bash "$LD/uploaded.sh" 2>&1)"
+case "$OUT" in *"fetched and verified"*"BOOTSTRAP-A"*) ok "the pin is read from the MDM-delivered com.memex.local profile (BootstrapCommit, BootstrapSha256)" ;; *) bad "pin from profile" "$OUT" ;; esac
+# nothing at all to run: FAILED, exit 1 — never a silent success
+rm -rf "$LD/dir"; LSCRIPT="$FL"
+OUT="$(lrun)"; RC=$?
+case "$RC:$OUT" in 1:*"FAILED — no pinned, embedded or verified bootstrap"*) grep -q '^failed ' "$LD/st/loader" && ok "no pin, no embedded copy, no verified copy: FAILED, exit 1, reading loader = failed" || bad "loader failed reading" "" ;; *) bad "nothing to run" "rc=$RC $OUT" ;; esac
+unset LSCRIPT
+grep -q '^return 0 2>/dev/null || exit 0$' "$FL" && [ "$(tail -1 "$FL")" = 'return 0 2>/dev/null || exit 0' ] && ok "the loader ends in an exit: the embedded bytes appended after it are never executed inline" || bad "loader end" "$(tail -1 "$FL")"
+rm -rf "$LD"
+
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -46,17 +46,23 @@
       "key": "bootstrap",
       "id": "00000000-0000-4000-8000-0000000000b1",
       "displayName": "Fleet — bootstrap (Mac Studios)",
-      "description": "MeshWeaver.Deploy deploy/macos/intune/fleet-bootstrap.sh v1.4.0 pinned at 07df3a7b364263e837707b93059c16ce649a59e2. Runs as root, hourly, idempotent; log /Library/Logs/MeshWeaver/fleet-bootstrap.log.",
-      "fileName": "fleet-bootstrap.sh",
+      "description": "MeshWeaver.Deploy deploy/macos/intune/fleet-loader.sh (the STABLE loader) pinned at <commit>, with the bootstrap embedded as its fallback. Each run reads BootstrapCommit + BootstrapSha256 from the com.memex.local profile, fetches that bootstrap, verifies it and runs it. Runs as root, hourly; logs /Library/Logs/MeshWeaver/fleet-loader.log and fleet-bootstrap.log.",
+      "fileName": "fleet-loader.sh",
       "runAsAccount": "system",
       "executionFrequency": "PT1H",
       "retryCount": 3,
       "blockExecutionNotifications": true,
       "source": {
         "repo": "Systemorph/MeshWeaver.Deploy",
-        "path": "deploy/macos/intune/fleet-bootstrap.sh",
-        "commit": "07df3a7b364263e837707b93059c16ce649a59e2",
-        "sha256": "06242902f7f9a2b593d7814485dbc7968ae31c32a68faeeb7fd02ab9bbc2f6fd"
+        "path": "deploy/macos/intune/fleet-loader.sh",
+        "commit": "0000000000000000000000000000000000000000",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "embed": {
+          "repo": "Systemorph/MeshWeaver.Deploy",
+          "path": "deploy/macos/intune/fleet-bootstrap.sh",
+          "commit": "0000000000000000000000000000000000000000",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
       },
       "assign": {
         "include": [
@@ -113,7 +119,9 @@
         "AcceptTokensResidency": "CH",
         "OperatorSshKeys": [
           "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDH5AD0ellP162c2ThMr3M79UFF5xWm4cAqHv5xf2coD operator@example.com"
-        ]
+        ],
+        "BootstrapCommit": "0000000000000000000000000000000000000000",
+        "BootstrapSha256": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "assign": {
         "include": [
