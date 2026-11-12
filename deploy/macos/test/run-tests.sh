@@ -699,6 +699,7 @@ printf 'fresh' > "$NT/u/.memex-local/enrol/studio-2.preauth"
 OUT="$(nt "Starting")"
 [ ! -s "$NT/up.log" ] && grep -q 'did not settle' <<<"$OUT" && [ -e "$NT/u/.memex-local/enrol/studio-2.preauth" ] \
   && ok "a daemon that does not settle in the bounded wait: WAITING, no 'up', the dropped key untouched" || bad "unsettled" "$OUT"
+case "$(head -1 "$NT/rd/network" 2>/dev/null)" in "waiting "*"WAITING"*) ok "…and the network step's own reading says waiting (the WAITING path through the wrapper, review on #282)" ;; *) bad "network waiting reading" "$(cat "$NT/rd/network" 2>/dev/null)" ;; esac
 # 7. a registered node that is Stopped: never re-keyed
 printf '{"_profiles":"x"}' > "$NT/state/tailscaled.state"; echo true > "$NT/havekey"
 OUT="$(nt "Stopped")"
