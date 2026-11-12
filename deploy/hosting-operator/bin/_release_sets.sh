@@ -70,7 +70,7 @@ values_carry_portal_image() { values_block_image portal "$1" >/dev/null; }
 # ── the ingress TLS Secret — the RECORD's, never a name invented over it ──
 # 🚨 `--set` beats every `-f`, so a flag composed here OVERRIDES what the record rendered. It used to
 # be `${HOSTING_TLS_SECRET:-${namespace}-tls}` unconditionally, which replaced a record's own
-# `ingress.tlsSecret` with `<namespace>-tls`. Measured on partnerre-esl, 2026-11-11 from 09:02Z: the
+# `ingress.tlsSecret` with `<namespace>-tls`. Measured on an enterprise estate's instance, 2026-11-11 from 09:02Z: the
 # record (and its overlay) name `keyvault-memex-portal`, the Secret the Key Vault CSI driver creates
 # from the instance's certificate; the first green Roll set `memex-tls`, a Secret that did not
 # exist, and nginx served "Kubernetes Ingress Controller Fake Certificate" on all three ingresses

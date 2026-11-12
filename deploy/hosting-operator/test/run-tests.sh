@@ -2832,7 +2832,7 @@ fi
 rm -rf "$_ap_dir"
 
 # ── hosting-deploy keeps the RECORD's ingress.tlsSecret ─────────────────────────────────────────
-# 🚨 Measured on partnerre-esl, 2026-11-11 from 09:02Z: the record names `keyvault-memex-portal`
+# 🚨 Measured on an enterprise estate's instance, 2026-11-11 from 09:02Z: the record names `keyvault-memex-portal`
 # (the Key Vault CSI Secret), the deploy's `--set ingress.tlsSecret=<namespace>-tls` overrode it with
 # `memex-tls`, a Secret that did not exist, and nginx served its fake certificate on every ingress.
 # `--set` beats `-f`, so the flag itself is the defect — pinned on the argument list.
