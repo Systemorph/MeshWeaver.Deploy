@@ -2831,6 +2831,40 @@ else
 fi
 rm -rf "$_ap_dir"
 
+# ── hosting-deploy keeps the RECORD's ingress.tlsSecret ─────────────────────────────────────────
+# 🚨 Measured on an enterprise estate's instance, 2026-11-11 from 09:02Z: the record names `keyvault-memex-portal`
+# (the Key Vault CSI Secret), the deploy's `--set ingress.tlsSecret=<namespace>-tls` overrode it with
+# `memex-tls`, a Secret that did not exist, and nginx served its fake certificate on every ingress.
+# `--set` beats `-f`, so the flag itself is the defect — pinned on the argument list.
+echo
+echo "── hosting-deploy: the record's ingress.tlsSecret survives the flags ─"
+_tl_dir="$(mktemp -d)"; cp -R "$DP_FIXTURES/." "$_tl_dir/"; _tl_log="$_tl_dir/calls.log"
+_tl_vals="$_tl_dir/values.yaml"
+_tl_run() { : > "$_tl_log"; env PATH="$DP_STUBS:$PATH" HOSTING_CHART=/tmp HOSTING_DEPLOY_FIXTURE="$_tl_dir" HOSTING_DEPLOY_STUB_LOG="$_tl_log" "$@" \
+  hosting-deploy --namespace memex --release memex --database memex --values "$_tl_vals" --image cr.example.test/memex-portal-ai:1 >/dev/null 2>&1
+  grep '^helm upgrade' "$_tl_log" | head -1; }
+printf '# GENERATED from the Hosting/Deployment record by HelmValues\ningress:\n  className: "nginx"\n  tlsSecret: "keyvault-memex-portal"\nreplicas:\n  portal: 1\n' > "$_tl_vals"
+_tl_up="$(_tl_run env)"
+if grep_in "$_tl_up" -q -- 'ingress.tlsSecret=keyvault-memex-portal' && ! grep_in "$_tl_up" -q -- 'ingress.tlsSecret=memex-tls'; then
+  ok "a record that names its TLS Secret keeps it (no <namespace>-tls over it)"
+else
+  bad "the record's ingress.tlsSecret is kept" "upgrade line: '${_tl_up}'"
+fi
+_tl_up="$(_tl_run env HOSTING_TLS_SECRET=operator-override)"
+if grep_in "$_tl_up" -q -- 'ingress.tlsSecret=operator-override'; then
+  ok "an explicit HOSTING_TLS_SECRET still wins over the record"
+else
+  bad "HOSTING_TLS_SECRET wins" "upgrade line: '${_tl_up}'"
+fi
+printf '# GENERATED from the Hosting/Deployment record by HelmValues\nreplicas:\n  portal: 1\n' > "$_tl_vals"
+_tl_up="$(_tl_run env)"
+if grep_in "$_tl_up" -q -- 'ingress.tlsSecret=memex-tls'; then
+  ok "values with no ingress block fall back to <namespace>-tls"
+else
+  bad "the <namespace>-tls fallback" "upgrade line: '${_tl_up}'"
+fi
+rm -rf "$_tl_dir"
+
 # ── hosting-deploy layers the Key Vault VALUES HALF first, when the record declares one ─────────
 # 🚨 MeshWeaver#3780, measured twice on the control instance (helm revisions 44 and 55). The chart's
 # own Secrets render from `secrets.<half>.*`, which on an external database live ONLY in the vault
