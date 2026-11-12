@@ -3438,6 +3438,10 @@ echo "not-escrowed 2026-11-12T09:00:00Z command since 2026-11-12T08:00:00Z" > "$
 OUT="$(fd ok)"; RC=$?
 [ "$RC" = 1 ] && grep -q 'bootstrap token: NOT escrowed' <<<"$OUT" && grep -q 'remedy: sign out and back in.*sudo profiles install -type bootstraptoken' <<<"$OUT" \
   && ok "an un-escrowed bootstrap token is RED: sign out and back in first, then 'sudo profiles install -type bootstraptoken'" || bad "doctor bootstrap token red" "rc=$RC $OUT"
+mkdir -p "$FD/home/.memex-local/enrol"; printf 'x' > "$FD/home/.memex-local/enrol/mini-1.signin"
+OUT="$(fd ok)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'sign-in: handed over by the join .* but NOT installed yet' <<<"$OUT" && ok "a handed-over sign-in that is not installed yet is RED in fleet doctor, with its remedy" || bad "doctor pending signin" "rc=$RC $OUT"
+rm -f "$FD/home/.memex-local/enrol/mini-1.signin"
 rm -f "$FD/state/bootstrap-token"
 OUT="$(fd ok)"; RC=$?
 [ "$RC" = 1 ] && grep -q 'bootstrap token: no reading' <<<"$OUT" && ok "no bootstrap-token reading at all is RED (the bootstrap has not run here), never a pass" || bad "doctor no reading" "rc=$RC $OUT"
@@ -3493,7 +3497,7 @@ sh_run() { env HOME="$SH/home" MEMEX_LOCAL_HOME="$SH/home/.memex-local" MEMEX_LO
 # 1. no private-network name yet (the bootstrap brings the network up after the join): handed over, 0600, never printed
 SHE='tailnet_name() { :; }; rc=0; fleet_apply_signin "'"$SH/items"'" || rc=$?; echo "RC=$rc"'
 OUT="$(sh_run)"
-case "$OUT" in *"handed to the device bootstrap"*"RC=0"*) [ "$(cat "$SH/home/.memex-local/enrol/mini-1.signin")" = "super-secret-client-value-1234" ] && [ "$(stat -f%Lp "$SH/home/.memex-local/enrol/mini-1.signin")" = 600 ] \
+case "$OUT" in *"handed to the device bootstrap"*"RC=0"*) [ "$(cat "$SH/home/.memex-local/enrol/mini-1.signin")" = "super-secret-client-value-1234" ] && [ "$(ls -l "$SH/home/.memex-local/enrol/mini-1.signin" | cut -c1-10)" = "-rw-------" ] \
   && grep -q '^clientId=11111111-1111-1111-1111-111111111111$' "$SH/home/.memex-local/enrol/mini-1.signin-facts" && grep -q '^tenant=00000000-0000-0000-0000-0000000000aa$' "$SH/home/.memex-local/enrol/mini-1.signin-facts" \
   && ok "no private-network name yet: the sign-in is HANDED OVER (0600 secret + tenant/client id), never dropped" || bad "signin handover files" "$(ls -l "$SH/home/.memex-local/enrol")" ;; *) bad "signin handover" "$OUT" ;; esac
 case "$OUT" in *super-secret*) bad "the sign-in secret is never printed" "" ;; *) ok "the handed-over sign-in secret is never printed" ;; esac

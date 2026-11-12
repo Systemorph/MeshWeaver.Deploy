@@ -2560,6 +2560,13 @@ fleet_doctor() {
       "confirm the Mac is in the Intune fleet group and its bootstrap runs (/Library/Logs/MeshWeaver/fleet-bootstrap.log, root-only)" ;;
     *) doc_red "bootstrap token: unread by the bootstrap (${bt})" "sudo profiles status -type bootstraptoken" ;;
   esac
+  # a sign-in the join HANDED OVER and nothing installed yet (review on #285): the first-run setup refuses without it
+  local ho
+  for ho in "$FLEET_DIR"/*.signin; do
+    [ -f "$ho" ] || continue
+    doc_red "sign-in: handed over by the join ($ho) but NOT installed yet" "the fleet bootstrap (≥ 1.11.0) installs it once the private network is up; by hand: memex-local internal on --tenant <tenant> --client-id <clientId> < $ho (both in ${ho}-facts)"
+  done
+  [ -f "$INTERNAL_FILE" ] && doc_ok "sign-in: this Mac's own app is configured ($(internal_value Authentication__Microsoft__ClientId))"
   ss="$(head -1 "$rd/operator-ssh" 2>/dev/null || true)"
   case "${ss%% *}" in
     ok) doc_ok "operator SSH: Remote Login on, the operator's keys installed (${ss#* })" ;;
