@@ -843,7 +843,7 @@ echo "── a fleet Mac joins BEFORE its first-run setup; every step leaves a r
 # sign in") — a fleet Mac's sign-in arrives WITH the enrolment — and the join was never filed; the reason was root-only.
 RS="$(mktemp -d)"; mkdir -p "$RS/home/.memex-local" "$RS/st"
 SMW='as_user() { shift; printf "%s\n" "$*" >> "$SM_CALLS"
-      case "$*" in /bin/mv\ *|/bin/rm\ *) "$@"; return ;; *-CAROOT*) printf "%s" "$SM_CAROOT" ;;
+      case "$*" in /bin/mv\ *|/bin/rm\ *) "$@"; return ;; *"internal on"*) : > "$FLEET_USER_HOME/.memex-local/internal.yaml"; return 0 ;; *-CAROOT*) printf "%s" "$SM_CAROOT" ;;
         *"fleet join"*) printf "%b\n" "${SM_JOIN_OUT:-}"; [ "${SM_JOIN_RC:-0}" = 0 ] && : > "$FLEET_USER_HOME/.memex-local/fleet.yaml"; return "${SM_JOIN_RC:-0}" ;;
         *"setup --apply"*) printf "%b\n" "${SM_SETUP_OUT:-}"; [ "${SM_SETUP_RC:-0}" = 0 ] && : > "$SM_CALLS.applied"; return "${SM_SETUP_RC:-0}" ;; esac; return 0; }
     probe_as_user() { case "$*" in *verify*) return 0 ;;
@@ -895,21 +895,30 @@ rsrun FLEET_CONTROL_URL= SM_AWAIT=0
 case "$(rd join):$(rd stage)" in "skipped "*"no ControlUrl in the com.memex.local profile:waiting "*"join: memex: WAITING for ControlUrl"*) case "$OUT" in *"NOTIFY Fleet join not filed"*"ControlUrl"*) ok "no ControlUrl: the join is skipped, the stage names ControlUrl, and the person is notified" ;; *) bad "no ControlUrl notify" "$OUT" ;; esac ;; *) bad "no ControlUrl" "$(rd join) / $(rd stage)" ;; esac
 # 6b. (1.11.0) joined, the sign-in HANDED OVER by the join: installed with 'internal on' once the network is up, then the setup
 rm -f "$RS/st/setup.answered"; : > "$RS/home/.memex-local/fleet.yaml"; rm -f "$RS/home/.memex-local/internal.yaml"; mkdir -p "$RS/home/.memex-local/enrol"
-printf 'secret-value-long-enough' > "$RS/home/.memex-local/enrol/studio-2.signin"; printf 'tenant=00000000-aaaa\nclientId=11111111-bbbb\n' > "$RS/home/.memex-local/enrol/studio-2.signin-facts"
+printf 'secret-value-long-enough' > "$RS/home/.memex-local/enrol/studio-2.signin"; chmod 600 "$RS/home/.memex-local/enrol/studio-2.signin"; printf 'tenant=00000000-aaaa\nclientId=11111111-bbbb\n' > "$RS/home/.memex-local/enrol/studio-2.signin-facts"
 SMW_TS='ts_backend_state() { printf "%s" "${SM_TS:-Running}"; }; '
 SMW_SAVE="$SMW"; SMW="$SMW_TS$SMW"
 rsrun SM_AWAIT=1 SM_TS=Running SM_USER="$(id -un)"
 grep -q 'internal on --tenant "$1" --client-id "$2" < "$3".* 00000000-aaaa 11111111-bbbb .*studio-2.signin' "$RS/calls" && grep -q 'rm -f .*studio-2.signin .*studio-2.signin-facts' "$RS/calls" \
   && grep -q 'setup --apply' "$RS/calls" && [ "$(sed -n '/internal on/=' "$RS/calls" | head -1)" -lt "$(sed -n '/setup --apply/=' "$RS/calls" | head -1)" ] \
   && case "$(rd signin)" in "ok "*) true ;; *) false ;; esac \
-  && ok "a handed-over sign-in is installed ('internal on', secret on stdin from its file) BEFORE the setup, then removed; reading signin = ok" || bad "signin install" "$(cat "$RS/calls") / $(rd signin)"
+  && ! grep -q 'fleet join' "$RS/calls" && [ -f "$RS/home/.memex-local/fleet.yaml" ] \
+  && ok "a handed-over sign-in is installed ('internal on', secret on stdin from its file) BEFORE the setup, then removed; reading signin = ok; the join is KEPT (no fresh join)" || bad "signin install" "$(cat "$RS/calls") / $(rd signin)"
 case "$OUT" in *secret-value-long-enough*) bad "the handed-over secret is never logged" "" ;; *) ok "…and the secret never reaches the log" ;; esac
-# 6c. the network not up yet: waiting, nothing installed, the file kept
-: > "$RS/home/.memex-local/fleet.yaml"
-printf 'secret-value-long-enough' > "$RS/home/.memex-local/enrol/studio-2.signin"; printf 'tenant=00000000-aaaa\nclientId=11111111-bbbb\n' > "$RS/home/.memex-local/enrol/studio-2.signin-facts"
+# 6c. the network not up yet: waiting, nothing installed, the file kept — and the setup NOT answered
+: > "$RS/home/.memex-local/fleet.yaml"; rm -f "$RS/home/.memex-local/internal.yaml"
+printf 'secret-value-long-enough' > "$RS/home/.memex-local/enrol/studio-2.signin"; chmod 600 "$RS/home/.memex-local/enrol/studio-2.signin"; printf 'tenant=00000000-aaaa\nclientId=11111111-bbbb\n' > "$RS/home/.memex-local/enrol/studio-2.signin-facts"
 rsrun SM_AWAIT=1 SM_TS=Starting SM_USER="$(id -un)"
-! grep -q 'internal on' "$RS/calls" && [ -f "$RS/home/.memex-local/enrol/studio-2.signin" ] && case "$(rd signin)" in "waiting "*) true ;; *) false ;; esac \
+! grep -q 'internal on' "$RS/calls" && ! grep -q 'setup --apply' "$RS/calls" && [ -f "$RS/home/.memex-local/enrol/studio-2.signin" ] && case "$(rd signin)" in "waiting "*) true ;; *) false ;; esac \
   && ok "the network not up yet: the sign-in waits (reading signin = waiting), the hand-over is kept" || bad "signin waits" "$(cat "$RS/calls") / $(rd signin)"
+# 6c'. a hand-over that is not 0600, or a facts file missing one value: refused, never installed
+chmod 644 "$RS/home/.memex-local/enrol/studio-2.signin"
+rsrun SM_AWAIT=1 SM_TS=Running SM_USER="$(id -un)"
+! grep -q 'internal on' "$RS/calls" && case "$(rd signin)" in "failed "*"0600"*) true ;; *) false ;; esac && ok "a hand-over that is not 0600 is REFUSED, never installed" || bad "signin mode" "$(rd signin)"
+chmod 600 "$RS/home/.memex-local/enrol/studio-2.signin"; printf 'clientId=11111111-bbbb\n' > "$RS/home/.memex-local/enrol/studio-2.signin-facts"
+rsrun SM_AWAIT=1 SM_TS=Running SM_USER="$(id -un)"
+! grep -q 'internal on' "$RS/calls" && case "$(rd signin)" in "failed "*"no valid tenant"*) true ;; *) false ;; esac && ok "a facts file missing the tenant is refused (each value checked on its own)" || bad "signin facts" "$(rd signin)"
+rm -f "$RS/home/.memex-local/internal.yaml"
 # 6d. joined but NO sign-in and no hand-over (memex-local before the fix dropped it): set aside, a FRESH join is filed
 rm -f "$RS/home/.memex-local/enrol/studio-2.signin" "$RS/home/.memex-local/enrol/studio-2.signin-facts"
 rsrun SM_AWAIT=1 SM_JOIN_RC=3 SM_JOIN_OUT='open https://control.example.test/Hosting/Heartbeats/Enrol/req-new to approve'

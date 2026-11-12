@@ -938,21 +938,29 @@ wait_setup_applied() {
 # <id>.signin-facts naming tenant and clientId) is installed with `memex-local internal on` as the person once the
 # private network is up — the secret on stdin from its file, never an argument or a log line — and then removed.
 step_signin_install() {
-  local user="$1" machine="$2" mlocal="$3" home f facts tenant cid out
+  local user="$1" machine="$2" mlocal="$3" home f facts tenant cid out v
+  SIGNIN_WAITING=""
   home="$(user_home "$user")"; f="$home/.memex-local/enrol/$machine.signin"; facts="$f-facts"
   [ -e "$f" ] || [ -L "$f" ] || return 0
-  if [ -L "$f" ] || [ ! -f "$f" ] || [ "$(stat -f%Su "$f" 2>/dev/null)" != "$user" ]; then
-    log "memex: REFUSED the handed-over sign-in ($f is not a regular file owned by $user)"; write_reading signin failed "the hand-over file is not $user's regular file"; return 1
+  # the one file holding the cleartext secret: the person's own regular file, and 0600 (review on #284)
+  if [ -L "$f" ] || [ ! -f "$f" ] || [ "$(stat -f%Su "$f" 2>/dev/null)" != "$user" ] || [ "$(stat -f%Lp "$f" 2>/dev/null)" != 600 ]; then
+    log "memex: REFUSED the handed-over sign-in ($f is not a 0600 regular file owned by $user)"; write_reading signin failed "the hand-over file is not $user's 0600 regular file"; return 1
   fi
   tenant="$(sed -n 's/^tenant=//p' "$facts" 2>/dev/null | head -1)"; cid="$(sed -n 's/^clientId=//p' "$facts" 2>/dev/null | head -1)"
-  case "$tenant$cid" in *[!A-Za-z0-9._-]*|'') log "memex: the handed-over sign-in has no valid tenant/client id ($facts)"; write_reading signin failed "no valid tenant/client id beside the hand-over"; return 1 ;; esac
+  for v in "$tenant" "$cid"; do   # each one on its own (review on #284): an empty one never reaches `internal on`
+    case "$v" in ''|*[!A-Za-z0-9._-]*) log "memex: the handed-over sign-in has no valid tenant/client id ($facts)"; write_reading signin failed "no valid tenant/client id beside the hand-over"; return 1 ;; esac
+  done
   if [ "$(ts_backend_state)" != Running ]; then
+    # the caller ends the step on this: the setup is never answered without a sign-in (review on #284)
+    SIGNIN_WAITING=1
     log "memex: WAITING for the private network before installing the handed-over sign-in ($cid)"; write_reading signin waiting "the network is not up yet"; return 0
   fi
   log "memex: installing the handed-over sign-in ($cid) with 'memex-local internal on' (the secret from its file, never printed)"
   if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then printf 'DRY-RUN: memex-local internal on --tenant %s --client-id %s < %s\n' "$tenant" "$cid" "$f"; return 0; fi
-  if out="$(as_user "$user" /bin/sh -c 'exec "$0" internal on --tenant "$1" --client-id "$2" < "$3"' "$mlocal" "$tenant" "$cid" "$f" 2>&1)"; then
+  if out="$(as_user "$user" /bin/sh -c 'exec "$0" internal on --tenant "$1" --client-id "$2" < "$3"' "$mlocal" "$tenant" "$cid" "$f" 2>&1)" \
+     && [ -f "$home/.memex-local/internal.yaml" ]; then
     as_user "$user" /bin/rm -f "$f" "$facts"
+    SIGNIN_INSTALLED=1
     log "memex: sign-in installed ($cid); the hand-over removed"; write_reading signin ok "this Mac's own sign-in app $cid"
     return 0
   fi
@@ -1028,7 +1036,9 @@ step_memex() {
     # joined, the setup still pending: a sign-in the join HANDED OVER (no network name at the time) is installed now
     if [ -f "$home/.memex-local/fleet.yaml" ]; then
       step_signin_install "$user" "$machine" "$mlocal" || return 1
-      if [ ! -f "$home/.memex-local/internal.yaml" ] && [ ! -f "$home/.memex-local/enrol/$machine.signin" ]; then
+      [ -n "${SIGNIN_WAITING:-}" ] && return 0
+      # never re-file in the run that has just installed the sign-in (review on #284)
+      if [ -z "${SIGNIN_INSTALLED:-}" ] && [ ! -f "$home/.memex-local/internal.yaml" ] && [ ! -f "$home/.memex-local/enrol/$machine.signin" ]; then
         # joined, but its sign-in never landed (a memex-local before the hand-over dropped it) — the setup can never pass
         # and the issued secret is gone with the join's throw-away key: a FRESH join issues a new one (owner, 2026-11-12)
         log "memex: joined but this Mac's SIGN-IN is missing (no internal.yaml) — filing a fresh join for a new one"
@@ -1047,6 +1057,7 @@ step_memex() {
       # hour later (the first Mac mini waited a full run for nothing, 2026-11-12)
       # the join's sign-in, when it was handed over (the network came up only with the join): installed before the setup
       step_signin_install "$user" "$machine" "$mlocal" || return 1
+      [ -n "${SIGNIN_WAITING:-}" ] && return 0
       log "memex: joined before the setup — answering the setup now (the sign-in is installed)"
     fi
     answer_setup "$user" "$machine" "$mlocal" || return
