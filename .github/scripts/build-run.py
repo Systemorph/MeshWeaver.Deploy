@@ -4130,7 +4130,7 @@ PLATFORM_REPO = "MeshWeaver"
 #   * the platform set (MW_BUILD_PLATFORM_VERSION), its framework identity and its tester and portal image digests: the
 #     compiler and the reference set a build compiles against (determined by the set; listed so a re-sealed set with the same
 #     version still rebuilds);
-#   * the .NET SDKs the runner image carries: the floating `dotnet/sdk:10.0` base can move under an unchanged Dockerfile, and
+#   * the .NET SDKs the runner image carries: the floating `dotnet/sdk:11.0` base can move under an unchanged Dockerfile, and
 #     the SDK is the compiler too;
 #   * the CPU architecture (a property of the machine, never of the set);
 #   * WARM_LAYOUT, bumped BY HAND for a change to this runner that changes what a tree's outputs mean (rare).
@@ -7759,7 +7759,7 @@ def self_test() -> int:
     t = OutputParser("/work/run2/src", "portal-hosts")
     out: list[dict] = []
     for ln in [
-        "Test run for /work/run2/src/bin/MeshWeaver.Hosting.Test.dll (.NETCoreApp,Version=v10.0)",
+        "Test run for /work/run2/src/bin/MeshWeaver.Hosting.Test.dll (.NETCoreApp,Version=v11.0)",
         "  Passed MeshWeaver.Hosting.Test.QueueTest.Claims [12 ms]",
         "  Failed MeshWeaver.Hosting.Test.QueueTest.Orders [1 s]",
         "  Error Message:",
@@ -7787,9 +7787,9 @@ def self_test() -> int:
     il = OutputParser("/work/run2/src", "portal-hosts")
     io_: list[dict] = []
     for ln in [
-        "::mw-lane::1::Test run for /work/run2/src/bin/Alpha.Test.dll (.NETCoreApp,Version=v10.0)",
+        "::mw-lane::1::Test run for /work/run2/src/bin/Alpha.Test.dll (.NETCoreApp,Version=v11.0)",
         "::mw-lane::1::  Failed Alpha.Test.Suite.Breaks [1 s]",
-        "::mw-lane::2::Test run for /work/run2/src/bin/Beta.Test.dll (.NETCoreApp,Version=v10.0)",
+        "::mw-lane::2::Test run for /work/run2/src/bin/Beta.Test.dll (.NETCoreApp,Version=v11.0)",
         "::mw-lane::1::  Error Message:",
         "::mw-lane::2::  Passed Beta.Test.Suite.Holds [3 ms]",
         "::mw-lane::1::   alpha went wrong",
@@ -8146,7 +8146,7 @@ def self_test() -> int:
     # The host's OWN sandbox binds every staged image root read-only — /core-tests included: core's
     # shard and doc-gate stages run `python3 /core-tests/core-tests.py …` (core .github/build-stages.json).
     hav = " ".join(Host({}, None, log=lambda s: None).sandbox.argv("true", "/w/s", "/w/o", {}))
-    long_unit = "diagnostics/portal-hosts/test-logs/src__MeshWeaver.Fleet.Control.Test__bin__Release__net10.0__test-logs__" + "A" * 300 + ".log"
+    long_unit = "diagnostics/portal-hosts/test-logs/src__MeshWeaver.Fleet.Control.Test__bin__Release__net11.0__test-logs__" + "A" * 300 + ".log"
     short_unit = artifact_unit(long_unit)
     check("artifact/a unit too long for the store's receipt is shortened deterministically, its directory and extension kept",
           len(short_unit) <= ARTIFACT_UNIT_MAX and short_unit.startswith("diagnostics/portal-hosts/test-logs/") and short_unit.endswith(".log")
@@ -8844,26 +8844,26 @@ def self_test() -> int:
                   warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.1"}, "c003") != warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.2"}, "c003")
                   and warm_key({}, "a") != warm_key({}, "b")
                   and warm_key({"MW_BUILD_TESTER_DIGEST": "t"}, "a") != warm_key({}, "a")
-                  and warm_key({TOOLCHAIN_ENV: "sdk=10.0.403"}, "a") != warm_key({TOOLCHAIN_ENV: "sdk=10.0.404"}, "a"))
+                  and warm_key({TOOLCHAIN_ENV: "sdk=11.0.100"}, "a") != warm_key({TOOLCHAIN_ENV: "sdk=11.0.101"}, "a"))
             check("warm/the RUNNER IMAGE DIGEST keys nothing: a rebuilt runner with the same compiler keeps the tree's obj/ and bin/",
                   warm_key({"MW_BUILD_RUNNER_DIGEST": "sha256:" + "a" * 64, TOOLCHAIN_ENV: "x"}, "a")
                   == warm_key({"MW_BUILD_RUNNER_DIGEST": "sha256:" + "b" * 64, TOOLCHAIN_ENV: "x"}, "a"))
             # the compiler part: the SDKs and the architecture; NOT the runner's code or its helpers (a Deploy merge moves those)
             tc_dn = os.path.join(wroot, "tc-dotnet")
-            os.makedirs(os.path.join(tc_dn, "sdk", "10.0.403"))
+            os.makedirs(os.path.join(tc_dn, "sdk", "11.0.100"))
             open(os.path.join(tc_dn, "dotnet"), "w").close()
             tc_which = lambda n: os.path.join(tc_dn, "dotnet") if n == "dotnet" else None
             tc0 = build_toolchain(tc_which)
             check("toolchain/it names the layout, the architecture and the SDKs — and nothing of the runner (no code, no helpers)",
-                  f"layout={WARM_LAYOUT}" in tc0 and "arch=" in tc0 and "sdk=10.0.403" in tc0
+                  f"layout={WARM_LAYOUT}" in tc0 and "arch=" in tc0 and "sdk=11.0.100" in tc0
                   and "code=" not in tc0 and "helpers=" not in tc0, tc0)
             real_wk = globals()["WARM_KEEP"]
             globals()["WARM_KEEP"] = real_wk + ("planted/",)
             check("toolchain/a change to the runner's build code (a Deploy merge) leaves it unchanged — no whole rebuild",
                   build_toolchain(tc_which) == tc0)
             globals()["WARM_KEEP"] = real_wk
-            os.makedirs(os.path.join(tc_dn, "sdk", "10.0.404"))
-            check("toolchain/another .NET SDK in the image changes it (a new compiler)", "sdk=10.0.403,10.0.404" in build_toolchain(tc_which))
+            os.makedirs(os.path.join(tc_dn, "sdk", "11.0.101"))
+            check("toolchain/another .NET SDK in the image changes it (a new compiler)", "sdk=11.0.100,11.0.101" in build_toolchain(tc_which))
             no_root = build_toolchain(lambda n: None)
             check("toolchain/no dotnet is NAMED in the value (never an exception, never the empty digest)", "sdk=no-dotnet" in no_root, no_root)
             check("warm/opt-in only", warm_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}) and not warm_enabled({}))
@@ -10339,7 +10339,7 @@ def self_test() -> int:
         def fixture_zip(signed_: bool, encrypted_: bool = False) -> bytes:
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-                for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net10.0/Demo.dll", b"the-real-dll"),
+                for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net11.0/Demo.dll", b"the-real-dll"),
                                ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
                     z.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_)
                 if signed_:
@@ -10366,11 +10366,11 @@ def self_test() -> int:
         # match what the fixture records) — extraction raises zlib.error, which must be a refusal, never a crash.
         _cz = io.BytesIO()
         with zipfile.ZipFile(_cz, "w", zipfile.ZIP_DEFLATED) as z:
-            for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net10.0/Demo.dll", b"the-real-dll" * 64),
+            for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net11.0/Demo.dll", b"the-real-dll" * 64),
                            ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
                 z.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_, compress_type=zipfile.ZIP_DEFLATED)
         corrupt_zip = bytearray(_cz.getvalue())
-        _at = corrupt_zip.find(b"PK\x03\x04", corrupt_zip.find(b"lib/net10.0/Demo.dll") - 30)
+        _at = corrupt_zip.find(b"PK\x03\x04", corrupt_zip.find(b"lib/net11.0/Demo.dll") - 30)
         _data = _at + 30 + struct.unpack_from("<H", corrupt_zip, _at + 26)[0] + struct.unpack_from("<H", corrupt_zip, _at + 28)[0]
         corrupt_zip[_data:_data + 4] = b"\xff\xff\xff\xff"
         corrupt_zip = bytes(corrupt_zip)
@@ -10406,7 +10406,7 @@ def self_test() -> int:
             return root_
         _fz = io.BytesIO()
         with zipfile.ZipFile(_fz, "w", zipfile.ZIP_DEFLATED) as z:
-            for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net10.0/Demo.dll", b"NOT-the-published-dll"),
+            for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net11.0/Demo.dll", b"NOT-the-published-dll"),
                            ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
                 z.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_)
         forged_zip = _fz.getvalue()
@@ -10585,15 +10585,15 @@ def self_test() -> int:
             root_ = os.path.join(tmp, f"pkg-{kind_}")
             d_ = os.path.join(root_, "demo.pkg", "1.0.0")
             shutil.rmtree(root_, ignore_errors=True)
-            os.makedirs(os.path.join(d_, "lib", "net10.0"))
+            os.makedirs(os.path.join(d_, "lib", "net11.0"))
             b_ = (signed_zip if kind_ == "signed" else encrypted_zip if kind_ == "encrypted"
                   else corrupt_zip if kind_ == "corrupt" else unsigned_)
             open(os.path.join(d_, "demo.pkg.1.0.0.nupkg"), "wb").write(b_)
             open(os.path.join(d_, "demo.pkg.1.0.0.nupkg.sha512"), "w").write(b64sha(b_))
             open(os.path.join(d_, "demo.pkg.nuspec"), "wb").write(b"<package/>")
-            open(os.path.join(d_, "lib", "net10.0", "Demo.dll"), "wb").write(b"POISONED" if kind_ == "tamper" else b"the-real-dll")
+            open(os.path.join(d_, "lib", "net11.0", "Demo.dll"), "wb").write(b"POISONED" if kind_ == "tamper" else b"the-real-dll")
             if kind_ == "tamper":
-                open(os.path.join(d_, "lib", "net10.0", "Extra.targets"), "w").write("<Project/>")
+                open(os.path.join(d_, "lib", "net11.0", "Extra.targets"), "w").write("<Project/>")
             json.dump({"version": 2, "contentHash": "forged" if kind_ == "forged" else nupkg_content_hash(b_),
                        "source": "https://api.nuget.org/v3/index.json"},
                       open(os.path.join(d_, ".nupkg.metadata"), "w"))
@@ -10659,9 +10659,9 @@ def self_test() -> int:
         check("prepared/negative control: a package whose hash is not what NuGet recorded is NOT promoted", not os.path.exists(warm))
         host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("tamper")}]})).run(dict(claim, isTrunk=True))
         check("prepared/negative control: an ALTERED extracted file never reaches the warm cache — it is rebuilt from the verified archive",
-              os.path.isfile(os.path.join(warm, "lib", "net10.0", "Demo.dll"))
-              and open(os.path.join(warm, "lib", "net10.0", "Demo.dll"), "rb").read() == b"the-real-dll"
-              and not os.path.exists(os.path.join(warm, "lib", "net10.0", "Extra.targets")))
+              os.path.isfile(os.path.join(warm, "lib", "net11.0", "Demo.dll"))
+              and open(os.path.join(warm, "lib", "net11.0", "Demo.dll"), "rb").read() == b"the-real-dll"
+              and not os.path.exists(os.path.join(warm, "lib", "net11.0", "Extra.targets")))
         shutil.rmtree(os.path.join(cache, "nuget"))
         # what an EARLIER stage restored (present before the build stage started) is promoted by the build stage too
         host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [
@@ -10771,7 +10771,7 @@ def self_test() -> int:
         # MODE MIGRATION (review of #109): a package an OLDER runner rebuilt lives ONLY in the cache — the stage reads it
         # in place from the fallback folder, so it never reaches `restored`, and the held warm key skips promotion. The
         # run still repairs its modes before any stage (a 0644 protoc stays unexecutable otherwise).
-        legacy_ = os.path.join(warm_pkg, "lib", "net10.0", "Demo.dll")
+        legacy_ = os.path.join(warm_pkg, "lib", "net11.0", "Demo.dll")
         os.remove(os.path.join(warm_pkg, NUGET_MATERIALIZED_MARK))
         os.chmod(legacy_, 0o644)
         posted.clear()
@@ -12595,7 +12595,7 @@ def self_test() -> int:
             except Refusal as e:
                 check("compile refs/the portal's /app alone (the old staging) is refused",
                       "NO shared frameworks" in str(e) and "MW_BUILD_COMPILE_REFS" in str(e), e)
-            fx = os.path.join(cr, "shared-frameworks", "Microsoft.NETCore.App", "10.0.0")
+            fx = os.path.join(cr, "shared-frameworks", "Microsoft.NETCore.App", "11.0.0")
             os.makedirs(fx)
             open(os.path.join(fx, "System.Private.CoreLib.dll"), "wb").close()
             check("compile refs/NEGATIVE CONTROL: a set without System.Reactive.dll is refused (core's checker refuses it too)",
@@ -12747,7 +12747,7 @@ def self_test() -> int:
         def seed_pkg(name_: str) -> bytes:
             buf_ = io.BytesIO()
             with zipfile.ZipFile(buf_, "w", zipfile.ZIP_DEFLATED) as z_:
-                for n_, b_ in ((f"{name_}.nuspec", b"<package/>"), (f"lib/net10.0/{name_}.dll", name_.encode()),
+                for n_, b_ in ((f"{name_}.nuspec", b"<package/>"), (f"lib/net11.0/{name_}.dll", name_.encode()),
                                ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
                     z_.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_)
             return buf_.getvalue()

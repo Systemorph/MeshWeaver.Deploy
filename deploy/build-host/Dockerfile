@@ -29,7 +29,7 @@
 #     --build-arg PLATFORM_COMMIT=<platform sha> deploy/build-host
 # Handed to the hosts BY DIGEST with the rest of the set (`BuildHostChannel.RunnerDigest`). No moving
 # tag names it anywhere.
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS sources
+FROM mcr.microsoft.com/dotnet/sdk:11.0 AS sources
 
 # 40-hex commits only: a branch or tag would let one version's image be rebuilt from other bytes.
 ARG DEPLOY_COMMIT
@@ -90,7 +90,7 @@ RUN set -eu; \
     sed -e 's/#.*//' -e 's/[[:space:]]//g' "$l" | grep -v '^$' > /out/browser/chromium-fonts.list; \
     [ -s /out/browser/chromium-fonts.list ] || { echo ".github/chromium-fonts.list at $PLATFORM_COMMIT names no package"; exit 1; }
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0
+FROM mcr.microsoft.com/dotnet/sdk:11.0
 
 # PostgreSQL 17 with pgvector from the PostgreSQL project's own apt repository — the SAME major and
 # extension line the CI runners' shared server and the developer container run (pgvector/pgvector:pg17);
