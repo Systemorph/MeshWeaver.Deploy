@@ -1272,11 +1272,11 @@ main() {
   check_password "$user"
   machine="$(machine_id)"
   log "run for console user $user, machine $machine"
+  # 75 (EX_TEMPFAIL): a give-up is never read as a finished run by anything that calls main
+  acquire_run_lock 900 || { log "another bootstrap run (the join poller's continuation) holds the run lock for over 15 min — this run stops; the next one retries"; exit 75; }
   # which bootstrap ran — readable without root (the Intune agent runs a CACHED copy until its full sync, so the pinned
   # version and the running one can differ for hours; measured on the first Mac mini, 2026-11-12)
   write_reading version "$FLEET_BOOTSTRAP_VERSION" "run started"
-  # 75 (EX_TEMPFAIL): a give-up is never read as a finished run by anything that calls main
-  acquire_run_lock 900 || { log "another bootstrap run (the join poller's continuation) holds the run lock for over 15 min — this run stops; the next one retries"; exit 75; }
   # the operator's way in comes before everything that can fail: a Mac whose later steps fail is still reachable
   # failures that must not stop the rest of the run (operator SSH, the energy enabler): exit 1 at the end
   local deferred_failed=0
