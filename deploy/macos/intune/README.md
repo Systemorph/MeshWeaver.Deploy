@@ -70,7 +70,11 @@ least one way to sign in"*), and the join was never filed. So when the portal is
 has not joined, the bootstrap runs `fleet join --no-update --heartbeat-wait 0` first; the Approve's items install the
 sign-in as host configuration (which the setup accepts — `configuredElsewhere`), and a later run answers the setup and
 finishes (back-lease enrolment + update). The earlier Macs passed this step because a person answered the browser
-wizard before the join.
+wizard before the join. Since 1.10.0 a pre-setup join that is collected goes straight on in the SAME run: the setup
+is answered (the sign-in is installed by then), the bootstrap waits up to `FLEET_SETUP_WAIT_S` (600 s) for the portal to
+restart configured, and the finalisation (back-lease enrolment + update) follows — on the first Mac mini that was an
+hour's wait for nothing. Every step rewrites its own reading whoever runs it (the network step's reading had stayed at a
+stale WAITING after the join's own call brought the tailnet up).
 
 **Operator SSH — optional**: `OperatorSshKeys`, a list of OpenSSH PUBLIC keys (a profile array, one key per
 element; the reconcile writes it as an array, never comma-joined; a newline-separated string is read too; environment

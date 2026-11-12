@@ -61,7 +61,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.9.0"
+readonly FLEET_BOOTSTRAP_VERSION="1.10.0"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -762,7 +762,18 @@ drop_preauth_keys() {
   done
 }
 
+# The network step's OWN reading, written whoever runs it (review of the first Mac mini, 2026-11-12: the join's call
+# brought the tailnet up at 19:23:02 and the reading kept the 19:22:33 "WAITING for a single-use pre-auth key").
 step_network() {
+  local rc v
+  LAST_LOG=""
+  step_network_inner "$@"; rc=$?
+  if [ "$rc" != 0 ]; then v=failed; else case "$LAST_LOG" in *WAITING*) v=waiting ;; *) v=ok ;; esac; fi
+  write_reading network "$v" "$LAST_LOG"
+  return "$rc"
+}
+
+step_network_inner() {
   local machine="$1" user="${2:-}" ts=("$TS_DIR/bin/tailscale" --socket="$TAILSCALED_SOCKET") state
   state="$(ts_backend_state)"
   case "$state" in
@@ -897,6 +908,23 @@ answer_setup() {
   return 0
 }
 
+# After the setup was answered the portal restarts configured: wait for that (bounded, FLEET_SETUP_WAIT_S, default
+# 600 s) so the finalisation follows in the same run. Returns 1 — WAITING said — when it has not restarted in time.
+wait_setup_applied() {
+  local user="$1" waited=0 max="${FLEET_SETUP_WAIT_S:-600}"
+  [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] && { log "memex: (dry run) would wait for the portal to restart configured"; return 1; }
+  while probe_as_user "$user" env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(memex_libexec)/share" MEMEX_CHART_DIR="$(memex_libexec)/share/helm" \
+          /bin/bash -c '. "$0"; awaiting_setup' "$(memex_libexec)/memex-local"; do
+    if [ "$waited" -ge "$max" ]; then
+      STEP_STAGE="setup"; log "memex: WAITING for the portal to restart configured after the setup (${max} s so far) — the next run finishes"
+      return 1
+    fi
+    sleep 15; waited=$((waited + 15))
+  done
+  log "memex: the portal restarted configured after ${waited} s — finishing in this run"
+  return 0
+}
+
 step_memex() {
   local user="$1" machine="$2" control registry home mlocal
   control="$(setting FLEET_CONTROL_URL ControlUrl)"; registry="$(setting FLEET_REGISTRY_URL RegistryUrl)"
@@ -964,9 +992,15 @@ step_memex() {
     # sign-in as host configuration, which the setup then accepts. The setup is answered on a later run.
     if [ ! -f "$home/.memex-local/fleet.yaml" ]; then
       log "memex: the portal is in first-run setup and this Mac has not joined — a fleet Mac's sign-in arrives with the enrolment, so the join runs BEFORE the setup"
-      run_join "$user" "$machine" "$control" "$mlocal" pre-setup; return
+      run_join "$user" "$machine" "$control" "$mlocal" pre-setup || return
+      # not collected yet (waiting for the Approve): nothing more this run
+      [ -f "$home/.memex-local/fleet.yaml" ] || [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] || return 0
+      # collected — the sign-in is installed now: the setup and the finalisation follow in THIS run (1.10.0), never an
+      # hour later (the first Mac mini waited a full run for nothing, 2026-11-12)
+      log "memex: joined before the setup — answering the setup now (the sign-in is installed)"
     fi
-    answer_setup "$user" "$machine" "$mlocal"; return
+    answer_setup "$user" "$machine" "$mlocal" || return
+    wait_setup_applied "$user" || return 0
   fi
   [ -e "$STATE_DIR/setup.answered" ] && run rm -f "$STATE_DIR/setup.answered"
   write_reading setup ok "the portal is configured"
@@ -1014,8 +1048,9 @@ run_join() {
        # so its own log lines never overwrite the verdict this step leaves for track() (review on #276)
        step_network "$machine" "$user" || true
        if [ "$mode" = pre-setup ]; then
-         write_reading join ok "joined as $machine (before the setup; the setup and the finalisation follow)"
-         STEP_STAGE="setup"; log "memex: joined as $machine before the setup — WAITING for the next run to answer the setup (the sign-in is now installed) and finish"
+         # the caller (step_memex) goes on into the setup and the finalisation in this same run
+         write_reading join ok "joined as $machine (before the setup; the setup and the finalisation follow in this run)"
+         log "memex: joined as $machine before the setup"
        else
          as_user "$user" /usr/bin/touch "$home/.memex-local/fleet.finalized" || true
          write_reading join ok "joined as $machine"; log "memex: joined as $machine"
