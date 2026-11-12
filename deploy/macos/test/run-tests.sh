@@ -660,13 +660,14 @@ chmod +x "$NT/ts/bin/tailscale"
 nt() {  # $1 = states (space-separated); rest = extra env
   local st="$1"; shift; printf '%s\n' $st > "$NT/states"; rm -f "$NT/n" "$NT/up.log"
   env FLEET_BOOTSTRAP_LIB=1 FLEET_TS_DIR="$NT/ts" FLEET_TAILSCALED_SOCKET="$NT/sock" FLEET_TAILSCALED_STATE_DIR="$NT/state" \
-    FLEET_USER_HOME="$NT/u" FLEET_LOG_DIR="$NT/log" FLEET_MANAGED_PREFS="$NT/none" FLEET_LOGIN_SERVER=https://hs.example.test FLEET_TS_SETTLE_S=4 "$@" \
+    FLEET_USER_HOME="$NT/u" FLEET_LOG_DIR="$NT/log" FLEET_MANAGED_PREFS="$NT/none" FLEET_STATE_DIR="$NT/rd" FLEET_LOGIN_SERVER=https://hs.example.test FLEET_TS_SETTLE_S=4 "$@" \
     bash -c '. "$0"; step_network studio-2 "$(id -un)"; echo "RC=$?"' "$FB" 2>&1; }
 # 1. THE RESTART RACE: status fails while the daemon starts, then Running — a held (spent) key is NOT presented, and goes
 printf 'spent' > "$NT/state/preauth.key"; printf '{"_profiles":"x"}' > "$NT/state/tailscaled.state"
 OUT="$(nt "FAIL Starting Running")"
 [ ! -s "$NT/up.log" ] && grep -q 'network: joined (BackendState Running)' <<<"$OUT" && [ ! -e "$NT/state/preauth.key" ] \
   && ok "after a daemon restart the step WAITS for a settled state: Running → joined, no 'up', the held spent key removed (the second Mac Studio was logged out here)" || bad "restart race" "$OUT / up: $(cat "$NT/up.log" 2>/dev/null)"
+case "$(head -1 "$NT/rd/network" 2>/dev/null)" in "ok "*) ok "the network step rewrites its OWN reading whoever runs it (the join's call left a stale WAITING on the first Mac mini)" ;; *) bad "network reading rewritten" "$(cat "$NT/rd/network" 2>/dev/null)" ;; esac
 # 2. a registered node that IS logged out, with only the spent key held: the key is removed, never presented
 printf 'spent' > "$NT/state/preauth.key"
 OUT="$(nt "NeedsLogin")"
@@ -842,15 +843,16 @@ echo "── a fleet Mac joins BEFORE its first-run setup; every step leaves a r
 RS="$(mktemp -d)"; mkdir -p "$RS/home/.memex-local" "$RS/st"
 SMW='as_user() { shift; printf "%s\n" "$*" >> "$SM_CALLS"
       case "$*" in *-CAROOT*) printf "%s" "$SM_CAROOT" ;;
-        *"fleet join"*) printf "%b\n" "${SM_JOIN_OUT:-}"; return "${SM_JOIN_RC:-0}" ;;
-        *"setup --apply"*) printf "%b\n" "${SM_SETUP_OUT:-}"; return "${SM_SETUP_RC:-0}" ;; esac; return 0; }
-    probe_as_user() { case "$*" in *verify*) return 0 ;; *awaiting_setup*) [ "${SM_AWAIT:-0}" = 1 ] ;; *) return 1 ;; esac; }
+        *"fleet join"*) printf "%b\n" "${SM_JOIN_OUT:-}"; [ "${SM_JOIN_RC:-0}" = 0 ] && : > "$FLEET_USER_HOME/.memex-local/fleet.yaml"; return "${SM_JOIN_RC:-0}" ;;
+        *"setup --apply"*) printf "%b\n" "${SM_SETUP_OUT:-}"; [ "${SM_SETUP_RC:-0}" = 0 ] && : > "$SM_CALLS.applied"; return "${SM_SETUP_RC:-0}" ;; esac; return 0; }
+    probe_as_user() { case "$*" in *verify*) return 0 ;;
+        *awaiting_setup*) [ "${SM_AWAIT:-0}" = 1 ] || return 1; [ "${SM_AWAIT_UNTIL_APPLIED:-}" = 1 ] && [ -e "$SM_CALLS.applied" ] && return 1; return 0 ;; *) return 1 ;; esac; }
     notify_user() { printf "NOTIFY %s | %s\n" "$2" "$3"; }
     read_participation >/dev/null; track memex step_memex jroe studio-2; rc=$?; finish_stage jroe; echo "rc=$rc"'
 mkdir -p "$RS/ld" "$RS/bin" "$RS/pbin"; printf '#!/bin/bash\nexit 0\n' > "$RS/pbin/launchctl"; chmod +x "$RS/pbin/launchctl"
-rsrun() { : > "$RS/calls"; OUT="$(env $FCA_ENV PATH="$RS/pbin:$T/secb:$PATH" FLEET_LAUNCHDAEMONS_DIR="$RS/ld" FLEET_BIN_DIR="$RS/bin" FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$RS/log" FLEET_MANAGED_PREFS="$RS/none" FLEET_USER_HOME="$RS/home" FLEET_BREW_PREFIX="$RS/brew" \
+rsrun() { : > "$RS/calls"; rm -f "$RS/calls.applied"; OUT="$(env $FCA_ENV PATH="$RS/pbin:$T/secb:$PATH" FLEET_LAUNCHDAEMONS_DIR="$RS/ld" FLEET_BIN_DIR="$RS/bin" FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$RS/log" FLEET_MANAGED_PREFS="$RS/none" FLEET_USER_HOME="$RS/home" FLEET_BREW_PREFIX="$RS/brew" \
   FLEET_STATE_DIR="$RS/st" FLEET_CONTROL_URL=https://control.example.test SM_CALLS="$RS/calls" SM_CAROOT="$T/sm/caroot" FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=false \
-  FLEET_ORGANISATION=Acme FLEET_OWNER_NAME="Jane Roe" FLEET_OWNER_EMAIL=jane.roe@example.com FLEET_ACCEPT_TERMS=true FLEET_CA_SHA256="$FSHA" "$@" bash -c '. "$0"; '"$SMW" "$FB" 2>&1)"; }
+  FLEET_ORGANISATION=Acme FLEET_OWNER_NAME="Jane Roe" FLEET_OWNER_EMAIL=jane.roe@example.com FLEET_ACCEPT_TERMS=true FLEET_CA_SHA256="$FSHA" FLEET_SETUP_WAIT_S=0 "$@" bash -c '. "$0"; '"$SMW" "$FB" 2>&1)"; }
 rd() { head -1 "$RS/st/$1" 2>/dev/null; }
 # 1. in first-run setup, not joined: the join runs FIRST (no update, no heartbeat wait); the setup is NOT answered
 rsrun SM_AWAIT=1 SM_JOIN_RC=3 SM_JOIN_OUT='open https://control.example.test/Hosting/Heartbeats/Enrol/studio-2-abc to approve'
@@ -859,10 +861,17 @@ grep -q 'fleet join --control https://control.example.test --id studio-2 --no-op
 case "$(rd join)" in "waiting-approval "*"request filed; waiting for the Approve on control: https://control.example.test/Hosting/Heartbeats/Enrol/studio-2-abc") ok "…reading join = waiting-approval, with the approval link" ;; *) bad "join reading" "$(rd join)" ;; esac
 case "$(rd stage)" in "waiting-approval "*"join: "*) ok "…reading stage names the join, waiting for the Approve" ;; *) bad "stage approval" "$(rd stage)" ;; esac
 case "$OUT" in *"NOTIFY Fleet join not filed"*) bad "waiting for the Approve is not a failed join: no 'not filed' notification" "$OUT" ;; *) ok "…and no 'join not filed' notification (waiting for the Approve is not a failure; the filing itself is announced — 1.9.0)" ;; esac
-# 2. the pre-setup join succeeds: joined, but NOT finalised (the setup and the finalisation follow)
+# 2. the pre-setup join succeeds: the setup is answered in THE SAME RUN (1.10.0), never marked finalised before it
+rm -f "$RS/home/.memex-local/fleet.yaml" "$RS/st/setup.answered"
 rsrun SM_AWAIT=1 SM_JOIN_RC=0 SM_JOIN_OUT='joined as studio-2'
-case "$(rd join)" in "ok "*"before the setup"*) ! grep -q 'fleet.finalized' "$RS/calls" && ok "a join before the setup is recorded (join ok) and never marked finalised" || bad "pre-setup finalized" "$(cat "$RS/calls")" ;; *) bad "pre-setup join ok" "$(rd join) / $OUT" ;; esac
-case "$(rd stage)" in "waiting "*"setup: memex: joined as studio-2 before the setup — WAITING for the next run to answer the setup"*) ok "…and stage reads waiting at the setup — never 'done' while the setup and the finalisation are pending (review on #276: the network step's log must not overwrite it)" ;; *) bad "pre-setup stage" "$(rd stage)" ;; esac
+case "$(rd join)" in "ok "*"before the setup"*) grep -q 'setup --apply' "$RS/calls" && ! grep -q 'fleet.finalized' "$RS/calls" && ok "a pre-setup join that is collected answers the setup in the SAME run (no hour's wait), and nothing is finalised while the portal is still in setup" || bad "same-run setup" "$(cat "$RS/calls")" ;; *) bad "pre-setup join ok" "$(rd join) / $OUT" ;; esac
+case "$(rd stage)" in "waiting "*"setup: memex: WAITING for the portal to restart configured"*) ok "…and when the portal has not restarted configured in time, stage reads waiting at the setup — never 'done'" ;; *) bad "pre-setup stage" "$(rd stage)" ;; esac
+# 2b. …and when the portal restarts configured, the finalisation follows in the same run too
+rm -f "$RS/home/.memex-local/fleet.yaml" "$RS/home/.memex-local/fleet.finalized" "$RS/st/setup.answered"
+rsrun SM_AWAIT=1 SM_AWAIT_UNTIL_APPLIED=1 SM_JOIN_RC=0 SM_JOIN_OUT='joined as studio-2'
+grep -q 'setup --apply' "$RS/calls" && grep -q 'backlease enroll' "$RS/calls" && grep -q 'memex-local update' "$RS/calls" && grep -q 'fleet.finalized' "$RS/calls" \
+  && case "$(rd setup):$(rd join)" in "ok "*":ok "*"finished"*) true ;; *) false ;; esac \
+  && ok "the Approve collected before the setup: join → setup → the portal restarts configured → back-lease enrolment + update, ALL in one run" || bad "same-run finalisation" "$(cat "$RS/calls") / setup=$(rd setup) join=$(rd join)"
 # 3. joined, the setup refused — its own words reach the reading, the stage, and the person
 printf 'x' > "$RS/home/.memex-local/fleet.yaml"
 rsrun SM_AWAIT=1 SM_SETUP_RC=1 SM_SETUP_OUT='\033[31merr\033[0m  setup --apply: the portal refused the answers — signIn: Choose at least one way to sign in'
