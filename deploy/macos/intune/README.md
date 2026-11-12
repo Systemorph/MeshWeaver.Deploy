@@ -180,6 +180,13 @@ role `DeviceManagementManagedDevices.PrivilegedOperations.All`, declared in `app
 reports it missing; it is assigned to the app's service principal as an appRoleAssignment — `az ad app permission
 admin-consent` alone did not create it.
 
+🚨 **Measured since (2026-11-12): `syncDevice` delivers PROFILES, not a new SCRIPT.** It wakes the Mac's MDM channel
+(mdmclient), and a pending profile installs within a minute — but the Intune agent (the sidecar that runs the script)
+fetched its script policies only at enrolment and then every 8 h (10:11Z … 18:12Z on the first Mac mini), whatever
+`syncDevice` said; four syncs in between fetched nothing. A bootstrap bump therefore reaches a Mac at its agent's next
+full sync, or sooner only when a person checks in through Company Portal ("Check status"). The reading
+`/Library/MeshWeaver/fleet-state/version` (1.11.1) names the bootstrap that actually ran.
+
 ### The console password that expired at enrolment (2026-11-09)
 
 Read-only Graph on 2026-11-09: no macOS configuration profile and no macOS settings-catalog policy in the tenant
