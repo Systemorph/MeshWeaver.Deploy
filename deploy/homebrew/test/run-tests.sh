@@ -3474,6 +3474,10 @@ echo "not-escrowed 2026-11-12T09:00:00Z command since 2026-11-12T08:00:00Z" > "$
 OUT="$(fd ok)"; RC=$?
 [ "$RC" = 1 ] && grep -q 'bootstrap token: NOT escrowed' <<<"$OUT" && grep -q 'remedy: sign out and back in.*sudo profiles install -type bootstraptoken' <<<"$OUT" \
   && ok "an un-escrowed bootstrap token is RED: sign out and back in first, then 'sudo profiles install -type bootstraptoken'" || bad "doctor bootstrap token red" "rc=$RC $OUT"
+mkdir -p "$FD/home/.memex-local/enrol"; printf 'x' > "$FD/home/.memex-local/enrol/mini-1.signin"
+OUT="$(fd ok)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'sign-in: handed over by the join .* but NOT installed yet' <<<"$OUT" && ok "a handed-over sign-in that is not installed yet is RED in fleet doctor, with its remedy" || bad "doctor pending signin" "rc=$RC $OUT"
+rm -f "$FD/home/.memex-local/enrol/mini-1.signin"
 rm -f "$FD/state/bootstrap-token"
 OUT="$(fd ok)"; RC=$?
 [ "$RC" = 1 ] && grep -q 'bootstrap token: no reading' <<<"$OUT" && ok "no bootstrap-token reading at all is RED (the bootstrap has not run here), never a pass" || bad "doctor no reading" "rc=$RC $OUT"
@@ -3529,6 +3533,29 @@ OUT="$(fdj)"; RC=$?
 [ "$RC" = 1 ] && grep -q 'no release follower installed' <<<"$OUT" && grep -q 'reading(s) red' <<<"$OUT" && grep -q 'runner: no claim line in the last 400 log lines' <<<"$OUT" && grep -q 'package seed: not installed yet' <<<"$OUT" && grep -q 'model qwen3:8b' <<<"$OUT" && grep -q 'fleet doctor:' <<<"$OUT" \
   && ok "fleet doctor on a jobs-YES Mac reads to the END when the runner logs carry no claim line (exit 1 for exactly its one red reading — no follower in the fixture — never a silent stop after the disk reading)" || bad "doctor jobs path" "rc=$RC $OUT"
 rm -rf "$FD"
+
+echo "── fleet join: a sign-in that cannot be installed yet is HANDED OVER by file; one that fails makes the join fail (2026-11-12) ──"
+SH="$(mktemp -d)"; mkdir -p "$SH/items" "$SH/home/.memex-local/enrol"
+printf 'super-secret-client-value-1234' > "$SH/items/e"
+printf '{"v":2,"d":"mini-1","f":{"tenant":"00000000-0000-0000-0000-0000000000aa","clientId":"11111111-1111-1111-1111-111111111111"},"s":{}}' > "$SH/items/code.json"
+sh_run() { env HOME="$SH/home" MEMEX_LOCAL_HOME="$SH/home/.memex-local" MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c '. "$0"; id=mini-1; '"$SHE" "$CLI" 2>&1; }
+# 1. no private-network name yet (the bootstrap brings the network up after the join): handed over, 0600, never printed
+SHE='tailnet_name() { :; }; rc=0; fleet_apply_signin "'"$SH/items"'" || rc=$?; echo "RC=$rc"'
+OUT="$(sh_run)"
+case "$OUT" in *"handed to the device bootstrap"*"RC=0"*) [ "$(cat "$SH/home/.memex-local/enrol/mini-1.signin")" = "super-secret-client-value-1234" ] && [ "$(ls -l "$SH/home/.memex-local/enrol/mini-1.signin" | cut -c1-10)" = "-rw-------" ] \
+  && grep -q '^clientId=11111111-1111-1111-1111-111111111111$' "$SH/home/.memex-local/enrol/mini-1.signin-facts" && grep -q '^tenant=00000000-0000-0000-0000-0000000000aa$' "$SH/home/.memex-local/enrol/mini-1.signin-facts" \
+  && ok "no private-network name yet: the sign-in is HANDED OVER (0600 secret + tenant/client id), never dropped" || bad "signin handover files" "$(ls -l "$SH/home/.memex-local/enrol")" ;; *) bad "signin handover" "$OUT" ;; esac
+case "$OUT" in *super-secret*) bad "the sign-in secret is never printed" "" ;; *) ok "the handed-over sign-in secret is never printed" ;; esac
+# 2. a name, and `internal on` fails: the step FAILS (the join turns non-zero)
+SHE='tailnet_name() { echo mini-1.net.example.test; }; cmd_internal() { return 1; }; rc=0; fleet_apply_signin "'"$SH/items"'" || rc=$?; echo "RC=$rc"'
+OUT="$(sh_run)"
+case "$OUT" in *"'internal on' failed — NOT installed"*"RC=1"*) ok "a sign-in that does not land fails the step (exit 1), never a warning that reads ok" ;; *) bad "signin failure" "$OUT" ;; esac
+# 3. a secret without its client id: NOT installed, failed
+printf '{"v":2,"d":"mini-1","f":{},"s":{}}' > "$SH/items/code.json"
+SHE='tailnet_name() { echo n; }; rc=0; fleet_apply_signin "'"$SH/items"'" || rc=$?; echo "RC=$rc"'
+OUT="$(sh_run)"; case "$OUT" in *"no tenant/clientId — NOT installed"*"RC=1"*) ok "a secret without its tenant/client id is NOT installed and fails the step" ;; *) bad "signin no facts" "$OUT" ;; esac
+grep -q 'fleet_apply_signin "\$items" || signin_failed=1' "$CLI" && grep -q 'exit 4' "$CLI" && ok "the join exits 4 when its sign-in did not land (a join without a sign-in never reads ok)" || bad "join exit 4" ""
+rm -rf "$SH"
 
 echo "── the local ingress never pins browsers to https for localhost: HSTS max-age=0 (2026-11-11) ──────"
 HS="$(mktemp -d)"; mkdir -p "$HS/stubs"
