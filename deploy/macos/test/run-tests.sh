@@ -847,7 +847,8 @@ SMW='as_user() { shift; printf "%s\n" "$*" >> "$SM_CALLS"
     probe_as_user() { case "$*" in *verify*) return 0 ;; *awaiting_setup*) [ "${SM_AWAIT:-0}" = 1 ] ;; *) return 1 ;; esac; }
     notify_user() { printf "NOTIFY %s | %s\n" "$2" "$3"; }
     read_participation >/dev/null; track memex step_memex jroe studio-2; rc=$?; finish_stage jroe; echo "rc=$rc"'
-rsrun() { : > "$RS/calls"; OUT="$(env $FCA_ENV FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$RS/log" FLEET_MANAGED_PREFS="$RS/none" FLEET_USER_HOME="$RS/home" FLEET_BREW_PREFIX="$RS/brew" \
+mkdir -p "$RS/ld" "$RS/bin" "$RS/pbin"; printf '#!/bin/bash\nexit 0\n' > "$RS/pbin/launchctl"; chmod +x "$RS/pbin/launchctl"
+rsrun() { : > "$RS/calls"; OUT="$(env $FCA_ENV PATH="$RS/pbin:$T/secb:$PATH" FLEET_LAUNCHDAEMONS_DIR="$RS/ld" FLEET_BIN_DIR="$RS/bin" FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$RS/log" FLEET_MANAGED_PREFS="$RS/none" FLEET_USER_HOME="$RS/home" FLEET_BREW_PREFIX="$RS/brew" \
   FLEET_STATE_DIR="$RS/st" FLEET_CONTROL_URL=https://control.example.test SM_CALLS="$RS/calls" SM_CAROOT="$T/sm/caroot" FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=false \
   FLEET_ORGANISATION=Acme FLEET_OWNER_NAME="Jane Roe" FLEET_OWNER_EMAIL=jane.roe@example.com FLEET_ACCEPT_TERMS=true FLEET_CA_SHA256="$FSHA" "$@" bash -c '. "$0"; '"$SMW" "$FB" 2>&1)"; }
 rd() { head -1 "$RS/st/$1" 2>/dev/null; }
@@ -857,7 +858,7 @@ grep -q 'fleet join --control https://control.example.test --id studio-2 --no-op
   && ok "portal in first-run setup, Mac not joined: 'fleet join --no-update --heartbeat-wait 0' runs BEFORE the setup, and the setup is not answered" || bad "join before setup" "$(cat "$RS/calls") / $OUT"
 case "$(rd join)" in "waiting-approval "*"request filed; waiting for the Approve on control: https://control.example.test/Hosting/Heartbeats/Enrol/studio-2-abc") ok "…reading join = waiting-approval, with the approval link" ;; *) bad "join reading" "$(rd join)" ;; esac
 case "$(rd stage)" in "waiting-approval "*"join: "*) ok "…reading stage names the join, waiting for the Approve" ;; *) bad "stage approval" "$(rd stage)" ;; esac
-case "$OUT" in *NOTIFY*) bad "waiting for the Approve is control's to give: no notification" "$OUT" ;; *) ok "…and no notification (the Approve is control's to give, not the person's)" ;; esac
+case "$OUT" in *"NOTIFY Fleet join not filed"*) bad "waiting for the Approve is not a failed join: no 'not filed' notification" "$OUT" ;; *) ok "…and no 'join not filed' notification (waiting for the Approve is not a failure; the filing itself is announced — 1.9.0)" ;; esac
 # 2. the pre-setup join succeeds: joined, but NOT finalised (the setup and the finalisation follow)
 rsrun SM_AWAIT=1 SM_JOIN_RC=0 SM_JOIN_OUT='joined as studio-2'
 case "$(rd join)" in "ok "*"before the setup"*) ! grep -q 'fleet.finalized' "$RS/calls" && ok "a join before the setup is recorded (join ok) and never marked finalised" || bad "pre-setup finalized" "$(cat "$RS/calls")" ;; *) bad "pre-setup join ok" "$(rd join) / $OUT" ;; esac
@@ -926,6 +927,102 @@ OUT="$(ens EN_CUSTOM="$EN/pmset.sleep1" EN_PMSET_RC=1)"
 case "$OUT" in *"FAILED to set 'pmset -c sleep 0'"*"RC=1"*) grep -q '^failed ' "$EN/st/energy" && ok "a failed pmset is FAILED in the log and the reading" || bad "pmset failed reading" "$(cat "$EN/st/energy")" ;; *) bad "pmset failed" "$OUT" ;; esac
 awk '/^main\(\) \{/{on=1} on' "$FB" | grep -n 'step_energy_enabler\|read_participation' | head -1 | grep -q step_energy_enabler && ok "main runs the energy enabler before the participation answers (a Mac failing later still receives profiles)" || bad "enabler order" ""
 rm -rf "$EN"
+
+echo "── join poller: once filed, the Approve is collected within 30 s, the approver is told at once (bootstrap 1.9.0) ──"
+JP="$(mktemp -d)"; mkdir -p "$JP/home/.memex-local" "$JP/st" "$JP/ld" "$JP/bin" "$JP/pbin"
+cat > "$JP/pbin/launchctl" <<STUB
+#!/bin/bash
+echo "launchctl \$*" >> "$JP/lcalls"; exit 0
+STUB
+chmod +x "$JP/pbin/launchctl"
+JPW='as_user() { shift; printf "%s\n" "$*" >> "$SM_CALLS"
+      case "$*" in *-CAROOT*) printf "%s" "$SM_CAROOT" ;; *"fleet join"*) printf "%b\n" "${SM_JOIN_OUT:-}"; return "${SM_JOIN_RC:-0}" ;; esac; return 0; }
+    probe_as_user() { case "$*" in *verify*) return 0 ;; *) return 1 ;; esac; }
+    notify_user() { printf "NOTIFY %s | %s\n" "$2" "$3"; }
+    read_participation >/dev/null; track memex step_memex jroe studio-2; echo "rc=$?"'
+jprun() { : > "$JP/calls"; OUT="$(env $FCA_ENV FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$T/secb:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_MANAGED_PREFS="$JP/none" FLEET_USER_HOME="$JP/home" FLEET_BREW_PREFIX="$JP/brew" \
+  FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" FLEET_CONTROL_URL=https://control.example.test SM_CALLS="$JP/calls" SM_CAROOT="$T/sm/caroot" \
+  FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=false FLEET_CA_SHA256="$FSHA" "$@" bash -c '. "$0"; '"$JPW" "$FB" 2>&1)"; }
+LINK='https://control.example.test/Hosting/Heartbeats/Enrol/req-abc'
+# 1. a NEW request: announced (notification + the page opened as the person) and the poller installed
+rm -f "$JP/lcalls"; jprun SM_JOIN_RC=3 SM_JOIN_OUT="open $LINK to approve"
+case "$OUT" in *"NOTIFY Approve this Mac | The fleet join for studio-2 is filed"*) grep -q "launchctl asuser $(id -u jroe 2>/dev/null || echo '[0-9]*') sudo -u jroe /usr/bin/open $LINK" "$JP/lcalls" 2>/dev/null || grep -q "sudo -u jroe /usr/bin/open $LINK" "$JP/lcalls" 2>/dev/null || [ -z "$(id -u jroe 2>/dev/null)" ] \
+  && ok "a NEW request is announced at once: a notification, and the approval page opened in the person's browser (as them)" || bad "announce open" "$(cat "$JP/lcalls")" ;; *) bad "announce" "$OUT" ;; esac
+[ -f "$JP/ld/com.meshweaver.fleet.join-poller.plist" ] && [ -x "$JP/bin/fleet-bootstrap.sh" ] && cmp -s "$FB" "$JP/bin/fleet-bootstrap.sh" && grep -q 'launchctl bootstrap system' "$JP/lcalls" && [ -s "$JP/st/join-poller.since" ] \
+  && ok "…and the join poller is installed: a root copy of the script, its LaunchDaemon bootstrapped, the start recorded" || bad "poller installed" "$(ls -l "$JP/ld" "$JP/bin"; cat "$JP/lcalls")"
+plutil -lint "$JP/ld/com.meshweaver.fleet.join-poller.plist" >/dev/null && grep -q '<key>StartInterval</key><integer>30</integer>' "$JP/ld/com.meshweaver.fleet.join-poller.plist" \
+  && grep -q "<string>$JP/bin/fleet-bootstrap.sh</string>" "$JP/ld/com.meshweaver.fleet.join-poller.plist" && grep -q '<string>poll-join</string>' "$JP/ld/com.meshweaver.fleet.join-poller.plist" \
+  && ok "the poller plist lints and runs '<root copy> poll-join' every 30 s" || bad "poller plist" "$(cat "$JP/ld/com.meshweaver.fleet.join-poller.plist")"
+# 2. the SAME request on the next run: not announced again, the poller not reloaded
+rm -f "$JP/lcalls"; jprun SM_JOIN_RC=3 SM_JOIN_OUT="open $LINK to approve"
+case "$OUT" in *NOTIFY*) bad "the same request is announced once" "$OUT" ;; *) [ ! -s "$JP/lcalls" ] && ok "the same request on a later run: not announced again, the poller left as it is" || bad "re-announce/reload" "$(cat "$JP/lcalls")" ;; esac
+# 3. in poll mode the join asks ONCE (--wait 0) and installs nothing
+rm -f "$JP/lcalls"; jprun SM_JOIN_RC=3 SM_JOIN_OUT="open $LINK to approve" FLEET_POLL_MODE=1
+grep -q -- 'fleet join .* --wait 0 ' "$JP/calls" && [ ! -s "$JP/lcalls" ] && ok "the poller's run asks control ONCE (--wait 0) and installs nothing" || bad "poll mode" "$(cat "$JP/calls") / $(cat "$JP/lcalls" 2>/dev/null)"
+# 4. poll-join: the Approve collected → the full run continues FIRST, then the poller is removed (bootout last)
+PJ='console_user() { printf jroe; }; machine_id() { printf studio-2; }; read_participation() { return 0; }
+    poll_join_once() { : > "$FLEET_USER_HOME/.memex-local/fleet.yaml"; log "memex: joined as studio-2"; }
+    main() { echo "MAIN-RAN"; exit 0; }
+    poll_join_main; echo "after"'
+rm -f "$JP/lcalls" "$JP/home/.memex-local/fleet.yaml"
+OUT="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN= PATH="$JP/pbin:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_USER_HOME="$JP/home" FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" \
+  bash -c '. "$0"; id() { [ "$1" = -u ] && [ $# = 1 ] && echo 0 || command id "$@"; }; '"$PJ" "$FB" 2>&1)"
+case "$OUT" in *"MAIN-RAN"*"removing the join poller (the Approve was collected)"*) [ ! -f "$JP/ld/com.meshweaver.fleet.join-poller.plist" ] && [ "$(tail -1 "$JP/lcalls")" = "launchctl bootout system/com.meshweaver.fleet.join-poller" ] \
+  && case "$OUT" in *after*) bad "poll-join exits after continuing" "$OUT" ;; *) ok "the Approve collected: the full run continues at once, THEN the poller removes itself (bootout last)" ;; esac || bad "poller removal" "$(cat "$JP/lcalls")" ;; *) bad "poll-join collected" "$OUT" ;; esac
+# 5. poll-join older than 24 h: the poller goes, nothing is polled
+rm -f "$JP/home/.memex-local/fleet.yaml" "$JP/lcalls"; printf '%s\n' "$(( $(date +%s) - 90000 ))" > "$JP/st/join-poller.since"; printf 'x' > "$JP/ld/com.meshweaver.fleet.join-poller.plist"
+PJE='console_user() { printf jroe; }; machine_id() { printf studio-2; }; read_participation() { return 0; }
+    poll_join_once() { echo POLLED; }
+    poll_join_main'
+OUT="$(env FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_USER_HOME="$JP/home" FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" \
+  bash -c '. "$0"; id() { [ "$1" = -u ] && [ $# = 1 ] && echo 0 || command id "$@"; }; '"$PJE" "$FB" 2>&1)"
+case "$OUT" in *"not approved within 24 h"*) case "$OUT" in *POLLED*) bad "expired poller polled" "$OUT" ;; *) [ ! -f "$JP/ld/com.meshweaver.fleet.join-poller.plist" ] && ok "after 24 h without an Approve the poller removes itself (the hourly run keeps polling)" || bad "expired plist kept" "" ;; esac ;; *) bad "poller expiry" "$OUT" ;; esac
+# 6. a refused join (no longer waiting): the poller goes
+rm -f "$JP/lcalls"; date +%s > "$JP/st/join-poller.since"; printf 'x' > "$JP/ld/com.meshweaver.fleet.join-poller.plist"
+PJR='console_user() { printf jroe; }; machine_id() { printf studio-2; }; read_participation() { return 0; }
+    poll_join_once() { write_reading join failed "exit 1: REFUSED"; return 1; }
+    poll_join_main'
+OUT="$(env FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_USER_HOME="$JP/home" FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" \
+  bash -c '. "$0"; id() { [ "$1" = -u ] && [ $# = 1 ] && echo 0 || command id "$@"; }; '"$PJR" "$FB" 2>&1)"
+case "$OUT" in *"removing the join poller (the join is no longer waiting for the Approve (failed"*) ok "a join that is refused or failed: the poller removes itself" ;; *) bad "refused poller" "$OUT" ;; esac
+grep -q 'poll-join) poll_join_main' "$FB" && ok "the script's entry point dispatches 'poll-join' to the poller's run" || bad "entry point" ""
+# 7. ONE run at a time (review on #280): a live holder makes the poller skip its tick; a dead holder's lock is taken over
+mkdir -p "$JP/st/.run.lock"; sleep 300 & HOLDER=$!; echo "$HOLDER" > "$JP/st/.run.lock/pid"
+PJL='console_user() { printf jroe; }; machine_id() { printf studio-2; }; read_participation() { return 0; }
+    poll_join_once() { echo POLLED; }
+    poll_join_main'
+date +%s > "$JP/st/join-poller.since"
+OUT="$(env FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_USER_HOME="$JP/home" FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" \
+  bash -c '. "$0"; id() { [ "$1" = -u ] && [ $# = 1 ] && echo 0 || command id "$@"; }; '"$PJL" "$FB" 2>&1)"
+case "$OUT" in *POLLED*) bad "a held run lock makes the poller skip its tick" "$OUT" ;; *) [ -d "$JP/st/.run.lock" ] && ok "while a full run holds the run lock the poller SKIPS its tick (no concurrent bootstraps)" || bad "lock removed by skipper" "" ;; esac
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+OUT="$(env FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_USER_HOME="$JP/home" FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" \
+  bash -c '. "$0"; id() { [ "$1" = -u ] && [ $# = 1 ] && echo 0 || command id "$@"; }; '"$PJL" "$FB" 2>&1)"
+case "$OUT" in *"taking over a stale lock"*POLLED*) [ ! -d "$JP/st/.run.lock" ] && ok "a lock whose holder is gone is taken over, and released when the tick ends" || bad "lock not released" "$(ls -la "$JP/st")" ;; *) bad "stale lock" "$OUT" ;; esac
+# 7b. joined while a run holds the lock: the tick neither runs main nor removes the poller (review on #280)
+mkdir -p "$JP/st/.run.lock"; sleep 300 & HOLDER=$!; echo "$HOLDER" > "$JP/st/.run.lock/pid"; : > "$JP/home/.memex-local/fleet.yaml"
+printf 'x' > "$JP/ld/com.meshweaver.fleet.join-poller.plist"; rm -f "$JP/lcalls"
+PJH='console_user() { printf jroe; }; machine_id() { printf studio-2; }; main() { echo MAIN-RAN; exit 0; }
+    poll_join_main'
+OUT="$(env FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_USER_HOME="$JP/home" FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" \
+  bash -c '. "$0"; id() { [ "$1" = -u ] && [ $# = 1 ] && echo 0 || command id "$@"; }; '"$PJH" "$FB" 2>&1)"
+case "$OUT" in *MAIN-RAN*|*"removing the join poller"*) bad "a held lock: the joined fast path does nothing" "$OUT" ;; *) [ -f "$JP/ld/com.meshweaver.fleet.join-poller.plist" ] && [ ! -s "$JP/lcalls" ] && ok "joined while another run holds the lock: the tick runs nothing and removes nothing (the holder is never booted out)" || bad "held-lock removal" "$(cat "$JP/lcalls" 2>/dev/null)" ;; esac
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; rm -rf "$JP/st/.run.lock" "$JP/home/.memex-local/fleet.yaml"
+grep -q 'exit 75; }' "$FB" && ok "main's lock give-up exits 75 (EX_TEMPFAIL), never a success" || bad "give-up status" ""
+# 8. a tick does ONLY the setup probe and ONE poll — no up, no verify
+: > "$JP/calls"
+OUT="$(env $FCA_ENV FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$T/secb:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_MANAGED_PREFS="$JP/none" FLEET_USER_HOME="$JP/home" FLEET_BREW_PREFIX="$JP/brew" \
+  FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" FLEET_CONTROL_URL=https://control.example.test SM_CALLS="$JP/calls" FLEET_POLL_MODE=1 \
+  FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=false bash -c '. "$0"; as_user() { shift; printf "%s\n" "$*" >> "$SM_CALLS"; return 3; }
+    probe_as_user() { printf "PROBE %s\n" "$*" >> "$SM_CALLS"; return 1; }; notify_user() { :; }
+    read_participation >/dev/null; poll_join_once jroe studio-2' "$FB" 2>&1)"
+[ "$(grep -c 'fleet join' "$JP/calls")" = 1 ] && grep -q -- '--wait 0' "$JP/calls" && ! grep -qE 'memex-local (up|verify)' "$JP/calls" && [ "$(grep -c '^PROBE' "$JP/calls")" = 1 ] \
+  && ok "a poller tick is ONE setup probe and ONE poll (--wait 0) — never 'memex-local up' or 'verify'" || bad "tick weight" "$(cat "$JP/calls")"
+# 9. an hourly run that collects the Approve removes the poller AT ONCE (not at the end of its run)
+printf 'x' > "$JP/ld/com.meshweaver.fleet.join-poller.plist"; date +%s > "$JP/st/join-poller.since"; rm -f "$JP/lcalls"
+grep -A3 '^    0) # collected by an ordinary run' "$FB" | grep -q 'remove_join_poller "the Approve was collected by an hourly run"' \
+  && ok "an hourly run that collects the Approve removes the poller right then (no second continuation on its next tick)" || bad "immediate removal" ""
+rm -rf "$JP"
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"

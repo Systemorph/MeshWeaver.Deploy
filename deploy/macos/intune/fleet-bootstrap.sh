@@ -27,8 +27,11 @@
 #      (sign out and back in first; a later run names `sudo profiles install -type bootstraptoken`). Never a password.
 #   0c. Energy enabler (1.8.0): until the Intune Energy Saver profile is installed, only `pmset -c sleep 0`, so the
 #      Mac is awake to receive it (a sleeping Mac answers MDM commands NotNow during DarkWake).
+#   5b. Once the join is filed (1.9.0): the approval page is opened for the person at the console and a notification
+#      posted, and a root LaunchDaemon (com.meshweaver.fleet.join-poller) polls control every 30 s for at most 24 h — the
+#      Approve is collected within half a minute and the run continues at once. It removes itself when done.
 #   Readings the person can read without root: /Library/MeshWeaver/fleet-state/ — one file per step (operator-ssh,
-#      bootstrap-token, energy, participation, homebrew, devtools, tools, tailscale, tailscaled, network, up, setup, join, doctor,
+#      bootstrap-token, energy, join-poller, participation, homebrew, devtools, tools, tailscale, tailscaled, network, up, setup, join, doctor,
 #      heartbeat, buildhost) and `stage`: the step the onboarding is stuck on, since when and why (1.7.0). A join that
 #      failed or was skipped for a missing prerequisite also reaches the person as a notification, naming it.
 #
@@ -58,13 +61,22 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.8.0"
+readonly FLEET_BOOTSTRAP_VERSION="1.9.0"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
 readonly TAILSCALED_SOCKET="${FLEET_TAILSCALED_SOCKET:-/var/run/tailscaled.socket}"
 readonly TAILSCALED_STATE_DIR="${FLEET_TAILSCALED_STATE_DIR:-/var/lib/tailscale}"
 readonly LOG_DIR="${FLEET_LOG_DIR:-/Library/Logs/MeshWeaver}"
+# The JOIN POLLER (1.9.0): once a join is filed, a root LaunchDaemon re-runs THIS script's `poll-join` every 30 s for at
+# most 24 h, so an Approve is collected within half a minute instead of at the next hourly run. It runs a root-owned
+# copy of the script (Intune runs it from a temporary file) and removes itself when the join is collected, refused or
+# expired.
+readonly POLLER_LABEL="com.meshweaver.fleet.join-poller"
+readonly POLLER_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${POLLER_LABEL}.plist"
+readonly POLLER_SCRIPT="${FLEET_BIN_DIR:-/Library/MeshWeaver/bin}/fleet-bootstrap.sh"
+readonly POLLER_EVERY_S="${FLEET_POLLER_EVERY_S:-30}"
+readonly POLLER_MAX_S="${FLEET_POLLER_MAX_S:-86400}"
 readonly MANAGED_PREFS="${FLEET_MANAGED_PREFS:-/Library/Managed Preferences/com.memex.local}"
 readonly BREW_TOOLS=(colima docker kubectl helm ollama lego)   # lego: memex-local cert issue (the internal name's certificate, DNS-01)
 # 🚨 What runs AS ROOT never comes from the Homebrew tree, which the console user owns (they could replace the
@@ -986,6 +998,8 @@ run_join() {
   # The POLLING join (enrolment v2): it asks control for its own code, signed with its throw-away key, for a bounded
   # wait per run; the next run resumes with the same key. A code dropped at $code_file is the fallback.
   local wait_min; wait_min="$(setting FLEET_JOIN_WAIT_MIN JoinWaitMinutes 10)"
+  # the poller asks ONCE per run (`--wait 0`): launchd runs it again in 30 s
+  [ "${FLEET_POLL_MODE:-}" = 1 ] && wait_min=0
   case "$wait_min" in ''|*[!0-9]*) wait_min=10 ;; esac
   log "memex: fleet join as $machine (control $control) — polling control for the code up to $wait_min min this run (fallback: $code_file)"
   if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then STEP_STAGE="join"; log "memex: (dry run) would run 'memex-local fleet join --wait $wait_min${extra[*]:+ ${extra[*]}} ${PART_ARGS[*]-}' and poll control for the code"; return 0; fi
@@ -994,7 +1008,9 @@ run_join() {
   # the approval link and the fingerprints only — never a token-bearing setup URL
   printf '%s\n' "$out" | grep -E 'Hosting/Heartbeats/Enrol/|fingerprint|joined as|WAITING|waiting|approved|REFUSED|network:|sign-in:|certificate:|build host:' | grep -v 'token=' | while IFS= read -r l; do log "memex: $l"; done
   case "$rc" in
-    0) # the join handed the private-network key over by file: join the network now, not at the next run — and FIRST,
+    0) # collected by an ordinary run: the poller has nothing left to do — it goes NOW, not at the end of this run
+       [ -n "${FLEET_IN_POLLER:-}" ] || remove_join_poller "the Approve was collected by an hourly run"
+       # the join handed the private-network key over by file: join the network now, not at the next run — and FIRST,
        # so its own log lines never overwrite the verdict this step leaves for track() (review on #276)
        step_network "$machine" "$user" || true
        if [ "$mode" = pre-setup ]; then
@@ -1005,12 +1021,151 @@ run_join() {
          write_reading join ok "joined as $machine"; log "memex: joined as $machine"
        fi ;;
     3) local link; link="$(printf '%s\n' "$out" | grep -o 'https://[^[:space:]]*Hosting/Heartbeats/Enrol/[^[:space:]]*' | grep -v 'token=' | tail -1)"
-       STEP_STAGE="join"; log "memex: WAITING for the approval on control${link:+ ($link)} — the next run polls again"
+       # a NEW request (not the one an earlier run already announced): the approver is told now, not when someone looks
+       if [ -n "$link" ] && ! grep -qF "$link" "$STATE_DIR/join" 2>/dev/null; then announce_join "$user" "$machine" "$link"; fi
+       install_join_poller
+       # the WAITING line is the step's LAST log line: track() reads the verdict from it
+       STEP_STAGE="join"; log "memex: WAITING for the approval on control${link:+ ($link)} — polled every ${POLLER_EVERY_S} s until it is approved"
        write_reading join waiting-approval "request filed; waiting for the Approve on control${link:+: $link}" ;;
     *) local refused; refused="$(printf '%s\n' "$out" | grep -E 'REFUSED|refused' | grep -v 'token=' | tail -1 | strip_ansi | cut -c1-300)"
        STEP_STAGE="join"; log "memex: fleet join FAILED (exit $rc) — ${refused:-$(last_said "$out")}"
        write_reading join failed "exit $rc: ${refused:-$(last_said "$out")}"; return 1 ;;
   esac
+}
+
+# ONE run at a time (review on #280): the hourly run and the poller's continuation must never run the full bootstrap
+# concurrently (both would race on brew, memex-local and the readings). A mkdir lock in the state directory (macOS has
+# no flock): the poller SKIPS a tick while it is held, an hourly run waits up to 15 min for it. A lock whose owner is
+# gone (its pid dead, or older than 2 h) is taken over. A dry run, or a state directory that cannot be written, runs
+# without it (and says so).
+RUN_LOCK_HELD_BY_ME=""
+acquire_run_lock() {
+  local wait_s="$1" lock="$STATE_DIR/.run.lock" waited=0 pid
+  [ -n "${FLEET_RUN_LOCK_HELD:-}" ] && return 0
+  [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] && return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || { log "run lock: $STATE_DIR is not writable — running without the lock"; return 0; }
+  while ! mkdir "$lock" 2>/dev/null; do
+    pid="$(cat "$lock/pid" 2>/dev/null)"
+    if { [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; } || [ -n "$(find "$lock" -maxdepth 0 -mmin +120 2>/dev/null)" ]; then
+      log "run lock: taking over a stale lock (pid ${pid:-unknown})"; rm -rf "$lock"; continue
+    fi
+    [ "$waited" -ge "$wait_s" ] && return 1
+    sleep 5; waited=$((waited + 5))
+  done
+  printf '%s\n' "$$" > "$lock/pid"
+  FLEET_RUN_LOCK_HELD=1; export FLEET_RUN_LOCK_HELD; RUN_LOCK_HELD_BY_ME=1
+  trap 'release_run_lock' EXIT
+}
+release_run_lock() {
+  [ -n "$RUN_LOCK_HELD_BY_ME" ] || return 0
+  rm -rf "$STATE_DIR/.run.lock"; RUN_LOCK_HELD_BY_ME=""
+}
+
+# A filed request reaches the person at this Mac at once: a notification, and the approval page opened in their browser
+# (as them). The approval needs a global administrator of control — on a fleet Mac usually its owner, at this console or
+# over Screen Sharing. (Control itself learns of a request only when the link is opened: the poll of an unknown key
+# answers `pending` and records nothing, by design — Hosting/MacStudioOnboarding "Enrolment v2".)
+announce_join() {
+  local user="$1" machine="$2" link="$3" uid
+  log "memex: join request for $machine FILED — the approval page is opened for $user and a notification posted"
+  notify_user "$user" "Approve this Mac" "The fleet join for $machine is filed: the approval page is open in the browser (a global administrator of control approves it). This Mac collects the rest by itself."
+  uid="$(id -u "$user" 2>/dev/null)" || return 0
+  run launchctl asuser "$uid" sudo -u "$user" /usr/bin/open "$link" 2>/dev/null || log "memex: could not open the approval page for $user"
+}
+
+# The poller's LaunchDaemon. Pure: prints the plist.
+poller_plist() {
+  cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${POLLER_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>${POLLER_SCRIPT}</string>
+    <string>poll-join</string>
+  </array>
+  <key>StartInterval</key><integer>${POLLER_EVERY_S}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>${LOG_DIR}/join-poller.log</string>
+  <key>StandardErrorPath</key><string>${LOG_DIR}/join-poller.log</string>
+</dict>
+</plist>
+PLIST
+}
+
+# Installs (idempotently) the root-owned script copy and the poller; records when polling began. Never from the poller.
+install_join_poller() {
+  [ "${FLEET_POLL_MODE:-}" = 1 ] && return 0
+  local self="${BASH_SOURCE[0]}" want
+  want="$(poller_plist)"
+  [ -f "$STATE_DIR/join-poller.since" ] || { [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] || { mkdir -p "$STATE_DIR" && date +%s > "$STATE_DIR/join-poller.since"; } 2>/dev/null; }
+  if [ -f "$POLLER_PLIST" ] && [ "$(cat "$POLLER_PLIST")" = "$want" ] && cmp -s "$self" "$POLLER_SCRIPT"; then return 0; fi
+  log "memex: installing the join poller ($POLLER_LABEL, every ${POLLER_EVERY_S} s, at most $((POLLER_MAX_S / 3600)) h) — the Approve is collected within half a minute"
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then printf 'DRY-RUN: install %s → %s; write %s; launchctl bootstrap system\n' "$self" "$POLLER_SCRIPT" "$POLLER_PLIST"; return 0; fi
+  { install -d -o root -g wheel -m 0755 "$(dirname "$POLLER_SCRIPT")" && install -o root -g wheel -m 0755 "$self" "$POLLER_SCRIPT"; } 2>/dev/null \
+    || { cp "$self" "$POLLER_SCRIPT" 2>/dev/null && chmod 755 "$POLLER_SCRIPT"; } \
+    || { log "memex: FAILED to install the poller's script copy — the hourly run polls instead"; return 0; }
+  mkdir -p "$(dirname "$POLLER_PLIST")" && printf '%s\n' "$want" > "$POLLER_PLIST" && chmod 644 "$POLLER_PLIST" && { chown root:wheel "$POLLER_PLIST" 2>/dev/null || true; } \
+    || { log "memex: FAILED to write $POLLER_PLIST — the hourly run polls instead"; return 0; }
+  launchctl bootout system "$POLLER_PLIST" >/dev/null 2>&1 || true
+  launchctl bootstrap system "$POLLER_PLIST" 2>/dev/null || log "memex: FAILED to load the join poller — the hourly run polls instead"
+  return 0
+}
+
+remove_join_poller() {
+  local why="$1"
+  [ -f "$POLLER_PLIST" ] || [ -f "$STATE_DIR/join-poller.since" ] || return 0
+  log "memex: removing the join poller ($why)"
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then printf 'DRY-RUN: launchctl bootout system %s; rm %s\n' "$POLLER_PLIST" "$POLLER_PLIST"; return 0; fi
+  rm -f "$STATE_DIR/join-poller.since" "$POLLER_PLIST"
+  write_reading join-poller removed "$why"
+  # last: booting ourselves out ends this very process when the poller is the caller — the lock goes first
+  [ -n "${FLEET_IN_POLLER:-}" ] && release_run_lock
+  launchctl bootout "system/$POLLER_LABEL" >/dev/null 2>&1 || true
+}
+
+# One tick's work, and ONLY that (review on #280): no `memex-local up`, no verify — the probe whether the portal is still
+# in its first-run setup (one HTTPS request, which picks the join's mode) and ONE poll of control (`--wait 0`).
+poll_join_once() {
+  local user="$1" machine="$2" control mlocal mode=full
+  control="$(setting FLEET_CONTROL_URL ControlUrl)"; mlocal="$BREW_PREFIX/bin/memex-local"
+  [ -n "$control" ] || { log "poll-join: no ControlUrl — nothing to poll"; return 0; }
+  if probe_as_user "$user" env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(memex_libexec)/share" MEMEX_CHART_DIR="$(memex_libexec)/share/helm" \
+       /bin/bash -c '. "$0"; awaiting_setup' "$(memex_libexec)/memex-local"; then mode=pre-setup; fi
+  run_join "$user" "$machine" "$control" "$mlocal" "$mode"
+}
+
+# `fleet-bootstrap.sh poll-join` — what the poller runs every 30 s: ONE poll of control for this Mac's code. Collected →
+# the poller goes and the full run continues at once (network, setup, finalisation). Refused, or older than 24 h → it goes.
+poll_join_main() {
+  [ "$(id -u)" = "0" ] || [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] || { log "poll-join: must run as root"; exit 2; }
+  local user machine since now home
+  FLEET_IN_POLLER=1
+  user="$(console_user)" || exit 0
+  home="$(user_home "$user")"; machine="$(machine_id)"
+  # the lock FIRST, before either fast path (review on #280): while any run holds it this tick does nothing at all — it
+  # never waits inside main, never mistakes a lock give-up for a finished run, never removes the poller. The next tick
+  # (launchd starts it only after this one ended) tries again.
+  acquire_run_lock 0 || exit 0
+  # joined: the full run continues FIRST (in a subshell — main exits), then the poller goes: booting it out ends this
+  # process, so it must be the last thing done
+  if [ -f "$home/.memex-local/fleet.yaml" ]; then ( FLEET_POLL_MODE="" main ); remove_join_poller "joined"; exit 0; fi
+  since="$(head -1 "$STATE_DIR/join-poller.since" 2>/dev/null)"; now="$(date +%s)"
+  case "$since" in ''|*[!0-9]*) since="$now" ;; esac
+  if [ $((now - since)) -ge "$POLLER_MAX_S" ]; then
+    remove_join_poller "not approved within $((POLLER_MAX_S / 3600)) h — the hourly run keeps polling"; exit 0
+  fi
+  read_participation >/dev/null || exit 0
+  FLEET_POLL_MODE=1 track memex poll_join_once "$user" "$machine"
+  if [ -f "$home/.memex-local/fleet.yaml" ]; then
+    ( FLEET_POLL_MODE="" main )   # continue NOW: the network, the setup and the finalisation, not at the next hourly run
+    remove_join_poller "the Approve was collected"; exit 0
+  fi
+  case "$(head -1 "$STATE_DIR/join" 2>/dev/null)" in waiting-approval*) ;; *) remove_join_poller "the join is no longer waiting for the Approve ($(head -1 "$STATE_DIR/join" 2>/dev/null | cut -c1-120))" ;; esac
+  exit 0
 }
 
 main() {
@@ -1021,6 +1176,8 @@ main() {
   check_password "$user"
   machine="$(machine_id)"
   log "run for console user $user, machine $machine"
+  # 75 (EX_TEMPFAIL): a give-up is never read as a finished run by anything that calls main
+  acquire_run_lock 900 || { log "another bootstrap run (the join poller's continuation) holds the run lock for over 15 min — this run stops; the next one retries"; exit 75; }
   # the operator's way in comes before everything that can fail: a Mac whose later steps fail is still reachable
   # failures that must not stop the rest of the run (operator SSH, the energy enabler): exit 1 at the end
   local deferred_failed=0
@@ -1043,9 +1200,13 @@ main() {
   [ "$failed" = 0 ] && { track network step_network "$machine" "$user" || failed=1; }
   [ "$failed" = 0 ] && { track memex step_memex "$user" "$machine" || failed=1; }
   finish_stage "$user"
+  # an hourly run that finds the Mac joined removes a leftover poller (never from inside the poller: that is its own job)
+  if [ -z "${FLEET_IN_POLLER:-}" ] && [ -f "$(user_home "$user")/.memex-local/fleet.yaml" ]; then remove_join_poller "joined"; fi
   [ "$deferred_failed" = 0 ] || failed=1
   [ "$failed" = 0 ] && log "done (everything this run could do)" || log "a step FAILED — the next run retries from it"
   exit "$failed"
 }
 
-[ "${FLEET_BOOTSTRAP_LIB:-}" = "1" ] || main "$@"
+if [ "${FLEET_BOOTSTRAP_LIB:-}" != "1" ]; then
+  case "${1:-}" in poll-join) poll_join_main ;; *) main "$@" ;; esac
+fi
