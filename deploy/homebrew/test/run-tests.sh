@@ -3320,6 +3320,8 @@ hbw "$NOTLISTED_NEW" "$NOTLISTED_NEW"
   && ok "MeshWeaver#8128's 'selects NOTHING for it' Error line STOPS the wait at once, naming the instance, the plan read from the line and the remedy" || bad "not listed (new line)" "rc=$RC restarts=$RESTARTS $OUT"
 [ "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's/on plan free;/on plan unknown (the registry'"'"'s answer named no plan);/')")" = "notlisted|unknown" ] \
   && ok "…a plan the registry did not name reads 'unknown'" || bad "not listed unknown plan" "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's/on plan free;/on plan unknown (the registry answer named no plan);/')")"
+[ "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's/on plan free; listing complete: True)/on plan pro)/')")" = "notlisted|pro" ] \
+  && ok "…a plan closed by ')' with no listing tail is still read" || bad "not listed plan without tail" "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's/on plan free; listing complete: True)/on plan pro)/')")"
 [ "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's|names Plugins/Hosting|names Hosting|')")" = "notlisted|free" ] \
   && ok "…and Hosting is matched bare as well as under a source prefix" || bad "not listed bare id" "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's|names Plugins/Hosting|names Hosting|')")"
 REFUSED_NEW='fail: MeshWeaver.PluginCatalog.InstanceAutoRegistrationService[0]

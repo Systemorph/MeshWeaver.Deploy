@@ -2352,7 +2352,7 @@ heartbeat_state() {
   if [ -z "$hosting" ]; then
     l="$(printf '%s\n' "$log" | grep -E 'names ([A-Za-z0-9_.-]+/)?Hosting(@[^ ]*)? exactly, and the default install selects NOTHING for it' | tail -1)" || true
     if [ -n "$l" ]; then
-      pk="$(printf '%s' "$l" | sed -n -E 's/.*this instance is on plan ([^;]*);.*/\1/p' | sed -E 's/ +$//')"
+      pk="$(printf '%s' "$l" | sed -n -E 's/.*this instance is on plan ([^;)]*)[;)].*/\1/p' | sed -E 's/ +$//')"
       case "$pk" in ''|unknown*) pk=unknown ;; esac
       printf 'notlisted|%s' "$pk"; return 0
     fi
