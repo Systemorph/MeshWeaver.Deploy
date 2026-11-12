@@ -48,6 +48,8 @@ GRAPH = "https://graph.microsoft.com"
 GUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
+# The line after which the fleet loader carries its embedded bootstrap (deploy/macos/intune/fleet-loader.sh).
+EMBED_MARK = b"__FLEET_EMBEDDED_BOOTSTRAP__"
 SPECIAL_TARGETS = {
     "allDevices": "#microsoft.graph.allDevicesAssignmentTarget",
     "allLicensedUsers": "#microsoft.graph.allLicensedUsersAssignmentTarget",
@@ -229,6 +231,11 @@ def validate(spec, spec_dir):
             p.append(f"{w}: source.sha256 must be 64 lower-hex")
         if not src.get("repo") or not src.get("path"):
             p.append(f"{w}: source.repo and source.path are required")
+        emb = src.get("embed")
+        if emb is not None:
+            if not isinstance(emb, dict) or not HEX40.match(emb.get("commit", "")) or not HEX64.match(emb.get("sha256", "")) \
+                    or not emb.get("repo") or not emb.get("path"):
+                p.append(f"{w}: source.embed needs repo, path, a 40-hex commit and a 64-hex sha256 (the loader's embedded bootstrap)")
         targets(w, s.get("assign"))
     for c in spec.get("customProfiles", []):
         w = f"customProfiles.{c.get('key')}"
@@ -259,6 +266,13 @@ def validate(spec, spec_dir):
                          "would look for a certificate the profile never delivers)")
             if cas and not keys.get("FleetCaSha256"):
                 p.append(f"{w}: a fleet CA is declared but keys.FleetCaSha256 is absent (memex-local ca adopt reads it)")
+            # the bootstrap's pin for the fleet loader (it travels in the profile: minutes, not the agent's 8 h)
+            if ("BootstrapCommit" in keys) != ("BootstrapSha256" in keys):
+                p.append(f"{w}: keys.BootstrapCommit and keys.BootstrapSha256 go together (the loader verifies one by the other)")
+            if "BootstrapCommit" in keys and not HEX40.match(str(keys["BootstrapCommit"])):
+                p.append(f"{w}: keys.BootstrapCommit must be a full 40-hex commit")
+            if "BootstrapSha256" in keys and not HEX64.match(str(keys["BootstrapSha256"])):
+                p.append(f"{w}: keys.BootstrapSha256 must be 64 lower-hex")
             if "AcceptTokensResidency" in keys and not isinstance(keys["AcceptTokensResidency"], str):
                 p.append(f"{w}: keys.AcceptTokensResidency must be a string")
             if "OperatorSshKeys" in keys:
@@ -581,30 +595,43 @@ class Reconcile:
                 full = self.g.get(f"beta/deviceManagement/deviceShellScripts/{live['id']}?$expand=assignments")
                 live["assignments"] = full.get("assignments", [])
                 live_sha = hashlib.sha256(base64.b64decode(full.get("scriptContent") or "")).hexdigest()
+                want_sha = self.expected_sha(s)
                 diffs = [f"{k} live={full.get(k)!r}" for k, v in meta.items() if full.get(k) != v]
-                if live_sha != s["source"]["sha256"]:
-                    diffs.append(f"content sha256 live={live_sha[:12]} spec={s['source']['sha256'][:12]}")
+                if live_sha != want_sha:
+                    diffs.append(f"content sha256 live={live_sha[:12]} spec={want_sha[:12]}")
                 if diffs:
-                    def patch(full=full, live_sha=live_sha):
+                    def patch(full=full, live_sha=live_sha, want_sha=want_sha):
                         body = dict(meta, **{"@odata.type": "#microsoft.graph.deviceShellScript"})
-                        if live_sha != s["source"]["sha256"]:
+                        if live_sha != want_sha:
                             body["scriptContent"] = base64.b64encode(self.source(s)).decode()
                         self.g.patch(f"beta/deviceManagement/deviceShellScripts/{full['id']}", body)
                     self.finding(s, what, "; ".join(diffs), f"PATCH deviceShellScripts/{short(live['id'])}"
-                                 + (f" with the content of {s['source']['repo']}@{s['source']['commit'][:12]}" if live_sha != s["source"]["sha256"] else ""),
+                                 + (f" with the content of {s['source']['repo']}@{s['source']['commit'][:12]}" if live_sha != want_sha else ""),
                                  patch)
                 else:
                     self.line("OK", what, f"{short(live['id'])}, content {live_sha[:12]} = {s['source']['path']}@{s['source']['commit'][:12]}")
             self.reconcile_assignments(s, what, live.get("assignments", []), f"beta/deviceManagement/deviceShellScripts/{live['id']}/assign",
                                        "deviceManagementScriptAssignments")
 
-    def source(self, s):
-        content = self.fetch(s["source"])
+    def pinned(self, src):
+        content = self.fetch(src)
         got = hashlib.sha256(content).hexdigest()
-        if got != s["source"]["sha256"]:
-            raise GraphError(0, "FETCH", s["source"]["path"], f"the pinned source hashes to {got[:12]}, the spec says "
-                             f"{s['source']['sha256'][:12]} — refusing to upload it")
+        if got != src["sha256"]:
+            raise GraphError(0, "FETCH", src["path"], f"the pinned source hashes to {got[:12]}, the spec says "
+                             f"{src['sha256'][:12]} — refusing to upload it")
         return content
+
+    def source(self, s):
+        """The script's uploaded content: the pinned source, and — with `source.embed` (the fleet loader) — the pinned
+        EMBEDDED copy appended after the marker line the loader reads it from (deploy/macos/intune/fleet-loader.sh)."""
+        content = self.pinned(s["source"])
+        if s["source"].get("embed"):
+            content = content.rstrip(b"\n") + b"\n" + EMBED_MARK + b"\n" + self.pinned(s["source"]["embed"])
+        return content
+
+    def expected_sha(self, s):
+        """What the live content must hash to: the source's own sha256, or that of the combined upload."""
+        return hashlib.sha256(self.source(s)).hexdigest() if s["source"].get("embed") else s["source"]["sha256"]
 
     def name_match(self, what, obj, found):
         """Found by exact name. With no id declared that is the match (INFO: record it); a declared id that does
@@ -1357,6 +1384,31 @@ def self_test():
     bad_fv["settingsPolicies"][-1]["create"]["groups"]["x"] = ["undeclared.setting"]
     expect("validate: create.groups naming a setting the policy does not declare is refused",
            any("does not declare" in x for x in validate(bad_fv, ".")), validate(bad_fv, "."))
+
+    # the fleet loader: the uploaded script is the loader + the pinned EMBEDDED bootstrap after the marker
+    loader, boot = b"#!/bin/bash\necho loader\nreturn 0 2>/dev/null || exit 0\n", b"#!/bin/bash\necho bootstrap\n"
+    ld = copy.deepcopy(spec)
+    ld["scripts"][0]["source"].update(path="fleet-loader.sh", sha256=hashlib.sha256(loader).hexdigest(),
+                                      embed={"repo": "acme/deploy", "path": "fleet-bootstrap.sh", "commit": "b" * 40, "sha256": hashlib.sha256(boot).hexdigest()})
+    ld["customProfiles"][0]["keys"].update(BootstrapCommit="b" * 40, BootstrapSha256=hashlib.sha256(boot).hexdigest())
+    expect("validate: a loader script with an embedded bootstrap and the profile's pin passes", not validate(ld, "."), validate(ld, "."))
+    fetch2 = lambda src: loader if src["path"] == "fleet-loader.sh" else boot
+    st9 = tenant()
+    lines9 = []
+    g9 = FakeGraph(st9)
+    Reconcile(copy.deepcopy(ld), tempfile.gettempdir(), g9, apply=True, fetch=fetch2, token=tok, out=lines9.append).run()
+    up = [base64.b64decode(w[2]["scriptContent"]) for w in g9.writes if w[1] == "beta/deviceManagement/deviceShellScripts"]
+    expect("the loader is uploaded WITH its embedded bootstrap after the marker line", up == [loader + b"__FLEET_EMBEDDED_BOOTSTRAP__\n" + boot], [repr(up)])
+    lines9b = []
+    rc9 = Reconcile(copy.deepcopy(ld), tempfile.gettempdir(), FakeGraph(st9), fetch=fetch2, token=tok, out=lines9b.append).run()
+    expect("…and the next check of the combined upload is clean (no drift forever on the combined sha256)",
+           not any(ln.startswith("DRIFT") and "script" in ln for ln in lines9b), lines9b)
+    half = copy.deepcopy(ld)
+    del half["customProfiles"][0]["keys"]["BootstrapSha256"]
+    expect("validate: a BootstrapCommit without its BootstrapSha256 is refused", any("go together" in x for x in validate(half, ".")), validate(half, "."))
+    badpin = copy.deepcopy(ld)
+    badpin["customProfiles"][0]["keys"]["BootstrapCommit"] = "main"
+    expect("validate: a bootstrap pin that is a branch, not a commit, is refused", any("BootstrapCommit must be a full 40-hex" in x for x in validate(badpin, ".")), validate(badpin, "."))
 
     print(f"self-test: {'FAILED ' + str(len(fails)) if fails else 'passed'}")
     return 1 if fails else 0

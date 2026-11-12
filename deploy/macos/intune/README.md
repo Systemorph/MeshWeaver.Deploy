@@ -91,6 +91,18 @@ The environment variables `FLEET_ACCEPT_JOBS`, `FLEET_ACCEPT_JOBS_FROM`, `FLEET_
 `FLEET_ACCEPT_JOBS_REPOS`, `FLEET_ACCEPT_TOKENS`, `FLEET_ACCEPT_TOKENS_FROM`, `FLEET_ACCEPT_TOKENS_MODELS`,
 `FLEET_ACCEPT_TOKENS_RESIDENCY` and `FLEET_CA_SHA256` override them.
 
+**The loader — a bootstrap bump in minutes, not hours** (2026-11-12). The Intune script is `fleet-loader.sh`, a STABLE
+loader of about 100 lines that changes only when its own behaviour does. Each run it reads the bootstrap's pin from the
+`com.memex.local` profile — `BootstrapCommit` (40 hex) and `BootstrapSha256` (64 hex) — fetches
+`deploy/macos/intune/fleet-bootstrap.sh` from this repository at that commit, verifies its sha256, keeps it
+root-owned in `/Library/MeshWeaver/loader/` and runs it with the run's arguments. Bytes that do not match the pin are
+REFUSED (logged). With no pin, a failed fetch or a refusal it runs its EMBEDDED copy — the bootstrap the reconcile
+appends to the uploaded script after the line `__FLEET_EMBEDDED_BOOTSTRAP__` (`scripts[].source.embed`) — and else the
+last verified copy; with none of them it FAILS (exit 1). Decisions go to `/Library/Logs/MeshWeaver/fleet-loader.log`
+and the reading `loader`. Why: the Intune agent re-runs a CACHED script until its next full sync (8 h) and `syncDevice`
+does not change that, but a PROFILE arrives within a minute of a `syncDevice` — so a bump is now a change of the
+profile's two keys, which `--apply` writes and syncs: every awake Mac runs the new bootstrap at its next hourly run.
+
 **Registering it** is the reconcile's job (section "Intune objects as code" below): the spec pins the script to a full commit of this
 repository and the file's sha256, `--apply` uploads exactly those bytes (refusing any that hash differently), and
 `--check` names a live copy that differs. A new version is a new pin in the spec, never a moving reference. It runs
