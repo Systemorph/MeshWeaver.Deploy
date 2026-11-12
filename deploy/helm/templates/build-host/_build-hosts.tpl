@@ -453,7 +453,15 @@ The refusals, and why each one exists:
 {{- end -}}
 {{- $np := ($b.networkPolicy | default dict) -}}
 {{- $wi := ($b.workloadIdentity | default dict) -}}
-{{- toYaml (dict "enabled" true "sharedName" $shared "apiUrl" $api "scalerApiUrl" $scalerApi "tokenSecret" $tokName "tokenKey" $tokKey
+{{- /* The MACHINE the hosts run on (its Deployments/<id> on control), or empty: when set every host names itself
+       `<machine>-<pod>` in its claims, so the fleet's price list can credit a run to the machine by host prefix — two Macs
+       serving one queue are otherwise indistinguishable (`build-host-mac-<rs>-<pod>` on both; MeshWeaver.Plugins
+       Hosting/BuildQueue §2a). A DNS label, so the claimed host name stays one too. */ -}}
+{{- $machine := trim (toString ($b.machine | default "")) -}}
+{{- if and $machine (not (regexMatch "^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$" $machine)) -}}
+{{- fail (printf "buildHosts.machine %q must be a lower-case DNS label of at most 32 characters (the machine's Deployments/<id>)" $machine) -}}
+{{- end -}}
+{{- toYaml (dict "enabled" true "machine" $machine "sharedName" $shared "apiUrl" $api "scalerApiUrl" $scalerApi "tokenSecret" $tokName "tokenKey" $tokKey
       "workloadIdentityClientId" (trim ($wi.clientId | default ""))
       "cacheClaim" $cache "cache" $cacheCreate "imagePullSecret" ($b.imagePullSecret | default "")
       "pluginsRegistry" ($b.pluginsRegistry | default "") "pluginsSource" ($b.pluginsSource | default "plugins")

@@ -276,8 +276,16 @@ spec:
             - { name: MW_BUILD_CORE_TESTS_DIGEST, value: {{ $c.coreTestsDigest | quote }} }
             {{- end }}
             - { name: MW_BUILD_IDENTITY_FILE, value: "/portal/app/meshweaver-framework.identity" }
+            {{- if $b.machine }}
+            # the claimed host name carries the MACHINE (`<machine>-<pod>`), so the price list credits the run to it by
+            # host prefix; `$(MW_BUILD_POD)` is expanded by the kubelet from the variable defined just above
+            - name: MW_BUILD_POD
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: MW_BUILD_HOST, value: {{ printf "%s-$(MW_BUILD_POD)" $b.machine | quote }} }
+            {{- else }}
             - name: MW_BUILD_HOST
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            {{- end }}
             - { name: MW_BUILD_CACHE, value: "/cache" }
             - { name: MW_BUILD_WORK, value: "/work" }
             - { name: MW_BUILD_READY_FILE, value: "/tmp/build-host-ready" }
