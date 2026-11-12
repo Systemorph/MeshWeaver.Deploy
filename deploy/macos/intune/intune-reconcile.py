@@ -804,11 +804,16 @@ class Reconcile:
             return
         for oid, (name, aad) in sorted(reach.items(), key=lambda kv: kv[1][0]):
             what = f"device sync {name}"
-            md = self.g.list("v1.0/deviceManagement/managedDevices?$filter="
-                             + urllib.parse.quote(f"azureADDeviceId eq '{aad}'") + "&$select=id,deviceName") if aad else []
+            if not aad:
+                # a user or service principal in the group: no device to sync (review on #278)
+                self.line("INFO", what, f"directory object {short(oid)} is not a device — nothing to sync")
+                continue
+            md = [m for m in self.g.list("v1.0/deviceManagement/managedDevices?$filter="
+                                         + urllib.parse.quote(f"azureADDeviceId eq '{aad}'") + "&$select=id,deviceName,operatingSystem")
+                  if (m.get("operatingSystem") or "macOS") == "macOS"]   # the fleet's Macs only, as the device step
             if len(md) != 1:
                 self.pending += 1
-                self.line("PENDING", what, f"{len(md)} managed devices for directory device {short(oid)} — not synced")
+                self.line("PENDING", what, f"{len(md)} managed macOS devices for directory device {short(oid)} — not synced")
                 continue
             try:
                 self.g.post(f"v1.0/deviceManagement/managedDevices/{md[0]['id']}/syncDevice", None)
@@ -833,8 +838,9 @@ class Reconcile:
                 self.line("ERROR", name, f"{e}{hint}")
         try:
             if self.sync_only:
+                # a HELD object is not touched at all — not even by a device action on its behalf (review on #278)
                 self.sync_devices([x for k in ("scripts", "customProfiles", "trustedRootCertificates", "settingsPolicies")
-                                   for x in self.spec.get(k, [])], "--sync")
+                                   for x in self.spec.get(k, []) if not x.get("hold")], "--sync")
             elif self.apply and self.changed:
                 self.sync_devices(self.changed, "changed by this apply: " + ", ".join(o.get("key", "?") for o in self.changed))
         except GraphError as e:
@@ -1057,6 +1063,25 @@ def self_test():
     r.sync_devices([r.spec["settingsPolicies"][0]], "test")
     expect("device sync: a member with no managed device is PENDING, named, never a silent skip",
            r.pending == 1 and any(ln.startswith("PENDING") and "hand-added" in ln for ln in lines), lines)
+    st2s = copy.deepcopy(st)
+    st2s["managedDevices"]["mw"] = {"id": "mw", "serialNumber": "W", "azureADDeviceId": "aad-x", "operatingSystem": "Windows"}
+    st2s["devices"]["u1"] = {"id": "u1", "displayName": "a person"}
+    st2s["groups"][G1]["_members"].append("u1")
+    lines = []
+    g = FakeGraph(st2s)
+    r = Reconcile(copy.deepcopy(spec), tempfile.gettempdir(), g, apply=True, token=tok, out=lines.append)
+    r.groups()
+    r.sync_devices([r.spec["settingsPolicies"][0]], "test")
+    synced = [w[1].split("/")[3] for w in g.writes if w[1].endswith("/syncDevice")]
+    expect("device sync: a non-macOS managed device is never synced, and a non-device member is INFO, not PENDING",
+           synced == ["m1"] and any(ln.startswith("INFO") and "not a device" in ln for ln in lines) and r.pending == 1, lines)
+    held = copy.deepcopy(spec)
+    held["settingsPolicies"][0]["hold"] = "the owner's go"
+    held["scripts"] = []; held["customProfiles"] = []; held["trustedRootCertificates"] = []
+    lines = []
+    g = FakeGraph(copy.deepcopy(st))
+    Reconcile(held, tempfile.gettempdir(), g, token=tok, out=lines.append, sync_only=True).run()
+    expect("device sync: --sync never acts for a HELD object", not any(w[1].endswith("/syncDevice") for w in g.writes), lines)
     # the real client: an empty POST carries Content-Length: 0 (Graph answers 411 without it), and no Content-Type
     seen = {}
     class _R:
@@ -1072,9 +1097,11 @@ def self_test():
         Graph("t").post("v1.0/deviceManagement/managedDevices/x/syncDevice", None)
     finally:
         urllib.request.urlopen = real
-    expect("Graph: an action POST with no body sends Content-Length: 0 and no Content-Type",
+    # what is observable here is the Request the client builds (urllib's handler adds its own form Content-Type later,
+    # harmless to Graph — the 411 is about Content-Length): an explicit Content-Length: 0, an empty body, no JSON type
+    expect("Graph: an action POST with no body is built with an empty body and an explicit Content-Length: 0 (no JSON type)",
            seen.get("method") == "POST" and seen.get("data") == b"" and seen["headers"].get("content-length") == "0"
-           and "content-type" not in seen["headers"], [repr(seen)])
+           and seen["headers"].get("content-type") != "application/json", [repr(seen)])
     rc, lines, g = run(st, False)
     expect("no-op: a reconciled tenant checks clean apart from the held policy (writes nothing)",
            rc == 2 and not g.writes and sum(ln.startswith("DRIFT") for ln in lines) == 0 and sum(ln.startswith("HELD") for ln in lines) == 1, lines)
