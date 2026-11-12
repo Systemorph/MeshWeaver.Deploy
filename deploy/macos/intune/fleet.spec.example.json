@@ -170,7 +170,7 @@
       "settings": {
         "com.apple.mcx.filevault2_enable": "com.apple.mcx.filevault2_enable_0",
         "com.apple.mcx.filevault2_defer": "com.apple.mcx.filevault2_defer_true",
-        "com.apple.mcx.filevault2_deferforceatuserloginmaxbypassattempts": "0",
+        "com.apple.mcx.filevault2_deferforceatuserloginmaxbypassattempts": 0,
         "com.apple.mcx.filevault2_deferdontaskatuserlogout": "com.apple.mcx.filevault2_deferdontaskatuserlogout_false",
         "com.apple.mcx.filevault2_userecoverykey": "com.apple.mcx.filevault2_userecoverykey_true",
         "com.apple.mcx.filevault2_showrecoverykey": "com.apple.mcx.filevault2_showrecoverykey_false",

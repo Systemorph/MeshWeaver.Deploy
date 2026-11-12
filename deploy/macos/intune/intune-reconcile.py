@@ -548,7 +548,7 @@ class Reconcile:
                 if oid in members:
                     self.line("OK", what, f"member (managed {short(md[0]['id'])}, directory {short(oid)})")
                     continue
-                def add(oid=oid, mid=md[0]["id"], name=d["name"]):
+                def add(oid=oid, mid=md[0]["id"], name=d.get("name") or d["serial"]):
                     self.g.post(f"v1.0/groups/{gid}/members/$ref", {"@odata.id": f"{GRAPH}/v1.0/directoryObjects/{oid}"})
                     # a Mac that just joined the group gets its first bootstrap NOW, not at the agent's next check-in
                     self.new_members.append((name, mid))
@@ -736,7 +736,8 @@ class Reconcile:
                 continue
             full = self.g.get(f"beta/deviceManagement/configurationPolicies/{live['id']}?$expand=settings")
             flat = flatten_settings(full.get("settings", []))
-            diffs = [f"{k}: live={flat.get(k)!r} spec={v!r}" for k, v in s["settings"].items() if flat.get(k) != v]
+            # compared as text: Graph returns an integer setting as 0 where a spec may say "0" (no drift forever)
+            diffs = [f"{k}: live={flat.get(k)!r} spec={v!r}" for k, v in s["settings"].items() if str(flat.get(k)) != str(v)]
             if diffs:
                 def put(full=full):
                     body = strip_ids({k: full[k] for k in ("name", "description", "platforms", "technologies",
@@ -756,6 +757,14 @@ class Reconcile:
         choice setting carries the declared option id, a simple one an integer or string value as the definition says."""
         out = []
         for group, children in s["create"]["groups"].items():
+            # every declared child must be one the GROUP's own definition lists as a direct child — a setting that lives
+            # under a choice option instead would be posted in the wrong place, so it is refused by name (review on #281)
+            gdef = self.g.get(f"beta/deviceManagement/configurationSettings/{urllib.parse.quote(group)}")
+            allowed = set(gdef.get("childIds") or [])
+            wrong = [c for c in children if allowed and c not in allowed]
+            if wrong:
+                raise GraphError(400, "GET", f"configurationSettings/{group}",
+                                 "not direct children of this group (declare them under their parent): " + ", ".join(wrong))
             kids = []
             for sid in children:
                 d = self.g.get(f"beta/deviceManagement/configurationSettings/{urllib.parse.quote(sid)}")
@@ -767,10 +776,15 @@ class Reconcile:
                                  "choiceSettingValue": {"value": v, "children": []}})
                 elif kind == "deviceManagementConfigurationSimpleSettingDefinition":
                     integer = "Integer" in ((d.get("valueDefinition") or {}).get("@odata.type") or "")
+                    try:
+                        value = int(v) if integer else str(v)
+                    except (TypeError, ValueError):
+                        # an ERROR line naming the setting, never a traceback (review on #281)
+                        raise GraphError(400, "GET", f"configurationSettings/{sid}", f"declared value {v!r} is not an integer") from None
                     kids.append({"@odata.type": "#microsoft.graph.deviceManagementConfigurationSimpleSettingInstance", **tmpl,
                                  "simpleSettingValue": {"@odata.type": "#microsoft.graph.deviceManagementConfiguration"
                                                         + ("IntegerSettingValue" if integer else "StringSettingValue"),
-                                                        "value": int(v) if integer else str(v)}})
+                                                        "value": value}})
                 else:
                     raise GraphError(400, "GET", f"configurationSettings/{sid}", f"cannot build a {kind or 'unknown'} setting")
             out.append({"@odata.type": "#microsoft.graph.deviceManagementConfigurationSetting",
@@ -1309,8 +1323,15 @@ def self_test():
         "com.apple.mcx.filevault2_deferforceatuserloginmaxbypassattempts": {"@odata.type": "#microsoft.graph.deviceManagementConfigurationSimpleSettingDefinition",
             "valueDefinition": {"@odata.type": "#microsoft.graph.deviceManagementConfigurationIntegerSettingValueDefinition"}},
         "com.apple.security.fderecoverykeyescrow_location": {"@odata.type": "#microsoft.graph.deviceManagementConfigurationSimpleSettingDefinition",
-            "valueDefinition": {"@odata.type": "#microsoft.graph.deviceManagementConfigurationStringSettingValueDefinition"}}}
+            "valueDefinition": {"@odata.type": "#microsoft.graph.deviceManagementConfigurationStringSettingValueDefinition"}},
+        # the groups, as this tenant's Graph defines them: the declared settings are their DIRECT children (childIds)
+        "com.apple.mcx.filevault2_com.apple.mcx.filevault2": {"childIds": ["com.apple.mcx.filevault2_enable",
+                                                                           "com.apple.mcx.filevault2_deferforceatuserloginmaxbypassattempts"]},
+        "com.apple.security.fderecoverykeyescrow_com.apple.security.fderecoverykeyescrow": {"childIds": ["com.apple.security.fderecoverykeyescrow_location"]}}
     rc, lines, g = run(st6, True, {**fv, "compliancePolicies": []})
+    rc2, lines2, g2 = run(st6, False, {**fv, "compliancePolicies": []})
+    expect("create: the next --check of the created policy is clean (an integer 0 matches a declared \"0\")",
+           not any(ln.startswith("DRIFT") and "FileVault" in ln for ln in lines2), lines2)
     made = [x for x in st6["policies"].values() if x.get("name") == "Fleet — FileVault"]
     flat = flatten_settings(made[0].get("settings", [])) if made else {}
     vals = [x for x in flatten_settings_values(made[0]["settings"])] if made else []
@@ -1318,6 +1339,20 @@ def self_test():
            "integer, string), assigned, and its Macs synced",
            len(made) == 1 and flat == fv["settingsPolicies"][-1]["settings"] | {"com.apple.mcx.filevault2_deferforceatuserloginmaxbypassattempts": 0}
            and 0 in vals and made[0].get("_assign") and any(ln.startswith("SYNCED") for ln in lines), lines + [repr(made)])
+    st7 = copy.deepcopy(st6)
+    st7["policies"] = {k: v for k, v in st7["policies"].items() if v.get("name") != "Fleet — FileVault"}
+    st7["settingDefs"]["com.apple.mcx.filevault2_com.apple.mcx.filevault2"] = {"childIds": ["com.apple.mcx.filevault2_enable"]}
+    rc, lines, g = run(st7, True, {**fv, "compliancePolicies": []})
+    expect("create: a declared child the group's definition does not list is refused by NAME (ERROR, nothing posted)",
+           rc == 1 and any(ln.startswith("ERROR") and "deferforceatuserloginmaxbypassattempts" in ln for ln in lines)
+           and not any(x.get("name") == "Fleet — FileVault" for x in st7["policies"].values()), lines)
+    st8 = copy.deepcopy(st6)
+    st8["policies"] = {k: v for k, v in st8["policies"].items() if v.get("name") != "Fleet — FileVault"}
+    nan = copy.deepcopy(fv)
+    nan["settingsPolicies"][-1]["settings"]["com.apple.mcx.filevault2_deferforceatuserloginmaxbypassattempts"] = "abc"
+    rc, lines, g = run(st8, True, {**nan, "compliancePolicies": []})
+    expect("create: a non-integer value for an integer setting is an ERROR line naming it, never a traceback",
+           rc == 1 and any(ln.startswith("ERROR") and "is not an integer" in ln for ln in lines), lines)
     bad_fv = copy.deepcopy(fv)
     bad_fv["settingsPolicies"][-1]["create"]["groups"]["x"] = ["undeclared.setting"]
     expect("validate: create.groups naming a setting the policy does not declare is refused",
