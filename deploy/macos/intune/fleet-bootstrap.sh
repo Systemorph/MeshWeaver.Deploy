@@ -31,7 +31,7 @@
 #      posted, and a root LaunchDaemon (com.meshweaver.fleet.join-poller) polls control every 30 s for at most 24 h — the
 #      Approve is collected within half a minute and the run continues at once. It removes itself when done.
 #   Readings the person can read without root: /Library/MeshWeaver/fleet-state/ — one file per step (operator-ssh,
-#      bootstrap-token, energy, participation, homebrew, devtools, tools, tailscale, tailscaled, network, up, setup, join, doctor,
+#      bootstrap-token, energy, join-poller, participation, homebrew, devtools, tools, tailscale, tailscaled, network, up, setup, join, doctor,
 #      heartbeat, buildhost) and `stage`: the step the onboarding is stuck on, since when and why (1.7.0). A join that
 #      failed or was skipped for a missing prerequisite also reaches the person as a notification, naming it.
 #
@@ -1008,7 +1008,9 @@ run_join() {
   # the approval link and the fingerprints only — never a token-bearing setup URL
   printf '%s\n' "$out" | grep -E 'Hosting/Heartbeats/Enrol/|fingerprint|joined as|WAITING|waiting|approved|REFUSED|network:|sign-in:|certificate:|build host:' | grep -v 'token=' | while IFS= read -r l; do log "memex: $l"; done
   case "$rc" in
-    0) # the join handed the private-network key over by file: join the network now, not at the next run — and FIRST,
+    0) # collected by an ordinary run: the poller has nothing left to do — it goes NOW, not at the end of this run
+       [ -n "${FLEET_IN_POLLER:-}" ] || remove_join_poller "the Approve was collected by an hourly run"
+       # the join handed the private-network key over by file: join the network now, not at the next run — and FIRST,
        # so its own log lines never overwrite the verdict this step leaves for track() (review on #276)
        step_network "$machine" "$user" || true
        if [ "$mode" = pre-setup ]; then
@@ -1029,6 +1031,34 @@ run_join() {
        STEP_STAGE="join"; log "memex: fleet join FAILED (exit $rc) — ${refused:-$(last_said "$out")}"
        write_reading join failed "exit $rc: ${refused:-$(last_said "$out")}"; return 1 ;;
   esac
+}
+
+# ONE run at a time (review on #280): the hourly run and the poller's continuation must never run the full bootstrap
+# concurrently (both would race on brew, memex-local and the readings). A mkdir lock in the state directory (macOS has
+# no flock): the poller SKIPS a tick while it is held, an hourly run waits up to 15 min for it. A lock whose owner is
+# gone (its pid dead, or older than 2 h) is taken over. A dry run, or a state directory that cannot be written, runs
+# without it (and says so).
+RUN_LOCK_HELD_BY_ME=""
+acquire_run_lock() {
+  local wait_s="$1" lock="$STATE_DIR/.run.lock" waited=0 pid
+  [ -n "${FLEET_RUN_LOCK_HELD:-}" ] && return 0
+  [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] && return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || { log "run lock: $STATE_DIR is not writable — running without the lock"; return 0; }
+  while ! mkdir "$lock" 2>/dev/null; do
+    pid="$(cat "$lock/pid" 2>/dev/null)"
+    if { [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; } || [ -n "$(find "$lock" -maxdepth 0 -mmin +120 2>/dev/null)" ]; then
+      log "run lock: taking over a stale lock (pid ${pid:-unknown})"; rm -rf "$lock"; continue
+    fi
+    [ "$waited" -ge "$wait_s" ] && return 1
+    sleep 5; waited=$((waited + 5))
+  done
+  printf '%s\n' "$$" > "$lock/pid"
+  FLEET_RUN_LOCK_HELD=1; export FLEET_RUN_LOCK_HELD; RUN_LOCK_HELD_BY_ME=1
+  trap 'release_run_lock' EXIT
+}
+release_run_lock() {
+  [ -n "$RUN_LOCK_HELD_BY_ME" ] || return 0
+  rm -rf "$STATE_DIR/.run.lock"; RUN_LOCK_HELD_BY_ME=""
 }
 
 # A filed request reaches the person at this Mac at once: a notification, and the approval page opened in their browser
@@ -1092,8 +1122,20 @@ remove_join_poller() {
   if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then printf 'DRY-RUN: launchctl bootout system %s; rm %s\n' "$POLLER_PLIST" "$POLLER_PLIST"; return 0; fi
   rm -f "$STATE_DIR/join-poller.since" "$POLLER_PLIST"
   write_reading join-poller removed "$why"
-  # last: booting ourselves out ends this very process when the poller is the caller
+  # last: booting ourselves out ends this very process when the poller is the caller — the lock goes first
+  [ -n "${FLEET_IN_POLLER:-}" ] && release_run_lock
   launchctl bootout "system/$POLLER_LABEL" >/dev/null 2>&1 || true
+}
+
+# One tick's work, and ONLY that (review on #280): no `memex-local up`, no verify — the probe whether the portal is still
+# in its first-run setup (one HTTPS request, which picks the join's mode) and ONE poll of control (`--wait 0`).
+poll_join_once() {
+  local user="$1" machine="$2" control mlocal mode=full
+  control="$(setting FLEET_CONTROL_URL ControlUrl)"; mlocal="$BREW_PREFIX/bin/memex-local"
+  [ -n "$control" ] || { log "poll-join: no ControlUrl — nothing to poll"; return 0; }
+  if probe_as_user "$user" env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(memex_libexec)/share" MEMEX_CHART_DIR="$(memex_libexec)/share/helm" \
+       /bin/bash -c '. "$0"; awaiting_setup' "$(memex_libexec)/memex-local"; then mode=pre-setup; fi
+  run_join "$user" "$machine" "$control" "$mlocal" "$mode"
 }
 
 # `fleet-bootstrap.sh poll-join` — what the poller runs every 30 s: ONE poll of control for this Mac's code. Collected →
@@ -1112,8 +1154,10 @@ poll_join_main() {
   if [ $((now - since)) -ge "$POLLER_MAX_S" ]; then
     remove_join_poller "not approved within $((POLLER_MAX_S / 3600)) h — the hourly run keeps polling"; exit 0
   fi
+  # a full run holds the lock: skip this tick (the next is 30 s away)
+  acquire_run_lock 0 || exit 0
   read_participation >/dev/null || exit 0
-  FLEET_POLL_MODE=1 track memex step_memex "$user" "$machine"
+  FLEET_POLL_MODE=1 track memex poll_join_once "$user" "$machine"
   if [ -f "$home/.memex-local/fleet.yaml" ]; then
     ( FLEET_POLL_MODE="" main )   # continue NOW: the network, the setup and the finalisation, not at the next hourly run
     remove_join_poller "the Approve was collected"; exit 0
@@ -1130,6 +1174,7 @@ main() {
   check_password "$user"
   machine="$(machine_id)"
   log "run for console user $user, machine $machine"
+  acquire_run_lock 900 || { log "another bootstrap run (the join poller's continuation) holds the run lock for over 15 min — this run stops; the next one retries"; exit 0; }
   # the operator's way in comes before everything that can fail: a Mac whose later steps fail is still reachable
   # failures that must not stop the rest of the run (operator SSH, the energy enabler): exit 1 at the end
   local deferred_failed=0

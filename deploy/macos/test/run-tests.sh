@@ -961,7 +961,7 @@ rm -f "$JP/lcalls"; jprun SM_JOIN_RC=3 SM_JOIN_OUT="open $LINK to approve" FLEET
 grep -q -- 'fleet join .* --wait 0 ' "$JP/calls" && [ ! -s "$JP/lcalls" ] && ok "the poller's run asks control ONCE (--wait 0) and installs nothing" || bad "poll mode" "$(cat "$JP/calls") / $(cat "$JP/lcalls" 2>/dev/null)"
 # 4. poll-join: the Approve collected → the full run continues FIRST, then the poller is removed (bootout last)
 PJ='console_user() { printf jroe; }; machine_id() { printf studio-2; }; read_participation() { return 0; }
-    step_memex() { : > "$FLEET_USER_HOME/.memex-local/fleet.yaml"; log "memex: joined as studio-2"; }
+    poll_join_once() { : > "$FLEET_USER_HOME/.memex-local/fleet.yaml"; log "memex: joined as studio-2"; }
     main() { echo "MAIN-RAN"; exit 0; }
     poll_join_main; echo "after"'
 rm -f "$JP/lcalls" "$JP/home/.memex-local/fleet.yaml"
@@ -972,7 +972,7 @@ case "$OUT" in *"MAIN-RAN"*"removing the join poller (the Approve was collected)
 # 5. poll-join older than 24 h: the poller goes, nothing is polled
 rm -f "$JP/home/.memex-local/fleet.yaml" "$JP/lcalls"; printf '%s\n' "$(( $(date +%s) - 90000 ))" > "$JP/st/join-poller.since"; printf 'x' > "$JP/ld/com.meshweaver.fleet.join-poller.plist"
 PJE='console_user() { printf jroe; }; machine_id() { printf studio-2; }; read_participation() { return 0; }
-    step_memex() { echo POLLED; }
+    poll_join_once() { echo POLLED; }
     poll_join_main'
 OUT="$(env FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_USER_HOME="$JP/home" FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" \
   bash -c '. "$0"; id() { [ "$1" = -u ] && [ $# = 1 ] && echo 0 || command id "$@"; }; '"$PJE" "$FB" 2>&1)"
@@ -980,12 +980,38 @@ case "$OUT" in *"not approved within 24 h"*) case "$OUT" in *POLLED*) bad "expir
 # 6. a refused join (no longer waiting): the poller goes
 rm -f "$JP/lcalls"; date +%s > "$JP/st/join-poller.since"; printf 'x' > "$JP/ld/com.meshweaver.fleet.join-poller.plist"
 PJR='console_user() { printf jroe; }; machine_id() { printf studio-2; }; read_participation() { return 0; }
-    step_memex() { write_reading join failed "exit 1: REFUSED"; return 1; }
+    poll_join_once() { write_reading join failed "exit 1: REFUSED"; return 1; }
     poll_join_main'
 OUT="$(env FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_USER_HOME="$JP/home" FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" \
   bash -c '. "$0"; id() { [ "$1" = -u ] && [ $# = 1 ] && echo 0 || command id "$@"; }; '"$PJR" "$FB" 2>&1)"
 case "$OUT" in *"removing the join poller (the join is no longer waiting for the Approve (failed"*) ok "a join that is refused or failed: the poller removes itself" ;; *) bad "refused poller" "$OUT" ;; esac
 grep -q 'poll-join) poll_join_main' "$FB" && ok "the script's entry point dispatches 'poll-join' to the poller's run" || bad "entry point" ""
+# 7. ONE run at a time (review on #280): a live holder makes the poller skip its tick; a dead holder's lock is taken over
+mkdir -p "$JP/st/.run.lock"; sleep 300 & HOLDER=$!; echo "$HOLDER" > "$JP/st/.run.lock/pid"
+PJL='console_user() { printf jroe; }; machine_id() { printf studio-2; }; read_participation() { return 0; }
+    poll_join_once() { echo POLLED; }
+    poll_join_main'
+date +%s > "$JP/st/join-poller.since"
+OUT="$(env FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_USER_HOME="$JP/home" FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" \
+  bash -c '. "$0"; id() { [ "$1" = -u ] && [ $# = 1 ] && echo 0 || command id "$@"; }; '"$PJL" "$FB" 2>&1)"
+case "$OUT" in *POLLED*) bad "a held run lock makes the poller skip its tick" "$OUT" ;; *) [ -d "$JP/st/.run.lock" ] && ok "while a full run holds the run lock the poller SKIPS its tick (no concurrent bootstraps)" || bad "lock removed by skipper" "" ;; esac
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+OUT="$(env FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_USER_HOME="$JP/home" FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" \
+  bash -c '. "$0"; id() { [ "$1" = -u ] && [ $# = 1 ] && echo 0 || command id "$@"; }; '"$PJL" "$FB" 2>&1)"
+case "$OUT" in *"taking over a stale lock"*POLLED*) [ ! -d "$JP/st/.run.lock" ] && ok "a lock whose holder is gone is taken over, and released when the tick ends" || bad "lock not released" "$(ls -la "$JP/st")" ;; *) bad "stale lock" "$OUT" ;; esac
+# 8. a tick does ONLY the setup probe and ONE poll — no up, no verify
+: > "$JP/calls"
+OUT="$(env $FCA_ENV FLEET_BOOTSTRAP_LIB=1 PATH="$JP/pbin:$T/secb:$PATH" FLEET_LOG_DIR="$JP/log" FLEET_MANAGED_PREFS="$JP/none" FLEET_USER_HOME="$JP/home" FLEET_BREW_PREFIX="$JP/brew" \
+  FLEET_STATE_DIR="$JP/st" FLEET_LAUNCHDAEMONS_DIR="$JP/ld" FLEET_BIN_DIR="$JP/bin" FLEET_CONTROL_URL=https://control.example.test SM_CALLS="$JP/calls" FLEET_POLL_MODE=1 \
+  FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=false bash -c '. "$0"; as_user() { shift; printf "%s\n" "$*" >> "$SM_CALLS"; return 3; }
+    probe_as_user() { printf "PROBE %s\n" "$*" >> "$SM_CALLS"; return 1; }; notify_user() { :; }
+    read_participation >/dev/null; poll_join_once jroe studio-2' "$FB" 2>&1)"
+[ "$(grep -c 'fleet join' "$JP/calls")" = 1 ] && grep -q -- '--wait 0' "$JP/calls" && ! grep -qE 'memex-local (up|verify)' "$JP/calls" && [ "$(grep -c '^PROBE' "$JP/calls")" = 1 ] \
+  && ok "a poller tick is ONE setup probe and ONE poll (--wait 0) — never 'memex-local up' or 'verify'" || bad "tick weight" "$(cat "$JP/calls")"
+# 9. an hourly run that collects the Approve removes the poller AT ONCE (not at the end of its run)
+printf 'x' > "$JP/ld/com.meshweaver.fleet.join-poller.plist"; date +%s > "$JP/st/join-poller.since"; rm -f "$JP/lcalls"
+grep -A3 '^    0) # collected by an ordinary run' "$FB" | grep -q 'remove_join_poller "the Approve was collected by an hourly run"' \
+  && ok "an hourly run that collects the Approve removes the poller right then (no second continuation on its next tick)" || bad "immediate removal" ""
 rm -rf "$JP"
 
 echo
