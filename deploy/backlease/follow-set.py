@@ -294,6 +294,32 @@ def estate_values(values: dict) -> dict:
 
 SIZING_FILE = "sizing.yaml"
 
+# The Mac's back-lease file (`memex-local backlease enroll` writes it): its `Hosting__Deployment` is the machine's
+# Deployments/<id> on control — the name every build host of this Mac carries in its claims (`buildHosts.machine`).
+BACKLEASE_FILE = "backlease.yaml"
+MACHINE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$")
+
+
+def machine_of(home: str, chart: str) -> Optional[str]:
+    """THIS MAC'S MACHINE NAME — the `Hosting__Deployment` of its back-lease file — when the chart can carry it
+    (`buildHosts.machine` in its build-host template) and it is a DNS label; else None (the host keeps claiming as its pod).
+    With it the claimed host is `<machine>-<pod>`, so the fleet's price list credits the Mac's runs to it by host prefix:
+    two Macs on one queue are otherwise both `build-host-mac-…` and their work is credited to neither."""
+    tpl = os.path.join(chart, "templates", "build-host", "_build-hosts.tpl")
+    try:
+        with open(tpl) as fh:
+            if "$b.machine" not in fh.read():
+                return None
+        with open(os.path.join(home, BACKLEASE_FILE)) as fh:
+            for raw in fh:
+                key, _, value = raw.strip().partition(":")
+                if key == "Hosting__Deployment":
+                    v = value.strip().strip('"').strip("'")
+                    return v if MACHINE.match(v) else None
+    except OSError:
+        return None
+    return None
+
 
 def sizing_file(agent: Optional[str], chart: str) -> Optional[str]:
     """THIS MAC'S SIZING (`memex-local buildhost apply` writes `<agent>/sizing.yaml`: runners, resources, stage slots, the
@@ -314,7 +340,7 @@ def sizing_file(agent: Optional[str], chart: str) -> Optional[str]:
 
 
 def full_upgrade_cmd(release: str, ns: str, ctx: str, chart: str, values_file: str, estate_file: str, channel: str,
-                     s: dict, sizing: Optional[str] = None) -> list:
+                     s: dict, sizing: Optional[str] = None, machine: Optional[str] = None) -> list:
     """A FULL upgrade: the chart's defaults, the Mac values, the estate values, this Mac's sizing, then the set — never
     --reuse-values."""
     cmd = ["helm", "upgrade", release, chart, "--kube-context", ctx, "-n", ns,
@@ -323,20 +349,25 @@ def full_upgrade_cmd(release: str, ns: str, ctx: str, chart: str, values_file: s
         cmd += ["-f", sizing]
     for k in FIELDS:
         cmd += ["--set-string", f"buildHosts.{channel}.{k}={s[k]}"]
+    if machine is not None:
+        cmd += ["--set-string", f"buildHosts.machine={machine}"]
     return cmd + ["--wait=false"]
 
 
-def upgrade_cmd(release: str, ns: str, ctx: str, chart: str, channel: str, s: dict) -> list:
+def upgrade_cmd(release: str, ns: str, ctx: str, chart: str, channel: str, s: dict, machine: Optional[str] = None) -> list:
     cmd = ["helm", "upgrade", release, chart, "--kube-context", ctx, "-n", ns, "--reuse-values"]
     for k in FIELDS:
         cmd += ["--set-string", f"buildHosts.{channel}.{k}={s[k]}"]
+    # None leaves the release's value alone; "" CLEARS it (--reuse-values would otherwise keep a stale machine name)
+    if machine is not None:
+        cmd += ["--set-string", f"buildHosts.machine={machine}"]
     return cmd + ["--wait=false"]
 
 
 def follow_once(api: str, follow: str, release: str, ns: str, ctx: str, chart: str, channel: str,
                 get: Fetcher, sh: Runner, dry_run: bool = False, agent: Optional[str] = None,
                 download: "Optional[Callable[[str, str], int]]" = None, source_repo: str = SOURCE_REPO,
-                source_ref: str = SOURCE_REF) -> "tuple[str, int]":
+                source_ref: str = SOURCE_REF, home: Optional[str] = None) -> "tuple[str, int]":
     """One pass: (the line it prints, exit code). Exit 0 for current/applied/nothing-to-follow, 1 for a failed apply.
     With `agent` (the agent's directory) and `download`, the chart and the Mac values follow `source_ref` too."""
     want, why = desired_set(api, follow, get)
@@ -369,7 +400,19 @@ def follow_once(api: str, follow: str, release: str, ns: str, ctx: str, chart: s
         applied = read_json(os.path.join(agent, "applied.json"))
         source_changed = bool(staged.get("key")) and staged.get("key") != applied.get("key")
     note = f" ({'; '.join(notes)})" if notes else ""
-    if have == want and not source_changed:
+    # `home` is the Mac's memex-local home (main passes it; a test passes its own, or none: then the follower leaves the
+    # machine name as the release has it). `values` are the RELEASE's current user values (deployed_set), so a release
+    # that already carries the name reads current; one without it is applied once; one whose name no longer holds (the Mac
+    # un-enrolled, or its id is no DNS label) is cleared once, back to claiming as its pod.
+    carried = ((values.get("buildHosts") or {}).get("machine") or None)
+    machine = (machine_of(home, chart) or "") if home else None
+    machine_changed = machine is not None and (machine or None) != carried
+    if machine_changed:
+        notes.append(f"the hosts claim as {machine}-<pod>" if machine else "the hosts claim as their pod again (no machine name)")
+        note = f" ({'; '.join(notes)})"
+    elif machine == "":
+        machine = None   # nothing carried, nothing to clear: leave the value alone
+    if have == want and not source_changed and not machine_changed:
         return f"follow-set: current — {release} runs {follow}'s set {want['platformVersion']}{note}", 0
     if not os.path.isfile(os.path.join(chart, "Chart.yaml")):
         return f"follow-set: nothing applied — no chart at {chart}", 0
@@ -382,9 +425,9 @@ def follow_once(api: str, follow: str, release: str, ns: str, ctx: str, chart: s
     if agent and os.path.isfile(values_file):
         estate = os.path.join(agent, "estate-values.json")
         write_json(estate, estate_values(values))
-        rc, out = sh(full_upgrade_cmd(release, ns, ctx, chart, values_file, estate, channel, want, sizing_file(agent, chart)))
+        rc, out = sh(full_upgrade_cmd(release, ns, ctx, chart, values_file, estate, channel, want, sizing_file(agent, chart), machine))
     else:
-        rc, out = sh(upgrade_cmd(release, ns, ctx, chart, channel, want))
+        rc, out = sh(upgrade_cmd(release, ns, ctx, chart, channel, want, machine))
     if rc != 0:
         tail = out.strip().splitlines()[-1][:300] if out.strip() else ""
         return f"follow-set: FAILED to apply {line} (helm exit {rc}): {tail}{note}", 1
@@ -720,6 +763,71 @@ def self_test() -> int:
               and cmd.index(os.path.join(sz, SIZING_FILE)) < cmd.index("--set-string"), cmd)
         os.remove(os.path.join(sz, SIZING_FILE))
         check("sizing: no sizing.yaml (a Mac never sized) → the Mac values alone", sizing_file(sz, ch) is None)
+    # THE MACHINE NAME (buildHosts.machine): read from the Mac's back-lease file, carried only by a chart that reads it,
+    # passed on both upgrade forms, and a release without it is applied once even on an unchanged set
+    with tempfile.TemporaryDirectory() as mh:
+        mchart = os.path.join(mh, "chart")
+        os.makedirs(os.path.join(mchart, "templates", "build-host"))
+        with open(os.path.join(mchart, "Chart.yaml"), "w") as fh:
+            fh.write("name: memex\n")
+        tplf = os.path.join(mchart, "templates", "build-host", "_build-hosts.tpl")
+        with open(tplf, "w") as fh:
+            fh.write("{{- $machine := ($b.machine | default \"\") -}}")
+        with open(os.path.join(mh, BACKLEASE_FILE), "w") as fh:
+            fh.write('Hosting__ReportTo: "https://ops.example"\nHosting__Deployment: "studio-1"\n')
+        check("machine: the back-lease deployment names the machine", machine_of(mh, mchart) == "studio-1", machine_of(mh, mchart))
+        full = full_upgrade_cmd("r", "n", "c", mchart, "v.yaml", "e.json", "mac", good, None, "studio-1")
+        short = upgrade_cmd("r", "n", "c", mchart, "mac", good, "studio-1")
+        check("machine: both upgrade forms set buildHosts.machine",
+              "buildHosts.machine=studio-1" in full and "buildHosts.machine=studio-1" in short, (full, short))
+        check("machine: no machine → no buildHosts.machine",
+              not any("buildHosts.machine" in x for x in upgrade_cmd("r", "n", "c", mchart, "mac", good)))
+        hm = Helm(dict(good))
+        line_m, rc_m = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                                   mchart, "mac", control(good), hm, home=mh)
+        check("machine: a release without the machine is applied once on an unchanged set",
+              rc_m == 0 and len(hm.upgrades()) == 1 and "buildHosts.machine=studio-1" in hm.upgrades()[0] and "studio-1-<pod>" in line_m,
+              (line_m, hm.upgrades()))
+        class Carried(Helm):
+            def __init__(self, values: dict, machine: str):
+                super().__init__(values)
+                self.machine = machine
+
+            def __call__(self, cmd: list) -> "tuple[int, str]":
+                if cmd[:3] == ["helm", "get", "values"]:
+                    self.calls.append(cmd)
+                    return 0, json.dumps({"buildHosts": {"mac": self.values, "machine": self.machine}})
+                return super().__call__(cmd)
+        hs = Carried(dict(good), "studio-1")
+        line_s, rc_s = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                                   mchart, "mac", control(good), hs, home=mh)
+        check("machine: a release that already carries the name reads current — applied ONCE, not every pass",
+              rc_s == 0 and hs.upgrades() == [] and line_s.startswith("follow-set: current"), (line_s, hs.upgrades()))
+        hr = Carried(dict(good), "studio-9")
+        line_r, _ = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                                mchart, "mac", control(good), hr, home=mh)
+        check("machine: a renamed machine is applied once", len(hr.upgrades()) == 1 and "buildHosts.machine=studio-1" in hr.upgrades()[0], line_r)
+        line_n, _ = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                                mchart, "mac", control(good), Helm(dict(good)))
+        check("machine: without a home nothing changes on an unchanged set", line_n.startswith("follow-set: current"), line_n)
+        with open(os.path.join(mh, BACKLEASE_FILE), "w") as fh:
+            fh.write('Hosting__Deployment: "Studio_1"\n')
+        check("machine: a deployment that is not a DNS label names no machine", machine_of(mh, mchart) is None)
+        hc = Carried(dict(good), "studio-1")
+        line_c, _ = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                                mchart, "mac", control(good), hc, home=mh)
+        check("machine: a name that no longer holds is CLEARED once (the short form would keep it)",
+              len(hc.upgrades()) == 1 and "buildHosts.machine=" in hc.upgrades()[0] and "their pod again" in line_c, (line_c, hc.upgrades()))
+        hq = Helm(dict(good))
+        line_q, _ = follow_once("https://ops.example/api/builds", "latest", "build-host-mac", "build-mac", "colima-build",
+                                mchart, "mac", control(good), hq, home=mh)
+        check("machine: nothing carried and nothing named → current, nothing applied", hq.upgrades() == [] and line_q.startswith("follow-set: current"), line_q)
+        with open(tplf, "w") as fh:
+            fh.write("{{- /* an older chart */ -}}")
+        with open(os.path.join(mh, BACKLEASE_FILE), "w") as fh:
+            fh.write('Hosting__Deployment: "studio-1"\n')
+        check("machine: a chart that cannot read it gets none", machine_of(mh, mchart) is None)
+        check("machine: no back-lease file → none", machine_of(os.path.join(mh, "nowhere"), mchart) is None)
     # first-attach's estate --set-string keys are exactly what a full upgrade keeps
     attach = os.path.join(os.path.dirname(os.path.abspath(__file__)), "first-attach.sh")
     if os.path.isfile(attach):
@@ -776,7 +884,7 @@ def main() -> int:
                                chart, a.channel, fetch, run, dry_run=a.dry_run,
                                agent=agent if os.path.realpath(chart) == os.path.realpath(os.path.join(agent, "helm")) else None,
                                download=download_to,
-                               source_repo=a.source_repo, source_ref=a.source_ref)
+                               source_repo=a.source_repo, source_ref=a.source_ref, home=HOME)
     print(line, flush=True)
     return rc
 

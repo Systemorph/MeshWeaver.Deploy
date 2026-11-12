@@ -1234,6 +1234,11 @@ database:
 # job `build-host-latest`) into the operations record through its signed inbox — never by hand.
 buildHosts:
   enabled: false
+  # The MACHINE these hosts run on — its Deployments/<id> on the control instance (a leased Mac's back-lease
+  # deployment), or empty. Set, every host names itself `<machine>-<pod>` in the runs it claims, so the fleet's price
+  # list credits the run to that machine by host prefix (`hosts: ["<machine>-"]`); two Macs serving one queue are
+  # otherwise the same `build-host-<channel>-…` and their work is credited to neither. A lower-case DNS label.
+  machine: ""
   # The build API base the host claims from, in-cluster (http is accepted only for a cluster-local
   # host), e.g. http://memex-portal-service:8080/api/builds. The KEDA trigger reads `<apiUrl>/queue`.
   apiUrl: ""

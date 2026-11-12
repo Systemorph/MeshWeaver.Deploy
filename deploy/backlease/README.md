@@ -27,6 +27,11 @@ exactly the four set values (`--reuse-values`, the profile's own kube context).
   is mid-operation, or no chart sits beside the agent. Each pass writes one line to `follow.log` beside it.
 - **Why it follows `latest`:** that set is what main is built against, and it is the set a Mac must present to serve
   `latest`'s runs.
+- **The hosts carry the machine's name.** When the Mac has enrolled for back-lease (`~/.memex-local/backlease.yaml`
+  names its `Hosting__Deployment`) and the chart reads `buildHosts.machine`, every pass sets it, so each runner claims as
+  `<machine>-<pod>` instead of `build-host-mac-<rs>-<pod>`. Two Macs serving one queue are then told apart, and the
+  fleet's price list credits a run to the machine by host prefix (`hosts: ["<machine>-"]`; MeshWeaver.Plugins
+  `Hosting/BuildQueue.md` §2a). A release that does not carry it yet is applied once, even on an unchanged set.
 - **Pin a host** by attaching with `--follow off`.
 - **A chart change** still needs a re-attach, which re-copies the chart.
 
