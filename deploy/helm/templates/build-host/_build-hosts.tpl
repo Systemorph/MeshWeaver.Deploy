@@ -170,8 +170,21 @@ The refusals, and why each one exists:
 {{- if or (lt $budgetGi 1) (gt $budgetGi 4096) -}}
 {{- fail (printf "buildHosts.cache.maxGi %d must be within [1, 4096] — the budget of the whole build cache" $budgetGi) -}}
 {{- end -}}
-{{- if and (gt $sizeGi 0) (gt $budgetGi $sizeGi) -}}
-{{- fail (printf "buildHosts.cache.maxGi %d exceeds the declared cache.size %s — the cache's budget can never be larger than its declared size" $budgetGi $sz) -}}
+{{- /* sizeEnforced: false — the claim's storage class does NOT enforce its size (local-path: a directory on the node,
+       whatever the request says), so the REQUEST is nominal and the budget may exceed it; the runner's budget is then
+       the only bound, and it is sized from the node's disk (memex-local buildhost apply). A bound local-path claim
+       cannot be expanded (a spec.resources change fails the upgrade), which is why the budget is decoupled from it
+       instead of raising the claim (2026-11-11: the Macs' 20Gi claim held the budget at 18 GiB, under the ~20 GiB
+       deployment tree, and every run was COLD). */ -}}
+{{- $enforced := ternary true $cc.sizeEnforced (or (not (hasKey $cc "sizeEnforced")) (kindIs "invalid" $cc.sizeEnforced)) -}}
+{{- if not (kindIs "bool" $enforced) -}}
+{{- fail (printf "buildHosts.cache.sizeEnforced %v must be true or false — whether the claim's storage class enforces its size" $cc.sizeEnforced) -}}
+{{- end -}}
+{{- if and (not $enforced) (ne (toString ($cc.storageClass | default "")) "local-path") -}}
+{{- fail (printf "buildHosts.cache.sizeEnforced: false is only for a local-path claim (its request is nominal) — %q enforces or may enforce the size" (toString $cc.storageClass)) -}}
+{{- end -}}
+{{- if and $enforced (gt $sizeGi 0) (gt $budgetGi $sizeGi) -}}
+{{- fail (printf "buildHosts.cache.maxGi %d exceeds the declared cache.size %s — the cache's budget can never be larger than its declared size (a local-path claim, whose size nothing enforces, declares cache.sizeEnforced: false)" $budgetGi $sz) -}}
 {{- end -}}
 {{- else if gt $sizeGi 0 -}}
 {{- $budgetGi = max 1 (div (mul $sizeGi 90) 100) | int -}}

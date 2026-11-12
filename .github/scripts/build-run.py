@@ -2383,7 +2383,12 @@ def read_seed_manifest(path: str, version: str) -> list[dict]:
     for e in pkgs:
         ok = (isinstance(e, dict) and all(isinstance(e.get(k), str) and e[k] for k in ("id", "version", "sha256", "sha512"))
               and re.fullmatch(r"[A-Za-z0-9._-]+", e["id"]) and re.fullmatch(r"[A-Za-z0-9._+-]+", e["version"])
-              and re.fullmatch(r"[0-9a-f]{64}", e["sha256"]) and re.fullmatch(r"[A-Za-z0-9+/]{86}==", e["sha512"]))
+              and re.fullmatch(r"[0-9a-f]{64}", e["sha256"]) and re.fullmatch(r"[A-Za-z0-9+/]{86}==", e["sha512"])
+              # a package above the ingress limit is published in PARTS (nuget-seed.py PART_BYTES): ordered blobs, each named
+              # by its own sha256; the whole package is still verified by the entry's sha256 and sha512 once joined
+              and ("parts" not in e or (isinstance(e["parts"], list) and 0 < len(e["parts"]) <= 1024 and all(
+                  isinstance(p, dict) and isinstance(p.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", p["sha256"])
+                  for p in e["parts"]))))
         if not ok:
             raise Refusal(f"the seed's manifest carries an unusable entry ({str(e)[:160]})")
         out.append(e)
@@ -2424,13 +2429,18 @@ def install_nuget_seed(cache: str, api: "Api", version: str, log: Callable[[str]
                 continue
             if fetched and fetched % NUGET_SEED_PROGRESS_EVERY == 0:
                 log(f"package seed {version}: {fetched} package(s) fetched so far ({clock() - started:.0f} s)")
-            blob = os.path.join(tmp, e["sha256"])
-            status, why = api.download(f"/seeds/blobs/{e['sha256']}", blob, timeout=600)
-            if status != 200:
-                raise Refusal(f"the seed's {pid}/{ver} could not be fetched ({status}: {why})")
-            with open(blob, "rb") as fh:
-                data = fh.read()
-            os.remove(blob)
+            data = b""
+            for part in e.get("parts") or [{"sha256": e["sha256"]}]:
+                blob = os.path.join(tmp, part["sha256"])
+                status, why = api.download(f"/seeds/blobs/{part['sha256']}", blob, timeout=600)
+                if status != 200:
+                    raise Refusal(f"the seed's {pid}/{ver} could not be fetched ({status}: {why})")
+                with open(blob, "rb") as fh:
+                    chunk = fh.read()
+                os.remove(blob)
+                if hashlib.sha256(chunk).hexdigest() != part["sha256"]:
+                    raise Refusal(f"a part of the seed's {pid}/{ver} does not hash to its name — refused whole")
+                data += chunk
             if hashlib.sha256(data).hexdigest() != e["sha256"] or base64.b64encode(hashlib.sha512(data).digest()).decode() != e["sha512"]:
                 raise Refusal(f"the seed's {pid}/{ver} does not hash to its manifest — refused whole")
             content = nupkg_content_hash(data)
@@ -3692,19 +3702,27 @@ class Sandbox:
         a += ["--chdir", inside, "--", "/bin/bash", "-c", command]
         return a
 
-    def probe(self, run: Callable[[list[str]], tuple[int, str]]) -> None:
+    def probe(self, run: Callable[[list[str]], tuple[int, str]], offline: bool = False) -> None:
         """Create the namespaces once at startup. If the node does not allow them, the host REFUSES
-        to start, naming why — it never runs a stage unsandboxed."""
+        to start, naming why — it never runs a stage unsandboxed. `offline` (MW_BUILD_STAGE_NETWORK=offline)
+        also creates the stage's own NETWORK namespace, so a node that cannot make one refuses here,
+        once, instead of failing every stage of every run."""
         d = tempfile.mkdtemp(prefix="bwrap-probe-")
         try:
             rc, err = run(self.argv("test \"$$\" -le 3 && test ! -e /run/build-worker", d, d, {"PATH": "/usr/bin:/bin"}))
+            if rc == 0 and offline:
+                # network=False is what adds --unshare-net: the stage's own, loopback-only network namespace
+                rc, err = run(self.argv("test \"$$\" -le 3", d, d, {"PATH": "/usr/bin:/bin"}, network=False))
+                if rc != 0:
+                    err = f"the offline stage network (--unshare-net): {err}"
         except OSError as e:
             rc, err = 127, str(e)
         finally:
             shutil.rmtree(d, ignore_errors=True)
         if rc != 0:
             raise Fatal(f"the sandbox cannot be created on this node (bwrap exit {rc}: {err.strip()[-300:]}) — "
-                        f"user/PID/mount namespaces are required; the host refuses to run any stage unsandboxed")
+                        f"user/PID/mount namespaces are required (and a network namespace when stages run offline); "
+                        f"the host refuses to run any stage unsandboxed")
 
 
 # The places PR code must NOT reach from a stage, probed from INSIDE a sandbox at host start
@@ -7607,7 +7625,7 @@ def main(argv: list[str]) -> int:
                 # listening from the start: 503 while the host prepares, 200 once it is staged (mark_ready)
                 ReadinessServer(host.ready.is_set, port).start()
         host.preflight()
-        host.sandbox.probe(_run_capture)
+        host.sandbox.probe(_run_capture, offline=host.stage_offline)
         boundary_check(host.sandbox, env, _run_capture)
         host.stage_refset()
         scoping_check(host, _run_capture)
@@ -8180,6 +8198,17 @@ def self_test() -> int:
     check("probe/uses the same sandbox argv", probe_calls and probe_calls[0][0] == "/usr/bin/bwrap"
           and "--unshare-pid" in probe_calls[0], probe_calls)
     sb.probe(lambda argv: (0, ""))      # a node that allows them starts
+    seen: list[list[str]] = []
+    sb.probe(lambda argv: (seen.append(argv) or (0, "")))
+    check("probe/open makes no network namespace", len(seen) == 1 and "--unshare-net" not in seen[0], seen)
+    seen.clear()
+    sb.probe(lambda argv: (seen.append(argv) or (0, "")), offline=True)
+    check("probe/offline also makes the stage's network namespace", len(seen) == 2 and "--unshare-net" in seen[1], seen)
+    try:
+        sb.probe(lambda argv: (1, "bwrap: loopback: Failed RTM_NEWADDR") if "--unshare-net" in argv else (0, ""), offline=True)
+        check("probe/offline without a network namespace is FATAL at startup", False, "accepted")
+    except Fatal as e:
+        check("probe/offline names the network namespace", "--unshare-net" in str(e) and "RTM_NEWADDR" in str(e), e)
 
     # the boundary self-check, with injected results
     sbx = Sandbox("/usr/bin/bwrap", [])
@@ -12739,6 +12768,24 @@ def self_test() -> int:
                 src_ = (blob_override_ or {}).get(h_, blobs_.get(h_))
                 return (200, src_) if src_ is not None else (404, b"")
             return _FakeApi({("GET-BYTES", "/seeds/"): serve})
+        # a package published in PARTS (above the ingress limit): the parts are fetched in order, joined and verified whole
+        big_ = seed_pkg("Demo.Big")
+        parts_ = [big_[i:i + 100] for i in range(0, len(big_), 100)]
+        for c_ in parts_:
+            blobs_[hashlib.sha256(c_).hexdigest()] = c_
+        big_entry_ = {"id": "Demo.Big", "version": "2.0.0", "sha256": hashlib.sha256(big_).hexdigest(), "bytes": len(big_),
+                      "sha512": base64.b64encode(hashlib.sha512(big_).digest()).decode(),
+                      "parts": [{"sha256": hashlib.sha256(c_).hexdigest(), "bytes": len(c_)} for c_ in parts_]}
+        parted_ = os.path.join(seed_tmp, "parted")
+        line_pt = install_nuget_seed(parted_, seed_api({"platformVersion": "3.1.1", "packages": [big_entry_]}), "3.1.1", lambda m_: None)
+        check("seed/a package published in parts is fetched part by part, joined and verified whole",
+              nuget_packages(os.path.join(parted_, "nuget")) == {"demo.big/2.0.0"} and "1 installed" in line_pt and len(parts_) > 1, line_pt)
+        try:
+            install_nuget_seed(os.path.join(seed_tmp, "badpart"), seed_api({"platformVersion": "3.1.1", "packages": [big_entry_]},
+                               {big_entry_["parts"][1]["sha256"]: b"planted"}), "3.1.1", lambda m_: None)
+            check("seed/a part that does not hash to its name is refused", False, "installed")
+        except Refusal as e_:
+            check("seed/a part that does not hash to its name refuses the package whole", "does not hash" in str(e_), e_)
         fresh_ = os.path.join(seed_tmp, "fresh-cache")
         api_s = seed_api({"platformVersion": "3.1.1", "packages": pkgs_})
         line_ = install_nuget_seed(fresh_, api_s, "3.1.1", lambda m_: None)

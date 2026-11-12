@@ -2002,12 +2002,12 @@ case "$OUT" in *"is current"*|"") ok "the poll is throttled (a second tick insid
 rm -f "$AU/home/.memex-local/autoupdate.checked"
 AU_CALL=(cmd_autoupdate _tick); au "$KEG/memex-local" FAKE_NEW_VERSION=0.3.2
 case "$OUT" in *"upgraded 0.3.1 -> 0.3.2"*"chart and share assets unchanged"*) ok "a script-only release upgrades without re-applying the chart" ;; *) bad "script-only release" "$OUT" ;; esac
-[ ! -s "$AU/update.log" ] && ok "… and restarts nothing" || bad "script-only release restarts nothing" "$(cat "$AU/update.log")"
+[ "$(cat "$AU/update.log")" = "settle|1" ] && ok "… and restarts nothing: only the in-place 'settle' runs (no update, no restart)" || bad "script-only release restarts nothing" "$(cat "$AU/update.log")"
 
 rm -f "$AU/home/.memex-local/autoupdate.checked"
 mkdir -p "$AU/home/.memex-local"; : > "$AU/home/.memex-local/autoroll-tick"
 AU_CALL=(cmd_autoupdate _tick); au "$KEG/memex-local" FAKE_NEW_VERSION=0.3.3 FAKE_NEW_CHART="chart v2"
-case "$(cat "$AU/update.log")" in "update --skip-image|1") ok "a release that changed the chart re-applies it once with update --skip-image, flagged as the agent" ;;
+case "$(cat "$AU/update.log")" in "settle|1"$'\n'"update --skip-image|1") ok "a release that changed the chart re-applies it once with update --skip-image, flagged as the agent" ;;
   *) bad "a changed chart is re-applied" "update.log=$(cat "$AU/update.log") out=$OUT" ;; esac
 cmp -s "$AU/home/.memex-local/autoroll-tick" "$AU/prefix/opt/memex-local/libexec/memex-local" \
   && ok "the auto-roll's tick copy is refreshed from the new keg" || bad "the auto-roll tick copy is refreshed" "$OUT"
@@ -2431,25 +2431,28 @@ done; chmod +x "$BH/stubs/"*
 # PATH holds the stubs and the system directories ONLY (no Homebrew), and MEMEX_PREFIX names an empty
 # prefix: the resolver can find no real colima, helm or kubectl — a test must never start a VM.
 mkdir -p "$BH/prefix"
-bh() { env PATH="$BH/stubs:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" MEMEX_PREFIX="$BH/prefix" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_NET_NO_MEASURE=1 MEMEX_K3S_STABLE_S=0 MEMEX_K3S_POLL_S=0 MEMEX_K3S_HEALTH_S=2 MEMEX_HOST_DISK_FREE_GIB="${BH_FREE:-240}" MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
+bh() { env PATH="$BH/stubs:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" MEMEX_PREFIX="$BH/prefix" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_NET_NO_MEASURE=1 MEMEX_K3S_STABLE_S=0 MEMEX_K3S_POLL_S=0 MEMEX_K3S_HEALTH_S=2 MEMEX_BUILD_DISK_MAX_GIB=300 MEMEX_HOST_DISK_FREE_GIB="${BH_FREE:-400}" MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
 OUT="$(bh "$CLI" buildhost apply 2>&1)"
-grep -q 'colima start -p build --cpu 16 --memory 104 --disk 200 --runtime containerd --kubernetes' "$BH/log" && grep -q 'kubectl --context colima-build get crd scaledobjects.keda.sh' "$BH/log" \
+grep -q 'colima start -p build --cpu 16 --memory 104 --disk 300 --runtime containerd --kubernetes' "$BH/log" && grep -q 'kubectl --context colima-build get crd scaledobjects.keda.sh' "$BH/log" \
   && case "$OUT" in *"first attach installs it"*) true ;; *) false ;; esac \
   && ok "apply creates the build VM at the plan (containerd, k3s), checks KEDA in colima-build, and names the first attach for a missing release" || bad "apply create" "$OUT / $(cat "$BH/log")"
 grep -q 'colima ssh -p build -- sudo systemctl restart mw-netshape.service' "$BH/log" && [ -f "$BH/.memex-local/netshape-build.env" ] \
   && ok "apply also shapes the build VM's network (mw-netshape.service in the VM) and records the rates" || bad "apply netshape" "$(grep netshape "$BH/log")"
 : > "$BH/log"
 OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
-grep -q 'helm --kube-context colima-build -n build-mac upgrade build-host-mac .* --reuse-values --set buildHosts.mac.minReplicas=1 --set buildHosts.mac.maxReplicas=4 --set-string buildHosts.resources.requests.cpu=3500m --set-string buildHosts.resources.requests.memory=20Gi --set-string buildHosts.resources.limits.cpu=4 --set-string buildHosts.resources.limits.memory=24Gi --set buildHosts.stageSlots=4' "$BH/log" \
+SZ="$BH/.memex-local/buildhost-follow/build/sizing.yaml"
+grep -q "helm --kube-context colima-build -n build-mac upgrade build-host-mac .* --reuse-values -f $SZ" "$BH/log" \
+  && grep -q 'mac: {minReplicas: 1, maxReplicas: 4}' "$SZ" && grep -q 'requests: {cpu: "3500m", memory: "20Gi"}' "$SZ" && grep -q 'limits: {cpu: "4", memory: "24Gi"}' "$SZ" && grep -q 'stageSlots: 4' "$SZ" \
+  && grep -q 'cache: {sizeEnforced: false, maxGi: 80, shares: {treeGi: 24, slicesGi: 30, nugetGi: 8, refsetsGi: 3, preparedGi: 2}}' "$SZ" \
   && ! grep -q 'colima start\|colima stop' "$BH/log" \
   && ok "an installed release is sized in place (--reuse-values, its own context); a VM that covers the plan is not restarted" || bad "apply size" "$OUT / $(cat "$BH/log")"
 : > "$BH/log"
 OUT="$(bh FAKE_COLIMA_LIST=$'{"name":"default","cpus":8,"memory":17179869184}\n{"name":"build","status":"Running","cpus":8,"memory":25769803776}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
-! grep -q 'colima stop' "$BH/log" && grep -q 'maxReplicas=2 ' "$BH/log" && case "$OUT" in *"apply --resize"*) true ;; *) false ;; esac \
+! grep -q 'colima stop' "$BH/log" && grep -q 'maxReplicas: 2}' "$BH/.memex-local/buildhost-follow/build/sizing.yaml" && case "$OUT" in *"apply --resize"*) true ;; *) false ;; esac \
   && ok "a smaller VM is NOT restarted without --resize: the runners are sized to what it has, and the resize is named" || bad "apply no resize" "$OUT / $(cat "$BH/log")"
 : > "$BH/log"
 bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":8,"memory":25769803776}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize >/dev/null 2>&1
-grep -q 'colima stop -p build' "$BH/log" && grep -q 'colima start -p build --cpu 16 --memory 104' "$BH/log" && grep -q 'maxReplicas=4 ' "$BH/log" \
+grep -q 'colima stop -p build' "$BH/log" && grep -q 'colima start -p build --cpu 16 --memory 104' "$BH/log" && grep -q 'maxReplicas: 4}' "$BH/.memex-local/buildhost-follow/build/sizing.yaml" \
   && ok "--resize restarts the build VM at the plan and sizes the runners to it" || bad "apply resize" "$(cat "$BH/log")"
 : > "$BH/log"
 bh FAKE_COLIMA_LIST='{"name":"build","status":"Stopped","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply >/dev/null 2>&1
@@ -2464,26 +2467,27 @@ echo "── buildhost: the build VM's disk is sized from this Mac, the runners 
 : > "$BH/log"; bh "$CLI" buildhost apply >/dev/null 2>&1
 grep -q -- '--k3s-arg=--kubelet-arg=image-gc-high-threshold=60 --k3s-arg=--kubelet-arg=image-gc-low-threshold=45 --k3s-arg=--kube-controller-manager-arg=terminated-pod-gc-threshold=5' "$BH/log" \
   && ok "a NEW build VM collects unused images early (GC at 60 %, 48 h max age) and keeps at most 5 finished pod records" || bad "gc args on create" "$(grep 'colima start' "$BH/log")"
-[ "$(lib buildhost_disk_runs 100)" = 2 ] && [ "$(lib buildhost_disk_runs 200)" = 6 ] && [ "$(lib buildhost_disk_runs 60)" = 0 ] \
-  && ok "runs a disk holds: 100 GiB → 2, 200 GiB → 6, 60 GiB → 0 (85 % − cache 20 − images 12 − system 4, over 20 per run)" || bad "disk runs" "$(lib buildhost_disk_runs 100) $(lib buildhost_disk_runs 200) $(lib buildhost_disk_runs 60)"
-[ "$(lib buildhost_disk_min)" = 66 ] && ok "the least disk that holds one run is 66 GiB" || bad "disk min" "$(lib buildhost_disk_min)"
+[ "$(lib buildhost_disk_runs 100)" = 1 ] && [ "$(lib buildhost_disk_runs 200)" = 3 ] && [ "$(lib buildhost_disk_runs 60)" = 1 ] && [ "$(lib buildhost_disk_runs 50)" = 0 ] \
+  && [ "$(lib buildhost_cache_gib 197)" = 80 ] && [ "$(lib buildhost_cache_gib 100)" = 49 ] && [ "$(lib buildhost_cache_gib 60)" = 15 ] && [ "$(lib buildhost_cache_gib 40)" = 10 ] \
+  && ok "the cache budget grows with the disk up to 80 GiB, always leaving ONE run: 197 GiB → 80 (3 runs), 100 → 49 (1 run), 60 → 15 (1 run), 50 → no run" || bad "disk runs" "$(lib buildhost_disk_runs 100) $(lib buildhost_disk_runs 200) $(lib buildhost_disk_runs 60)"
+[ "$(lib buildhost_disk_min)" = 55 ] && ok "the least disk that holds one run is 55 GiB (the 10 GiB minimum cache beside it)" || bad "disk min" "$(lib buildhost_disk_min)"
 [ "$(lib buildhost_disk_plan 1600 0 0)" = 200 ] && [ "$(lib buildhost_disk_plan 150 84 0)" = 26 ] && [ "$(lib buildhost_disk_plan 150 0 30)" = 140 ] \
   && ok "the disk: capped at 200; a 256 GB Mac with 150 GiB free and a portal VM that may grow 84 more gets 26 (too small — refused below); what the build VM already holds counts as its own" || bad "disk plan" "$(lib buildhost_disk_plan 1600 0 0) $(lib buildhost_disk_plan 150 84 0) $(lib buildhost_disk_plan 150 0 30)"
 P="$(lib buildhost_plan 18 128 8 16 0 100)"
-grep -q '^runners_max=2$' <<<"$P" && grep -q '^vm_disk=100$' <<<"$P" && grep -q '^runner_mem_limit=24$' <<<"$P" \
-  && ok "an 18-core Mac on a 100 GiB build disk gets 2 runners, not 4 (the second Mac Studio's 4 runners on 98 GiB could never claim)" || bad "plan disk cap" "$P"
-P="$(lib buildhost_plan 18 128 8 16 0 50 2>&1)" && bad "a 50 GiB disk was planned" "$P" || { grep -q 'holds no run' <<<"$P" && grep -q 'at least 66 GiB' <<<"$P" && ok "a disk that holds no run is refused, with the arithmetic" || bad "small disk reason" "$P"; }
+grep -q '^runners_max=1$' <<<"$P" && grep -q '^vm_disk=100$' <<<"$P" && grep -q '^runner_mem_limit=24$' <<<"$P" \
+  && ok "an 18-core Mac on a 100 GiB build disk gets 1 runner beside a 49 GiB cache, not 4 (the second Mac Studio's 4 runners on 98 GiB could never claim)" || bad "plan disk cap" "$P"
+P="$(lib buildhost_plan 18 128 8 16 0 50 2>&1)" && bad "a 50 GiB disk was planned" "$P" || { grep -q 'holds no run' <<<"$P" && grep -q 'at least 55 GiB' <<<"$P" && ok "a disk that holds no run is refused, with the arithmetic" || bad "small disk reason" "$P"; }
 : > "$BH/log"
 OUT="$(BH_FREE=60 bh "$CLI" buildhost plan 2>&1)" && bad "a Mac with 60 GiB free planned a build VM" "$OUT" || { case "$OUT" in *"holds no run"*"free disk on this Mac"*) ok "a Mac without the disk for one run is REFUSED at plan time, naming the free disk and the remedy" ;; *) bad "low free disk" "$OUT" ;; esac; }
 mkdir -p "$BH/.colima/build"; printf 'kubernetes:\n  enabled: true\n  k3sArgs:\n    - --disable=traefik\n    - --kubelet-arg=root-dir=/var/lib/rancher/kubelet\n' > "$BH/.colima/build/colima.yaml"
 : > "$BH/log"
 bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400,"disk":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize >/dev/null 2>&1
-grep -q 'colima start -p build --cpu 16 --memory 104 --disk 200' "$BH/log" && grep -qxF -- '    - --kubelet-arg=image-gc-high-threshold=60' "$BH/.colima/build/colima.yaml" && ! grep -q 'image-maximum-gc-age' "$BH/.colima/build/colima.yaml" && grep -qxF -- '    - --kubelet-arg=root-dir=/var/lib/rancher/kubelet' "$BH/.colima/build/colima.yaml" && grep -q 'maxReplicas=4 ' "$BH/log" \
+grep -q 'colima start -p build --cpu 16 --memory 104 --disk 300' "$BH/log" && grep -qxF -- '    - --kubelet-arg=image-gc-high-threshold=60' "$BH/.colima/build/colima.yaml" && ! grep -q 'image-maximum-gc-age' "$BH/.colima/build/colima.yaml" && grep -qxF -- '    - --kubelet-arg=root-dir=/var/lib/rancher/kubelet' "$BH/.colima/build/colima.yaml" && grep -q 'maxReplicas: 4}' "$BH/.memex-local/buildhost-follow/build/sizing.yaml" \
   && ok "--resize grows a 100 GiB build disk to what the Mac backs (200), adds the GC args to its profile (root-dir kept), and sizes 4 runners" || bad "resize disk+gc" "$(cat "$BH/log"; cat "$BH/.colima/build/colima.yaml")"
 : > "$BH/log"
 OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400,"disk":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
-! grep -q 'colima stop' "$BH/log" && grep -q 'maxReplicas=2 ' "$BH/log" \
-  && ok "without --resize an existing 100 GiB disk is kept and the runners sized to it (2)" || bad "existing disk" "$OUT / $(cat "$BH/log")"
+! grep -q 'colima stop' "$BH/log" && grep -q 'maxReplicas: 1}' "$BH/.memex-local/buildhost-follow/build/sizing.yaml" \
+  && ok "without --resize an existing 100 GiB disk is kept and the runners sized to it (1, beside a 49 GiB cache)" || bad "existing disk" "$OUT / $(cat "$BH/log")"
 grep -q 'colima ssh -p build -- sudo k3s crictl rmi --prune' "$BH/log" && grep -q 'kubectl --context colima-build -n build-mac get pods --field-selector=status.phase=Failed' "$BH/log" \
   && ok "apply collects unused images and finished pod records in the build VM" || bad "apply gc" "$(cat "$BH/log")"
 echo "── buildhost: only k3s arguments measured on this k3s are written; a resize that breaks k3s is rolled back (2026-11-11) ──"
@@ -3433,6 +3437,38 @@ OUT="$(fd norecord)"; RC=$?
 OUT="$(fd 404)"; RC=$?
 [ "$RC" = 1 ] && grep -q 'does not answer /api/fleet/self-status yet' <<<"$OUT" && ok "a control that does not serve the endpoint is RED (unread), never a pass" || bad "doctor 404" "rc=$RC $OUT"
 rm -rf "$FD"
+
+echo "── the local ingress never pins browsers to https for localhost: HSTS max-age=0 (2026-11-11) ──────"
+HS="$(mktemp -d)"; mkdir -p "$HS/stubs"
+cat > "$HS/stubs/helm" <<STUB
+#!/bin/bash
+echo "helm \$*" >> "$HS/log"; exit 0
+STUB
+cat > "$HS/stubs/kubectl" <<STUB
+#!/bin/bash
+echo "kubectl \$*" >> "$HS/log"
+case "\$*" in *"get configmap ingress-nginx-controller"*) cat "$HS/cm" 2>/dev/null || exit 1 ;; esac
+exit 0
+STUB
+chmod +x "$HS/stubs/"*
+hs() { env MEMEX_LOCAL_LIB=1 PATH="$HS/stubs:$PATH" bash -c '. "$0"; '"$1" "$CLI" 2>&1; }
+: > "$HS/log"; hs install_ingress_nginx >/dev/null
+grep -q -- '--set-string controller.config.hsts=true --set-string controller.config.hsts-max-age=0 --set-string controller.config.hsts-include-subdomains=true --set-string controller.config.hsts-preload=false' "$HS/log" \
+  && ok "a fresh install's ingress-nginx answers Strict-Transport-Security max-age=0; includeSubDomains (never the 1-year default that broke loopback OAuth)" || bad "install hsts" "$(cat "$HS/log")"
+printf 'allow-snippet-annotations=false\n' > "$HS/cm"; : > "$HS/log"
+OUT="$(hs ensure_ingress_no_hsts)"
+grep -q 'kubectl -n ingress-nginx patch configmap ingress-nginx-controller --type merge -p {"data":{"hsts":"true","hsts-max-age":"0","hsts-include-subdomains":"true","hsts-preload":"false"}}' "$HS/log" \
+  && ok "an EXISTING install gets the same keys patched into the controller's ConfigMap on update (no chart re-run)" || bad "update hsts patch" "$OUT / $(cat "$HS/log")"
+printf 'hsts=true\nhsts-include-subdomains=true\nhsts-max-age=0\nhsts-preload=false\n' > "$HS/cm"; : > "$HS/log"
+hs ensure_ingress_no_hsts >/dev/null; ! grep -q 'patch' "$HS/log" && ok "…and a ConfigMap that already says so is left alone (idempotent)" || bad "hsts idempotent" "$(cat "$HS/log")"
+rm -f "$HS/cm"; OUT="$(hs ensure_ingress_no_hsts)"
+grep -q 'no ConfigMap ingress-nginx/ingress-nginx-controller to set HSTS on' <<<"$OUT" && ok "a missing controller ConfigMap is SAID (a warning naming it), never a silent skip" || bad "hsts not found" "$OUT"
+grep -q 'ensure_ingress_no_hsts' <<<"$(sed -n '/^cmd_update() {/,/^}/p' "$CLI")" && ok "every update runs it (existing installs on eiger and the second Mac heal on their next update)" || bad "update calls hsts" ""
+A="$(sed -n '/^cmd_autoupdate() {/,/^}/p' "$CLI")"
+grep -q 'memex-local" settle' <<<"$A" && [ "$(grep -n 'memex-local" settle' <<<"$A" | cut -d: -f1)" -lt "$(grep -n 'chart and share assets unchanged' <<<"$A" | head -1 | cut -d: -f1)" ] \
+  && grep -q 'ensure_ingress_no_hsts' <<<"$(sed -n '/^cmd_settle() {/,/^}/p' "$CLI")" \
+  && ok "the autoupdate agent runs 'settle' after EVERY upgrade, before the assets-unchanged skip — a script-only repair (HSTS) reaches existing Macs" || bad "autoupdate settle" ""
+rm -rf "$HS"
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"

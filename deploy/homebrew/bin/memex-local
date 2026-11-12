@@ -4040,14 +4040,45 @@ image_pull_acr() {                                     # §3 Option A
 # ---------------------------------------------------------------------------
 # §5 — ingress-nginx
 # ---------------------------------------------------------------------------
+# 🚨 NO HSTS FROM A LOCAL INSTALL (2026-11-11, the maintainer's laptop): ingress-nginx sends
+# `Strict-Transport-Security: max-age=31536000; includeSubDomains` by default, and HSTS is per HOST, not per port — after
+# one visit to https://localhost:8443 Safari upgraded EVERY http://localhost:<port> to https for a year, which broke every
+# loopback OAuth redirect on the machine (`az login` died at "Safari can't open https://localhost:65217/"). A local install
+# therefore sends `max-age=0; includeSubDomains` (no preload): the directive that tells a browser to DROP the cached entry
+# for localhost and its subdomains, so the next https visit heals a browser the old default poisoned ("off" would leave
+# it broken for the rest of the year). Decided for EVERY host this controller serves,
+# including a fleet Mac's internal name (<machine>.net.<domain>): it is reached only over the private network with a
+# trusted certificate and the sign-in is Microsoft's, so HSTS there protects nothing, while the same controller answers
+# localhost.
+readonly INGRESS_HSTS_CONFIG=(hsts=true hsts-max-age=0 hsts-include-subdomains=true hsts-preload=false)
 install_ingress_nginx() {
   step "Installing ingress-nginx (no Traefik on k3s here) (§5)"
   helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx >/dev/null 2>&1 || true
   helm repo update ingress-nginx >/dev/null 2>&1 || helm repo update >/dev/null 2>&1 || true
+  local cfg=() kv; for kv in ${INGRESS_HSTS_CONFIG[@]+"${INGRESS_HSTS_CONFIG[@]}"}; do cfg+=(--set-string "controller.config.${kv}"); done
   helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
     -n "$INGRESS_NS" --create-namespace \
     --set controller.service.type=ClusterIP \
-    --set controller.admissionWebhooks.enabled=false
+    --set controller.admissionWebhooks.enabled=false \
+    ${cfg[@]+"${cfg[@]}"}
+}
+# An EXISTING install (made before the above) carries the default HSTS: set the same keys on the controller's ConfigMap in
+# place — ingress-nginx reloads it by itself — without re-running the chart (an `update` never upgrades ingress-nginx).
+# Idempotent: nothing is written when the ConfigMap already says so.
+ensure_ingress_no_hsts() {
+  # The controller ConfigMap's name follows the release name install_ingress_nginx uses (`ingress-nginx` →
+  # `ingress-nginx-controller`); a missing one is SAID, never a silent skip.
+  local cm=ingress-nginx-controller have kv k v patch=""
+  have="$(kubectl -n "$INGRESS_NS" get configmap "$cm" -o go-template='{{range $k, $v := .data}}{{$k}}={{$v}}{{"\n"}}{{end}}' 2>/dev/null)" \
+    || { warn "local ingress: no ConfigMap $INGRESS_NS/$cm to set HSTS on — 'memex-local up' installs the controller with max-age=0"; return 0; }
+  for kv in ${INGRESS_HSTS_CONFIG[@]+"${INGRESS_HSTS_CONFIG[@]}"}; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    grep -qxF -- "$kv" <<<"$have" || patch="${patch:+$patch,}\"$k\":\"$v\""
+  done
+  [ -n "$patch" ] || return 0
+  kubectl -n "$INGRESS_NS" patch configmap "$cm" --type merge -p "{\"data\":{$patch}}" >/dev/null \
+    && ok "local ingress: HSTS answered max-age=0; includeSubDomains (a browser drops its cached localhost entry) — loopback OAuth redirects (az login, …) work again" \
+    || warn "could not turn HSTS off on the local ingress (kubectl -n $INGRESS_NS patch configmap $cm) — a browser may keep upgrading http://localhost to https"
 }
 
 # ---------------------------------------------------------------------------
@@ -6514,6 +6545,7 @@ cmd_update() {
   # change to the portal's :latest tag, so it does NOT restart the portal — that is forced
   # separately below. (There is no memex-migration *Deployment* — it was converted to a
   # run-once Job in dd49cd1bf; rolling a Deployment here is what used to break `update`.)
+  ensure_ingress_no_hsts                          # §5 — an install made before 2026-11-11 sent HSTS for localhost
   helm_deploy                                     # §4 — bumps revision → fresh migration Job
 
   step "Waiting for the migration Job to finish (§4)"
@@ -6653,7 +6685,11 @@ readonly BUILD_RUNNER_MAX_GIB=24                                   # one runner'
 #   disk    = min(BUILD_DISK_MAX_GIB, host free − host reserve − what the other VMs may still grow into)
 readonly BUILD_DISK_MAX_GIB="${MEMEX_BUILD_DISK_MAX_GIB:-200}"         # a bigger disk only holds more stale state
 readonly BUILD_HOST_DISK_RESERVE_GIB="${MEMEX_BUILD_HOST_DISK_RESERVE_GIB:-40}"  # macOS updates, model pulls, the owner
-readonly BUILD_CACHE_GIB="${MEMEX_BUILD_CACHE_GIB:-20}"               # the cache claim (build-host-mac.values.yaml cache.size)
+# THE CACHE BUDGET is sized from the build disk too (2026-11-11, the owner's go): up to BUILD_CACHE_MAX_GIB, which holds the
+# deployment tree (~20 GiB) warm beside the slices — but never so much that ONE run (20 GiB + 15 %) no longer fits. The
+# Macs' claim is local-path (its 20Gi request is nominal and cannot be expanded), so the budget is what bounds the cache.
+readonly BUILD_CACHE_MAX_GIB="${MEMEX_BUILD_CACHE_MAX_GIB:-80}"
+readonly BUILD_CACHE_MIN_GIB=10
 readonly BUILD_IMAGES_GIB="${MEMEX_BUILD_IMAGES_GIB:-12}"             # runner + tester + portal images, two generations
 readonly BUILD_VM_SYSTEM_DISK_GIB=4                                   # k3s, KEDA, logs inside the VM
 readonly BUILD_RUN_DISK_GIB="${MEMEX_BUILD_RUN_DISK_GIB:-20}"         # what ONE run may write (chart buildHosts.runDiskGi)
@@ -6733,7 +6769,7 @@ buildhost_plan() {
   local disk="${6:-}" disk_runs=""
   if [ -n "$disk" ]; then
     disk_runs="$(buildhost_disk_runs "$disk")"
-    [ "$disk_runs" -ge 1 ] || { echo "error=the build VM's disk of ${disk} GiB holds no run: ${disk} × $(( 100 - BUILD_DISK_HEADROOM_PCT )) % − cache ${BUILD_CACHE_GIB} − images ${BUILD_IMAGES_GIB} − system ${BUILD_VM_SYSTEM_DISK_GIB} leaves less than one run's ${BUILD_RUN_DISK_GIB} GiB (it needs at least $(buildhost_disk_min) GiB)"; return 1; }
+    [ "$disk_runs" -ge 1 ] || { echo "error=the build VM's disk of ${disk} GiB holds no run: ${disk} × $(( 100 - BUILD_DISK_HEADROOM_PCT )) % − cache $(buildhost_cache_gib "$disk") − images ${BUILD_IMAGES_GIB} − system ${BUILD_VM_SYSTEM_DISK_GIB} leaves less than one run's ${BUILD_RUN_DISK_GIB} GiB (it needs at least $(buildhost_disk_min) GiB)"; return 1; }
     [ "$disk_runs" -ge "$runners" ] || runners="$disk_runs"
     lim=$(( (vmem - BUILD_SYSTEM_GIB) / runners )); [ "$lim" -le "$BUILD_RUNNER_MAX_GIB" ] || lim="$BUILD_RUNNER_MAX_GIB"; req=$(( lim - 4 ))
   fi
@@ -6745,14 +6781,34 @@ buildhost_plan() {
   [ -z "$disk" ] || printf 'vm_disk=%s\ndisk_runs=%s\n' "$disk" "$disk_runs"
 }
 # How many runs at once the build VM's disk holds (whole runs; pure).
+# The cache budget a build disk of $1 GiB gets (GiB; pure): what is left once images, the VM's system and ONE run are
+# kept beside the 15 % headroom, at most BUILD_CACHE_MAX_GIB, at least BUILD_CACHE_MIN_GIB.
+buildhost_cache_gib() {
+  local room=$(( $1 * (100 - BUILD_DISK_HEADROOM_PCT) / 100 - BUILD_IMAGES_GIB - BUILD_VM_SYSTEM_DISK_GIB - BUILD_RUN_DISK_GIB ))
+  [ "$room" -le "$BUILD_CACHE_MAX_GIB" ] || room="$BUILD_CACHE_MAX_GIB"
+  [ "$room" -ge "$BUILD_CACHE_MIN_GIB" ] || room="$BUILD_CACHE_MIN_GIB"
+  printf '%s' "$room"
+}
+# Each area's share of a budget of $1 GiB, as "tree slices nuget refsets prepared" (pure). The tree (~20 GiB, the warm
+# deployment tree) gets 24 only when the budget can hold it beside the rest (≥ 45) — below that a run builds COLD rather
+# than thrash a tree it cannot keep; the slices take what is left, at most 30, never 0; the shares stay under 90 %.
+buildhost_cache_shares() {
+  local c="$1" tree=0 nuget=4 refsets=2 prepared=2 slices
+  [ "$c" -ge 45 ] && { tree=24; refsets=3; }
+  [ "$c" -ge 30 ] && nuget=8
+  slices=$(( c * 90 / 100 - tree - nuget - refsets - prepared ))
+  [ "$slices" -le 30 ] || slices=30
+  [ "$slices" -ge 1 ] || slices=1
+  printf '%s %s %s %s %s' "$tree" "$slices" "$nuget" "$refsets" "$prepared"
+}
 buildhost_disk_runs() {
-  local usable=$(( $1 * (100 - BUILD_DISK_HEADROOM_PCT) / 100 - BUILD_CACHE_GIB - BUILD_IMAGES_GIB - BUILD_VM_SYSTEM_DISK_GIB ))
+  local usable=$(( $1 * (100 - BUILD_DISK_HEADROOM_PCT) / 100 - $(buildhost_cache_gib "$1") - BUILD_IMAGES_GIB - BUILD_VM_SYSTEM_DISK_GIB ))
   [ "$usable" -gt 0 ] || { printf 0; return; }
   printf '%s' "$(( usable / BUILD_RUN_DISK_GIB ))"
 }
 # The least disk that holds one run (GiB, rounded up; pure).
 buildhost_disk_min() {
-  local need=$(( BUILD_CACHE_GIB + BUILD_IMAGES_GIB + BUILD_VM_SYSTEM_DISK_GIB + BUILD_RUN_DISK_GIB ))
+  local need=$(( BUILD_CACHE_MIN_GIB + BUILD_IMAGES_GIB + BUILD_VM_SYSTEM_DISK_GIB + BUILD_RUN_DISK_GIB ))
   printf '%s' "$(( (need * 100 + (100 - BUILD_DISK_HEADROOM_PCT) - 1) / (100 - BUILD_DISK_HEADROOM_PCT) ))"
 }
 # The disk a build VM may be given here (GiB; pure): $1 free on the host's volume, $2 what the OTHER VMs may still grow
@@ -6859,6 +6915,27 @@ buildhost_profile_args() {
   done
 }
 
+# THIS MAC'S SIZING as a values file the release follower layers over the Mac values on every full upgrade
+# (<agent>/sizing.yaml): before it, a follower's full upgrade put the runners and the cache back to the values file's
+# defaults, sized for a 16-CPU / 100 GiB VM. Prints its path.
+buildhost_write_sizing() {
+  local plan="$1" disk="$2" dir f c t sl n r p
+  dir="$LOCAL_HOME/buildhost-follow/$BUILD_PROFILE"; f="$dir/sizing.yaml"; mkdir -p "$dir"
+  c="$(buildhost_cache_gib "$disk")"; read -r t sl n r p <<<"$(buildhost_cache_shares "$c")"
+  cat > "$f.tmp" <<YAML
+# Written by memex-local buildhost apply ($(date -u +%Y-%m-%dT%H:%M:%SZ)) from this Mac's plan — re-run it to change.
+buildHosts:
+  mac: {minReplicas: $(plan_value runners_min "$plan"), maxReplicas: $(plan_value runners_max "$plan")}
+  resources:
+    requests: {cpu: "$(plan_value runner_cpu_request "$plan")", memory: "$(plan_value runner_mem_request "$plan")Gi"}
+    limits: {cpu: "${BUILD_CPU_PER_RUNNER}", memory: "$(plan_value runner_mem_limit "$plan")Gi"}
+  stageSlots: $(plan_value stage_slots "$plan")
+  cache: {sizeEnforced: false, maxGi: $c, shares: {treeGi: $t, slicesGi: $sl, nugetGi: $n, refsetsGi: $r, preparedGi: $p}}
+YAML
+  mv -f "$f.tmp" "$f"
+  printf '%s' "$f"
+}
+
 buildhost_gc_args_check() {
   local y a missing=""
   y="$(colima_profile_yaml "$BUILD_PROFILE")" || return 0
@@ -6938,7 +7015,7 @@ cmd_buildhost() {
       [ $# -eq 0 ] || die "buildhost plan: takes no arguments"
       info "host: $(host_cores) cores, $(host_mem_gib) GiB; other VMs ${others} GiB (the portal's included); largest model $(largest_model_gib) GiB"
       info "build VM (profile $BUILD_PROFILE): ${cpu} CPU / ${vmem} GiB / disk ${disk} GiB$( [ -n "$have_disk" ] && [ "$want_disk" -gt "$have_disk" ] && printf ' (this Mac could back %s — apply --resize grows it)' "$want_disk")"
-      info "disk: ${free} GiB free on this Mac; the disk holds $(plan_value disk_runs "$plan") run(s) of ${BUILD_RUN_DISK_GIB} GiB at once beside cache ${BUILD_CACHE_GIB}, images ${BUILD_IMAGES_GIB}, ${BUILD_DISK_HEADROOM_PCT} % kept free"
+      info "disk: ${free} GiB free on this Mac; the disk holds $(plan_value disk_runs "$plan") run(s) of ${BUILD_RUN_DISK_GIB} GiB at once beside a cache budget of $(buildhost_cache_gib "$disk") GiB (shares tree/slices/nuget/refsets/prepared: $(buildhost_cache_shares "$(buildhost_cache_gib "$disk")" | tr ' ' '/')), images ${BUILD_IMAGES_GIB}, ${BUILD_DISK_HEADROOM_PCT} % kept free"
       info "runners: $(plan_value runners_min "$plan") warm … $(plan_value runners_max "$plan") (KEDA), each ${BUILD_CPU_PER_RUNNER} CPU / $(plan_value runner_mem_request "$plan")–$(plan_value runner_mem_limit "$plan") GiB, $(plan_value stage_slots "$plan") stage slots → up to $(plan_value stage_total "$plan") stage containers at once"
       ;;
     apply)
@@ -7000,15 +7077,10 @@ cmd_buildhost() {
       buildhost_gc || true
       if helm --kube-context "$(build_ctx)" -n "$BUILD_NS" status "$BUILD_RELEASE" >/dev/null 2>&1; then
         step "Sizing the runners: $(plan_value runners_min "$plan")…$(plan_value runners_max "$plan") × ${BUILD_CPU_PER_RUNNER} CPU, $(plan_value stage_slots "$plan") stage slots"
-        helm --kube-context "$(build_ctx)" -n "$BUILD_NS" upgrade "$BUILD_RELEASE" "$(resolve_chart)" --reuse-values \
-          --set "buildHosts.mac.minReplicas=$(plan_value runners_min "$plan")" \
-          --set "buildHosts.mac.maxReplicas=$(plan_value runners_max "$plan")" \
-          --set-string "buildHosts.resources.requests.cpu=$(plan_value runner_cpu_request "$plan")" \
-          --set-string "buildHosts.resources.requests.memory=$(plan_value runner_mem_request "$plan")Gi" \
-          --set-string "buildHosts.resources.limits.cpu=${BUILD_CPU_PER_RUNNER}" \
-          --set-string "buildHosts.resources.limits.memory=$(plan_value runner_mem_limit "$plan")Gi" \
-          --set "buildHosts.stageSlots=$(plan_value stage_slots "$plan")" >/dev/null \
+        local sizing; sizing="$(buildhost_write_sizing "$plan" "$disk")"
+        helm --kube-context "$(build_ctx)" -n "$BUILD_NS" upgrade "$BUILD_RELEASE" "$(resolve_chart)" --reuse-values -f "$sizing" >/dev/null \
           || die "buildhost: helm could not size the release $BUILD_RELEASE"
+        ok "cache budget $(buildhost_cache_gib "$disk") GiB on the ${disk} GiB build disk (one run of ${BUILD_RUN_DISK_GIB} GiB + ${BUILD_DISK_HEADROOM_PCT} % still fits) — $sizing, which the release follower layers over the Mac values"
         ok "runners sized: up to $(plan_value stage_total "$plan") stage containers at once"
       else
         warn "no build-host release yet: the first attach installs it with this Mac's worker token (MeshWeaver.Deploy deploy/backlease/first-attach.sh --profile $BUILD_PROFILE …); then re-run 'memex-local buildhost apply' to size it. Target: the token arrives through the enrolment channel (Hosting/MacStudioFleet §2b.5)"
@@ -7771,6 +7843,16 @@ autoupdate_default() {
   cmd_autoupdate on --quiet
 }
 
+# memex-local settle — the in-place repairs of THIS release that need no chart re-apply and no restart (idempotent; the
+# autoupdate agent runs it after every upgrade, `update` runs the same steps). Today: the local ingress's HSTS.
+cmd_settle() {
+  [ $# -eq 0 ] || die "settle: takes no arguments"
+  colima_running || { info "settle: Colima is not running — the next up/update applies it"; return 0; }
+  require_tool kubectl kubernetes-cli
+  ensure_ingress_no_hsts
+  ok "settle: done"
+}
+
 cmd_autoupdate() {
   local action="${1:-status}"; [ $# -gt 0 ] && shift
   case "$action" in
@@ -7854,6 +7936,17 @@ PLIST
         install -m 0755 "$keg/memex-local" "$AUTOROLL_TICK_SCRIPT" \
           && printf '%s autoupdate: auto-roll tick refreshed to %s\n' "$(date -u +%FT%TZ)" "$after"
       fi
+      # In-place repairs a NEW CLI carries that no chart change announces (2026-11-11: the local ingress's HSTS lived in
+      # the script, so "assets unchanged" skipped it and every existing Mac kept pinning localhost to https). Cheap and
+      # idempotent; run by the NEW binary, whatever the assets did.
+      if colima_running; then
+        # its output prefixed AFTER it ran, so the exit status is settle's own; a failed settle is said and never ends
+        # the tick (the chart re-apply below still runs)
+        local sout src=0
+        sout="$(MEMEX_IN_AUTOUPDATE=1 "$(brew --prefix)/bin/memex-local" settle 2>&1)" || src=$?
+        [ -z "$sout" ] || printf '%s\n' "$sout" | sed "s/^/$(date -u +%FT%TZ) autoupdate: settle: /"
+        [ "$src" = 0 ] || printf '%s autoupdate: settle FAILED (exit %s) on %s — its output is above; the next upgrade or update retries\n' "$(date -u +%FT%TZ)" "$src" "$after"
+      fi
       if [ "$abefore" = "$aafter" ]; then
         printf '%s autoupdate: chart and share assets unchanged — nothing to re-apply\n' "$(date -u +%FT%TZ)"
       elif ! colima_running; then
@@ -7901,6 +7994,7 @@ main() {
     port-forward)  cmd_port_forward "$@" ;;
     observability) cmd_observability "$@" ;;
     doctor)        cmd_doctor "$@" ;;
+    settle)        cmd_settle "$@" ;;
     owner)         cmd_owner "$@" ;;
     ca)            cmd_ca "$@" ;;
     profile)       cmd_profile "$@" ;;
