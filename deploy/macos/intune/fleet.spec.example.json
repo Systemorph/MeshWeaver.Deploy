@@ -11,7 +11,8 @@
       "DeviceManagementManagedDevices.Read.All",
       "Group.Read.All",
       "Device.Read.All",
-      "GroupMember.ReadWrite.All"
+      "GroupMember.ReadWrite.All",
+      "DeviceManagementManagedDevices.PrivilegedOperations.All"
     ]
   },
   "groups": {
