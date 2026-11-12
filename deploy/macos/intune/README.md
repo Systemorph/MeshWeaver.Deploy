@@ -133,6 +133,16 @@ reads INFO (a different application), and the apply identity's grants are verifi
 | `settingsPolicies[]` | settings-catalog policy (the DDM night-window software-update policy) | `settings` maps `settingDefinitionId` → value; `--apply` rewrites those values in the LIVE tree and PUTs it back (the tree itself is created in the admin center, then its id is recorded). Each Apple release bumps `enforcement_targetosversion` + `enforcement_targetlocaldatetime` here |
 | `compliancePolicies[]` | `deviceCompliancePolicy` | existing policies by id (assignments, declared `properties`), new ones created from `properties` |
 
+**Device sync after an apply.** The Intune agent re-runs its CACHED copy of a script until its next FULL sync —
+every 28800 s (8 h): measured on the first Mac mini (2026-11-12), the hourly run after an `--apply` logged
+*"Cached script policy result matches"* and ran the old bootstrap. So an `--apply` that CHANGED a script, profile,
+certificate or settings policy then asks every Mac that object reaches (its include groups' members, minus its exclude
+groups') to sync — `POST managedDevices/{id}/syncDevice` (an empty POST: Graph answers 411 without `Content-Length:
+0`), one `SYNCED` line per Mac. `--sync` does only that, for every object the spec declares. It needs the application
+role `DeviceManagementManagedDevices.PrivilegedOperations.All`, declared in `appIdentity.requiredRoles` so `--check`
+reports it missing; it is assigned to the app's service principal as an appRoleAssignment — `az ad app permission
+admin-consent` alone did not create it.
+
 ### The console password that expired at enrolment (2026-11-09)
 
 Read-only Graph on 2026-11-09: no macOS configuration profile and no macOS settings-catalog policy in the tenant

@@ -3,6 +3,7 @@
 
     intune-reconcile.py --check  --spec <fleet.spec.json>   read-only; one line per object, exit 2 on drift
     intune-reconcile.py --apply  --spec <fleet.spec.json>   create / patch / assign to match the spec
+    intune-reconcile.py --sync   --spec <fleet.spec.json>   only: ask Intune to sync every Mac the spec assigns to
     intune-reconcile.py --validate --spec <file>            the spec's shape only, no Graph call
     intune-reconcile.py --self-test                         against an in-memory fake Graph
 
@@ -19,6 +20,10 @@ The rules the reconcile keeps:
   * An object marked "hold" is reported as drift and never written, not even by --apply: the owner's go
     lifts the hold in the spec (a reviewed change), not a flag on the command line.
   * A secret is never printed: the token is used, never echoed; ids are shortened to 8 characters.
+  * After an --apply that CHANGED a script, profile, certificate or settings policy, every Mac that object
+    reaches (its include groups' members, minus its exclude groups') is asked to sync (managedDevices/{id}/
+    syncDevice, one line per Mac): the Intune agent otherwise re-runs a CACHED script until its next full sync,
+    up to 8 hours later (measured 2026-11-12). Needs DeviceManagementManagedDevices.PrivilegedOperations.All.
 
 Exit codes: 0 in sync (PENDING lines allowed) · 2 drift (check) or drift left after apply (held) · 1 error.
 Python standard library only.
@@ -98,10 +103,14 @@ class Graph:
     def call(self, method, path, body=None):
         url = path if path.startswith("http") else f"{self.base}/{path.lstrip('/')}"
         data = json.dumps(body).encode() if body is not None else None
+        if data is None and method == "POST":
+            data = b""   # an action with no body (syncDevice): Graph answers 411 without an explicit Content-Length: 0
         req = urllib.request.Request(url, data=data, method=method)
         req.add_header("Authorization", "Bearer " + self._token)
-        if data is not None:
+        if body is not None:
             req.add_header("Content-Type", "application/json")
+        elif method == "POST":
+            req.add_header("Content-Length", "0")
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
                 raw = r.read()
@@ -350,11 +359,13 @@ def strip_ids(o):
 
 # ── the reconcile ───────────────────────────────────────────────────────────────────────────────────────────
 class Reconcile:
-    def __init__(self, spec, spec_dir, graph, apply=False, fetch=fetch_source, token=None, out=print):
+    def __init__(self, spec, spec_dir, graph, apply=False, fetch=fetch_source, token=None, out=print, sync_only=False):
         self.spec, self.dir, self.g, self.apply, self.fetch, self.out = spec, spec_dir, graph, apply, fetch, out
         self.token = token
+        self.sync_only = sync_only
         self.drift = self.held = self.errors = self.pending = 0
         self.gid = {}
+        self.changed = []   # the delivered objects (script / profile / certificate / policy) an --apply changed
 
     # one line per finding ─────────────────────────────────────────────────────────────────────────────────
     def line(self, status, what, detail, action=""):
@@ -374,6 +385,8 @@ class Reconcile:
         try:
             do()
             self.line("APPLIED", what, detail, action)
+            if self.delivered(obj) and not any(obj is c for c in self.changed):
+                self.changed.append(obj)
         except GraphError as e:
             self.errors += 1
             self.line("ERROR", what, f"{detail}; {action} failed: {e}")
@@ -757,10 +770,65 @@ class Reconcile:
             self.line("INFO", what, "a delegated (user) token: application permissions are not verifiable from it; "
                       "scopes: " + (claims.get("scp") or "none"))
 
+    # device sync ──────────────────────────────────────────────────────────────────────────────────────────
+    def delivered(self, obj):
+        """An object Intune DELIVERS to the Macs (whose change a Mac sees only at its next sync)."""
+        return any(obj is x for k in ("scripts", "customProfiles", "trustedRootCertificates", "settingsPolicies")
+                   for x in self.spec.get(k, []))
+
+    def group_devices(self, key):
+        """{directory object id: (name, Entra deviceId)} of a declared group's members."""
+        gid = self.gid.get(key)
+        if not gid:
+            return {}
+        return {m["id"]: (m.get("displayName") or short(m["id"]), m.get("deviceId"))
+                for m in self.g.list(f"v1.0/groups/{gid}/members?$select=id,displayName,deviceId")}
+
+    def sync_devices(self, objs, why):
+        """Ask Intune to sync every Mac the objects reach: include groups' members minus that object's exclude
+        groups' members. One line per Mac; a failure is an ERROR naming the Mac, never a silent skip."""
+        cache, reach = {}, {}
+        def members(key):
+            if key not in cache:
+                cache[key] = self.group_devices(key) if key in self.spec.get("groups", {}) else {}
+            return cache[key]
+        for o in objs:
+            a = o.get("assign") or {}
+            out = set().union(*[set(members(k)) for k in a.get("exclude", [])]) if a.get("exclude") else set()
+            for k in a.get("include", []):
+                for oid, v in members(k).items():
+                    if oid not in out:
+                        reach[oid] = v
+        if not reach:
+            self.line("INFO", "device sync", f"{why}: no Mac to sync")
+            return
+        for oid, (name, aad) in sorted(reach.items(), key=lambda kv: kv[1][0]):
+            what = f"device sync {name}"
+            if not aad:
+                # a user or service principal in the group: no device to sync (review on #278)
+                self.line("INFO", what, f"directory object {short(oid)} is not a device — nothing to sync")
+                continue
+            md = [m for m in self.g.list("v1.0/deviceManagement/managedDevices?$filter="
+                                         + urllib.parse.quote(f"azureADDeviceId eq '{aad}'") + "&$select=id,deviceName,operatingSystem")
+                  if (m.get("operatingSystem") or "macOS") == "macOS"]   # the fleet's Macs only, as the device step
+            if len(md) != 1:
+                self.pending += 1
+                self.line("PENDING", what, f"{len(md)} managed macOS devices for directory device {short(oid)} — not synced")
+                continue
+            try:
+                self.g.post(f"v1.0/deviceManagement/managedDevices/{md[0]['id']}/syncDevice", None)
+                self.line("SYNCED", what, f"managed {short(md[0]['id'])} asked to sync ({why})")
+            except GraphError as e:
+                self.errors += 1
+                hint = " (needs DeviceManagementManagedDevices.PrivilegedOperations.All)" if e.status in (401, 403) else ""
+                self.line("ERROR", what, f"syncDevice failed: {e}{hint}")
+
     def run(self):
         steps = [("app identity", self.app_identity), ("groups", self.groups), ("devices", self.devices),
                  ("scripts", self.scripts), ("profiles", self.custom_profiles), ("certificates", self.trusted_roots),
                  ("settings policies", self.settings_policies), ("compliance", self.compliance)]
+        if self.sync_only:
+            steps = [("groups", self.groups)]
         for name, step in steps:
             try:
                 step()
@@ -768,7 +836,17 @@ class Reconcile:
                 self.errors += 1
                 hint = " (the credential lacks a permission — see appIdentity.requiredRoles)" if e.status in (401, 403) else ""
                 self.line("ERROR", name, f"{e}{hint}")
-        mode = "apply" if self.apply else "check"
+        try:
+            if self.sync_only:
+                # a HELD object is not touched at all — not even by a device action on its behalf (review on #278)
+                self.sync_devices([x for k in ("scripts", "customProfiles", "trustedRootCertificates", "settingsPolicies")
+                                   for x in self.spec.get(k, []) if not x.get("hold")], "--sync")
+            elif self.apply and self.changed:
+                self.sync_devices(self.changed, "changed by this apply: " + ", ".join(o.get("key", "?") for o in self.changed))
+        except GraphError as e:
+            self.errors += 1
+            self.line("ERROR", "device sync", str(e))
+        mode = "sync" if self.sync_only else "apply" if self.apply else "check"
         self.out(f"── {mode}: drift {self.drift}, held {self.held}, pending {self.pending}, errors {self.errors}")
         if self.errors:
             return 1
@@ -843,6 +921,11 @@ class FakeGraph:
             return {}
         if rest[1:] == ["members", "$ref"]:
             obj.setdefault("_members", []).append(body["@odata.id"].rsplit("/", 1)[1])
+            return {}
+        if key == "managedDevices" and rest[1:] == ["syncDevice"]:
+            if body is not None:
+                raise GraphError(400, "POST", path, "syncDevice takes no body")
+            obj["_synced"] = obj.get("_synced", 0) + 1
             return {}
         raise GraphError(400, "POST", path, "route not faked")
 
@@ -946,7 +1029,79 @@ def self_test():
     expect("a HELD exclusion is reported and never written", any(ln.startswith("HELD") and "compliance basic" in ln and "exclude studios" in ln for ln in lines)
            and not any("deviceCompliancePolicies" in w[1] for w in g.writes) and rc == 2, lines)
 
+    syncs = [w for w in g.writes if w[1].endswith("/syncDevice")]
+    expect("device sync: an apply that changed delivered objects asks every Mac they reach to sync, ONE call each, no body",
+           [w[1] for w in syncs] == ["v1.0/deviceManagement/managedDevices/m1/syncDevice"] and syncs[0][2] is None
+           and any(ln.startswith("SYNCED") and "studio-1" in ln for ln in lines), lines)
     st["groups"][G1]["_members"].append("dx")
+    rc, lines, g = run(st, False)
+    expect("device sync: --check never syncs", not any(w[1].endswith("/syncDevice") for w in g.writes)
+           and not any(ln.startswith("SYNCED") for ln in lines), lines)
+    rc, lines, g = run(st, True, {**spec, "compliancePolicies": []})
+    expect("device sync: an apply that changed nothing syncs nothing", not g.writes and not any(ln.startswith("SYNCED") for ln in lines), lines)
+    st["managedDevices"]["mx"] = {"id": "mx", "serialNumber": "SERIALX", "azureADDeviceId": "aad-x", "operatingSystem": "macOS"}
+    st["groups"][G2]["_members"] = ["dx"]
+    lines = []
+    g = FakeGraph(st)
+    rc = Reconcile(copy.deepcopy(spec), tempfile.gettempdir(), g, token=tok, out=lines.append, sync_only=True).run()
+    synced = sorted(w[1].split("/")[3] for w in g.writes if w[1].endswith("/syncDevice"))
+    expect("device sync: --sync syncs only, writes nothing else; a Mac in a policy's include group is synced even when "
+           "another object excludes it (the update policy reaches it), and each Mac is asked ONCE",
+           rc == 0 and synced == ["m1", "mx"] and all(w[1].endswith("/syncDevice") for w in g.writes), lines)
+    lines = []
+    g = FakeGraph(st)
+    r = Reconcile(copy.deepcopy(spec), tempfile.gettempdir(), g, apply=True, token=tok, out=lines.append)
+    r.groups()
+    r.sync_devices([r.spec["scripts"][0]], "test")
+    synced = [w[1].split("/")[3] for w in g.writes if w[1].endswith("/syncDevice")]
+    expect("device sync: a Mac in the object's EXCLUDE group is not synced for it", synced == ["m1"], lines)
+    del st["managedDevices"]["mx"]
+    lines = []
+    g = FakeGraph(st)
+    r = Reconcile(copy.deepcopy(spec), tempfile.gettempdir(), g, apply=True, token=tok, out=lines.append)
+    r.groups()
+    r.sync_devices([r.spec["settingsPolicies"][0]], "test")
+    expect("device sync: a member with no managed device is PENDING, named, never a silent skip",
+           r.pending == 1 and any(ln.startswith("PENDING") and "hand-added" in ln for ln in lines), lines)
+    st2s = copy.deepcopy(st)
+    st2s["managedDevices"]["mw"] = {"id": "mw", "serialNumber": "W", "azureADDeviceId": "aad-x", "operatingSystem": "Windows"}
+    st2s["devices"]["u1"] = {"id": "u1", "displayName": "a person"}
+    st2s["groups"][G1]["_members"].append("u1")
+    lines = []
+    g = FakeGraph(st2s)
+    r = Reconcile(copy.deepcopy(spec), tempfile.gettempdir(), g, apply=True, token=tok, out=lines.append)
+    r.groups()
+    r.sync_devices([r.spec["settingsPolicies"][0]], "test")
+    synced = [w[1].split("/")[3] for w in g.writes if w[1].endswith("/syncDevice")]
+    expect("device sync: a non-macOS managed device is never synced, and a non-device member is INFO, not PENDING",
+           synced == ["m1"] and any(ln.startswith("INFO") and "not a device" in ln for ln in lines) and r.pending == 1, lines)
+    held = copy.deepcopy(spec)
+    held["settingsPolicies"][0]["hold"] = "the owner's go"
+    held["scripts"] = []; held["customProfiles"] = []; held["trustedRootCertificates"] = []
+    lines = []
+    g = FakeGraph(copy.deepcopy(st))
+    Reconcile(held, tempfile.gettempdir(), g, token=tok, out=lines.append, sync_only=True).run()
+    expect("device sync: --sync never acts for a HELD object", not any(w[1].endswith("/syncDevice") for w in g.writes), lines)
+    # the real client: an empty POST carries Content-Length: 0 (Graph answers 411 without it), and no Content-Type
+    seen = {}
+    class _R:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b""
+    real = urllib.request.urlopen
+    def _open(req, timeout=60):
+        seen.update(method=req.get_method(), data=req.data, headers={k.lower(): v for k, v in req.header_items()})
+        return _R()
+    urllib.request.urlopen = _open
+    try:
+        Graph("t").post("v1.0/deviceManagement/managedDevices/x/syncDevice", None)
+    finally:
+        urllib.request.urlopen = real
+    # what is observable here is the Request the client builds (urllib's handler adds its own form Content-Type later,
+    # harmless to Graph — the 411 is about Content-Length): an explicit Content-Length: 0, an empty body, no JSON type
+    expect("Graph: an action POST with no body is built with an empty body and an explicit Content-Length: 0 (no JSON type)",
+           seen.get("method") == "POST" and seen.get("data") == b"" and seen["headers"].get("content-length") == "0"
+           and seen["headers"].get("content-type") != "application/json", [repr(seen)])
     rc, lines, g = run(st, False)
     expect("no-op: a reconciled tenant checks clean apart from the held policy (writes nothing)",
            rc == 2 and not g.writes and sum(ln.startswith("DRIFT") for ln in lines) == 0 and sum(ln.startswith("HELD") for ln in lines) == 1, lines)
@@ -1056,6 +1211,7 @@ def main(argv=None):
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true", help="read-only; exit 2 on drift")
     mode.add_argument("--apply", action="store_true", help="create/patch/assign to match the spec; never deletes")
+    mode.add_argument("--sync", action="store_true", help="only ask Intune to sync every Mac the spec assigns objects to")
     mode.add_argument("--validate", action="store_true", help="the spec's shape only, no Graph call")
     mode.add_argument("--self-test", action="store_true", help="against an in-memory fake Graph")
     ap.add_argument("--spec", help="the declared fleet spec (JSON)")
@@ -1076,8 +1232,8 @@ def main(argv=None):
         print(f"spec valid: {a.spec}")
         return 0
     token, source = acquire_token(spec.get("tenant"))
-    print(f"── {'apply' if a.apply else 'check'} against Graph, signed in with {source}")
-    return Reconcile(spec, spec_dir, Graph(token), apply=a.apply, token=token).run()
+    print(f"── {'sync' if a.sync else 'apply' if a.apply else 'check'} against Graph, signed in with {source}")
+    return Reconcile(spec, spec_dir, Graph(token), apply=a.apply, token=token, sync_only=a.sync).run()
 
 
 if __name__ == "__main__":
