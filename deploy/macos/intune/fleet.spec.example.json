@@ -72,7 +72,7 @@
       "key": "memexLocal",
       "id": "00000000-0000-4000-8000-0000000000c1",
       "displayName": "Fleet — Memex Local (Mac Studios)",
-      "description": "com.memex.local fleet keys for the Mac Studios: ControlUrl, RegistryUrl, LoginServer, OwnerId, OwnerEmail; for the unattended first-run setup Organisation, OwnerName, AcceptTerms; FleetCaSha256 once the fleet CA is declared (memex-local ca adopt reads it); the participation answers AcceptJobs* / AcceptTokens* (lists as one comma-separated string). DeploymentId deliberately omitted (the bootstrap uses the Mac's LocalHostName).",
+      "description": "com.memex.local fleet keys for the Mac Studios: ControlUrl, RegistryUrl, LoginServer, OwnerId, OwnerEmail; for the unattended first-run setup Organisation, OwnerName, AcceptTerms; FleetCaSha256 once the fleet CA is declared (memex-local ca adopt reads it); the participation answers AcceptJobs* / AcceptTokens* (lists as one comma-separated string); OperatorSshKeys, the fleet operator's PUBLIC SSH keys (kept as a plist array: the bootstrap turns Remote Login on and appends each to the console user's authorized_keys). DeploymentId deliberately omitted (the bootstrap uses the Mac's LocalHostName).",
       "payloadName": "Memex Local — fleet Mac Studio",
       "payloadFileName": "fleet-studio.mobileconfig",
       "deploymentChannel": "deviceChannel",
@@ -109,7 +109,10 @@
           "qwen3.8:27b-mlx",
           "qwen3.6"
         ],
-        "AcceptTokensResidency": "CH"
+        "AcceptTokensResidency": "CH",
+        "OperatorSshKeys": [
+          "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDH5AD0ellP162c2ThMr3M79UFF5xWm4cAqHv5xf2coD operator@example.com"
+        ]
       },
       "assign": {
         "include": [

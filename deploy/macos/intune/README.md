@@ -9,6 +9,7 @@ MeshWeaver.Plugins `Hosting/MacStudioFleet.md` §2b and §2b.2.
 | Step | What it does | Waits (exit 0) when |
 |---|---|---|
 | console user | the person the Mac's memex runs as (`stat -f%Su /dev/console`). If that person's password must be changed (an expired password, or a device-management "change at next sign-in" policy whose moment has passed — read from `pwpolicy -getaccountpolicies` and `dscl … accountPolicyData`), the run's FIRST line says so with the remedy: every non-interactive SSH login fails until the person changes it at the console | no one is logged in |
+| operator SSH | only when `OperatorSshKeys` is configured (below): Remote Login on (`launchctl enable system/com.openssh.sshd` + `bootstrap` of `/System/Library/LaunchDaemons/ssh.plist`, which needs no privacy grant; `systemsetup -setremotelogin on` — which needs Full Disk Access — only as the fallback), the console user added to `com.apple.access_ssh` when Remote Login is restricted to that group, and each declared key appended to the console user's `~/.ssh/authorized_keys` AS that user (`~/.ssh` 0700, the file 0600; only when absent — matched on type + key, any comment or options; no line removed; a symlinked or foreign-owned file refused). `sshd_config` is never touched. Not configured: nothing changes, and the run says so | — **fails** (exit 1, after the rest of the run) when an entry is refused (not one single-line `ssh-ed25519` / `ecdsa-sha2-*` / `ssh-rsa` public key without options — its content is never logged; the valid ones are still installed) or Remote Login cannot be turned on |
 | participation | the owner's two answers, `AcceptJobs` and `AcceptTokens` (below), read BEFORE anything is installed | — **fails** (exit 1, the missing key named) when either is absent or not a boolean, or a YES lacks its `…From` (tokens: also `AcceptTokensModels`) |
 | Homebrew | `/opt/homebrew`, owned by that person (the documented untar install, no prompt) | — |
 | tools | `colima docker kubectl helm ollama lego` (lego: `memex-local cert issue`, the internal name's certificate) and `systemorph/memex/memex-local` (the tap tapped AND trusted first), as that person. Every command run as that person gets `/opt/homebrew/bin` and `/usr/local/bin` on PATH | — |
@@ -46,6 +47,11 @@ placed on issuing CA"*. Re-measure on the first profile-trusted fleet Mac (Safar
 | `AcceptTokens` | boolean, **required** | the Mac serves local models to the fleet's token queue. NO ⇒ no token models beyond the portal's own chat model |
 | `AcceptTokensFrom`, `AcceptTokensModels` | list, both required on YES | whose token requests, which models |
 | `AcceptTokensResidency` | string, optional | where the Mac is (`CH`, `Eu`) — stamped on what it serves |
+
+**Operator SSH — optional**: `OperatorSshKeys`, a list of OpenSSH PUBLIC keys (a profile array, one key per
+element; the reconcile writes it as an array, never comma-joined; a newline-separated string is read too; environment
+`FLEET_OPERATOR_SSH_KEYS`, newline-separated). The log names each key by its SHA256 fingerprint. Until bootstrap 1.5.0
+Remote Login and the operator's key were set up by hand on each Mac (owner, 2026-11-12: "i try to avoid manual steps").
 
 The environment variables `FLEET_ACCEPT_JOBS`, `FLEET_ACCEPT_JOBS_FROM`, `FLEET_ACCEPT_JOBS_CHANNELS`,
 `FLEET_ACCEPT_JOBS_REPOS`, `FLEET_ACCEPT_TOKENS`, `FLEET_ACCEPT_TOKENS_FROM`, `FLEET_ACCEPT_TOKENS_MODELS`,

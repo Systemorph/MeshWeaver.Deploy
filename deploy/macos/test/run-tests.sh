@@ -705,6 +705,100 @@ OUT="$(nt "Stopped")"
   && ok "a registered node that is Stopped is never re-keyed by the script" || bad "stopped" "$OUT"
 rm -rf "$NT"
 
+echo "── operator SSH: Remote Login on + the operator's PUBLIC keys for the console user (bootstrap 1.5.0, 2026-11-12) ──"
+OT="$(mktemp -d)"; mkdir -p "$OT/bin" "$OT/home"; ME="$(id -un)"
+ssh-keygen -q -t ed25519 -N '' -C 'operator one' -f "$OT/k1" && ssh-keygen -q -t ecdsa -N '' -C 'operator two' -f "$OT/k2" \
+  && ssh-keygen -q -t ed25519 -N '' -C 'private' -f "$OT/kp" || bad "ssh-keygen fixtures" "failed"
+K1="$(cat "$OT/k1.pub")"; K2="$(cat "$OT/k2.pub")"; KPRIV="$(sed -n 2p "$OT/kp")"
+FP1="$(ssh-keygen -lf "$OT/k1.pub" | awk '{print $2}')"
+# Stubs: launchd (sshd loaded iff $OT/loaded; its override from $OT/disabled), the directory (the access group iff
+# $OT/group; membership iff $OT/member), systemsetup (loads sshd iff $OT/systemsetup-works). Every call is recorded.
+cat > "$OT/bin/launchctl" <<STUB
+#!/bin/bash
+echo "launchctl \$*" >> "$OT/calls"
+case "\$1" in
+  print) [ -e "$OT/loaded" ] ;;
+  print-disabled) printf '\tdisabled services = {\n\t\t"com.openssh.sshd" => %s\n\t}\n' "\$(cat "$OT/disabled" 2>/dev/null || echo enabled)" ;;
+  enable) rm -f "$OT/disabled" ;;
+  bootstrap) [ -e "$OT/bootstrap-works" ] && touch "$OT/loaded"; [ -e "$OT/bootstrap-works" ] ;;
+esac
+STUB
+cat > "$OT/bin/dscl" <<STUB
+#!/bin/bash
+echo "dscl \$*" >> "$OT/calls"; [ -e "$OT/group" ]
+STUB
+cat > "$OT/bin/dseditgroup" <<STUB
+#!/bin/bash
+echo "dseditgroup \$*" >> "$OT/calls"; case "\$2" in checkmember) [ -e "$OT/member" ] ;; *) exit 0 ;; esac
+STUB
+cat > "$OT/bin/systemsetup" <<STUB
+#!/bin/bash
+echo "systemsetup \$*" >> "$OT/calls"; [ -e "$OT/systemsetup-works" ] && touch "$OT/loaded"
+echo "Turning Remote Login on or off requires Full Disk Access privileges."
+STUB
+chmod +x "$OT/bin/"*
+ost() {  # $1 = the shell to evaluate after sourcing; rest = extra env
+  local ev="$1"; shift; rm -f "$OT/calls"
+  env FLEET_BOOTSTRAP_LIB=1 PATH="$OT/bin:$PATH" FLEET_USER_HOME="$OT/home" FLEET_LOG_DIR="$OT/log" FLEET_MANAGED_PREFS="$OT/none" "$@" \
+    bash -c '. "$0"; '"$ev"'; echo "RC=$?"' "$FB" 2>&1; }
+# 1. not configured: nothing happens, never an error
+OUT="$(ost 'step_operator_ssh "$(id -un)"')"
+case "$OUT" in *"operator ssh: not configured"*"RC=0"*) [ ! -e "$OT/calls" ] && [ ! -e "$OT/home/.ssh" ] && ok "OperatorSshKeys absent: 'not configured', exit 0, Remote Login and ~/.ssh untouched (not even probed)" || bad "not configured touched something" "$(cat "$OT/calls" 2>/dev/null)" ;; *) bad "not configured" "$OUT" ;; esac
+# 2. one key on a Mac with Remote Login off and restricted to a group the person is not in: everything planned (dry run)
+touch "$OT/group"
+OUT="$(ost 'step_operator_ssh "$(id -un)"' FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_OPERATOR_SSH_KEYS="$K1")"
+case "$OUT" in *"turning Remote Login on"*"DRY-RUN: launchctl enable system/com.openssh.sshd"*"DRY-RUN: launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist"*"adding $ME to com.apple.access_ssh"*"DRY-RUN: dseditgroup -o edit -a $ME -t user com.apple.access_ssh"*"adding key $FP1 to $OT/home/.ssh/authorized_keys (as $ME)"*"DRY-RUN: sudo -u $ME"*"1 key(s) added, 0 already present, 0 refused"*"RC=0"*)
+  ok "one key, Remote Login off, a restricting access group: enable + bootstrap sshd, the person added to the group, the key appended AS the person" ;; *) bad "one key planned" "$OUT" ;; esac
+[ ! -e "$OT/home/.ssh" ] && ! grep -q '^launchctl \(enable\|bootstrap\)' "$OT/calls" && ok "…and the dry run changed nothing" || bad "dry run changed something" "$(cat "$OT/calls")"
+case "$OUT" in *"$FP1"*) case "$OUT" in *"adding key ssh-ed25519"*) bad "the log names the fingerprint, not the key" "$OUT" ;; *) ok "the log names the key by its SHA256 fingerprint" ;; esac ;; *) bad "fingerprint logged" "$OUT" ;; esac
+# 3. already present (another comment, an options-prefixed line kept): nothing appended, the file byte-identical
+touch "$OT/loaded" "$OT/member"; mkdir -p "$OT/home/.ssh"; chmod 700 "$OT/home/.ssh"
+printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherKeyOtherKeyOtherKeyOtherKeyOtherKey0 someone else\nfrom="10.0.0.1" %s renamed\n' "$(cut -d' ' -f1-2 "$OT/k1.pub")" > "$OT/home/.ssh/authorized_keys"
+chmod 600 "$OT/home/.ssh/authorized_keys"; SUM="$(shasum "$OT/home/.ssh/authorized_keys")"
+OUT="$(ost 'step_operator_ssh "$(id -un)"' FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_OPERATOR_SSH_KEYS="$K1")"
+case "$OUT" in *"Remote Login is on (com.openssh.sshd loaded)"*"$ME is allowed through Remote Login's access group"*"key $FP1 already in"*"0 key(s) added, 1 already present"*"RC=0"*)
+  case "$OUT" in *"DRY-RUN"*) bad "an already-present key plans no change" "$OUT" ;; *) ok "a key already there (any comment, any options) is not appended again; Remote Login on and a member: no change at all" ;; esac ;; *) bad "already present" "$OUT" ;; esac
+[ "$(shasum "$OT/home/.ssh/authorized_keys")" = "$SUM" ] && ok "…and authorized_keys is byte-identical (no line removed or rewritten)" || bad "authorized_keys changed" "$(cat "$OT/home/.ssh/authorized_keys")"
+# 4. malformed entries are REFUSED (and never logged); a valid one beside them is still installed; the run says FAILED
+OUT="$(ost 'step_operator_ssh "$(id -un)"' FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_OPERATOR_SSH_KEYS="$(printf '%s\ncommand="/bin/sh" %s\n-----BEGIN OPENSSH PRIVATE KEY-----\n%s\nssh-dss AAAAB3NzaC1kc3MAAACB x\n' "$K2" "$K1" "$KPRIV")")"
+case "$OUT" in *"REFUSED OperatorSshKeys entry 2"*"REFUSED OperatorSshKeys entry 3"*"REFUSED OperatorSshKeys entry 4"*"REFUSED OperatorSshKeys entry 5"*"adding key SHA256:"*"1 key(s) added, 0 already present, 4 refused"*"RC=1"*)
+  ok "an options prefix, private key material and an unaccepted type are each REFUSED; the valid key is still installed; the step fails (exit 1)" ;; *) bad "malformed refused" "$OUT" ;; esac
+case "$OUT" in *"$KPRIV"*|*"BEGIN OPENSSH"*|*'command='*) bad "a refused entry's content never reaches the log" "$OUT" ;; *) ok "a refused entry's content never reaches the output or the log" ;; esac
+OUT="$(ost 'step_operator_ssh "$(id -un)"' FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_OPERATOR_SSH_KEYS="ssh-rsa ${K1#* }")"
+case "$OUT" in *"REFUSED OperatorSshKeys entry 1"*"FAILED — none of the 1 declared key(s)"*"RC=1"*) ! grep -q '^launchctl' "$OT/calls" && ok "only invalid keys (an ed25519 blob labelled ssh-rsa): FAILED, and Remote Login is not touched" || bad "invalid-only probed launchd" "$(cat "$OT/calls")" ;; *) bad "invalid only" "$OUT" ;; esac
+# 5. a symlinked authorized_keys is never followed
+mkdir -p "$OT/h2/.ssh"; ln -s /etc/hosts "$OT/h2/.ssh/authorized_keys"
+OUT="$(ost 'step_operator_ssh "$(id -un)"' FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_USER_HOME="$OT/h2" FLEET_OPERATOR_SSH_KEYS="$K1")"
+case "$OUT" in *"REFUSED $OT/h2/.ssh/authorized_keys"*"symlink"*"RC=1"*) case "$OUT" in *"DRY-RUN"*) bad "symlink: nothing planned" "$OUT" ;; *) ok "a symlinked authorized_keys is REFUSED, nothing written" ;; esac ;; *) bad "symlink refused" "$OUT" ;; esac
+# 6. Remote Login, for real (stubs): launchd first; systemsetup only when launchd did not take; a failure says why
+rm -f "$OT/loaded"; echo disabled > "$OT/disabled"; touch "$OT/bootstrap-works"
+OUT="$(ost step_remote_login)"
+case "$OUT" in *"Remote Login turned on (launchctl)"*"RC=0"*) grep -q '^launchctl enable system/com.openssh.sshd' "$OT/calls" && grep -q '^launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist' "$OT/calls" && ! grep -q '^systemsetup' "$OT/calls" \
+  && ok "Remote Login via launchd: the persisted override enabled and ssh.plist bootstrapped; systemsetup (Full Disk Access) not needed" || bad "launchd path calls" "$(cat "$OT/calls")" ;; *) bad "launchd path" "$OUT" ;; esac
+rm -f "$OT/loaded" "$OT/bootstrap-works"; touch "$OT/systemsetup-works"
+OUT="$(ost step_remote_login)"
+case "$OUT" in *"Remote Login turned on (systemsetup)"*"RC=0"*) ok "launchd did not take: the systemsetup fallback turns it on" ;; *) bad "systemsetup fallback" "$OUT" ;; esac
+rm -f "$OT/loaded" "$OT/systemsetup-works"
+OUT="$(ost step_remote_login)"
+case "$OUT" in *"FAILED to turn Remote Login on"*"Full Disk Access"*"RC=1"*) ok "neither took: FAILED, with what systemsetup said (retried next run)" ;; *) bad "remote login failure" "$OUT" ;; esac
+# 7. the append itself (run as the person in production): perms set, a missing final newline repaired, every line kept
+mkdir -p "$OT/h3/.ssh"; chmod 755 "$OT/h3/.ssh"; printf 'ssh-ed25519 AAAAexisting keep-me' > "$OT/h3/.ssh/authorized_keys"; chmod 644 "$OT/h3/.ssh/authorized_keys"
+AP="$(env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; printf "%s" "$AUTHKEYS_APPEND_SH"' "$FB")"
+/bin/sh -c "$AP" sh "$OT/h3" "$K1" && [ "$(sed -n 1p "$OT/h3/.ssh/authorized_keys")" = "ssh-ed25519 AAAAexisting keep-me" ] && [ "$(sed -n 2p "$OT/h3/.ssh/authorized_keys")" = "$K1" ] \
+  && [ "$(wc -l < "$OT/h3/.ssh/authorized_keys" | tr -d ' ')" = 2 ] && ok "the append keeps every line and repairs a missing final newline (never glues onto the last key)" || bad "append" "$(cat -e "$OT/h3/.ssh/authorized_keys")"
+[ "$(stat -f%Lp "$OT/h3/.ssh")" = 700 ] && [ "$(stat -f%Lp "$OT/h3/.ssh/authorized_keys")" = 600 ] && ok "…~/.ssh is 0700 and authorized_keys 0600" || bad "modes" "$(stat -f'%Lp %N' "$OT/h3/.ssh" "$OT/h3/.ssh/authorized_keys")"
+/bin/sh -c "$AP" sh "$OT/h4" "$K1" && [ "$(cat "$OT/h4/.ssh/authorized_keys")" = "$K1" ] && [ "$(stat -f%Lp "$OT/h4/.ssh")" = 700 ] && ok "a home without ~/.ssh gets one (0700) holding just the key" || bad "fresh ~/.ssh" "$(ls -la "$OT/h4/.ssh" 2>&1)"
+# 8. the profile shapes: an array (one key per element) and a newline-separated string
+plutil -create xml1 "$OT/arr.plist" && plutil -insert OperatorSshKeys -array "$OT/arr.plist" && plutil -insert OperatorSshKeys -string "$K1" -append "$OT/arr.plist" && plutil -insert OperatorSshKeys -string "$K2" -append "$OT/arr.plist"
+[ "$(ost operator_ssh_keys FLEET_MANAGED_PREFS="$OT/arr" | sed '$d')" = "$(printf '%s\n%s' "$K1" "$K2")" ] && ok "OperatorSshKeys as a profile array: one key per element" || bad "array keys" "$(ost operator_ssh_keys FLEET_MANAGED_PREFS="$OT/arr")"
+plutil -create xml1 "$OT/str.plist" && plutil -insert OperatorSshKeys -string "$(printf '%s\n\n%s' "$K1" "$K2")" "$OT/str.plist"
+[ "$(ost operator_ssh_keys FLEET_MANAGED_PREFS="$OT/str" | sed '$d')" = "$(printf '%s\n%s' "$K1" "$K2")" ] && ok "OperatorSshKeys as one string: newline-separated, blank lines dropped" || bad "string keys" "$(ost operator_ssh_keys FLEET_MANAGED_PREFS="$OT/str")"
+# 9. it runs right after the console user, before anything that can fail the run
+awk '/^main\(\) \{/{on=1} on' "$FB" | grep -n 'step_operator_ssh\|read_participation' | head -1 | grep -q step_operator_ssh \
+  && ! grep -q 'sshd_config' <(grep -v '^#\|never touches sshd_config\|sshd_config never' "$FB") \
+  && ok "main runs the operator SSH step before the participation answers (a Mac that fails later is still reachable); sshd_config is never touched" || bad "ssh step order" "$(awk '/^main\(\) \{/{on=1} on' "$FB")"
+rm -rf "$OT"
+
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

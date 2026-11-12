@@ -20,6 +20,9 @@
 #      prints the approval link (and writes it to the log), and a later run completes the join once the
 #      enrolment code is at its code file. Until control hands the code back itself (§2b.1, target 1), the
 #      code file is where it is delivered.
+#   0. (right after the console user) Operator SSH: when OperatorSshKeys is configured, Remote Login is turned on
+#      and each declared PUBLIC key is appended to ~<console user>/.ssh/authorized_keys (written AS that user;
+#      only when absent; nothing else in the file is touched; sshd_config never). Not configured: nothing changes.
 #
 # Configuration — the managed preference domain com.memex.local (a configuration profile; memex-local reads
 # the same keys): ControlUrl, DeploymentId, RegistryUrl, FleetCaSha256 (the fleet local CA's certificate), and for the
@@ -36,6 +39,10 @@
 # AcceptTokens FAILS (exit 1, named in the log) before it installs anything. Jobs NO ⇒ no build host (no build VM,
 # runners, priority agent); tokens NO ⇒ no token models beyond the portal's own chat model.
 #
+# OPERATOR SSH, optional: OperatorSshKeys (a profile array of OpenSSH public keys, or one string of newline-separated
+# keys; environment FLEET_OPERATOR_SSH_KEYS, newline-separated). Accepted: one line each, ssh-ed25519 /
+# ecdsa-sha2-nistp{256,384,521} / ssh-rsa, no options prefix, never private key material. Absent ⇒ not configured.
+#
 # Output: one line per step, also appended to /Library/Logs/MeshWeaver/fleet-bootstrap.log. Exit 0 when the
 # run did all it could (including "waiting for X"), non-zero only when a step FAILED.
 #
@@ -43,7 +50,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.4.3"
+readonly FLEET_BOOTSTRAP_VERSION="1.5.0"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -218,6 +225,122 @@ check_password() {
   [ -n "$v" ] || return 0
   log "🚨🚨 PASSWORD EXPIRED for $user: $v. Every non-interactive SSH login fails until it is changed (\"Password change required but no TTY available\"). REMEDY: the person signs in at this Mac's console (the login window asks for a new password) or runs 'passwd' in Terminal; device-management policy should not force it on a fleet Mac (Intune: the macOS password policy's 'change at next sign-in')"
   return 0
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# OPERATOR SSH (owner, 2026-11-12: "i try to avoid manual steps"). Until 1.5.0 Remote Login and the operator's key
+# were set up by hand on every Mac. Now, when the profile declares OperatorSshKeys, the run turns Remote Login on,
+# lets the console user through Remote Login's access group when that group restricts it, and appends each
+# declared PUBLIC key to that user's ~/.ssh/authorized_keys. It never removes a line, never rewrites the file and
+# never touches sshd_config. Not configured ⇒ nothing changes (Remote Login stays as it is), and the run says so.
+readonly SSHD_LABEL="com.openssh.sshd"
+readonly SSHD_PLIST="${FLEET_SSHD_PLIST:-/System/Library/LaunchDaemons/ssh.plist}"
+readonly SSH_ACCESS_GROUP="com.apple.access_ssh"
+# Appends ONE key line to "$1/.ssh/authorized_keys". Run AS the console user (as_user), so a symlink planted there
+# can only ever reach what that user could write anyway: ~/.ssh 0700, the file 0600, a missing final newline
+# repaired first (an append must never glue the key onto someone else's last line).
+# shellcheck disable=SC2016   # a script text: expanded by the /bin/sh it is handed to, never here
+readonly AUTHKEYS_APPEND_SH='umask 077; d="$1/.ssh"; f="$d/authorized_keys"
+mkdir -p "$d" && chmod 700 "$d" && touch "$f" && chmod 600 "$f" || exit 1
+if [ -s "$f" ] && [ -n "$(tail -c 1 "$f")" ]; then printf "\n" >> "$f" || exit 1; fi
+printf "%s\n" "$2" >> "$f"'
+
+# The declared keys, one per line, blank lines dropped: the environment (newline-separated) wins, then the managed
+# preference — a plist array (one key per element) or a string (newline-separated). Pure read.
+operator_ssh_keys() {
+  local f="${MANAGED_PREFS}.plist" i=0 v
+  if [ -n "${FLEET_OPERATOR_SSH_KEYS:-}" ]; then printf '%s\n' "$FLEET_OPERATOR_SSH_KEYS" | sed '/^[[:space:]]*$/d'; return 0; fi
+  [ -f "$f" ] || return 0
+  case "$(plutil -type OperatorSshKeys "$f" 2>/dev/null)" in
+    array) while v="$(plutil -extract "OperatorSshKeys.$i" raw -o - "$f" 2>/dev/null)"; do printf '%s\n' "$v"; i=$((i + 1)); done ;;
+    string) plutil -extract OperatorSshKeys raw -o - "$f" 2>/dev/null; printf '\n' ;;
+  esac | sed '/^[[:space:]]*$/d'
+}
+
+# "<type> <base64>" of a line that is exactly ONE OpenSSH public key of an accepted type, optionally followed by a
+# comment — no options prefix (`from=…`, `command=…`), no private key material, no second line — and whose blob
+# names the same type it is labelled with (RFC 4253 §6.6: the blob starts with its length-prefixed type name).
+# Returns 1 for anything else. Pure.
+ssh_key_core() {
+  local line="$1" type blob
+  case "$line" in *$'\r'*|*$'\n'*) return 1 ;; esac
+  printf '%s\n' "$line" | LC_ALL=C grep -Eq '^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+={0,3}( [^[:cntrl:]]*)?$' || return 1
+  type="${line%% *}"; blob="${line#* }"; blob="${blob%% *}"
+  [ "$(printf '%s' "$blob" | base64 --decode 2>/dev/null | head -c $((4 + ${#type})) | tail -c "${#type}")" = "$type" ] || return 1
+  printf '%s %s' "$type" "$blob"
+}
+
+# The key's SHA256 fingerprint — what the log names, never the key itself. Empty when ssh-keygen cannot read it.
+ssh_key_fingerprint() {
+  printf '%s\n' "$1" | ssh-keygen -l -f - 2>/dev/null | awk '{print $2}'
+}
+
+# Remote Login is ON when launchd has sshd loaded and its override is not "disabled". Pure reads.
+sshd_loaded() { launchctl print "system/$SSHD_LABEL" >/dev/null 2>&1; }
+sshd_disabled() { launchctl print-disabled system 2>/dev/null | grep -Eq "\"$SSHD_LABEL\" => (disabled|true)"; }
+
+# Remote Login on, as root. FIRST launchd itself — `launchctl enable` (the persisted override) + `bootstrap` of the
+# system's own ssh.plist — which needs no privacy grant. Only when that does not take, `systemsetup -setremotelogin
+# on`, which on current macOS refuses without Full Disk Access for the calling process ("Turning Remote Login on or
+# off requires Full Disk Access privileges"), so it is the fallback and its words are logged.
+step_remote_login() {
+  if sshd_loaded && ! sshd_disabled; then log "operator ssh: Remote Login is on ($SSHD_LABEL loaded)"; return 0; fi
+  log "operator ssh: turning Remote Login on (launchctl enable system/$SSHD_LABEL + bootstrap $SSHD_PLIST)"
+  run launchctl enable "system/$SSHD_LABEL" || log "operator ssh: 'launchctl enable system/$SSHD_LABEL' failed"
+  sshd_loaded || run launchctl bootstrap system "$SSHD_PLIST" || log "operator ssh: 'launchctl bootstrap system $SSHD_PLIST' failed"
+  [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] && return 0
+  if sshd_loaded && ! sshd_disabled; then log "operator ssh: Remote Login turned on (launchctl)"; return 0; fi
+  local out; out="$(systemsetup -f -setremotelogin on 2>&1)"
+  if sshd_loaded && ! sshd_disabled; then log "operator ssh: Remote Login turned on (systemsetup)"; return 0; fi
+  log "operator ssh: FAILED to turn Remote Login on (launchctl did not load $SSHD_LABEL; systemsetup said: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)) — retried next run"
+  return 1
+}
+
+# When Remote Login is restricted to "only these users", macOS keeps that list as the group com.apple.access_ssh:
+# the console user is added unless already a member (directly or through a nested group such as admin). No such
+# group ⇒ every local user may log in, and nothing is changed.
+step_ssh_access() {
+  local user="$1"
+  if ! dscl . -read "/Groups/$SSH_ACCESS_GROUP" >/dev/null 2>&1; then
+    log "operator ssh: Remote Login is not restricted to a group (no $SSH_ACCESS_GROUP) — $user may log in"; return 0
+  fi
+  if dseditgroup -o checkmember -m "$user" "$SSH_ACCESS_GROUP" >/dev/null 2>&1; then
+    log "operator ssh: $user is allowed through Remote Login's access group ($SSH_ACCESS_GROUP)"; return 0
+  fi
+  log "operator ssh: adding $user to $SSH_ACCESS_GROUP (Remote Login is restricted to that group)"
+  run dseditgroup -o edit -a "$user" -t user "$SSH_ACCESS_GROUP" || { log "operator ssh: FAILED to add $user to $SSH_ACCESS_GROUP"; return 1; }
+}
+
+step_operator_ssh() {
+  local user="$1" keys home dir f line core fp n=0 valid=() added=0 present=0 refused=0
+  keys="$(operator_ssh_keys)"
+  if [ -z "$keys" ]; then
+    log "operator ssh: not configured (no OperatorSshKeys in the com.memex.local profile) — Remote Login and authorized_keys left as they are"
+    return 0
+  fi
+  while IFS= read -r line; do
+    n=$((n + 1))
+    if core="$(ssh_key_core "$line")" && fp="$(ssh_key_fingerprint "$line")" && [ -n "$fp" ]; then valid+=("$line")
+    else refused=$((refused + 1)); log "operator ssh: REFUSED OperatorSshKeys entry $n — not one single-line ssh-ed25519 / ecdsa-sha2-* / ssh-rsa public key without options (its content is not logged)"
+    fi
+  done <<<"$keys"
+  [ "${#valid[@]}" -gt 0 ] || { log "operator ssh: FAILED — none of the $n declared key(s) is an accepted public key; nothing changed"; return 1; }
+  home="$(user_home "$user")"; dir="$home/.ssh"; f="$dir/authorized_keys"
+  # a symlink, or a file someone else owns, where the person's own keys belong is never followed or written
+  if [ -L "$dir" ] || [ -L "$f" ] || { [ -e "$dir" ] && [ "$(stat -f%Su "$dir" 2>/dev/null)" != "$user" ]; } || { [ -e "$f" ] && [ "$(stat -f%Su "$f" 2>/dev/null)" != "$user" ]; }; then
+    log "operator ssh: REFUSED $f — it (or ~/.ssh) is a symlink or not owned by $user; nothing written"; return 1
+  fi
+  step_remote_login || return 1
+  step_ssh_access "$user" || return 1
+  for line in "${valid[@]}"; do
+    core="$(ssh_key_core "$line")"; fp="$(ssh_key_fingerprint "$line")"
+    if [ -f "$f" ] && grep -qF -- "$core" "$f"; then present=$((present + 1)); log "operator ssh: key $fp already in $f"; continue; fi
+    log "operator ssh: adding key $fp to $f (as $user)"
+    as_user "$user" /bin/sh -c "$AUTHKEYS_APPEND_SH" sh "$home" "$line" || { log "operator ssh: FAILED to append key $fp to $f"; return 1; }
+    added=$((added + 1))
+  done
+  log "operator ssh: $user — $added key(s) added, $present already present, $refused refused"
+  [ "$refused" = 0 ]
 }
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -661,6 +784,9 @@ main() {
   check_password "$user"
   machine="$(machine_id)"
   log "run for console user $user, machine $machine"
+  # the operator's way in comes before everything that can fail: a Mac whose later steps fail is still reachable
+  local ssh_failed=0
+  step_operator_ssh "$user" || ssh_failed=1
   # the owner's answers are required BEFORE anything is installed — an unanswered one fails the run, loudly
   read_participation || { log "a step FAILED — the profile must carry the owner's answers (AcceptJobs, AcceptTokens); the next run retries"; exit 1; }
   step_homebrew "$user" || failed=1
@@ -670,6 +796,7 @@ main() {
   [ "$failed" = 0 ] && { step_tailscaled || failed=1; }
   [ "$failed" = 0 ] && { step_network "$machine" "$user" || failed=1; }
   [ "$failed" = 0 ] && { step_memex "$user" "$machine" || failed=1; }
+  [ "$ssh_failed" = 0 ] || failed=1
   [ "$failed" = 0 ] && log "done (everything this run could do)" || log "a step FAILED — the next run retries from it"
   exit "$failed"
 }
