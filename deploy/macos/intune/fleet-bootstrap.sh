@@ -955,15 +955,16 @@ run_join() {
   # the approval link and the fingerprints only — never a token-bearing setup URL
   printf '%s\n' "$out" | grep -E 'Hosting/Heartbeats/Enrol/|fingerprint|joined as|WAITING|waiting|approved|REFUSED|network:|sign-in:|certificate:|build host:' | grep -v 'token=' | while IFS= read -r l; do log "memex: $l"; done
   case "$rc" in
-    0) if [ "$mode" = pre-setup ]; then
-         STEP_STAGE="setup"; log "memex: joined as $machine before the setup — WAITING for the next run to answer the setup (the sign-in is now installed) and finish"
+    0) # the join handed the private-network key over by file: join the network now, not at the next run — and FIRST,
+       # so its own log lines never overwrite the verdict this step leaves for track() (review on #276)
+       step_network "$machine" "$user" || true
+       if [ "$mode" = pre-setup ]; then
          write_reading join ok "joined as $machine (before the setup; the setup and the finalisation follow)"
+         STEP_STAGE="setup"; log "memex: joined as $machine before the setup — WAITING for the next run to answer the setup (the sign-in is now installed) and finish"
        else
-         as_user "$user" /usr/bin/touch "$home/.memex-local/fleet.finalized" || true; log "memex: joined as $machine"
-         write_reading join ok "joined as $machine"
-       fi
-       # the join handed the private-network key over by file: join the network now, not at the next run
-       step_network "$machine" "$user" || true ;;
+         as_user "$user" /usr/bin/touch "$home/.memex-local/fleet.finalized" || true
+         write_reading join ok "joined as $machine"; log "memex: joined as $machine"
+       fi ;;
     3) local link; link="$(printf '%s\n' "$out" | grep -o 'https://[^[:space:]]*Hosting/Heartbeats/Enrol/[^[:space:]]*' | grep -v 'token=' | tail -1)"
        STEP_STAGE="join"; log "memex: WAITING for the approval on control${link:+ ($link)} — the next run polls again"
        write_reading join waiting-approval "request filed; waiting for the Approve on control${link:+: $link}" ;;

@@ -861,6 +861,7 @@ case "$OUT" in *NOTIFY*) bad "waiting for the Approve is control's to give: no n
 # 2. the pre-setup join succeeds: joined, but NOT finalised (the setup and the finalisation follow)
 rsrun SM_AWAIT=1 SM_JOIN_RC=0 SM_JOIN_OUT='joined as studio-2'
 case "$(rd join)" in "ok "*"before the setup"*) ! grep -q 'fleet.finalized' "$RS/calls" && ok "a join before the setup is recorded (join ok) and never marked finalised" || bad "pre-setup finalized" "$(cat "$RS/calls")" ;; *) bad "pre-setup join ok" "$(rd join) / $OUT" ;; esac
+case "$(rd stage)" in "waiting "*"setup: memex: joined as studio-2 before the setup — WAITING for the next run to answer the setup"*) ok "…and stage reads waiting at the setup — never 'done' while the setup and the finalisation are pending (review on #276: the network step's log must not overwrite it)" ;; *) bad "pre-setup stage" "$(rd stage)" ;; esac
 # 3. joined, the setup refused — its own words reach the reading, the stage, and the person
 printf 'x' > "$RS/home/.memex-local/fleet.yaml"
 rsrun SM_AWAIT=1 SM_SETUP_RC=1 SM_SETUP_OUT='\033[31merr\033[0m  setup --apply: the portal refused the answers — signIn: Choose at least one way to sign in'
