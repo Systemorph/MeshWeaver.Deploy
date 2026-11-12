@@ -280,6 +280,15 @@ def validate(spec, spec_dir):
         targets(w, t.get("assign"))
     for s in spec.get("settingsPolicies", []):
         w = f"settingsPolicies.{s.get('key')}"
+        cr = s.get("create")
+        if cr is not None:
+            cgroups = cr.get("groups") if isinstance(cr, dict) else None   # never `groups`: targets() reads the spec's
+            if not isinstance(cgroups, dict) or not cgroups or not all(isinstance(v, list) and v for v in cgroups.values()):
+                p.append(f"settingsPolicies.{s.get('key')}: create.groups must map each group definition id to its child setting ids")
+            else:
+                for sid in {x for v in cgroups.values() for x in v}:
+                    if sid not in (s.get("settings") or {}):
+                        p.append(f"settingsPolicies.{s.get('key')}: create.groups names {sid}, which settings does not declare")
         if not s.get("name") or not isinstance(s.get("settings"), dict):
             p.append(f"{w}: name and a settings map are required")
         targets(w, s.get("assign"))
@@ -334,6 +343,11 @@ def flatten_settings(o, out=None):
     return out
 
 
+def flatten_settings_values(o):
+    """Every simple/choice value in a tree, in order (the test reads a value's TYPE, which a flat dict compare hides)."""
+    return list(flatten_settings(o).values())
+
+
 def rewrite_settings(o, want):
     if isinstance(o, dict):
         d = o.get("settingDefinitionId")
@@ -366,6 +380,7 @@ class Reconcile:
         self.drift = self.held = self.errors = self.pending = 0
         self.gid = {}
         self.changed = []   # the delivered objects (script / profile / certificate / policy) an --apply changed
+        self.new_members = []   # (name, managed device id) of Macs this --apply added to a group
 
     # one line per finding ─────────────────────────────────────────────────────────────────────────────────
     def line(self, status, what, detail, action=""):
@@ -533,10 +548,12 @@ class Reconcile:
                 if oid in members:
                     self.line("OK", what, f"member (managed {short(md[0]['id'])}, directory {short(oid)})")
                     continue
+                def add(oid=oid, mid=md[0]["id"], name=d["name"]):
+                    self.g.post(f"v1.0/groups/{gid}/members/$ref", {"@odata.id": f"{GRAPH}/v1.0/directoryObjects/{oid}"})
+                    # a Mac that just joined the group gets its first bootstrap NOW, not at the agent's next check-in
+                    self.new_members.append((name, mid))
                 self.finding(g, what, "not a member",
-                             f"POST v1.0/groups/{short(gid)}/members/$ref directory object {short(oid)}",
-                             lambda oid=oid: self.g.post(f"v1.0/groups/{gid}/members/$ref",
-                                                         {"@odata.id": f"{GRAPH}/v1.0/directoryObjects/{oid}"}))
+                             f"POST v1.0/groups/{short(gid)}/members/$ref directory object {short(oid)}", add)
             for mid, m in members.items():
                 if mid not in declared:
                     self.line("INFO", what_g, f"member {m.get('displayName') or short(mid)} is not declared, kept")
@@ -698,10 +715,24 @@ class Reconcile:
         for s in self.spec.get("settingsPolicies", []):
             what = f"settings policy {s['key']} \"{s['name']}\""
             live = self.find("beta/deviceManagement/configurationPolicies", s, "name")
+            if live is None and s.get("create"):
+                def create(s=s):
+                    body = {"name": s["name"], "description": s.get("description", ""),
+                            "platforms": s["create"].get("platforms", "macOS"),
+                            "technologies": s["create"].get("technologies", "mdm,appleRemoteManagement"),
+                            "settings": self.build_settings(s)}
+                    s["_live"] = self.g.post("beta/deviceManagement/configurationPolicies", body)
+                self.finding(s, what, "absent", "POST beta/deviceManagement/configurationPolicies (the settings tree built "
+                             "from the declared values and each setting's own definition)", create)
+                live = s.get("_live")
+                if live is None:
+                    continue
+                self.reconcile_assignments(s, what, [], f"beta/deviceManagement/configurationPolicies/{live['id']}/assign", "assignments")
+                continue
             if live is None:
                 self.errors += 1
                 self.line("ERROR", what, "absent; a settings-catalog policy is created in the admin center (its "
-                          "settings tree is not generated here), then its id is recorded in the spec")
+                          "settings tree is not generated here — declare `create` to have it built), then its id is recorded in the spec")
                 continue
             full = self.g.get(f"beta/deviceManagement/configurationPolicies/{live['id']}?$expand=settings")
             flat = flatten_settings(full.get("settings", []))
@@ -718,6 +749,34 @@ class Reconcile:
                 self.line("OK", what, f"{short(live['id'])}, " + ", ".join(f"{k.split('_')[-1]}={v}" for k, v in s["settings"].items()))
             self.reconcile_assignments(s, what, self.g.list(f"beta/deviceManagement/configurationPolicies/{live['id']}/assignments"),
                                        f"beta/deviceManagement/configurationPolicies/{live['id']}/assign", "assignments")
+
+    def build_settings(self, s):
+        """The settings-catalog tree for a declared policy: one group-collection instance per `create.groups` entry
+        (group definition id → its child setting ids), each child built from its OWN definition read from Graph — a
+        choice setting carries the declared option id, a simple one an integer or string value as the definition says."""
+        out = []
+        for group, children in s["create"]["groups"].items():
+            kids = []
+            for sid in children:
+                d = self.g.get(f"beta/deviceManagement/configurationSettings/{urllib.parse.quote(sid)}")
+                kind = (d.get("@odata.type") or "").rsplit(".", 1)[-1]
+                v = s["settings"][sid]
+                tmpl = {"settingDefinitionId": sid}
+                if kind == "deviceManagementConfigurationChoiceSettingDefinition":
+                    kids.append({"@odata.type": "#microsoft.graph.deviceManagementConfigurationChoiceSettingInstance", **tmpl,
+                                 "choiceSettingValue": {"value": v, "children": []}})
+                elif kind == "deviceManagementConfigurationSimpleSettingDefinition":
+                    integer = "Integer" in ((d.get("valueDefinition") or {}).get("@odata.type") or "")
+                    kids.append({"@odata.type": "#microsoft.graph.deviceManagementConfigurationSimpleSettingInstance", **tmpl,
+                                 "simpleSettingValue": {"@odata.type": "#microsoft.graph.deviceManagementConfiguration"
+                                                        + ("IntegerSettingValue" if integer else "StringSettingValue"),
+                                                        "value": int(v) if integer else str(v)}})
+                else:
+                    raise GraphError(400, "GET", f"configurationSettings/{sid}", f"cannot build a {kind or 'unknown'} setting")
+            out.append({"@odata.type": "#microsoft.graph.deviceManagementConfigurationSetting",
+                        "settingInstance": {"@odata.type": "#microsoft.graph.deviceManagementConfigurationGroupSettingCollectionInstance",
+                                            "settingDefinitionId": group, "groupSettingCollectionValue": [{"children": kids}]}})
+        return out
 
     # compliance policies ─────────────────────────────────────────────────────────────────────────────────
     def compliance(self):
@@ -784,6 +843,21 @@ class Reconcile:
         return {m["id"]: (m.get("displayName") or short(m["id"]), m.get("deviceId"))
                 for m in self.g.list(f"v1.0/groups/{gid}/members?$select=id,displayName,deviceId")}
 
+    def sync_new_members(self):
+        """Every Mac this apply ADDED to a group is asked to sync at once (its first bootstrap, its profiles) — unless the
+        changed-object sync above already asked it."""
+        done = {w for w in getattr(self, "_synced", set())}
+        for name, mid in self.new_members:
+            if mid in done:
+                continue
+            try:
+                self.g.post(f"v1.0/deviceManagement/managedDevices/{mid}/syncDevice", None)
+                self.line("SYNCED", f"device sync {name}", f"managed {short(mid)} asked to sync (newly added to a group)")
+                done.add(mid)
+            except GraphError as e:
+                self.errors += 1
+                self.line("ERROR", f"device sync {name}", f"syncDevice failed: {e}")
+
     def sync_devices(self, objs, why):
         """Ask Intune to sync every Mac the objects reach: include groups' members minus that object's exclude
         groups' members. One line per Mac; a failure is an ERROR naming the Mac, never a silent skip."""
@@ -818,6 +892,7 @@ class Reconcile:
             try:
                 self.g.post(f"v1.0/deviceManagement/managedDevices/{md[0]['id']}/syncDevice", None)
                 self.line("SYNCED", what, f"managed {short(md[0]['id'])} asked to sync ({why})")
+                self._synced = getattr(self, "_synced", set()) | {md[0]["id"]}
             except GraphError as e:
                 self.errors += 1
                 hint = " (needs DeviceManagementManagedDevices.PrivilegedOperations.All)" if e.status in (401, 403) else ""
@@ -843,6 +918,8 @@ class Reconcile:
                                    for x in self.spec.get(k, []) if not x.get("hold")], "--sync")
             elif self.apply and self.changed:
                 self.sync_devices(self.changed, "changed by this apply: " + ", ".join(o.get("key", "?") for o in self.changed))
+            if self.apply and not self.sync_only:
+                self.sync_new_members()
         except GraphError as e:
             self.errors += 1
             self.line("ERROR", "device sync", str(e))
@@ -879,6 +956,7 @@ class FakeGraph:
                             ("beta/deviceManagement/deviceShellScripts", "scripts"),
                             ("beta/deviceManagement/deviceConfigurations", "configs"),
                             ("beta/deviceManagement/configurationPolicies", "policies"),
+                            ("beta/deviceManagement/configurationSettings", "settingDefs"),
                             ("beta/deviceManagement/deviceCompliancePolicies", "compliance")):
             if p == prefix or p.startswith(prefix + "/"):
                 return key, p[len(prefix):].strip("/").split("/") if p != prefix else []
@@ -1201,6 +1279,49 @@ def self_test():
     r = Reconcile(spec, ".", FakeGraph(tenant()), token="x." + base64.urlsafe_b64encode(b'{"idtyp":"app","roles":[]}').decode().rstrip("=") + ".y", out=lines.append)
     r.app_identity()
     expect("the apply identity without a declared permission is drift", r.drift == 1 and any("Device.Read.All" in ln for ln in lines), lines)
+
+    # 2c: a Mac this apply ADDS to a group is asked to sync at once, even when nothing it receives changed
+    st5 = tenant()
+    for k in ("scripts", "configs"):
+        st5[k] = copy.deepcopy(st[k])
+    st5["groups"][G1]["_members"] = []
+    st5["policies"] = copy.deepcopy(st["policies"])
+    rc, lines, g = run(st5, True, {**spec, "compliancePolicies": []})
+    syn = [ln for ln in lines if ln.startswith("SYNCED")]
+    expect("device sync: a Mac newly ADDED to a group is asked to sync at once (its first bootstrap), once",
+           "d1" in st5["groups"][G1]["_members"] and len(syn) == 1 and "newly added" in syn[0]
+           and sum(1 for w in g.writes if w[1].endswith("/syncDevice")) == 1, lines)
+    # 2d: a settings-catalog policy declared with `create` is BUILT from its settings' own definitions and posted
+    fv = copy.deepcopy(spec)
+    fv["settingsPolicies"].append({"key": "fileVault", "name": "Fleet — FileVault", "description": "d",
+        "settings": {"com.apple.mcx.filevault2_enable": "com.apple.mcx.filevault2_enable_0",
+                     "com.apple.mcx.filevault2_deferforceatuserloginmaxbypassattempts": "0",
+                     "com.apple.security.fderecoverykeyescrow_location": "Intune"},
+        "create": {"platforms": "macOS", "technologies": "mdm,appleRemoteManagement",
+                   "groups": {"com.apple.mcx.filevault2_com.apple.mcx.filevault2": ["com.apple.mcx.filevault2_enable",
+                                                                                    "com.apple.mcx.filevault2_deferforceatuserloginmaxbypassattempts"],
+                              "com.apple.security.fderecoverykeyescrow_com.apple.security.fderecoverykeyescrow": ["com.apple.security.fderecoverykeyescrow_location"]}},
+        "assign": {"include": ["studios"]}})
+    expect("validate: a declared create shape passes", not validate(fv, "."), validate(fv, "."))
+    st6 = copy.deepcopy(st5)
+    st6["settingDefs"] = {
+        "com.apple.mcx.filevault2_enable": {"@odata.type": "#microsoft.graph.deviceManagementConfigurationChoiceSettingDefinition"},
+        "com.apple.mcx.filevault2_deferforceatuserloginmaxbypassattempts": {"@odata.type": "#microsoft.graph.deviceManagementConfigurationSimpleSettingDefinition",
+            "valueDefinition": {"@odata.type": "#microsoft.graph.deviceManagementConfigurationIntegerSettingValueDefinition"}},
+        "com.apple.security.fderecoverykeyescrow_location": {"@odata.type": "#microsoft.graph.deviceManagementConfigurationSimpleSettingDefinition",
+            "valueDefinition": {"@odata.type": "#microsoft.graph.deviceManagementConfigurationStringSettingValueDefinition"}}}
+    rc, lines, g = run(st6, True, {**fv, "compliancePolicies": []})
+    made = [x for x in st6["policies"].values() if x.get("name") == "Fleet — FileVault"]
+    flat = flatten_settings(made[0].get("settings", [])) if made else {}
+    vals = [x for x in flatten_settings_values(made[0]["settings"])] if made else []
+    expect("create: an absent declared policy is POSTed with the tree built from each setting's definition (choice id, "
+           "integer, string), assigned, and its Macs synced",
+           len(made) == 1 and flat == fv["settingsPolicies"][-1]["settings"] | {"com.apple.mcx.filevault2_deferforceatuserloginmaxbypassattempts": 0}
+           and 0 in vals and made[0].get("_assign") and any(ln.startswith("SYNCED") for ln in lines), lines + [repr(made)])
+    bad_fv = copy.deepcopy(fv)
+    bad_fv["settingsPolicies"][-1]["create"]["groups"]["x"] = ["undeclared.setting"]
+    expect("validate: create.groups naming a setting the policy does not declare is refused",
+           any("does not declare" in x for x in validate(bad_fv, ".")), validate(bad_fv, "."))
 
     print(f"self-test: {'FAILED ' + str(len(fails)) if fails else 'passed'}")
     return 1 if fails else 0

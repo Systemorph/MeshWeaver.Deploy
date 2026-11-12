@@ -134,6 +134,19 @@ reads INFO (a different application), and the apply identity's grants are verifi
 | `settingsPolicies[]` | settings-catalog policy (the DDM night-window software-update policy) | `settings` maps `settingDefinitionId` → value; `--apply` rewrites those values in the LIVE tree and PUTs it back (the tree itself is created in the admin center, then its id is recorded). Each Apple release bumps `enforcement_targetosversion` + `enforcement_targetlocaldatetime` here |
 | `compliancePolicies[]` | `deviceCompliancePolicy` | existing policies by id (assignments, declared `properties`), new ones created from `properties` |
 
+**A Mac newly added to a group is synced at once.** When an `--apply` adds a declared Mac to a group, it asks that Mac
+to sync right after (one `SYNCED … newly added to a group` line): its first bootstrap and its profiles come at the next
+check-in, not at the agent's own cadence.
+
+**A settings-catalog policy can be CREATED from the spec** (`settingsPolicies[].create`): `groups` maps each group
+collection definition id to its child setting ids, and the reconcile builds the tree from each setting's OWN definition
+(`GET beta/deviceManagement/configurationSettings/{id}`: a choice setting carries the declared option id, a simple one an
+integer or a string as its value definition says), POSTs it with `platforms` / `technologies`, assigns it, and records
+nothing by hand. The example spec declares the fleet's **FileVault** policy this way: FileVault on, deferred to the next
+sign-in with no bypass, the personal recovery key escrowed to Intune (`com.apple.security.fderecoverykeyescrow_location`)
+and rotated every 12 months. A Mac whose FileVault a person already turned on keeps its key until it rotates (or the
+person stores it through Company Portal); a new Mac is encrypted at its first sign-in after the policy lands.
+
 **Device sync after an apply.** The Intune agent re-runs its CACHED copy of a script until its next FULL sync —
 every 28800 s (8 h): measured on the first Mac mini (2026-11-12), the hourly run after an `--apply` logged
 *"Cached script policy result matches"* and ran the old bootstrap. So an `--apply` that CHANGED a script, profile,

@@ -162,6 +162,44 @@
           "studios"
         ]
       }
+    },
+    {
+      "key": "fileVault",
+      "name": "Fleet — FileVault, recovery key escrowed to Intune (Mac Studios)",
+      "description": "FileVault on (deferred to the console user's next sign-in, no bypass), the personal recovery key escrowed to Intune and rotated every 12 months, never shown on screen. Created by the reconcile from this declaration (create).",
+      "settings": {
+        "com.apple.mcx.filevault2_enable": "com.apple.mcx.filevault2_enable_0",
+        "com.apple.mcx.filevault2_defer": "com.apple.mcx.filevault2_defer_true",
+        "com.apple.mcx.filevault2_deferforceatuserloginmaxbypassattempts": "0",
+        "com.apple.mcx.filevault2_deferdontaskatuserlogout": "com.apple.mcx.filevault2_deferdontaskatuserlogout_false",
+        "com.apple.mcx.filevault2_userecoverykey": "com.apple.mcx.filevault2_userecoverykey_true",
+        "com.apple.mcx.filevault2_showrecoverykey": "com.apple.mcx.filevault2_showrecoverykey_false",
+        "com.apple.mcx.filevault2_recoverykeyrotationinmonths": "com.apple.mcx.filevault2_recoverykeyrotationinmonths_12",
+        "com.apple.security.fderecoverykeyescrow_location": "Intune (the organisation's device management)"
+      },
+      "create": {
+        "platforms": "macOS",
+        "technologies": "mdm,appleRemoteManagement",
+        "groups": {
+          "com.apple.mcx.filevault2_com.apple.mcx.filevault2": [
+            "com.apple.mcx.filevault2_enable",
+            "com.apple.mcx.filevault2_defer",
+            "com.apple.mcx.filevault2_deferforceatuserloginmaxbypassattempts",
+            "com.apple.mcx.filevault2_deferdontaskatuserlogout",
+            "com.apple.mcx.filevault2_userecoverykey",
+            "com.apple.mcx.filevault2_showrecoverykey",
+            "com.apple.mcx.filevault2_recoverykeyrotationinmonths"
+          ],
+          "com.apple.security.fderecoverykeyescrow_com.apple.security.fderecoverykeyescrow": [
+            "com.apple.security.fderecoverykeyescrow_location"
+          ]
+        }
+      },
+      "assign": {
+        "include": [
+          "studios"
+        ]
+      }
     }
   ],
   "compliancePolicies": [
