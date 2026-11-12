@@ -889,6 +889,44 @@ FB_EVAL='STUCK_NAME=""; WAIT_NAME=""; finish_stage jroe' fb FLEET_STATE_DIR="$RS
 case "$(rd stage)" in "done "*) ok "a run with nothing stuck writes stage = done" ;; *) bad "stage done" "$(rd stage)" ;; esac
 rm -rf "$RS"
 
+echo "── energy enabler: a sleeping Mac cannot receive the Energy Saver profile — only 'pmset -c sleep 0' until it arrives (1.8.0) ──"
+EN="$(mktemp -d)"; mkdir -p "$EN/bin"
+cat > "$EN/pmset.sleep1" <<'TXT'
+Battery Power:
+ sleep                1
+AC Power:
+ displaysleep         10
+ womp                 1
+ sleep                1
+ autorestart          0
+ disksleep            10
+TXT
+sed 's/^ sleep                1$/ sleep                0/' "$EN/pmset.sleep1" > "$EN/pmset.sleep0"
+cat > "$EN/bin/pmset" <<STUB
+#!/bin/bash
+case "\$1" in -g) cat "\$EN_CUSTOM" ;; *) echo "pmset \$*" >> "$EN/calls"; exit "\${EN_PMSET_RC:-0}" ;; esac
+STUB
+chmod +x "$EN/bin/pmset"
+[ "$(env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; ac_sleep_minutes "$(cat "$1")"' "$FB" "$EN/pmset.sleep1")" = 1 ] && ok "the AC-power system sleep is read from 'pmset -g custom' (not the battery section)" || bad "ac sleep parse" ""
+ens() { rm -f "$EN/calls"; env FLEET_BOOTSTRAP_LIB=1 PATH="$EN/bin:$PATH" FLEET_STATE_DIR="$EN/st" FLEET_LOG_DIR="$EN/log" FLEET_MCX_PREFS="$EN/mcx.plist" "$@" \
+  bash -c '. "$0"; step_energy_enabler; echo "RC=$?"' "$FB" 2>&1; }
+OUT="$(ens EN_CUSTOM="$EN/pmset.sleep1")"
+case "$OUT" in *"not installed and AC system sleep is 1"*"RC=0"*) [ "$(cat "$EN/calls")" = "pmset -c sleep 0" ] && grep -q '^enabler .*AC system sleep 1 → 0' "$EN/st/energy" \
+  && ok "no profile, AC sleep 1: ONLY 'pmset -c sleep 0' (nothing else), said, reading energy = enabler" || bad "enabler calls/reading" "$(cat "$EN/calls") / $(cat "$EN/st/energy")" ;; *) bad "enabler" "$OUT" ;; esac
+OUT="$(ens EN_CUSTOM="$EN/pmset.sleep0")"
+case "$OUT" in *"WAITING for the Energy Saver profile"*"RC=0"*) [ ! -e "$EN/calls" ] && ok "no profile, AC sleep already 0: nothing set, WAITING" || bad "sleep0 set something" "$(cat "$EN/calls")" ;; *) bad "sleep0" "$OUT" ;; esac
+# a BINARY plist, as Managed Preferences holds it
+python3 -c 'import plistlib,sys; plistlib.dump({"com.apple.EnergySaver.desktop.ACPower": {"System Sleep Timer": 0}}, open(sys.argv[1], "wb"), fmt=plistlib.FMT_BINARY)' "$EN/mcx.plist"
+OUT="$(ens EN_CUSTOM="$EN/pmset.sleep1")"
+case "$OUT" in *"Energy Saver profile is installed"*"RC=0"*) [ ! -e "$EN/calls" ] && grep -q '^ok ' "$EN/st/energy" && ok "the profile installed: it decides — the bootstrap sets NOTHING, even with AC sleep 1" || bad "profile present touched pmset" "$(cat "$EN/calls" 2>/dev/null)" ;; *) bad "profile present" "$OUT" ;; esac
+rm -f "$EN/mcx.plist"
+OUT="$(ens EN_CUSTOM="$EN/pmset.sleep1" FLEET_BOOTSTRAP_DRY_RUN=1)"
+case "$OUT" in *"DRY-RUN: pmset -c sleep 0"*"RC=0"*) [ ! -e "$EN/calls" ] && ok "a dry run prints 'pmset -c sleep 0' and changes nothing" || bad "dry run pmset" "$(cat "$EN/calls")" ;; *) bad "dry run enabler" "$OUT" ;; esac
+OUT="$(ens EN_CUSTOM="$EN/pmset.sleep1" EN_PMSET_RC=1)"
+case "$OUT" in *"FAILED to set 'pmset -c sleep 0'"*"RC=1"*) grep -q '^failed ' "$EN/st/energy" && ok "a failed pmset is FAILED in the log and the reading" || bad "pmset failed reading" "$(cat "$EN/st/energy")" ;; *) bad "pmset failed" "$OUT" ;; esac
+awk '/^main\(\) \{/{on=1} on' "$FB" | grep -n 'step_energy_enabler\|read_participation' | head -1 | grep -q step_energy_enabler && ok "main runs the energy enabler before the participation answers (a Mac failing later still receives profiles)" || bad "enabler order" ""
+rm -rf "$EN"
+
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

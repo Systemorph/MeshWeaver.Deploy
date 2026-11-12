@@ -25,6 +25,8 @@
 #      only when absent; nothing else in the file is touched; sshd_config never). Not configured: nothing changes.
 #   0b. Bootstrap token: when it is not escrowed to the MDM, the log, a reading and a notification to the person say so
 #      (sign out and back in first; a later run names `sudo profiles install -type bootstraptoken`). Never a password.
+#   0c. Energy enabler (1.8.0): until the Intune Energy Saver profile is installed, only `pmset -c sleep 0`, so the
+#      Mac is awake to receive it (a sleeping Mac answers MDM commands NotNow during DarkWake).
 #   Readings the person can read without root: /Library/MeshWeaver/fleet-state/ — one file per step (operator-ssh,
 #      bootstrap-token, participation, homebrew, devtools, tools, tailscale, tailscaled, network, up, setup, join, doctor,
 #      heartbeat, buildhost) and `stage`: the step the onboarding is stuck on, since when and why (1.7.0). A join that
@@ -56,7 +58,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.7.0"
+readonly FLEET_BOOTSTRAP_VERSION="1.8.0"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -79,6 +81,8 @@ readonly SYSTEM_KEYCHAIN="${FLEET_SYSTEM_KEYCHAIN:-/Library/Keychains/System.key
 # READINGS the console user (and `memex-local fleet doctor`) may read without root — the run log is root-only. One
 # root-owned 0644 file per reading, one line: "<verdict> <UTC time> <detail>". Nothing secret is ever written here.
 readonly STATE_DIR="${FLEET_STATE_DIR:-/Library/MeshWeaver/fleet-state}"
+# Where the Energy Saver profile (com.apple.MCX, pushed by Intune) lands once installed.
+readonly MCX_PREFS="${FLEET_MCX_PREFS:-/Library/Managed Preferences/com.apple.MCX.plist}"
 
 log() {
   local line; line="$(date -u +%Y-%m-%dT%H:%M:%SZ) fleet-bootstrap ${FLEET_BOOTSTRAP_VERSION}: $*"
@@ -373,6 +377,39 @@ notify_user() {
   run launchctl asuser "$uid" sudo -u "$user" /usr/bin/osascript -e 'on run argv' \
     -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' "$title" "$msg" 2>/dev/null \
     || log "notify: could not post the notification to $user (the log line above says the same)"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# ENERGY ENABLER (1.8.0). The fleet's energy policy (never sleep, restart after a power loss) is an Intune PROFILE —
+# but a Mac on macOS's default `sleep 1` cannot RECEIVE it: measured on the first Mac mini and the second Mac Studio
+# (2026-11-12), every device command Intune sent arrived during PowerNap and mdmclient answered
+# "NotNow … reason: Not supported during DarkWake", so the profile never installed. The one case where MDM genuinely
+# cannot deliver: until the profile is installed, the bootstrap sets ONLY `pmset -c sleep 0` (system sleep on AC power,
+# nothing else), so the Mac is awake when the profile arrives. Once the profile is in Managed Preferences it is the
+# source of truth and the bootstrap touches nothing.
+# The AC-power system-sleep minutes from `pmset -g custom` (text as $1), or nothing. Pure.
+ac_sleep_minutes() {
+  printf '%s\n' "$1" | awk '/^AC Power:/ { ac = 1; next } /^[A-Za-z].*:$/ { ac = 0 } ac && $1 == "sleep" { print $2; exit }'
+}
+
+step_energy_enabler() {
+  local custom ac
+  # the key's dots are part of its NAME (plutil -extract would read them as a key path): searched in the XML form
+  if [ -f "$MCX_PREFS" ] && plutil -convert xml1 -o - "$MCX_PREFS" 2>/dev/null | grep -qF '<key>com.apple.EnergySaver.desktop.ACPower</key>'; then
+    log "energy: the Energy Saver profile is installed (Intune) — it decides; nothing set here"
+    write_reading energy ok "the Energy Saver profile is installed"; return 0
+  fi
+  custom="$(pmset -g custom 2>/dev/null)"; ac="$(ac_sleep_minutes "$custom")"
+  if [ "$ac" = 0 ]; then
+    log "energy: WAITING for the Energy Saver profile (Intune) — system sleep on AC is already off, so the Mac can receive it"
+    write_reading energy waiting "profile not installed yet; AC system sleep already 0"; return 0
+  fi
+  log "energy: the Energy Saver profile is not installed and AC system sleep is ${ac:-unreadable} — a sleeping Mac answers every MDM command NotNow (DarkWake), so setting ONLY 'pmset -c sleep 0' until the profile arrives"
+  if ! run pmset -c sleep 0; then
+    log "energy: FAILED to set 'pmset -c sleep 0' — the profile may never reach a sleeping Mac (retried next run)"
+    write_reading energy failed "pmset -c sleep 0 failed (AC sleep ${ac:-unreadable})"; return 1
+  fi
+  write_reading energy enabler "AC system sleep ${ac:-unreadable} → 0 until the Energy Saver profile arrives"
 }
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -988,6 +1025,8 @@ main() {
   else ssh_failed=1; write_reading operator-ssh failed "$user"; fi
   # never fails the run: it says, every run, what only a person can do (escrow takes their password)
   step_bootstrap_token "$user"
+  # before anything that can fail or wait: a sleeping Mac receives no profile at all
+  step_energy_enabler || ssh_failed=1
   # the owner's answers are required BEFORE anything is installed — an unanswered one fails the run, loudly
   if ! track participation read_participation; then
     log "a step FAILED — the profile must carry the owner's answers (AcceptJobs, AcceptTokens); the next run retries"
