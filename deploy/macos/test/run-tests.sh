@@ -1075,6 +1075,8 @@ grep -A3 '^    0) # collected by an ordinary run' "$FB" | grep -q 'remove_join_p
   && ok "an hourly run that collects the Approve removes the poller right then (no second continuation on its next tick)" || bad "immediate removal" ""
 rm -rf "$JP"
 
+grep -q 'write_reading version "$FLEET_BOOTSTRAP_VERSION"' "$FB" && awk '/^main\(\) \{/{on=1} on' "$FB" | grep -n 'write_reading version\|step_operator_ssh\|acquire_run_lock 900' | head -2 | tail -1 | grep -q 'write_reading version' \
+  && ok "every run that gets past the run lock names its own bootstrap version in the reading 'version' (the agent may run a cached copy)" || bad "version reading" ""
 echo "── the fleet loader: the bootstrap's pin travels in the PROFILE (minutes), not in the Intune script (8 h) — 2026-11-12 ──"
 FL="$MACOS/intune/fleet-loader.sh"
 bash -n "$FL" && ok "fleet-loader.sh parses" || bad "loader parses" ""
