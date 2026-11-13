@@ -861,7 +861,14 @@ jobs:
           # `latest3` and the compatibility `latest` for a 3.x set — ONE signed event per channel, each moving only its
           # own key on the record (so nothing is applied twice). A channel of another major is never named
           # (build-host-announcement.py refuses to sign one, and the receiver refuses it again).
-          channels=$(python3 deploy/.github/scripts/build-host-announcement.py channels --declaration deploy/.github/build-hosts.json --version "$V_SET" | sed -n 's/^channels=//p')
+          # The script's OWN exit status decides: a malformed declaration or a version that is not a set
+          # name is a RED step, never mistaken for "no channel of the line" below.
+          if ! out=$(python3 deploy/.github/scripts/build-host-announcement.py channels --declaration deploy/.github/build-hosts.json --version "$V_SET"); then
+            echo "::error::build-host-announcement.py channels failed for $V_SET — the hand-over's channels could not be computed"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+          channels=$(printf '%s\n' "$out" | sed -n 's/^channels=//p')
           if [ -z "$channels" ]; then
             echo "::warning::.github/build-hosts.json declares no channel of the line of $V_SET — nothing is handed over"
             echo "- build-host: $V_SET is of a line no declared channel follows — not handed over" >> "$GITHUB_STEP_SUMMARY"
