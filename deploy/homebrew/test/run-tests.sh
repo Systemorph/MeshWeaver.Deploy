@@ -2988,7 +2988,14 @@ print(m.sign("a\nb", "k"))' "$IDLE")"
   [ "$(sed -n 1p <<<"$S")" = "'studio-9\\n1763028000\\nPOST /demand\\n\\n\\n{\"host\":\"studio-9\",\"models\":[\"gpt-oss:120b\"]}'" ] \
     && [ "$(sed -n 2p <<<"$S")" = "sha256=$(printf 'a\nb' | openssl dgst -sha256 -hmac k | awk '{ print $NF }')" ] \
     && ok "the signed text has the two empty lines (residency, user) and the signature is sha256=hex(HMAC-SHA256) (checked against openssl)" || bad "signed text" "$S"
-  grep -qF "$KEY" "$G/ml/buildhost-idle.log" "$G/ml/backlease/buildhost.json" "$G/ml/buildhost-idle.memory.json" <<<"$OUT" 2>/dev/null && bad "the key leaked" "" || ok "the key appears in no log, state or output"
+  # every file must exist (a missing operand is no pass), and the governor's own output is searched too (review on #293)
+  # grep's exit is read whole: 1 = no match is the only pass, 0 = a leak, 2 = an error (an unreadable operand) is no pass
+  KL=("$G/ml/buildhost-idle.log" "$G/ml/backlease/buildhost.json" "$G/ml/buildhost-idle.memory.json")
+  grep -qF "$KEY" "${KL[@]}"; KRC=$?
+  grep -qF "$KEY" <<<"$OUT"; KRO=$?
+  if [ "$KRC" = 1 ] && [ "$KRO" = 1 ]; then ok "the key appears in no log, state, memory file or governor output"
+  elif [ "$KRC" = 0 ] || [ "$KRO" = 0 ]; then bad "the key leaked" ""
+  else bad "key-leak check: grep could not read every file (exit $KRC)" "${KL[*]}"; fi
   python3 -c 'import json,re,sys; d = json.load(open(sys.argv[1])); assert set(d) == {"state","since","reason"} and re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", d["since"])' "$G/ml/backlease/buildhost.json" \
     && [ -z "$(find "$G/ml/backlease" -name '.*tmp' -print)" ] && grep -q 'os.replace(tmp, path)' "$IDLE" && grep -q 'os.path.dirname(path)' "$IDLE" \
     && ok "the state file is {state, since (ISO-8601 UTC), reason}, written as a temp file in the same directory and renamed — no temp left behind" || bad "atomic state file" "$(cat "$G/ml/backlease/buildhost.json")"
