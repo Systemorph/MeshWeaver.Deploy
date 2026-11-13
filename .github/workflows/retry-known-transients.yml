@@ -25,7 +25,7 @@ permissions:
 
 jobs:
   retry:
-    uses: Systemorph/MeshWeaver/.github/workflows/node-repo-retry-transients.yml@main
+    uses: Systemorph/MeshWeaver/.github/workflows/node-repo-retry-transients.yml@main3
     permissions:
       actions: write     # list the run's jobs, read their logs, POST the one rerun
       checks: read       # check-runs/<job>/annotations — the ONLY record of a runner death
@@ -33,4 +33,4 @@ jobs:
     with:
       # Scripts-only lane: it fetches its decision script at `scripts-ref`, and `main` keeps that
       # script one vintage with the `@main` lane that fetches it (scripts/check-shared-lanes.py).
-      scripts-ref: main
+      scripts-ref: main3
