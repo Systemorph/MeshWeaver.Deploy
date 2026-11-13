@@ -2508,6 +2508,15 @@ OUT="$(bh FAKE_NR_GROWS=1 FAKE_COLIMA_LIST='{"name":"build","status":"Running","
 OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400,"disk":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize 2>&1)"
 grep -q "k3s is healthy: API ready, k3s NRestarts 0 (stable)" <<<"$OUT" && grep -q 'upgrade build-host-mac' "$BH/log" \
   && ok "a resize whose k3s comes back and stays up (API ready, NRestarts stable) goes on to size the runners" || bad "resize healthy" "$OUT"
+# a build VM the idle governor stopped for an idle-only model is NOT started by apply (review on #293: executed, not grepped)
+mkdir -p "$BH/.memex-local/backlease"; printf '{"state":"stopped","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$BH/.memex-local/backlease/buildhost.json"
+: > "$BH/log"
+OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Stopped","cpus":16,"memory":111669149696,"disk":322122547200}' "$CLI" buildhost apply 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ! grep -q '^colima start' "$BH/log" && grep -q "starts it the moment CI asks" <<<"$OUT" \
+  && ok "buildhost apply never starts a build VM the governor stopped for an idle-only model (and says so)" || bad "apply respects idle state" "rc=$RC $OUT / $(grep colima "$BH/log")"
+printf '{"state":"running","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$BH/.memex-local/backlease/buildhost.json"; : > "$BH/log"
+bh FAKE_COLIMA_LIST='{"name":"build","status":"Stopped","cpus":16,"memory":111669149696,"disk":322122547200}' "$CLI" buildhost apply >/dev/null 2>&1
+grep -q '^colima start -p build' "$BH/log" && ok "…while a state of 'running' (the VM merely stopped) is started as before" || bad "apply starts when running" "$(grep colima "$BH/log")"
 rm -rf "$BH"
 
 echo "── buildhost priority: fleet jobs at the lowest priority, every idle core otherwise ──"
@@ -2859,6 +2868,211 @@ printf '3.1.12855' > "$VR/bh"
 vw | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["versions"]=={"memex-local":"0.3.440","build-host":"3.1.12855"}' 2>/dev/null \
   && ok "the written readings.json carries the versions object" || bad "versions in readings.json" "$(vw)"
 rm -rf "$VR"
+
+echo "── idle-only models: CI first, a large model only while the build VM is stopped for it (Hosting/BackLease §15.9) ──"
+IO="$(mktemp -d)"; mkdir -p "$IO/home" "$IO/stubs"
+printf '#!/bin/bash\necho "launchctl $*" >> "%s/launchctl.log"\nexit 0\n' "$IO" > "$IO/stubs/launchctl"; chmod +x "$IO/stubs/launchctl"
+io() { env PATH="$IO/stubs:$STUBS:$PATH" HOME="$IO/home" MEMEX_LOCAL_HOME="$IO/home/.memex-local" COLIMA_HOME="$IO/home/.colima" "$@"; }
+IOF="$IO/home/.memex-local/backlease.yaml"; ioh() { grep -qF "$1" "$IOF" 2>/dev/null; }
+io "$CLI" registry https://memex.example.test --id ci-io >/dev/null 2>&1
+io "$CLI" backlease enroll --control https://control.example.test --deployment studio-9 --accept-tokens='*.meshweaver.cloud' --token-models qwen3.8:27b-mlx --residency CH </dev/null >/dev/null 2>&1
+OUT="$(io "$CLI" backlease accept tokens --idle-only-models gpt-oss:120b </dev/null 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ioh 'Hosting__BackLease__Accept__Tokens__IdleOnlyModels__0: "gpt-oss:120b"' && ioh 'Hosting__BackLease__Accept__Tokens__Models__0: "qwen3.8:27b-mlx"' \
+  && ioh 'Hosting__BackLease__Accept__Tokens__Models__1: "gpt-oss:120b"' \
+  && ok "accept tokens --idle-only-models declares the model idle-only AND served (the claim names it), the other models kept" || bad "idle-only declaration" "rc=$RC $OUT $(grep Tokens "$IOF")"
+case "$OUT" in *"idle-only models: gpt-oss:120b — served only while the build VM is stopped"*) ok "the opt-in summary names the idle-only models and the rule" ;; *) bad "idle-only summary" "$OUT" ;; esac
+case "$OUT" in *"no build VM (Colima profile build)"*) [ ! -e "$IO/home/Library/LaunchAgents/com.memex.local.buildhost-idle.plist" ] \
+  && ok "with no build profile nothing yields: no idle governor is installed, and that is said" || bad "no profile, no agent" "$OUT" ;; *) bad "no build profile said" "$OUT" ;; esac
+mkdir -p "$IO/home/.colima/build"
+OUT="$(io "$CLI" backlease accept tokens --idle-only-models gpt-oss:120b </dev/null 2>&1)"
+PL="$IO/home/Library/LaunchAgents/com.memex.local.buildhost-idle.plist"
+grep -q '<string>buildhost</string>' "$PL" 2>/dev/null && grep -q '<string>idle</string>' "$PL" && grep -q '<string>run</string>' "$PL" \
+  && grep -q "<string>$IO/home/.memex-local</string>" "$PL" && grep -q 'launchctl bootstrap gui/[0-9]* .*com.memex.local.buildhost-idle.plist' "$IO/launchctl.log" \
+  && ok "with a build profile the launchd agent com.memex.local.buildhost-idle is written and loaded (memex-local buildhost idle run)" || bad "idle agent install" "$OUT / $(cat "$PL" 2>/dev/null)"
+command -v plutil >/dev/null 2>&1 && { plutil -lint "$PL" >/dev/null 2>&1 && ok "the idle agent's plist is valid" || bad "idle plist lint" "$(plutil -lint "$PL" 2>&1)"; }
+io "$CLI" backlease accept tokens --models qwen3.8:27b-mlx </dev/null >/dev/null 2>&1
+ioh 'Tokens__Models__1: "gpt-oss:120b"' && ioh 'IdleOnlyModels__0: "gpt-oss:120b"' && ok "narrowing --models keeps a declared idle-only model served" || bad "models keep idle-only" "$(grep Tokens "$IOF")"
+OUT="$(io "$CLI" backlease status </dev/null 2>&1)"
+case "$OUT" in *"idle-only models: gpt-oss:120b"*"no build-host state yet"*) ok "backlease status shows the idle-only models and the build host's state" ;; *) bad "status idle line" "$OUT" ;; esac
+OUT="$(io "$CLI" backlease accept tokens --idle-only-models 'bad name!' </dev/null 2>&1)" && bad "a bad idle-only model accepted" "$OUT" || ok "an idle-only model that is not a model name is refused"
+# withdrawn while the VM is stopped for it: the agent stays to give the VM back first; withdrawn while running: removed
+mkdir -p "$IO/home/.memex-local/backlease"; printf '{"state":"stopped","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$IO/home/.memex-local/backlease/buildhost.json"
+OUT="$(io "$CLI" backlease accept tokens --idle-only-models none </dev/null 2>&1)"
+! ioh 'IdleOnlyModels__0' && [ -e "$PL" ] && grep -q "gives it back to CI first" <<<"$OUT" \
+  && ok "--idle-only-models none while the VM is stopped for a model: declaration gone, governor kept to drain and restart the VM" || bad "withdraw while stopped" "$OUT"
+OUT="$(io "$CLI" buildhost idle off </dev/null 2>&1)" && bad "idle off while stopped accepted" "$OUT" || ok "buildhost idle off refuses while the VM is stopped for an idle-only model"
+printf '{"state":"running","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$IO/home/.memex-local/backlease/buildhost.json"
+io "$CLI" backlease accept tokens --idle-only-models none </dev/null >/dev/null 2>&1
+[ ! -e "$PL" ] && [ ! -e "$IO/home/.memex-local/backlease/buildhost.json" ] && ok "--idle-only-models none with the VM back: governor removed, no state file (the worker serves none)" || bad "withdraw while running" "$(ls "$IO/home/.memex-local/backlease")"
+io "$CLI" backlease enroll --control https://control.example.test --deployment studio-9 --accept-tokens='*.meshweaver.cloud' --token-models qwen3.8:27b-mlx \
+  --token-idle-only-models gpt-oss:120b --residency CH </dev/null >/dev/null 2>&1
+ioh 'IdleOnlyModels__0: "gpt-oss:120b"' && ioh 'Tokens__Models__1: "gpt-oss:120b"' && [ -e "$PL" ] \
+  && ok "backlease enroll --token-idle-only-models declares it and loads the governor (the same path as accept)" || bad "enroll idle flag" "$(grep Tokens "$IOF")"
+printf '{"state":"stopped","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$IO/home/.memex-local/backlease/buildhost.json"
+OUT="$(io "$CLI" backlease off </dev/null 2>&1)"
+[ ! -e "$IOF" ] && [ -e "$PL" ] && [ -e "$IO/home/.memex-local/backlease/buildhost.json" ] && grep -q "gives it back to CI first" <<<"$OUT" \
+  && ok "backlease off while the VM is stopped for a model: the layer goes, the governor stays to restart the VM (it drains with nothing declared)" || bad "off while stopped" "$OUT"
+
+# ── the governor itself: share/buildhost-idle.py against a stub control + Ollama, a stub colima and kubectl ──
+IDLE="$HERE/../share/buildhost-idle.py"
+python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read(), feature_version=(3, 9))" "$IDLE" && ok "buildhost-idle.py parses at the Python 3.9 grammar (macOS's python3)" || bad "idle py grammar" ""
+G="$IO/gov"; mkdir -p "$G/ml/backlease" "$G/colima/build" "$G/bin"
+KEY="test-key-not-a-secret-0123"
+printf 'secrets:\n  memex_portal:\n    Hosting__ModuleReportSecret: "%s"\n' "$KEY" > "$G/ml/fleet.yaml"
+cat > "$G/server.py" <<'PY'
+import hashlib, hmac, json, os, sys, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+d = sys.argv[1]; key = sys.argv[2]
+def answer(name):
+    seq = json.load(open(os.path.join(d, "scenario.json"))).get(name, [[404, ""]])
+    n = os.path.join(d, "n." + name); i = int(open(n).read()) if os.path.exists(n) else 0
+    open(n, "w").write(str(i + 1)); return seq[min(i, len(seq) - 1)]
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def reply(self, st, body):
+        self.send_response(st); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body.encode())
+    def do_GET(self):
+        if self.path == "/api/builds/queue?channel=mac": st, b = answer("queue"); self.reply(st, b if isinstance(b, str) else json.dumps(b))
+        elif self.path == "/api/ps": st, b = answer("ps"); self.reply(st, b if isinstance(b, str) else json.dumps(b))
+        else: self.reply(404, "")
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
+        rec = {"path": self.path, "body": body, "h": {k.lower(): v for k, v in self.headers.items() if k.lower().startswith("x-")}}
+        if self.path == "/api/fleet-models/demand":
+            text = "%s\n%s\nPOST /demand\n\n\n%s" % (self.headers.get("X-MeshWeaver-Deployment"), self.headers.get("X-MeshWeaver-Timestamp"), body)
+            rec["sigOk"] = hmac.compare_digest(self.headers.get("X-Hub-Signature-256", ""), "sha256=" + hmac.new(key.encode(), text.encode(), hashlib.sha256).hexdigest())
+            st, b = answer("demand")
+        elif self.path == "/api/generate": st, b = 200, "{}"
+        else: st, b = 404, ""
+        open(os.path.join(d, "requests.jsonl"), "a").write(json.dumps(rec) + "\n")
+        self.reply(st, b if isinstance(b, str) else json.dumps(b))
+srv = HTTPServer(("127.0.0.1", 0), H)
+open(os.path.join(d, "port"), "w").write(str(srv.server_address[1]))
+srv.serve_forever()
+PY
+python3 "$G/server.py" "$G" "$KEY" & GSRV=$!
+for _ in $(seq 1 50); do [ -s "$G/port" ] && break; sleep 0.1; done
+PORT="$(cat "$G/port" 2>/dev/null)"
+printf '#!/bin/bash\necho "colima $*" >> "%s/calls"\nexit "${FAKE_COLIMA_RC:-0}"\n' "$G" > "$G/bin/colima"
+printf '#!/bin/bash\necho "kubectl $*" >> "%s/calls"\n[ "$2" = current-context ] && echo colima\nexit 0\n' "$G" > "$G/bin/kubectl"
+chmod +x "$G/bin/"*
+layer() { printf 'config:\n  memex_portal:\n    Hosting__Deployment: "studio-9"\n    Hosting__ReportTo: "http://127.0.0.1:%s"\n%s' "$PORT" "$1" > "$G/ml/backlease.yaml"; }
+DECL='    Hosting__BackLease__Accept__Tokens__IdleOnlyModels__0: "gpt-oss:120b"\n'
+layer "$(printf "$DECL")"
+scen() { printf '%s' "$1" > "$G/scenario.json"; rm -f "$G"/n.*; }
+gov_once() { env PATH="$G/bin:$PATH" MEMEX_LOCAL_HOME="$G/ml" COLIMA_HOME="$G/colima" MEMEX_IDLE_OLLAMA="http://127.0.0.1:$PORT" \
+  MEMEX_IDLE_KEY_FILES="$G/ml/fleet.yaml" MEMEX_IDLE_NOW="${NOW:-1763028000}" MEMEX_IDLE_GIVEBACK=600 MEMEX_IDLE_DRAIN_MAX=1800 \
+  python3 -I "$IDLE" once 2>&1; }
+gstate() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$G/ml/backlease/buildhost.json" 2>/dev/null; }
+reset_gov() { rm -f "$G/ml/backlease/buildhost.json" "$G/ml/buildhost-idle.memory.json" "$G/calls" "$G/requests.jsonl"; }
+DQ1='{"host":"studio-9","models":{"gpt-oss:120b":{"queued":1,"running":0}}}'
+DR1='{"host":"studio-9","models":{"gpt-oss:120b":{"queued":0,"running":1}}}'
+D00='{"host":"studio-9","models":{"gpt-oss:120b":{"queued":0,"running":0}}}'
+Q0='{"channel":"mac","claimable":0,"running":0,"demand":0}'; Q1='{"channel":"mac","claimable":1,"running":0,"demand":1}'
+if [ -n "$PORT" ]; then
+  # running → stopped: no CI demand, an idle-only job queued
+  reset_gov; scen "{\"queue\":[[200,$Q0]],\"demand\":[[200,$DQ1]]}"
+  OUT="$(gov_once)"
+  [ "$(gstate)" = stopped ] && grep -q '^colima stop -p build$' "$G/calls" && grep -q '^kubectl config use-context colima$' "$G/calls" \
+    && ok "running → stopped: no mac demand and a queued idle-only job → colima stop -p build (kubectl context kept), then 'stopped'" || bad "running → stopped" "$OUT / $(cat "$G/calls" 2>/dev/null) / $(gstate)"
+  python3 -c 'import json,sys
+r = [json.loads(l) for l in open(sys.argv[1]) if "/demand" in l]
+assert r and all(x["sigOk"] for x in r), r
+x = r[0]; assert x["h"]["x-meshweaver-deployment"] == "studio-9" and x["h"]["x-meshweaver-timestamp"] == "1763028000", x
+assert json.loads(x["body"]) == {"host": "studio-9", "models": ["gpt-oss:120b"]}, x' "$G/requests.jsonl" 2>/dev/null \
+    && ok "the demand read is signed with the Mac's own key over \"<dep>\\n<ts>\\nPOST /demand\\n\\n\\n<body>\" (verified by the stub control)" || bad "signed demand" "$(cat "$G/requests.jsonl")"
+  S="$(env MEMEX_LOCAL_HOME="$G/ml" python3 -I -c 'import importlib.util,sys
+s = importlib.util.spec_from_file_location("bi", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(repr(m.signed_text("studio-9", "1763028000", "/demand", "{\"host\":\"studio-9\",\"models\":[\"gpt-oss:120b\"]}")))
+print(m.sign("a\nb", "k"))' "$IDLE")"
+  [ "$(sed -n 1p <<<"$S")" = "'studio-9\\n1763028000\\nPOST /demand\\n\\n\\n{\"host\":\"studio-9\",\"models\":[\"gpt-oss:120b\"]}'" ] \
+    && [ "$(sed -n 2p <<<"$S")" = "sha256=$(printf 'a\nb' | openssl dgst -sha256 -hmac k | awk '{ print $NF }')" ] \
+    && ok "the signed text has the two empty lines (residency, user) and the signature is sha256=hex(HMAC-SHA256) (checked against openssl)" || bad "signed text" "$S"
+  grep -qF "$KEY" "$G/ml/buildhost-idle.log" "$G/ml/backlease/buildhost.json" "$G/ml/buildhost-idle.memory.json" <<<"$OUT" 2>/dev/null && bad "the key leaked" "" || ok "the key appears in no log, state or output"
+  python3 -c 'import json,re,sys; d = json.load(open(sys.argv[1])); assert set(d) == {"state","since","reason"} and re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", d["since"])' "$G/ml/backlease/buildhost.json" \
+    && [ -z "$(find "$G/ml/backlease" -name '.*tmp' -print)" ] && grep -q 'os.replace(tmp, path)' "$IDLE" && grep -q 'os.path.dirname(path)' "$IDLE" \
+    && ok "the state file is {state, since (ISO-8601 UTC), reason}, written as a temp file in the same directory and renamed — no temp left behind" || bad "atomic state file" "$(cat "$G/ml/backlease/buildhost.json")"
+  # stopped → draining → running: CI asks
+  : > "$G/calls"; scen "{\"queue\":[[200,$Q1]],\"demand\":[[200,$DR1]]}"
+  NOW=1763028060 gov_once >/dev/null
+  [ "$(gstate)" = draining ] && ! grep -q '^colima' "$G/calls" && ok "stopped → draining the moment the mac queue has demand; nothing started while a step runs" || bad "stopped → draining" "$(gstate) $(cat "$G/calls")"
+  NOW=1763028075 gov_once >/dev/null
+  [ "$(gstate)" = draining ] && ! grep -q '^colima' "$G/calls" && ok "draining holds while an idle-only step is still running (never preempted)" || bad "draining holds" "$(gstate) $(cat "$G/calls")"
+  scen "{\"queue\":[[200,$Q1]],\"demand\":[[200,$D00]]}"
+  NOW=1763028090 gov_once >/dev/null
+  python3 -c 'import json,sys
+g = [json.loads(json.loads(l)["body"]) for l in open(sys.argv[1]) if "/api/generate" in l]
+assert g == [{"model": "gpt-oss:120b", "keep_alive": 0}], g' "$G/requests.jsonl" 2>/dev/null \
+    && [ "$(gstate)" = running ] && grep -q '^colima start -p build$' "$G/calls" \
+    && ok "draining → running once no idle-only step runs: ONLY the idle-only model unloaded (keep_alive 0), colima start -p build, then 'running'" || bad "draining → running" "$(gstate) $(cat "$G/calls") $(grep generate "$G/requests.jsonl")"
+  # a model that does not unload holds the drain: the VM never starts under it (review on #293)
+  reset_gov; printf '{"state":"draining","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$G/ml/backlease/buildhost.json"
+  printf '{"drainSince":1763028000}' > "$G/ml/buildhost-idle.memory.json"
+  scen "{\"queue\":[[200,$Q1]],\"demand\":[[200,$D00]],\"ps\":[[200,{\"models\":[{\"name\":\"gpt-oss:120b\"},{\"name\":\"qwen3.8:27b-mlx\"}]}]]}"
+  NOW=1763028100 gov_once >/dev/null
+  [ "$(gstate)" = draining ] && ! grep -q '^colima start' "$G/calls" 2>/dev/null && grep -q 'gpt-oss:120b still resident' "$G/ml/buildhost-idle.log" \
+    && ok "an idle-only model still resident after the unload keeps the state 'draining': the VM is not started under it" || bad "resident holds drain" "$(gstate) $(cat "$G/calls" 2>/dev/null)"
+  scen "{\"queue\":[[200,$Q1]],\"demand\":[[200,$D00]],\"ps\":[[200,{\"models\":[{\"name\":\"qwen3.8:27b-mlx\"}]}]]}"
+  NOW=1763028115 gov_once >/dev/null
+  [ "$(gstate)" = running ] && grep -q '^colima start -p build$' "$G/calls" \
+    && ok "…and once only other models are resident (qwen3.8 is left alone) the VM starts" || bad "resident cleared" "$(gstate)"
+  reset_gov; printf '{"state":"draining","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$G/ml/backlease/buildhost.json"
+  printf '{"drainSince":1763028000}' > "$G/ml/buildhost-idle.memory.json"
+  scen "{\"queue\":[[200,$Q1]],\"demand\":[[200,$D00]],\"ps\":[[200,{\"models\":[{\"name\":\"gpt-oss:120b\"}]}]]}"
+  NOW=1763029900 gov_once >/dev/null
+  [ "$(gstate)" = running ] && grep -q 'starting the VM anyway, CI first' "$G/ml/buildhost-idle.log" \
+    && ok "a model that never unloads holds the drain at most 30 min, then CI wins (logged)" || bad "resident bounded" "$(gstate)"
+  # CI first when control cannot answer: the queue 404s, or nothing listens
+  reset_gov; scen "{\"queue\":[[404,\"\"]],\"demand\":[[200,$DQ1]]}"
+  gov_once >/dev/null
+  [ "$(gstate)" = running ] && ! grep -q '^colima stop' "$G/calls" 2>/dev/null && ok "the build queue answering 404: state stays 'running', nothing stops (CI first)" || bad "queue 404" "$(gstate) $(cat "$G/calls" 2>/dev/null)"
+  reset_gov; scen "{\"queue\":[[200,$Q0]],\"demand\":[[404,\"\"]]}"
+  gov_once >/dev/null
+  [ "$(gstate)" = running ] && ! grep -q '^colima' "$G/calls" 2>/dev/null && ok "the demand route answering 404 (a control before 3.1.x): no idle demand, state 'running', nothing stops" || bad "demand 404" "$(gstate)"
+  reset_gov; layer "$(printf "$DECL")" ; sed -i.bak "s|127.0.0.1:$PORT|127.0.0.1:1|" "$G/ml/backlease.yaml"
+  gov_once >/dev/null
+  [ "$(gstate)" = running ] && ! grep -q '^colima' "$G/calls" 2>/dev/null && ok "control unreachable: state 'running', nothing stops" || bad "unreachable" "$(gstate)"
+  printf '{"state":"stopped","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$G/ml/backlease/buildhost.json"
+  gov_once >/dev/null
+  [ "$(gstate)" = draining ] && ok "control unreachable while stopped: the VM is given back to CI (draining) — an unread queue counts as demand" || bad "unreachable while stopped" "$(gstate)"
+  layer "$(printf "$DECL")"
+  # the re-check right before the stop
+  reset_gov; scen "{\"queue\":[[200,$Q0],[200,$Q1]],\"demand\":[[200,$DQ1]]}"
+  gov_once >/dev/null
+  [ "$(gstate)" = running ] && ! grep -q '^colima stop' "$G/calls" 2>/dev/null && grep -q 'stop cancelled' "$G/ml/buildhost-idle.log" \
+    && ok "a mac build queued between the read and the stop cancels the stop (the queue is read again right before colima stop)" || bad "stop recheck" "$(gstate) $(cat "$G/calls" 2>/dev/null)"
+  # a failed colima stop leaves it running
+  reset_gov; scen "{\"queue\":[[200,$Q0]],\"demand\":[[200,$DQ1]]}"
+  FAKE_COLIMA_RC=1 gov_once >/dev/null
+  [ "$(gstate)" = running ] && grep -q 'ERROR: colima stop' "$G/ml/buildhost-idle.log" && ok "a failed colima stop is logged and the state stays 'running' (never 'stopped' with the VM up)" || bad "stop fails" "$(gstate)"
+  # give back after ten minutes without idle-only demand
+  reset_gov; scen "{\"queue\":[[200,$Q0]],\"demand\":[[200,$DQ1]]}"; gov_once >/dev/null
+  scen "{\"queue\":[[200,$Q0]],\"demand\":[[200,$DR1]]}"; NOW=1763028500 gov_once >/dev/null
+  scen "{\"queue\":[[200,$Q0]],\"demand\":[[200,$D00]]}"; NOW=1763029000 gov_once >/dev/null
+  [ "$(gstate)" = stopped ] && ok "stopped holds while the model was in use within the last 10 min" || bad "giveback too early" "$(gstate)"
+  NOW=1763029101 gov_once >/dev/null
+  [ "$(gstate)" = draining ] && ok "stopped → draining after 10 min with no idle-only job queued or running (the VM goes back to CI)" || bad "giveback" "$(gstate)"
+  # no queued idle job: nothing stops; no build profile: nothing at all
+  reset_gov; scen "{\"queue\":[[200,$Q0]],\"demand\":[[200,$D00]]}"; gov_once >/dev/null
+  [ "$(gstate)" = running ] && ! grep -q '^colima' "$G/calls" 2>/dev/null && ok "no idle-only job queued: the build VM keeps running for CI" || bad "no idle demand" "$(gstate)"
+  reset_gov; rmdir "$G/colima/build"; scen "{\"queue\":[[200,$Q0]],\"demand\":[[200,$DQ1]]}"; gov_once >/dev/null
+  ! grep -q '^colima' "$G/calls" 2>/dev/null && [ "$(gstate)" = running ] && ok "no build profile on the Mac: no colima call, the state says 'running'" || bad "no profile" "$(cat "$G/calls" 2>/dev/null)"
+  mkdir -p "$G/colima/build"
+  # withdrawn while stopped: drains and restarts; nothing declared and no state: no file at all
+  printf '{"state":"stopped","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$G/ml/backlease/buildhost.json"; layer ""
+  gov_once >/dev/null; gov_once >/dev/null
+  [ "$(gstate)" = running ] && grep -q '^colima start -p build$' "$G/calls" && ok "a declaration withdrawn while stopped: draining, then the VM starts and the state is 'running'" || bad "withdrawn while stopped" "$(gstate) $(cat "$G/calls")"
+  reset_gov; gov_once >/dev/null
+  [ ! -e "$G/ml/backlease/buildhost.json" ] && ok "nothing declared and no state: no state file is written (absent = no idle-only model served)" || bad "no decl writes" ""
+  printf 'garbage' > "$G/ml/backlease/buildhost.json"
+  [ "$(env MEMEX_LOCAL_HOME="$G/ml" python3 -I -c 'import importlib.util,sys
+s = importlib.util.spec_from_file_location("bi", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.read_state())' "$IDLE")" = None ] \
+    && ok "an unreadable state file reads as no state" || bad "garbage state" ""
+else
+  bad "the stub control did not start" ""
+fi
+kill "$GSRV" 2>/dev/null; wait "$GSRV" 2>/dev/null
+rm -rf "$IO"
 
 echo "── token slots: the machine's capacity; the owner's ceiling is optional (Hosting/BackLease §14.5) ──"
 TS="$(mktemp -d)"; mkdir -p "$TS/home"
