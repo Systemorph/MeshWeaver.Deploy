@@ -2508,6 +2508,15 @@ OUT="$(bh FAKE_NR_GROWS=1 FAKE_COLIMA_LIST='{"name":"build","status":"Running","
 OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400,"disk":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize 2>&1)"
 grep -q "k3s is healthy: API ready, k3s NRestarts 0 (stable)" <<<"$OUT" && grep -q 'upgrade build-host-mac' "$BH/log" \
   && ok "a resize whose k3s comes back and stays up (API ready, NRestarts stable) goes on to size the runners" || bad "resize healthy" "$OUT"
+# a build VM the idle governor stopped for an idle-only model is NOT started by apply (review on #293: executed, not grepped)
+mkdir -p "$BH/.memex-local/backlease"; printf '{"state":"stopped","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$BH/.memex-local/backlease/buildhost.json"
+: > "$BH/log"
+OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Stopped","cpus":16,"memory":111669149696,"disk":322122547200}' "$CLI" buildhost apply 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ! grep -q '^colima start' "$BH/log" && grep -q "starts it the moment CI asks" <<<"$OUT" \
+  && ok "buildhost apply never starts a build VM the governor stopped for an idle-only model (and says so)" || bad "apply respects idle state" "rc=$RC $OUT / $(grep colima "$BH/log")"
+printf '{"state":"running","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$BH/.memex-local/backlease/buildhost.json"; : > "$BH/log"
+bh FAKE_COLIMA_LIST='{"name":"build","status":"Stopped","cpus":16,"memory":111669149696,"disk":322122547200}' "$CLI" buildhost apply >/dev/null 2>&1
+grep -q '^colima start -p build' "$BH/log" && ok "…while a state of 'running' (the VM merely stopped) is started as before" || bad "apply starts when running" "$(grep colima "$BH/log")"
 rm -rf "$BH"
 
 echo "── buildhost priority: fleet jobs at the lowest priority, every idle core otherwise ──"
@@ -2895,8 +2904,14 @@ OUT="$(io "$CLI" buildhost idle off </dev/null 2>&1)" && bad "idle off while sto
 printf '{"state":"running","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$IO/home/.memex-local/backlease/buildhost.json"
 io "$CLI" backlease accept tokens --idle-only-models none </dev/null >/dev/null 2>&1
 [ ! -e "$PL" ] && [ ! -e "$IO/home/.memex-local/backlease/buildhost.json" ] && ok "--idle-only-models none with the VM back: governor removed, no state file (the worker serves none)" || bad "withdraw while running" "$(ls "$IO/home/.memex-local/backlease")"
-grep -q 'stopped|draining)' <<<"$(sed -n '/^cmd_buildhost() {/,/^}/p' "$CLI")" && grep -q "starts it the moment CI asks" "$CLI" \
-  && ok "buildhost apply never starts a build VM the governor stopped for an idle-only model" || bad "apply respects idle state" ""
+io "$CLI" backlease enroll --control https://control.example.test --deployment studio-9 --accept-tokens='*.meshweaver.cloud' --token-models qwen3.8:27b-mlx \
+  --token-idle-only-models gpt-oss:120b --residency CH </dev/null >/dev/null 2>&1
+ioh 'IdleOnlyModels__0: "gpt-oss:120b"' && ioh 'Tokens__Models__1: "gpt-oss:120b"' && [ -e "$PL" ] \
+  && ok "backlease enroll --token-idle-only-models declares it and loads the governor (the same path as accept)" || bad "enroll idle flag" "$(grep Tokens "$IOF")"
+printf '{"state":"stopped","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$IO/home/.memex-local/backlease/buildhost.json"
+OUT="$(io "$CLI" backlease off </dev/null 2>&1)"
+[ ! -e "$IOF" ] && [ -e "$PL" ] && [ -e "$IO/home/.memex-local/backlease/buildhost.json" ] && grep -q "gives it back to CI first" <<<"$OUT" \
+  && ok "backlease off while the VM is stopped for a model: the layer goes, the governor stays to restart the VM (it drains with nothing declared)" || bad "off while stopped" "$OUT"
 
 # ── the governor itself: share/buildhost-idle.py against a stub control + Ollama, a stub colima and kubectl ──
 IDLE="$HERE/../share/buildhost-idle.py"
@@ -2918,6 +2933,7 @@ class H(BaseHTTPRequestHandler):
         self.send_response(st); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body.encode())
     def do_GET(self):
         if self.path == "/api/builds/queue?channel=mac": st, b = answer("queue"); self.reply(st, b if isinstance(b, str) else json.dumps(b))
+        elif self.path == "/api/ps": st, b = answer("ps"); self.reply(st, b if isinstance(b, str) else json.dumps(b))
         else: self.reply(404, "")
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
@@ -2989,6 +3005,23 @@ g = [json.loads(json.loads(l)["body"]) for l in open(sys.argv[1]) if "/api/gener
 assert g == [{"model": "gpt-oss:120b", "keep_alive": 0}], g' "$G/requests.jsonl" 2>/dev/null \
     && [ "$(gstate)" = running ] && grep -q '^colima start -p build$' "$G/calls" \
     && ok "draining → running once no idle-only step runs: ONLY the idle-only model unloaded (keep_alive 0), colima start -p build, then 'running'" || bad "draining → running" "$(gstate) $(cat "$G/calls") $(grep generate "$G/requests.jsonl")"
+  # a model that does not unload holds the drain: the VM never starts under it (review on #293)
+  reset_gov; printf '{"state":"draining","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$G/ml/backlease/buildhost.json"
+  printf '{"drainSince":1763028000}' > "$G/ml/buildhost-idle.memory.json"
+  scen "{\"queue\":[[200,$Q1]],\"demand\":[[200,$D00]],\"ps\":[[200,{\"models\":[{\"name\":\"gpt-oss:120b\"},{\"name\":\"qwen3.8:27b-mlx\"}]}]]}"
+  NOW=1763028100 gov_once >/dev/null
+  [ "$(gstate)" = draining ] && ! grep -q '^colima start' "$G/calls" 2>/dev/null && grep -q 'gpt-oss:120b still resident' "$G/ml/buildhost-idle.log" \
+    && ok "an idle-only model still resident after the unload keeps the state 'draining': the VM is not started under it" || bad "resident holds drain" "$(gstate) $(cat "$G/calls" 2>/dev/null)"
+  scen "{\"queue\":[[200,$Q1]],\"demand\":[[200,$D00]],\"ps\":[[200,{\"models\":[{\"name\":\"qwen3.8:27b-mlx\"}]}]]}"
+  NOW=1763028115 gov_once >/dev/null
+  [ "$(gstate)" = running ] && grep -q '^colima start -p build$' "$G/calls" \
+    && ok "…and once only other models are resident (qwen3.8 is left alone) the VM starts" || bad "resident cleared" "$(gstate)"
+  reset_gov; printf '{"state":"draining","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$G/ml/backlease/buildhost.json"
+  printf '{"drainSince":1763028000}' > "$G/ml/buildhost-idle.memory.json"
+  scen "{\"queue\":[[200,$Q1]],\"demand\":[[200,$D00]],\"ps\":[[200,{\"models\":[{\"name\":\"gpt-oss:120b\"}]}]]}"
+  NOW=1763029900 gov_once >/dev/null
+  [ "$(gstate)" = running ] && grep -q 'starting the VM anyway, CI first' "$G/ml/buildhost-idle.log" \
+    && ok "a model that never unloads holds the drain at most 30 min, then CI wins (logged)" || bad "resident bounded" "$(gstate)"
   # CI first when control cannot answer: the queue 404s, or nothing listens
   reset_gov; scen "{\"queue\":[[404,\"\"]],\"demand\":[[200,$DQ1]]}"
   gov_once >/dev/null

@@ -469,7 +469,7 @@ an argument list.
 |---|---|---|
 | running → stopped | CI demand 0 AND an idle-only job is queued for this Mac | re-reads the CI demand, then `colima stop -p build` (kubectl context kept), then writes `stopped` |
 | stopped → draining | CI demand > 0 or unread, OR no idle-only job queued or running for 10 min, OR the declaration withdrawn | writes `draining` FIRST: the worker claims no new idle-only job, the step in progress finishes |
-| draining → running | every idle-only model reports `running == 0` (or the demand is unread; or 30 min passed) | unloads each idle-only model (`POST 127.0.0.1:11434/api/generate {"model":m,"keep_alive":0}`), `colima start -p build`, writes `running` |
+| draining → running | every idle-only model reports `running == 0` (or the demand is unread; or 30 min passed) | unloads each idle-only model (`POST 127.0.0.1:11434/api/generate {"model":m,"keep_alive":0}`); while `GET /api/ps` still lists one, it stays `draining` and retries (bounded by the 30 min); then `colima start -p build`, writes `running` |
 
 Every transition and every changed reading is logged to `~/.memex-local/buildhost-idle.log`. `buildhost apply` does not
 start a VM the governor stopped (it says so); `fleet doctor` reads a VM stopped for an idle-only model as green. The

@@ -323,6 +323,18 @@ def unload(model):
     return st, text
 
 
+def still_resident(models):
+    """The given models Ollama still holds loaded (GET /api/ps). An Ollama that does not answer holds nothing: none."""
+    st, text = http(OLLAMA + "/api/ps")
+    if st != 200:
+        return []
+    try:
+        loaded = [m.get("name") or m.get("model") for m in json.loads(text).get("models") or []]
+    except (ValueError, TypeError, AttributeError):
+        return []
+    return [m for m in models if m in loaded or (m + ":latest") in loaded]
+
+
 # ── one tick ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 def tick():
     now = now_s()
@@ -377,6 +389,14 @@ def tick():
         for m in models_to_unload(models, memory):
             st, why = unload(m)
             log("unload %s from Ollama: %s" % (m, "ok" if st == 200 else ("HTTP %d" % st if st else why)))
+        resident = still_resident(models_to_unload(models, memory))
+        if resident and now - drain_since < DRAIN_MAX:
+            # never start the VM under a resident large model — the contention this governor exists to prevent
+            log("draining: %s still resident in Ollama — the VM starts once it is unloaded (retried next tick)" % " ".join(resident))
+            action = None
+        elif resident:
+            log("WARN: %s still resident after %d s of draining — starting the VM anyway, CI first" % (" ".join(resident), now - drain_since))
+    if action == "start":
         rc, out = colima("start")
         if rc == 0:
             write_state("running", "CI first: %s" % reason, now)
