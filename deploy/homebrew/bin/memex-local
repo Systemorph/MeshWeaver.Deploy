@@ -298,6 +298,13 @@ readonly BACKLEASE_SAMPLER="$LOCAL_HOME/backlease-sampler.sh"
 readonly BACKLEASE_PLIST_LABEL="com.memex.local.backlease"
 readonly BACKLEASE_PLIST_DST="$HOME/Library/LaunchAgents/${BACKLEASE_PLIST_LABEL}.plist"
 readonly BACKLEASE_LOG="$LOCAL_HOME/backlease-sampler.log"
+# IDLE-ONLY MODELS (MeshWeaver.Plugins Hosting/BackLease §15.9): the governor share/buildhost-idle.py stops the build VM
+# for a declared large model only while CI has no demand, and writes its decision to $BACKLEASE_DIR/buildhost.json —
+# the file the portal's token worker reads at /host-readings/buildhost.json.
+readonly IDLE_PLIST_LABEL="com.memex.local.buildhost-idle"
+readonly IDLE_PLIST_DST="$HOME/Library/LaunchAgents/${IDLE_PLIST_LABEL}.plist"
+readonly IDLE_LOG="$LOCAL_HOME/buildhost-idle.log"
+readonly IDLE_STATE_FILE="$BACKLEASE_DIR/buildhost.json"
 # ── DEVICE RELAY — this Mac answers a cloud instance's inbox reads, live (Hosting/DeviceRelay) ───
 # `memex-local relay pair` installs the native memex-relay build under $RELAY_DIR (a STABLE path: macOS
 # Full Disk Access is granted to that binary) and a launchd login agent that runs it. The API token is
@@ -821,6 +828,11 @@ readonly ACCEPT_DEFAULT_TOKENS_FROM="*.meshweaver.cloud"
 readonly ACCEPT_DEFAULT_TOKEN_MODELS="qwen3.8:27b-mlx qwen3.6"
 ACC_JOBS_ENABLED=false; ACC_JOBS_FROM=""; ACC_JOBS_CHANNELS=""; ACC_JOBS_REPOS=""
 ACC_TOK_ENABLED=false; ACC_TOK_FROM=""; ACC_TOK_MODELS=""; ACC_TOK_MAXC=""; ACC_TOK_RES=""; ACC_TOK_SLOTS=""; ACC_TOK_YIELD=""
+# IDLE-ONLY MODELS (Hosting/BackLease §15.9): the token models this Mac serves ONLY while its build VM is stopped for
+# them — "CI first, a large model when the build host is idle". Each is also a served model (the claim names it), and
+# the build-host idle governor (share/buildhost-idle.py) decides when the VM yields. Not asked interactively (like the
+# slots): `--idle-only-models <m>` / `none`.
+ACC_TOK_IDLE=""
 
 # TOKEN SLOTS — how many requests the machine itself serves at once (MeshWeaver.Plugins Hosting/BackLease §14.5):
 # a property of the hardware and the model runner, not an owner choice. Measured on a Mac Studio (M5 Max, 2026-11-08):
@@ -866,6 +878,7 @@ accept_load() {
   ACC_TOK_MAXC="$(backlease_value "${p}__Tokens__MaxConcurrency")"
   ACC_TOK_SLOTS="$(backlease_value "${p}__Tokens__Slots")"
   ACC_TOK_YIELD="$(backlease_value "${p}__Tokens__YieldAtPercent")"
+  ACC_TOK_IDLE="$(accept_list "${p}__Tokens__IdleOnlyModels")"
   local r; r="$(backlease_value "${p}__Tokens__Residency")"
   [ -z "$r" ] || ACC_TOK_RES="$r"
 }
@@ -900,7 +913,7 @@ accept_flag() {
   local flag="${1%%=*}" val="" used=1
   case "$1" in *=*) val="${1#*=}" ;; esac
   case "$flag" in
-    --accept-jobs|--accept-tokens|--job-channels|--job-repos|--token-models|--token-max-concurrency|--token-slots|--token-yield-at|--residency)
+    --accept-jobs|--accept-tokens|--job-channels|--job-repos|--token-models|--token-max-concurrency|--token-slots|--token-yield-at|--token-idle-only-models|--residency)
       if [ "$1" = "$flag" ]; then val="${2-}"; used=2; [ -n "$val" ] || die "$flag needs a value"; fi ;;
   esac
   case "$flag" in
@@ -914,6 +927,7 @@ accept_flag() {
     --token-max-concurrency) if [ "$val" = none ]; then ACC_TOK_MAXC=""; else ACC_TOK_MAXC="$val"; accept_check_count "$val" "$flag"; fi ;;
     --token-slots)   if [ "$val" = none ]; then ACC_TOK_SLOTS=""; else ACC_TOK_SLOTS="$val"; accept_check_count "$val" "$flag"; fi ;;
     --token-yield-at) if [ "$val" = none ]; then ACC_TOK_YIELD=""; else ACC_TOK_YIELD="$val"; accept_check_yield "$val" "$flag"; fi ;;
+    --token-idle-only-models) if [ "$val" = none ]; then ACC_TOK_IDLE=""; else ACC_TOK_IDLE="$(accept_norm "$val")"; accept_check_models "$ACC_TOK_IDLE" "$flag"; fi ;;
     --residency)     ACC_TOK_RES="$val"; accept_check_residency "$val" "$flag" ;;
     *) used=0 ;;
   esac
@@ -955,11 +969,26 @@ accept_validate() {
   if [ "$ACC_TOK_ENABLED" = true ]; then
     accept_check_patterns "$ACC_TOK_FROM" "tokens: --accept-tokens"
     [ -n "$ACC_TOK_MODELS" ] || die "tokens: name the models this Mac serves (--token-models qwen3.8:27b-mlx)"
+    accept_idle_in_models
     token_models_fit
     # the machine's slots: a calibrated or saved value stands; otherwise the hardware's measured default
     [ -n "$ACC_TOK_SLOTS" ] || ACC_TOK_SLOTS="$(token_slots_default)"
   fi
 }
+
+# An idle-only model is a SERVED model too — the worker's claim names it and control refuses a model the opt-in does not
+# list — so each one missing from the models is added, and said. Withdrawing a model from the models keeps it while it
+# is declared idle-only (`--idle-only-models none` withdraws it).
+accept_idle_in_models() {
+  local m added=""
+  set -f
+  for m in $ACC_TOK_IDLE; do
+    case " $ACC_TOK_MODELS " in *" $m "*) ;; *) ACC_TOK_MODELS="${ACC_TOK_MODELS:+$ACC_TOK_MODELS }$m"; added="$added $m" ;; esac
+  done
+  set +f
+  [ -z "$added" ] || info "tokens: idle-only model(s)${added} added to the served models (served only while the build VM is stopped for them)"
+}
+is_idle_only() { case " $ACC_TOK_IDLE " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # THE TOKEN MODELS MUST FIT THIS MAC (2026-11-11: the fleet profile declares qwen3.8:27b-mlx and qwen3.6 for every Mac,
 # and a Mac mini may not hold them). A model is kept when its weights fit in what is left of unified memory after the
@@ -987,14 +1016,16 @@ readonly BUILD_HEADROOM_GIB_TOKENS=8   # = BUILD_HEADROOM_GIB (macOS, menu bar a
 readonly BUILD_MIN_VM_GIB=12           # one runner (8) + the VM's system share (4): the least a jobs YES needs
 token_models_fit() {
   [ "${MEMEX_TOKEN_MODELS_UNCHECKED:-0}" = 1 ] && return 0
-  local mem budget m sz kept="" dropped=""
+  local mem budget idle_budget b m sz kept="" dropped=""
   mem="$(host_mem_gib_early)"; case "$mem" in ''|*[!0-9]*|0) warn "tokens: this Mac's memory is unreadable — the token models are NOT checked against it"; return 0 ;; esac
   budget="$(token_model_budget_gib "$mem" "$COLIMA_MEM" "${ACC_JOBS_ENABLED:-false}")"
+  # an idle-only model runs only while the build VM is stopped: its budget leaves no build VM out
+  idle_budget="$(token_model_budget_gib "$mem" "$COLIMA_MEM" false)"
   set -f
   for m in $ACC_TOK_MODELS; do
-    sz="$(model_size_gib "$m")"
-    if [ -z "$sz" ]; then kept="$kept $m"; warn "tokens: the size of '$m' is unknown (not pulled here) — kept unchecked against this Mac's ${budget} GiB budget"
-    elif [ "$sz" -le "$budget" ]; then kept="$kept $m"
+    sz="$(model_size_gib "$m")"; b="$budget"; is_idle_only "$m" && b="$idle_budget"
+    if [ -z "$sz" ]; then kept="$kept $m"; warn "tokens: the size of '$m' is unknown (not pulled here) — kept unchecked against this Mac's ${b} GiB budget"
+    elif [ "$sz" -le "$b" ]; then kept="$kept $m"
     else dropped="$dropped $m(${sz} GiB)"; fi
   done
   set +f
@@ -1027,6 +1058,7 @@ accept_block() {
   [ -z "$ACC_TOK_MAXC" ] || printf '%s__Tokens__MaxConcurrency: "%s"\n' "$p" "$ACC_TOK_MAXC"
   [ -z "$ACC_TOK_SLOTS" ] || printf '%s__Tokens__Slots: "%s"\n' "$p" "$ACC_TOK_SLOTS"
   [ -z "$ACC_TOK_YIELD" ] || printf '%s__Tokens__YieldAtPercent: "%s"\n' "$p" "$ACC_TOK_YIELD"
+  i=0; for x in $ACC_TOK_IDLE; do printf '%s__Tokens__IdleOnlyModels__%d: "%s"\n' "$p" "$i" "$x"; i=$((i+1)); done
   [ -z "$ACC_TOK_RES" ] || printf '%s__Tokens__Residency: "%s"\n' "$p" "$ACC_TOK_RES"
   set +f
 }
@@ -1055,6 +1087,8 @@ accept_summary() {
   if [ "$ACC_TOK_ENABLED" = true ]; then
     local cap="the whole machine"; [ -z "$ACC_TOK_MAXC" ] || cap="owner ceiling $ACC_TOK_MAXC at once"
     ok "accepts TOKEN requests from: $ACC_TOK_FROM · models: $ACC_TOK_MODELS · ${ACC_TOK_SLOTS:-default} slot(s), $cap${ACC_TOK_YIELD:+ · yields at ${ACC_TOK_YIELD}% owner CPU} · residency: ${ACC_TOK_RES:-<none stated — serves only requests that require none>}"
+    if [ -n "$ACC_TOK_IDLE" ]; then info "idle-only models: $ACC_TOK_IDLE — served only while the build VM is stopped for them; CI first ($(idle_state_line))"
+    else info "idle-only models: none (memex-local backlease accept tokens --idle-only-models <m> serves a large model only while CI leaves the build VM idle)"; fi
   else info "serves NO token requests (memex-local backlease accept tokens --from '$ACCEPT_DEFAULT_TOKENS_FROM' --models … --residency … to opt in)"; fi
 }
 
@@ -1205,6 +1239,7 @@ cmd_backlease() {
       ok "back-lease layer written: $BACKLEASE_FILE (reports to ${control%/} as '$deployment', heartbeat every ${interval}s; leased work only while host load < ${load_max}%, host memory < ${mem_max}%, VM CPU < ${vm_cpu_max}%, VM memory < ${vm_mem_max}%)"
       accept_summary
       install_backlease_sampler "$interval"
+      ensure_buildhost_idle_agent
       backlease_declarations "${control%/}" "$deployment"
       info "Apply it: memex-local update   (re-renders the chart with the back-lease layer; the portal's heartbeat arms on its next activation)"
       ;;
@@ -1222,6 +1257,10 @@ cmd_backlease() {
           warn "no readings yet at $BACKLEASE_DIR/readings.json"
         fi
         accept_load; accept_summary
+        if [ -n "$ACC_TOK_IDLE" ]; then
+          if launchctl print "gui/$(id -u)/${IDLE_PLIST_LABEL}" >/dev/null 2>&1; then ok "idle governor '$IDLE_PLIST_LABEL' loaded (log: $IDLE_LOG)"
+          else warn "idle governor '$IDLE_PLIST_LABEL' NOT loaded — the idle-only models are never served ('memex-local buildhost idle apply')"; fi
+        fi
         if grep -q 'Hosting__ModuleReportSecret' "$OVERLAY" 2>/dev/null; then ok "pairing secret present in the overlay (never printed)"; else warn "pairing secret MISSING — the portal does not beat until secrets.memex_portal.Hosting__ModuleReportSecret is in $OVERLAY"; fi
         backlease_declarations "$(backlease_control)" "$(backlease_deployment)"
       else
@@ -1256,7 +1295,7 @@ cmd_backlease() {
           done ;;
         tokens)
           ACC_JOBS_ANSWERED=yes
-          [ $# -gt 0 ] || accept_interactive || die "backlease accept tokens: give --from <patterns> --models <m> [--max-concurrency n|none] [--slots n|none] [--yield-at pct|none] [--residency X] or --off"
+          [ $# -gt 0 ] || accept_interactive || die "backlease accept tokens: give --from <patterns> --models <m> [--max-concurrency n|none] [--slots n|none] [--yield-at pct|none] [--idle-only-models m|none] [--residency X] or --off"
           while [ $# -gt 0 ]; do
             case "$1" in
               --off) accept_flag --no-accept-tokens ;;
@@ -1265,6 +1304,7 @@ cmd_backlease() {
               --max-concurrency|--max-concurrency=*) accept_flag "--token-max-concurrency${1#--max-concurrency}" "${2-}" ;;
               --slots|--slots=*) accept_flag "--token-slots${1#--slots}" "${2-}" ;;
               --yield-at|--yield-at=*) accept_flag "--token-yield-at${1#--yield-at}" "${2-}" ;;
+              --idle-only-models|--idle-only-models=*) accept_flag "--token-idle-only-models${1#--idle-only-models}" "${2-}" ;;
               --residency|--residency=*) accept_flag "--residency${1#--residency}" "${2-}" ;;
               *) die "backlease accept tokens: unknown flag '$1'" ;;
             esac
@@ -1281,6 +1321,7 @@ cmd_backlease() {
         "$(backlease_ceiling Hosting__BackLease__VmCpuMax)" "$(backlease_ceiling Hosting__BackLease__VmMemoryMax)"
       ok "opt-in written: $BACKLEASE_FILE"
       accept_summary
+      ensure_buildhost_idle_agent
       info "Apply it: memex-local update   (the portal re-renders and restarts; the next heartbeat carries the change — work already running finishes)"
       ;;
     off)
@@ -1288,12 +1329,13 @@ cmd_backlease() {
       uninstall_backlease_sampler
       if [ -f "$BACKLEASE_FILE" ]; then
         rm -f "$BACKLEASE_FILE"
+        ensure_buildhost_idle_agent
         ok "back-lease OFF — the next 'memex-local update' stops the heartbeat; control keeps the machine's last advertisement until its freshness rule retires it"
       else
         info "back-lease was not on"
       fi
       ;;
-    *) die "usage: memex-local backlease {enroll --control <url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>] [--accept-jobs=<patterns> | --no-accept-jobs] [--job-channels <c>] [--job-repos <owner/repo>] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--token-max-concurrency <n>|none] [--token-slots <n>|none] [--token-yield-at <pct>|none] [--residency <X>] | accept {jobs [--from <patterns>] [--channels <c>] [--repos <r>] [--off] | tokens [--from <patterns>] [--models <m>] [--max-concurrency <n>|none] [--slots <n>|none] [--yield-at <pct>|none] [--residency <X>] [--off]} | status | off}" ;;
+    *) die "usage: memex-local backlease {enroll --control <url> [--deployment <id>] [--interval <s>] [--repo <github.com/OWNER/REPO>] [--host-load-max <pct>] [--host-memory-max <pct>] [--vm-cpu-max <pct>] [--vm-memory-max <pct>] [--accept-jobs=<patterns> | --no-accept-jobs] [--job-channels <c>] [--job-repos <owner/repo>] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--token-max-concurrency <n>|none] [--token-slots <n>|none] [--token-yield-at <pct>|none] [--token-idle-only-models <m>|none] [--residency <X>] | accept {jobs [--from <patterns>] [--channels <c>] [--repos <r>] [--off] | tokens [--from <patterns>] [--models <m>] [--max-concurrency <n>|none] [--slots <n>|none] [--yield-at <pct>|none] [--idle-only-models <m>|none] [--residency <X>] [--off]} | status | off}" ;;
   esac
 }
 
@@ -2538,7 +2580,12 @@ fleet_doctor() {
     size="$(build_vm_size)"
     case "$size" in *Running*) doc_ok "build VM '$BUILD_PROFILE' running ($(printf '%s' "$size" | awk '{ print $1 " CPU / " $2 " GiB" }'), disk $(build_vm_disk_gib) GiB)" ;;
       '') doc_red "no build VM although the owner said YES to jobs" "memex-local buildhost apply" ;;
-      *) doc_red "build VM '$BUILD_PROFILE' is not running ($size)" "colima start -p $BUILD_PROFILE" ;; esac
+      *) case "$(idle_state)" in stopped|draining) doc_ok "build VM '$BUILD_PROFILE' $(idle_state) for an idle-only model — $(idle_state_line)" ;; *) doc_red "build VM '$BUILD_PROFILE' is not running ($size)" "colima start -p $BUILD_PROFILE" ;; esac ;; esac
+    accept_load
+    if [ -n "$ACC_TOK_IDLE" ]; then
+      if launchctl print "gui/$(id -u)/${IDLE_PLIST_LABEL}" >/dev/null 2>&1; then doc_ok "idle-only models ${ACC_TOK_IDLE}: governor loaded — $(idle_state_line)"
+      else doc_red "idle-only models ${ACC_TOK_IDLE} declared but the governor '$IDLE_PLIST_LABEL' is NOT loaded — they are never served" "memex-local buildhost idle apply"; fi
+    fi
     if printf '%s' "$size" | grep -q Running; then
       ready="$(build_kubectl -n "$BUILD_NS" get pods -l app.kubernetes.io/component=build-host --no-headers 2>/dev/null | awk '$3 == "Running" { split($2, a, "/"); if (a[1] == a[2]) r++; t++ } END { printf "%d %d", r, t }')"
       total="${ready#* }"; ready="${ready% *}"
@@ -6672,6 +6719,7 @@ cmd_update() {
   # An enrolled Mac's host sampler is a COPY under ~/.memex-local taken at enrolment: refresh it with this release's,
   # so a new reading (host.ownerCpuPercent, Hosting/BackLease §14.5) reaches the heartbeat without a re-enrolment.
   if [ -f "$BACKLEASE_FILE" ]; then install_backlease_sampler "$(backlease_interval)" || warn "the back-lease host sampler was not refreshed — re-run 'memex-local backlease enroll …'"; fi
+  if [ -f "$BACKLEASE_FILE" ]; then ensure_buildhost_idle_agent || true; fi
   # §14 — `update` verified NOTHING before this: it printed "update complete" straight after the
   # rollout, which is exactly how MeshWeaver#2367's portal reported success while unusable.
   verify_usable --wait 600 --repair; verdict=$?
@@ -7066,6 +7114,7 @@ buildhost_disk_report() {
 
 cmd_buildhost() {
   local sub="${1:-status}"; shift || true
+  if [ "$sub" = idle ]; then cmd_buildhost_idle "$@"; return; fi
   [ "$sub" = apply ] && [ "$(participation_answer Jobs)" = false ] \
     && die "buildhost apply: the owner said NO to fleet jobs on this Mac ($BACKLEASE_FILE) — no build host is installed. To opt in: memex-local backlease accept jobs --from <instances>"
   buildhost_tools
@@ -7117,6 +7166,12 @@ cmd_buildhost() {
       else
         local have_status
         read -r have_cpu have_mem have_status <<<"$size"
+        if [ "$have_status" != "Running" ]; then
+          case "$(idle_state)" in stopped|draining)
+            ok "the build VM is $(idle_state) for an idle-only model ($(idle_state_line)) — '$IDLE_PLIST_LABEL' starts it the moment CI asks; nothing else is changed now"
+            return 0 ;;
+          esac
+        fi
         if [ "$have_status" != "Running" ] && { [ "$resize" != "yes" ] || { [ "${have_cpu:-0}" -ge "$cpu" ] && [ "${have_mem:-0}" -ge "$vmem" ]; }; }; then
           step "Starting the build VM (profile $BUILD_PROFILE is ${have_status:-not running})"
           colima_keep_context colima start -p "$BUILD_PROFILE" || die "buildhost: could not start the build VM (colima start -p $BUILD_PROFILE)"
@@ -7155,6 +7210,7 @@ cmd_buildhost() {
       fi
       buildhost_keda
       buildhost_priority_install
+      ensure_buildhost_idle_agent
       vm_netshape_apply "$BUILD_PROFILE"
       buildhost_gc_args_check
       buildhost_gc || true
@@ -7193,7 +7249,7 @@ print("  runners %s…%s, %s stage slots, requests %s, limits %s" % (m.get("minR
     net) shift_net_cmd "$BUILD_PROFILE" "$@" ;;
     gc) [ $# -eq 0 ] || die "buildhost gc: takes no arguments"; buildhost_gc ;;
     disk) [ $# -eq 0 ] || die "buildhost disk: takes no arguments"; buildhost_disk_report ;;
-    *) die "usage: memex-local buildhost {plan | apply [--resize] | status | gc | disk | priority [install|off|status] | net [apply|measure|off|status]}" ;;
+    *) die "usage: memex-local buildhost {plan | apply [--resize] | status | gc | disk | priority [install|off|status] | net [apply|measure|off|status] | idle [status|apply|off]}" ;;
   esac
 }
 
@@ -7206,6 +7262,97 @@ buildhost_priority_install() {
   MEMEX_BUILD_PROFILE="$BUILD_PROFILE" MEMEX_LOCAL_HOME="$LOCAL_HOME" bash "$(resolve_share)/buildhost-priority.sh" --install --profile "$BUILD_PROFILE" >/dev/null \
     && ok "launchd agent com.memex.local.buildhost-priority loaded ('memex-local buildhost priority status')" \
     || warn "the build-host priority governor did not load — the build VM competes with the owner at the default band; 'memex-local buildhost priority install'"
+}
+
+# ── IDLE-ONLY MODELS: CI first, a large model when the build host is idle (MeshWeaver.Plugins Hosting/BackLease §15.9) ──
+# The governor share/buildhost-idle.py runs as the launchd agent $IDLE_PLIST_LABEL (`memex-local buildhost idle run`)
+# whenever the owner declared idle-only token models AND this Mac has a build profile. It stops the build VM only
+# while CI has no `mac` demand and an idle-only job waits for this Mac, gives it back the moment CI asks (or after ten
+# minutes without idle-only demand), and writes the state the portal's token worker reads ($IDLE_STATE_FILE).
+# The declaration is re-read every tick; this installs, refreshes or removes the agent. Idempotent.
+
+# The governor's current state as one phrase: "running since … (reason)" or "no state file".
+idle_state_line() {
+  [ -f "$IDLE_STATE_FILE" ] || { printf 'no build-host state yet — the worker serves no idle-only model'; return 0; }
+  python3 -c 'import json,sys
+try: d = json.load(open(sys.argv[1]))
+except Exception: print("state file unreadable — the worker serves no idle-only model"); sys.exit(0)
+print("build host %s since %s: %s" % (d.get("state", "?"), d.get("since", "?"), d.get("reason", "")))' "$IDLE_STATE_FILE" 2>/dev/null \
+    || printf 'state file unreadable'
+}
+idle_state() { [ -f "$IDLE_STATE_FILE" ] && python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("state", ""))
+except Exception: pass' "$IDLE_STATE_FILE" 2>/dev/null; return 0; }
+
+# Does this Mac have the build profile (Colima keeps one directory per profile)?
+has_build_profile() { [ -d "${COLIMA_HOME:-$HOME/.colima}/$BUILD_PROFILE" ]; }
+
+install_buildhost_idle_agent() {
+  local share self; share="$(resolve_share)"
+  self="$(command -v memex-local 2>/dev/null || printf '%s' "$0")"
+  mkdir -p "$HOME/Library/LaunchAgents" "$BACKLEASE_DIR"
+  sed -e "s|__MEMEX_LOCAL__|${self}|g" -e "s|__HOME__|${LOCAL_HOME}|g" -e "s|__LOG__|${IDLE_LOG}|g" -e "s|__PROFILE__|${BUILD_PROFILE}|g" \
+      "$share/com.memex.local.buildhost-idle.plist" > "$IDLE_PLIST_DST"
+  launchctl bootout "gui/$(id -u)" "$IDLE_PLIST_DST" >/dev/null 2>&1 || true
+  if launchctl bootstrap "gui/$(id -u)" "$IDLE_PLIST_DST" >/dev/null 2>&1; then
+    ok "launchd agent '$IDLE_PLIST_LABEL' loaded — idle-only models ($ACC_TOK_IDLE) run only while CI leaves the build VM idle (log: $IDLE_LOG)"
+  else
+    warn "could not load the launchd agent '$IDLE_PLIST_LABEL' (no GUI session?) — the idle-only models are never served; the build VM keeps serving CI"
+    return 1
+  fi
+}
+
+uninstall_buildhost_idle_agent() {
+  if [ -f "$IDLE_PLIST_DST" ]; then
+    launchctl bootout "gui/$(id -u)" "$IDLE_PLIST_DST" >/dev/null 2>&1 || true
+    rm -f "$IDLE_PLIST_DST"
+    ok "launchd agent '$IDLE_PLIST_LABEL' removed"
+  fi
+}
+
+# Declared → the agent runs; withdrawn → it is removed once the build VM is back (state `running` or none); a
+# withdrawal while the VM is stopped for a model leaves the agent to drain and restart it first (it does so on its own
+# next tick: a stopped host with nothing declared drains). No build profile: nothing to govern.
+ensure_buildhost_idle_agent() {
+  accept_load
+  if [ -n "$ACC_TOK_IDLE" ] && [ "$ACC_TOK_ENABLED" = true ]; then
+    if ! has_build_profile; then info "idle-only models: no build VM (Colima profile $BUILD_PROFILE) on this Mac — nothing yields, they are served whenever the worker can"; return 0; fi
+    if [ "$HEADLESS" = "1" ]; then warn "idle-only models: a headless host has no login session for '$IDLE_PLIST_LABEL' — not installed; the worker serves no idle-only model"; return 0; fi
+    install_buildhost_idle_agent || true
+    return 0
+  fi
+  case "$(idle_state)" in
+    stopped|draining) info "idle-only models withdrawn while the build VM is $(idle_state) for them — '$IDLE_PLIST_LABEL' gives it back to CI first; 'memex-local buildhost idle off' removes it after" ;;
+    *) uninstall_buildhost_idle_agent; rm -f "$IDLE_STATE_FILE" ;;
+  esac
+}
+
+# Runs share/buildhost-idle.py with this Mac's context (the toolchain memex-local resolved on PATH: colima, kubectl).
+buildhost_idle_exec() {
+  local share; share="$(resolve_share)"
+  tools_activate
+  command -v python3 >/dev/null 2>&1 || die "buildhost idle: python3 is required (the Xcode command line tools carry it: xcode-select --install)"
+  env MEMEX_LOCAL_HOME="$LOCAL_HOME" MEMEX_BUILD_PROFILE="$BUILD_PROFILE" MEMEX_IDLE_BACKLEASE_FILE="$BACKLEASE_FILE" \
+      MEMEX_IDLE_READINGS_DIR="$BACKLEASE_DIR" MEMEX_IDLE_LOG="$IDLE_LOG" MEMEX_IDLE_KEY_FILES="$FLEET_FILE:$OVERLAY" \
+      python3 -I "$share/buildhost-idle.py" "$@"
+}
+
+cmd_buildhost_idle() {
+  case "${1:-status}" in
+    run|once) buildhost_idle_exec "$1" ;;
+    apply) ensure_buildhost_idle_agent ;;
+    status)
+      accept_load
+      info "idle-only models: ${ACC_TOK_IDLE:-none declared} — $(idle_state_line)"
+      if launchctl print "gui/$(id -u)/${IDLE_PLIST_LABEL}" >/dev/null 2>&1; then ok "governor '$IDLE_PLIST_LABEL' loaded (log: $IDLE_LOG)"
+      else info "governor '$IDLE_PLIST_LABEL' not loaded"; fi
+      [ -f "$IDLE_LOG" ] && tail -5 "$IDLE_LOG" | sed 's/^/  /'
+      return 0 ;;
+    off)
+      case "$(idle_state)" in stopped|draining) die "buildhost idle off: the build VM is $(idle_state) for an idle-only model — withdraw the models first (memex-local backlease accept tokens --idle-only-models none) and let the governor start the VM" ;; esac
+      uninstall_buildhost_idle_agent; rm -f "$IDLE_STATE_FILE" ;;
+    *) die "usage: memex-local buildhost idle {status | apply | off | run | once}" ;;
+  esac
 }
 
 # Fleet traffic yields to the owner's network too (maintainer, 2026-11-08): inside the Colima VM of profile $1, Linux tc
