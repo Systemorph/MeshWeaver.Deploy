@@ -1770,6 +1770,8 @@ HW="$(fj_lib 'FLEET_HW_MODEL="Mac Studio"; FLEET_HW_ID=""; FLEET_HW_CHIP="Apple 
 [ "$HW" = '{"model":"Mac Studio","chip":"Apple M5 Maxscript","memGb":128}' ] && ok "fleet_hw_json leaves out what it cannot read and filters what it admits" || bad "fleet_hw_json partial" "$HW"
 HW="$(fj_lib 'FLEET_HW_MODEL=""; FLEET_HW_ID=""; FLEET_HW_CHIP=""; FLEET_HW_CPU=""; FLEET_HW_GPU=""; FLEET_HW_MEM_BYTES=""; fleet_hw_json')"
 [ "$HW" = '{}' ] && ok "fleet_hw_json with nothing readable is an empty object" || bad "fleet_hw_json empty" "$HW"
+HW="$(fj_lib 'FLEET_HW_MODEL=""; FLEET_HW_ID=""; FLEET_HW_CHIP=""; FLEET_HW_CPU=""; FLEET_HW_GPU=""; FLEET_HW_MEM_BYTES=068719476736; fleet_hw_json')"
+[ "$HW" = '{"memGb":64}' ] && ok "fleet_hw_json reads the memory in base 10 (a leading zero is not octal)" || bad "fleet_hw_json base 10" "$HW"
 # Managed preferences answer the two questions (an Intune profile): a plist array or a comma string.
 PREFS="$(fj_lib 'managed_pref() { case "$1" in AcceptJobs) echo 1 ;; AcceptJobsFrom) printf "(\n    \"control.example.test\",\n    \"*.example.test\"\n)" ;; AcceptTokens) echo false ;; esac; }; fleet_participation_from_prefs; echo "$ACC_JOBS_ANSWERED $ACC_JOBS_ENABLED [$ACC_JOBS_FROM] $ACC_TOK_ANSWERED $ACC_TOK_ENABLED"')"
 [ "$PREFS" = 'yes true [control.example.test *.example.test] yes false' ] && ok "the Intune profile's AcceptJobs/AcceptJobsFrom/AcceptTokens answer both questions" || bad "participation from managed prefs" "$PREFS"

@@ -2147,7 +2147,7 @@ fleet_hw_json() {
   model="$(fleet_hw_fact "$model")"; id="$(fleet_hw_fact "$id")"; chip="$(fleet_hw_fact "$chip")"
   case "$cpu" in ''|*[!0-9]*) cpu="" ;; esac
   case "$gpu" in ''|*[!0-9]*) gpu="" ;; esac
-  case "$mem" in ''|*[!0-9]*) mem="" ;; *) mem=$(( mem / 1073741824 )) ;; esac
+  case "$mem" in ''|*[!0-9]*) mem="" ;; *) mem=$(( 10#$mem / 1073741824 )) ;; esac
   [ -z "$model" ] || out="$out,\"model\":\"$model\""
   [ -z "$id" ] || out="$out,\"id\":\"$id\""
   [ -z "$chip" ] || out="$out,\"chip\":\"$chip\""
