@@ -23,7 +23,7 @@
 #   .github/lane-caller-grants.yml — a called workflow's permissions are a hard requirement on every
 #   caller (startup_failure, zero jobs, otherwise).
 #
-# 🔁 The lane floats on `@main` with `scripts-ref: main`, like every other lane this repository calls.
+# 🔁 The lane floats on `@main3` with `scripts-ref: main3` (core's v3 line), like every other lane this repository calls.
 #
 # 🚦 The context joins protection only after this workflow has been seen published on a live pull
 # request here (classic protection blocks forever on an absent required context — Plugins#1453).
@@ -49,7 +49,7 @@ concurrency:
 
 jobs:
   review-answered:
-    uses: Systemorph/MeshWeaver/.github/workflows/node-repo-review-answered.yml@main
+    uses: Systemorph/MeshWeaver/.github/workflows/node-repo-review-answered.yml@main3
     permissions:
       contents: read
       pull-requests: read
@@ -57,4 +57,4 @@ jobs:
       checks: read
       actions: write
     with:
-      scripts-ref: main
+      scripts-ref: main3

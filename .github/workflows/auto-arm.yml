@@ -26,7 +26,7 @@
 #
 # So: one lane, seven callers, no copies. A satellite's CI calls the platform's reusable
 # workflows — it does not copy them (AGENTS.md → "never hand-roll or copy-paste a node repo's
-# CI"). The shared lane follows main; implementation changes belong there.
+# CI"). The shared lane follows core main3; implementation changes belong there.
 #
 # 🚨 The two secrets are forwarded EXPLICITLY, never `secrets: inherit` — inherit would hand the
 # platform's lane every secret this repository owns. They are named exactly as the lane declares
@@ -53,7 +53,7 @@ jobs:
   # No `timeout-minutes` — GitHub ignores it on a `uses:` job; the cap (10 minutes) lives on the
   # job inside the reusable workflow, where check-workflow-timeouts.py gates it.
   arm:
-    uses: Systemorph/MeshWeaver/.github/workflows/auto-arm.yml@main
+    uses: Systemorph/MeshWeaver/.github/workflows/auto-arm.yml@main3
     permissions:
       contents: write
       pull-requests: write
