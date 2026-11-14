@@ -110,6 +110,14 @@ findings, comparisons = [], 0
 def finding(kind, what, detail=""):
     findings.append((kind, what, detail))
 
+# INFORMATIONAL: a difference the comparison MEASURED and deliberately does not count as drift,
+# because it cannot change what the pod does. Printed, so "compared and inert" never reads as "not
+# compared" — but never an `::error::`, never in the divergence count and never in the exit code.
+# The one member today is a liveness/readiness `initialDelaySeconds` under a startupProbe (§4).
+informational = []
+def inform(what, detail):
+    informational.append((what, detail))
+
 # ---- desired ---------------------------------------------------------------
 d_cm = d_dep = None
 for doc in yaml.safe_load_all(open(desired_path)):
@@ -486,20 +494,29 @@ for label, dv, lv in [
                 f"live {json.dumps(lv)} — set on the cluster; a `helm upgrade` PRESERVES it "
                 f"(measured), but it is in no committed source")
     else:
-        note = ""
-        # A liveness/readiness `initialDelaySeconds` is INERT whenever a startupProbe is present:
-        # Kubernetes suspends both probes until the startup probe succeeds, so the delay can never
-        # be what protects a slow boot. Saying so here is what stops the recurring, and wrong,
-        # "live is authoritative — add initialDelaySeconds to the chart" conclusion on #2355.
+        # A liveness/readiness `initialDelaySeconds` is INERT whenever the running container has a
+        # startupProbe: Kubernetes suspends both probes until the startup probe succeeds, so the
+        # delay can never be what protects a slow boot. Such a difference is INFORMATIONAL, not
+        # drift (MeshWeaver#5844, Memex#148): counting it kept memex's Audit above zero for a
+        # difference no change on either side would make observable, and inviting the recurring,
+        # wrong "live is authoritative — add initialDelaySeconds to the chart" conclusion (#2355).
+        # 🚨 ONLY under a LIVE startupProbe, and ONLY when initialDelaySeconds is the sole
+        # difference: without a startupProbe the delay is exactly what holds the probe off a slow
+        # boot, so it stays DIFFERS — the self-test's negative control pins that.
+        def without_delay(p):
+            return {k: v for k, v in p.items() if k != "initialDelaySeconds"}
         if (label in ("readinessProbe", "livenessProbe")
                 and isinstance(dv, dict) and isinstance(lv, dict)
                 and l_c.get("startupProbe")
-                and {k: v for k, v in lv.items() if k != "initialDelaySeconds"} == dv):
-            note = (" — the ONLY difference is initialDelaySeconds, and this container has a "
-                    "startupProbe: Kubernetes suspends liveness AND readiness until that probe "
-                    "passes, so the delay is inert. The chart is authoritative here; do NOT "
-                    "'fix' this by adding initialDelaySeconds to the chart")
-        finding("DIFFERS", label, f"chart {json.dumps(dv)} vs live {json.dumps(lv)}{note}")
+                and without_delay(lv) == without_delay(dv)):
+            inform(label,
+                   f"initialDelaySeconds chart {dv.get('initialDelaySeconds', 0)} vs live "
+                   f"{lv.get('initialDelaySeconds', 0)} — the ONLY difference, and this container "
+                   f"has a startupProbe: Kubernetes suspends liveness AND readiness until that probe "
+                   f"passes, so the delay is inert and not counted as drift. The chart is "
+                   f"authoritative; do NOT 'fix' this by adding initialDelaySeconds to the chart")
+            continue
+        finding("DIFFERS", label, f"chart {json.dumps(dv)} vs live {json.dumps(lv)}")
 
 # ---- 5. the AVAILABILITY shape: replicas, the budget, the autoscaler --------
 # Everything above describes ONE pod's configuration. None of it can tell you how many pods there
@@ -694,8 +711,18 @@ if comparisons < MIN:
           f"reporting 'no drift' on no evidence.")
     sys.exit(1)
 
+for what, detail in sorted(informational):
+    print(f"INFORMATIONAL {what}")
+    print(f"                 {detail}")
+if informational:
+    print(f"{len(informational)} informational difference(s), not counted as drift.")
+
 if not findings:
-    print(f"No drift: {comparisons} fields compared, the cluster matches the rendered chart.")
+    # The prefix `No drift: N fields compared` is the contract hosting-chart-drift greps — only the
+    # tail may vary, and it must not claim an exact match when an inert difference was measured.
+    tail = ("the cluster matches the rendered chart apart from the informational difference(s) above"
+            if informational else "the cluster matches the rendered chart")
+    print(f"No drift: {comparisons} fields compared, {tail}.")
     sys.exit(0)
 
 # Worst first. COLLIDES and SHADOWS are live-wrong RIGHT NOW; the rest are hygiene that a deploy
@@ -739,4 +766,6 @@ print("DIFFERS       → a deploy does NOT resolve it (measured) for a ConfigMap
 print("                 decide which side is authoritative, then make the other match. The ONE")
 print("                 exception is `inline env` — helm owns an entry it renders, so an upgrade")
 print("                 DOES reset that one; the finding says so.")
+print("INFORMATIONAL → measured and NOT counted: a liveness/readiness initialDelaySeconds under a")
+print("                 startupProbe, which Kubernetes makes inert. Nothing to do.")
 sys.exit(1)

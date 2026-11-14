@@ -82,7 +82,6 @@ expect_class "SHADOWS"      "inline env Grpc__TrustedPort"
 expect_class "CLUSTER-ONLY" "inline env Features__Ai__Clis__Copilot"
 expect_class "CLUSTER-ONLY" "ConfigMap LogWatch__DefaultRepository"
 expect_class "CHART-ONLY"   "ConfigMap PluginCatalog__RegistryUrl"
-expect_class "DIFFERS"      "livenessProbe"
 # An inline env over an envFrom SECRET key — the shape the ConfigMap-only comparison could not see,
 # and the one that is live on memex today (MeshWeaver#3201).
 expect_class "SHADOWS"      "inline env PluginCatalog__RegistryToken"
@@ -204,14 +203,66 @@ else
   echo "  ok   a valueFrom env entry does not crash the comparison"
 fi
 
-# The inert-probe note: a liveness/readiness initialDelaySeconds under a startupProbe.
-if echo "$out" | grep -A1 'DIFFERS *livenessProbe' | grep -q 'startupProbe'; then
-  echo "  ok   an initialDelaySeconds-only probe diff is explained as inert"
+# The inert probe delay: the drifted live livenessProbe differs from the chart ONLY in
+# initialDelaySeconds, and the live container has a startupProbe. That is INFORMATIONAL — printed,
+# explained, never an `::error::` and never counted (MeshWeaver#5844, Memex#148).
+if echo "$out" | grep -qE '^::error::DIFFERS +livenessProbe$'; then
+  echo "::error::an initialDelaySeconds-only livenessProbe difference under a startupProbe was"
+  echo "         counted as DIFFERS — it is inert and must be INFORMATIONAL."
+  fail=1
 else
-  echo "::error::the livenessProbe DIFFERS finding does not explain that a startupProbe makes"
-  echo "         initialDelaySeconds inert — the note that stops the wrong fix."
+  echo "  ok   an initialDelaySeconds-only probe diff under a startupProbe is not counted as drift"
+fi
+if echo "$out" | grep -A1 -E '^INFORMATIONAL livenessProbe$' | grep -q 'startupProbe'; then
+  echo "  ok   …and is reported as INFORMATIONAL, explained by the startupProbe"
+else
+  echo "::error::the inert livenessProbe delay is not reported as INFORMATIONAL with its reason —"
+  echo "         'not counted' must never read as 'not compared'. Actual:"
+  echo "$out" | grep -A1 'livenessProbe' | sed 's/^/      /'
   fail=1
 fi
+
+# ---- 2b. INFORMATIONAL ONLY: an inert probe delay alone is NOT drift -------
+# The clean case's live Deployment plus an initialDelaySeconds on liveness AND readiness. The
+# container keeps its startupProbe, so the run must stay clean: exit 0, "No drift", two
+# INFORMATIONAL lines — the memex shape of 2026-11-14 (1 SHADOWS + these 2 as DIFFERS).
+drifted_out="$out"   # sections 3+ read the drifted run's output; restored below
+tmp_dep="$(mktemp)"; tmp_nostart="$(mktemp)"
+python3 - "$DATA/clean/live-deployment.json" "$tmp_dep" "$tmp_nostart" <<'PY'
+import json, sys
+dep = json.load(open(sys.argv[1]))
+c = next(c for c in dep["spec"]["template"]["spec"]["containers"] if c["name"] == "memex-portal")
+c["livenessProbe"]["initialDelaySeconds"] = 60
+c["readinessProbe"]["initialDelaySeconds"] = 30
+json.dump(dep, open(sys.argv[2], "w"))
+del c["startupProbe"]
+json.dump(dep, open(sys.argv[3], "w"))
+PY
+echo "case: clean + inert probe delays under a startupProbe (informational only)"
+out="$(run_case_with_manifest clean "$DATA/clean/release-manifest.yaml" "$DATA/clean/record.json" "$tmp_dep")"; rc=$?
+check "exit code" "0" "$rc"
+case "$out" in
+  *"No drift: "*) echo "  ok   reports 'No drift'" ;;
+  *) echo "::error::an inert probe delay alone turned a clean run into drift. Output:"; echo "$out"; fail=1 ;;
+esac
+check "INFORMATIONAL lines" "2" "$(echo "$out" | grep -cE '^INFORMATIONAL (livenessProbe|readinessProbe)$')"
+
+# ---- 2c. NEGATIVE CONTROL: the same delays WITHOUT a startupProbe still count -
+# Without a startupProbe the delay is exactly what holds liveness off a slow boot, so it is a real
+# difference. A comparator that waved every initialDelaySeconds through would pass 2b; it fails here.
+echo "case: clean + probe delays, NO startupProbe (negative control)"
+out="$(run_case_with_manifest clean "$DATA/clean/release-manifest.yaml" "$DATA/clean/record.json" "$tmp_nostart")"; rc=$?
+check "exit code" "1" "$rc"
+expect_class "DIFFERS"      "livenessProbe"
+expect_class "DIFFERS"      "readinessProbe"
+if echo "$out" | grep -qE '^INFORMATIONAL (livenessProbe|readinessProbe)$'; then
+  echo "::error::a probe delay with NO startupProbe was reported INFORMATIONAL — it is not inert."
+  fail=1
+else
+  echo "  ok   no INFORMATIONAL line without a startupProbe"
+fi
+rm -f "$tmp_dep" "$tmp_nostart"
+out="$drifted_out"
 
 # ---- 3. PENDING DELETIONS — the third side, D vs M -------------------------
 # D = the chart as CI renders it, L = the live objects, M = the last-deployed release manifest.
