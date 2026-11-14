@@ -2776,7 +2776,9 @@ def stage_processor_count(capacity: "tuple[float, Optional[int]] | str", concurr
         cpus, basis = float(seen), f"{seen} visible CPU(s) — no cgroup limit was measured: {capacity}"
     else:
         cpus = float(capacity[0])
-        basis = f"the cgroup's {cpus:g} CPU(s)" + ("" if cpus < seen else " (no CPU limit below the visible count)")
+        # cgroup_capacity folds an unlimited `cpu.max` into the visible count, so a limit EQUAL to it reads the same: the line
+        # states the number the cgroup answers, never a guess at which of the two it was
+        basis = f"the cgroup's {cpus:g} CPU(s)"
     return max(1, int(cpus // concurrent)), f"{basis} / {concurrent} stage(s) at once"
 
 
@@ -7048,7 +7050,9 @@ class Host:
         `cancel` set (the heartbeat met the 409 — the run is not this host's claim any more) kills the sandbox's whole
         tree at once and raises Lost: a build for a run another host now owns is never waited out (Deploy#49)."""
         # a warm build, the warm NuGet fill and a prepared input each run with no stage beside them: sized for ONE
-        argv = self.sandbox.argv(command, tree, out, sandbox_env(self.env, {**extra, **self.stage_processor_env(1)[0]}, self.cache),
+        cpu_env, cpu_line = self.stage_processor_env(1)
+        self.log(f"sandboxed host step: {cpu_line}")
+        argv = self.sandbox.argv(command, tree, out, sandbox_env(self.env, {**extra, **cpu_env}, self.cache),
                                  readonly=readonly, writable=writable, mount=mount, binds=binds)
         logs = tempfile.mkdtemp(prefix=".prep-log-", dir=workdir)
         try:
@@ -11663,7 +11667,11 @@ def self_test() -> int:
             got_ = stage_processor_count(cap_, conc_, "", visible=16)
             check(f"cpu/{cap_[0]:g} cgroup CPU(s) / {conc_} slot(s) -> {want_}", got_[0] == want_ and "cgroup's" in got_[1], got_)
         got_ = stage_processor_count((16.0, None), 4, "", visible=16)
-        check("cpu/no CPU limit: the visible count / slots, said", got_[0] == 4 and "no CPU limit" in got_[1], got_)
+        got_ = stage_processor_count((4.0, None), 4, "", visible=4)
+        check("cpu/a limit EQUAL to the visible count is stated as the cgroup's count, never called 'no limit'",
+              got_ == (1, "the cgroup's 4 CPU(s) / 4 stage(s) at once"), got_)
+        got_ = stage_processor_count((16.0, None), 4, "", visible=16)
+        check("cpu/no CPU limit (cgroup_capacity answers the visible count): the visible count / slots", got_[0] == 4, got_)
         got_ = stage_processor_count("the cgroup limits under /x (unreadable)", 4, "", visible=6)
         check("cpu/an unreadable cgroup: floor(visible / slots), said as visible — never as a measured limit",
               got_[0] == 1 and "visible" in got_[1] and "no cgroup limit was measured" in got_[1], got_)

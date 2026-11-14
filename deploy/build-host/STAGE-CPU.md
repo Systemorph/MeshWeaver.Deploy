@@ -43,8 +43,12 @@ The runner sets `DOTNET_PROCESSOR_COUNT` in the explicit environment of every sa
   - a `build` stage always runs alone, so it gets 1;
   - every stage of a serial run gets 1;
   - the warm build, the warm NuGet fill and a prepared input run with no stage beside them, so they also get 1.
-- **A cgroup with no CPU limit** gives the visible CPU count. **An unreadable cgroup** falls back to the visible count
-  too. The log line names which case applied. It never presents an unmeasured count as a measured limit.
+- **A cgroup with no CPU limit** gives the visible CPU count: `cgroup_capacity` folds an unlimited `cpu.max` into it,
+  so a limit equal to the visible count reads the same, and the log line states the cgroup's number without guessing
+  which of the two it was. **An unreadable cgroup** also falls back to the visible count, and that line says no limit
+  was measured. It never presents an unmeasured count as a measured limit.
+- The warm build, the warm NuGet fill and a prepared input log their count in the host's own log
+  (`sandboxed host step: DOTNET_PROCESSOR_COUNT=…`); they have no stage log.
 
 Each stage's log carries one line naming the count and its source, right after the stage's header line. For example:
 
@@ -63,7 +67,8 @@ runner hands to the stage.
 These cases are in `build-run.py --self-test`, under the `cpu/` prefix:
 
 - 4 / 4 gives 1; 4 / 1 gives 4; 16 / 4 gives 4;
-- with no CPU limit, the visible count divided by the slots;
+- with no CPU limit, the visible count divided by the slots; a limit equal to the visible count is stated as the
+  cgroup's count (the case CI's 4-CPU runner hit, where an earlier line wrongly said "no CPU limit");
 - with an unreadable cgroup, the visible count divided by the slots, and the source line says so;
 - the floor is never below 1;
 - a declared count wins;
