@@ -28,6 +28,21 @@ metadata:
     # … and given an hour each way, the same budget the portal's long-lived streams carry.
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # … and a RECEIVE WINDOW wide enough to upload a layer at line rate. 🚨 This is a throughput
+    # setting, not a timeout. The controller offers HTTP/2, and Go clients (buildx `imagetools`,
+    # containerd, crane) take it, so every layer upload is one HTTP/2 stream. With request buffering
+    # off, nginx grants a stream at most max(client_body_buffer_size, http2_body_preread_size) bytes
+    # in flight. Its default is 64 KiB, so a stream moves at most 64 KiB per round trip, whatever
+    # the link. Measured on cr: 64 KiB is the largest window the ingress granted, and a 4 MiB body
+    # took 2.5 s over HTTP/2 against 0.47 s over HTTP/1.1 from the same client (35 ms RTT). From a
+    # CI runner an ocean away that is about 0.5 MB/s per layer. One 935 MiB layer of the .NET 11
+    # portal base then needs about half an hour, and core CD's 25-minute mirror was cancelled while
+    # still copying, twice. Storage was never the limit: one 4 MiB AppendBlock took about 60 ms.
+    # nginx sizes the window to this buffer (checked against nginx 1.27.5: the default granted
+    # 65,536 bytes, 8m granted 8,323,073), so the bound becomes 8 MiB per round trip. The buffer is
+    # allocated per request at min(Content-Length + 1, this size), only for requests with a body on
+    # this host. Nothing is written to disk: buffering stays off.
+    nginx.ingress.kubernetes.io/client-body-buffer-size: "8m"
 spec:
   ingressClassName: {{ $r.ingressClassName | quote }}
   tls:
