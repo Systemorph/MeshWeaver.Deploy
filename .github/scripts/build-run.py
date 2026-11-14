@@ -6959,7 +6959,7 @@ class Host:
             rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", f"{what}^{{commit}}"], genv)
             base = out.strip().splitlines()[-1].strip().lower() if rc == 0 and out.strip() else ""
             if not SHA.match(base):
-                raise Refusal(f"{'the base line ' + repr(base_ref) if base_ref else 'the default branch'}'s tip could not be "
+                raise Refusal(f"{'the base line ' + base_ref if base_ref else 'the default branch'}'s tip could not be "
                               f"resolved from the mirror (exit {rc}) — never merged onto another line: {out.strip()[-160:]}")
             self.log(f"merge base: the tip of {'the base line ' + base_ref if base_ref else 'the default branch (the claim names no base)'}"
                      f" = {base[:12]}")
@@ -7037,17 +7037,17 @@ class Host:
         try:
             decl = validate_restore(json.loads(doc)) if rc == 0 else None
         except (ValueError, Refusal) as e:
-            return {"state": "none", "text": f"warm NuGet cache: the default branch's tip {tip[:12]} declares no usable `restore` ({e})"}
+            return {"state": "none", "text": f"warm NuGet cache: the {'line ' + line if line else 'default branch'}'s tip {tip[:12]} declares no usable `restore` ({e})"}
         if decl is None:
-            return {"state": "none", "text": f"warm NuGet cache: the default branch's tip {tip[:12]} declares no `restore` — "
+            return {"state": "none", "text": f"warm NuGet cache: the {'line ' + line if line else 'default branch'}'s tip {tip[:12]} declares no `restore` — "
                                              "the cache is filled only by trunk builds"}
         rc, listing = self.git_runner(["--git-dir", mirror, "ls-tree", "-r", "--full-tree", tip], genv)
         if rc != 0:
-            return {"state": "none", "text": f"warm NuGet cache: the default branch's tip {tip[:12]} could not be listed (exit {rc})"}
+            return {"state": "none", "text": f"warm NuGet cache: the {'line ' + line if line else 'default branch'}'s tip {tip[:12]} could not be listed (exit {rc})"}
         key = nuget_warm_key(listing, decl["command"], self.platform_version)
         marker = nuget_warm_marker(self.cache, repo, key)
         if os.path.isfile(marker):
-            return {"state": "held", "text": f"warm NuGet cache: holds the default branch's restore (tip {tip[:12]}, key {key[:12]}) "
+            return {"state": "held", "text": f"warm NuGet cache: holds the {'line ' + line if line else 'default branch'}'s restore (tip {tip[:12]}, key {key[:12]}) "
                                              "— nothing restored for the server"}
         return {"state": "warm", "tip": tip, "key": key, "marker": marker, "line": line, **decl}
 
@@ -7159,7 +7159,7 @@ class Host:
             views.close()                                  # the platform view: unmounted or its cold worktree removed + pruned
         secs = int(self.clock() - started)
         if rc != 0 or nr:
-            warn(f"the warm NuGet cache was not filled from the default branch's tip {tip[:12]} (restore exit {rc}"
+            warn(f"the warm NuGet cache was not filled from the {'line ' + plan['line'] if plan.get('line') else 'default branch'}'s tip {tip[:12]} (restore exit {rc}"
                  + (f", {len(nr)} package(s) failed verification: {nr[:5]}" if nr else "") + f"): {text.strip()[-400:]}")
             return
         try:
@@ -7236,7 +7236,7 @@ class Host:
                      ["-C", tree, "checkout", "--quiet", "--detach", tip]):
             rc, out = self.git_runner(args, genv)
             if rc != 0:
-                raise Refusal(f"the default branch's tip {tip[:12]} could not be checked out (exit {rc}): {out.strip()[-160:]}")
+                raise Refusal(f"the {'line ' + line if line else 'default branch'}'s tip {tip[:12]} could not be checked out (exit {rc}): {out.strip()[-160:]}")
         return tip, tree
 
     def prepare_inputs(self, repo: str, checkout: str, workdir: str, trunk: bool, inputs: list[dict],
@@ -12903,7 +12903,7 @@ def self_test() -> int:
             {"name": "a", "kind": "build", "command": "true"}]})).run(pr_onto("main9"))
         rf = [e for _, es in posted for e in es if e["kind"] == "run-finished"]
         check("line/an unresolvable base line is red by name, never merged onto another line",
-              rf and rf[0]["succeeded"] is False and "'main9'" in rf[0]["error"] and not any("merge" in a for a in lg) and not plans(),
+              rf and rf[0]["succeeded"] is False and "the base line main9's tip" in rf[0]["error"] and not any("merge" in a for a in lg) and not plans(),
               (rf, lg))
         # the warm restore's plan reads the run's line tip: main3 for a main3 pull request, the default branch otherwise
         for base_, want_ref in (("main3", "refs/heads/main3^{commit}"), ("feat/stack", "HEAD^{commit}"), (None, "HEAD^{commit}")):
@@ -12912,6 +12912,9 @@ def self_test() -> int:
             wp = hw.nuget_warm_plan("MeshWeaver", tmp, warm_line(base_))
             revs = [a[-1] for a in lg if "rev-parse" in a]
             check(f"line/the warm restore for a run onto {base_ or '(none)'} reads {want_ref.split('^')[0]}'s tip", revs == [want_ref], (revs, wp))
+            if base_ == "main3":
+                check("line/... and every warm-plan sentence names the line it read, never the default branch",
+                      "line main3's" in wp["text"] and "default branch" not in wp["text"], wp)
         lg = []
         hw = host(api_ev(), env=env_s, git_runner=line_git(lg, {}))
         wp = hw.nuget_warm_plan("MeshWeaver", tmp, "main3")
