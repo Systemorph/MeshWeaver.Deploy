@@ -119,9 +119,23 @@ jobs:
         id: ceiling
         env:
           GH_TOKEN: ${{ steps.reader.outputs.token }}
+        # 🚨 THE LANE'S OWN LINE (policy major-lines-run-separately; MeshWeaver.Deploy#302). A resolver
+        # reads the CD runs (and the satellite branch of the ceiling) of the ONE core line it serves, so
+        # core main's copy would read the v4 line. `stable` names no major: build-host-announcement.py
+        # `line-major` says which one it reads (the compatibility line `latest` names), platform-line.py
+        # places that major on its line exactly as build-host.yml's hand-over places its set (none, or
+        # several, is RED), and the resolver is fetched AT that line and told it through MW_CORE_LINE.
         run: |
           set -euo pipefail
-          python3 platform/.github/scripts/resolve-platform.py --no-registry --passed-on-main Systemorph/MeshWeaver.Plugins \
+          major=$(python3 deploy/.github/scripts/build-host-announcement.py line-major --channel stable)
+          python3 deploy/.github/scripts/platform-line.py of-major --major "$major" --repo Systemorph/MeshWeaver > "$RUNNER_TEMP/stable-line" \
+            || { cat "$RUNNER_TEMP/stable-line"; echo "::error::build-stable's core line could not be placed — build-stable was NOT handed a set"; exit 1; }
+          line=$(sed -n 's/^line=//p' "$RUNNER_TEMP/stable-line")
+          [ -n "$line" ] || { echo "::error::platform-line.py named no line for major $major"; exit 1; }
+          echo "build-stable reads major $major — core line $line ($(sed -n 's/^majors=//p' "$RUNNER_TEMP/stable-line"))"
+          gh api "repos/Systemorph/MeshWeaver/contents/.github/scripts/resolve-platform.py?ref=$line" \
+            -H "Accept: application/vnd.github.raw" > "$RUNNER_TEMP/resolve-platform.py"
+          MW_CORE_LINE="$line" python3 "$RUNNER_TEMP/resolve-platform.py" --no-registry --passed-on-main Systemorph/MeshWeaver.Plugins \
             || { echo "::error::the main-passed ceiling could not be read — the fleet-reader token needs Actions: read and Checks: read on MeshWeaver.Plugins (its main runs and their annotations). build-stable was NOT handed a set."; exit 1; }
       - name: Ensure Azure CLI
         if: steps.build_host_stable.outputs.enabled == 'true'
