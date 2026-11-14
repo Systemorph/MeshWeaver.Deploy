@@ -684,18 +684,28 @@ jobs:
           done
 
   handover:
-    name: "Build host: hand the armed set to build-latest (record path)"
+    name: "Build host: hand line ${{ matrix.major }}'s armed set to its channels (record path)"
     # ORDERED after the runner image, so a set is never handed over before its mw-build-host
     # exists; and it runs on EVERY hand-over, not only an arming one: it hands over the NEWEST ARMED
     # set each time, so a hand-over missed once is recovered by the next tick.
+    # 🧵 ONE LEG PER MAJOR LINE (policy major-lines-run-separately): each leg hands over the newest
+    # armed set OF ITS MAJOR (`arm-promoted-set.py armed-state --major`) to that line's declared
+    # channels — `latest3` and the compatibility `latest` for 3, `latest4` for 4. Before the legs, the
+    # ONE newest armed set of any major was handed over, so the first armed 4.x set would have stopped
+    # every v3 channel moving. The legs are listed here (a matrix cannot read a file); a line the
+    # declaration follows that has no leg is RED in every leg, naming it (`LEG_MAJORS` below).
     needs: [preflight, image]
     if: >-
       always() && (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch') &&
       needs.preflight.result == 'success' && needs.image.result != 'cancelled'
+    strategy:
+      fail-fast: false
+      matrix:
+        major: [3, 4]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
-      group: build-host-handover
+      group: build-host-handover-${{ matrix.major }}
       cancel-in-progress: false
     permissions:
       contents: read
@@ -722,17 +732,45 @@ jobs:
             .github/scripts
             .github/control-instance.json
           sparse-checkout-cone-mode: false
+      # arm-promoted-set.py's per-major cursor (`armed-state --major`) from the platform's DEFAULT branch: the sending
+      # run's commit may be a backfill set's, older than the per-major reading. PUBLIC: no token.
+      - name: Check out the platform's arming cursor (default branch)
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PLATFORM_REPO }}
+          path: platform-main
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
       - name: "The announcement can say no (self-test)"
         run: python3 deploy/.github/scripts/build-host-announcement.py --self-test
+      - name: "Does the declaration follow line ${{ matrix.major }}? (every declared line has a leg)"
+        id: line
+        env:
+          MAJOR: ${{ matrix.major }}
+          LEG_MAJORS: "3 4"
+        run: |
+          set -euo pipefail
+          out=$(python3 deploy/.github/scripts/build-host-announcement.py majors --declaration deploy/.github/build-hosts.json)
+          majors=$(printf '%s\n' "$out" | sed -n 's/^majors=//p')
+          for m in $majors; do
+            case " $LEG_MAJORS " in *" $m "*) ;; *) echo "::error::.github/build-hosts.json follows line $m, but the handover matrix has no leg for it (legs: $LEG_MAJORS) — add $m to the matrix and to LEG_MAJORS"; exit 1 ;; esac
+          done
+          case " $majors " in
+            *" $MAJOR "*) echo "follows=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "follows=false" >> "$GITHUB_OUTPUT"
+               echo "- build-host line $MAJOR: no declared channel follows it (.github/build-hosts.json: ${majors:-none}) — nothing handed over" >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
       - name: "Does this estate run standing build hosts?"
         id: build_host
+        if: steps.line.outputs.follows == 'true'
         run: |
           set -euo pipefail
           python3 deploy/.github/scripts/build-host-announcement.py decide --channel latest \
             --declaration deploy/.github/build-hosts.json --control-instance platform/.github/control-instance.json \
             | tee -a "$GITHUB_OUTPUT"
       - name: Not enabled — say so and send nothing
-        if: steps.build_host.outputs.enabled != 'true'
+        if: steps.line.outputs.follows == 'true' && steps.build_host.outputs.enabled != 'true'
         env:
           WHY: ${{ steps.build_host.outputs.why }}
         run: |
@@ -765,10 +803,11 @@ jobs:
           # (least privilege), so it signs in tenant-level; the registry is then reached through its
           # data plane only (acr-data-plane.py), never through an ARM lookup.
           allow-no-subscriptions: true
-      - name: "The newest armed set, and its runner"
+      - name: "The newest armed set of line ${{ matrix.major }}, and its runner"
         id: build_host_current
         if: steps.build_host.outputs.enabled == 'true'
         env:
+          MAJOR: ${{ matrix.major }}
           ARMED_HERE: ${{ needs.preflight.outputs.armed }}
           V_ARMED_HERE: ${{ needs.preflight.outputs.armed_version }}
           CORE_HERE: ${{ needs.preflight.outputs.armed_core_sha }}
@@ -781,9 +820,18 @@ jobs:
           set -euo pipefail
           python3 deploy/.github/scripts/acr-data-plane.py manifests --registry "$ACR" --tenant "$AZURE_TENANT_ID" \
             --repository memex-portal-ai --top 300 > "$RUNNER_TEMP/portal-manifests.json"
-          st=$(python3 platform/.github/scripts/arm-promoted-set.py armed-state --manifests "$RUNNER_TEMP/portal-manifests.json")
-          newest=$(printf '%s' "$st" | jq -r '.version // empty')
-          [ -n "$newest" ] || { echo "::error::no armed set could be read from memex-portal-ai — nothing to hand build-latest, and nothing to say it is current"; exit 1; }
+          # The cursor's own exit status decides (an unreadable listing is RED); its last line is the JSON row.
+          st=$(env -u GITHUB_OUTPUT python3 platform-main/.github/scripts/arm-promoted-set.py armed-state --major "$MAJOR" \
+            --manifests "$RUNNER_TEMP/portal-manifests.json") || { printf '%s\n' "$st"; exit 1; }
+          newest=$(printf '%s\n' "$st" | tail -n 1 | jq -r '.version // empty')
+          if [ -z "$newest" ]; then
+            # A line that has armed no set yet (a new major's first days) holds its channels where they are — said.
+            echo "send=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Line $MAJOR has no armed set::no $MAJOR.x set is armed in memex-portal-ai yet — line $MAJOR's build-host channels keep their set"
+            echo "- build-host line $MAJOR: no armed $MAJOR.x set yet — not handed over" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          case "$newest" in "$MAJOR".*) ;; *) echo "::error::armed-state --major $MAJOR answered $newest, a set of another major — refusing to hand it over"; exit 1 ;; esac
           python3 platform/.github/scripts/platform-version.py ordinal "$newest" >/dev/null \
             || { echo "::error::the newest armed set '$newest' carries no run ordinal — the armed-state reading is not trustworthy"; exit 1; }
           # 🚨 THE CHANNEL NAMES ONLY A SEALED SET. Arming does not wait for the platform bake or

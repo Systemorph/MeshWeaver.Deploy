@@ -710,6 +710,37 @@ def pull_request_number(refs: list) -> Optional[int]:
     return None
 
 
+# A git branch name a claim may name as a pull request's base: one or more path segments of safe characters, never an
+# option, never `..`, never a lock file or a trailing slash (git check-ref-format's rules that matter here).
+BASE_REF_NAME = re.compile(r"(?!-)(?!.*\.\.)(?!.*//)(?!.*\.lock(?:/|$))[A-Za-z0-9._][A-Za-z0-9._/-]{0,199}(?<![/.])")
+# A DELIVERY LINE other than the default branch (policy `major-lines-run-separately`, platform
+# Doc/Architecture/MajorLinesRunSeparately): `main<major>` — `main3` is the v3 line in every repository that has one, cut
+# with the ruleset main has. Only such a line (or the default branch) may fill the SHARED warm NuGet cache: a stacked pull
+# request's feature-branch base is not protected content, so its tip never writes what other runs read.
+LINE_BRANCH = re.compile(r"main[1-9][0-9]{0,2}")
+
+
+def pull_request_base_ref(refs: list) -> Optional[str]:
+    """The base branch a claim's pull-request ref names (`{kind: PullRequest, baseRef}` — the admission's
+    `ref.baseRef`, carried by the operations instance on every claim), or None when none is named or the name is not a
+    safe branch name. Pure."""
+    for r in refs or []:
+        if not isinstance(r, dict):
+            continue
+        kind = r.get("kind")
+        is_pr = (kind == 1 and not isinstance(kind, bool)) or str(kind).strip().lower() in ("pullrequest", "pull_request", "1")
+        base = r.get("baseRef")
+        if is_pr and isinstance(base, str) and BASE_REF_NAME.fullmatch(base.strip()):
+            return base.strip()
+    return None
+
+
+def warm_line(base_ref: Optional[str]) -> Optional[str]:
+    """The line whose tip warms the shared NuGet cache for a run onto `base_ref`: that branch when it is a delivery line
+    (`main<major>`), else None — the default branch, as before. Pure."""
+    return base_ref if base_ref and LINE_BRANCH.fullmatch(base_ref) else None
+
+
 def module_hub_enabled(env: dict) -> bool:
     return (env.get("MW_BUILD_MODULE_HUB_ENABLED") or "").strip().lower() in ("1", "true", "yes")
 
@@ -6517,12 +6548,17 @@ class Host:
                 # merged. The base is named in the plan; the instance refuses a PR success whose plan
                 # names another sha, or none.
                 merge_base = None
+                base_ref = None
                 probe = claim.get("isProbe") is True or str(claim.get("kind") or "").lower() == "probe"
                 # a probe that NAMES a pull request is measured on the tree that pull request's own run builds: merged once
                 # onto the same base (its narrowing reads HEAD^2...HEAD, its module hub the pull-request lane); a plain
                 # probe is not merged
+                # 🧵 THE BASE LINE (policy major-lines-run-separately): a pull request is merged onto ITS base branch's
+                # tip (`refs[].baseRef`), never the default branch's — a main3 pull request merged onto main tested a
+                # tree nobody would ever merge (core #8216 onto bdaa436b).
+                base_ref = None if trunk else pull_request_base_ref(claim.get("refs") or [])
                 if not trunk and (not probe or pull_request_number(claim.get("refs") or []) is not None):
-                    merge_base = self.merge_onto_base(repo, checkout_dir, claim.get("mergeBaseSha"), token)
+                    merge_base = self.merge_onto_base(repo, checkout_dir, claim.get("mergeBaseSha"), token, base_ref)
                 declared = load_stages(os.path.join(checkout_dir, ".github", "build-stages.json"))
                 prepared_inputs = load_prepared(os.path.join(checkout_dir, ".github", "build-stages.json"))
                 parallel = load_parallel(os.path.join(checkout_dir, ".github", "build-stages.json"))
@@ -6561,7 +6597,7 @@ class Host:
             plan = self._sink_for(repo, sha, stages[0]["name"])
             # The run's declared execution budget: the instance sets the attempt's deadline to claim
             # time + budget + 15 min. The host enforces the same number (`budget`, below).
-            warm = self.nuget_warm_plan(repo, workdir)
+            warm = self.nuget_warm_plan(repo, workdir, warm_line(base_ref))
             # Fan-out: the repository declares its stages safe to run concurrently (`parallel`), the host declares how many
             # may (`MW_BUILD_STAGE_SLOTS`); either one absent is today's serial run.
             slots = self.stage_slots if parallel else 1
@@ -6899,12 +6935,16 @@ class Host:
             self.sandbox.readonly = tuple(p for p in self.sandbox.readonly if p != src) + (staged,)
         return staged
 
-    def merge_onto_base(self, repo: str, checkout: str, claimed: object, token: Optional[str]) -> str:
+    def merge_onto_base(self, repo: str, checkout: str, claimed: object, token: Optional[str],
+                        base_ref: Optional[str] = None) -> str:
         """Merge the checked-out head onto ONE base and return that base's sha. `claimed` is the
-        claim's `mergeBaseSha`: used VERBATIM (fetched if absent) when given; when null, main's tip
-        is resolved ONCE from the repository's mirror (its HEAD — the default branch, fetched just
-        before the checkout). The merge happens once, in the run's checkout, so every stage tests the
-        same merged tree; a conflict is a Refusal naming the base."""
+        claim's `mergeBaseSha`: used VERBATIM (fetched if absent) when given; when null, the tip of the
+        pull request's BASE branch (`base_ref`, the claim's `refs[].baseRef`) is resolved ONCE from the
+        repository's mirror (fetched just before the checkout) — a `main3` pull request onto main3's tip,
+        never main's (policy major-lines-run-separately). A base the mirror cannot resolve is a Refusal
+        naming it, never a fall-back to the default branch. Only a claim that names no base (an older
+        instance) is merged onto the mirror's HEAD, the default branch. The merge happens once, in the
+        run's checkout, so every stage tests the same merged tree; a conflict is a Refusal naming the base."""
         genv = {**{k: self.env[k] for k in ("PATH", "LANG", "SSL_CERT_FILE", "SSL_CERT_DIR") if self.env.get(k)},
                 "HOME": os.path.dirname(checkout), **git_auth_env(token),
                 "GIT_AUTHOR_NAME": "build host", "GIT_AUTHOR_EMAIL": "build-host@invalid",
@@ -6915,10 +6955,14 @@ class Host:
                 raise Refusal(f"the claim's mergeBaseSha {claimed!r} is not a full commit")
         else:
             mirror = os.path.join(self.cache, "git", f"{repo}.git")
-            rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", "HEAD^{commit}"], genv)
+            what = f"refs/heads/{base_ref}" if base_ref else "HEAD"
+            rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", f"{what}^{{commit}}"], genv)
             base = out.strip().splitlines()[-1].strip().lower() if rc == 0 and out.strip() else ""
             if not SHA.match(base):
-                raise Refusal(f"main's tip could not be resolved from the mirror (exit {rc}): {out.strip()[-160:]}")
+                raise Refusal(f"{'the base line ' + base_ref if base_ref else 'the default branch'}'s tip could not be "
+                              f"resolved from the mirror (exit {rc}) — never merged onto another line: {out.strip()[-160:]}")
+            self.log(f"merge base: the tip of {'the base line ' + base_ref if base_ref else 'the default branch (the claim names no base)'}"
+                     f" = {base[:12]}")
         rc, out = self.git_runner(["-C", checkout, "fetch", "--quiet", "origin", base], genv)
         if rc != 0:
             raise Refusal(f"the merge base {base[:12]} could not be fetched (exit {rc}): {out.strip()[-160:]}")
@@ -6967,43 +7011,45 @@ class Host:
                     continue
         return gone
 
-    def nuget_warm_plan(self, repo: str, workdir: str) -> dict:
-        """What the warm NuGet cache needs for this repository's DEFAULT BRANCH tip, read from the host's mirror only (the
+    def nuget_warm_plan(self, repo: str, workdir: str, line: Optional[str] = None) -> dict:
+        """What the warm NuGet cache needs for this run's LINE tip — `line` (a delivery line, `warm_line`) or, when None, the
+        DEFAULT BRANCH — read from the host's mirror only (the
         run's own tree is never consulted): `state` is `warm` (the tip declares a restore whose key the cache does not
         hold yet — `tip`, `key`, `command`, `timeoutMinutes`, `marker`), `held` (it does) or `none` (nothing to do), with
         `text` saying which. Never raises: a mirror that cannot answer — a nonzero exit, a git that times out, an I/O error —
         is said and the run proceeds unwarmed (the cache is optional; a run's verdict never hangs on it)."""
         try:
-            return self._nuget_warm_plan(repo, workdir)
+            return self._nuget_warm_plan(repo, workdir, line)
         except (subprocess.SubprocessError, OSError, ValueError) as e:
             return {"state": "none", "text": f"warm NuGet cache: the mirror could not be read ({type(e).__name__}: {str(e)[:160]}) "
                                              "— not warmed this run"}
 
-    def _nuget_warm_plan(self, repo: str, workdir: str) -> dict:
+    def _nuget_warm_plan(self, repo: str, workdir: str, line: Optional[str] = None) -> dict:
         mirror = os.path.join(self.cache, "git", f"{repo}.git")
         genv = {**{k: self.env[k] for k in ("PATH", "LANG") if self.env.get(k)}, "HOME": workdir, "GIT_TERMINAL_PROMPT": "0"}
-        rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", "HEAD^{commit}"], genv)
+        what = f"refs/heads/{line}" if line else "HEAD"
+        rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", f"{what}^{{commit}}"], genv)
         tip = out.strip().splitlines()[-1].strip().lower() if rc == 0 and out.strip() else ""
         if not SHA.match(tip):
-            return {"state": "none", "text": f"warm NuGet cache: the default branch's tip could not be resolved from the mirror "
-                                             f"(exit {rc}) — not warmed this run"}
+            return {"state": "none", "text": f"warm NuGet cache: the {'line ' + line if line else 'default branch'}'s tip could not be "
+                                             f"resolved from the mirror (exit {rc}) — not warmed this run"}
         rc, doc = self.git_runner(["--git-dir", mirror, "show", f"{tip}:.github/build-stages.json"], genv)
         try:
             decl = validate_restore(json.loads(doc)) if rc == 0 else None
         except (ValueError, Refusal) as e:
-            return {"state": "none", "text": f"warm NuGet cache: the default branch's tip {tip[:12]} declares no usable `restore` ({e})"}
+            return {"state": "none", "text": f"warm NuGet cache: the {'line ' + line if line else 'default branch'}'s tip {tip[:12]} declares no usable `restore` ({e})"}
         if decl is None:
-            return {"state": "none", "text": f"warm NuGet cache: the default branch's tip {tip[:12]} declares no `restore` — "
+            return {"state": "none", "text": f"warm NuGet cache: the {'line ' + line if line else 'default branch'}'s tip {tip[:12]} declares no `restore` — "
                                              "the cache is filled only by trunk builds"}
         rc, listing = self.git_runner(["--git-dir", mirror, "ls-tree", "-r", "--full-tree", tip], genv)
         if rc != 0:
-            return {"state": "none", "text": f"warm NuGet cache: the default branch's tip {tip[:12]} could not be listed (exit {rc})"}
+            return {"state": "none", "text": f"warm NuGet cache: the {'line ' + line if line else 'default branch'}'s tip {tip[:12]} could not be listed (exit {rc})"}
         key = nuget_warm_key(listing, decl["command"], self.platform_version)
         marker = nuget_warm_marker(self.cache, repo, key)
         if os.path.isfile(marker):
-            return {"state": "held", "text": f"warm NuGet cache: holds the default branch's restore (tip {tip[:12]}, key {key[:12]}) "
+            return {"state": "held", "text": f"warm NuGet cache: holds the {'line ' + line if line else 'default branch'}'s restore (tip {tip[:12]}, key {key[:12]}) "
                                              "— nothing restored for the server"}
-        return {"state": "warm", "tip": tip, "key": key, "marker": marker, **decl}
+        return {"state": "warm", "tip": tip, "key": key, "marker": marker, "line": line, **decl}
 
     def platform_env(self) -> dict:
         """The INSTALLED platform's facts a repository-declared command on this host is handed: the set's identity (what
@@ -7064,12 +7110,13 @@ class Host:
         # Every host-side failure at this boundary (a git that times out, an I/O error) is SAID and the run goes on:
         # warming is optional, so it must never end the worker without a run verdict.
         try:
-            tip, tree = self.default_branch_tree(repo, workdir)
+            tip, tree = self.default_branch_tree(repo, workdir, plan.get("line"))
         except (Refusal, subprocess.SubprocessError, OSError, ValueError) as r:
             warn(f"the warm NuGet cache was not filled: {r}")
             return
         if tip != plan["tip"]:
-            warn(f"the warm NuGet cache was not filled: the default branch moved ({plan['tip'][:12]} → {tip[:12]}) while it was planned")
+            warn(f"the warm NuGet cache was not filled: the {'line ' + plan['line'] if plan.get('line') else 'default branch'} moved "
+                 f"({plan['tip'][:12]} → {tip[:12]}) while it was planned")
             return
         left = run_end - self.clock()
         if left <= 0:
@@ -7112,7 +7159,7 @@ class Host:
             views.close()                                  # the platform view: unmounted or its cold worktree removed + pruned
         secs = int(self.clock() - started)
         if rc != 0 or nr:
-            warn(f"the warm NuGet cache was not filled from the default branch's tip {tip[:12]} (restore exit {rc}"
+            warn(f"the warm NuGet cache was not filled from the {'line ' + plan['line'] if plan.get('line') else 'default branch'}'s tip {tip[:12]} (restore exit {rc}"
                  + (f", {len(nr)} package(s) failed verification: {nr[:5]}" if nr else "") + f"): {text.strip()[-400:]}")
             return
         try:
@@ -7121,7 +7168,8 @@ class Host:
         except OSError as e:
             warn(f"the warm NuGet cache was filled but its key could not be marked ({e})")
             return
-        sink.add([{"kind": "line", "text": f"warm NuGet cache: filled from the default branch's tip {tip[:12]} (key {plan['key'][:12]}, "
+        sink.add([{"kind": "line", "text": f"warm NuGet cache: filled from the {'line ' + plan['line'] if plan.get('line') else 'default branch'}'s "
+                                           f"tip {tip[:12]} (key {plan['key'][:12]}, "
                                            f"{secs} s): {np_} package(s) promoted, {nk} already present — later runs restore nothing"}])
         self.deliver(sink)
 
@@ -7169,23 +7217,26 @@ class Host:
         finally:
             shutil.rmtree(logs, ignore_errors=True)
 
-    def default_branch_tree(self, repo: str, workdir: str) -> tuple[str, str]:
-        """The repository's DEFAULT BRANCH tip as a host-made tree: the mirror's HEAD (the default branch, fetched just
-        before this run's checkout) cloned `--shared` from the LOCAL mirror and checked out detached — no network, no
-        credential, and none of the run's own content. Returns (tip sha, tree). Raises Refusal, naming why."""
+    def default_branch_tree(self, repo: str, workdir: str, line: Optional[str] = None) -> tuple[str, str]:
+        """The repository's DEFAULT BRANCH tip — or, with `line`, that delivery line's tip (`refs/heads/<line>`) — as a
+        host-made tree: resolved in the mirror (fetched just before this run's checkout), cloned `--shared` from the LOCAL
+        mirror and checked out detached — no network, no credential, and none of the run's own content. Returns (tip sha,
+        tree). Raises Refusal, naming why."""
         mirror = os.path.join(self.cache, "git", f"{repo}.git")
         tree = os.path.join(workdir, "default-branch")
         genv = {**{k: self.env[k] for k in ("PATH", "LANG") if self.env.get(k)}, "HOME": workdir, "GIT_TERMINAL_PROMPT": "0"}
-        rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", "HEAD^{commit}"], genv)
+        what = f"refs/heads/{line}" if line else "HEAD"
+        rc, out = self.git_runner(["--git-dir", mirror, "rev-parse", "--verify", f"{what}^{{commit}}"], genv)
         tip = out.strip().splitlines()[-1].strip().lower() if rc == 0 and out.strip() else ""
         if not SHA.match(tip):
-            raise Refusal(f"the default branch's tip could not be resolved from the mirror (exit {rc}): {out.strip()[-160:]}")
+            raise Refusal(f"the {'line ' + line if line else 'default branch'}'s tip could not be resolved from the mirror "
+                          f"(exit {rc}): {out.strip()[-160:]}")
         shutil.rmtree(tree, ignore_errors=True)
         for args in (["clone", "--quiet", "--shared", "--no-checkout", mirror, tree],
                      ["-C", tree, "checkout", "--quiet", "--detach", tip]):
             rc, out = self.git_runner(args, genv)
             if rc != 0:
-                raise Refusal(f"the default branch's tip {tip[:12]} could not be checked out (exit {rc}): {out.strip()[-160:]}")
+                raise Refusal(f"the {'line ' + line if line else 'default branch'}'s tip {tip[:12]} could not be checked out (exit {rc}): {out.strip()[-160:]}")
         return tip, tree
 
     def prepare_inputs(self, repo: str, checkout: str, workdir: str, trunk: bool, inputs: list[dict],
@@ -12798,6 +12849,88 @@ def self_test() -> int:
                                 refs=[{"kind": 1, "name": "probe/p-2", "number": 5107, "baseRef": "main"}]))
         check("merge/a PR-named probe whose kind arrives as the NUMBER the claim answer writes is merged too",
               sum(1 for a in gl if "merge" in a) == 1 and plans()[0].get("mergeBase") == "e" * 40, (gl, plans()))
+        # 🧵 THE BASE LINE (policy major-lines-run-separately; core #8216 was merged onto bdaa436b, a MAIN commit not on
+        # main3): a pull request is merged onto its BASE branch's tip, and the warm restore reads that line's tip.
+        check("line/the claim's pull-request ref names its base", pull_request_base_ref(
+            [{"kind": 1, "name": "fix/x", "number": 8216, "baseRef": "main3"}]) == "main3")
+        check("line/a base on the name form and a string ref", pull_request_base_ref(
+            ["refs/pull/9/head", {"kind": "PullRequest", "number": 9, "baseRef": "main"}]) == "main")
+        for bad_ref in ([], [{"kind": "Branch", "name": "main", "baseRef": "main3"}], [{"kind": 1, "number": 1}],
+                        [{"kind": 1, "number": 1, "baseRef": "-oops"}], [{"kind": 1, "number": 1, "baseRef": "a..b"}],
+                        [{"kind": 1, "number": 1, "baseRef": "main3/"}], [{"kind": 1, "number": 1, "baseRef": 3}],
+                        [{"kind": 1, "number": 1, "baseRef": "x.lock"}], [{"kind": 1, "number": 1, "baseRef": "a b"}]):
+            check(f"line/no usable base in {bad_ref!r}", pull_request_base_ref(bad_ref) is None, pull_request_base_ref(bad_ref))
+        check("line/a delivery line warms from its own tip", warm_line("main3") == "main3" and warm_line("main4") == "main4")
+        check("line/negative control: the default branch, a stacked feature base and none warm from the default branch",
+              warm_line("main") is None and warm_line("feat/stack") is None and warm_line("main03") is None and warm_line(None) is None)
+
+        def line_git(log_, tips):
+            def g(args, env_):
+                log_.append(args)
+                if "rev-parse" in args:
+                    t_ = tips.get(args[-1])
+                    return (0, t_ + "\n") if t_ else (128, f"fatal: Needed a single revision ({args[-1]})")
+                if "merge" in args and "--abort" not in args:
+                    return 0, ""
+                return 0, ""
+            return g
+        line_tips = {"HEAD^{commit}": "e" * 40, "refs/heads/main^{commit}": "e" * 40, "refs/heads/main3^{commit}": "3" * 40}
+        pr_onto = lambda base_: dict(claim, isTrunk=False, mergeBaseSha=None,
+                                     refs=[{"kind": 1, "name": "fix/x", "number": 8216, **({"baseRef": base_} if base_ else {})}])
+        for base_, want_ref, want_sha in (("main3", "refs/heads/main3^{commit}", "3" * 40),
+                                          ("main", "refs/heads/main^{commit}", "e" * 40),
+                                          (None, "HEAD^{commit}", "e" * 40)):
+            lg: list = []
+            posted.clear()
+            host(api_ev(), env=env_s, git_runner=line_git(lg, line_tips), checkout=checkout_with({"stages": [
+                {"name": "a", "kind": "build", "command": "true"}]})).run(pr_onto(base_))
+            merged = [a for a in lg if "merge" in a and "--abort" not in a]
+            check(f"line/a pull request onto {base_ or '(no base named)'} is merged onto {want_ref.split('^')[0]} = {want_sha[:6]}",
+                  len(merged) == 1 and merged[0][-1] == want_sha and plans() and plans()[0].get("mergeBase") == want_sha, (lg, plans()))
+            revs = [a[-1] for a in lg if "rev-parse" in a]
+            check(f"line/onto {base_ or '(no base named)'}: the merge base is resolved from {want_ref}", revs[:1] == [want_ref], revs)
+        # NEGATIVE CONTROL: the old behaviour (HEAD for every run) would merge a main3 pull request onto main's e…e tip
+        lg = []
+        posted.clear()
+        host(api_ev(), env=env_s, git_runner=line_git(lg, line_tips), checkout=checkout_with({"stages": [
+            {"name": "a", "kind": "build", "command": "true"}]})).run(pr_onto("main3"))
+        check("line/negative control: a main3 pull request is NEVER merged onto main's tip",
+              not any("merge" in a and a[-1] == "e" * 40 for a in lg), lg)
+        # a base the mirror cannot resolve is RED, naming it — never a fall-back to the default branch
+        lg = []
+        posted.clear()
+        host(api_ev(), env=env_s, git_runner=line_git(lg, line_tips), checkout=checkout_with({"stages": [
+            {"name": "a", "kind": "build", "command": "true"}]})).run(pr_onto("main9"))
+        rf = [e for _, es in posted for e in es if e["kind"] == "run-finished"]
+        check("line/an unresolvable base line is red by name, never merged onto another line",
+              rf and rf[0]["succeeded"] is False and "the base line main9's tip" in rf[0]["error"] and not any("merge" in a for a in lg) and not plans(),
+              (rf, lg))
+        # the warm restore's plan reads the run's line tip: main3 for a main3 pull request, the default branch otherwise
+        for base_, want_ref in (("main3", "refs/heads/main3^{commit}"), ("feat/stack", "HEAD^{commit}"), (None, "HEAD^{commit}")):
+            lg = []
+            hw = host(api_ev(), env=env_s, git_runner=line_git(lg, {**line_tips, "refs/heads/feat/stack^{commit}": "f" * 40}))
+            wp = hw.nuget_warm_plan("MeshWeaver", tmp, warm_line(base_))
+            revs = [a[-1] for a in lg if "rev-parse" in a]
+            check(f"line/the warm restore for a run onto {base_ or '(none)'} reads {want_ref.split('^')[0]}'s tip", revs == [want_ref], (revs, wp))
+            if base_ == "main3":
+                check("line/... and every warm-plan sentence names the line it read, never the default branch",
+                      "line main3's" in wp["text"] and "default branch" not in wp["text"], wp)
+        lg = []
+        hw = host(api_ev(), env=env_s, git_runner=line_git(lg, {}))
+        wp = hw.nuget_warm_plan("MeshWeaver", tmp, "main3")
+        check("line/an unresolvable warm line is said, never warmed from another line",
+              wp["state"] == "none" and "line main3" in wp["text"], wp)
+        lg = []
+        tip_, tree_ = host(api_ev(), env=env_s, git_runner=line_git(lg, line_tips)).default_branch_tree("MeshWeaver", tmp, "main3")
+        check("line/the warm checkout is the line's tip, detached", tip_ == "3" * 40
+              and any(a[-2:] == ["--detach", "3" * 40] for a in lg), lg)
+        lg = []
+        posted.clear()
+        host(api_ev(), env=env_s, git_runner=line_git(lg, line_tips), checkout=checkout_with({"stages": [
+            {"name": "a", "kind": "build", "command": "true"}]})).run(pr_onto("main3"))
+        check("line/a main3 run's warm plan reads main3's tip (not the default branch's)",
+              [a[-1] for a in lg if "rev-parse" in a].count("refs/heads/main3^{commit}") == 2
+              and "HEAD^{commit}" not in [a[-1] for a in lg if "rev-parse" in a], [a for a in lg if "rev-parse" in a])
         # a probe run's id rides on every events POST (and the token request); a normal run's never
         pq: list = []
         hpq = host(_FakeApi({("POST", "/token"): lambda p_, b: (pq.append(("token", None)), (404, None))[1],
