@@ -144,6 +144,13 @@ def channels_for(declaration: dict, version: str) -> list[str]:
     return [c for c in ordered if c in declaration["channels"] and channel_major(c) == major]
 
 
+def declared_majors(declaration: dict) -> list[int]:
+    """The platform majors the declared channels follow, ascending: `latest<N>` → N, the compatibility `latest` →
+    LATEST_ALIAS_MAJOR; `stable` follows none. build-host.yml runs one hand-over leg per major and is RED for a major it
+    has no leg for. Pure."""
+    return sorted({m for c in declaration["channels"] if (m := channel_major(c)) is not None})
+
+
 def decide(declaration: dict, control: dict, channel: str, trigger: str = "") -> tuple[bool, str, str]:
     """(send?, deployment, why). Pure."""
     dep = str(control.get("deployment") or "").strip()
@@ -238,6 +245,8 @@ def main(argv: list[str]) -> int:
     c = sub.add_parser("channels")
     c.add_argument("--declaration", type=Path, default=Path(".github/build-hosts.json"))
     c.add_argument("--version", required=True)
+    mj = sub.add_parser("majors")
+    mj.add_argument("--declaration", type=Path, default=Path(".github/build-hosts.json"))
     lm = sub.add_parser("line-major")
     lm.add_argument("--channel", required=True)
     b = sub.add_parser("body")
@@ -254,6 +263,9 @@ def main(argv: list[str]) -> int:
             if major is None:
                 raise ValueError(f"channel {a.channel!r} reads its set on no major")
             print(major)
+            return 0
+        if a.cmd == "majors":
+            print(f"majors={' '.join(str(m) for m in declared_majors(load_declaration(a.declaration)))}")
             return 0
         if a.cmd == "channels":
             print(f"channels={' '.join(channels_for(load_declaration(a.declaration), a.version))}")
@@ -287,6 +299,19 @@ def self_test() -> int:
             failures.append(f"{name}: {detail}")
 
     control = {"deployment": "control", "url": "https://control.example.com", "platformLagBoundMinutes": 180}
+    # 🧵 one hand-over leg per declared major line (build-host.yml)
+    check("majors/latest, latest3 and latest4 follow lines 3 and 4",
+          declared_majors({"enabled": True, "channels": ["latest", "latest3", "latest4"]}) == [3, 4])
+    check("majors/the compatibility latest alone follows line 3", declared_majors({"enabled": True, "channels": ["latest"]}) == [3])
+    check("majors/negative control: stable follows no line", declared_majors({"enabled": True, "channels": ["stable"]}) == [])
+    committed = Path(__file__).resolve().parent.parent / "build-hosts.json"
+    if committed.is_file():
+        cd_ = load_declaration(committed)
+        check("majors/the committed declaration follows lines 3 and 4", declared_majors(cd_) == [3, 4], declared_majors(cd_))
+        check("majors/the committed declaration hands a 4.x set to latest4 alone", channels_for(cd_, "4.0.13239") == ["latest4"],
+              channels_for(cd_, "4.0.13239"))
+        check("majors/... and a 3.x set to latest3 and the compatibility latest, never latest4",
+              channels_for(cd_, "3.1.13219") == ["latest3", "latest"], channels_for(cd_, "3.1.13219"))
     off = {"enabled": False, "channels": ["latest"]}
     on = {"enabled": True, "channels": ["latest"]}
     send, dep, why = decide(off, control, "latest")
