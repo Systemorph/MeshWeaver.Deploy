@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  memex-local IDLE-ONLY MODELS GOVERNOR — a launchd login agent (MeshWeaver.Plugins Hosting/BackLease §15.9:
+  "CI first, a large model when the build host is idle").
+  Runs `memex-local buildhost idle run` at login (RunAtLoad) and restarts it whenever it exits (KeepAlive — also how
+  an upgraded executor takes over: share/buildhost-idle.py exits when its file changes). Every 15 s it reads control's
+  `mac` build demand and this Mac's idle-only token demand, stops or starts the build VM, and writes the decision to
+  ~/.memex-local/backlease/buildhost.json (the portal's /host-readings/buildhost.json). Log: __LOG__.
+
+  `memex-local backlease accept tokens` with idle-only models (and `buildhost idle apply`, `update`) write a copy with
+  the __TOKENS__ substituted to ~/Library/LaunchAgents/com.memex.local.buildhost-idle.plist and bootstrap it;
+  withdrawing them (idle-only models none) or `buildhost idle off` boots it out once the build VM is back.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memex.local.buildhost-idle</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__MEMEX_LOCAL__</string>
+        <string>buildhost</string>
+        <string>idle</string>
+        <string>run</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/memex/bin</string>
+        <key>MEMEX_LOCAL_HOME</key>
+        <string>__HOME__</string>
+        <key>MEMEX_BUILD_PROFILE</key>
+        <string>__PROFILE__</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- A crash loop is retried every 30 s, not hammered. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>__LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG__</string>
+</dict>
+</plist>

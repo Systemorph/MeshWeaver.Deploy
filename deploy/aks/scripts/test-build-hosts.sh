@@ -236,6 +236,9 @@ for ch, (tester, portal, runner, mx, pv, mn) in want.items():
         problems.append(f"{ch}: BUILD_TOKEN_FILE is not /run/build-worker/token")
     if env.get("MW_BUILD_STAGE_SLOTS", {}).get("value") != "8":
         problems.append(f"{ch}: MW_BUILD_STAGE_SLOTS is not the chart's default 8 (fan-out): {env.get('MW_BUILD_STAGE_SLOTS')}")
+    if "MW_BUILD_STAGE_PROCESSOR_COUNT" in env:
+        problems.append(f"{ch}: MW_BUILD_STAGE_PROCESSOR_COUNT rendered although nothing declares it (null = the runner sizes "
+                        f"DOTNET_PROCESSOR_COUNT from its cgroup and the slots): {env.get('MW_BUILD_STAGE_PROCESSOR_COUNT')}")
     if env.get("MW_BUILD_SLICE_CACHE_MAX_GIB", {}).get("value") != "32":
         problems.append(f"{ch}: MW_BUILD_SLICE_CACHE_MAX_GIB is not the chart's default bound 32 (the slice cache): {env.get('MW_BUILD_SLICE_CACHE_MAX_GIB')}")
     if any(k.startswith("MW_BUILD_CACHE_") for k in env if k != "MW_BUILD_CACHE"):
@@ -651,6 +654,44 @@ else
   report "the mac first-attach values did not render:"; sed 's/^/    /' "$WORK/mac.err"
 fi
 
+# 3c-m. THE MACHINE in the claimed host name: unset, a host claims as its pod (`build-host-mac-…`, the default above); set,
+#       as `<machine>-<pod>` — the kubelet expands $(MW_BUILD_POD), defined BEFORE it — so the fleet's price list can credit
+#       two Macs serving one queue by host prefix (MeshWeaver.Plugins Hosting/BuildQueue §2a); a non-DNS-label is refused.
+if helm template build-host-mac "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-host-mac.yaml" --set-string buildHosts.machine=studio-1 \
+     --namespace memex > "$WORK/mac-machine.yaml" 2> "$WORK/mac-machine.err"; then
+  python3 - "$WORK/mac.yaml" "$WORK/mac-machine.yaml" <<'PYM' && ok "buildHosts.machine names the claimed host <machine>-<pod> (pod defined first); unset, the host stays its pod" || report "the machine host-name render is wrong (above)"
+import sys, yaml
+def env(path):
+    docs = [d for d in yaml.safe_load_all(open(path)) if d]
+    dep = next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "build-host-mac")
+    c = next(c for c in dep["spec"]["template"]["spec"]["containers"] if c["name"] == "build")
+    return c.get("env", [])
+problems = []
+plain = {e["name"]: e for e in env(sys.argv[1])}
+if plain.get("MW_BUILD_HOST", {}).get("valueFrom", {}).get("fieldRef", {}).get("fieldPath") != "metadata.name" or "MW_BUILD_POD" in plain:
+    problems.append(f"unset: MW_BUILD_HOST should be the pod name, got {plain.get('MW_BUILD_HOST')}")
+named = env(sys.argv[2])
+names = [e["name"] for e in named]
+by = {e["name"]: e for e in named}
+if by.get("MW_BUILD_HOST", {}).get("value") != "studio-1-$(MW_BUILD_POD)": problems.append(f"set: MW_BUILD_HOST={by.get('MW_BUILD_HOST')}")
+if by.get("MW_BUILD_POD", {}).get("valueFrom", {}).get("fieldRef", {}).get("fieldPath") != "metadata.name": problems.append("set: MW_BUILD_POD is not the pod name")
+if "MW_BUILD_POD" in names and "MW_BUILD_HOST" in names and names.index("MW_BUILD_POD") > names.index("MW_BUILD_HOST"):
+    problems.append("MW_BUILD_POD must be defined before MW_BUILD_HOST, or the kubelet does not expand it")
+for p in problems: print("   ", p)
+sys.exit(1 if problems else 0)
+PYM
+else
+  report "the machine values did not render:"; sed 's/^/    /' "$WORK/mac-machine.err"
+fi
+if helm template build-host-mac "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-host-mac.yaml" --set-string buildHosts.machine=Studio_1 \
+     --namespace memex > /dev/null 2> "$WORK/mac-machine-bad.err"; then
+  report "a machine that is not a DNS label rendered"
+elif grep -q "must be a lower-case DNS label" "$WORK/mac-machine-bad.err"; then
+  ok "a machine that is not a DNS label is refused by name"
+else
+  report "a bad machine failed for another reason:"; sed 's/^/    /' "$WORK/mac-machine-bad.err"
+fi
+
 # 3h. THE CACHE BUDGET: one total per cache, a share per area, none above it and together never above it — checked on every
 #     render below whose cache declares a size, the SHIPPED Mac values included. budget_check <render> <want budget|-> <claim size Gi|->
 budget_check() {
@@ -735,6 +776,27 @@ if [ -s "$WORK/mac.yaml" ]; then
   else
     report "negative control: the budget check did not refuse shares above the budget:"; sed 's/^/    /' "$WORK/mac-over.out"
   fi
+fi
+
+# 3d-cpu. THE CPU A STAGE IS ALLOWED (deploy/build-host/STAGE-CPU.md): a declared buildHosts.stageProcessorCount renders
+#     MW_BUILD_STAGE_PROCESSOR_COUNT on every build container, verbatim; undeclared (the default, checked above) it is absent.
+if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.stageProcessorCount=3 \
+     --namespace check > "$WORK/cpu.yaml" 2> "$WORK/cpu.err"; then
+  python3 - "$WORK/cpu.yaml" <<'PYCPU' && ok "buildHosts.stageProcessorCount 3 renders MW_BUILD_STAGE_PROCESSOR_COUNT=3 on every build container" || report "the declared stage processor count render is wrong (above)"
+import sys, yaml
+hosts = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d and d.get("kind") == "Deployment"
+         and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "build-host"]
+problems = [] if hosts else ["no build-host Deployment rendered"]
+for d in hosts:
+    build = next(c for c in d["spec"]["template"]["spec"]["containers"] if c["name"] == "build")
+    got = {e["name"]: e.get("value") for e in build.get("env", [])}.get("MW_BUILD_STAGE_PROCESSOR_COUNT")
+    if got != "3":
+        problems.append(f"{d['metadata']['name']}: MW_BUILD_STAGE_PROCESSOR_COUNT={got!r}, want '3'")
+for p in problems: print("   ", p)
+sys.exit(1 if problems else 0)
+PYCPU
+else
+  report "the declared stage processor count did not render:"; sed 's/^/    /' "$WORK/cpu.err"
 fi
 
 # 3d. the opt-in user-namespace sandbox: hostUsers false on the pod, procMount Unmasked on the build container, and on a
@@ -927,6 +989,8 @@ for entry in \
   "values.build-hosts-run-deadline-zero.yaml|RUN budget" \
   "values.build-hosts-stage-slots-zero.yaml|buildHosts.stageSlots 0 must be within" \
   "values.build-hosts-stage-slots-fraction.yaml|buildHosts.stageSlots 2.9 must be a whole number" \
+  "values.build-hosts-stage-cpu-zero.yaml|buildHosts.stageProcessorCount 0 must be within [1, 1024]" \
+  "values.build-hosts-stage-cpu-fraction.yaml|buildHosts.stageProcessorCount 1.5 must be a whole number" \
   "values.build-hosts-slice-cache-zero.yaml|buildHosts.sliceCacheMaxGi 0 must be within" \
   "values.build-hosts-slice-cache-fraction.yaml|buildHosts.sliceCacheMaxGi 1.5 must be a whole number" \
   "values.build-hosts-cache-share-above-budget.yaml|the slices share 32 GiB exceeds the cache budget 18 GiB" \

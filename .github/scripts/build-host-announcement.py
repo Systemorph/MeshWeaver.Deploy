@@ -21,7 +21,22 @@ Deployment: the record is the only source of truth for what the host runs.
         --core-sha <40 hex> [--plugins-sha <40 hex>] --instance <run url> \
         [--supersedes "sha256:… sha256:…"]
         → the event JSON, one line (the bytes that are signed are the bytes that are sent)
+    build-host-announcement.py channels --declaration .github/build-hosts.json --version 3.1.13071
+        → `channels=<the declared channels this set moves>` (GITHUB_OUTPUT line): its LINE's channel
+          `latest<major>`, and `latest` for a set of the line it names (see THE LINES)
     build-host-announcement.py --self-test
+
+🚨 THE LINES — A CHANNEL NEVER CROSSES A MAJOR (policy `major-lines-run-separately`, platform
+Doc/Architecture/MajorLinesRunSeparately; the incident of core #8129). Each platform major is its own
+line with its own channel, `latest<major>` (`latest3`, `latest4`) — an OPEN vocabulary: a new major
+needs a declared channel here and on the record, no change to this script. The bare `latest` is the
+v3 line's COMPATIBILITY name (`LATEST_ALIAS_MAJOR`), kept while any reader still follows it (the
+standing `build-host-latest`, a leased host's `follow-set.py`). A set is handed to EVERY declared
+channel of its own major — `latest3` and `latest` for a 3.x set — as ONE event per channel: each
+event moves only its own channel's key on the record, so nothing is applied twice, and the receiver
+answers a re-send of the set a channel already runs with "nothing changed". A set is never handed to
+a channel of another major: `body` refuses it here, and the receiver (MeshWeaver.Plugins
+`BuildHostUpdates.Decide`) refuses it again.
 
 🚨 A NO-OP UNTIL DECLARED. `.github/build-hosts.json` says whether the platform's estate runs
 standing build hosts at all (`enabled`) and which channels CD rolls (`channels`). While it says
@@ -54,6 +69,11 @@ REPORTER = "main-cd build-host-latest"
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 CHANNELS = ("latest", "stable")
+# A major line's channel: `latest<major>` (policy `major-lines-run-separately`). Open — any major.
+LINE_CHANNEL = re.compile(r"^latest([1-9][0-9]{0,3})$")
+# The line the compatibility name `latest` belongs to: the v3 line, which every reader followed before
+# the lines split. MeshWeaver.Plugins `BuildHostUpdates.CompatibilityAliasMajor` names the same major.
+LATEST_ALIAS_MAJOR = 3
 # Which channel each CD trigger may roll. `latest` follows the set CD ARMS (any trigger that arms);
 # `stable` — until core's stable promoter exists — is the main-passed ceiling, handed on by the
 # DAILY `schedule` of build-host-stable.yml only (§2: "by the daily full run, to the main-passed
@@ -65,14 +85,51 @@ REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9./_-]*$")
 MAX_SUPERSEDED = 64
 
 
+def is_channel(channel: object) -> bool:
+    """A channel this lane may name: `latest`, `stable`, or a line's `latest<major>`. Pure."""
+    return isinstance(channel, str) and (channel in CHANNELS or LINE_CHANNEL.match(channel) is not None)
+
+
+def channel_major(channel: str) -> int | None:
+    """The major a channel's NAME commits it to: `latest<N>` → N, `latest` → LATEST_ALIAS_MAJOR, any other
+    (`stable`) → None — no line, no major guard. Pure."""
+    if channel == "latest":
+        return LATEST_ALIAS_MAJOR
+    m = LINE_CHANNEL.match(channel or "")
+    return int(m.group(1)) if m else None
+
+
+def set_major(version: str) -> int | None:
+    """The MAJOR of a set name (`3.1.13071` → 3, `3.0.0-ci.10052` → 3, `4.0.13200` → 4); None for no set name. Pure."""
+    return int(version.split(".", 1)[0]) if SET_NAME.match(version or "") else None
+
+
 def load_declaration(path: Path) -> dict:
-    d = json.loads(path.read_text())
+    return load_declaration_doc(json.loads(path.read_text()), path)
+
+
+def load_declaration_doc(d: object, path: object = ".github/build-hosts.json") -> dict:
     if not isinstance(d, dict) or type(d.get("enabled")) is not bool:
         raise ValueError(f"{path}: `enabled` must be true or false")
     ch = d.get("channels")
-    if not isinstance(ch, list) or not all(isinstance(c, str) and c in CHANNELS for c in ch):
-        raise ValueError(f"{path}: `channels` must be a list drawn from {list(CHANNELS)}")
+    if not isinstance(ch, list) or not all(is_channel(c) for c in ch) or len(set(ch)) != len(ch):
+        raise ValueError(f"{path}: `channels` must be a list of distinct names drawn from {list(CHANNELS)} or latest<major>")
     return d
+
+
+def channels_for(declaration: dict, version: str) -> list[str]:
+    """The declared channels CD's newest armed set `version` moves, in send order: its line's own
+    `latest<major>` first, then the compatibility `latest` when the set is of the line `latest` names.
+    `stable` is never one (build-host-stable.yml's daily lane rolls it). Empty when the estate does not
+    run build hosts or declares no channel of the set's major. Raises ValueError for no set name. Pure."""
+    major = set_major(version)
+    if major is None:
+        raise ValueError(f"version {version!r} is not a platform set name")
+    if not declaration["enabled"]:
+        return []
+    line = f"latest{major}"
+    ordered = [line, "latest"]
+    return [c for c in ordered if c in declaration["channels"] and channel_major(c) == major]
 
 
 def decide(declaration: dict, control: dict, channel: str, trigger: str = "") -> tuple[bool, str, str]:
@@ -81,9 +138,9 @@ def decide(declaration: dict, control: dict, channel: str, trigger: str = "") ->
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", dep):
         raise ValueError(f"control-instance.json names no plain `deployment` ({dep!r}) — the operations record "
                          f"the build hosts live on")
-    if channel not in CD_CHANNELS:
-        raise ValueError(f"channel {channel!r} is not a channel CD rolls ({list(CD_CHANNELS)})")
-    only_on = CD_CHANNELS[channel]
+    if channel not in CD_CHANNELS and not LINE_CHANNEL.match(channel or ""):
+        raise ValueError(f"channel {channel!r} is not a channel CD rolls ({list(CD_CHANNELS)} or latest<major>)")
+    only_on = CD_CHANNELS.get(channel)
     if only_on is not None and trigger != only_on:
         raise ValueError(f"channel {channel!r} is rolled only by the {only_on!r} trigger (this is {trigger or 'no trigger'!r})")
     if not declaration["enabled"]:
@@ -99,10 +156,13 @@ def body(*, deployment: str, channel: str, version: str, tester_image: str, test
          plugins_sha: str, instance: str, detected_at: str, supersedes: list[str] | None = None) -> dict:
     """The signed event. Pure; every field validated — a fact naming something malformed is worse
     than no fact."""
-    if channel not in CHANNELS:
-        raise ValueError(f"channel {channel!r} is not one of {list(CHANNELS)}")
+    if not is_channel(channel):
+        raise ValueError(f"channel {channel!r} is not one of {list(CHANNELS)} or latest<major>")
     if not SET_NAME.match(version or ""):
         raise ValueError(f"version {version!r} is not a platform set name")
+    if (line := channel_major(channel)) is not None and set_major(version) != line:
+        raise ValueError(f"{version} is not a {line}.x set, and build-{channel} is the {line}.x line's channel — "
+                         "a channel never crosses a major; refusing to sign it")
     for name, d in (("tester", tester_digest), ("portal", portal_digest), ("runner", runner_digest)):
         if not DIGEST.match(d or ""):
             raise ValueError(f"{name} digest {d!r} is not sha256:<64 hex>")
@@ -163,6 +223,9 @@ def main(argv: list[str]) -> int:
     d.add_argument("--control-instance", type=Path, default=Path(".github/control-instance.json"))
     d.add_argument("--channel", default="latest")
     d.add_argument("--trigger", default="")
+    c = sub.add_parser("channels")
+    c.add_argument("--declaration", type=Path, default=Path(".github/build-hosts.json"))
+    c.add_argument("--version", required=True)
     b = sub.add_parser("body")
     for k in ("deployment", "channel", "version", "tester-image", "tester-digest", "portal-image",
               "portal-digest", "runner-image", "runner-digest", "instance"):
@@ -172,6 +235,9 @@ def main(argv: list[str]) -> int:
     b.add_argument("--supersedes", default="", help="space-separated digests of the set's OLDER runners")
     a = ap.parse_args(argv)
     try:
+        if a.cmd == "channels":
+            print(f"channels={' '.join(channels_for(load_declaration(a.declaration), a.version))}")
+            return 0
         if a.cmd == "decide":
             send, dep, why = decide(load_declaration(a.declaration),
                                     json.loads(a.control_instance.read_text()), a.channel, a.trigger)
@@ -263,9 +329,54 @@ def self_test() -> int:
             check(f"body/refuses {k}={v}", False, "accepted")
         except ValueError:
             pass
+    # THE LINES (policy major-lines-run-separately; core #8129): a set moves every declared channel of its
+    # own major, one event each, and never a channel of another major.
+    lines = {"enabled": True, "channels": ["latest", "latest3", "latest4"]}
+    check("lines/a 3.x set moves its line's channel first, then the compatibility latest",
+          channels_for(lines, "3.1.13071") == ["latest3", "latest"], channels_for(lines, "3.1.13071"))
+    check("lines/a 3.0.0-ci set is of the v3 line too", channels_for(lines, "3.0.0-ci.10052") == ["latest3", "latest"])
+    check("lines/a 4.x set moves latest4 ALONE — never latest or latest3 (the incident)",
+          channels_for(lines, "4.0.13200") == ["latest4"], channels_for(lines, "4.0.13200"))
+    check("lines/a set of a line nobody declared moves nothing", channels_for(lines, "5.0.1") == [])
+    check("lines/today's declaration (latest only) moves latest for a 3.x set — as before",
+          channels_for({"enabled": True, "channels": ["latest"]}, "3.1.13071") == ["latest"])
+    check("lines/…and nothing for a 4.x set (latest is the v3 line's name)",
+          channels_for({"enabled": True, "channels": ["latest"]}, "4.0.13200") == [])
+    check("lines/stable is never moved by the CD hand-over", channels_for({"enabled": True, "channels": ["latest3", "stable"]}, "3.1.13071") == ["latest3"])
+    check("lines/off moves nothing", channels_for(dict(lines, enabled=False), "3.1.13071") == [])
+    try:
+        channels_for(lines, "latest")
+        check("lines/a moving name is no set — refused", False, "accepted")
+    except ValueError:
+        pass
+    check("lines/the vocabulary", channel_major("latest") == 3 and channel_major("latest3") == 3 and channel_major("latest4") == 4
+          and channel_major("stable") is None and channel_major("latest03") is None and channel_major("latest-x") is None)
+    send, _, _ = decide({"enabled": True, "channels": ["latest3"]}, control, "latest3")
+    check("decide/a declared line channel follows any arming trigger", send is True)
+    for v, ch in (("3.1.13071", "latest3"), ("3.1.13071", "latest"), ("4.0.13200", "latest4")):
+        check(f"body/{v} is signed for {ch}", body(**dict(ok, version=v, channel=ch))["channel"] == ch)
+    check("body/the record fields name the line's channel", "buildHosts.latest3.platformVersion" in body(**dict(ok, channel="latest3"))["recordFields"])
+    # NEGATIVE CONTROLS — each would have moved a v3 reader onto v4 (or the reverse) under a lane that compared nothing.
+    for v, ch in (("4.0.13200", "latest"), ("4.0.13200", "latest3"), ("3.1.13071", "latest4")):
+        try:
+            body(**dict(ok, version=v, channel=ch))
+            check(f"body/refuses {v} on {ch}", False, "accepted")
+        except ValueError as e:
+            check(f"body/the refusal of {v} on {ch} is named", "never crosses a major" in str(e), str(e))
+    check("body/stable takes any major (no line, no guard)", body(**dict(ok, version="4.0.13200", channel="stable"))["channel"] == "stable")
+    for bad in (["latest", "latest"], ["latest-x"], ["latest0"], "latest"):
+        try:
+            load_declaration_doc({"enabled": True, "channels": bad})
+            check(f"declaration/refuses channels={bad!r}", False, "accepted")
+        except ValueError:
+            pass
     shipped = Path(__file__).resolve().parents[1] / "build-hosts.json"
     try:
-        load_declaration(shipped)
+        shipped_decl = load_declaration(shipped)
+        check("the shipped declaration hands a 3.x set to latest (the compatibility name every current reader follows)",
+              "latest" in channels_for(shipped_decl, "3.1.13071"), channels_for(shipped_decl, "3.1.13071"))
+        check("the shipped declaration never hands a 4.x set to latest or latest3",
+              not {"latest", "latest3"} & set(channels_for(shipped_decl, "4.0.13200")), channels_for(shipped_decl, "4.0.13200"))
     except (ValueError, OSError) as e:
         check("the shipped .github/build-hosts.json validates", False, str(e))
     if failures:
@@ -273,7 +384,8 @@ def self_test() -> int:
             print(f"SELF-TEST FAILED: {f}")
         return 1
     print("build-host-announcement self-test: all cases passed (no-op while off, channel declaration, "
-          "stable only on the daily schedule, record fields incl. the runner, the superseded runners, "
+          "stable only on the daily schedule, the lines (a set moves only its own major's channels, one event each), "
+          "record fields incl. the runner, the superseded runners, "
           "digest/repository/sha/version refusals, the shipped declaration)")
     return 0
 

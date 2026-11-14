@@ -843,13 +843,13 @@ echo "── a fleet Mac joins BEFORE its first-run setup; every step leaves a r
 # sign in") — a fleet Mac's sign-in arrives WITH the enrolment — and the join was never filed; the reason was root-only.
 RS="$(mktemp -d)"; mkdir -p "$RS/home/.memex-local" "$RS/st"
 SMW='as_user() { shift; printf "%s\n" "$*" >> "$SM_CALLS"
-      case "$*" in *-CAROOT*) printf "%s" "$SM_CAROOT" ;;
+      case "$*" in /bin/mv\ *|/bin/rm\ *) "$@"; return ;; *"internal on"*) : > "$FLEET_USER_HOME/.memex-local/internal.yaml"; return 0 ;; *-CAROOT*) printf "%s" "$SM_CAROOT" ;;
         *"fleet join"*) printf "%b\n" "${SM_JOIN_OUT:-}"; [ "${SM_JOIN_RC:-0}" = 0 ] && : > "$FLEET_USER_HOME/.memex-local/fleet.yaml"; return "${SM_JOIN_RC:-0}" ;;
         *"setup --apply"*) printf "%b\n" "${SM_SETUP_OUT:-}"; [ "${SM_SETUP_RC:-0}" = 0 ] && : > "$SM_CALLS.applied"; return "${SM_SETUP_RC:-0}" ;; esac; return 0; }
     probe_as_user() { case "$*" in *verify*) return 0 ;;
         *awaiting_setup*) [ "${SM_AWAIT:-0}" = 1 ] || return 1; [ "${SM_AWAIT_UNTIL_APPLIED:-}" = 1 ] && [ -e "$SM_CALLS.applied" ] && return 1; return 0 ;; *) return 1 ;; esac; }
     notify_user() { printf "NOTIFY %s | %s\n" "$2" "$3"; }
-    read_participation >/dev/null; track memex step_memex jroe studio-2; rc=$?; finish_stage jroe; echo "rc=$rc"'
+    read_participation >/dev/null; track memex step_memex "${SM_USER:-jroe}" studio-2; rc=$?; finish_stage "${SM_USER:-jroe}"; echo "rc=$rc"'
 mkdir -p "$RS/ld" "$RS/bin" "$RS/pbin"; printf '#!/bin/bash\nexit 0\n' > "$RS/pbin/launchctl"; chmod +x "$RS/pbin/launchctl"
 rsrun() { : > "$RS/calls"; rm -f "$RS/calls.applied"; OUT="$(env $FCA_ENV PATH="$RS/pbin:$T/secb:$PATH" FLEET_LAUNCHDAEMONS_DIR="$RS/ld" FLEET_BIN_DIR="$RS/bin" FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$RS/log" FLEET_MANAGED_PREFS="$RS/none" FLEET_USER_HOME="$RS/home" FLEET_BREW_PREFIX="$RS/brew" \
   FLEET_STATE_DIR="$RS/st" FLEET_CONTROL_URL=https://control.example.test SM_CALLS="$RS/calls" SM_CAROOT="$T/sm/caroot" FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=false \
@@ -893,6 +893,47 @@ case "$(rd setup):$(rd up)" in "ok "*":ok "*) ok "the earlier steps leave their 
 # 6. a missing prerequisite is NAMED: no ControlUrl → the join is skipped, said, and the person told
 rsrun FLEET_CONTROL_URL= SM_AWAIT=0
 case "$(rd join):$(rd stage)" in "skipped "*"no ControlUrl in the com.memex.local profile:waiting "*"join: memex: WAITING for ControlUrl"*) case "$OUT" in *"NOTIFY Fleet join not filed"*"ControlUrl"*) ok "no ControlUrl: the join is skipped, the stage names ControlUrl, and the person is notified" ;; *) bad "no ControlUrl notify" "$OUT" ;; esac ;; *) bad "no ControlUrl" "$(rd join) / $(rd stage)" ;; esac
+# 6b. (1.11.0) joined, the sign-in HANDED OVER by the join: installed with 'internal on' once the network is up, then the setup
+rm -f "$RS/st/setup.answered"; : > "$RS/home/.memex-local/fleet.yaml"; rm -f "$RS/home/.memex-local/internal.yaml"; mkdir -p "$RS/home/.memex-local/enrol"
+printf 'secret-value-long-enough' > "$RS/home/.memex-local/enrol/studio-2.signin"; chmod 600 "$RS/home/.memex-local/enrol/studio-2.signin"; printf 'tenant=00000000-aaaa\nclientId=11111111-bbbb\n' > "$RS/home/.memex-local/enrol/studio-2.signin-facts"
+SMW_TS='ts_backend_state() { printf "%s" "${SM_TS:-Running}"; }; '
+SMW_SAVE="$SMW"; SMW="$SMW_TS$SMW"
+rsrun SM_AWAIT=1 SM_TS=Running SM_USER="$(id -un)"
+grep -q 'internal on --tenant "$1" --client-id "$2" < "$3".* 00000000-aaaa 11111111-bbbb .*studio-2.signin' "$RS/calls" && grep -q 'rm -f .*studio-2.signin .*studio-2.signin-facts' "$RS/calls" \
+  && grep -q 'setup --apply' "$RS/calls" && [ "$(sed -n '/internal on/=' "$RS/calls" | head -1)" -lt "$(sed -n '/setup --apply/=' "$RS/calls" | head -1)" ] \
+  && case "$(rd signin)" in "ok "*) true ;; *) false ;; esac \
+  && ! grep -q 'fleet join' "$RS/calls" && [ -f "$RS/home/.memex-local/fleet.yaml" ] \
+  && ok "a handed-over sign-in is installed ('internal on', secret on stdin from its file) BEFORE the setup, then removed; reading signin = ok; the join is KEPT (no fresh join)" || bad "signin install" "$(cat "$RS/calls") / $(rd signin)"
+case "$OUT" in *secret-value-long-enough*) bad "the handed-over secret is never logged" "" ;; *) ok "…and the secret never reaches the log" ;; esac
+# 6c. the network not up yet: waiting, nothing installed, the file kept — and the setup NOT answered
+: > "$RS/home/.memex-local/fleet.yaml"; rm -f "$RS/home/.memex-local/internal.yaml"
+printf 'secret-value-long-enough' > "$RS/home/.memex-local/enrol/studio-2.signin"; chmod 600 "$RS/home/.memex-local/enrol/studio-2.signin"; printf 'tenant=00000000-aaaa\nclientId=11111111-bbbb\n' > "$RS/home/.memex-local/enrol/studio-2.signin-facts"
+rsrun SM_AWAIT=1 SM_TS=Starting SM_USER="$(id -un)"
+! grep -q 'internal on' "$RS/calls" && ! grep -q 'setup --apply' "$RS/calls" && [ -f "$RS/home/.memex-local/enrol/studio-2.signin" ] && case "$(rd signin)" in "waiting "*) true ;; *) false ;; esac \
+  && ok "the network not up yet: the sign-in waits (reading signin = waiting), the hand-over is kept" || bad "signin waits" "$(cat "$RS/calls") / $(rd signin)"
+# 6c'. a hand-over that is not 0600, or a facts file missing one value: refused, never installed
+chmod 644 "$RS/home/.memex-local/enrol/studio-2.signin"
+rsrun SM_AWAIT=1 SM_TS=Running SM_USER="$(id -un)"
+! grep -q 'internal on' "$RS/calls" && case "$(rd signin)" in "failed "*"0600"*) true ;; *) false ;; esac && ok "a hand-over that is not 0600 is REFUSED, never installed" || bad "signin mode" "$(rd signin)"
+chmod 600 "$RS/home/.memex-local/enrol/studio-2.signin"; printf 'clientId=11111111-bbbb\n' > "$RS/home/.memex-local/enrol/studio-2.signin-facts"
+rsrun SM_AWAIT=1 SM_TS=Running SM_USER="$(id -un)"
+! grep -q 'internal on' "$RS/calls" && case "$(rd signin)" in "failed "*"no valid tenant"*) true ;; *) false ;; esac && ok "a facts file missing the tenant is refused (each value checked on its own)" || bad "signin facts" "$(rd signin)"
+rm -f "$RS/home/.memex-local/internal.yaml"
+# 6d. joined but NO sign-in and no hand-over (memex-local before the fix dropped it): set aside, a FRESH join is filed
+rm -f "$RS/home/.memex-local/enrol/studio-2.signin" "$RS/home/.memex-local/enrol/studio-2.signin-facts"
+rsrun SM_AWAIT=1 SM_JOIN_RC=3 SM_JOIN_OUT='open https://control.example.test/Hosting/Heartbeats/Enrol/req-new to approve'
+grep -q '/bin/mv -f .*fleet.yaml .*fleet.yaml.no-signin-' "$RS/calls" && grep -q 'fleet join --control' "$RS/calls" && ! grep -q 'setup --apply' "$RS/calls" \
+  && case "$(rd join)" in "waiting-approval "*req-new*) true ;; *) false ;; esac \
+  && ok "joined but the sign-in is missing: the join is set aside and a FRESH join is filed by itself (no hand step), the setup not answered" || bad "re-join" "$(cat "$RS/calls") / $(rd join)"
+SMW="$SMW_SAVE"; rm -f "$RS/home/.memex-local/fleet.yaml"
+# 6e. a memex-local without the sign-in hand-over is upgraded from the tap
+mkdir -p "$RS/brewx/bin" "$RS/brewx/opt/memex-local/libexec"; for t in colima docker kubectl helm ollama lego memex-local; do printf '#!/bin/sh\n' > "$RS/brewx/bin/$t"; chmod +x "$RS/brewx/bin/$t"; done
+printf '#!/bin/bash\n# old\n' > "$RS/brewx/opt/memex-local/libexec/memex-local"
+OUT="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_BREW_PREFIX="$RS/brewx" FLEET_LOG_DIR="$RS/log" bash -c '. "$0"; step_tools jroe' "$FB" 2>&1)"
+case "$OUT" in *"predates the sign-in hand-over — upgrading it from the tap"*) ok "a memex-local that predates the sign-in hand-over is upgraded from the tap" ;; *) bad "memex-local upgrade" "$OUT" ;; esac
+printf '#!/bin/bash\n# FLEET_SIGNIN_HANDOVER\n' > "$RS/brewx/opt/memex-local/libexec/memex-local"
+OUT="$(env FLEET_BOOTSTRAP_LIB=1 FLEET_BOOTSTRAP_DRY_RUN=1 FLEET_BREW_PREFIX="$RS/brewx" FLEET_LOG_DIR="$RS/log" bash -c '. "$0"; step_tools jroe' "$FB" 2>&1)"
+case "$OUT" in *"tools: all present"*) case "$OUT" in *upgrade*) bad "a current memex-local is not upgraded" "$OUT" ;; *) ok "…and a current one is left alone" ;; esac ;; *) bad "current memex-local" "$OUT" ;; esac
 # 7. the readings: world-readable, no secrets
 [ "$(stat -f%Lp "$RS/st/join")" = 644 ] && ! grep -rqiE 'secret|password|token=[^<]' "$RS/st" && ok "every reading is 0644 and carries no secret" || bad "readings mode/secret" "$(ls -l "$RS/st")"
 # 8. a run that ends with every step done says so
@@ -1033,6 +1074,41 @@ printf 'x' > "$JP/ld/com.meshweaver.fleet.join-poller.plist"; date +%s > "$JP/st
 grep -A3 '^    0) # collected by an ordinary run' "$FB" | grep -q 'remove_join_poller "the Approve was collected by an hourly run"' \
   && ok "an hourly run that collects the Approve removes the poller right then (no second continuation on its next tick)" || bad "immediate removal" ""
 rm -rf "$JP"
+
+grep -q 'write_reading version "$FLEET_BOOTSTRAP_VERSION"' "$FB" && awk '/^main\(\) \{/{on=1} on' "$FB" | grep -n 'write_reading version\|step_operator_ssh\|acquire_run_lock 900' | head -2 | tail -1 | grep -q 'write_reading version' \
+  && ok "every run that gets past the run lock names its own bootstrap version in the reading 'version' (the agent may run a cached copy)" || bad "version reading" ""
+echo "── the fleet loader: the bootstrap's pin travels in the PROFILE (minutes), not in the Intune script (8 h) — 2026-11-12 ──"
+FL="$MACOS/intune/fleet-loader.sh"
+bash -n "$FL" && ok "fleet-loader.sh parses" || bad "loader parses" ""
+LD="$(mktemp -d)"; C1="$(printf 'a%.0s' $(seq 1 40))"
+mkdir -p "$LD/web/Systemorph/MeshWeaver.Deploy/$C1/deploy/macos/intune"
+printf '#!/bin/bash\necho "BOOTSTRAP-A $*"\n' > "$LD/web/Systemorph/MeshWeaver.Deploy/$C1/deploy/macos/intune/fleet-bootstrap.sh"
+S1="$(shasum -a 256 "$LD/web/Systemorph/MeshWeaver.Deploy/$C1/deploy/macos/intune/fleet-bootstrap.sh" | cut -d' ' -f1)"
+{ cat "$FL"; printf '\n__FLEET_EMBEDDED_BOOTSTRAP__\n'; printf '#!/bin/bash\necho "EMBEDDED-B $*"\n'; } > "$LD/uploaded.sh"
+lrun() { env FLEET_BOOTSTRAP_BASE_URL="file://$LD/web" FLEET_LOADER_DIR="$LD/dir" FLEET_LOG_DIR="$LD/log" FLEET_STATE_DIR="$LD/st" FLEET_MANAGED_PREFS="$LD/none" "$@" bash "${LSCRIPT:-$LD/uploaded.sh}" first-arg 2>&1; }
+OUT="$(lrun FLEET_BOOTSTRAP_COMMIT="$C1" FLEET_BOOTSTRAP_SHA256="$S1")"; RC=$?
+case "$RC:$OUT" in 0:*"fetched and verified"*"BOOTSTRAP-A first-arg"*) case "$OUT" in *EMBEDDED-B*) bad "a pinned run never runs the embedded copy" "$OUT" ;; *) [ -f "$LD/dir/fleet-bootstrap.sh" ] && grep -q '^ok .*fetched and verified' "$LD/st/loader" && ok "a pin in the profile: the bootstrap at that commit is fetched, verified by its sha256, kept and run (with the arguments); reading loader = ok" || bad "pinned fetch side effects" "$(ls -la "$LD/dir")" ;; esac ;; *) bad "pinned fetch" "rc=$RC $OUT" ;; esac
+mv "$LD/web" "$LD/web.gone"
+OUT="$(lrun FLEET_BOOTSTRAP_COMMIT="$C1" FLEET_BOOTSTRAP_SHA256="$S1")"
+case "$OUT" in *"verified copy"*"BOOTSTRAP-A"*) ok "the next run with the same pin uses the verified copy — no fetch needed (the network may be down)" ;; *) bad "verified copy reuse" "$OUT" ;; esac
+mv "$LD/web.gone" "$LD/web"; rm -rf "$LD/dir"
+OUT="$(lrun FLEET_BOOTSTRAP_COMMIT="$C1" FLEET_BOOTSTRAP_SHA256="$(printf 'b%.0s' $(seq 1 64))")"
+case "$OUT" in *"REFUSED the fetched bootstrap"*"EMBEDDED-B first-arg"*) case "$OUT" in *BOOTSTRAP-A*) bad "mismatched bytes never run" "$OUT" ;; *) ok "bytes that do not match the pinned sha256 are REFUSED (said), and the embedded copy runs instead" ;; esac ;; *) bad "sha mismatch" "$OUT" ;; esac
+rm -rf "$LD/dir"
+OUT="$(lrun)"
+case "$OUT" in *"no bootstrap pin in the com.memex.local profile"*"EMBEDDED-B first-arg"*) ok "no pin in the profile: the embedded copy runs" ;; *) bad "no pin" "$OUT" ;; esac
+# the pin from the managed profile itself
+python3 -c 'import plistlib,sys; plistlib.dump({"BootstrapCommit": sys.argv[1], "BootstrapSha256": sys.argv[2]}, open(sys.argv[3], "wb"), fmt=plistlib.FMT_BINARY)' "$C1" "$S1" "$LD/prefs.plist"
+rm -rf "$LD/dir"
+OUT="$(env FLEET_BOOTSTRAP_BASE_URL="file://$LD/web" FLEET_LOADER_DIR="$LD/dir" FLEET_LOG_DIR="$LD/log" FLEET_STATE_DIR="$LD/st" FLEET_MANAGED_PREFS="$LD/prefs" bash "$LD/uploaded.sh" 2>&1)"
+case "$OUT" in *"fetched and verified"*"BOOTSTRAP-A"*) ok "the pin is read from the MDM-delivered com.memex.local profile (BootstrapCommit, BootstrapSha256)" ;; *) bad "pin from profile" "$OUT" ;; esac
+# nothing at all to run: FAILED, exit 1 — never a silent success
+rm -rf "$LD/dir"; LSCRIPT="$FL"
+OUT="$(lrun)"; RC=$?
+case "$RC:$OUT" in 1:*"FAILED — no pinned, embedded or verified bootstrap"*) grep -q '^failed ' "$LD/st/loader" && ok "no pin, no embedded copy, no verified copy: FAILED, exit 1, reading loader = failed" || bad "loader failed reading" "" ;; *) bad "nothing to run" "rc=$RC $OUT" ;; esac
+unset LSCRIPT
+grep -q '^return 0 2>/dev/null || exit 0$' "$FL" && [ "$(tail -1 "$FL")" = 'return 0 2>/dev/null || exit 0' ] && ok "the loader ends in an exit: the embedded bytes appended after it are never executed inline" || bad "loader end" "$(tail -1 "$FL")"
+rm -rf "$LD"
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"

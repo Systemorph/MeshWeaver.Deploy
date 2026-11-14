@@ -235,6 +235,10 @@ spec:
             - { name: MW_BUILD_RUN_DEADLINE_SECONDS, value: {{ $b.runDeadline | quote }} }
             # Fan-out: how many of a `parallel` run's stages run at once; the runner checks it against its cgroup.
             - { name: MW_BUILD_STAGE_SLOTS, value: {{ $b.stageSlots | quote }} }
+            {{- if $b.stageProcessorCount }}
+            # DECLARED DOTNET_PROCESSOR_COUNT for every stage; absent, the runner sizes it from its cgroup and the slots.
+            - { name: MW_BUILD_STAGE_PROCESSOR_COUNT, value: {{ $b.stageProcessorCount | quote }} }
+            {{- end }}
             # The warm workspace (MeshWeaver.Plugins Hosting/BuildQueue.md §7.2): one checkout per repository kept across runs
             # under the work volume, moved to each run's exact sha with obj/ and bin/ kept, wiped on a set change.
             - { name: MW_BUILD_WARM_WORKSPACE, value: {{ ternary "true" "false" $b.warmWorkspace | quote }} }
@@ -276,8 +280,16 @@ spec:
             - { name: MW_BUILD_CORE_TESTS_DIGEST, value: {{ $c.coreTestsDigest | quote }} }
             {{- end }}
             - { name: MW_BUILD_IDENTITY_FILE, value: "/portal/app/meshweaver-framework.identity" }
+            {{- if $b.machine }}
+            # the claimed host name carries the MACHINE (`<machine>-<pod>`), so the price list credits the run to it by
+            # host prefix; `$(MW_BUILD_POD)` is expanded by the kubelet from the variable defined just above
+            - name: MW_BUILD_POD
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: MW_BUILD_HOST, value: {{ printf "%s-$(MW_BUILD_POD)" $b.machine | quote }} }
+            {{- else }}
             - name: MW_BUILD_HOST
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            {{- end }}
             - { name: MW_BUILD_CACHE, value: "/cache" }
             - { name: MW_BUILD_WORK, value: "/work" }
             - { name: MW_BUILD_READY_FILE, value: "/tmp/build-host-ready" }

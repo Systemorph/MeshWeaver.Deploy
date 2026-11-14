@@ -129,6 +129,18 @@ The refusals, and why each one exists:
 {{- if or (lt $stageSlots 1) (gt $stageSlots 32) -}}
 {{- fail (printf "buildHosts.stageSlots %d must be within [1, 32] — how many of one run's stages a host runs at once (1 = serial)" $stageSlots) -}}
 {{- end -}}
+{{- /* The DECLARED DOTNET_PROCESSOR_COUNT of every stage, or "" = the runner sizes it from the cgroup and the slots
+       (build-run.py `stage_processor_count`). Whole number FIRST, as stageSlots: `int` truncates. null is "not declared". */ -}}
+{{- $stageCpu := "" -}}
+{{- if and (hasKey $b "stageProcessorCount") (not (kindIs "invalid" $b.stageProcessorCount)) -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $b.stageProcessorCount)) -}}
+{{- fail (printf "buildHosts.stageProcessorCount %v must be a whole number within [1, 1024] (or null: sized from the cgroup and the stage slots) — the DOTNET_PROCESSOR_COUNT every stage gets" $b.stageProcessorCount) -}}
+{{- end -}}
+{{- if or (lt (int $b.stageProcessorCount) 1) (gt (int $b.stageProcessorCount) 1024) -}}
+{{- fail (printf "buildHosts.stageProcessorCount %v must be within [1, 1024] (or null: sized from the cgroup and the stage slots) — the DOTNET_PROCESSOR_COUNT every stage gets" $b.stageProcessorCount) -}}
+{{- end -}}
+{{- $stageCpu = toString (int $b.stageProcessorCount) -}}
+{{- end -}}
 {{- /* The module-slice cache's BOUND (MeshWeaver.Plugins Hosting/OneBuildTree.md §4, Deviations): a whole number of GiB, at least 1 — the
        runner evicts least-recently-used slices above it (they are a cache of control's append-only store). hasKey, not
        `default`: an explicit 0 is refused, never turned into the default and never "unbounded". */ -}}
@@ -453,14 +465,22 @@ The refusals, and why each one exists:
 {{- end -}}
 {{- $np := ($b.networkPolicy | default dict) -}}
 {{- $wi := ($b.workloadIdentity | default dict) -}}
-{{- toYaml (dict "enabled" true "sharedName" $shared "apiUrl" $api "scalerApiUrl" $scalerApi "tokenSecret" $tokName "tokenKey" $tokKey
+{{- /* The MACHINE the hosts run on (its Deployments/<id> on control), or empty: when set every host names itself
+       `<machine>-<pod>` in its claims, so the fleet's price list can credit a run to the machine by host prefix — two Macs
+       serving one queue are otherwise indistinguishable (`build-host-mac-<rs>-<pod>` on both; MeshWeaver.Plugins
+       Hosting/BuildQueue §2a). A DNS label, so the claimed host name stays one too. */ -}}
+{{- $machine := trim (toString ($b.machine | default "")) -}}
+{{- if and $machine (not (regexMatch "^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$" $machine)) -}}
+{{- fail (printf "buildHosts.machine %q must be a lower-case DNS label of at most 32 characters (the machine's Deployments/<id>)" $machine) -}}
+{{- end -}}
+{{- toYaml (dict "enabled" true "machine" $machine "sharedName" $shared "apiUrl" $api "scalerApiUrl" $scalerApi "tokenSecret" $tokName "tokenKey" $tokKey
       "workloadIdentityClientId" (trim ($wi.clientId | default ""))
       "cacheClaim" $cache "cache" $cacheCreate "imagePullSecret" ($b.imagePullSecret | default "")
       "pluginsRegistry" ($b.pluginsRegistry | default "") "pluginsSource" ($b.pluginsSource | default "plugins")
       "orasImage" (required "buildHosts.orasImage is required" $b.orasImage)
       "nodeSelector" $nodeSelector "tolerations" $tolerations
       "resources" ($b.resources | default dict) "workSizeLimit" ($b.workSizeLimit | default "60Gi")
-      "runDeadline" $runDeadline "stageSlots" $stageSlots "sliceCacheMaxGi" $sliceCacheMaxGi "cacheBudgetGi" $budgetGi "cacheShares" $shares "readyPort" $readyPort
+      "runDeadline" $runDeadline "stageSlots" $stageSlots "stageProcessorCount" $stageCpu "sliceCacheMaxGi" $sliceCacheMaxGi "cacheBudgetGi" $budgetGi "cacheShares" $shares "readyPort" $readyPort
       "stageNetwork" $stageNetwork "runDiskGi" $runDiskGi "diskHeadroomPercent" $diskHeadroom
       "warmWorkspace" (eq (toString ($b.warmWorkspace | default false)) "true")
       "moduleHub" (eq (toString ($b.moduleHub | default false)) "true")

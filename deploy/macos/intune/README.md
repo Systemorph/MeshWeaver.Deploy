@@ -73,7 +73,13 @@ finishes (back-lease enrolment + update). The earlier Macs passed this step beca
 wizard before the join. Since 1.10.0 a pre-setup join that is collected goes straight on in the SAME run: the setup
 is answered (the sign-in is installed by then), the bootstrap waits up to `FLEET_SETUP_WAIT_S` (600 s) for the portal to
 restart configured, and the finalisation (back-lease enrolment + update) follows — on the first Mac mini that was an
-hour's wait for nothing. Every step rewrites its own reading whoever runs it (the network step's reading had stayed at a
+hour's wait for nothing. **The sign-in reaches the Mac even when the join comes first** (1.11.0): a bootstrap-run join has no private-network name
+yet (the root daemon takes the key by file only after the join), so memex-local (FLEET_SIGNIN_HANDOVER) hands the
+sign-in over by file (`~/.memex-local/enrol/<id>.signin`, 0600, with `<id>.signin-facts`), and the bootstrap installs it
+with `memex-local internal on` once the network is up, before the setup (reading `signin`). A memex-local that predates
+the hand-over is upgraded from the tap. A Mac that JOINED but whose sign-in never landed (no `internal.yaml`, no
+hand-over, the portal still in setup) sets the join aside and files a FRESH join by itself — the first Mac mini lost its
+sign-in this way (2026-11-12). Every step rewrites its own reading whoever runs it (the network step's reading had stayed at a
 stale WAITING after the join's own call brought the tailnet up).
 
 **Operator SSH — optional**: `OperatorSshKeys`, a list of OpenSSH PUBLIC keys (a profile array, one key per
@@ -84,6 +90,18 @@ Remote Login and the operator's key were set up by hand on each Mac (owner, 2026
 The environment variables `FLEET_ACCEPT_JOBS`, `FLEET_ACCEPT_JOBS_FROM`, `FLEET_ACCEPT_JOBS_CHANNELS`,
 `FLEET_ACCEPT_JOBS_REPOS`, `FLEET_ACCEPT_TOKENS`, `FLEET_ACCEPT_TOKENS_FROM`, `FLEET_ACCEPT_TOKENS_MODELS`,
 `FLEET_ACCEPT_TOKENS_RESIDENCY` and `FLEET_CA_SHA256` override them.
+
+**The loader — a bootstrap bump in minutes, not hours** (2026-11-12). The Intune script is `fleet-loader.sh`, a STABLE
+loader of about 100 lines that changes only when its own behaviour does. Each run it reads the bootstrap's pin from the
+`com.memex.local` profile — `BootstrapCommit` (40 hex) and `BootstrapSha256` (64 hex) — fetches
+`deploy/macos/intune/fleet-bootstrap.sh` from this repository at that commit, verifies its sha256, keeps it
+root-owned in `/Library/MeshWeaver/loader/` and runs it with the run's arguments. Bytes that do not match the pin are
+REFUSED (logged). With no pin, a failed fetch or a refusal it runs its EMBEDDED copy — the bootstrap the reconcile
+appends to the uploaded script after the line `__FLEET_EMBEDDED_BOOTSTRAP__` (`scripts[].source.embed`) — and else the
+last verified copy; with none of them it FAILS (exit 1). Decisions go to `/Library/Logs/MeshWeaver/fleet-loader.log`
+and the reading `loader`. Why: the Intune agent re-runs a CACHED script until its next full sync (8 h) and `syncDevice`
+does not change that, but a PROFILE arrives within a minute of a `syncDevice` — so a bump is now a change of the
+profile's two keys, which `--apply` writes and syncs: every awake Mac runs the new bootstrap at its next hourly run.
 
 **Registering it** is the reconcile's job (section "Intune objects as code" below): the spec pins the script to a full commit of this
 repository and the file's sha256, `--apply` uploads exactly those bytes (refusing any that hash differently), and
@@ -161,6 +179,13 @@ groups') to sync — `POST managedDevices/{id}/syncDevice` (an empty POST: Graph
 role `DeviceManagementManagedDevices.PrivilegedOperations.All`, declared in `appIdentity.requiredRoles` so `--check`
 reports it missing; it is assigned to the app's service principal as an appRoleAssignment — `az ad app permission
 admin-consent` alone did not create it.
+
+🚨 **Measured since (2026-11-12): `syncDevice` delivers PROFILES, not a new SCRIPT.** It wakes the Mac's MDM channel
+(mdmclient), and a pending profile installs within a minute — but the Intune agent (the sidecar that runs the script)
+fetched its script policies only at enrolment and then every 8 h (10:11Z … 18:12Z on the first Mac mini), whatever
+`syncDevice` said; four syncs in between fetched nothing. A bootstrap bump therefore reaches a Mac at its agent's next
+full sync, or sooner only when a person checks in through Company Portal ("Check status"). The reading
+`/Library/MeshWeaver/fleet-state/version` (1.11.1) names the bootstrap that actually ran.
 
 ### The console password that expired at enrolment (2026-11-09)
 

@@ -33,7 +33,7 @@ name: Build host — runner image and the build-latest hand-over
 #                   ONLY ONCE IT IS SEALED: arming does not wait for the platform bake, and every
 #                   MeshWeaver.Plugins run takes the channel's set through core's resolver freeze
 #                   path (that set, sealed, or RED). So the hand-over asks that same resolver, at
-#                   core `main`, first (`platform-set-dispatch.py seal-gate`); not sealed yet → it
+#                   core `main3`, first (`platform-set-dispatch.py seal-gate`); not sealed yet → it
 #                   HOLDS, and build-latest keeps its previous sealed set (the receiver never moves
 #                   backwards) until a later tick finds this one sealed.
 #   3. `report`   — the lane's own alert issue (label `build-host-latest`) in THIS repository.
@@ -166,7 +166,7 @@ jobs:
           python3 deploy/.github/scripts/acr-data-plane.py --self-test
           python3 deploy/.github/scripts/acr-data-plane.py check-workflow deploy/.github/workflows/build-host.yml
       # The platform commit the image is composed against: the set's own commit when a hand-over
-      # names one, the platform's main otherwise (a change here is tested against the platform it
+      # names one, the platform's main3 (core's v3 line) otherwise (a change here is tested against the platform it
       # will next be built with).
       - name: Which platform commit to compose against
         id: platform
@@ -179,7 +179,7 @@ jobs:
             ref=$(sed -n 's/^set_core_sha=//p' "$RUNNER_TEMP/claim")
             [ -n "$ref" ] || ref=$(sed -n 's/^run_core_sha=//p' "$RUNNER_TEMP/claim")
           else
-            ref=main
+            ref=main3   # core's v3 line (policy major-lines-run-separately)
           fi
           [ -n "$ref" ] || { echo "::error::no platform ref resolved"; exit 1; }
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
@@ -777,11 +777,11 @@ jobs:
           # 🚨 THE CHANNEL NAMES ONLY A SEALED SET. Arming does not wait for the platform bake or
           # verify-images, and every MeshWeaver.Plugins run takes the channel's set through core's
           # resolver FREEZE path (that set, sealed, or RED) — so the set is handed over only once that
-          # SAME resolver, at core `main` (the copy Plugins fetches), calls it sealed. Not sealed yet →
+          # SAME resolver, at core `main3` (the copy Plugins fetches), calls it sealed. Not sealed yet →
           # hold: the receiver never moves backwards, so build-latest keeps its previous sealed set and a
           # later tick hands this one over. A resolver that cannot answer is RED (platform-set-dispatch.py
           # seal-gate). GITHUB_OUTPUT/GITHUB_STEP_SUMMARY are withheld: the resolver writes its own outputs.
-          gh api "repos/$PLATFORM_REPO/contents/.github/scripts/resolve-platform.py?ref=main" \
+          gh api "repos/$PLATFORM_REPO/contents/.github/scripts/resolve-platform.py?ref=main3" \
             -H "Accept: application/vnd.github.raw" > "$RUNNER_TEMP/resolve-platform.py"
           rc=0
           env -u GITHUB_OUTPUT -u GITHUB_STEP_SUMMARY python3 "$RUNNER_TEMP/resolve-platform.py" --no-registry \
@@ -857,30 +857,50 @@ jobs:
           TESTER_DIGEST=$(resolve mw-plugin-test)
           PORTAL_DIGEST=$(resolve memex-portal-ai)
           # RUNNER_DIGEST was resolved (and required) by the previous step, for the same version.
-          BODY=$(python3 deploy/.github/scripts/build-host-announcement.py body --deployment "$DEPLOYMENT" --channel latest \
-            --version "$V_SET" --tester-image "$ACR/mw-plugin-test" --tester-digest "$TESTER_DIGEST" \
-            --portal-image "$ACR/memex-portal-ai" --portal-digest "$PORTAL_DIGEST" \
-            --runner-image "$ACR/mw-build-host" --runner-digest "$RUNNER_DIGEST" \
-            --core-sha "$CORE_SHA" --plugins-sha "$PLUGINS_SHA" --instance "$RUN_URL" --supersedes "$SUPERSEDED")
-          SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^.*= /sha256=/')
-          code=$(curl -sS -o "$RUNNER_TEMP/build-host-resp" -w '%{http_code}' --connect-timeout 10 --max-time 60 \
-            -X POST "$URL" -H 'Content-Type: application/json' \
-            -H "X-Hub-Signature-256: $SIG" --data "$BODY") || code=000
-          echo "POST $URL -> $code"; cat "$RUNNER_TEMP/build-host-resp" || true
-          verdict=$(tr -d '\n' < "$RUNNER_TEMP/build-host-resp" 2>/dev/null | sed -n 's/.*"signature"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-          case "$code" in
-            2*)
-              [ "$verdict" = verified ] || { echo "::error::the inbox stored the build-host event but did not VERIFY its signature (signature: '${verdict:-<none>}') — the router drops what it cannot verify, so build-latest would not move"; exit 1; }
-              # STORED AND VERIFIED IS NOT DELIVERED: the receiver changes the record only when that
-              # record declares buildHosts.enabled. Whether build-latest RUNS the set is read on the
-              # run nodes it claims (`PlatformVersion`), never inferred from this 200.
-              echo "handed=true" >> "$GITHUB_OUTPUT"
-              echo "- build-latest handed \`$V_SET\` (tester \`${TESTER_DIGEST:7:12}\`, portal \`${PORTAL_DIGEST:7:12}\`, runner \`$RUNNER_TAG\` = \`${RUNNER_DIGEST:7:12}\`, superseding $(printf '%s' "$SUPERSEDED" | wc -w | tr -d ' ') older runner(s)) for record \`$DEPLOYMENT\`: STORED and signature-verified (HTTP $code). Not yet a roll — the record's Reconcile is" >> "$GITHUB_STEP_SUMMARY"
-              ;;
-            000) echo "::error::could not reach the control plane's inbox — build-latest was NOT handed $V_SET"; exit 1 ;;
-            401) echo "::error::the inbox REFUSED the signature (HTTP 401): secrets.CONTROL_WEBHOOK_SECRET and the instance's Hosting:PlatformWebhookSecret differ — build-latest was NOT handed $V_SET"; exit 1 ;;
-            *)   echo "::error::the inbox refused the build-host event (HTTP $code) — build-latest was NOT handed $V_SET"; exit 1 ;;
-          esac
+          # 🚨 THE LINES (policy major-lines-run-separately): the set moves every declared channel of its OWN major —
+          # `latest3` and the compatibility `latest` for a 3.x set — ONE signed event per channel, each moving only its
+          # own key on the record (so nothing is applied twice). A channel of another major is never named
+          # (build-host-announcement.py refuses to sign one, and the receiver refuses it again).
+          # The script's OWN exit status decides: a malformed declaration or a version that is not a set
+          # name is a RED step, never mistaken for "no channel of the line" below.
+          if ! out=$(python3 deploy/.github/scripts/build-host-announcement.py channels --declaration deploy/.github/build-hosts.json --version "$V_SET"); then
+            echo "::error::build-host-announcement.py channels failed for $V_SET — the hand-over's channels could not be computed"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+          channels=$(printf '%s\n' "$out" | sed -n 's/^channels=//p')
+          if [ -z "$channels" ]; then
+            echo "::warning::.github/build-hosts.json declares no channel of the line of $V_SET — nothing is handed over"
+            echo "- build-host: $V_SET is of a line no declared channel follows — not handed over" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          for CHANNEL in $channels; do
+            BODY=$(python3 deploy/.github/scripts/build-host-announcement.py body --deployment "$DEPLOYMENT" --channel "$CHANNEL" \
+              --version "$V_SET" --tester-image "$ACR/mw-plugin-test" --tester-digest "$TESTER_DIGEST" \
+              --portal-image "$ACR/memex-portal-ai" --portal-digest "$PORTAL_DIGEST" \
+              --runner-image "$ACR/mw-build-host" --runner-digest "$RUNNER_DIGEST" \
+              --core-sha "$CORE_SHA" --plugins-sha "$PLUGINS_SHA" --instance "$RUN_URL" --supersedes "$SUPERSEDED")
+            SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^.*= /sha256=/')
+            code=$(curl -sS -o "$RUNNER_TEMP/build-host-resp" -w '%{http_code}' --connect-timeout 10 --max-time 60 \
+              -X POST "$URL" -H 'Content-Type: application/json' \
+              -H "X-Hub-Signature-256: $SIG" --data "$BODY") || code=000
+            echo "POST $URL ($CHANNEL) -> $code"; cat "$RUNNER_TEMP/build-host-resp" || true
+            verdict=$(tr -d '\n' < "$RUNNER_TEMP/build-host-resp" 2>/dev/null | sed -n 's/.*"signature"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+            case "$code" in
+              2*)
+                [ "$verdict" = verified ] || { echo "::error::the inbox stored the build-host event for build-$CHANNEL but did not VERIFY its signature (signature: '${verdict:-<none>}') — the router drops what it cannot verify, so build-$CHANNEL would not move"; exit 1; }
+                # STORED AND VERIFIED IS NOT DELIVERED: the receiver changes the record only when that
+                # record declares buildHosts.enabled AND this channel. Whether build-latest RUNS the set is read on the
+                # run nodes it claims (`PlatformVersion`), never inferred from this 200.
+                echo "- build-$CHANNEL handed \`$V_SET\` (tester \`${TESTER_DIGEST:7:12}\`, portal \`${PORTAL_DIGEST:7:12}\`, runner \`$RUNNER_TAG\` = \`${RUNNER_DIGEST:7:12}\`, superseding $(printf '%s' "$SUPERSEDED" | wc -w | tr -d ' ') older runner(s)) for record \`$DEPLOYMENT\`: STORED and signature-verified (HTTP $code). Not yet a roll — the record's Reconcile is" >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              000) echo "::error::could not reach the control plane's inbox — build-$CHANNEL was NOT handed $V_SET"; exit 1 ;;
+              401) echo "::error::the inbox REFUSED the signature (HTTP 401): secrets.CONTROL_WEBHOOK_SECRET and the instance's Hosting:PlatformWebhookSecret differ — build-$CHANNEL was NOT handed $V_SET"; exit 1 ;;
+              *)   echo "::error::the inbox refused the build-host event (HTTP $code) — build-$CHANNEL was NOT handed $V_SET"; exit 1 ;;
+            esac
+          done
+          # Every channel of the set's line was handed it (a failure above exits before this line).
+          echo "handed=true" >> "$GITHUB_OUTPUT"
 
   # 📣 THE BUILD-HOST LANE REPORTS ITSELF, on its own label, in THIS repository. A red `image` or
   # `handover` files or comments on the ONE open `build-host-latest` issue; that issue is CLOSED only

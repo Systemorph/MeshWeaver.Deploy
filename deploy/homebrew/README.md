@@ -430,6 +430,54 @@ Colima mounts the home directory with virtiofs, where every uid in the VM reads 
 measured on a Mac Studio (2026-11-08): `nobody` inside the VM created a file in a `0755` directory. A `0600` file
 inside the mount would therefore be readable by the first instance's pod.
 
+## Idle-only models — CI first, a large model when the build host is idle
+
+A Mac Studio that is a CI build host (Colima profile `build`) AND serves tokens cannot hold the build VM and a large
+model at once. Measured on a 128 GB M5 Max (2026-11-12): the build VM holds about 56 GB resident even when idle, and
+`gpt-oss:120b` needs about 70 GB. The owner therefore declares the models that may run ONLY while the build VM is
+stopped (MeshWeaver.Plugins `Hosting/BackLease` §15.9):
+
+```bash
+memex-local backlease accept tokens --idle-only-models gpt-oss:120b   # none withdraws them
+memex-local update                                                   # the portal re-renders with the key
+```
+
+That writes `Hosting__BackLease__Accept__Tokens__IdleOnlyModels__N` into `~/.memex-local/backlease.yaml` beside the
+other token keys (each idle-only model is added to `…__Tokens__Models__N` too — the claim names it, and control refuses
+a model the opt-in does not list), and loads the launchd agent `com.memex.local.buildhost-idle`
+(`memex-local buildhost idle run` → `share/buildhost-idle.py`). It is not asked interactively, like the token slots.
+`backlease status`, `buildhost idle status` and `fleet doctor` show the declaration and the current state.
+
+**The state file** — the ONLY thing the portal's token worker reads: `~/.memex-local/backlease/buildhost.json`,
+mounted read-only as `/host-readings/buildhost.json`, written atomically (a temp file in the same directory, then a
+rename): `{"state":"running|draining|stopped","since":"<ISO-8601 UTC>","reason":"<short text>"}`. The worker lists an
+idle-only model in a claim only while it reads `stopped`; an absent or unreadable file serves none.
+
+**The reads, every 15 s** (only while idle-only models are declared and the Mac has the build profile):
+
+| read | how | when it fails |
+|---|---|---|
+| CI demand | `GET {Hosting__ReportTo}/api/builds/queue?channel=mac`, anonymous → `demand` (claimable + running) | counts as DEMAND — CI first: nothing stops, a stopped VM drains |
+| idle-only demand | `POST {control}/api/fleet-models/demand {"host","models"}`, signed with the Mac's own key exactly as the token worker signs: `X-MeshWeaver-Deployment`, `X-MeshWeaver-Timestamp` (unix s), `X-Hub-Signature-256: sha256=hex(HMAC-SHA256(key, "<dep>\n<ts>\nPOST /demand\n\n\n<body>"))` | counts as NO idle demand — CI first (a control that does not serve the route yet answers 404) |
+
+The key is `Hosting__ModuleReportSecret` from `fleet.yaml` (else the overlay). It is never printed, logged or passed on
+an argument list.
+
+**The state machine** (it never preempts a running step, and never touches the Ollama server or another model):
+
+| from → to | when | what it does |
+|---|---|---|
+| running → stopped | CI demand 0 AND an idle-only job is queued for this Mac | re-reads the CI demand, then `colima stop -p build` (kubectl context kept), then writes `stopped` |
+| stopped → draining | CI demand > 0 or unread, OR no idle-only job queued or running for 10 min, OR the declaration withdrawn | writes `draining` FIRST: the worker claims no new idle-only job, the step in progress finishes |
+| draining → running | every idle-only model reports `running == 0` (or the demand is unread; or 30 min passed) | unloads each idle-only model (`POST 127.0.0.1:11434/api/generate {"model":m,"keep_alive":0}`); while `GET /api/ps` still lists one, it stays `draining` and retries (bounded by the 30 min); then `colima start -p build`, writes `running` |
+
+Every transition and every changed reading is logged to `~/.memex-local/buildhost-idle.log`. `buildhost apply` does not
+start a VM the governor stopped (it says so); `fleet doctor` reads a VM stopped for an idle-only model as green. The
+timings are overridable for a test: `MEMEX_IDLE_INTERVAL`, `MEMEX_IDLE_GIVEBACK`, `MEMEX_IDLE_DRAIN_MAX`.
+
+**Not covered:** a headless host (no GUI login session) gets no agent — it says so and serves no idle-only model; the
+release follower's helm calls against the stopped build VM fail and retry until it is back.
+
 ## Auto-update of the CLI and its chart — on by default
 
 A Homebrew install keeps **itself** current: `memex-local up` and `memex-local update` arm a
@@ -511,7 +559,7 @@ rolled in place; the **migration** is re-run as a Job (it has no Deployment).
 | §5 mkcert TLS | `mkcert -install` + mint cert + `kubectl create secret tls memex-portal-tls` | `setup_tls()` |
 | §6 Hostname | `memex.localhost` (auto-resolves), port `8443` | constants `HOSTNAME_LOCAL` / `HOST_PORT` |
 | §7 Durable access | `port-forward.sh` + `com.memex.local.plist`, `launchctl bootstrap` | `install_launchd()` (assets in `share/`) |
-| §10 Local LLM | `brew services start ollama` (loopback 127.0.0.1:11434, `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`; memex-local's own agent as the fallback; the VM reaches it through its gateway); `ollama pull qwen3.8:27b-mlx`; the portal calls `http://ollama.memex.svc.cluster.local:11434/v1` — a Host Ollama admits (the short name `ollama:11434` is answered 403) | `setup_ollama()` + `ensure_chat_model()` + tracked defaults (endpoint, `ollama.external`) + `~/.memex-local/llm.auto.yaml` (model, context window, `AI__Tiers__chat`, gateway IP) + `llm_chat_smoke()` (a real completion from inside the pod; `up`/`update` fail on a 403 or any non-200). **Embeddings are local too:** `ensure_embed_model()` pulls `bge-m3` (1024-dim, multilingual), `llm.auto.yaml` sets `Embedding__Provider=Ollama`, `Embedding__Endpoint` (the same host-safe endpoint) and `Embedding__Model` for the portal AND the migration Job (which sizes the vector columns and backfills), and `embed_smoke()` proves a vector of the platform's width from inside the pod — a Mac install never embeds in the cloud |
+| §10 Local LLM | `brew services start ollama` (loopback 127.0.0.1:11434, `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`; memex-local's own agent as the fallback; the VM reaches it through its gateway); `ollama pull qwen3.8:27b-mlx`; the portal calls `http://ollama.memex.svc.cluster.local:11434/v1` — a Host Ollama admits (the short name `ollama:11434` is answered 403) | `setup_ollama()` + `ensure_chat_model()` + tracked defaults (endpoint, `ollama.external`) + `~/.memex-local/llm.auto.yaml` (model, context window, `AI__Tiers__chat`, gateway IP) + `llm_chat_smoke()` (a real completion from inside the pod; `up`/`update` fail on a 403 or any non-200). **Embeddings are local too:** `ensure_embed_model()` pulls `bge-m3` (1024-dim, multilingual), `llm.auto.yaml` sets `Embedding__Provider=Ollama`, `Embedding__Endpoint` (the same host-safe endpoint) and `Embedding__Model` for the portal AND the migration Job (which sizes the vector columns and backfills), and `embed_smoke()` proves a vector of the platform's width from inside the pod — a Mac install never embeds in the cloud. **Every other AI service too:** `llm.auto.yaml` maps the `utility`, `reasoning` and `review` tiers to the chat model and `coding` to the code model when Ollama has it (an unmapped tier falls to a cloud default), and OCR stays on the vision model `resolve_ocr_vision()` picks (`Ocr__Engine=OllamaVision`, the same endpoint); `ocr_smoke()` proves an image read from inside the pod and gates `up`/`update` |
 | §11 Observability | `helm upgrade --install loki grafana/loki-stack -f share/values.observability.yaml` (sized for the VM; `fleet join` runs it) | `cmd_observability()` |
 | §12 Instance identity | `Portal__InstanceName/Color` | overlay `config.memex_portal` |
 | §14 Verify | assert the portal is USABLE — it serves, `/login` is routed, and the DefaultViews/GraphViews packs are present | `verify_usable()` (`up` / `update` / `verify`; behaviour-tested in `test/run-tests.sh`) |
@@ -567,6 +615,8 @@ strings from it).
 | `share/tools.sh` | the resolver: existing installation first (floor met), the `.pkg`'s vendored copy second — `need`, `preflight`, `doctor` |
 | `share/instances.py` | further instances on this Mac (`memex-local instances`) and the executor of the first instance's "new instance" GUI — see *Further instances on this Mac* |
 | `share/com.memex.local.instances.plist` | the executor's launchd login-agent template |
+| `share/buildhost-idle.py` | the idle-only models governor — CI first, a large model only while the build VM is stopped for it — see *Idle-only models* |
+| `share/com.memex.local.buildhost-idle.plist` | its launchd login-agent template |
 
 State lives in `~/.memex-local/` (overlay, mkcert cert/key, port-forward script +
 log, ollama log, grafana password) — exactly the paths the doc uses.
