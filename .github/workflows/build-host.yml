@@ -787,14 +787,46 @@ jobs:
           # 🚨 THE CHANNEL NAMES ONLY A SEALED SET. Arming does not wait for the platform bake or
           # verify-images, and every MeshWeaver.Plugins run takes the channel's set through core's
           # resolver FREEZE path (that set, sealed, or RED) — so the set is handed over only once that
-          # SAME resolver, at core `main` (the copy Plugins fetches), calls it sealed. Not sealed yet →
-          # hold: the receiver never moves backwards, so build-latest keeps its previous sealed set and a
-          # later tick hands this one over. A resolver that cannot answer is RED (platform-set-dispatch.py
-          # seal-gate). GITHUB_OUTPUT/GITHUB_STEP_SUMMARY are withheld: the resolver writes its own outputs.
-          gh api "repos/$PLATFORM_REPO/contents/.github/scripts/resolve-platform.py?ref=main" \
+          # SAME resolver, at the set's OWN delivery line (the copy a Plugins run of that line fetches),
+          # calls it sealed. Not sealed yet → hold: the receiver never moves backwards, so build-latest
+          # keeps its previous sealed set and a later tick hands this one over. A resolver that cannot
+          # answer is RED (platform-set-dispatch.py seal-gate). GITHUB_OUTPUT/GITHUB_STEP_SUMMARY are
+          # withheld: the resolver writes its own outputs.
+          # 🚨 THE SET'S OWN LINE (policy major-lines-run-separately; MeshWeaver.Deploy#302). Each core
+          # delivery line (.github/delivery-lines.json on the platform's default branch: main = v4,
+          # main3 = v3) seals its own sets, and a resolver lists the CD runs of the line it serves —
+          # so a 3.x set asked of core main's copy "matched no main-cd.yml run on main". The set's line
+          # is the ONE line whose own Directory.Build.props declares the set's major, read by the
+          # platform's `cd-line.py platform-major` (the reading core's CD keys its set selection on);
+          # none, or more than one, is RED. The resolver is fetched AT that line and told the line
+          # through MW_CORE_LINE (a copy that predates the variable lists that same branch anyway).
+          set_major=${newest%%.*}
+          default_branch=$(gh api "repos/$PLATFORM_REPO" --jq .default_branch)
+          gh api "repos/$PLATFORM_REPO/contents/.github/scripts/cd-line.py?ref=$default_branch" \
+            -H "Accept: application/vnd.github.raw" > "$RUNNER_TEMP/cd-line.py"
+          lines=$(gh api "repos/$PLATFORM_REPO/contents/.github/delivery-lines.json?ref=$default_branch" \
+            -H "Accept: application/vnd.github.raw" | jq -r '.lines[].branch') \
+            || { echo "::error::could not read the platform's delivery lines — the line of $newest cannot be placed, so its seal cannot be asked"; exit 1; }
+          [ -n "$lines" ] || { echo "::error::the platform's delivery-lines.json declares no line — the line of $newest cannot be placed"; exit 1; }
+          set_line=""; seen=""
+          for l in $lines; do
+            gh api "repos/$PLATFORM_REPO/contents/Directory.Build.props?ref=$l" \
+              -H "Accept: application/vnd.github.raw" > "$RUNNER_TEMP/props-line" \
+              || { echo "::error::could not read Directory.Build.props on the platform's line $l — the line of $newest cannot be placed"; exit 1; }
+            m=$(python3 -I "$RUNNER_TEMP/cd-line.py" platform-major "$RUNNER_TEMP/props-line") \
+              || { echo "::error::the platform's line $l declares no readable PlatformVersion major ($m) — the line of $newest cannot be placed"; exit 1; }
+            seen="$seen $l:$m"
+            if [ "$m" = "$set_major" ]; then
+              [ -z "$set_line" ] || { echo "::error::the platform's lines $set_line and $l both declare major $set_major — the line of $newest is ambiguous, and is never guessed"; exit 1; }
+              set_line=$l
+            fi
+          done
+          [ -n "$set_line" ] || { echo "::error::no platform delivery line declares major $set_major (${seen# }) — the seal of $newest cannot be asked of its own line"; exit 1; }
+          echo "the set $newest is of major $set_major — core line $set_line (${seen# })"
+          gh api "repos/$PLATFORM_REPO/contents/.github/scripts/resolve-platform.py?ref=$set_line" \
             -H "Accept: application/vnd.github.raw" > "$RUNNER_TEMP/resolve-platform.py"
           rc=0
-          env -u GITHUB_OUTPUT -u GITHUB_STEP_SUMMARY python3 "$RUNNER_TEMP/resolve-platform.py" --no-registry \
+          env -u GITHUB_OUTPUT -u GITHUB_STEP_SUMMARY MW_CORE_LINE="$set_line" python3 "$RUNNER_TEMP/resolve-platform.py" --no-registry \
             --freeze "$newest" > "$RUNNER_TEMP/seal.log" 2>&1 || rc=$?
           python3 deploy/.github/scripts/platform-set-dispatch.py seal-gate --version "$newest" --exit "$rc" \
             --output "$RUNNER_TEMP/seal.log" > "$RUNNER_TEMP/seal-gate" || { cat "$RUNNER_TEMP/seal.log"; exit 1; }
