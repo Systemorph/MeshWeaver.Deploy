@@ -256,6 +256,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: deploy/aks/scripts/test-registry-identity.sh
 
+      # The registry ingress's upload RECEIVE WINDOW (templates/registry/ingress.yaml): over HTTP/2
+      # with request buffering off, nginx grants a stream max(client_body_buffer_size, 64 KiB) in
+      # flight, so without the annotation every layer upload runs at 64 KiB per round trip and a
+      # large layer cannot reach cr inside core CD's mirror cap. The render must carry it at
+      # >= 4 MiB; a negative control strips it from the same render and must be reported.
+      - name: Assert the registry ingress gives an upload a line-rate receive window
+        if: ${{ !cancelled() }}
+        run: deploy/aks/scripts/test-registry-upload-window.sh
+
       # The registry's maintenance window (registry.maintenance.*, MeshWeaver.Plugins#4370 slice 3): with no
       # key the render is unchanged (the negative control); readOnly renders the read-only configuration and
       # annotates the pod template; a collect renders ONE garbage-collect Job, never --delete-untagged, as the

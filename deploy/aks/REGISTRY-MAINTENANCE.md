@@ -106,3 +106,30 @@ the fleet registry:
 This is the procedural close of the "migration Job outside any instance action" hole (the owner's
 decision 2A on MeshWeaver.Plugins#4370). It is the same class of hole as the tag writers outside
 instance actions.
+
+## Upload throughput: the ingress's HTTP/2 receive window
+
+A layer push that "hangs" against the hosted registry is usually a push that is running at a
+fraction of the link's speed. Measured on the fleet registry, 2026-11-14:
+
+- The ingress controller offers HTTP/2, and Go clients (`docker buildx imagetools`, containerd,
+  crane) use it, so each layer upload is one HTTP/2 stream. ACR answers HTTP/1.1 only, which is why
+  the same copy into ACR was never slow.
+- With `proxy-request-buffering: off`, nginx grants a stream at most
+  max(`client_body_buffer_size`, `http2_body_preread_size`) bytes in flight. Both defaulted to
+  64 KiB, so the throughput bound was 64 KiB per round trip. A 4 MiB body to the registry host took
+  2.5 s over HTTP/2 and 0.47 s over HTTP/1.1 from the same client at 35 ms RTT. From a CI runner an
+  ocean away that is about 0.5 MB/s per layer.
+- The storage account was not the limit: an `AppendBlock` of 4 MiB took about 60 ms end to end,
+  and bytes kept arriving the whole time. Nothing was stuck, and no timeout was exceeded.
+- The .NET 11 portal base brought a 935 MiB (amd64) and an 855 MiB (arm64) layer that cr had never
+  seen. At 0.5 MB/s the larger one needs about 30 minutes, so core CD's 25-minute mirror and
+  control promotion jobs were cancelled while still copying. The largest layer the old base added
+  per build was about 230 MiB, which fit.
+
+The fix is `nginx.ingress.kubernetes.io/client-body-buffer-size: "8m"` on the registry ingress.
+Against nginx 1.27.5 the largest stream window granted went from 65,536 bytes (default) to
+8,323,073 (8m). It is a throughput setting, not a timeout. The buffer is allocated per request at
+min(Content-Length + 1, 8 MiB), only for requests with a body on the registry host, and nothing is
+spooled to disk. `deploy/aks/scripts/test-registry-upload-window.sh` (chart gate) keeps it at
+4 MiB or more and proves, with a negative control, that it would notice the annotation's removal.
