@@ -40,18 +40,20 @@ v = a.get(p + "client-body-buffer-size")
 if v is None:
     print("client-body-buffer-size is missing: every HTTP/2 layer upload is held to 64 KiB per round trip")
 else:
-    m = re.fullmatch(r"(\d+)([kKmM]?)", str(v))
+    m = re.fullmatch(r"(\d+)([kKmMgG]?)", str(v))
     if not m:
         print(f"client-body-buffer-size {v!r} is not an nginx size")
     else:
-        n = int(m.group(1)) * {"": 1, "k": 1024, "m": 1024 * 1024}[m.group(2).lower()]
+        n = int(m.group(1)) * {"": 1, "k": 1024, "m": 1024 * 1024, "g": 1024 * 1024 * 1024}[m.group(2).lower()]
         floor = int(os.environ["MIN_BYTES"])
         if n < floor:
             print(f"client-body-buffer-size {v!r} is {n} bytes, below the {floor} a layer upload needs")
 '
 
-out="$(helm template t "$CHART" -f "$EXAMPLE" 2>&1)"; rc=$?
-[ $rc -eq 0 ] && [ -n "$out" ] || { echo "::error::the registry example does not render: $out"; exit 1; }
+errf="$(mktemp)"
+out="$(helm template t "$CHART" -f "$EXAMPLE" 2>"$errf")"; rc=$?
+# stderr stays out of the YAML: a warning on a successful render must not poison the parser.
+[ $rc -eq 0 ] && [ -n "$out" ] || { echo "::error::the registry example does not render (rc=$rc): $(cat "$errf")"; exit 1; }
 
 fail=0
 verdict="$(printf '%s' "$out" | MIN_BYTES=$MIN_BYTES python3 -c "$CHECK")" || { echo "::error::the inspection itself failed, so there is no evidence"; exit 1; }
