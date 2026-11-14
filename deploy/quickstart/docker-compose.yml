@@ -38,9 +38,12 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U memex -d memex"]
+      # Over TCP: during a first boot initdb's temporary server listens on the unix socket only,
+      # so a socket check could pass before the real server (the one db-init reaches) exists.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U memex -d memex"]
       interval: 5s
       retries: 30
+    restart: unless-stopped
 
   db-init:
     image: pgvector/pgvector:pg17
@@ -65,8 +68,10 @@ services:
 
   data-owner:
     image: busybox:1.37
-    # Only when the owner is wrong (a fresh volume): a re-up does not walk the whole volume again.
-    command: ["sh", "-c", "[ \"$$(stat -c %u /data)\" = 1654 ] || chown -R 1654:1654 /data"]
+    # The sentinel is written only after a COMPLETE chown, so a first run that was interrupted
+    # part-way leaves none and the next `up` repairs the whole volume again; a healthy volume is
+    # not walked twice.
+    command: ["sh", "-c", "[ -f /data/.memex-owned ] || { chown -R 1654:1654 /data && touch /data/.memex-owned && chown 1654:1654 /data/.memex-owned; }"]
     volumes:
       - data:/data
 
