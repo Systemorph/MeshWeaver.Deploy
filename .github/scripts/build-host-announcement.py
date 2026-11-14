@@ -24,6 +24,9 @@ Deployment: the record is the only source of truth for what the host runs.
     build-host-announcement.py channels --declaration .github/build-hosts.json --version 3.1.13071
         → `channels=<the declared channels this set moves>` (GITHUB_OUTPUT line): its LINE's channel
           `latest<major>`, and `latest` for a set of the line it names (see THE LINES)
+    build-host-announcement.py line-major --channel stable
+        → the platform major the lane reads its set on (`stable` → STABLE_MAJOR); platform-line.py
+          places that major on its core delivery line
     build-host-announcement.py --self-test
 
 🚨 THE LINES — A CHANNEL NEVER CROSSES A MAJOR (policy `major-lines-run-separately`, platform
@@ -74,6 +77,10 @@ LINE_CHANNEL = re.compile(r"^latest([1-9][0-9]{0,3})$")
 # The line the compatibility name `latest` belongs to: the v3 line, which every reader followed before
 # the lines split. MeshWeaver.Plugins `BuildHostUpdates.CompatibilityAliasMajor` names the same major.
 LATEST_ALIAS_MAJOR = 3
+# The major build-stable's ceiling is read on (build-host-stable.yml, through platform-line.py): `stable`
+# names no major, and until a per-major `stable<major>` exists it follows the line the compatibility
+# `latest` names — the line the fleet runs (MeshWeaver.Deploy#302).
+STABLE_MAJOR = LATEST_ALIAS_MAJOR
 # Which channel each CD trigger may roll. `latest` follows the set CD ARMS (any trigger that arms);
 # `stable` — until core's stable promoter exists — is the main-passed ceiling, handed on by the
 # DAILY `schedule` of build-host-stable.yml only (§2: "by the daily full run, to the main-passed
@@ -97,6 +104,11 @@ def channel_major(channel: str) -> int | None:
         return LATEST_ALIAS_MAJOR
     m = LINE_CHANNEL.match(channel or "")
     return int(m.group(1)) if m else None
+
+
+def lane_major(channel: str) -> int | None:
+    """The major a LANE reads its set on: `stable` → STABLE_MAJOR, otherwise channel_major. Pure."""
+    return STABLE_MAJOR if channel == "stable" else channel_major(channel)
 
 
 def set_major(version: str) -> int | None:
@@ -226,6 +238,8 @@ def main(argv: list[str]) -> int:
     c = sub.add_parser("channels")
     c.add_argument("--declaration", type=Path, default=Path(".github/build-hosts.json"))
     c.add_argument("--version", required=True)
+    lm = sub.add_parser("line-major")
+    lm.add_argument("--channel", required=True)
     b = sub.add_parser("body")
     for k in ("deployment", "channel", "version", "tester-image", "tester-digest", "portal-image",
               "portal-digest", "runner-image", "runner-digest", "instance"):
@@ -235,6 +249,12 @@ def main(argv: list[str]) -> int:
     b.add_argument("--supersedes", default="", help="space-separated digests of the set's OLDER runners")
     a = ap.parse_args(argv)
     try:
+        if a.cmd == "line-major":
+            major = lane_major(a.channel)
+            if major is None:
+                raise ValueError(f"channel {a.channel!r} reads its set on no major")
+            print(major)
+            return 0
         if a.cmd == "channels":
             print(f"channels={' '.join(channels_for(load_declaration(a.declaration), a.version))}")
             return 0
@@ -294,6 +314,8 @@ def self_test() -> int:
     check("decide/stable not declared is a no-op", send is False and "not in" in why, why)
     send, _, _ = decide(both, control, "latest", "push")
     check("decide/latest follows any arming trigger", send is True)
+    check("lane_major/stable reads the compatibility line", lane_major("stable") == LATEST_ALIAS_MAJOR == 3)
+    check("lane_major/latest4 is 4, latest is the alias", lane_major("latest4") == 4 and lane_major("latest") == 3)
 
     ok = dict(deployment="control", channel="latest", version="3.1.10412",
               tester_image="cr.example.com/mw-plugin-test", tester_digest="sha256:" + "1" * 64,
