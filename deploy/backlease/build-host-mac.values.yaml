@@ -17,7 +17,13 @@ buildHosts:
   # The plugins layer: as the cluster hosts take it — the sealed publication /hosts/inputs names, or none. The registry's
   # bundle index (H8, a READ-ONLY instance key) is opt-in through first-attach.sh's --plugins-registry/--instance-key-secret:
   # measured 2026-11-07 the registry served AI as an assemblies-only bundle, module-fetch refused it, and the host never claimed.
-  rolloutStrategy: "Recreate"
+  # ONE REPLICA AT A TIME (2026-11-11): RollingUpdate with maxSurge 0 / maxUnavailable 1 — the old pod drains its run in
+  # hand while the others keep claiming, so a roll never takes the Mac to 0 ready (Recreate did, for up to the 2 h run
+  # grace: eiger, 2026-11-11 18:16Z, 0/3 while one old pod drained). It waits for each new pod to be READY, which the
+  # Macs now pass: readiness is the runner's HTTP endpoint (#252), not an exec (an exec into the build container fails
+  # under hostUsers:false on Colima/containerd 2.3 — "unable to setup user: chown /dev/stdout"). Measured: the second
+  # Mac's three runners 1/1 Ready on the HTTP probe, 2026-11-11 18:15Z.
+  rolloutStrategy: "RollingUpdate"
   nodeSelector: null
   tolerations: null
   # Sized for a 16 CPU / 100 GiB-memory / 300 GiB-disk build VM (the first Mac's `build` profile, 2026-11-07): up to four
@@ -28,21 +34,61 @@ buildHosts:
     requests: { cpu: "3500m", memory: 20Gi }
     limits: { cpu: "4", memory: 24Gi }
   # A modules stage writes past 12 GiB (measured on the first Mac, 2026-11-07: "Usage of EmptyDir volume work exceeds the
-  # limit 12Gi" evicted the replica mid-run). 40 GiB each: 4 replicas + the 20 GiB cache + the images fit a 300 GiB VM disk.
-  workSizeLimit: 40Gi
+  # limit 12Gi" evicted the replica mid-run). Until §7.3b a run started by COPYING the shared warm tree into its work volume —
+  # 18 GiB for MeshWeaver.Plugins — and 40 GiB evicted both replicas of a wide pull request mid modules (probe 01fcb9311f3c).
+  # Since §7.3b nothing is copied (an overlay's upper holds only the run's delta, a cold worktree only the sources), so the
+  # work volume holds a run's own outputs; 52 GiB each is kept as the measured envelope: 4 replicas (208) + the cache (29
+  # measured) + the images fit the 295 GiB data disk the VM mounts at /var/lib/rancher (230 free at 52 used, 2026-11-08).
+  workSizeLimit: 52Gi
   # Fan-out within a replica: 4 stages of a `parallel` run at once within its 4 CPU / 24 GiB limit; the chart default (8)
   # would exceed the replica's cgroup, and the runner refuses to start on that.
   stageSlots: 4
-  # The warm workspace (Hosting/BuildQueue.md §7.2): the Mac measures it first, before any cluster host turns it on. Each
-  # replica's warm copy lives under its work volume (the 40 GiB above), beside the run's disposable copy.
+  # The warm workspace (Hosting/BuildQueue.md §7.3b): one master per host (the cache's bare mirrors) and one persistent
+  # worktree per repository for this host's deployment, advanced in place by its single writer — nothing is ever copied.
+  # MOOT while `cache.shares.treeGi` is 0 (below): the 20Gi cache cannot hold the tree, so no tree is kept or warmed.
   warmWorkspace: true
   # The module-hub broker (Hosting/BuildQueue.md §7.4): the host asks control's per-module build hubs for each module a
   # `modules` stage names — a Hit is fetched and verified instead of built, a Grant is built once and handed back by its
   # hash. The Mac measures it first, with the warm workspace; inert until a repository's default branch declares `moduleHub`.
   moduleHub: true
+  # The shared tree switch: INERT since §7.3b (see the chart's matrix beside `sharedTree`); the deployment trees live on the
+  # cache volume every replica on this node mounts, so every replica starts warm and a roll keeps them.
+  sharedTree: true
+  # The run overlay (Hosting/BuildQueue.md §7.3b): each run mounts its deployment tree read-only and writes only its delta;
+  # a busy, unbuilt or refused tree gives a cold worktree off the master, said — never a copy (measured 2026-11-08: 32 s → 3 s,
+  # 18 GiB → 20 KiB).
+  runOverlay: true
+  # No network during a run (Plugins Hosting/OneBuildTree.md §6): loopback-only stages, NuGet from the prepared folder only.
+  # Flipped on measured 0 x MWPREP001 on a normal Mac run (readings in MeshWeaver.Deploy#272); the host probes it at start (#271).
+  stageNetwork: "offline"
   cacheClaimName: "build-cache-mac"
   # The Mac's only class is node-local; the replicas share it on the one node (ReadWriteOnce is per node).
-  cache: {create: true, storageClass: "local-path", size: "20Gi", accessMode: "ReadWriteOnce"}
+  # The cache's real footprint under §7.3b (measured 29 GiB on 2026-11-08 before it): the bare mirrors (the master), the warm
+  # NuGet cache, and ONE built deployment worktree per repository (~18 GiB for MeshWeaver.Plugins, obj/ and bin/ included).
+  # During the roll to §7.3b the old §7.3 generations under <cache>/shared (~18 GiB) sit beside the first deployment tree
+  # until the new runner's first idle pass deletes them — a transient inside the 230 GiB free on the data disk. `size` is
+  # NOT raised here: local-path does not enforce a claim's capacity and cannot expand one, so editing it would only make
+  # the upgrade try (and fail) to resize a bound claim; the data disk is the real bound.
+  # THE CACHE BUDGET (deploy/build-host/CACHE-BUDGET.md) makes the runner honour that declared size: 20Gi less 10 % = 18 GiB,
+  # which local-path never enforced — the cache held 43 GiB on 2026-11-11 (tree 20, slices 14 under a bound of 32, NuGet 6.1,
+  # reference sets 2.0, prepared 1.4, masters 0.4) and the disk guard refused every claim with 34 GiB free of 98. The one
+  # MeshWeaver.Plugins deployment tree alone (~18-20 GiB, obj/ and bin/) does not fit 18 GiB, so the Mac keeps NO tree
+  # (treeGi 0: no warm build starts, every run takes a cold worktree off the master, said) and spends the budget on what
+  # does fit: the warm NuGet cache (8, measured 6.1), the module slices (5), the reference sets and prepared inputs (2 each);
+  # 1 GiB of the budget and the 2 GiB margin hold the masters. Shares above the budget, or summing above it, are refused.
+  cache:
+    create: true
+    storageClass: "local-path"
+    size: "20Gi"
+    accessMode: "ReadWriteOnce"
+    # The 20Gi REQUEST is nominal: local-path enforces nothing and a bound claim cannot be expanded, so the BUDGET bounds
+    # the cache (sizeEnforced: false). 80 GiB holds the deployment tree (~20 GiB) warm beside the slices — a budget under
+    # it made every run COLD (2026-11-11). This is the default for a Mac whose disk was never sized; `memex-local buildhost
+    # apply` writes the Mac's own budget, sized from its build disk so one run (20 GiB + 15 %) always still fits, into
+    # ~/.memex-local/buildhost-follow/<profile>/sizing.yaml, which the follower layers over these values.
+    sizeEnforced: false
+    maxGi: 80
+    shares: {treeGi: 24, slicesGi: 30, nugetGi: 8, refsetsGi: 3, preparedGi: 2}
   # bwrap needs a fresh /proc per stage, which only an Unmasked /proc allows, and Kubernetes grants that only to a pod in
   # its own user namespace (hostUsers: false) — hence the dedicated containerd profile first-attach.sh checks for.
   sandbox: {appArmorProfile: "Localhost", appArmorLocalhostProfile: "mw-build-host", seccompProfile: "Unconfined", userNamespace: true}

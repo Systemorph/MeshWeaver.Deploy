@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# hosting-registry-maintenance window  --namespace <ns> --release <release> --run <run id>
+# hosting-registry-maintenance restore --namespace <ns> --release <release>
+#
+# The fleet registry's blob garbage-collect, inside a READ-ONLY window (MeshWeaver.Plugins#4370,
+# slice 3; the owner's decision 1A; deploy/aks/REGISTRY-MAINTENANCE.md). The fleet cleanup
+# (MeshWeaver.Plugins Hosting/FleetRegistryCleanup) runs this while it HOLDS the registry-maintenance
+# lease: the lease refuses every image-applying action — HelmRelease, Reconcile and ApplyChart included
+# — so the window cannot be a separately filed chart apply; it is applied by the run that holds it.
+#
+# WINDOW, in this order, and nothing out of it:
+#   1. apply read-only   helm upgrade of the release that renders the registry, with
+#                        registry.maintenance.readOnly=true, over the release's OWN values
+#                        (--reset-then-reuse-values) — refused before anything changes when the upgrade
+#                        would change anything but the window's own keys (_registry_window.py scope);
+#   2. verify read-only  POD BY POD: every live registry pod started from the current template, which is
+#                        the read-only one, Ready, none terminating — a rolling update serves read-write
+#                        and read-only pods side by side, and the collect may start only when no
+#                        read-write pod is left (_registry_window.py pods);
+#   3. collect           the same values plus registry.maintenance.garbageCollect=<run>: the chart renders
+#                        the Job memex-registry-gc-<run> (`registry garbage-collect`, NO --delete-untagged),
+#                        followed to Complete; its summary line is reported;
+#   4. apply read-write  the collect Job stopped and gone, then readOnly=false, garbageCollect="";
+#   5. verify read-write pod by pod, the same way.
+#
+#   ::hosting:: registry_window=read-only       step 2 passed (registry_window_pods=<n> beside it)
+#   ::hosting:: registry_gc=complete            the collect Job completed
+#   ::hosting:: registry_gc_summary=<line>      distribution's own summary of what it collected
+#   ::hosting:: registry_window=read-write      step 5 passed
+#   ::hosting:: registry_window=closed          the whole window ran — the LAST line of a good run
+#
+# 🚨 READ-WRITE IS RESTORED ON EVERY EXIT PATH. Any exit before `closed` — a refusal, a failed apply, a
+# pod that never became read-only, a collect that failed, a shell error, SIGTERM at the job's deadline —
+# runs the restore (stop every collect Job and wait until its pods are GONE, then apply read-write and
+# verify it pod by pod) and ends RED:
+#
+#   ::hosting:: registry_window=restored        read-write is back, verified
+#   ::hosting:: registry_window=unchanged       refused before the first write — nothing to restore
+#   ::hosting:: registry_window=restore_failed  it is NOT — the registry may still refuse pushes; the
+#                                               control plane keeps the lease and says so
+#
+# The restore never applies read-write while a collect pod still runs: a collect beside a read-write pod
+# can delete the blobs of an upload in progress, which is the one outcome worse than a registry left
+# read-only. `restore` is that same restore on its own — the control plane's second door, run when the
+# window's job itself could not report (killed, unobserved).
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
+# shellcheck disable=SC2034  # read by hosting::die in _common.sh
+HOSTING_CMD="hosting-registry-maintenance"
+
+CHART="${HOSTING_CHART:-/opt/hosting/chart}"
+WINDOW_PY="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_registry_window.py"
+DEPLOYMENT="memex-registry-deployment"
+
+# ── declared bounds (seconds) ───────────────────────────────────────────────────────────────────
+# The whole window runs inside ONE operator job, cut at 45 minutes (2700 s), and the read-write restore
+# must fit inside it too. Worst case, every wait run to its bound:
+#   read-only verify 300 + collect 1560 + collect delete 120 + read-write verify 300 = 2280 s,
+# which leaves 420 s for the four helm upgrades and their server-side dry runs. GC_WAIT bounds the
+# collect whatever the Job's own deadline says (the chart caps it at 1500): past it, the window stops
+# the Job and restores read-write.
+SETTLE_WAIT="${HOSTING_REGISTRY_SETTLE_WAIT:-300}"           # one registry roll, until every pod is on the new side
+SETTLE_INTERVAL="${HOSTING_REGISTRY_SETTLE_INTERVAL:-5}"
+GC_WAIT="${HOSTING_REGISTRY_GC_WAIT:-1560}"                  # the Job's default deadline (1500) plus a minute
+GC_INTERVAL="${HOSTING_REGISTRY_GC_INTERVAL:-10}"
+
+mode="${1:-}"
+[ $# -gt 0 ] && shift
+namespace="" release="" run=""
+needs_value() { [ $# -ge 2 ] && [ -n "$2" ] || hosting::die "$1 needs a value"; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --namespace) needs_value "$@"; namespace="$2"; shift 2 ;;
+    --release)   needs_value "$@"; release="$2";   shift 2 ;;
+    --run)       needs_value "$@"; run="$2";       shift 2 ;;
+    *) hosting::die "unknown argument '$1'" ;;
+  esac
+done
+case "$mode" in
+  window|restore) ;;
+  *) hosting::die "the first argument is 'window' or 'restore', not '${mode}'" ;;
+esac
+[ -n "$namespace" ] || hosting::die "--namespace is required"
+[ -n "$release" ] || hosting::die "--release is required"
+[[ "$namespace" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]] || hosting::die "--namespace '${namespace}' is not a Kubernetes name"
+[[ "$release" =~ ^[a-z0-9]([-a-z0-9]{0,51}[a-z0-9])?$ ]] || hosting::die "--release '${release}' is not a helm release name"
+if [ "$mode" = window ]; then
+  [ -n "$run" ] || hosting::die "window needs --run <run id> — the collect Job is named after it"
+  [[ "$run" =~ ^[a-z0-9]([-a-z0-9]{0,38}[a-z0-9])?$ ]] || hosting::die "--run '${run}' is not a run id (1 to 40 lowercase letters, digits or '-')"
+else
+  [ -z "$run" ] || hosting::die "restore takes no --run — it stops EVERY collect Job of the release"
+fi
+[ -d "$CHART" ] || hosting::die "no chart at ${CHART} — it is baked into the operator image; an image without it is broken"
+
+work="$(mktemp -d)"
+selector="app.kubernetes.io/component=memex-registry,app.kubernetes.io/instance=${release}"
+gc_selector="app.kubernetes.io/component=memex-registry-gc,app.kubernetes.io/instance=${release}"
+
+# apply <read-only|read-write> [run] — the window's one write: the release's own values, the window's keys.
+apply() {
+  local side="$1" collect="${2:-}" ro=false
+  [ "$side" = read-only ] && ro=true
+  local sets=(--set "registry.maintenance.readOnly=${ro}" --set-string "registry.maintenance.garbageCollect=${collect}")
+  hosting::log "apply ${side}${collect:+, collect ${collect}}: helm upgrade ${release} over its own values"
+  hosting::read helm get manifest "$release" --namespace "$namespace" > "$work/live.yaml" \
+    || hosting::die "could not read the live manifest of release ${release} in ${namespace} — nothing was applied"
+  hosting::read helm upgrade "$release" "$CHART" --namespace "$namespace" --reset-then-reuse-values "${sets[@]}" \
+      --dry-run=server -o json > "$work/next.json" \
+    || hosting::die "the ${side} upgrade of ${release} does not render against the cluster — nothing was applied"
+  jq -er '.manifest' "$work/next.json" > "$work/next.yaml" \
+    || hosting::die "the ${side} dry run of ${release} returned no manifest — nothing was applied"
+  local outside
+  if ! outside="$(python3 "$WINDOW_PY" scope "$work/live.yaml" "$work/next.yaml")"; then
+    hosting::die "the ${side} upgrade of ${release} would change more than the maintenance window (${outside}) — the chart in this operator image differs from the one the release last applied; reconcile the record first. Nothing was applied"
+  fi
+  # From the first real write on, the registry may be read-only: every exit restores it from here.
+  [ "$side" = read-write ] || opened=1
+  hosting::do helm upgrade "$release" "$CHART" --namespace "$namespace" --reset-then-reuse-values "${sets[@]}" \
+    || hosting::die "helm upgrade of ${release} to ${side} failed"
+}
+
+# verify <read-only|read-write> — every live registry pod on that side, read pod by pod.
+verify() {
+  local side="$1" verdict="" waited=0
+  # No `rollout status`: it is a WATCH, and it answers for the Deployment, not for each pod. The pod
+  # listing below is the one verdict, read until it holds or the bound passes.
+  while :; do
+    hosting::read kubectl -n "$namespace" get deployment "$DEPLOYMENT" -o json > "$work/deployment.json" \
+      || hosting::die "could not read the Deployment ${DEPLOYMENT} — the registry's side cannot be established"
+    hosting::read kubectl -n "$namespace" get pods -l "$selector" -o json > "$work/pods.json" \
+      || hosting::die "could not list the registry pods — the registry's side cannot be established"
+    if verdict="$(python3 "$WINDOW_PY" pods "$side" "$work/deployment.json" "$work/pods.json")"; then
+      hosting::say registry_window_pods "${verdict#ok }"
+      return 0
+    fi
+    [ "$waited" -lt "$SETTLE_WAIT" ] || hosting::die "after ${SETTLE_WAIT}s the registry is still not ${side}, pod by pod: ${verdict}"
+    sleep "$SETTLE_INTERVAL"; waited=$((waited + SETTLE_INTERVAL))
+  done
+}
+
+# collect <run> — the Job the chart renders inside the window, followed to its own verdict.
+collect() {
+  local job="memex-registry-gc-$1" waited=0 state="" summary=""
+  apply read-only "$1"
+  while :; do
+    hosting::read kubectl -n "$namespace" get job "$job" -o json > "$work/job.json" \
+      || hosting::die "could not read the collect Job ${job}"
+    state="$(jq -r '[.status.conditions[]? | select(.status == "True") | .type] | if index("Complete") then "complete" elif index("Failed") then "failed" else "running" end' "$work/job.json")" \
+      || hosting::die "the collect Job ${job} answered something that is not a Job"
+    [ "$state" = running ] || break
+    [ "$waited" -lt "$GC_WAIT" ] || hosting::die "the collect Job ${job} had no verdict after ${GC_WAIT}s"
+    sleep "$GC_INTERVAL"; waited=$((waited + GC_INTERVAL))
+  done
+  hosting::read kubectl -n "$namespace" logs "job/${job}" --tail=200 > "$work/gc.log" \
+    || hosting::die "the collect Job ${job} ended ${state} and its log could not be read"
+  [ "$state" = complete ] || hosting::die "the collect Job ${job} FAILED: $(tail -n 3 "$work/gc.log" | tr '\n' ' ')"
+  # distribution's closing line — never a per-blob "blob eligible for deletion: …" line.
+  summary="$(grep -E '[0-9]+ blobs marked, [0-9]+ blobs and [0-9]+ manifests eligible for deletion' "$work/gc.log" | tail -n 1)" \
+    || hosting::die "the collect Job ${job} completed but printed no summary — its outcome is not claimed from silence"
+  hosting::say registry_gc complete
+  hosting::say registry_gc_summary "$summary"
+}
+
+# stop_collects — every collect Job of the release deleted, and its pods GONE, before read-write.
+stop_collects() {
+  local left
+  hosting::do kubectl -n "$namespace" delete jobs -l "$gc_selector" --ignore-not-found --cascade=foreground --wait=true --timeout=120s \
+    || hosting::die "the collect Jobs could not be deleted — read-write is NOT applied while a collect may run"
+  hosting::read kubectl -n "$namespace" get pods -l "$gc_selector" -o json > "$work/gc-pods.json" \
+    || hosting::die "the collect pods could not be listed — read-write is NOT applied while a collect may run"
+  left="$(jq -r '[.items[] | .metadata.name] | join(", ")' "$work/gc-pods.json")" \
+    || hosting::die "the collect pods listing is not a pod list — read-write is NOT applied while a collect may run"
+  [ -z "$left" ] || hosting::die "collect pod(s) still present: ${left} — read-write is NOT applied while a collect may run"
+}
+
+read_write() {
+  stop_collects
+  apply read-write
+  verify read-write
+  hosting::say registry_window read-write
+}
+
+opened="" closed=""
+# The exit status stays the one the script exited with: a window that did not close is RED whether or
+# not the restore succeeds; the restore's own line says which.
+finish() {
+  if [ "$mode" = window ] && [ -z "$closed" ] && [ -z "$opened" ]; then
+    # Refused before the first write: the registry never left read-write, so there is nothing to restore.
+    hosting::say registry_window unchanged
+  elif [ "$mode" = window ] && [ -z "$closed" ]; then
+    hosting::log "the window did not close — restoring read-write before anything else"
+    # A subshell: a refusal inside the restore ends the restore, never this report.
+    if (read_write); then
+      hosting::say registry_window restored
+    else
+      hosting::say registry_window restore_failed
+    fi
+  fi
+  rm -rf "$work"
+}
+trap 'hosting::on_exit; finish' EXIT
+# The job's deadline sends SIGTERM first: exit through the EXIT trap, so the restore still runs.
+trap 'hosting::die "terminated (SIGTERM) inside the maintenance window"' TERM
+
+if [ "$mode" = restore ]; then
+  read_write
+  hosting::say registry_window restored
+  exit 0
+fi
+
+apply read-only
+verify read-only
+hosting::say registry_window read-only
+collect "$run"
+read_write
+closed=1
+hosting::say registry_window closed

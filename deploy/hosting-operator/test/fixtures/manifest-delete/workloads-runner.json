@@ -1,0 +1,95 @@
+{
+ "kind": "List",
+ "items": [
+  {
+   "kind": "Pod",
+   "metadata": {
+    "name": "hosting-op-live",
+    "namespace": "memex-ops"
+   },
+   "spec": {
+    "serviceAccountName": "hosting-operator",
+    "containers": [
+     {
+      "name": "memex-portal",
+      "image": "cr.example.invalid/memex-portal:1",
+      "envFrom": [
+       {
+        "configMapRef": {
+         "name": "memex-portal-config"
+        }
+       },
+       {
+        "secretRef": {
+         "name": "memex-portal-keyvault"
+        }
+       }
+      ],
+      "volumeMounts": [
+       {
+        "name": "data",
+        "mountPath": "/data"
+       }
+      ]
+     }
+    ],
+    "volumes": [
+     {
+      "name": "data",
+      "persistentVolumeClaim": {
+       "claimName": "memex-data"
+      }
+     }
+    ]
+   },
+   "status": {
+    "phase": "Running"
+   }
+  },
+  {
+   "kind": "Pod",
+   "metadata": {
+    "name": "hosting-jobrunner-live",
+    "namespace": "memex"
+   },
+   "spec": {
+    "serviceAccountName": "hosting-jobrunner",
+    "containers": [
+     {
+      "name": "memex-portal",
+      "image": "cr.example.invalid/memex-portal:1",
+      "envFrom": [
+       {
+        "configMapRef": {
+         "name": "memex-portal-config"
+        }
+       },
+       {
+        "secretRef": {
+         "name": "memex-portal-keyvault"
+        }
+       }
+      ],
+      "volumeMounts": [
+       {
+        "name": "data",
+        "mountPath": "/data"
+       }
+      ]
+     }
+    ],
+    "volumes": [
+     {
+      "name": "data",
+      "persistentVolumeClaim": {
+       "claimName": "memex-data"
+      }
+     }
+    ]
+   },
+   "status": {
+    "phase": "Running"
+   }
+  }
+ ]
+}

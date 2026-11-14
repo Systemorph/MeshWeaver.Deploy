@@ -10,7 +10,18 @@
 #     [--profile build] [--plugins-registry <https URL> --instance-key-secret <vault object of a READ-ONLY mwi_ key>] \
 #     --version <x.y.z> --tester sha256:… --portal sha256:… --runner sha256:…
 #     [--accept-jobs <patterns> | --no-accept-jobs] [--accept-tokens <patterns> | --no-accept-tokens]
-#     [--token-models <m>] [--residency <X>]
+#     [--token-models <m>] [--residency <X>] [--owner <user-id> --owner-email <e-mail>]
+#
+#   FROM AN ENROLMENT (no vault, no az): `memex-local fleet join` opens the worker token, the pull password and the
+#   read-only registry key from its enrolment code into 0600 files and calls
+#     first-attach.sh --api … --registry … --pull-user … --secrets-from <dir> --set-from <channel> [--plugins-registry …]
+#   <dir> holds `worker`, `pull` and optionally `instance-key` (each 0600, owned by the caller); --set-from reads the
+#   version and the three digests from control's complete-set route (GET <api>/channels/<channel>/set, the same read
+#   follow-set.py makes), so no set is passed by hand.
+#
+# THE OWNER comes first: the Mac's owner (recorded by `memex-local owner`, the instance's global administrator) is the
+# person whose answers the opt-in records. Given with --owner/--owner-email it is written through memex-local; a Mac
+# with no owner recorded is REFUSED before anything changes.
 #
 # THE OWNER'S OPT-IN (MeshWeaver.Plugins Hosting/BackLease §13). Before anything is changed it ASKS — in a terminal —
 # whether this Mac accepts fleet jobs and from which instances (offered: control.systemorph.com), and whether it serves
@@ -36,18 +47,42 @@
 #   5. fleet jobs at the LOWEST priority on this Mac: loads the launchd governor (deploy/homebrew/share/buildhost-priority.sh
 #      --install) that puts the build VM's process in the background band while the owner, the portal VM or Ollama want
 #      the cores, and gives it every idle core otherwise (nice/renice do nothing on macOS — see the script's header).
+#      And the network: deploy/homebrew/share/vm-netshape.sh --apply caps the build VM's internet traffic (tc, inside the
+#      VM) at a share of the link measured once with networkQuality, and marks it DSCP CS1.
+#   6. FOLLOWS the sealed set from then on (follow-set.py, launchd com.memex.local.buildhost-follow.<profile>): every 5 min
+#      it reads the complete set channel `--follow` (default latest) runs from control and, when the release runs another,
+#      re-applies the chart with that set — so the host never falls behind what main needs and nobody re-runs this script
+#      to move it. The chart, build-host-mac.values.yaml and the follower itself follow this repository's GREEN main too:
+#      a change to deploy/helm or deploy/backlease is staged beside the agent and applied by a FULL upgrade (chart
+#      defaults + Mac values + the estate values set below + the set), so a values change needs no re-attach. The runners
+#      drain their run in hand on the roll. `--follow off` attaches pinned.
 # The set (version + tester/portal/runner digests) is the one the operations record names for `latest`; it is passed,
 # never committed. The runner digest must be a multi-arch index carrying linux/arm64.
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 chart="$here/../helm"
-profile=build api= registry= vault= worker= pull= pulluser= version= tester= portal= runner= pluginsreg= instkey=
+# host-fits-node.py (and the follow agent, which runs under the SAME interpreter — follow-set.py records
+# sys.executable in its launchd plist) need PyYAML, which macOS's python3 does not ship. On the second Mac
+# Studio (2026-11-10) the attach died at 0/6 with `ModuleNotFoundError: No module named 'yaml'`, and
+# `fleet join` reported only "first-attach failed". Bring a private interpreter that has it, once.
+attach_venv="${MEMEX_ATTACH_VENV:-$HOME/.mw-attach-venv}"
+if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+  if ! "$attach_venv/bin/python3" -c 'import yaml' >/dev/null 2>&1; then
+    echo "== PyYAML for the attach: a private venv at $attach_venv (python3 here has no 'yaml')"
+    python3 -m venv "$attach_venv" && "$attach_venv/bin/pip" install -q --disable-pip-version-check 'pyyaml>=6.0.2,<7' \
+      || { echo "ERROR: could not create $attach_venv with PyYAML — 'python3 -m venv $attach_venv && $attach_venv/bin/pip install "pyyaml>=6.0.2,<7"', then re-run. The attach did not start; a partial $attach_venv may remain and is reused or rebuilt on the next run." >&2; exit 1; }
+  fi
+  PATH="$attach_venv/bin:$PATH"; export PATH
+fi
+profile=build api= registry= vault= worker= pull= pulluser= version= tester= portal= runner= pluginsreg= instkey= secrets_from= set_from=
 acc_jobs='' acc_tokens='' acc_models='' acc_res=''   # empty = not answered by a flag; "off" = declined
+owner_id='' owner_email='' follow=latest
 while [ $# -gt 0 ]; do
   # `--flag=value` is the same as `--flag value` (the form memex-local documents for the opt-in flags)
   case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}";; esac
   case "$1" in
     --no-accept-jobs) acc_jobs=off; shift; continue;;
+    --owner) owner_id="${2:?--owner needs the owner user id}";; --owner-email) owner_email="${2:?--owner-email needs the owner e-mail}";;
     --no-accept-tokens) acc_tokens=off; shift; continue;;
     --accept-jobs) acc_jobs="${2:?--accept-jobs needs instance patterns}";; --accept-tokens) acc_tokens="${2:?--accept-tokens needs instance patterns}";;
     --token-models) acc_models="${2:?--token-models needs model names}";; --residency) acc_res="${2:?--residency needs a residency (e.g. CH, Eu)}";;
@@ -55,10 +90,34 @@ while [ $# -gt 0 ]; do
     --worker-secret) worker="$2";; --pull-secret) pull="$2";; --pull-user) pulluser="$2";;
     --plugins-registry) pluginsreg="$2";; --instance-key-secret) instkey="$2";;
     --version) version="$2";; --tester) tester="$2";; --portal) portal="$2";; --runner) runner="$2";;
+    --follow) follow="${2:?--follow needs a channel, or off}";;
+    --secrets-from) secrets_from="${2:?--secrets-from needs a directory}";; --set-from) set_from="${2:?--set-from needs a channel}";;
     *) echo "unknown argument $1" >&2; exit 2;;
   esac; shift 2
 done
-for v in api registry vault worker pull pulluser version tester portal runner; do
+if [ -n "$secrets_from" ]; then
+  # the values come from 0600 files an enrolment opened — the vault flags are not used, and mixing the two is refused
+  [ -z "$vault$worker$pull$instkey" ] || { echo "ERROR: --secrets-from replaces --vault/--worker-secret/--pull-secret/--instance-key-secret — give one or the other" >&2; exit 2; }
+  for f in worker pull; do
+    [ -f "$secrets_from/$f" ] && [ ! -L "$secrets_from/$f" ] || { echo "ERROR: --secrets-from: $secrets_from/$f is missing" >&2; exit 2; }
+    [ "$(stat -f%Lp "$secrets_from/$f" 2>/dev/null || stat -c%a "$secrets_from/$f")" = 600 ] || { echo "ERROR: --secrets-from: $secrets_from/$f must be mode 0600" >&2; exit 2; }
+  done
+fi
+if [ -n "$set_from" ]; then
+  [[ "$set_from" =~ ^[a-z][a-z0-9-]{0,62}$ ]] || { echo "ERROR: --set-from must be a channel name" >&2; exit 2; }
+  [ -z "$version$tester$portal$runner" ] || { echo "ERROR: --set-from replaces --version/--tester/--portal/--runner — give one or the other" >&2; exit 2; }
+  [[ "$api" == https://* ]] || { echo "ERROR: --api must be https (the worker token rides on it)" >&2; exit 2; }
+  set_json="$(curl -fsS -m 30 "${api%/}/channels/$set_from/set")" || { echo "ERROR: could not read ${api%/}/channels/$set_from/set. Nothing was changed." >&2; exit 1; }
+  read -r version tester portal runner < <(python3 -c 'import json,sys
+d=json.loads(sys.argv[1]); keys=("platformVersion","testerDigest","portalDigest","runnerDigest")
+missing=[k for k in keys if not str(d.get(k) or "").strip()]
+if missing: sys.exit("the set names no " + ", ".join(missing))
+print(*(d[k] for k in keys))' "$set_json") \
+    || { echo "ERROR: ${api%/}/channels/$set_from/set is not a complete set. Nothing was changed." >&2; exit 1; }
+fi
+required=(api registry pulluser version tester portal runner)
+[ -n "$secrets_from" ] || required+=(vault worker pull)
+for v in "${required[@]}"; do
   [ -n "${!v}" ] || { echo "ERROR: --${v//_/-} is required (see the header)" >&2; exit 2; }
 done
 [[ "$api" == https://* ]] || { echo "ERROR: --api must be https (the worker token rides on it)" >&2; exit 2; }
@@ -66,12 +125,30 @@ done
 # the host takes its plugins layer exactly as the cluster hosts do — the sealed publication /hosts/inputs names, or none.
 # Measured 2026-11-07: the registry serves a mixed package (AI) as an assemblies-only bundle, which module-fetch refuses,
 # so an H8 host never claimed.
+if [ -n "$secrets_from" ] && [ -f "$secrets_from/instance-key" ]; then instkey="(file)"; fi
 if [ -n "$pluginsreg$instkey" ]; then
-  { [ -n "$pluginsreg" ] && [ -n "$instkey" ]; } || { echo "ERROR: --plugins-registry and --instance-key-secret go together" >&2; exit 2; }
+  { [ -n "$pluginsreg" ] && [ -n "$instkey" ]; } || { echo "ERROR: --plugins-registry and --instance-key-secret (or <secrets-from>/instance-key) go together" >&2; exit 2; }
   [[ "$pluginsreg" == https://* ]] || { echo "ERROR: --plugins-registry must be https (the instance key rides on it)" >&2; exit 2; }
 fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: --version must be x.y.z" >&2; exit 2; }
+[ "$follow" = off ] || [[ "$follow" =~ ^[a-z][a-z0-9-]{0,62}$ ]] || { echo "ERROR: --follow must be a channel name or off" >&2; exit 2; }
 for d in "$tester" "$portal" "$runner"; do [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "ERROR: $d is not sha256:<64 hex>" >&2; exit 2; }; done
+
+# ── THE OWNER (onboarding rule, 2026-11-08: "in onboarding we collect the owner. he will be global admin") ─────
+# This Mac's owner is recorded by memex-local (`memex-local owner`): the global administrator of its instance and
+# the person whose answers the opt-in below records. Given here (--owner/--owner-email) it is written through the CLI;
+# otherwise the one memex-local already holds stands. NO owner = no attach: nothing below runs for an ownerless Mac.
+ml0="$(command -v memex-local || printf '%s' "$here/../homebrew/bin/memex-local")"
+[ -x "$ml0" ] || { echo "ERROR: memex-local is not installed — this Mac's owner is recorded by it (brew install memex-local)" >&2; exit 2; }
+if [ -n "$owner_id$owner_email" ]; then
+  "$ml0" owner ${owner_id:+--id "$owner_id"} ${owner_email:+--email "$owner_email"} >&2 || { echo "ERROR: the owner was not recorded (above). Nothing was changed." >&2; exit 2; }
+fi
+# capture first: `cmd | grep -q` under pipefail is red whenever grep exits on its match before cmd finishes writing (141,
+# SIGPIPE) — which read a Mac WITH an owner as ownerless
+owner_status="$("$ml0" owner status 2>&1 || true)"
+grep -q 'instance OWNER' <<<"$owner_status" \
+  || { echo "ERROR: this Mac has no OWNER — give --owner <user-id> --owner-email <e-mail> (or run 'memex-local owner --id … --email …'). Nothing was changed." >&2; exit 2; }
+echo "owner: $(grep 'instance OWNER' <<<"$owner_status" | sed 's/.*global administrator): //') — answers the opt-in below" >&2
 
 # ── the owner's opt-in: asked FIRST, VALIDATED before anything changes, applied LAST (Hosting/BackLease §13.3) ──
 # An enrolled Mac's SAVED answers are the defaults, and a class nobody answers keeps its saved answer: re-running this
@@ -135,7 +212,7 @@ runtime="$(k get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeV
   || { echo "ERROR: profile $profile runs '$runtime' — the build host needs containerd 2 or newer (a user-namespaced pod). Nothing was changed." >&2; exit 1; }
 
 # ── preconditions: everything is CHECKED before anything is changed ──────────────────────────────────────────
-echo "== 0/5 preconditions"
+echo "== 0/6 preconditions"
 k get crd scaledobjects.keda.sh -o name >/dev/null 2>&1 \
   || { echo "ERROR: KEDA is not installed in this cluster (no scaledobjects.keda.sh) — the host's scaler needs it; install KEDA first. Nothing was changed." >&2; exit 1; }
 k -n keda wait --for=condition=Available deployment --all --timeout=20s >/dev/null 2>&1 \
@@ -147,12 +224,21 @@ alloc="$(k get nodes -o jsonpath='{.items[0].status.allocatable.cpu} {.items[0].
 k get pods -A -o json | python3 "$here/host-fits-node.py" "$alloc" "$here/build-host-mac.values.yaml" --pods-json - \
   || { echo "Nothing was changed." >&2; exit 1; }
 # The vault reads happen BEFORE any apply, so a failed read never replaces a working Secret with an empty one.
+key_value=
+if [ -n "$secrets_from" ]; then
+  worker_value="$(cat "$secrets_from/worker")"; pull_value="$(cat "$secrets_from/pull")"
+  [ -n "$worker_value" ] && [ -n "$pull_value" ] || { echo "ERROR: --secrets-from: the worker or pull file is empty. Nothing was changed." >&2; exit 1; }
+  if [ -f "$secrets_from/instance-key" ]; then
+    key_value="$(cat "$secrets_from/instance-key")"
+    [[ "$key_value" == mwi_* ]] || { echo "ERROR: --secrets-from: instance-key is not a mwi_ instance key. Nothing was changed." >&2; exit 1; }
+  fi
+else
 worker_value="$(az keyvault secret show --vault-name "$vault" --name "$worker" --query value -o tsv)" \
   && [ -n "$worker_value" ] || { echo "ERROR: could not read the worker token $worker from $vault. Nothing was changed." >&2; exit 1; }
 pull_value="$(az keyvault secret show --vault-name "$vault" --name "$pull" --query value -o tsv)" \
   && [ -n "$pull_value" ] || { echo "ERROR: could not read the pull token $pull from $vault. Nothing was changed." >&2; exit 1; }
-key_value=
-if [ -n "$instkey" ]; then
+fi
+if [ -n "$instkey" ] && [ -z "$secrets_from" ]; then
   key_value="$(az keyvault secret show --vault-name "$vault" --name "$instkey" --query value -o tsv)" \
     && [[ "$key_value" == mwi_* ]] || { echo "ERROR: could not read a mwi_ instance key from $instkey in $vault. Nothing was changed." >&2; exit 1; }
 fi
@@ -169,7 +255,7 @@ if [ -z "$pluginsreg" ]; then
   echo "   /hosts/inputs names no sealed publication for mac — the host claims with the cluster hosts' plugins contract"
 fi
 
-echo "== 1/5 AppArmor profile mw-build-host in the Colima VM"
+echo "== 1/6 AppArmor profile mw-build-host in the Colima VM"
 printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' '' 'profile mw-build-host flags=(unconfined) {' '  userns,' '}' \
   | vm sudo sh -c 'cat > /etc/apparmor.d/mw-build-host && apparmor_parser --replace /etc/apparmor.d/mw-build-host'
 # The probe runs as the VM's ordinary, UNPRIVILEGED user — as the build container does (uid 1654, no capabilities).
@@ -188,10 +274,10 @@ got="$(vm sysctl -n fs.inotify.max_user_instances)"
 [ "${got:-0}" -ge 8192 ] || { echo "ERROR: fs.inotify.max_user_instances is ${got:-unreadable} in the build VM after setting 8192" >&2; exit 1; }
 echo "   inotify: ${got} instances per user (persisted in /etc/sysctl.d/90-mw-build-host.conf)"
 
-echo "== 2/5 namespace build-mac"
+echo "== 2/6 namespace build-mac"
 k create namespace build-mac --dry-run=client -o yaml | k apply -f - >/dev/null
 
-echo "== 3/5 secrets (values on stdin only — never in a process argument, never printed)"
+echo "== 3/6 secrets (values on stdin only — never in a process argument, never printed)"
 printf '%s' "$worker_value" \
   | k -n build-mac create secret generic build-worker-mac --from-file=token=/dev/stdin --dry-run=client -o yaml \
   | k apply -f - >/dev/null
@@ -214,7 +300,7 @@ fi
 unset worker_value pull_value key_value
 echo "   build-worker-mac and build-pull (image pulls only) applied${instkey:+, and build-registry-key-mac}"
 
-echo "== 4/5 helm upgrade --install build-host-mac ($version)"
+echo "== 4/6 helm upgrade --install build-host-mac ($version)"
 helm upgrade --install build-host-mac "$chart" --kube-context "$ctx" -n build-mac \
   -f "$chart/values.yaml" -f "$here/build-host-mac.values.yaml" \
   --set-string buildHosts.apiUrl="$api" \
@@ -232,10 +318,30 @@ helm upgrade --install build-host-mac "$chart" --kube-context "$ctx" -n build-ma
   --wait=false
 k -n build-mac get deploy,scaledobject,pvc
 
-echo "== 5/5 fleet jobs at the lowest priority (launchd governor for profile $profile)"
+echo "== 5/6 fleet jobs at the lowest priority (launchd governor for profile $profile)"
 # The runners are deployed by now: a governor that cannot load is reported, never a failed attach.
-bash "$here/../homebrew/share/buildhost-priority.sh" --install --profile "$profile" \
+# from a checkout: deploy/homebrew/share; from the brew install (libexec/share/backlease): the share beside it
+prio="$here/../homebrew/share/buildhost-priority.sh"; [ -f "$prio" ] || prio="$here/../buildhost-priority.sh"
+bash "$prio" --install --profile "$profile" \
   || echo "WARN: the priority governor did not load — the build VM competes at the default band; re-run: bash deploy/homebrew/share/buildhost-priority.sh --install --profile $profile" >&2
+# The network too (maintainer, 2026-11-08): the build VM's internet traffic is capped at a share of the measured link
+# and marked DSCP CS1, so an artefact upload never fills the owner's uplink (mw-netshape.service in the VM).
+bash "$here/../homebrew/share/vm-netshape.sh" --apply --profile "$profile" \
+  || echo "WARN: the build VM's network is NOT shaped — its uploads compete with the owner's traffic; re-run: bash deploy/homebrew/share/vm-netshape.sh --apply --profile $profile" >&2
+
+echo "== 6/6 follow the sealed set of channel ${follow}"
+# Installed AFTER the runners exist; a follower that cannot load is reported, never a failed attach (the host still runs
+# the set given, and a re-attach installs it again).
+if [ "$follow" = off ]; then
+  if python3 "$here/follow-set.py" --uninstall --profile "$profile" >/dev/null; then
+    echo "   --follow off: this host stays on $version until it is attached again"
+  else
+    echo "WARN: the follow agent could not be removed — it may still move this host off $version; remove it: python3 deploy/backlease/follow-set.py --uninstall --profile $profile" >&2
+  fi
+else
+  python3 "$here/follow-set.py" --install --profile "$profile" --follow "$follow" --api "$api" --chart "$chart" \
+    || echo "WARN: the follow agent did not load — this host stays on $version until it is attached again; re-run: python3 deploy/backlease/follow-set.py --install --profile $profile --follow $follow --api $api" >&2
+fi
 
 echo "== the owner's opt-in (jobs: ${acc_jobs:-unchanged} · tokens: ${acc_tokens:-unchanged})"
 # The answers live in the back-lease layer the portal's heartbeat reads (the runners alone carry no heartbeat). Both were

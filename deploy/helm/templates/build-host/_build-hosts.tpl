@@ -17,6 +17,8 @@ The refusals, and why each one exists:
     — the worker token rides on it;
   * at least one channel must be enabled — an enabled block that renders no host is a typo;
   * `cache.create` needs its storageClass and size — the chart never guesses a volume's tier or size;
+  * `cache.medium: host` needs an absolute `cache.path` and refuses a `size` (a hostPath has no size limit to
+    enforce) and `create` (no claim is made); a `path` beside any other medium would be silently ignored;
   * the artifact store is `upload: true` (through the build API) OR a `file:` store — never both, never anything else.
 */ -}}
 {{- define "memex.buildHosts" -}}
@@ -62,21 +64,43 @@ The refusals, and why each one exists:
 {{- /* medium: `claim` (default) — a claim every replica shares; `node` — a node-local emptyDir, for a host in its OWN
        user namespace (sandbox.userNamespace): the pod's volumes are ID-mapped, and SMB/NFS (Azure Files) supports no
        idmap mount — measured: "failed to set MOUNT_ATTR_IDMAP … maybe the filesystem used doesn't support idmap
-       mounts on this kernel?". A node-local cache is per replica and lives as long as the pod. */ -}}
+       mounts on this kernel?". A node-local cache is per replica and lives as long as the pod.
+       `host` — a hostPath directory on the NODE (`cache.path`), shared by every host on that node and outliving a pod
+       restart and a scale-in (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3b point 6: the node-local master). Mounted
+       as type `Directory`, never DirectoryOrCreate: node setup prepares it owned by the host's uid (an ID-mapped volume
+       shows the on-disk owner unchanged, so a kubelet-created root:root 0755 directory would be read-only to the host),
+       and a missing one keeps the pod visibly failing instead of handing it a root-owned directory. */ -}}
 {{- /* hasKey, not `default`: Sprig's default turns a present false, 0 or "" into "claim", which would silently
        select the claim (an SMB mount a user-namespaced host cannot take). A PRESENT key must itself be valid. */ -}}
 {{- $medium := "claim" -}}
 {{- if hasKey $cc "medium" -}}{{- $medium = $cc.medium -}}{{- end -}}
-{{- if not (and (kindIs "string" $medium) (has $medium (list "claim" "node"))) -}}
-{{- fail (printf "buildHosts.cache.medium %q must be claim or node" $medium) -}}
+{{- if not (and (kindIs "string" $medium) (has $medium (list "claim" "node" "host"))) -}}
+{{- fail (printf "buildHosts.cache.medium %q must be claim, node or host" $medium) -}}
+{{- end -}}
+{{- $cachePath := "" -}}
+{{- if eq $medium "host" -}}
+{{- $cachePath = $cc.path | default "" -}}
+{{- /* absolute, plain segments only, no `.`/`..` segment and not `/` itself: the hostPath is a node directory node
+       setup prepared, never a path the values can steer elsewhere */ -}}
+{{- if not (and (kindIs "string" $cachePath) (regexMatch "^(/[A-Za-z0-9._-]+)+$" $cachePath) (not (regexMatch "(^|/)[.][.]?(/|$)" $cachePath))) -}}
+{{- fail (printf "buildHosts.cache.path %q must be an absolute node directory (e.g. /var/lib/mw-build-cache) when cache.medium is host — the hostPath every build host on the node shares, prepared by node setup" (toString $cachePath)) -}}
+{{- end -}}
+{{- if $cc.size -}}
+{{- fail (printf "buildHosts.cache.size %q is not supported with cache.medium host — a hostPath has no size limit to enforce" (toString $cc.size)) -}}
+{{- end -}}
+{{- if $cc.create -}}
+{{- fail "buildHosts.cache.create is not supported with cache.medium host — the cache is the node directory, no claim is created" -}}
+{{- end -}}
+{{- else if $cc.path -}}
+{{- fail (printf "buildHosts.cache.path is only for cache.medium host (medium is %q) — it would be ignored" $medium) -}}
 {{- end -}}
 {{- $cache := "" -}}
 {{- if eq $medium "claim" -}}
-{{- $cache = required "buildHosts.cacheClaimName is required — the shared RWX build-cache claim (or cache.medium: node)" $b.cacheClaimName -}}
+{{- $cache = required "buildHosts.cacheClaimName is required — the shared RWX build-cache claim (or cache.medium: node or host)" $b.cacheClaimName -}}
 {{- end -}}
-{{- $cacheCreate := dict "create" false "medium" $medium "size" ($cc.size | default "") -}}
+{{- $cacheCreate := dict "create" false "medium" $medium "size" ($cc.size | default "") "path" $cachePath -}}
 {{- if and (eq $medium "claim") $cc.create -}}
-{{- $cacheCreate = dict "create" true "medium" $medium
+{{- $cacheCreate = dict "create" true "medium" $medium "path" ""
       "storageClass" (required "buildHosts.cache.storageClass is required when buildHosts.cache.create — the build cache is shared by every replica, so it needs a ReadWriteMany class (e.g. azurefile-memex)" $cc.storageClass)
       "size" (required "buildHosts.cache.size is required when buildHosts.cache.create — the chart will not guess a volume size" $cc.size)
       "accessMode" ($cc.accessMode | default "ReadWriteMany") -}}
@@ -104,6 +128,143 @@ The refusals, and why each one exists:
 {{- end -}}
 {{- if or (lt $stageSlots 1) (gt $stageSlots 32) -}}
 {{- fail (printf "buildHosts.stageSlots %d must be within [1, 32] — how many of one run's stages a host runs at once (1 = serial)" $stageSlots) -}}
+{{- end -}}
+{{- /* The module-slice cache's BOUND (MeshWeaver.Plugins Hosting/OneBuildTree.md §4, Deviations): a whole number of GiB, at least 1 — the
+       runner evicts least-recently-used slices above it (they are a cache of control's append-only store). hasKey, not
+       `default`: an explicit 0 is refused, never turned into the default and never "unbounded". */ -}}
+{{- $sliceCacheMaxGi := 32 -}}
+{{- $sliceSet := and (hasKey $b "sliceCacheMaxGi") (not (kindIs "invalid" $b.sliceCacheMaxGi)) -}}
+{{- if $sliceSet -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $b.sliceCacheMaxGi)) -}}
+{{- fail (printf "buildHosts.sliceCacheMaxGi %v must be a whole number of GiB within [1, 4096] — the bound of the host's module-slice cache" $b.sliceCacheMaxGi) -}}
+{{- end -}}
+{{- $sliceCacheMaxGi = int $b.sliceCacheMaxGi -}}
+{{- end -}}
+{{- if or (lt $sliceCacheMaxGi 1) (gt $sliceCacheMaxGi 4096) -}}
+{{- fail (printf "buildHosts.sliceCacheMaxGi %d must be within [1, 4096] — the bound of the host's module-slice cache" $sliceCacheMaxGi) -}}
+{{- end -}}
+{{- /* THE CACHE BUDGET (MeshWeaver.Plugins Hosting/OneBuildTree.md; deploy/build-host/CACHE-BUDGET.md): ONE total for the whole
+       cache, by default the declared cache.size less 10 % (the margin holds what no share covers: the masters, the
+       outputs, the markers), or cache.maxGi — never above the declared size. Every area the runner evicts has a SHARE of
+       it (cache.shares.<area>Gi, whole GiB; default a percentage of the budget), and the chart refuses any share above
+       the budget and shares that sum above it, so the cache honours its declared size by construction. A claim of
+       local-path never enforces its capacity (a Mac's 20Gi claim held 43 GiB on 2026-11-11): the runner does. No size
+       and no maxGi (a claim made elsewhere, or cache.medium host): no budget — only the slice bound, as before. */ -}}
+{{- $sizeGi := 0 -}}
+{{- $sz := toString ($cc.size | default "") -}}
+{{- if $sz -}}
+{{- if regexMatch "^[0-9]+Gi$" $sz -}}{{- $sizeGi = int (trimSuffix "Gi" $sz) -}}
+{{- else if regexMatch "^[0-9]+Ti$" $sz -}}{{- $sizeGi = mul (int (trimSuffix "Ti" $sz)) 1024 -}}
+{{- else if regexMatch "^[0-9]+G$" $sz -}}{{- $sizeGi = div (mul (int (trimSuffix "G" $sz)) 1000000000) 1073741824 -}}
+{{- else if regexMatch "^[0-9]+T$" $sz -}}{{- $sizeGi = div (mul (int (trimSuffix "T" $sz)) 1000000000000) 1073741824 -}}
+{{- else -}}
+{{- fail (printf "buildHosts.cache.size %q must be whole Gi, Ti, G or T (e.g. 20Gi) — the cache budget is derived from it" $sz) -}}
+{{- end -}}
+{{- end -}}
+{{- $budgetGi := 0 -}}
+{{- if and (hasKey $cc "maxGi") (not (kindIs "invalid" $cc.maxGi)) -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $cc.maxGi)) -}}
+{{- fail (printf "buildHosts.cache.maxGi %v must be a whole number of GiB within [1, 4096] — the budget of the whole build cache" $cc.maxGi) -}}
+{{- end -}}
+{{- $budgetGi = int $cc.maxGi -}}
+{{- if or (lt $budgetGi 1) (gt $budgetGi 4096) -}}
+{{- fail (printf "buildHosts.cache.maxGi %d must be within [1, 4096] — the budget of the whole build cache" $budgetGi) -}}
+{{- end -}}
+{{- /* sizeEnforced: false — the claim's storage class does NOT enforce its size (local-path: a directory on the node,
+       whatever the request says), so the REQUEST is nominal and the budget may exceed it; the runner's budget is then
+       the only bound, and it is sized from the node's disk (memex-local buildhost apply). A bound local-path claim
+       cannot be expanded (a spec.resources change fails the upgrade), which is why the budget is decoupled from it
+       instead of raising the claim (2026-11-11: the Macs' 20Gi claim held the budget at 18 GiB, under the ~20 GiB
+       deployment tree, and every run was COLD). */ -}}
+{{- $enforced := ternary true $cc.sizeEnforced (or (not (hasKey $cc "sizeEnforced")) (kindIs "invalid" $cc.sizeEnforced)) -}}
+{{- if not (kindIs "bool" $enforced) -}}
+{{- fail (printf "buildHosts.cache.sizeEnforced %v must be true or false — whether the claim's storage class enforces its size" $cc.sizeEnforced) -}}
+{{- end -}}
+{{- if and (not $enforced) (ne (toString ($cc.storageClass | default "")) "local-path") -}}
+{{- fail (printf "buildHosts.cache.sizeEnforced: false is only for a local-path claim (its request is nominal) — %q enforces or may enforce the size" (toString $cc.storageClass)) -}}
+{{- end -}}
+{{- if and $enforced (gt $sizeGi 0) (gt $budgetGi $sizeGi) -}}
+{{- fail (printf "buildHosts.cache.maxGi %d exceeds the declared cache.size %s — the cache's budget can never be larger than its declared size (a local-path claim, whose size nothing enforces, declares cache.sizeEnforced: false)" $budgetGi $sz) -}}
+{{- end -}}
+{{- else if gt $sizeGi 0 -}}
+{{- $budgetGi = max 1 (div (mul $sizeGi 90) 100) | int -}}
+{{- end -}}
+{{- $shares := dict -}}
+{{- if gt $budgetGi 0 -}}
+{{- $sh := ($cc.shares | default dict) -}}
+{{- $pct := dict "tree" 50 "slices" 20 "nuget" 15 "refsets" 5 "prepared" 5 -}}
+{{- $sum := 0 -}}
+{{- range $area := list "tree" "slices" "nuget" "refsets" "prepared" -}}
+{{- $k := printf "%sGi" $area -}}
+{{- $v := max (ternary 1 0 (eq $area "slices")) (div (mul $budgetGi (get $pct $area)) 100) | int -}}
+{{- if and (hasKey $sh $k) (not (kindIs "invalid" (get $sh $k))) -}}
+{{- if not (regexMatch "^[0-9]+$" (toString (get $sh $k))) -}}
+{{- fail (printf "buildHosts.cache.shares.%s %v must be a whole number of GiB — the %s area's share of the cache budget" $k (get $sh $k) $area) -}}
+{{- end -}}
+{{- $v = int (get $sh $k) -}}
+{{- else if and (eq $area "slices") $sliceSet -}}
+{{- $v = $sliceCacheMaxGi -}}
+{{- end -}}
+{{- if and (eq $area "slices") (lt $v 1) -}}
+{{- fail (printf "buildHosts.cache.shares.slicesGi %d must be at least 1 — the slice cache is never unbounded and never zero" $v) -}}
+{{- end -}}
+{{- if gt $v $budgetGi -}}
+{{- fail (printf "buildHosts.cache: the %s share %d GiB exceeds the cache budget %d GiB (cache.maxGi, or the declared cache.size %q less 10 %%) — no area may be larger than the whole cache" $area $v $budgetGi $sz) -}}
+{{- end -}}
+{{- $_ := set $shares $area $v -}}
+{{- $sum = add $sum $v | int -}}
+{{- end -}}
+{{- if gt $sum $budgetGi -}}
+{{- fail (printf "buildHosts.cache: the shares sum to %d GiB, above the cache budget %d GiB (tree %d, slices %d, nuget %d, refsets %d, prepared %d) — the areas together may never exceed the whole cache" $sum $budgetGi (get $shares "tree") (get $shares "slices") (get $shares "nuget") (get $shares "refsets") (get $shares "prepared")) -}}
+{{- end -}}
+{{- $sliceCacheMaxGi = get $shares "slices" -}}
+{{- else if kindIs "map" $cc.shares -}}
+{{- range $k, $v := $cc.shares -}}
+{{- if not (kindIs "invalid" $v) -}}
+{{- fail (printf "buildHosts.cache.shares.%s needs a cache budget — a cache.size (claim or node) or cache.maxGi; without one only the slice bound (sliceCacheMaxGi) applies" $k) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- /* The READINESS PORT: the runner answers the kubelet's httpGet probe on GET /ready itself (200 once staged, else 503).
+       An exec probe never passed on the Mac hosts (runc + user namespaces: "chown /dev/stdout: invalid argument"). A whole
+       number in [1024, 65535] — the pod runs unprivileged. hasKey, not `default`. */ -}}
+{{- $readyPort := 8090 -}}
+{{- if hasKey $b "readyPort" -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $b.readyPort)) -}}
+{{- fail (printf "buildHosts.readyPort %v must be a whole number within [1024, 65535] — the port the runner answers the readiness probe on" $b.readyPort) -}}
+{{- end -}}
+{{- $readyPort = int $b.readyPort -}}
+{{- end -}}
+{{- if or (lt $readyPort 1024) (gt $readyPort 65535) -}}
+{{- fail (printf "buildHosts.readyPort %d must be within [1024, 65535] — the port the runner answers the readiness probe on (the pod runs unprivileged)" $readyPort) -}}
+{{- end -}}
+{{- /* NO NETWORK DURING A RUN (MeshWeaver.Plugins Hosting/OneBuildTree.md): `offline` gives every run stage its own network
+       namespace and the prepared package folder as NuGet's only source; `open` keeps today's network. */ -}}
+{{- $stageNetwork := toString ($b.stageNetwork | default "open") -}}
+{{- if not (has $stageNetwork (list "open" "offline")) -}}
+{{- fail (printf "buildHosts.stageNetwork %q must be open or offline — whether a run's stages reach the network" $stageNetwork) -}}
+{{- end -}}
+{{- /* THE NODE'S DISK: a host claims a run only when one run's footprint (runDiskGi) still leaves diskHeadroomPercent of the
+       disk free for the kubelet's eviction threshold — measured on the node at claim time. Whole numbers. */ -}}
+{{- $runDiskGi := 20 -}}
+{{- if hasKey $b "runDiskGi" -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $b.runDiskGi)) -}}
+{{- fail (printf "buildHosts.runDiskGi %v must be a whole number of GiB within [0, 4096] — what one run may write on the node's disk (0 = no guard)" $b.runDiskGi) -}}
+{{- end -}}
+{{- $runDiskGi = int $b.runDiskGi -}}
+{{- end -}}
+{{- if gt $runDiskGi 4096 -}}
+{{- fail (printf "buildHosts.runDiskGi %d must be within [0, 4096]" $runDiskGi) -}}
+{{- end -}}
+{{- $diskHeadroom := 15 -}}
+{{- if hasKey $b "diskHeadroomPercent" -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $b.diskHeadroomPercent)) -}}
+{{- fail (printf "buildHosts.diskHeadroomPercent %v must be a whole percentage within [0, 90]" $b.diskHeadroomPercent) -}}
+{{- end -}}
+{{- $diskHeadroom = int $b.diskHeadroomPercent -}}
+{{- end -}}
+{{- if gt $diskHeadroom 90 -}}
+{{- fail (printf "buildHosts.diskHeadroomPercent %d must be within [0, 90]" $diskHeadroom) -}}
 {{- end -}}
 {{- $sb := ($b.sandbox | default dict) -}}
 {{- $sandbox := dict "seccompProfile" ($sb.seccompProfile | default "") "seccompLocalhostProfile" ($sb.seccompLocalhostProfile | default "")
@@ -292,16 +453,27 @@ The refusals, and why each one exists:
 {{- end -}}
 {{- $np := ($b.networkPolicy | default dict) -}}
 {{- $wi := ($b.workloadIdentity | default dict) -}}
-{{- toYaml (dict "enabled" true "sharedName" $shared "apiUrl" $api "scalerApiUrl" $scalerApi "tokenSecret" $tokName "tokenKey" $tokKey
+{{- /* The MACHINE the hosts run on (its Deployments/<id> on control), or empty: when set every host names itself
+       `<machine>-<pod>` in its claims, so the fleet's price list can credit a run to the machine by host prefix — two Macs
+       serving one queue are otherwise indistinguishable (`build-host-mac-<rs>-<pod>` on both; MeshWeaver.Plugins
+       Hosting/BuildQueue §2a). A DNS label, so the claimed host name stays one too. */ -}}
+{{- $machine := trim (toString ($b.machine | default "")) -}}
+{{- if and $machine (not (regexMatch "^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$" $machine)) -}}
+{{- fail (printf "buildHosts.machine %q must be a lower-case DNS label of at most 32 characters (the machine's Deployments/<id>)" $machine) -}}
+{{- end -}}
+{{- toYaml (dict "enabled" true "machine" $machine "sharedName" $shared "apiUrl" $api "scalerApiUrl" $scalerApi "tokenSecret" $tokName "tokenKey" $tokKey
       "workloadIdentityClientId" (trim ($wi.clientId | default ""))
       "cacheClaim" $cache "cache" $cacheCreate "imagePullSecret" ($b.imagePullSecret | default "")
       "pluginsRegistry" ($b.pluginsRegistry | default "") "pluginsSource" ($b.pluginsSource | default "plugins")
       "orasImage" (required "buildHosts.orasImage is required" $b.orasImage)
       "nodeSelector" $nodeSelector "tolerations" $tolerations
       "resources" ($b.resources | default dict) "workSizeLimit" ($b.workSizeLimit | default "60Gi")
-      "runDeadline" $runDeadline "stageSlots" $stageSlots
+      "runDeadline" $runDeadline "stageSlots" $stageSlots "sliceCacheMaxGi" $sliceCacheMaxGi "cacheBudgetGi" $budgetGi "cacheShares" $shares "readyPort" $readyPort
+      "stageNetwork" $stageNetwork "runDiskGi" $runDiskGi "diskHeadroomPercent" $diskHeadroom
       "warmWorkspace" (eq (toString ($b.warmWorkspace | default false)) "true")
       "moduleHub" (eq (toString ($b.moduleHub | default false)) "true")
+      "sharedTree" (eq (toString ($b.sharedTree | default false)) "true")
+      "runOverlay" (eq (toString ($b.runOverlay | default false)) "true")
       "scaleDownStabilizationSeconds" (int ($b.scaleDownStabilizationSeconds | default 300))
       "sandbox" $sandbox
       "pollingInterval" (int ($b.pollingInterval | default 15)) "cooldownPeriod" (int ($b.cooldownPeriod | default 600))

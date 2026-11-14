@@ -8,8 +8,35 @@ portal that `memex-local` runs stays in its own profile (`default`), and Ollama 
 |---|---|
 | Size the build VM and the runners from the host | `memex-local buildhost plan \| apply [--resize] \| status` (`deploy/homebrew/bin/memex-local`) |
 | First attach: AppArmor profile, Secrets, the `build-host-mac` release | `first-attach.sh` (this directory), header for the steps |
+| Following the sealed set from then on (no hand re-attach to move a set) | `follow-set.py` (this directory), installed by `first-attach.sh` step 6 |
 | The runners' values | `build-host-mac.values.yaml` |
 | Fleet jobs at the lowest priority | `deploy/homebrew/share/buildhost-priority.sh` (below) |
+| Fleet traffic yields to the owner's network | `deploy/homebrew/share/vm-netshape.sh` (below) |
+
+## The host follows the sealed set — never re-run first-attach to move it
+
+`first-attach.sh` step 6 loads the launchd agent `com.memex.local.buildhost-follow.<profile>` (`follow-set.py`, this
+directory). Every 5 minutes it reads the COMPLETE set the followed channel runs from control
+(`GET /api/builds/channels/latest/set`: the set CD sealed, armed and handed over). When the `build-host-mac` release runs
+another set, it re-applies the chart first-attach copied beside it (`~/.memex-local/buildhost-follow/<profile>/helm`) with
+exactly the four set values (`--reuse-values`, the profile's own kube context).
+
+- **Draining** is the chart's own rollout. On SIGTERM a runner stops claiming and finishes the run in hand, within
+  `terminationGracePeriodSeconds`, which is the run deadline.
+- **It fails closed.** Nothing is applied when control is unreachable, the set is incomplete or malformed, the release
+  is mid-operation, or no chart sits beside the agent. Each pass writes one line to `follow.log` beside it.
+- **Why it follows `latest`:** that set is what main is built against, and it is the set a Mac must present to serve
+  `latest`'s runs.
+- **The hosts carry the machine's name.** When the Mac has enrolled for back-lease (`~/.memex-local/backlease.yaml`
+  names its `Hosting__Deployment`) and the chart reads `buildHosts.machine`, every pass sets it, so each runner claims as
+  `<machine>-<pod>` instead of `build-host-mac-<rs>-<pod>`. Two Macs serving one queue are then told apart, and the
+  fleet's price list credits a run to the machine by host prefix (`hosts: ["<machine>-"]`; MeshWeaver.Plugins
+  `Hosting/BuildQueue.md` §2a). A release that does not carry it yet is applied once, even on an unchanged set.
+- **Pin a host** by attaching with `--follow off`.
+- **A chart change** still needs a re-attach, which re-copies the chart.
+
+Measured motivation, why the host pulls rather than control pushing, and how to operate it: MeshWeaver.Plugins
+`Hosting/MacStudioAttachRunbook.md` §8.
 
 ## Fleet jobs run at the lowest priority on a leased Mac
 
@@ -65,3 +92,57 @@ whose command line names Ollama.
 
 Inside the build VM there is nothing more to lower. The host schedules the whole VM as one process, so
 priorities inside the guest do not reach the host, and the VM runs only k3s, KEDA and the build runners.
+
+## Fleet traffic yields to the owner's network
+
+The lowest priority covers the network too (maintainer, 2026-11-08). A build uploads artefacts and module outputs
+to control at whatever the line gives it, and a home router queues that upload in front of everyone else's
+packets: the owner's TV stream or video call then waits behind it. `vm-netshape.sh` shapes each Colima VM's
+traffic inside the VM with Linux `tc`, so nothing on the Mac or the router needs changing:
+
+| What | How |
+|---|---|
+| Uploads | an HTB token bucket on the VM's uplink device caps internet-bound traffic, with `fq_codel` under it |
+| Downloads | the same cap on an `ifb` device the uplink's ingress is redirected to (image pulls, NuGet, git) |
+| Marking | DSCP CS1 (lower effort) on every internet-bound packet, for routers and Wi-Fi that honour it |
+| Exempt | the VM's on-link subnet: the Mac itself (gateway, port forwards, kube API) |
+
+The cap is `MEMEX_NET_SHARE_PCT` (default 25) percent of the link in each direction, never below
+`MEMEX_NET_MIN_KBIT` (default 2000) when it is derived from a measurement. The link is measured ONCE per Mac
+with macOS `networkQuality`, **per direction** (`-d` upload only, `-u` download only, up to 15 s each),
+`MEMEX_NET_SAMPLES` (default 3) times, and the **median** of each direction is recorded in
+`~/.memex-local/netshape-<profile>.env` together with the raw samples (a comment line, also printed); a
+second profile reuses the first one's measurement. A record whose uplink is under 1/50 of its downlink is
+no real line's shape (ADSL is ~1:16, DOCSIS ~1:20) and is re-measured instead of reused. Why: on the
+second Mac Studio (2026-11-10) ONE combined sequential run (`networkQuality -s -M 25`) recorded
+370 kbit/s up and 237972 kbit/s down on a fibre line, and the 256 kbit/s floor of the time capped the
+build VM's uploads at 256 kbit/s. The cause of that one bad reading was not established (the same
+command measured 306 Mbit/s up on another Mac's line); the median, the per-direction budget, the
+plausibility check and the floor make the cap robust to it whatever it was. The owner declares
+the caps instead with `MEMEX_NET_UP_KBIT` / `MEMEX_NET_DOWN_KBIT` (0 = no cap in that direction; the marking
+stays). In the VM the shaper is `/usr/local/sbin/mw-netshape` under the systemd unit `mw-netshape.service`, so it
+survives a VM restart.
+
+`memex-local buildhost apply` and `first-attach.sh` shape the build VM; `memex-local up` shapes the portal's VM
+(profile `default`). `MEMEX_NET_SHAPE=off` skips both.
+
+```
+memex-local net status  [--profile default|build]   # recorded rates, the unit, the capped classes' counters
+memex-local net apply   [--profile …]               # (re)apply from the recorded rates
+memex-local net measure [--profile …]               # measure the link again, then apply
+memex-local net off     [--profile …]               # remove it; the VM's traffic is unshaped
+memex-local buildhost net …                         # the same for the build profile
+```
+
+Measured on the first Mac (Wi-Fi, link 279 Mbit/s up, 2026-11-08), pinging 1.1.1.1 from another machine on
+the same Wi-Fi while the build VM uploaded 400 MB:
+
+| | upload | LAN ping p95 | p99 | max |
+|---|---|---|---|---|
+| idle | — | 6–8 ms | 7–9 ms | 8–14 ms |
+| unshaped, two runs | 224–260 Mbit/s | 18–28 ms | 27–59 ms | 29–65 ms |
+| capped at 70 Mbit/s | 67 Mbit/s | 8–11 ms | 10–17 ms | 11–18 ms |
+
+HTB's default burst (one MTU) let a 70 Mbit/s cap pass only 9–43 Mbit/s in the VM. The capped class uses a
+64 KiB burst, about 7 ms at that rate, and holds 67 Mbit/s.
+

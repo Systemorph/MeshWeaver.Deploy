@@ -25,6 +25,10 @@
 set -uo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CLI="$HERE/../bin/memex-local"
+# The machine the suite runs on must not decide what it asserts: a token model is checked against the HOST's memory and
+# the default chat model reads the host's jobs answer (an Intune profile on a developer Mac, none on a CI runner) —
+# pinned off here, exercised explicitly in their own section.
+export MEMEX_TOKEN_MODELS_UNCHECKED=1 MEMEX_HOST_TAKES_JOBS=0
 
 pass=0; fail=0; RC=0
 ok()  { printf '  ok    %s\n' "$1"; pass=$((pass+1)); }
@@ -65,6 +69,17 @@ for a in "$@"; do
   prev="$a"
 done
 if [ -n "${FAKE_CURL_FAILS:-}" ]; then printf '000'; exit 7; fi
+# The enrolment poll (fleet join, enrolment v2): the signed body is kept, and the next scripted answer
+# ("<status> <json>" per line of $FAKE_POLL_DIR/answers; the last one repeats) is written with ' <status>'.
+case "$url" in
+  */api/enrol/poll)
+    if [ -n "${FAKE_POLL_DIR:-}" ]; then
+      n=$(( $(find "$FAKE_POLL_DIR" -name 'body.*' | wc -l) + 1 ))
+      cat > "$FAKE_POLL_DIR/body.$n"
+      line="$(sed -n "${n}p" "$FAKE_POLL_DIR/answers")"; [ -n "$line" ] || line="$(tail -1 "$FAKE_POLL_DIR/answers")"
+      printf '%s %s' "${line#* }" "${line%% *}"; exit 0
+    fi ;;
+esac
 case "$fmt" in
   *redirect_url*)
     # Only an instance awaiting setup redirects the ROOT to the wizard.
@@ -477,6 +492,11 @@ else bad "values.local.defaults.yaml names 'memex-local setup' as the token comm
 if grep -q '^    InstanceSetup__HostPlatform: "mac"$' "$DEFAULTS"; then
   ok "values.local.defaults.yaml declares InstanceSetup__HostPlatform: mac for the package step"
 else bad "values.local.defaults.yaml declares InstanceSetup__HostPlatform: mac for the package step" "$(grep -n HostPlatform "$DEFAULTS")"; fi
+# …and keeps each person's Claude Code login on the persisted /data hostPath: the chart default
+# (empty) puts it on the container's writable layer, where a restart or an update deletes it.
+if grep -q '^    ClaudeCode__ConfigDirRoot: "/data/' "$DEFAULTS"; then
+  ok "values.local.defaults.yaml keeps Claude Code logins under the persisted /data"
+else bad "values.local.defaults.yaml keeps Claude Code logins under the persisted /data" "$(grep -n ClaudeCode__ConfigDirRoot "$DEFAULTS")"; fi
 
 echo "── a gate's own INPUT must be reachable (static — needs a live pod) ──"
 
@@ -790,8 +810,11 @@ case "$*" in
   *api/ps*) echo '{"models":[{"name":"qwen3.8:27b-mlx","size":1,"details":{"format":"safetensors","family":""},"context_length":65536,"runner":"mlx"},{"name":"qwen3.6-code:latest","details":{"family":"qwen"},"context_length":131072},{"name":"llama3.3:70b","details":{},"context_length":32768}]}' ;;
   *api/tags*)               echo "{\"models\":[${FAKE_TAGS:-}]}" ;;
   # /api/show: the capabilities Ollama reports; FAKE_NO_VISION drops "vision" (a text-only model).
-  *api/show*) if [ -n "${FAKE_NO_VISION:-}" ]; then echo '{"capabilities":["completion","tools"]}'
-              else echo '{"capabilities":["completion","vision","tools","thinking"]}'; fi ;;
+  # ollama_capability reads the body from `-o <file>` and the status from `-w '%{http_code}'`: honour both.
+  *api/show*) if [ -n "${FAKE_NO_VISION:-}" ]; then show='{"capabilities":["completion","tools"]}'
+              else show='{"capabilities":["completion","vision","tools","thinking"]}'; fi
+              out=""; prev=""; for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+              if [ -n "$out" ]; then printf '%s' "$show" > "$out"; printf 200; else echo "$show"; fi ;;
   *) exit 0 ;;
 esac
 STUB
@@ -831,6 +854,114 @@ if command -v helm >/dev/null 2>&1; then
 else
   grep -q 'memex_portal:' "$AUTO" && bad "a no-model layer writes memex_portal:" "$(cat "$AUTO")" || ok "a no-model llm.auto.yaml writes no memex_portal map"
 fi
+# RESIDENCY: the install's declared processing location lands on the local models; undeclared writes none.
+RESF="$LMH/home/.memex-local/residency"; : > "$OVL"; rm -f "$RESF"
+lm env MEMEX_OLLAMA_MODEL= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=arm64 FAKE_TAGS='{"name":"qwen3.8:27b-mlx"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+grep -q 'DataResidency' "$AUTO" && bad "an undeclared install writes a residency (a guess)" "$(cat "$AUTO")" \
+  || ok "an undeclared install writes NO residency line (the models read as Unknown, never a guessed Eu)"
+OUT="$(lm env MEMEX_ACCEPT_NONINTERACTIVE=1 bash -c 'set -euo pipefail; . "$0"; residency_onboard ""' "$CLI" 2>&1 </dev/null)"
+[ ! -f "$RESF" ] && ok "a headless up with no --residency declares nothing and records nothing (the next interactive up asks)" || bad "headless onboarding wrote a residency" "$(cat "$RESF" 2>/dev/null) $OUT"
+lm bash -c 'set -euo pipefail; . "$0"; cmd_residency ch' "$CLI" >/dev/null 2>&1
+[ "$(cat "$RESF" 2>/dev/null)" = "CH" ] && ok "memex-local residency ch persists the declaration as CH" || bad "residency CH not persisted" "$(cat "$RESF" 2>/dev/null)"
+lm env MEMEX_OLLAMA_MODEL= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=arm64 FAKE_TAGS='{"name":"qwen3.8:27b-mlx"}' bash -c 'set -euo pipefail; . "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+grep -qx '    OpenAICompatible__DataResidency: "CH"' "$AUTO" && ok "a declared CH lands in llm.auto.yaml as OpenAICompatible__DataResidency" || bad "declared CH missing from llm.auto.yaml" "$(cat "$AUTO")"
+if command -v helm >/dev/null 2>&1; then
+  printf 'config:\n  memex_portal:\n    OpenAICompatible__DataResidency: "Eu"\n' > "$OVL"
+  R="$(helm template memex "$HERE/../../helm" -f "$HERE/../../helm/values.yaml" -f "$DEF" -f "$AUTO" -f "$OVL" 2>&1)"
+  grep -q 'OpenAICompatible__DataResidency: "Eu"' <<<"$R" && ! grep -q 'OpenAICompatible__DataResidency: "CH"' <<<"$R" \
+    && ok "the overlay's own residency still wins over the declaration in the render" || bad "overlay residency did not win" "$(grep -n DataResidency <<<"$R")"
+  : > "$OVL"
+fi
+lm env MEMEX_RESIDENCY=eu MEMEX_OLLAMA_MODEL= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=arm64 FAKE_TAGS='{"name":"qwen3.8:27b-mlx"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
+grep -qx '    OpenAICompatible__DataResidency: "Eu"' "$AUTO" && ok "MEMEX_RESIDENCY=eu wins for the run and is spelled Eu (the one EU-only value)" || bad "MEMEX_RESIDENCY" "$(cat "$AUTO")"
+for v in 'C1' 'Switzerland-x' 'Switzerland' 'C H'; do
+  lm bash -c 'set -euo pipefail; . "$0"; cmd_residency "$1"' "$CLI" "$v" >/dev/null 2>&1 && bad "residency '$v' accepted" "" || ok "residency '$v' is refused"
+done
+[ "$(cat "$RESF")" = "CH" ] && ok "a refused value leaves the declaration as it was" || bad "refused value changed the declaration" "$(cat "$RESF")"
+lm env MEMEX_ACCEPT_NONINTERACTIVE=1 bash -c 'set -euo pipefail; . "$0"; residency_onboard ""' "$CLI" >/dev/null 2>&1 </dev/null
+[ "$(cat "$RESF")" = "CH" ] && ok "a later headless up keeps the declaration" || bad "headless up lost the declaration" "$(cat "$RESF")"
+lm bash -c 'set -euo pipefail; . "$0"; residency_onboard none' "$CLI" >/dev/null 2>&1
+[ -f "$RESF" ] && [ -z "$(tr -d '[:space:]' < "$RESF")" ] && ok "--residency none records 'asked, none declared'" || bad "residency none" "$(cat "$RESF" 2>/dev/null)"
+printf 'CH\n' > "$RESF"
+# The macOS region SUGGESTS (never applies): an EU member state → Eu, CH → CH, else the ISO code.
+mkdir -p "$LMH/defstub"
+for pair in 'de_CH:CH' 'en_CH@currency=CHF:CH' 'de_DE:Eu' 'fr_FR:Eu' 'zh_Hans_CN:CN' 'en_US_POSIX:US' 'en:'; do
+  loc="${pair%%:*}"; want="${pair#*:}"
+  printf '#!/bin/bash\necho "%s"\n' "$loc" > "$LMH/defstub/defaults"; chmod +x "$LMH/defstub/defaults"
+  got="$(env PATH="$LMH/defstub:$PATH" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$LMH/home/.memex-local" bash -c '. "$0"; residency_suggest' "$CLI" 2>/dev/null)"
+  [ "$got" = "$want" ] && ok "region $loc suggests '${want:-<nothing>}'" || bad "region $loc suggests '$got', want '$want'" ""
+done
+# An interactive first up ASKS, the region's suggestion as the default; Enter takes it.
+rm -f "$RESF"; printf '#!/bin/bash\necho "de_CH"\n' > "$LMH/defstub/defaults"
+OUT="$(printf '\n' | env PATH="$LMH/defstub:$PATH" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$LMH/home/.memex-local" HOME="$LMH/home" \
+  bash -c '. "$0"; accept_interactive() { return 0; }; residency_onboard ""' "$CLI" 2>&1)"
+grep -q 'Where is this machine? (residency, e.g. CH, Eu' <<<"$OUT" && grep -q '\[CH\]' <<<"$OUT" && [ "$(cat "$RESF" 2>/dev/null)" = "CH" ] \
+  && ok "the first interactive up asks 'Where is this machine?' with the region's CH as the default" || bad "interactive onboarding" "$OUT / $(cat "$RESF" 2>/dev/null)"
+rm -f "$RESF"
+OUT="$(printf 'C1\nch\n' | env PATH="$LMH/defstub:$PATH" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$LMH/home/.memex-local" HOME="$LMH/home" \
+  bash -c 'set -euo pipefail; . "$0"; accept_interactive() { return 0; }; residency_onboard ""; echo ONBOARD_DONE' "$CLI" 2>&1)"
+grep -q 'ONBOARD_DONE' <<<"$OUT" && grep -q "'C1' is not a residency" <<<"$OUT" && [ "$(cat "$RESF")" = "CH" ] \
+  && ok "a typo at the prompt is asked again (never the end of the install); the next answer is declared" || bad "interactive typo" "$OUT / $(cat "$RESF" 2>/dev/null)"
+OUT="$(printf 'Global\n' | env PATH="$LMH/defstub:$PATH" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$LMH/home/.memex-local" HOME="$LMH/home" \
+  bash -c '. "$0"; accept_interactive() { return 0; }; residency_onboard ""' "$CLI" 2>&1)"
+[ "$(cat "$RESF")" = "CH" ] && ok "an install that already answered is not asked again" || bad "asked again" "$OUT"
+# llm use --residency: any residency accept_check_residency accepts; an invalid one refused; default = the declaration.
+mkdir -p "$LMH/llmstub"
+cat > "$LMH/llmstub/curl" <<'STUB'
+#!/bin/bash
+case "$*" in *v1/models*) echo '{"data":[{"id":"qwen3.8:27b-mlx"}]}' ;; *) exit 0 ;; esac
+STUB
+chmod +x "$LMH/llmstub/curl"
+lmu() { env HOME="$LMH/home" MEMEX_LOCAL_HOME="$LMH/home/.memex-local" MEMEX_LOCAL_LIB=1 MEMEX_OLLAMA_MODEL=qwen3.8:27b-mlx PATH="$LMH/llmstub:$LMH/stubs:$STUBS:$PATH" "$@"; }
+LLMF="$LMH/home/.memex-local/llm.yaml"
+lmu bash -c 'set -euo pipefail; . "$0"; cmd_llm use --residency CH' "$CLI" >/dev/null 2>&1 \
+  && grep -qx '    OpenAICompatible__DataResidency: "CH"' "$LLMF" && ok "llm use --residency CH is accepted and written" || bad "llm use --residency CH" "$(cat "$LLMF" 2>/dev/null)"
+rm -f "$LLMF"
+lmu bash -c 'set -euo pipefail; . "$0"; cmd_llm use --residency C1' "$CLI" >/dev/null 2>&1 \
+  && bad "llm use --residency C1 accepted" "" || { [ ! -f "$LLMF" ] && ok "llm use --residency C1 is refused and writes nothing"; } || bad "refused but wrote" ""
+OUT="$(lmu bash -c 'set -euo pipefail; . "$0"; cmd_llm use' "$CLI" 2>&1)"
+! grep -q '^    OpenAICompatible__DataResidency:' "$LLMF" && grep -q 'residency CH' <<<"$OUT" \
+  && ok "llm use without --residency defaults to the install declaration (CH) and copies none into llm.yaml (the auto layer carries it)" || bad "llm use default" "$OUT / $(cat "$LLMF")"
+# An llm layer from before this change (llm use wrote "Eu" without a flag) outranks the declaration: named.
+printf 'config:\n  memex_portal:\n    OpenAICompatible__DataResidency: "Eu"\n' > "$LLMF"
+OUT="$(lm env MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" 2>&1)"
+grep -q "stamps residency 'Eu', which WINS over the install declaration 'CH'" <<<"$OUT" && ok "a stale llm-layer residency that disagrees with the declaration is named on every up/update" || bad "stale llm residency not named" "$OUT"
+printf 'config:\n  memex_portal:\n    OpenAICompatible__DataResidency: "CH"\n' > "$LLMF"
+OUT="$(lm env MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" 2>&1)"
+grep -q 'WINS over' <<<"$OUT" && bad "an agreeing llm-layer residency is warned about" "$OUT" || ok "…and an agreeing one is not"
+rm -f "$LLMF"
+# backlease accept tokens: the residency defaults to the install declaration.
+G="$(lm bash -c 'set -euo pipefail; . "$0"; accept_load; printf %s "$ACC_TOK_RES"' "$CLI" 2>/dev/null)"
+[ "$G" = "CH" ] && ok "backlease accept tokens: the residency defaults to the install declaration (CH)" || bad "backlease residency default" "'$G'"
+OUT="$(lm bash -c '. "$0"; cmd_residency' "$CLI" 2>&1)"
+grep -q 'residency: CH' <<<"$OUT" && ok "memex-local residency prints the declaration" || bad "residency print" "$OUT"
+B="$(fn_body cmd_status)"; grep -q '( cmd_residency ) || warn' <<<"$B" && ok "status prints the declared residency, and an invalid one never aborts the rest of status" || bad "status residency" ""
+printf 'C1\n' > "$RESF"
+OUT="$(lm bash -c '. "$0"; ( cmd_residency ) || warn "invalid"; echo STATUS_GOES_ON' "$CLI" 2>&1)"
+grep -q STATUS_GOES_ON <<<"$OUT" && ok "…proven: a corrupted declaration leaves the status run going" || bad "status aborted" "$OUT"
+printf 'CH\n' > "$RESF"
+B="$(fn_body cmd_up)"; grep -q 'residency_onboard "$residency"' <<<"$B" && ok "up runs the residency onboarding" || bad "up onboarding" ""
+B="$(fn_body cmd_update)"; grep -q 'if \[ -n "$residency" \] || \[ -n "${MEMEX_RESIDENCY:-}" \]; then residency_onboard "$residency"; fi' <<<"$B" \
+  && ok "update persists an explicit --residency or MEMEX_RESIDENCY (never asks)" || bad "update residency persistence" ""
+lm env MEMEX_RESIDENCY=at bash -c 'set -euo pipefail; . "$0"; residency_onboard ""' "$CLI" >/dev/null 2>&1
+[ "$(cat "$RESF")" = "AT" ] && ok "MEMEX_RESIDENCY is persisted by the onboarding (AT)" || bad "env not persisted" "$(cat "$RESF")"
+printf 'CH\n' > "$RESF"
+# An invalid declaration FAILS the run (never a quiet un-declare through a $( ) that swallowed the die).
+printf 'C1\n' > "$RESF"
+OUT="$(lm env MEMEX_OLLAMA_MODEL= FAKE_TAGS='{"name":"qwen3.8:27b-mlx"}' bash -c '. "$0"; write_llm_auto_layer; echo WROTE' "$CLI" 2>&1)"
+! grep -q WROTE <<<"$OUT" && grep -q "'C1' is not a residency" <<<"$OUT" && ok "a corrupted residency file fails up/update loudly instead of writing the layer as Unknown" || bad "corrupted residency swallowed" "$OUT"
+OUT="$(lm env MEMEX_RESIDENCY=x9 bash -c '. "$0"; accept_load; echo LOADED' "$CLI" 2>&1)"
+! grep -q LOADED <<<"$OUT" && ok "an invalid MEMEX_RESIDENCY fails the backlease answers too" || bad "invalid env swallowed by accept_load" "$OUT"
+# End to end through the CLI's own dispatcher (not the sourced function).
+EH="$(mktemp -d)"
+OUT="$(env MEMEX_LOCAL_HOME="$EH" HOME="$EH" PATH="$STUBS:$PATH" "$CLI" residency ch 2>&1)"; RC=$?
+[ "$RC" = 0 ] && [ "$(cat "$EH/residency" 2>/dev/null)" = "CH" ] && ok "'memex-local residency ch' through main() declares CH" || bad "CLI residency dispatch" "rc=$RC $OUT"
+OUT="$(env MEMEX_LOCAL_HOME="$EH" HOME="$EH" PATH="$STUBS:$PATH" "$CLI" residency 2>&1)"
+grep -q 'residency: CH' <<<"$OUT" && ok "'memex-local residency' through main() prints it" || bad "CLI residency print" "$OUT"
+env MEMEX_LOCAL_HOME="$EH" HOME="$EH" PATH="$STUBS:$PATH" "$CLI" residency C1 >/dev/null 2>&1 && bad "CLI accepted residency C1" "" \
+  || { [ "$(cat "$EH/residency")" = "CH" ] && ok "'memex-local residency C1' through main() is refused and changes nothing"; } || bad "CLI refusal changed the file" ""
+rm -rf "$EH"
+rm -f "$RESF"
 # The default is not in Ollama (pull failed / Ollama too old): name a model Ollama HAS, never a 404.
 lm env MEMEX_OLLAMA_MODEL= MEMEX_HOST_MEM_GIB=128 MEMEX_HOST_ARCH=arm64 FAKE_TAGS='{"name":"qwen3.6-code:latest"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
 grep -qx '    OpenAICompatible__Models__0: "qwen3.6-code"' "$AUTO" && ok "a failed qwen3.8 pull keeps the model the install already ran (qwen3.6-code), never one that answers 404" || bad "auto layer names a missing model" "$(cat "$AUTO")"
@@ -914,7 +1045,7 @@ grep -qx '    Embedding__Provider: "Ollama"' <<<"$EM" && grep -qx "    Embedding
 lm env MEMEX_OLLAMA_MODEL=none MEMEX_EMBED_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
 grep -q 'Embedding__\|memex_portal:' "$AUTO" && bad "MEMEX_EMBED_MODEL=none still configures embeddings" "$(cat "$AUTO")" || ok "MEMEX_EMBED_MODEL=none configures no embeddings (and writes no empty memex_portal map)"
 lm env MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
-grep -q 'Models__0' "$AUTO" || { grep -qx '    Embedding__Model: "bge-m3"' "$AUTO" && ok "no chat model still keeps local embeddings"; } || bad "no-chat layer lost embeddings" "$(cat "$AUTO")"
+if ! grep -q 'Models__0' "$AUTO" && grep -qx '    Embedding__Model: "bge-m3"' "$AUTO"; then ok "no chat model still keeps local embeddings"; else bad "no-chat layer names a chat model or lost embeddings" "$(cat "$AUTO")"; fi
 if command -v helm >/dev/null 2>&1; then
   lm env MEMEX_OLLAMA_MODEL=qwen3:8b FAKE_TAGS='{"name":"qwen3:8b"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
   R="$(helm template memex "$HERE/../../helm" -f "$HERE/../../helm/values.yaml" -f "$DEF" -f "$AUTO" 2>&1)"
@@ -930,7 +1061,7 @@ OUT="$(lm env MEMEX_EMBED_MODEL=all-minilm bash -c '. "$0"; ensure_embed_model; 
 grep -q '^  ensure_embed_model$' <<<"$(fn_body setup_ollama)" && ok "setup_ollama (up, update, fleet join) pulls the embedding model" || bad "no embed pull" ""
 grep -q 'memex_migration:' <<<"$(fn_body cmd_llm)" && bad "'llm use' still writes a provider-less migration endpoint" "" || ok "'llm use' leaves embeddings to the per-install layer (no provider-less migration endpoint)"
 
-echo "── every AI service on this Mac: all chat tiers + OCR on the local model (2026-11-08) ──"
+echo "── every AI service on this Mac: all chat tiers + OCR on the local model ──"
 : > "$OVL"
 lm env MEMEX_OLLAMA_MODEL=qwen3:8b FAKE_TAGS='{"name":"qwen3:8b"},{"name":"qwen3.6-code:latest"}' bash -c '. "$0"; write_llm_auto_layer' "$CLI" >/dev/null 2>&1
 for t in utility reasoning review; do
@@ -1000,6 +1131,14 @@ OUT="$(lm env FAKE_SMOKE_BODY='{"error":"x"}' bash -c '. "$0"; embed_smoke' "$CL
 [ "$RC" = 1 ] && ok "embedding smoke: a 200 with no vector FAILS" || bad "embed body ignored" "rc=$RC $OUT"
 OUT="$(lm env FAKE_EPROV=AzureFoundry bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
 [ "$RC" = 1 ] && grep -q "embeds on this Mac" <<<"$OUT" && ok "embedding smoke: a CLOUD embedding provider on a Mac install FAILS" || bad "cloud provider passed" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EPROV=OpenAICompatible FAKE_EP=https://api.openai.com/v1 bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && grep -q "is not on this Mac" <<<"$OUT" && ok "embedding smoke: an OpenAI-compatible provider pointed at a CLOUD host FAILS (the endpoint decides, not the name)" || bad "cloud endpoint passed" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EP=http://192.168.5.2:11434/v1 bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "embedding smoke: the VM's gateway to the Mac is on this Mac" || bad "gateway endpoint refused" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EMODEL=custom-embed FAKE_DIM=1024 bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 1 ] && grep -q "sizes its vector columns 1536" <<<"$OUT" && ok "embedding smoke: an overlay model the table does not size is held to the platform's 1536 default (never a skipped width check)" || bad "unsized overlay model passed" "rc=$RC $OUT"
+OUT="$(lm env FAKE_EMODEL=custom-embed FAKE_DIM=1536 bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "embedding smoke: …and passes when it returns 1536" || bad "unsized 1536 refused" "rc=$RC $OUT"
 OUT="$(lm env FAKE_EP= bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
 [ "$RC" = 1 ] && grep -q "carries no Embedding__Endpoint" <<<"$OUT" && ok "embedding smoke: configured here but invisible in the pod FAILS" || bad "invisible embed skipped" "rc=$RC $OUT"
 OUT="$(lm env FAKE_EP= MEMEX_EMBED_MODEL=none bash -c '. "$0"; embed_smoke' "$CLI" 2>&1)"; RC=$?
@@ -1011,6 +1150,226 @@ for c in cmd_up cmd_update; do
 done
 grep -q 'embed_smoke' <<<"$(fn_body cmd_doctor)" && grep -q 'embed_smoke' <<<"$(fn_body cmd_status)" && ok "doctor and status run the embedding smoke" || bad "doctor/status embed" ""
 rm -rf "$LMH"
+
+echo "── the OWNER: collected at onboarding, the instance's global administrator (2026-11-08) ──"
+OWH="$(mktemp -d)"; mkdir -p "$OWH/home/.memex-local" "$OWH/stubs"
+# `defaults` answers the managed preferences from FAKE_PREF_<Key>; nothing set = no preference.
+cat > "$OWH/stubs/defaults" <<'STUB'
+#!/bin/bash
+k="${!#}"; v="FAKE_PREF_$k"; [ -n "${!v:-}" ] && { echo "${!v}"; exit 0; }; exit 1
+STUB
+chmod +x "$OWH/stubs/defaults"
+# Stubbed from the FIRST owner test on: a developer's own Platform SSO registration must never become a test's owner.
+# `app-sso platform -s` answers from FAKE_PSSO (a file holding its output) or fails with FAKE_PSSO_FAILS.
+cat > "$OWH/stubs/app-sso" <<'STUB'
+#!/bin/bash
+[ -n "${FAKE_PSSO_FAILS:-}" ] && { echo "app-sso: error" >&2; exit 1; }
+[ -n "${FAKE_PSSO:-}" ] && { cat "$FAKE_PSSO"; exit 0; }
+printf 'Device Configuration:\n (null)\n\nLogin Configuration:\n (null)\n\nUser Configuration:\n (null)\n'
+STUB
+chmod +x "$OWH/stubs/app-sso"
+ow() { env HOME="$OWH/home" MEMEX_LOCAL_HOME="$OWH/home/.memex-local" MEMEX_LOCAL_LIB=1 PATH="$OWH/stubs:$STUBS:$PATH" "$@"; }
+OOV="$OWH/home/.memex-local/values.local.yaml"
+seed_overlay() { cat > "$OOV" <<'YAML'
+secrets:
+  memex_portal:
+    OpenAICompatible__ApiKey: "ollama"
+config:
+  memex_portal:
+    Portal__InstanceName: "Local"
+ingress:
+  host: "memex.localhost"
+YAML
+}
+seed_overlay
+OUT="$(ow env MEMEX_OWNER=alice MEMEX_OWNER_EMAIL=alice@example.com bash -c 'set -euo pipefail; . "$0"; ensure_owner_admin "" "" require; echo DONE' "$CLI" 2>&1)"
+if grep -q DONE <<<"$OUT" \
+   && awk '/^config:/{c=1} /^ingress:/{c=0} c' "$OOV" | grep -qx '    Auth__GlobalAdmins__0: "alice"' \
+   && awk '/^config:/{c=1} /^ingress:/{c=0} c' "$OOV" | grep -qx '    Instance__Owner__Id: "alice"' \
+   && awk '/^config:/{c=1} /^ingress:/{c=0} c' "$OOV" | grep -qx '    Instance__Owner__Email: "alice@example.com"' \
+   && ! awk '/^secrets:/{c=1} /^config:/{c=0} c' "$OOV" | grep -q 'Owner\|GlobalAdmins' \
+   && grep -qx '    Portal__InstanceName: "Local"' "$OOV" && grep -qx '  host: "memex.localhost"' "$OOV"; then
+  ok "the owner lands in config.memex_portal of the instance's OWN overlay (admin key + id + e-mail), secrets and the rest untouched"
+else bad "owner write" "$OUT
+$(cat "$OOV")"; fi
+cp "$OOV" "$OWH/before"
+ow env MEMEX_OWNER=alice MEMEX_OWNER_EMAIL=alice@example.com bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" >/dev/null 2>&1
+cmp -s "$OOV" "$OWH/before" && ok "a re-run with the same owner changes nothing (idempotent)" || bad "owner re-run changed the overlay" "$(diff "$OWH/before" "$OOV")"
+ow bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" >/dev/null 2>&1 && cmp -s "$OOV" "$OWH/before" \
+  && ok "an unattended re-run with no source keeps the owner the overlay records (no prompt, no failure)" || bad "re-run without source" "$(cat "$OOV")"
+OUT="$(ow bash -c '. "$0"; cmd_owner --id bob --email bob@example.com' "$CLI" 2>&1)"
+[ "$(grep -c 'Auth__GlobalAdmins__0' "$OOV")" = 1 ] && grep -qx '    Auth__GlobalAdmins__0: "bob"' "$OOV" && grep -qx '    Instance__Owner__Email: "bob@example.com"' "$OOV" \
+  && grep -q "was 'alice'" <<<"$OUT" && ok "'memex-local owner --id … --email …' changes the owner in place (one admin key, never a second)" || bad "owner change" "$OUT
+$(cat "$OOV")"
+seed_overlay
+OUT="$(ow bash -c 'set -euo pipefail; . "$0"; ensure_owner_admin "" "" require; echo SURVIVED' "$CLI" 2>&1 </dev/null)"; RC=$?
+[ "$RC" != 0 ] && ! grep -q SURVIVED <<<"$OUT" && grep -q "no OWNER" <<<"$OUT" && ! grep -q GlobalAdmins "$OOV" \
+  && ok "an UNATTENDED install with no owner FAILS, naming how to give one (never an instance without an administrator)" || bad "ownerless install passed" "rc=$RC $OUT"
+OUT="$(ow bash -c '. "$0"; ensure_owner_admin; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+grep -q SURVIVED <<<"$OUT" && grep -q "NO OWNER" <<<"$OUT" && ok "an update of an existing ownerless install warns loudly but does not halt the roll" || bad "update ownerless" "$OUT"
+OUT="$(ow env FAKE_PREF_OwnerId=carol FAKE_PREF_OwnerEmail=carol@example.com bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" 2>&1 </dev/null)"
+grep -qx '    Auth__GlobalAdmins__0: "carol"' "$OOV" && ok "an MDM's managed preferences OwnerId / OwnerEmail supply the owner of an unattended install" || bad "managed pref owner" "$OUT"
+for bad_id in 'a b' 'x;rm' ''\''q'\'''; do
+  OUT="$(ow bash -c '. "$0"; ensure_owner_admin "$1" "" require; echo SURVIVED' "$CLI" "$bad_id" 2>&1 </dev/null)"
+  grep -q SURVIVED <<<"$OUT" && bad "owner id '$bad_id' accepted" "$OUT" || ok "an owner id like '$bad_id' is refused"
+done
+OUT="$(ow bash -c '. "$0"; ensure_owner_admin carol not-an-email require; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+grep -q SURVIVED <<<"$OUT" && bad "a malformed e-mail accepted" "$OUT" || ok "a malformed owner e-mail is refused"
+grep -q 'Auth__GlobalAdmins\|Instance__Owner' "$HERE/../share/"*.yaml && bad "a SHARED values file names the owner (it belongs to each install's own overlay)" "$(grep -n 'Auth__GlobalAdmins\|Instance__Owner' "$HERE/../share/"*.yaml)" \
+  || ok "no shared values file (defaults, template, mode layers) names an owner or an admin"
+B="$(fn_body cmd_up)"; grep -B1 '^  ensure_overlay$' <<<"$B" | grep -q '^  OWNER_REQUIRED=require-fresh$' && ok "up REQUIRES an owner on a fresh install before anything is deployed" || bad "up owner requirement" ""
+# require-fresh: an install never DEPLOYED fails on EVERY ownerless `up` (a re-run of a failed first `up` too —
+# an existing overlay is not a deployed install); a deployed ownerless one — which the unattended daemon re-runs
+# `up` on at every start — warns, so a running Mac is never halted by its own restart.
+seed_overlay; rm -f "$OWH/home/.memex-local/deployed"; : > "$OWH/home/.memex-local/port-forward.sh"   # a standalone port-forward does not count
+for attempt in first re-run; do
+  OUT="$(ow bash -c '. "$0"; ensure_owner_admin "" "" require-fresh; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+  grep -q SURVIVED <<<"$OUT" && bad "an ownerless never-deployed install came up on the $attempt" "$OUT" || ok "up on a never-deployed install with no owner fails (the $attempt, overlay present)"
+done
+: > "$OWH/home/.memex-local/deployed"
+OUT="$(ow bash -c '. "$0"; ensure_owner_admin "" "" require-fresh; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+grep -q SURVIVED <<<"$OUT" && grep -q "NO OWNER" <<<"$OUT" && ok "up on a DEPLOYED ownerless install (the daemon's restart) warns loudly and carries on" || bad "deployed ownerless up" "$OUT"
+rm -f "$OWH/home/.memex-local/deployed"
+# A deployed install from BEFORE the marker, on the daemon's boot-time `up` (no cluster yet): its ingress
+# certificate — written only past this gate — identifies it, so its restart is not halted.
+: > "$OWH/home/.memex-local/memex.localhost.pem"
+OUT="$(ow env PATH="$OWH/stubs:$PATH" bash -c 'colima_running() { return 1; }; . "$0"; colima_running() { return 1; }; ensure_owner_admin "" "" require-fresh; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+grep -q SURVIVED <<<"$OUT" && ok "a pre-marker deployed install (its certificate present, no cluster yet) warns at boot and is not halted" || bad "pre-marker deployed install halted" "$OUT"
+rm -f "$OWH/home/.memex-local/memex.localhost.pem"
+grep -q ': > "$DEPLOYED_MARKER"' <<<"$(fn_body helm_deploy)" && ok "helm_deploy marks the install deployed" || bad "deployed marker" ""
+B="$(fn_body cmd_up)"
+[ "$(grep -n '^  ensure_overlay$' <<<"$B" | cut -d: -f1)" -lt "$(grep -n 'setup_tls' <<<"$B" | head -1 | cut -d: -f1)" ] \
+  && ok "the certificate that marks a pre-marker install is written only AFTER the owner gate in up" || bad "cert before gate" ""
+# The owner is id AND e-mail where one is required: an id without an e-mail fails the install.
+seed_overlay
+OUT="$(ow env MEMEX_OWNER=erin bash -c '. "$0"; ensure_owner_admin "" "" require; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+grep -q SURVIVED <<<"$OUT" && bad "an install with an owner id but no e-mail came up" "$OUT" || ok "an install whose owner has no e-mail fails (id AND e-mail are the owner)"
+# A lone managed OwnerEmail (no OwnerId) was recorded for nobody: never attributed.
+seed_overlay
+ow env FAKE_PREF_OwnerEmail=nobody@example.com bash -c '. "$0"; cmd_owner --id frank' "$CLI" >/dev/null 2>&1 </dev/null
+! grep -q 'nobody@example.com' "$OOV" && ok "a lone managed OwnerEmail without OwnerId is ignored" || bad "lone pref email used" "$(cat "$OOV")"
+# A managed preference's OwnerEmail belongs to its OwnerId: a different explicit owner never inherits it.
+seed_overlay
+OUT="$(ow env FAKE_PREF_OwnerId=carol FAKE_PREF_OwnerEmail=carol@example.com bash -c '. "$0"; cmd_owner --id bob' "$CLI" 2>&1 </dev/null)"
+grep -qx '    Auth__GlobalAdmins__0: "bob"' "$OOV" && ! grep -q 'carol@example.com' "$OOV" \
+  && ok "an MDM's OwnerEmail (for carol) is never written for a different owner (bob)" || bad "pref email inherited" "$(cat "$OOV")"
+echo "── the DEVICE'S WORK IDENTITY: an Intune-managed Mac's Entra account is its owner and sign-in default ──"
+cat > "$OWH/psso-registered.txt" <<'TXT'
+Time: 2026-11-08 10:23:19 +0000
+
+Device Configuration:
+ {
+    accountDisplayName = "Example";
+    loginUserName = "device-not-a-user@example.com";
+}
+
+Login Configuration:
+ (null)
+
+User Configuration:
+ {
+    created = "2026-11-01 08:00:00 +0000";
+    loginUserName = "jane.roe@example.com";
+    uniqueIdentifier = "00000000-0000-0000-0000-000000000000";
+}
+
+SSO Tokens:
+ (null)
+TXT
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; work_identity' "$CLI" 2>&1)"
+[ "$OUT" = "$(printf 'jane.roe@example.com\tmanaged preference UserPrincipalName (com.memex.local)')" ] \
+  && ok "work identity: the Intune managed preference UserPrincipalName is read first" || bad "work identity (pref)" "$OUT"
+OUT="$(ow env FAKE_PSSO="$OWH/psso-registered.txt" bash -c '. "$0"; work_identity' "$CLI" 2>&1)"
+[ "$OUT" = "$(printf 'jane.roe@example.com\tPlatform SSO (app-sso platform -s)')" ] \
+  && ok "work identity: a Platform SSO registration's USER loginUserName (never the device block's)" || bad "work identity (PSSO)" "$OUT"
+OUT="$(ow env FAKE_PREF_UserPrincipalName=max.muster@example.com FAKE_PSSO="$OWH/psso-registered.txt" bash -c '. "$0"; work_identity' "$CLI" 2>&1)"
+[ "${OUT%%$'\t'*}" = "max.muster@example.com" ] && ok "work identity: the managed preference wins over Platform SSO" || bad "work identity order" "$OUT"
+OUT="$(ow bash -c '. "$0"; work_identity; echo "[end]"' "$CLI" 2>&1)"
+[ "$OUT" = "[end]" ] && ok "work identity: an unregistered Mac (no preference, PSSO all (null)) has none" || bad "work identity (absent)" "$OUT"
+OUT="$(ow env FAKE_PSSO_FAILS=1 bash -c 'set -euo pipefail; . "$0"; work_identity; echo "[end]"' "$CLI" 2>&1)"
+[ "$OUT" = "[end]" ] && ok "work identity: a failing app-sso is no identity, never an error" || bad "work identity (failure)" "$OUT"
+OUT="$(ow env FAKE_PREF_UserPrincipalName='{{userprincipalname}}' bash -c '. "$0"; work_identity; echo "[end]"' "$CLI" 2>&1)"
+[ "$OUT" = "[end]" ] && ok "work identity: an Intune token left unsubstituted is no identity" || bad "work identity (raw token)" "$OUT"
+seed_overlay
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c 'set -euo pipefail; . "$0"; ensure_owner_admin "" "" require; echo DONE' "$CLI" 2>&1 </dev/null)"
+grep -q DONE <<<"$OUT" && grep -qx '    Auth__GlobalAdmins__0: "jane.roe"' "$OOV" && grep -qx '    Instance__Owner__Email: "jane.roe@example.com"' "$OOV" \
+  && grep -qx '    Authentication__Microsoft__LoginHint: "jane.roe@example.com"' "$OOV" && grep -qx '    Authentication__Microsoft__DomainHint: "example.com"' "$OOV" \
+  && ! awk '/^secrets:/{c=1} /^config:/{c=0} c' "$OOV" | grep -q 'Hint' \
+  && ok "an unattended install on a managed Mac: the work identity is the owner (id = UPN prefix) and the Microsoft sign-in hint" || bad "work identity owner" "$OUT
+$(cat "$OOV")"
+cp "$OOV" "$OWH/before"
+ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" >/dev/null 2>&1 </dev/null
+cmp -s "$OOV" "$OWH/before" && ok "the work-identity owner and hint are idempotent" || bad "work identity re-run" "$(diff "$OWH/before" "$OOV")"
+seed_overlay
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com MEMEX_OWNER=bob MEMEX_OWNER_EMAIL=bob@example.com bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" 2>&1 </dev/null)"
+grep -qx '    Auth__GlobalAdmins__0: "bob"' "$OOV" && ! grep -q 'jane.roe' "$OOV" && ! grep -q 'LoginHint' "$OOV" \
+  && ok "an explicit owner wins over the work identity, and no hint names a different person" || bad "explicit owner vs work identity" "$OUT
+$(cat "$OOV")"
+seed_overlay
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; cmd_owner --id bob --email bob@example.com' "$CLI" 2>&1 </dev/null)"
+! grep -q 'jane.roe' "$OOV" && ok "'owner --id bob' on a Mac managed for jane: jane's e-mail is never attributed to bob" || bad "work email inherited" "$(cat "$OOV")"
+seed_overlay
+OUT="$(ow bash -c '. "$0"; ensure_owner_admin "" "" require; echo SURVIVED' "$CLI" 2>&1 </dev/null)"
+! grep -q SURVIVED <<<"$OUT" && ! grep -q 'Hint' "$OOV" && ok "no work identity: the owner rule is unchanged (an unattended install without one fails)" || bad "no identity changed the rule" "$OUT"
+seed_overlay
+ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; ensure_owner_admin "" "" require' "$CLI" >/dev/null 2>&1 </dev/null
+OUT="$(ow env FAKE_PREF_UserPrincipalName=jane.roe@example.com bash -c '. "$0"; cmd_owner status' "$CLI" 2>&1 </dev/null)"
+grep -q "work identity: jane.roe@example.com (from managed preference UserPrincipalName" <<<"$OUT" && grep -q "sign-in hint: jane.roe@example.com" <<<"$OUT" \
+  && ok "'owner status' names the work identity, its source and the sign-in hint" || bad "owner status work identity" "$OUT"
+OUT="$(ow bash -c '. "$0"; cmd_owner status' "$CLI" 2>&1 </dev/null)"
+grep -q "work identity: none" <<<"$OUT" && ok "'owner status' says when the Mac has no work identity" || bad "owner status none" "$OUT"
+# The config section without a memex_portal map, and NOT last in the file: the map goes INSIDE config.
+printf 'secrets:\n  memex_portal:\n    X: "1"\nconfig:\n  other: "y"\ningress:\n  host: "memex.localhost"\n' > "$OOV"
+ow bash -c '. "$0"; overlay_set_portal_config Auth__GlobalAdmins__0 dave' "$CLI" >/dev/null 2>&1
+EXP="$(printf 'secrets:\n  memex_portal:\n    X: "1"\nconfig:\n  other: "y"\n  memex_portal:\n    Auth__GlobalAdmins__0: "dave"\ningress:\n  host: "memex.localhost"')"
+[ "$(cat "$OOV")" = "$EXP" ] && ok "a config section with no memex_portal map gets one INSIDE it (never appended under the last section)" || bad "map insertion" "$(cat "$OOV")"
+printf 'ingress:\n  host: "memex.localhost"\n' > "$OOV"
+ow bash -c '. "$0"; overlay_set_portal_config Auth__GlobalAdmins__0 dave' "$CLI" >/dev/null 2>&1
+tail -3 "$OOV" | tr '\n' '|' | grep -q '^config:|  memex_portal:|    Auth__GlobalAdmins__0: "dave"|$' && ok "an overlay with no config section gets one" || bad "no config section" "$(cat "$OOV")"
+# A different owner never inherits the previous owner's e-mail.
+seed_overlay
+ow env MEMEX_OWNER=alice MEMEX_OWNER_EMAIL=alice@example.com bash -c '. "$0"; ensure_owner_admin' "$CLI" >/dev/null 2>&1
+ow bash -c '. "$0"; cmd_owner --id bob' "$CLI" >/dev/null 2>&1 </dev/null
+grep -qx '    Auth__GlobalAdmins__0: "bob"' "$OOV" && ! grep -q 'alice@example.com' "$OOV" \
+  && ok "changing the owner by id alone drops the previous owner's e-mail (never attributed to the new owner)" || bad "email inherited" "$(cat "$OOV")"
+# The flags themselves, executed: fleet join --owner/--owner-email, and first-attach --owner/--owner-email.
+FA="$HERE/../../backlease/first-attach.sh"
+FAO="$(mktemp -d)"; mkdir -p "$FAO/bin"
+cat > "$FAO/bin/memex-local" <<STUB
+#!/bin/bash
+echo "\$*" >> "$FAO/calls"
+case "\$*" in "owner status") [ -f "$FAO/has" ] && echo " ok  instance OWNER (global administrator): bob <bob@example.com>" || echo "warn no OWNER"; exit 0 ;; owner\ *) touch "$FAO/has"; exit 0 ;; esac
+exit 0
+STUB
+chmod +x "$FAO/bin/memex-local"
+FA_ARGS=(--api https://ops.example.test/api/builds --registry r.example.test --vault v --worker-secret w --pull-secret p --pull-user u --version 1.2.3
+  --tester "sha256:$(printf 'a%.0s' $(seq 64))" --portal "sha256:$(printf 'b%.0s' $(seq 64))" --runner "sha256:$(printf 'c%.0s' $(seq 64))")
+OUT="$(PATH="$FAO/bin:$PATH" bash "$FA" "${FA_ARGS[@]}" </dev/null 2>&1)"; RC=$?
+[ "$RC" = 2 ] && grep -q "this Mac has no OWNER" <<<"$OUT" && ! grep -q "^owner --" "$FAO/calls" \
+  && ok "first-attach (executed) refuses a Mac with no owner before any change" || bad "first-attach ownerless" "rc=$RC $OUT"
+OUT="$(PATH="$FAO/bin:$PATH" MEMEX_HEADLESS=1 bash "$FA" "${FA_ARGS[@]}" --owner bob --owner-email bob@example.com </dev/null 2>&1)"
+grep -qx 'owner --id bob --email bob@example.com' "$FAO/calls" && grep -q "owner: bob" <<<"$OUT" \
+  && ok "first-attach --owner/--owner-email (executed) records the owner through memex-local and names who answers the opt-in" || bad "first-attach --owner" "$OUT
+$(cat "$FAO/calls")"
+# an owner line FOLLOWED by more output (the real CLI names the work identity next): `status | grep -q` under pipefail
+# reads that as 141 (SIGPIPE) and refused an owned Mac as ownerless (eiger, 2026-11-08)
+cat > "$FAO/bin/memex-local" <<STUB
+#!/bin/bash
+case "\$*" in "owner status") echo " ok  instance OWNER (global administrator): bob <bob@example.com>"; sleep 0.2
+  for i in \$(seq 2000); do echo "    this Mac's work identity: bob@example.com (line \$i)"; done; exit 0 ;; esac
+exit 0
+STUB
+OUT="$(PATH="$FAO/bin:$PATH" MEMEX_HEADLESS=1 bash "$FA" "${FA_ARGS[@]}" </dev/null 2>&1)"
+! grep -q "has no OWNER" <<<"$OUT" && grep -q "owner: bob" <<<"$OUT" \
+  && ok "first-attach reads an owner the CLI reports before further output (no SIGPIPE under pipefail)" || bad "first-attach owner SIGPIPE" "$OUT"
+rm -rf "$FAO"
+B="$(fn_body cmd_fleet)"; grep -A1 'OWNER_REQUIRED=require' <<<"$B" | grep -q 'ensure_overlay' \
+  && [ "$(grep -n 'OWNER_REQUIRED=require' <<<"$B" | head -1 | cut -d: -f1)" -lt "$(grep -n 'cmd_backlease enroll' <<<"$B" | head -1 | cut -d: -f1)" ] \
+  && ok "fleet join collects the owner FIRST — before the opt-in questions that owner answers" || bad "fleet join owner order" ""
+FA="$HERE/../../backlease/first-attach.sh"
+[ "$(grep -n 'owner status' "$FA" | head -1 | cut -d: -f1)" -lt "$(grep -n 'Accept fleet jobs' "$FA" | head -1 | cut -d: -f1)" ] \
+  && grep -q 'this Mac has no OWNER' "$FA" && ok "first-attach refuses a Mac with no owner, before the opt-in and before any change" || bad "first-attach owner" ""
+rm -rf "$OWH"
 
 echo "── release-channel labels: a seed, resolved to a VERSION (G1) ────"
 
@@ -1311,12 +1670,18 @@ mp_env "$CLI" backlease accept jobs --off --dry-run </dev/null >/dev/null 2>&1 &
 mp_env "$CLI" backlease accept tokens --from 'bad pattern!' --dry-run </dev/null >/dev/null 2>&1 && bad "dry run accepted a bad pattern" "" \
   || ok "accept --dry-run refuses a malformed answer"
 FA="$HERE/../../backlease/first-attach.sh"
-[ "$(grep -n -- '--dry-run >/dev/null' "$FA" | head -1 | cut -d: -f1)" -lt "$(grep -n '^echo "== 0/5 preconditions"' "$FA" | cut -d: -f1)" ] \
+[ "$(grep -n -- '--dry-run >/dev/null' "$FA" | head -1 | cut -d: -f1)" -lt "$(grep -n '^echo "== 0/6 preconditions"' "$FA" | cut -d: -f1)" ] \
   && ok "first-attach validates both opt-in answers BEFORE it changes any infrastructure" || bad "first-attach validates late" ""
 grep -q "case \"\$acc_jobs\" in '') ;;" "$FA" && grep -q '\[ "${#jobs_args\[@\]}" -eq 0 \] ||' "$FA" \
   && ok "first-attach leaves an unanswered class at its saved answer (a re-run never resets consent)" || bad "first-attach preserves answers" ""
 grep -q 'saved_list ${P}__Jobs__Channels)" \] || jobs_args+=(--channels mac)' "$FA" \
   && ok "first-attach narrows jobs to channel mac only when no channel list is saved (a saved list is the owner's)" || bad "first-attach keeps saved channels" ""
+# step 6: the host FOLLOWS the sealed set from then on, unless attached pinned
+grep -q 'follow-set.py" --install --profile "$profile" --follow "$follow" --api "$api" --chart "$chart"' "$FA" \
+  && [ "$(grep -n '^echo "== 6/6 follow' "$FA" | cut -d: -f1)" -gt "$(grep -n '^helm upgrade --install build-host-mac' "$FA" | cut -d: -f1)" ] \
+  && ok "first-attach installs the set follower after the runners exist (step 6)" || bad "first-attach follow step" ""
+grep -q 'follow-set.py" --uninstall --profile "$profile"' "$FA" && ok "first-attach --follow off removes the follower (a pinned host stays pinned)" || bad "first-attach follow off" ""
+OUT="$(bash "$FA" "${FA_ARGS[@]}" --follow 'Not A Channel' </dev/null 2>&1)"; case "$OUT" in *"--follow must be a channel name or off"*) ok "first-attach refuses a --follow that is not a channel or off" ;; *) bad "first-attach --follow validation" "$OUT" ;; esac
 OUT="$(bash "$FA" --token-models 2>&1)"; case "$OUT" in *"--token-models needs model names"*) ok "first-attach names a value flag given last without its value" ;; *) bad "first-attach bare \$2" "$OUT" ;; esac
 OUT="$(bash "$FA" --accept-jobs= 2>&1)"; case "$OUT" in *"--accept-jobs needs instance patterns"*) ok "first-attach reads --accept-jobs=<patterns> as --accept-jobs <patterns> (an empty one is named, not skipped)" ;; *) bad "first-attach equals form" "$OUT" ;; esac
 OUT="$(bash "$FA" --accept-tokens='*.meshweaver.cloud' 2>&1)"; case "$OUT" in *"unknown argument"*) bad "first-attach refuses --accept-tokens=…" "$OUT" ;; *) ok "first-attach takes --accept-tokens=<patterns> (no unknown-argument refusal)" ;; esac
@@ -1354,8 +1719,14 @@ M="$(printf 'a%.0s' $(seq 64))"; C="$(printf 'b%.0s' $(seq 64))"
 # (payload built first: bash 3.2 splits escaped quotes nested inside "$(…)")
 P2='{"v":1,"d":"studio-2","m":"'"$M"'","c":"'"$C"'"}'; P9='{"v":1,"d":"studio-9","m":"'"$M"'","c":"'"$C"'"}'
 sealed="$(seal "$P2" "$KEY")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/code.txt"
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/code.txt" 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/code.txt" --owner owner1 --owner-email owner1@example.com 2>&1)"; RC=$?
+grep -qx '    Auth__GlobalAdmins__0: "owner1"' "$FJ/home/.memex-local/values.local.yaml" && ok "fleet join --owner/--owner-email (executed) records the owner in the overlay" || bad "fleet join --owner flag" "$(grep -n Owner "$FJ/home/.memex-local/values.local.yaml")"
 case "$RC:$OUT" in 0:*"joined as 'studio-2'"*) ok "fleet join opens a code sealed to its key and joins" ;; *) bad "fleet join with a good code" "rc=$RC: $OUT" ;; esac
+# no managed preferences and no Platform SSO: on an Intune-enrolled developer Mac the real com.memex.local
+# profile carries an OwnerId, which would make this "ownerless" join find an owner and the test fail there only
+mkdir -p "$FJ/noprefs"; for t in defaults app-sso; do printf '#!/bin/bash\nexit 1\n' > "$FJ/noprefs/$t"; chmod +x "$FJ/noprefs/$t"; done
+OUT2="$(env PATH="$FJ/noprefs:$STUBS:$PATH" HOME="$FJ/home2" MEMEX_LOCAL_HOME="$FJ/home2/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/code.txt" 2>&1 </dev/null)"; RC2=$?
+case "$RC2:$OUT2" in 0:*) bad "an unattended fleet join without an owner joined" "$OUT2" ;; *"no OWNER"*) ok "an unattended fleet join without an owner FAILS before anything is joined" ;; *) bad "ownerless join" "rc=$RC2 $OUT2" ;; esac
 case "$OUT" in *"$M"*|*"$C"*) bad "fleet join never prints a key value" "a value is in the output" ;; *) ok "fleet join prints no key value (fingerprints only)" ;; esac
 case "$OUT" in *"Hosting/Heartbeats/Enrol/"*) ok "fleet join prints the control instance's approval link" ;; *) bad "approval link" "$OUT" ;; esac
 F="$FJ/home/.memex-local/fleet.yaml"
@@ -1370,23 +1741,84 @@ fmode="$(ls -l "$F" 2>/dev/null | cut -c1-10)"
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$KEY" 2>/dev/null ); OTHER="$FJ/other.pem"
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$OTHER" 2>/dev/null )
 sealed="$(seal "$P2" "$OTHER")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/wrong.txt"
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/wrong.txt" 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/wrong.txt" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "a code for another key is refused" "exited 0" ;; *"does not open with this Mac's key"*) ok "a code sealed to another key is refused by name" ;; *) bad "wrong-key refusal" "$OUT" ;; esac
 sealed="$(seal "$P9" "$KEY")"; printf 'mwenrol1.%s\n' "$sealed" > "$FJ/other-id.txt"
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --code-file "$FJ/other-id.txt" 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-2 --no-open --no-update --no-accept-jobs --no-accept-tokens --code-file "$FJ/other-id.txt" 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "a code for another id is refused" "exited 0" ;; *"issued for 'studio-9'"*) ok "a code issued for another id is refused by name" ;; *) bad "other-id refusal" "$OUT" ;; esac
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id Bad_Id --no-open 2>&1)"; RC=$?
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id Bad_Id --no-open 2>&1)"; RC=$?
 case "$RC:$OUT" in 0:*) bad "a bad id is refused" "exited 0" ;; *"--id must be lower-case"*) ok "an id that cannot be a record id is refused" ;; *) bad "bad id refusal" "$OUT" ;; esac
 OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet status 2>&1)"
 case "$OUT" in *"JOINED as 'studio-2'"*"sha256:"*) ok "fleet status shows the join and the key fingerprints" ;; *) bad "fleet status" "$OUT" ;; esac
 case "$OUT" in *"$M"*|*"$C"*) bad "fleet status never prints a key value" "a value is in the output" ;; *) ok "fleet status prints no key value" ;; esac
 # Unattended (a device-management run): no code yet → the link is printed and kept, exit 3, nothing joined.
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$FJ/home/.memex-local/enrol/studio-3.key.pem" 2>/dev/null )
-OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --code-file "$FJ/none.code" 2>&1)"; RC=$?
-case "$RC:$OUT" in 3:*"WAITING for the approval on control and the enrolment code at $FJ/none.code"*) ok "unattended: no code yet → says what it waits for, exit 3" ;; *) bad "unattended join waits" "rc=$RC: $OUT" ;; esac
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home" MEMEX_LOCAL_HOME="$FJ/home/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-3 --no-open --no-update --no-accept-jobs --no-accept-tokens --wait 0 --code-file "$FJ/none.code" 2>&1)"; RC=$?
+case "$RC:$OUT" in 3:*"WAITING for the approval on control"*) ok "unattended: no code yet → polls within its wait, says what it waits for, exit 3" ;; *) bad "unattended join waits" "rc=$RC: $OUT" ;; esac
 grep -q '/Hosting/Heartbeats/Enrol/' "$FJ/home/.memex-local/enrol/studio-3.link" 2>/dev/null && ok "unattended: the approval link is kept in enrol/<id>.link" || bad "link kept" "$(cat "$FJ/home/.memex-local/enrol/studio-3.link" 2>/dev/null)"
 [ -f "$FJ/home/.memex-local/enrol/studio-3.key.pem" ] && ok "unattended: the throw-away key is kept for the run that brings the code" || bad "key kept while waiting" "gone"
 grep -q 'mode_args+=(-f "$FLEET_FILE")' "$CLI" && ok "helm_deploy layers the fleet file" || bad "helm_deploy layers the fleet file" "no -f \$FLEET_FILE"
+
+echo "── fleet join v2: both answers up front, the signed poll, the itemised code (enrolment v2) ──"
+# The v2 request: owner and both answers, base64url of the JSON MachineEnrolment.Parse reads.
+req="$(fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="control.example.test"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=false; ACC_TOK_RES=CH; fleet_request_v2 studio-5 host-a jroe C02X AAAA jroe jane.roe@example.com')"
+dec="$(printf '%s' "$req" | tr '_-' '/+' | awk '{ n = length($0) % 4; if (n) $0 = $0 substr("===", 1, 4 - n); print }' | base64 -d 2>/dev/null)"
+[ "$dec" = '{"v":2,"deployment":"studio-5","host":"host-a","user":"jroe","machine":"C02X","key":"AAAA","owner":{"id":"jroe","email":"jane.roe@example.com"},"jobs":{"on":true,"from":["control.example.test"],"channels":["mac"],"repos":[]},"tokens":{"on":false,"from":[],"models":[],"residency":"CH"}}' ] \
+  && ok "fleet_request_v2 carries the owner and both explicit answers" || bad "fleet_request_v2" "$dec"
+# Managed preferences answer the two questions (an Intune profile): a plist array or a comma string.
+PREFS="$(fj_lib 'managed_pref() { case "$1" in AcceptJobs) echo 1 ;; AcceptJobsFrom) printf "(\n    \"control.example.test\",\n    \"*.example.test\"\n)" ;; AcceptTokens) echo false ;; esac; }; fleet_participation_from_prefs; echo "$ACC_JOBS_ANSWERED $ACC_JOBS_ENABLED [$ACC_JOBS_FROM] $ACC_TOK_ANSWERED $ACC_TOK_ENABLED"')"
+[ "$PREFS" = 'yes true [control.example.test *.example.test] yes false' ] && ok "the Intune profile's AcceptJobs/AcceptJobsFrom/AcceptTokens answer both questions" || bad "participation from managed prefs" "$PREFS"
+# Unattended with no answer: FAILS before any key or link exists — an unanswered question is never read as no.
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home4" MEMEX_LOCAL_HOME="$FJ/home4/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com "$CLI" fleet join --control https://control.example.test --id studio-4 --no-open --no-update --wait 0 2>&1 </dev/null)"; RC=$?
+case "$RC:$OUT" in 0:*|3:*) bad "an unanswered join is refused" "rc=$RC $OUT" ;; *"has not answered whether this Mac takes BUILD JOBS and whether it GENERATES TOKENS"*) ok "unattended with no answers: the join FAILS naming both questions" ;; *) bad "unanswered join" "rc=$RC $OUT" ;; esac
+[ ! -e "$FJ/home4/.memex-local/enrol/studio-4.link" ] && ok "…and nothing was sent (no key, no link)" || bad "unanswered join sent a request" "link exists"
+# The POLL: pending, then issuing, then ready with an itemised code; every item opens, lands by file, and none is printed.
+KEY5="$FJ/home5/.memex-local/enrol/studio-5.key.pem"; mkdir -p "$(dirname "$KEY5")" "$FJ/poll"
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$KEY5" 2>/dev/null )
+openssl pkey -in "$KEY5" -pubout -out "$FJ/pub5.pem" 2>/dev/null
+TV="tskey-auth-$(printf 't%.0s' $(seq 20))"; EV="$(printf 'e%.0s' $(seq 40))"
+code2='{"v":2,"d":"studio-5","f":{"loginServer":"https://hs.example.test","tenant":"<tenant-id>","clientId":"c1"},"s":{"m":"'"$(seal "$M" "$KEY5")"'","c":"'"$(seal "$C" "$KEY5")"'","t":"'"$(seal "$TV" "$KEY5")"'","e":"'"$(seal "$EV" "$KEY5")"'"}}'
+CODE2="mwenrol2.$(printf '%s' "$code2" | base64 | tr -d '\n=' | tr '+/' '-_')"
+{ printf '200 {"state":"pending"}\n'; printf '200 {"state":"issuing","waiting":["t","e"]}\n'; printf '200 {"state":"ready","code":"%s"}\n' "$CODE2"; } > "$FJ/poll/answers"
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home5" MEMEX_LOCAL_HOME="$FJ/home5/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com FAKE_POLL_DIR="$FJ/poll" MEMEX_FLEET_POLL_EVERY=0 \
+  "$CLI" fleet join --control https://control.example.test --id studio-5 --no-open --no-update --no-accept-jobs --no-accept-tokens --wait 1 2>&1 </dev/null)"; RC=$?
+case "$RC:$OUT" in 0:*"not approved yet"*"waiting for: t,e"*"the code is ready"*"joined as 'studio-5'"*) ok "fleet join polls pending → issuing → ready and continues by itself" ;; *) bad "polling join" "rc=$RC: $OUT" ;; esac
+case "$OUT" in *"$M"*|*"$C"*|*"$TV"*|*"$EV"*) bad "the polling join never prints a value" "a value is in the output" ;; *) ok "the polling join prints no value (fingerprints only)" ;; esac
+grep -q "Hosting__ModuleReportSecret: \"$M\"" "$FJ/home5/.memex-local/fleet.yaml" && ok "items m and c land in the fleet layer" || bad "v2 fleet layer" ""
+PA="$FJ/home5/.memex-local/enrol/studio-5.preauth"
+[ "$(cat "$PA" 2>/dev/null)" = "$TV" ] && [ "$(ls -l "$PA" | cut -c1-10)" = "-rw-------" ] && [ "$(cat "$FJ/home5/.memex-local/enrol/studio-5.login-server")" = "https://hs.example.test" ] \
+  && ok "not root: item t is handed to the device bootstrap as a 0600 file, with the login server beside it" || bad "pre-auth hand-off" "$(ls -l "$FJ/home5/.memex-local/enrol")"
+[ ! -e "$FJ/home5/.memex-local/enrol/studio-5.items" ] && [ ! -e "$KEY5" ] && ok "the opened items and the throw-away key are removed at the end" || bad "items/key cleanup" "$(ls "$FJ/home5/.memex-local/enrol")"
+# Every poll is signed with the throw-away key over 'mwenrol-poll\n{fp}\n{ts}', fp = the full SHA-256 of the key's DER.
+B1="$FJ/poll/body.1"; pfp="$(sed -n 's/.*"fp":"\([0-9a-f]*\)".*/\1/p' "$B1")"; pts="$(sed -n 's/.*"ts":\([0-9]*\).*/\1/p' "$B1")"
+sed -n 's/.*"sig":"\([^"]*\)".*/\1/p' "$B1" | base64 -d > "$FJ/sig.bin" 2>/dev/null
+[ "$(find "$FJ/poll" -name 'body.*' | wc -l | tr -d ' ')" = 3 ] && [ "${#pfp}" = 64 ] && [ -n "$pts" ] && ok "three signed polls, each naming the key by its full SHA-256" || bad "poll bodies" "$(cat "$B1")"
+printf 'mwenrol-poll\n%s\n%s' "$pfp" "$pts" | openssl dgst -sha256 -verify "$FJ/pub5.pem" -signature "$FJ/sig.bin" >/dev/null 2>&1 \
+  && [ "$pfp" = "$(openssl pkey -pubin -in "$FJ/pub5.pem" -outform DER 2>/dev/null | shasum -a 256 | cut -c1-64)" ] && ok "the poll signs exactly 'mwenrol-poll\\n{fp}\\n{ts}' with the throw-away key (RSA-SHA256)" || bad "poll signature shape" "missing"
+# A refused join stops loudly, naming why.
+printf '200 {"state":"refused","why":"superseded by a later approval"}\n' > "$FJ/poll/answers"; rm -f "$FJ/poll"/body.*
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$FJ/home5/.memex-local/enrol/studio-6.key.pem" 2>/dev/null )
+OUT="$(env PATH="$STUBS:$PATH" HOME="$FJ/home5" MEMEX_LOCAL_HOME="$FJ/home5/.memex-local" MEMEX_OWNER=owner1 MEMEX_OWNER_EMAIL=owner1@example.com FAKE_POLL_DIR="$FJ/poll" MEMEX_FLEET_POLL_EVERY=0 \
+  "$CLI" fleet join --control https://control.example.test --id studio-6 --no-open --no-update --no-accept-jobs --no-accept-tokens --wait 1 2>&1 </dev/null)"; RC=$?
+case "$RC:$OUT" in 0:*|3:*) bad "a refused join stops" "rc=$RC" ;; *"REFUSED this join: superseded by a later approval"*) ok "a refused join stops, naming control's reason" ;; *) bad "refused join" "rc=$RC $OUT" ;; esac
+grep -q 'drop="$FLEET_DIR/fleet-ca.key"' "$CLI" && grep -q '( cmd_ca adopt --sha256 "$sha" )' "$CLI" \
+  && ok "item a takes the ONE §6 path: the 0600 drop enrol/fleet-ca.key, then ca adopt --sha256 <caCertSha256> (the bootstrap adopts the same drop if this fails)" || bad "ca adopt path" "missing"
+# The owner's answers reach backlease enroll and first-attach as ONE argv word per flag — a multi-pattern list is never
+# split or globbed (executed, in a directory holding a file a glob would match).
+mkdir -p "$FJ/globdir" && : > "$FJ/globdir/evil.example.test"
+ARGV="$(cd "$FJ/globdir" && fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="control.example.test *.example.test"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=false; fleet_accept_argv first-attach; printf "[%s]\n" "${FLEET_ACCEPT_ARGV[@]}"')"
+[ "$ARGV" = "$(printf '[--accept-jobs=control.example.test *.example.test]\n[--no-accept-tokens]')" ] \
+  && ok "first-attach gets the multi-pattern answer as one word, unsplit and unglobbed (no --job-* flags)" || bad "accept argv for first-attach" "$ARGV"
+ARGV="$(fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="a.example b.example"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=true; ACC_TOK_FROM="*.example.test"; ACC_TOK_MODELS="qwen3.6 qwen3.8:27b-mlx"; ACC_TOK_RES=CH; fleet_accept_argv; printf "[%s]\n" "${FLEET_ACCEPT_ARGV[@]}"')"
+[ "$(printf '%s\n' "$ARGV" | wc -l | tr -d ' ')" = 5 ] && printf '%s' "$ARGV" | grep -qx '\[--token-models=qwen3.6 qwen3.8:27b-mlx\]' \
+  && ok "backlease enroll gets every answer as one word per flag" || bad "accept argv for backlease" "$ARGV"
+grep -q 'if \[ "${MEMEX_BUILDHOST_REGISTRY_BUNDLES:-0}" = 1 \] && \[ -s "$dir/k" \] && \[ -n "$preg" \]; then h8=1' "$CLI" && ok "the registry bundle index (H8) is opt-in: the key goes to first-attach only with MEMEX_BUILDHOST_REGISTRY_BUNDLES=1 AND the registry URL" || bad "H8 opt-in gate" "missing"
+! grep -q 'SC2046' "$CLI" || bad "no unquoted accept substitution remains" "$(grep -n SC2046 "$CLI")"
+grep -q -- '--auth-key="file:$dir/t"' "$CLI" && ok "as root the pre-auth key goes to tailscale by FILE reference on the root daemon's socket" || bad "tailscale auth by file" "missing"
+grep -q 'cmd_internal on --tenant "$tenant" --client-id "$cid" < "$dir/e"' "$CLI" && grep -q '< "$dir/n" )' "$CLI" \
+  && ok "the sign-in and DNS-01 secrets reach internal on / cert config on STDIN" || bad "secrets on stdin" "missing"
+grep -q '\[ "$ACC_JOBS_ENABLED" = true \] || { info "build host: jobs are OFF' "$CLI" && grep -q -- '--secrets-from "$secrets" --set-from latest' "$CLI" \
+  && ok "the build host is attached ONLY on a jobs opt-in, with its values from files (no vault)" || bad "build host gating" "missing"
 rm -rf "$FJ"
 
 echo "── a fleet Mac's template carries Hosting (fleet join / backlease, registry mode) ──"
@@ -1623,12 +2055,12 @@ case "$OUT" in *"is current"*|"") ok "the poll is throttled (a second tick insid
 rm -f "$AU/home/.memex-local/autoupdate.checked"
 AU_CALL=(cmd_autoupdate _tick); au "$KEG/memex-local" FAKE_NEW_VERSION=0.3.2
 case "$OUT" in *"upgraded 0.3.1 -> 0.3.2"*"chart and share assets unchanged"*) ok "a script-only release upgrades without re-applying the chart" ;; *) bad "script-only release" "$OUT" ;; esac
-[ ! -s "$AU/update.log" ] && ok "… and restarts nothing" || bad "script-only release restarts nothing" "$(cat "$AU/update.log")"
+[ "$(cat "$AU/update.log")" = "settle|1" ] && ok "… and restarts nothing: only the in-place 'settle' runs (no update, no restart)" || bad "script-only release restarts nothing" "$(cat "$AU/update.log")"
 
 rm -f "$AU/home/.memex-local/autoupdate.checked"
 mkdir -p "$AU/home/.memex-local"; : > "$AU/home/.memex-local/autoroll-tick"
 AU_CALL=(cmd_autoupdate _tick); au "$KEG/memex-local" FAKE_NEW_VERSION=0.3.3 FAKE_NEW_CHART="chart v2"
-case "$(cat "$AU/update.log")" in "update --skip-image|1") ok "a release that changed the chart re-applies it once with update --skip-image, flagged as the agent" ;;
+case "$(cat "$AU/update.log")" in "settle|1"$'\n'"update --skip-image|1") ok "a release that changed the chart re-applies it once with update --skip-image, flagged as the agent" ;;
   *) bad "a changed chart is re-applied" "update.log=$(cat "$AU/update.log") out=$OUT" ;; esac
 cmp -s "$AU/home/.memex-local/autoroll-tick" "$AU/prefix/opt/memex-local/libexec/memex-local" \
   && ok "the auto-roll's tick copy is refreshed from the new keg" || bad "the auto-roll tick copy is refreshed" "$OUT"
@@ -1654,6 +2086,8 @@ case "$*" in *redirect_url*) printf '%s' "${FAKE_REDIRECT:-}" ;; *) printf '%s' 
 EOF
 printf '#!/usr/bin/env bash\nprintf "info: Banner\\n  Token: %%s\\n" "$FAKE_TOKEN"\n' > "$SO/stubs/kubectl"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$FAKE_OPEN_LOG"\n' > "$SO/stubs/open"
+# the served certificate is trusted unless a test says otherwise (FAKE_UNTRUSTED)
+printf '#!/usr/bin/env bash\n[ "$1" = verify-cert ] && [ -z "${FAKE_UNTRUSTED:-}" ]\n' > "$SO/stubs/security"
 chmod +x "$SO/stubs/"*
 so_run() {
   : > "$SO/open.log"
@@ -1672,6 +2106,12 @@ so_run FAKE_REDIRECT="https://memex.localhost:8443/login" FAKE_TOKEN=tok3
 [ ! -s "$SO/open.log" ] && ok "a set-up instance opens nothing" || bad "a set-up instance opens nothing" "$(cat "$SO/open.log")"
 so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok4 MEMEX_HEADLESS=1
 [ ! -s "$SO/open.log" ] && ok "a headless host opens nothing" || bad "a headless host opens nothing" "$(cat "$SO/open.log")"
+so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok9 FAKE_UNTRUSTED=1
+[ ! -s "$SO/open.log" ] && case "$OUT" in *"NOT opening the browser"*"not trusted"*) true ;; *) false ;; esac \
+  && ok "the login agent never opens the wizard into an untrusted certificate (defect 10), and says why" || bad "agent opens into an untrusted cert" "open: $(cat "$SO/open.log") out: $OUT"
+case "$OUT" in *tok9*) bad "the agent's untrusted-certificate line never carries the token" "$OUT" ;; *) ok "the agent's untrusted-certificate line never carries the token" ;; esac
+so_run FAKE_REDIRECT="https://memex.localhost:8443/setup" FAKE_TOKEN=tok9
+[ "$(cat "$SO/open.log")" = "https://memex.localhost:8443/setup?token=tok9" ] && ok "…and opens it on a later start, once the certificate is trusted (no marker was written)" || bad "agent retries after trust" "$(cat "$SO/open.log")"
 grep -q '^open_setup_if_waiting &$' "$PF" && ok "the agent runs it in the background, before the forward" || bad "the agent runs it in the background" ""
 named=""; for m in "$SO/home/.memex-local/"setup-opened.*; do case "$m" in *tok*) named="$m" ;; esac; done
 if [ -n "$named" ]; then bad "the marker never names the token" "$named"
@@ -2034,6 +2474,8 @@ case "\$*" in *version*) case "$t" in colima) echo "colima version 0.10.3" ;; ku
 echo "$t \$*" >> "$BH/log"
 case "$t \$*" in
   "colima list"*) printf '%s' "\${FAKE_COLIMA_LIST:-}" ;;
+  "colima ssh"*"NRestarts"*) n=\$(cat "$BH/nr" 2>/dev/null || echo 0); echo \$n; [ -n "\${FAKE_NR_GROWS:-}" ] && echo \$((n+1)) > "$BH/nr"; true ;;
+  "kubectl --context colima-build get --raw /readyz"*) echo ok ;;
   "helm "*" status build-host-mac"*) exit "\${FAKE_RELEASE_RC:-1}" ;;
 esac
 exit 0
@@ -2042,23 +2484,28 @@ done; chmod +x "$BH/stubs/"*
 # PATH holds the stubs and the system directories ONLY (no Homebrew), and MEMEX_PREFIX names an empty
 # prefix: the resolver can find no real colima, helm or kubectl — a test must never start a VM.
 mkdir -p "$BH/prefix"
-bh() { env PATH="$BH/stubs:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" MEMEX_PREFIX="$BH/prefix" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
+bh() { env PATH="$BH/stubs:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" MEMEX_PREFIX="$BH/prefix" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_NET_NO_MEASURE=1 MEMEX_K3S_STABLE_S=0 MEMEX_K3S_POLL_S=0 MEMEX_K3S_HEALTH_S=2 MEMEX_BUILD_DISK_MAX_GIB=300 MEMEX_HOST_DISK_FREE_GIB="${BH_FREE:-400}" MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
 OUT="$(bh "$CLI" buildhost apply 2>&1)"
-grep -q 'colima start -p build --cpu 16 --memory 104 --disk 100 --runtime containerd --kubernetes' "$BH/log" && grep -q 'kubectl --context colima-build get crd scaledobjects.keda.sh' "$BH/log" \
+grep -q 'colima start -p build --cpu 16 --memory 104 --disk 300 --runtime containerd --kubernetes' "$BH/log" && grep -q 'kubectl --context colima-build get crd scaledobjects.keda.sh' "$BH/log" \
   && case "$OUT" in *"first attach installs it"*) true ;; *) false ;; esac \
   && ok "apply creates the build VM at the plan (containerd, k3s), checks KEDA in colima-build, and names the first attach for a missing release" || bad "apply create" "$OUT / $(cat "$BH/log")"
+grep -q 'colima ssh -p build -- sudo systemctl restart mw-netshape.service' "$BH/log" && [ -f "$BH/.memex-local/netshape-build.env" ] \
+  && ok "apply also shapes the build VM's network (mw-netshape.service in the VM) and records the rates" || bad "apply netshape" "$(grep netshape "$BH/log")"
 : > "$BH/log"
 OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
-grep -q 'helm --kube-context colima-build -n build-mac upgrade build-host-mac .* --reuse-values --set buildHosts.mac.minReplicas=1 --set buildHosts.mac.maxReplicas=4 --set-string buildHosts.resources.requests.cpu=3500m --set-string buildHosts.resources.requests.memory=20Gi --set-string buildHosts.resources.limits.cpu=4 --set-string buildHosts.resources.limits.memory=24Gi --set buildHosts.stageSlots=4' "$BH/log" \
+SZ="$BH/.memex-local/buildhost-follow/build/sizing.yaml"
+grep -q "helm --kube-context colima-build -n build-mac upgrade build-host-mac .* --reuse-values -f $SZ" "$BH/log" \
+  && grep -q 'mac: {minReplicas: 1, maxReplicas: 4}' "$SZ" && grep -q 'requests: {cpu: "3500m", memory: "20Gi"}' "$SZ" && grep -q 'limits: {cpu: "4", memory: "24Gi"}' "$SZ" && grep -q 'stageSlots: 4' "$SZ" \
+  && grep -q 'cache: {sizeEnforced: false, maxGi: 80, shares: {treeGi: 24, slicesGi: 30, nugetGi: 8, refsetsGi: 3, preparedGi: 2}}' "$SZ" \
   && ! grep -q 'colima start\|colima stop' "$BH/log" \
   && ok "an installed release is sized in place (--reuse-values, its own context); a VM that covers the plan is not restarted" || bad "apply size" "$OUT / $(cat "$BH/log")"
 : > "$BH/log"
 OUT="$(bh FAKE_COLIMA_LIST=$'{"name":"default","cpus":8,"memory":17179869184}\n{"name":"build","status":"Running","cpus":8,"memory":25769803776}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
-! grep -q 'colima stop' "$BH/log" && grep -q 'maxReplicas=2 ' "$BH/log" && case "$OUT" in *"apply --resize"*) true ;; *) false ;; esac \
+! grep -q 'colima stop' "$BH/log" && grep -q 'maxReplicas: 2}' "$BH/.memex-local/buildhost-follow/build/sizing.yaml" && case "$OUT" in *"apply --resize"*) true ;; *) false ;; esac \
   && ok "a smaller VM is NOT restarted without --resize: the runners are sized to what it has, and the resize is named" || bad "apply no resize" "$OUT / $(cat "$BH/log")"
 : > "$BH/log"
 bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":8,"memory":25769803776}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize >/dev/null 2>&1
-grep -q 'colima stop -p build' "$BH/log" && grep -q 'colima start -p build --cpu 16 --memory 104' "$BH/log" && grep -q 'maxReplicas=4 ' "$BH/log" \
+grep -q 'colima stop -p build' "$BH/log" && grep -q 'colima start -p build --cpu 16 --memory 104' "$BH/log" && grep -q 'maxReplicas: 4}' "$BH/.memex-local/buildhost-follow/build/sizing.yaml" \
   && ok "--resize restarts the build VM at the plan and sizes the runners to it" || bad "apply resize" "$(cat "$BH/log")"
 : > "$BH/log"
 bh FAKE_COLIMA_LIST='{"name":"build","status":"Stopped","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply >/dev/null 2>&1
@@ -2069,6 +2516,60 @@ grep -q '^launchctl bootstrap gui/[0-9]* .*/Library/LaunchAgents/com.memex.local
   && [ -x "$BH/.memex-local/buildhost-priority.sh" ] \
   && ok "apply loads the priority governor (launchd agent for profile build, script copied to ~/.memex-local)" || bad "apply priority governor" "$(cat "$BH/log")"
 OUT="$(bh MEMEX_HOST_MEM_GIB=abc "$CLI" buildhost plan 2>&1)" && bad "a non-numeric probe was used" "$OUT" || { case "$OUT" in *"instead of a whole number"*) ok "a host probe that is not a whole number stops the plan (never sized from 0)" ;; *) bad "probe validation" "$OUT" ;; esac; }
+echo "── buildhost: the build VM's disk is sized from this Mac, the runners from the disk (2026-11-11) ──"
+: > "$BH/log"; bh "$CLI" buildhost apply >/dev/null 2>&1
+grep -q -- '--k3s-arg=--kubelet-arg=image-gc-high-threshold=60 --k3s-arg=--kubelet-arg=image-gc-low-threshold=45 --k3s-arg=--kube-controller-manager-arg=terminated-pod-gc-threshold=5' "$BH/log" \
+  && ok "a NEW build VM collects unused images early (GC at 60 %, 48 h max age) and keeps at most 5 finished pod records" || bad "gc args on create" "$(grep 'colima start' "$BH/log")"
+[ "$(lib buildhost_disk_runs 100)" = 1 ] && [ "$(lib buildhost_disk_runs 200)" = 3 ] && [ "$(lib buildhost_disk_runs 60)" = 1 ] && [ "$(lib buildhost_disk_runs 50)" = 0 ] \
+  && [ "$(lib buildhost_cache_gib 197)" = 80 ] && [ "$(lib buildhost_cache_gib 100)" = 49 ] && [ "$(lib buildhost_cache_gib 60)" = 15 ] && [ "$(lib buildhost_cache_gib 40)" = 10 ] \
+  && ok "the cache budget grows with the disk up to 80 GiB, always leaving ONE run: 197 GiB → 80 (3 runs), 100 → 49 (1 run), 60 → 15 (1 run), 50 → no run" || bad "disk runs" "$(lib buildhost_disk_runs 100) $(lib buildhost_disk_runs 200) $(lib buildhost_disk_runs 60)"
+[ "$(lib buildhost_disk_min)" = 55 ] && ok "the least disk that holds one run is 55 GiB (the 10 GiB minimum cache beside it)" || bad "disk min" "$(lib buildhost_disk_min)"
+[ "$(lib buildhost_disk_plan 1600 0 0)" = 200 ] && [ "$(lib buildhost_disk_plan 150 84 0)" = 26 ] && [ "$(lib buildhost_disk_plan 150 0 30)" = 140 ] \
+  && ok "the disk: capped at 200; a 256 GB Mac with 150 GiB free and a portal VM that may grow 84 more gets 26 (too small — refused below); what the build VM already holds counts as its own" || bad "disk plan" "$(lib buildhost_disk_plan 1600 0 0) $(lib buildhost_disk_plan 150 84 0) $(lib buildhost_disk_plan 150 0 30)"
+P="$(lib buildhost_plan 18 128 8 16 0 100)"
+grep -q '^runners_max=1$' <<<"$P" && grep -q '^vm_disk=100$' <<<"$P" && grep -q '^runner_mem_limit=24$' <<<"$P" \
+  && ok "an 18-core Mac on a 100 GiB build disk gets 1 runner beside a 49 GiB cache, not 4 (the second Mac Studio's 4 runners on 98 GiB could never claim)" || bad "plan disk cap" "$P"
+P="$(lib buildhost_plan 18 128 8 16 0 50 2>&1)" && bad "a 50 GiB disk was planned" "$P" || { grep -q 'holds no run' <<<"$P" && grep -q 'at least 55 GiB' <<<"$P" && ok "a disk that holds no run is refused, with the arithmetic" || bad "small disk reason" "$P"; }
+: > "$BH/log"
+OUT="$(BH_FREE=60 bh "$CLI" buildhost plan 2>&1)" && bad "a Mac with 60 GiB free planned a build VM" "$OUT" || { case "$OUT" in *"holds no run"*"free disk on this Mac"*) ok "a Mac without the disk for one run is REFUSED at plan time, naming the free disk and the remedy" ;; *) bad "low free disk" "$OUT" ;; esac; }
+mkdir -p "$BH/.colima/build"; printf 'kubernetes:\n  enabled: true\n  k3sArgs:\n    - --disable=traefik\n    - --kubelet-arg=root-dir=/var/lib/rancher/kubelet\n' > "$BH/.colima/build/colima.yaml"
+: > "$BH/log"
+bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400,"disk":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize >/dev/null 2>&1
+grep -q 'colima start -p build --cpu 16 --memory 104 --disk 300' "$BH/log" && grep -qxF -- '    - --kubelet-arg=image-gc-high-threshold=60' "$BH/.colima/build/colima.yaml" && ! grep -q 'image-maximum-gc-age' "$BH/.colima/build/colima.yaml" && grep -qxF -- '    - --kubelet-arg=root-dir=/var/lib/rancher/kubelet' "$BH/.colima/build/colima.yaml" && grep -q 'maxReplicas: 4}' "$BH/.memex-local/buildhost-follow/build/sizing.yaml" \
+  && ok "--resize grows a 100 GiB build disk to what the Mac backs (200), adds the GC args to its profile (root-dir kept), and sizes 4 runners" || bad "resize disk+gc" "$(cat "$BH/log"; cat "$BH/.colima/build/colima.yaml")"
+: > "$BH/log"
+OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400,"disk":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
+! grep -q 'colima stop' "$BH/log" && grep -q 'maxReplicas: 1}' "$BH/.memex-local/buildhost-follow/build/sizing.yaml" \
+  && ok "without --resize an existing 100 GiB disk is kept and the runners sized to it (1, beside a 49 GiB cache)" || bad "existing disk" "$OUT / $(cat "$BH/log")"
+grep -q 'colima ssh -p build -- sudo k3s crictl rmi --prune' "$BH/log" && grep -q 'kubectl --context colima-build -n build-mac get pods --field-selector=status.phase=Failed' "$BH/log" \
+  && ok "apply collects unused images and finished pod records in the build VM" || bad "apply gc" "$(cat "$BH/log")"
+echo "── buildhost: only k3s arguments measured on this k3s are written; a resize that breaks k3s is rolled back (2026-11-11) ──"
+V="$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; for a in "${BUILD_K3S_GC_ARGS[@]}" "$KUBELET_ROOT_ARG"; do k3s_arg_verified "$a" || echo "UNVERIFIED $a"; done; for a in "${K3S_ARGS_REFUSED[@]}"; do k3s_arg_verified "$a" && echo "REFUSED-BUT-LISTED $a"; for b in "${BUILD_K3S_GC_ARGS[@]}"; do [ "$a" = "$b" ] && echo "REFUSED-IN-GC $a"; done; done' "$CLI")"
+[ -z "$V" ] && ok "every k3s argument the CLI writes is in K3S_ARGS_VERIFIED, and no refused one (image-maximum-gc-age: a config field, not a flag) is written" || bad "k3s arg allowlist" "$V"
+grep -q 'image-maximum-gc-age' <<<"$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; printf "%s\n" "${BUILD_K3S_GC_ARGS[@]}"' "$CLI")" && bad "image-maximum-gc-age still written" "" || ok "image-maximum-gc-age is not among the written args (k3s v1.35's kubelet refused it and crash-looped 195 times)"
+printf 'kubernetes:\n  enabled: true\n  k3sArgs:\n    - --disable=traefik\n    - --kubelet-arg=root-dir=/var/lib/rancher/kubelet\n    - --kubelet-arg=image-maximum-gc-age=48h\n' > "$BH/.colima/build/colima.yaml"
+: > "$BH/log"; rm -f "$BH/nr"
+bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":111669149696,"disk":214748364800}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply >/dev/null 2>&1
+! grep -q 'image-maximum-gc-age' "$BH/.colima/build/colima.yaml" && compgen -G "$BH/.colima/build/colima.yaml.bak-*" >/dev/null \
+  && ok "an apply removes a refused argument an earlier release wrote (backup beside it), before the VM's next start crash-loops on it" || bad "refused arg repair" "$(cat "$BH/.colima/build/colima.yaml")"
+printf 'kubernetes:\n  enabled: true\n  k3sArgs:\n    - --disable=traefik\n    - --kubelet-arg=root-dir=/var/lib/rancher/kubelet\n' > "$BH/.colima/build/colima.yaml"
+: > "$BH/log"; rm -f "$BH/nr"
+OUT="$(bh FAKE_NR_GROWS=1 FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400,"disk":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize 2>&1)"; RC=$?
+[ "$RC" != 0 ] && grep -qi 'rolled back' <<<"$OUT" && ! grep -q 'image-gc-high-threshold' "$BH/.colima/build/colima.yaml" && [ "$(grep -c '^colima start -p build' "$BH/log")" -ge 2 ] && ! grep -q 'upgrade build-host-mac' "$BH/log" \
+  && ok "a resize after which k3s keeps restarting is ROLLED BACK: the profile restored, the VM restarted on it, nothing sized, and the run fails naming it" || bad "resize rollback" "rc=$RC $OUT / $(cat "$BH/.colima/build/colima.yaml")"
+: > "$BH/log"; rm -f "$BH/nr"
+OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400,"disk":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize 2>&1)"
+grep -q "k3s is healthy: API ready, k3s NRestarts 0 (stable)" <<<"$OUT" && grep -q 'upgrade build-host-mac' "$BH/log" \
+  && ok "a resize whose k3s comes back and stays up (API ready, NRestarts stable) goes on to size the runners" || bad "resize healthy" "$OUT"
+# a build VM the idle governor stopped for an idle-only model is NOT started by apply (review on #293: executed, not grepped)
+mkdir -p "$BH/.memex-local/backlease"; printf '{"state":"stopped","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$BH/.memex-local/backlease/buildhost.json"
+: > "$BH/log"
+OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Stopped","cpus":16,"memory":111669149696,"disk":322122547200}' "$CLI" buildhost apply 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ! grep -q '^colima start' "$BH/log" && grep -q "starts it the moment CI asks" <<<"$OUT" \
+  && ok "buildhost apply never starts a build VM the governor stopped for an idle-only model (and says so)" || bad "apply respects idle state" "rc=$RC $OUT / $(grep colima "$BH/log")"
+printf '{"state":"running","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$BH/.memex-local/backlease/buildhost.json"; : > "$BH/log"
+bh FAKE_COLIMA_LIST='{"name":"build","status":"Stopped","cpus":16,"memory":111669149696,"disk":322122547200}' "$CLI" buildhost apply >/dev/null 2>&1
+grep -q '^colima start -p build' "$BH/log" && ok "…while a state of 'running' (the VM merely stopped) is started as before" || bad "apply starts when running" "$(grep colima "$BH/log")"
 rm -rf "$BH"
 
 echo "── buildhost priority: fleet jobs at the lowest priority, every idle core otherwise ──"
@@ -2143,10 +2644,743 @@ grep -q 'Hosting__BackLease__HostLoadMax: "85%"' "$BL/backlease.yaml" && grep -q
   && ok "the back-lease layer declares the host load/memory and VM CPU/memory ceilings for the heartbeat" || bad "backlease thresholds" "$(ls "$BL"; cat "$BL"/backlease.yaml 2>/dev/null)"
 rm -rf "$BL"
 
+echo "── further instances: the executor, its contract, the layers ─────"
+# share/instances.py against stub kubectl/helm/dig (the cluster this runner does not have). What it proves: the
+# job contract (claim once, Refused with a reason, result + inventory shape), the per-instance layers (none of the
+# first instance's back-lease/fleet/publish/bridge keys), the bridge layer on the first instance only, and the
+# capacity refusal. What it cannot: a real helm release on a real VM — that is the live proof on a Mac.
+IX="$(mktemp -d)"; mkdir -p "$IX/stubs" "$IX/home/.memex-local"
+cat > "$IX/stubs/kubectl" <<'EOF'
+#!/usr/bin/env bash
+# answers the reads share/instances.py makes; logs every call
+[ "${1:-}" = version ] && { echo "Client Version: v1.37.1"; exit 0; }
+printf '%s\n' "$*" >> "$IX_LOG/kubectl.log"
+a=" $* "
+case "$a" in
+  *" get nodes "*) printf '{"items":[{"status":{"allocatable":{"cpu":"%s","memory":"%s"}}}]}' "${FAKE_ALLOC_CPU:-8}" "${FAKE_ALLOC_MEM:-16341600Ki}" ;;
+  *" get pods -A "*) printf '{"items":[{"status":{"phase":"Running"},"spec":{"containers":[{"resources":{"requests":{"cpu":"%s","memory":"%s"}}}]}}]}' "${FAKE_REQ_CPU:-300m}" "${FAKE_REQ_MEM:-240Mi}" ;;
+  *" -n memex get configmap memex-portal-config "*) printf '{"data":{"Authentication__Microsoft__ClientId":"00000000-client","Authentication__Microsoft__TenantId":"00000000-tenant","Hosting__Deployment":"mac-1","Hosting__BackLease__Enabled":"true","Embedding__Provider":"OpenAICompatible","Embedding__Endpoint":"http://ollama.memex.svc.cluster.local:11434/v1","Embedding__Model":"bge-m3","OpenAICompatible__DataResidency":"CH"}}' ;;
+  *" -n memex get secret memex-portal-secrets "*) printf '{"data":{"Authentication__Microsoft__ClientSecret":"%s"}}' "$(printf 'sign-in-secret-value-0123' | base64)" ;;
+  *" -n memex get deployment memex-portal-deployment "*) printf '{"spec":{"template":{"spec":{"containers":[{"name":"memex-portal","image":"ghcr.io/systemorph/memex-portal-ai:latest"}]}}}}' ;;
+  *" -n memex get jobs "*) printf '{"items":[{"metadata":{"creationTimestamp":"2026-11-08T00:00:00Z"},"spec":{"template":{"spec":{"containers":[{"image":"ghcr.io/systemorph/memex-migration:latest"}]}}}}]}' ;;
+  *" get namespace "*) [ -e "$IX_LOG/ns-exists" ] && printf '{}' || exit 1 ;;
+  *" create namespace "*) printf 'apiVersion: v1\nkind: Namespace\n' ;;
+  *" get deployment memex-portal-deployment "*) printf '{"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"memex-portal","image":"ghcr.io/systemorph/memex-portal-ai:latest"}]}}},"status":{"readyReplicas":1}}' ;;
+  *" get --raw "*) printf 'Healthy\ntiming: 3ms\n' ;;
+  *" exec "*) printf 'mac-1-proof\n' ;;
+  *" get pods "*) printf '{"items":[]}' ;;
+  *" get pv "*) printf '{"items":[]}' ;;
+  *" apply "*) cat >/dev/null ;;
+  *) : ;;
+esac
+exit 0
+EOF
+printf '#!/usr/bin/env bash\n[ "${1:-}" = version ] && { echo v4.3.1; exit 0; }\nprintf "%%s\\n" "$*" >> "$IX_LOG/helm.log"\nexit 0\n' > "$IX/stubs/helm"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$IX/stubs/dig"
+chmod +x "$IX/stubs/"*
+cat > "$IX/home/.memex-local/registry.yaml" <<'EOF'
+pluginCatalog:
+  registryUrl: "https://registry.example.com"
+  instanceId: "mac-1"
+EOF
+cat > "$IX/home/.memex-local/backlease.yaml" <<'EOF'
+config:
+  memex_portal:
+    Hosting__Deployment: "mac-1"
+    Hosting__ReportTo: "https://control.example.com"
+EOF
+IXB="$IX/home/.memex-local/instances"
+ix() { env PATH="$IX/stubs:$STUBS:$PATH" HOME="$IX/home" MEMEX_LOCAL_HOME="$IX/home/.memex-local" IX_LOG="$IX" MEMEX_LOCAL_SHARE="$HERE/../share" "$@"; }
+job() {  # job <jobId> <json>
+  mkdir -p "$IXB/jobs"; printf '%s' "$2" > "$IXB/jobs/.$1.tmp" && mv "$IXB/jobs/.$1.tmp" "$IXB/jobs/$1.json"; }
+res() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["status"]+"|"+d["message"])' "$IXB/results/$1.json" 2>/dev/null; }
+runonce() { ix "$CLI" instances agent run-once >"$IX/agent.out" 2>&1; }
+SPEC='{"hostName":"proof.mac-1.net.example.com","displayName":"Proof","owner":{"id":"owner1","email":"owner1@example.com"},"resources":{"cpu":2,"memoryGi":6,"storageGi":20},"packages":["Plugins/Hosting","Plugins/Notes"],"ai":{"chatModel":"","embeddings":true}}'
+J() { printf '{"schema":1,"jobId":"%s","operation":"%s","name":"%s","requestedBy":"owner1","requestedAt":"2026-11-08T12:00:00Z"%s}' "$1" "$2" "$3" "${4:-}"; }
+
+# Refusals — each a Refused result naming why, never a silent drop.
+job local-instance-bad-name-create-a "$(J local-instance-bad-name-create-a create Bad_Name ",\"spec\":$SPEC")"
+job local-instance-memex-create-a "$(J local-instance-memex-create-a create memex ",\"spec\":$SPEC")"
+job local-instance-kube-x-create-a "$(J local-instance-kube-x-create-a create kube-x ",\"spec\":$SPEC")"
+job local-instance-pkg-create-a "$(J local-instance-pkg-create-a create proof ",\"spec\":${SPEC/Plugins\/Notes/not a package}")"
+job local-instance-proof-remove-a "$(J local-instance-proof-remove-a remove proof)"
+job local-instance-proof-wipe-a "$(J local-instance-proof-wipe-a wipe proof)"
+job local-instance-json-a '{"schema":1, "jobId": '
+job 'Bad Name' "$(J x stop proof)"
+runonce
+for c in "local-instance-bad-name-create-a|is not ^[a-z]" "local-instance-memex-create-a|reserved" "local-instance-kube-x-create-a|reserved" \
+         "local-instance-pkg-create-a|is not <Source>/<Package>" "local-instance-proof-remove-a|confirm equal to the name" \
+         "local-instance-proof-wipe-a|is not one of create" "local-instance-json-a|not valid JSON"; do
+  id="${c%%|*}"; want="${c#*|}"; r="$(res "$id")"
+  case "$r" in "Refused|"*"$want"*) ok "a job is Refused with its reason: $id ($want)" ;; *) bad "refusal $id" "got '$r' — $(cat "$IX/agent.out")" ;; esac
+done
+# The bridge is writable by the first instance's pod: a planted symlink is never followed.
+printf 'secret-on-the-mac' > "$IX/outside.txt"; ln -s "$IX/outside.txt" "$IXB/jobs/local-instance-link-stop-a.json"; runonce
+case "$(res local-instance-link-stop-a)" in "Refused|"*"symbolic link is never followed"*) ok "a job that is a symbolic link is Refused, never read" ;; *) bad "symlink job" "$(res local-instance-link-stop-a)" ;; esac
+grep -rq 'secret-on-the-mac' "$IXB" && bad "a symlinked job's target leaked into the bridge" "" || ok "the symlink's target never reaches a result"
+mv "$IXB/results" "$IX/results-real"; ln -s "$IX" "$IXB/results"; job local-instance-x-stop-a "$(J local-instance-x-stop-a stop proof)"
+ix "$CLI" instances agent run-once >"$IX/agent.out" 2>&1
+grep -q 'symbolic link' "$IX/agent.out" && [ ! -e "$IX/local-instance-x-stop-a.json" ] && ok "a results/ replaced by a symlink stops the executor (nothing written through it)" || bad "results symlink" "$(cat "$IX/agent.out")"
+rm "$IXB/results" "$IXB/jobs/local-instance-x-stop-a.json"; mv "$IX/results-real" "$IXB/results"
+[ -f "$IXB/results/invalid-bad-name.json" ] && ok "a job file whose name is not a job id is answered Refused too (invalid-<name>)" || bad "invalid file name" "$(ls "$IXB/results")"
+[ -z "$(find "$IXB/jobs" "$IXB/running" -name '*.json' 2>/dev/null)" ] && ok "every refused job left jobs/ and running/" || bad "leftovers" "$(ls -R "$IXB")"
+
+# A create that succeeds against the stubs — result shape, claim-once, the layers.
+rm -f "$IXB"/results/*
+job local-instance-proof-create-a "$(J local-instance-proof-create-a create proof ",\"spec\":$SPEC")"
+runonce
+R="$IXB/results/local-instance-proof-create-a.json"
+python3 - "$R" <<'PY2' && ok "a create ends Succeeded with the contract's result shape (steps, log, url, actionsForOwner, finishedAt)" || bad "result shape" "$(cat "$R" 2>/dev/null; cat "$IX/agent.out")"
+import json, sys
+d = json.load(open(sys.argv[1]))
+want = {"schema", "jobId", "operation", "name", "status", "message", "startedAt", "updatedAt", "finishedAt", "steps", "log", "url", "actionsForOwner"}
+assert want <= set(d), set(d) ^ want
+assert d["schema"] == 1 and d["status"] == "Succeeded" and d["finishedAt"], d
+assert d["url"] == "https://proof.mac-1.net.example.com", d["url"]
+assert all(set(s) == {"name", "status", "detail"} and s["status"] in ("Done", "Running", "Failed", "Skipped", "Pending") for s in d["steps"]), d["steps"]
+assert any("signin-microsoft" in a and "00000000-client" in a for a in d["actionsForOwner"]), d["actionsForOwner"]
+assert any("dns.extraRecords" in a for a in d["actionsForOwner"]), d["actionsForOwner"]
+assert len(d["log"]) <= 200
+PY2
+grep -rq 'sign-in-secret-value-0123' "$IXB" && bad "a secret reached the bridge" "$(grep -rl 'sign-in-secret-value-0123' "$IXB")" || ok "no secret reaches the bridge (results, inventory)"
+[ ! -e "$IXB/running/local-instance-proof-create-a.json" ] && ok "a terminal job leaves running/" || bad "running left" ""
+before="$(cat "$R")"; job local-instance-proof-create-a "$(J local-instance-proof-create-a create proof ",\"spec\":$SPEC")"; runonce
+[ "$(cat "$R")" = "$before" ] && [ ! -e "$IXB/jobs/local-instance-proof-create-a.json" ] && [ "$(grep -c '^upgrade' "$IX/helm.log")" = 1 ] \
+  && ok "a job whose id already has a terminal result is not re-run (one helm upgrade, result untouched)" || bad "re-run" "$(grep -c '^upgrade' "$IX/helm.log") helm runs"
+ST="$IX/home/.memex-local/instance-state/proof"
+python3 - "$ST/values.json" "$ST/secret-values.json" <<'PY2' && ok "the instance's own layers: owner keys, registry id <machine>-<name>, its host + TLS, Hosting first then the spec's packages, resources, a local data volume — and none of the first instance's back-lease/fleet/bridge keys" || bad "instance layers" "$(cat "$ST/values.json")"
+import json, sys
+v = json.load(open(sys.argv[1])); s = json.load(open(sys.argv[2]))
+c = v["config"]["memex_portal"]
+assert c["Auth__GlobalAdmins__0"] == "owner1" and c["Instance__Owner__Id"] == "owner1" and c["Instance__Owner__Email"] == "owner1@example.com"
+assert v["pluginCatalog"]["instanceId"] == "mac-1-proof" and v["pluginCatalog"]["homeUrl"] == "https://proof.mac-1.net.example.com"
+assert v["pluginCatalog"]["registryUrl"] == "https://registry.example.com"
+assert v["ingress"]["host"] == "proof.mac-1.net.example.com" and v["ingress"]["tlsSecret"] == "memex-proof-tls"
+assert [c["PluginCatalog__InstallByDefault__%d" % i] for i in range(2)] == ["Plugins/Hosting", "Plugins/Notes"]
+assert c["PluginCatalog__InstallPreInstalledPackages"] == "true"
+assert v["resources"]["portal"]["requests"] == {"cpu": "2", "memory": "6Gi"}
+assert v["persistDataVolume"] is False and v["persistence"]["data"]["create"] is True and v["persistence"]["data"]["size"] == "20Gi"
+assert c["Authentication__Microsoft__ClientId"] == "00000000-client" and c["Authentication__EnableDevLogin"] == "false"
+assert c["Embedding__Endpoint"] == "http://ollama.memex-proof.svc.cluster.local:11434/v1", c["Embedding__Endpoint"]
+assert c["OpenAICompatible__Endpoint"].startswith("http://ollama.memex-proof.svc.cluster.local"), c["OpenAICompatible__Endpoint"]
+text = json.dumps(v)
+for banned in ("Hosting__BackLease", "Hosting__Deployment", "Hosting__ReportTo", "Hosting__Fleet", "Hosting__LocalInstances", "host-instances", "backlease", "extraVolumes", "Bootstrap"):
+    assert banned not in text, banned
+p = s["secrets"]["memex_portal"]
+assert p["Ai__KeyProtection__MasterKey"] and p["memex_postgres_password"] and p["Authentication__Microsoft__ClientSecret"]
+PY2
+[ "$(stat -c %a "$ST/secrets.json" 2>/dev/null || stat -f %Lp "$ST/secrets.json")" = 600 ] && [ "$(stat -c %a "$ST/secret-values.json" 2>/dev/null || stat -f %Lp "$ST/secret-values.json")" = 600 ] \
+  && ok "the instance's secrets are 0600 and live outside the mounted bridge" || bad "secret modes" "$(ls -l "$ST")"
+H="$(grep '^upgrade' "$IX/helm.log" | head -1)"
+case "$H" in
+  *backlease.yaml*|*fleet.yaml*|*publish.yaml*|*internal.yaml*|*instances-host.yaml*|*values.local.yaml\ *|*self-registry*) bad "a first-instance layer reached the instance's helm call" "$H" ;;
+  *"--install memex-proof "*"-n memex-proof"*"values.local.defaults.yaml"*"registry-mode.yaml"*"fleet-host.yaml"*"instance-state/proof/values.json"*"secret-values.json"*) ok "helm: release + namespace memex-proof, layers defaults → model → registry mode → fleet host → the instance's own (no back-lease, fleet, publish, internal, bridge or overlay)" ;;
+  *) bad "helm layering" "$H" ;;
+esac
+python3 - "$IXB/inventory.json" <<'PY2' && ok "inventory.json: the contract's shape, the instance listed with its health and registry id, the first instance not listed" || bad "inventory" "$(cat "$IXB/inventory.json" 2>/dev/null)"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert {"schema", "sampledAt", "machine", "networkName", "agentVersion", "capacity", "instances"} <= set(d), set(d)
+assert d["machine"] == "mac-1" and set(d["capacity"]) == {"vmCpu", "vmMemoryGi", "requestedCpu", "requestedMemoryGi"}
+assert [i["name"] for i in d["instances"]] == ["proof"], d["instances"]
+i = d["instances"][0]
+want = {"name", "namespace", "release", "hostName", "url", "state", "ready", "health", "healthDetail", "nameResolves", "certificateExpires", "image", "owner", "resources", "packages", "createdAt", "registeredAs"}
+assert want <= set(i), set(i) ^ want
+assert i["state"] == "Running" and i["health"] == "Healthy" and i["nameResolves"] is False and i["registeredAs"] == "mac-1-proof", i
+PY2
+touch "$IX/ns-exists"
+job local-instance-proof2-create-a "$(J local-instance-proof2-create-a create proof ",\"spec\":$SPEC")"; runonce
+case "$(res local-instance-proof2-create-a)" in "Refused|"*"already exists"*) ok "creating a name that exists is Refused" ;; *) bad "duplicate create" "$(res local-instance-proof2-create-a)" ;; esac
+job local-instance-proof-remove-b "$(J local-instance-proof-remove-b remove proof ',"confirm":"proof"')"; runonce
+case "$(res local-instance-proof-remove-b)" in "Succeeded|"*) ;; *) bad "remove" "$(res local-instance-proof-remove-b)" ;; esac
+grep -q 'registry claim' "$IXB/results/local-instance-proof-remove-b.json" && grep -q 'delete namespace memex-proof' "$IX/kubectl.log" && [ ! -d "$ST" ] \
+  && ok "remove deletes the namespace and the instance's state, and says the registry claim is not released" || bad "remove effects" "$(cat "$IXB/results/local-instance-proof-remove-b.json")"
+rm -f "$IX/ns-exists"
+# Capacity: a VM with 1.5 CPU left refuses a 2-CPU instance, naming the numbers.
+job local-instance-big-create-a "$(J local-instance-big-create-a create big ",\"spec\":${SPEC/proof.mac/big.mac}")"
+ix FAKE_ALLOC_CPU=2 FAKE_REQ_CPU=500m "$CLI" instances agent run-once >/dev/null 2>&1
+case "$(res local-instance-big-create-a)" in "Refused|not enough room"*"free 1.50 CPU"*"needs 2 CPU"*) ok "capacity: a create the VM has no room for is Refused, naming the numbers" ;; *) bad "capacity" "$(res local-instance-big-create-a)" ;; esac
+[ ! -d "$IX/home/.memex-local/instance-state/big" ] && ok "a refused create leaves no state behind" || bad "refused create left state" ""
+# The CLI refuses the same things directly.
+OUT="$(ix "$CLI" instances remove proof 2>&1)"; RC=$?
+[ "$RC" = 3 ] && ok "the CLI refuses a remove with no --confirm (exit 3)" || bad "cli remove" "rc=$RC $OUT"
+# The bridge layer: the first instance only.
+ix MEMEX_LOCAL_LIB=1 bash -c '. "$0"; write_instances_layer' "$CLI" 2>/dev/null
+IF="$IX/home/.memex-local/instances-host.yaml"
+grep -q 'Hosting__LocalInstances__Root: "/host-instances"' "$IF" && grep -q 'Hosting__LocalInstances__Machine: "mac-1"' "$IF" \
+  && grep -q 'name: host-instances' "$IF" && grep -q "path: \"$IXB\"" "$IF" && grep -q 'mountPath: "/host-instances"' "$IF" \
+  && grep -q 'name: backlease-readings' "$IF" && grep -q 'mountPath: /host-readings, readOnly: true' "$IF" \
+  && ok "the first instance's bridge layer: the RW mount at /host-instances, the three keys, and the back-lease readings volume restated (a later -f replaces extraVolumes)" || bad "bridge layer" "$(cat "$IF")"
+HD="$(awk '/^helm_deploy\(\) \{/,/^}$/' "$CLI")"
+grep -q 'mode_args+=(-f "$INSTANCES_FILE")' <<<"$HD" && [ "$(grep -n 'mode_args+=(-f "$BACKLEASE_FILE")' <<<"$HD" | cut -d: -f1)" -lt "$(grep -n 'mode_args+=(-f "$INSTANCES_FILE")' <<<"$HD" | cut -d: -f1)" ] \
+  && ok "helm_deploy layers the bridge on the first instance, after back-lease" || bad "bridge in helm_deploy" ""
+# share/boot-progress.py — the terminal's reading of the portal's /_boot/progress (what changed between
+# two readings, the heartbeat with the ETA, errors, the ready line); pure, so its self-test needs no cluster.
+OUT="$(python3 -I "$HERE/../share/boot-progress.py" --self-test 2>&1)" && ok "boot-progress.py prints phases, landed modules, errors and the ETA heartbeat from the portal's own report" || bad "boot-progress.py self-test" "$OUT"
+grep -q 'instances-host' "$HERE/../share/instances.py" && bad "instances.py names the bridge layer" "" || ok "a created instance never gets the bridge layer (instances.py does not know it)"
+grep -c 'ensure_instances_agent  ' "$CLI" | grep -qx 2 && ok "up and update install the executor agent (registry mode)" || bad "agent install" "$(grep -n ensure_instances_agent "$CLI")"
+rm -rf "$IX"
+
+echo "── back-lease sampler: host.ownerCpuPercent is the owner's CPU over the interval (Hosting/BackLease §14.5) ──"
+OC="$(mktemp -d)"; mkdir -p "$OC/stubs" "$OC/dir" "$OC/home/.colima/_lima/colima-build" "$OC/home/.colima/_lima/colima"
+: > "$OC/home/.colima/_lima/colima-build/disk"; : > "$OC/home/.colima/_lima/colima/disk"
+# the build VM is pid 20 (holds the build profile's disk), the portal VM pid 21 (the default profile's)
+printf '#!/bin/bash\n[ "$1" = -t ] && case "$2" in */colima-build/disk) echo 20 ;; */_lima/colima/disk) echo 21 ;; esac\n' > "$OC/stubs/lsof"; chmod +x "$OC/stubs/lsof"
+printf '#!/bin/bash\ncat "%s/ps.now"\n' "$OC" > "$OC/stubs/fakeps"; chmod +x "$OC/stubs/fakeps"
+SAMPLER="$HERE/../share/backlease-sampler.sh"
+oc() { env PATH="$OC/stubs:$PATH" HOME="$OC/home" COLIMA_HOME= MEMEX_LOCAL_HOME="$OC/none" MEMEX_LOCAL_SHARE= MEMEX_BUILD_PRIO_SCRIPT="${OC_GOV-$GOV}" \
+  MEMEX_BACKLEASE_DIR="$OC/dir" MEMEX_BACKLEASE_INTERVAL=30 MEMEX_SAMPLER_PS="$OC/stubs/fakeps" MEMEX_SAMPLER_NOW="$1" MEMEX_BACKLEASE_SAMPLER_LIB=1 \
+  bash -c '. "$0"; owner_cpu' "$SAMPLER"; }
+printf '  0 1:00.00 kernel_task\n  10 0:10.00 /Applications/Safari\n  20 1:00:00.00 VZ build\n  21 30:00.00 VZ portal\n  30 0:05.00 /opt/homebrew/bin/ollama serve\n  31 0:05.00 /opt/homebrew/Cellar/ollama/0.40.14/libexec/lib/ollama/llama-server --model x\n' > "$OC/ps.now"
+[ -z "$(oc 1000)" ] && ok "the first sample reports NO ownerCpuPercent (absent, never a guess)" || bad "first sample" "$(oc 1000)"
+# 30 s later: Safari +30 s CPU (100 %), a new owner process +15 s (50 %); the VMs, Ollama and kernel_task all busy
+printf '  0 9:00.00 kernel_task\n  10 0:40.00 /Applications/Safari\n  11 0:15.00 /usr/bin/make\n  20 2:00:00.00 VZ build\n  21 45:00.00 VZ portal\n  30 1:05.00 /opt/homebrew/bin/ollama serve\n  31 9:05.00 /opt/homebrew/Cellar/ollama/0.40.14/libexec/lib/ollama/llama-server --model x\n' > "$OC/ps.now"
+[ "$(oc 1030)" = 150 ] && ok "ownerCpuPercent = the owner's CPU-time delta over the interval, excluding Ollama (serve + llama-server), both VMs and kernel_task" || bad "ownerCpuPercent value" "$(oc 1030)"
+[ -z "$(oc 1200)" ] && ok "a gap longer than three intervals reports nothing (a stale window is not a reading)" || bad "stale gap" "$(oc 1200)"
+[ -z "$(OC_GOV="$OC/missing.sh" oc 1230)" ] && ok "no governor library to measure with → the field is absent" || bad "no governor" ""
+# the splice: only into a JSON object — a degraded host reading stays valid JSON
+osp() { env HOSTJSON="$1" MEMEX_BACKLEASE_DIR="$OC/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "%s" "$HOSTJSON"; }; owner_cpu() { printf 150; }; host_cpu() { :; }; net_rate() { :; }
+  sample_models() { printf "[]"; }; sample_vm() { printf null; }; colima() { return 1; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }
+  OUT="$1"; write_sample; cat "$OUT"' "$SAMPLER" "$OC/out.json"; }
+osp '{"cores":2}' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"]=={"cores":2,"ownerCpuPercent":150}' 2>/dev/null \
+  && ok "ownerCpuPercent is spliced into the host object" || bad "splice into object" "$(osp '{"cores":2}')"
+osp 'null' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"] is None' 2>/dev/null \
+  && ok "a degraded (non-object) host reading stays valid JSON — nothing is spliced into it" || bad "splice into null" "$(osp null)"
+# a baseline that cannot be rotated is no reading, and the stamp never runs ahead of the baseline it measures from
+rm -f "$OC/dir/owner-cpu."*; printf '  10 0:50.00 /Applications/Safari\n' > "$OC/ps.now"
+oc 2000 >/dev/null; chmod 555 "$OC/dir"; r1="$(oc 2030)"; chmod 755 "$OC/dir"
+printf '  10 1:50.00 /Applications/Safari\n' > "$OC/ps.now"
+r2="$(oc 2060)"
+[ -z "$r1" ] && [ "$r2" = 100 ] && ok "a failed baseline rotation reports nothing, and the next reading divides by the baseline's own age (100 %, never doubled)" || bad "rotation failure" "r1=$r1 r2=$r2"
+OUT="$(MEMEX_BACKLEASE_SAMPLER_LIB=1 MEMEX_BACKLEASE_DIR="$OC/dir" bash "$SAMPLER" 2>&1)"; RC=$?
+[ "$RC" = 2 ] && case "$OUT" in *"for sourcing only"*) true ;; *) false ;; esac \
+  && ok "library mode fails CLOSED: executed with the variable set, the sampler stops loudly instead of sampling" || bad "lib guard fails open" "rc=$RC $OUT"
+rm -rf "$OC"
+
+echo "── back-lease sampler: host.cpuPercent and the network rate (Hosting/FleetMetricHistory) ──"
+NR="$(mktemp -d)"; mkdir -p "$NR/dir"
+SAMPLER="$HERE/../share/backlease-sampler.sh"
+printf 'Processes: 1 total\nCPU usage: 10.00%% user, 5.00%% sys, 85.00%% idle \nProcesses: 1 total\nCPU usage: 30.50%% user, 7.25%% sys, 62.25%% idle \n' > "$NR/top.out"
+hc() { env MEMEX_BACKLEASE_DIR="$NR/dir" MEMEX_SAMPLER_TOP="cat $1" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; host_cpu' "$SAMPLER"; }
+[ "$(hc "$NR/top.out")" = 37.8 ] && ok "cpuPercent = 100 − idle of the SECOND top sample (a delta, never the boot average)" || bad "cpuPercent" "$(hc "$NR/top.out")"
+printf 'garbage\n' > "$NR/top.bad"
+[ -z "$(hc "$NR/top.bad")" ] && ok "an unparseable top reports no cpuPercent (absent, never 0)" || bad "cpu garbage" "$(hc "$NR/top.bad")"
+ns() { # $1 = now, $2 = en0 Ibytes, $3 = en0 Obytes
+  printf 'Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll\nlo0   16384 <Link#1>                       9     0      99999        9     0      99999     0\nen0   1500  <Link#11>   aa:bb:cc:dd:ee:ff  100   0  %s  100   0  %s  0\nen0   1500  192.168.1     192.168.1.10   100   0  555  100   0  555  -\nen1   1500  <Link#12>   aa:bb:cc:dd:ee:00  1     0  1000  1   0  2000  0\nutun0 1380  <Link#20>                      5     0      77777        5     0      77777     0\n' "$2" "$3" > "$NR/netstat.out"
+  env MEMEX_BACKLEASE_DIR="$NR/dir" MEMEX_BACKLEASE_INTERVAL=30 MEMEX_SAMPLER_NOW="$1" MEMEX_SAMPLER_NETSTAT="cat $NR/netstat.out" MEMEX_BACKLEASE_SAMPLER_LIB=1 \
+    bash -c '. "$0"; net_rate' "$SAMPLER"; }
+[ -z "$(ns 1000 1000000 500000 2>&1)" ] && ok "the first network sample reports nothing (no window yet), and says nothing on stderr" || bad "net first" "$(ns 1000 1000000 500000 2>&1)"
+[ "$(ns 1030 4000000 1100000)" = "100000 20000" ] && ok "netIn/Out = the en* link-level byte delta over the interval (loopback, utun and address rows excluded)" || bad "net rate" "$(ns 1030 4000000 1100000)"
+[ -z "$(ns 1200 5000000 1200000)" ] && ok "a gap longer than three intervals reports nothing" || bad "net gap" "$(ns 1200 5000000 1200000)"
+[ -z "$(ns 1230 100 100)" ] && ok "a counter that went backwards (reboot, reset) reports nothing, never a negative rate" || bad "net reset" "$(ns 1230 100 100)"
+[ "$(ns 1260 3100 2100)" = "100 67" ] && ok "after a reset the next window measures again" || bad "net after reset" "$(ns 1260 3100 2100)"
+ws() { env HOSTJSON="$1" MEMEX_BACKLEASE_DIR="$NR/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "%s" "$HOSTJSON"; }; owner_cpu() { :; }; host_cpu() { printf 12.5; }; net_rate() { printf "100 200"; }
+  sample_models() { printf "[]"; }; sample_vm() { printf null; }; colima() { return 1; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }
+  OUT="$1"; write_sample; cat "$OUT"' "$SAMPLER" "$NR/out.json"; }
+ws '{"cores":2}' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"]=={"cores":2,"cpuPercent":12.5,"netInBytesPerSec":100,"netOutBytesPerSec":200}' 2>/dev/null \
+  && ok "cpuPercent and the network rate are spliced into the host object" || bad "net/cpu splice" "$(ws '{"cores":2}')"
+ws 'null' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"] is None' 2>/dev/null \
+  && ok "a degraded host reading stays valid JSON with the new fields too" || bad "net/cpu splice into null" "$(ws null)"
+wsj() { env HOSTJSON='{"cores":2}' NET="$1" MEMEX_BACKLEASE_DIR="$NR/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "%s" "$HOSTJSON"; }; owner_cpu() { :; }; host_cpu() { :; }; net_rate() { printf "%s" "$NET"; }
+  sample_models() { printf "[]"; }; sample_vm() { printf null; }; colima() { return 1; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }
+  OUT="$1"; write_sample; cat "$OUT"' "$SAMPLER" "$NR/out.json"; }
+bad_net=0; for v in '1 2junk' 'x 2' '1 ' ' 2' '12'; do
+  wsj "$v" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["host"]=={"cores":2}' 2>/dev/null || bad_net=1
+done
+[ "$bad_net" = 0 ] && ok "a malformed network reading (non-numeric, half-empty, one token) splices nothing and the JSON stays valid" || bad "net guard" "$(wsj '1 2junk')"
+rm -rf "$NR"
+
+echo "── back-lease sampler: versions — memex-local's keg and the build host's set (Hosting MachineReadings.Versions) ──"
+VR="$(mktemp -d)"; mkdir -p "$VR/stubs" "$VR/dir"
+SAMPLER="$HERE/../share/backlease-sampler.sh"
+# kubectl stub: answers for the build profile's context (the value in $VR/bh) and for the bare `colima` context
+# of MEMEX_BUILD_PROFILE=default (the value in $VR/bh.default); any other context fails
+printf '#!/bin/bash\ncase " $* " in *" --context colima-build "*) cat "%s/bh" 2>/dev/null ;; *" --context colima "*) cat "%s/bh.default" 2>/dev/null ;; *) exit 1 ;; esac\n' "$VR" "$VR" > "$VR/stubs/kubectl"; chmod +x "$VR/stubs/kubectl"
+# sv SHARE [PROFILE] — PROFILE is MEMEX_BUILD_PROFILE, empty (→ build) unless given, never the ambient value
+sv() { env PATH="$VR/stubs:$PATH" MEMEX_LOCAL_SHARE="$1" MEMEX_BUILD_PROFILE="${2:-}" MEMEX_BACKLEASE_DIR="$VR/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_versions' "$SAMPLER"; }
+printf '3.1.12855' > "$VR/bh"
+[ "$(sv /opt/homebrew/Cellar/memex-local/0.3.440/libexec/share)" = '{"memex-local":"0.3.440","build-host":"3.1.12855"}' ] \
+  && ok "versions carry the keg's memex-local version and the build host's platform-version annotation" || bad "versions" "$(sv /opt/homebrew/Cellar/memex-local/0.3.440/libexec/share)"
+[ "$(sv /some/checkout/deploy/homebrew/share)" = '{"build-host":"3.1.12855"}' ] \
+  && ok "a share outside a Homebrew keg reports no memex-local version (absent, never the 0.3.0 series constant)" || bad "no keg" "$(sv /some/checkout/deploy/homebrew/share)"
+: > "$VR/bh"
+[ "$(sv '')" = '{}' ] && ok "no keg and no build host → an empty versions object, still valid JSON" || bad "empty versions" "$(sv '')"
+printf '3.1.1"bad' > "$VR/bh"
+[ "$(sv '')" = '{}' ] && ok "a value that is not version-shaped is dropped, never spliced into the JSON" || bad "version guard" "$(sv '')"
+# a multi-line value whose FIRST line is version-shaped: a line-by-line match would pass it and splice the rest
+printf '3.1.12855\n","injected":"x' > "$VR/bh"
+[ "$(sv '')" = '{}' ] && ok "a multi-line value is dropped whole, even when its first line is version-shaped" || bad "multi-line version guard" "$(sv '')"
+# MEMEX_BUILD_PROFILE=default reads the bare `colima` context, the same rule as memex-local's build_ctx
+: > "$VR/bh"; printf '3.1.12900' > "$VR/bh.default"
+[ "$(sv '' default)" = '{"build-host":"3.1.12900"}' ] && ok "MEMEX_BUILD_PROFILE=default reads the build host from the bare colima context" || bad "default profile" "$(sv '' default)"
+rm -f "$VR/bh.default"
+vw() { env PATH="$VR/stubs:$PATH" MEMEX_BUILD_PROFILE= MEMEX_LOCAL_SHARE=/opt/homebrew/Cellar/memex-local/0.3.440/libexec/share MEMEX_BACKLEASE_DIR="$VR/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "{\"cores\":2}"; }; owner_cpu() { :; }; host_cpu() { :; }; net_rate() { :; }
+  sample_models() { printf "[]"; }; sample_vm() { printf null; }; colima() { return 1; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }
+  OUT="$1"; write_sample; cat "$OUT"' "$SAMPLER" "$VR/out.json"; }
+printf '3.1.12855' > "$VR/bh"
+vw | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["versions"]=={"memex-local":"0.3.440","build-host":"3.1.12855"}' 2>/dev/null \
+  && ok "the written readings.json carries the versions object" || bad "versions in readings.json" "$(vw)"
+rm -rf "$VR"
+
+echo "── idle-only models: CI first, a large model only while the build VM is stopped for it (Hosting/BackLease §15.9) ──"
+IO="$(mktemp -d)"; mkdir -p "$IO/home" "$IO/stubs"
+printf '#!/bin/bash\necho "launchctl $*" >> "%s/launchctl.log"\nexit 0\n' "$IO" > "$IO/stubs/launchctl"; chmod +x "$IO/stubs/launchctl"
+io() { env PATH="$IO/stubs:$STUBS:$PATH" HOME="$IO/home" MEMEX_LOCAL_HOME="$IO/home/.memex-local" COLIMA_HOME="$IO/home/.colima" "$@"; }
+IOF="$IO/home/.memex-local/backlease.yaml"; ioh() { grep -qF "$1" "$IOF" 2>/dev/null; }
+io "$CLI" registry https://memex.example.test --id ci-io >/dev/null 2>&1
+io "$CLI" backlease enroll --control https://control.example.test --deployment studio-9 --accept-tokens='*.meshweaver.cloud' --token-models qwen3.8:27b-mlx --residency CH </dev/null >/dev/null 2>&1
+OUT="$(io "$CLI" backlease accept tokens --idle-only-models gpt-oss:120b </dev/null 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ioh 'Hosting__BackLease__Accept__Tokens__IdleOnlyModels__0: "gpt-oss:120b"' && ioh 'Hosting__BackLease__Accept__Tokens__Models__0: "qwen3.8:27b-mlx"' \
+  && ioh 'Hosting__BackLease__Accept__Tokens__Models__1: "gpt-oss:120b"' \
+  && ok "accept tokens --idle-only-models declares the model idle-only AND served (the claim names it), the other models kept" || bad "idle-only declaration" "rc=$RC $OUT $(grep Tokens "$IOF")"
+case "$OUT" in *"idle-only models: gpt-oss:120b — served only while the build VM is stopped"*) ok "the opt-in summary names the idle-only models and the rule" ;; *) bad "idle-only summary" "$OUT" ;; esac
+case "$OUT" in *"no build VM (Colima profile build)"*) [ ! -e "$IO/home/Library/LaunchAgents/com.memex.local.buildhost-idle.plist" ] \
+  && ok "with no build profile nothing yields: no idle governor is installed, and that is said" || bad "no profile, no agent" "$OUT" ;; *) bad "no build profile said" "$OUT" ;; esac
+mkdir -p "$IO/home/.colima/build"
+OUT="$(io "$CLI" backlease accept tokens --idle-only-models gpt-oss:120b </dev/null 2>&1)"
+PL="$IO/home/Library/LaunchAgents/com.memex.local.buildhost-idle.plist"
+grep -q '<string>buildhost</string>' "$PL" 2>/dev/null && grep -q '<string>idle</string>' "$PL" && grep -q '<string>run</string>' "$PL" \
+  && grep -q "<string>$IO/home/.memex-local</string>" "$PL" && grep -q 'launchctl bootstrap gui/[0-9]* .*com.memex.local.buildhost-idle.plist' "$IO/launchctl.log" \
+  && ok "with a build profile the launchd agent com.memex.local.buildhost-idle is written and loaded (memex-local buildhost idle run)" || bad "idle agent install" "$OUT / $(cat "$PL" 2>/dev/null)"
+command -v plutil >/dev/null 2>&1 && { plutil -lint "$PL" >/dev/null 2>&1 && ok "the idle agent's plist is valid" || bad "idle plist lint" "$(plutil -lint "$PL" 2>&1)"; }
+io "$CLI" backlease accept tokens --models qwen3.8:27b-mlx </dev/null >/dev/null 2>&1
+ioh 'Tokens__Models__1: "gpt-oss:120b"' && ioh 'IdleOnlyModels__0: "gpt-oss:120b"' && ok "narrowing --models keeps a declared idle-only model served" || bad "models keep idle-only" "$(grep Tokens "$IOF")"
+OUT="$(io "$CLI" backlease status </dev/null 2>&1)"
+case "$OUT" in *"idle-only models: gpt-oss:120b"*"no build-host state yet"*) ok "backlease status shows the idle-only models and the build host's state" ;; *) bad "status idle line" "$OUT" ;; esac
+OUT="$(io "$CLI" backlease accept tokens --idle-only-models 'bad name!' </dev/null 2>&1)" && bad "a bad idle-only model accepted" "$OUT" || ok "an idle-only model that is not a model name is refused"
+# withdrawn while the VM is stopped for it: the agent stays to give the VM back first; withdrawn while running: removed
+mkdir -p "$IO/home/.memex-local/backlease"; printf '{"state":"stopped","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$IO/home/.memex-local/backlease/buildhost.json"
+OUT="$(io "$CLI" backlease accept tokens --idle-only-models none </dev/null 2>&1)"
+! ioh 'IdleOnlyModels__0' && [ -e "$PL" ] && grep -q "gives it back to CI first" <<<"$OUT" \
+  && ok "--idle-only-models none while the VM is stopped for a model: declaration gone, governor kept to drain and restart the VM" || bad "withdraw while stopped" "$OUT"
+OUT="$(io "$CLI" buildhost idle off </dev/null 2>&1)" && bad "idle off while stopped accepted" "$OUT" || ok "buildhost idle off refuses while the VM is stopped for an idle-only model"
+printf '{"state":"running","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$IO/home/.memex-local/backlease/buildhost.json"
+io "$CLI" backlease accept tokens --idle-only-models none </dev/null >/dev/null 2>&1
+[ ! -e "$PL" ] && [ ! -e "$IO/home/.memex-local/backlease/buildhost.json" ] && ok "--idle-only-models none with the VM back: governor removed, no state file (the worker serves none)" || bad "withdraw while running" "$(ls "$IO/home/.memex-local/backlease")"
+io "$CLI" backlease enroll --control https://control.example.test --deployment studio-9 --accept-tokens='*.meshweaver.cloud' --token-models qwen3.8:27b-mlx \
+  --token-idle-only-models gpt-oss:120b --residency CH </dev/null >/dev/null 2>&1
+ioh 'IdleOnlyModels__0: "gpt-oss:120b"' && ioh 'Tokens__Models__1: "gpt-oss:120b"' && [ -e "$PL" ] \
+  && ok "backlease enroll --token-idle-only-models declares it and loads the governor (the same path as accept)" || bad "enroll idle flag" "$(grep Tokens "$IOF")"
+printf '{"state":"stopped","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$IO/home/.memex-local/backlease/buildhost.json"
+OUT="$(io "$CLI" backlease off </dev/null 2>&1)"
+[ ! -e "$IOF" ] && [ -e "$PL" ] && [ -e "$IO/home/.memex-local/backlease/buildhost.json" ] && grep -q "gives it back to CI first" <<<"$OUT" \
+  && ok "backlease off while the VM is stopped for a model: the layer goes, the governor stays to restart the VM (it drains with nothing declared)" || bad "off while stopped" "$OUT"
+
+# ── the governor itself: share/buildhost-idle.py against a stub control + Ollama, a stub colima and kubectl ──
+IDLE="$HERE/../share/buildhost-idle.py"
+python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read(), feature_version=(3, 9))" "$IDLE" && ok "buildhost-idle.py parses at the Python 3.9 grammar (macOS's python3)" || bad "idle py grammar" ""
+G="$IO/gov"; mkdir -p "$G/ml/backlease" "$G/colima/build" "$G/bin"
+KEY="test-key-not-a-secret-0123"
+printf 'secrets:\n  memex_portal:\n    Hosting__ModuleReportSecret: "%s"\n' "$KEY" > "$G/ml/fleet.yaml"
+cat > "$G/server.py" <<'PY'
+import hashlib, hmac, json, os, sys, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+d = sys.argv[1]; key = sys.argv[2]
+def answer(name):
+    seq = json.load(open(os.path.join(d, "scenario.json"))).get(name, [[404, ""]])
+    n = os.path.join(d, "n." + name); i = int(open(n).read()) if os.path.exists(n) else 0
+    open(n, "w").write(str(i + 1)); return seq[min(i, len(seq) - 1)]
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def reply(self, st, body):
+        self.send_response(st); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body.encode())
+    def do_GET(self):
+        if self.path == "/api/builds/queue?channel=mac": st, b = answer("queue"); self.reply(st, b if isinstance(b, str) else json.dumps(b))
+        elif self.path == "/api/ps": st, b = answer("ps"); self.reply(st, b if isinstance(b, str) else json.dumps(b))
+        else: self.reply(404, "")
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
+        rec = {"path": self.path, "body": body, "h": {k.lower(): v for k, v in self.headers.items() if k.lower().startswith("x-")}}
+        if self.path == "/api/fleet-models/demand":
+            text = "%s\n%s\nPOST /demand\n\n\n%s" % (self.headers.get("X-MeshWeaver-Deployment"), self.headers.get("X-MeshWeaver-Timestamp"), body)
+            rec["sigOk"] = hmac.compare_digest(self.headers.get("X-Hub-Signature-256", ""), "sha256=" + hmac.new(key.encode(), text.encode(), hashlib.sha256).hexdigest())
+            st, b = answer("demand")
+        elif self.path == "/api/generate": st, b = 200, "{}"
+        else: st, b = 404, ""
+        open(os.path.join(d, "requests.jsonl"), "a").write(json.dumps(rec) + "\n")
+        self.reply(st, b if isinstance(b, str) else json.dumps(b))
+srv = HTTPServer(("127.0.0.1", 0), H)
+open(os.path.join(d, "port"), "w").write(str(srv.server_address[1]))
+srv.serve_forever()
+PY
+python3 "$G/server.py" "$G" "$KEY" & GSRV=$!
+for _ in $(seq 1 50); do [ -s "$G/port" ] && break; sleep 0.1; done
+PORT="$(cat "$G/port" 2>/dev/null)"
+printf '#!/bin/bash\necho "colima $*" >> "%s/calls"\nexit "${FAKE_COLIMA_RC:-0}"\n' "$G" > "$G/bin/colima"
+printf '#!/bin/bash\necho "kubectl $*" >> "%s/calls"\n[ "$2" = current-context ] && echo colima\nexit 0\n' "$G" > "$G/bin/kubectl"
+chmod +x "$G/bin/"*
+layer() { printf 'config:\n  memex_portal:\n    Hosting__Deployment: "studio-9"\n    Hosting__ReportTo: "http://127.0.0.1:%s"\n%s' "$PORT" "$1" > "$G/ml/backlease.yaml"; }
+DECL='    Hosting__BackLease__Accept__Tokens__IdleOnlyModels__0: "gpt-oss:120b"\n'
+layer "$(printf "$DECL")"
+scen() { printf '%s' "$1" > "$G/scenario.json"; rm -f "$G"/n.*; }
+gov_once() { env PATH="$G/bin:$PATH" MEMEX_LOCAL_HOME="$G/ml" COLIMA_HOME="$G/colima" MEMEX_IDLE_OLLAMA="http://127.0.0.1:$PORT" \
+  MEMEX_IDLE_KEY_FILES="$G/ml/fleet.yaml" MEMEX_IDLE_NOW="${NOW:-1763028000}" MEMEX_IDLE_GIVEBACK=600 MEMEX_IDLE_DRAIN_MAX=1800 \
+  python3 -I "$IDLE" once 2>&1; }
+gstate() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$G/ml/backlease/buildhost.json" 2>/dev/null; }
+reset_gov() { rm -f "$G/ml/backlease/buildhost.json" "$G/ml/buildhost-idle.memory.json" "$G/calls" "$G/requests.jsonl"; }
+DQ1='{"host":"studio-9","models":{"gpt-oss:120b":{"queued":1,"running":0}}}'
+DR1='{"host":"studio-9","models":{"gpt-oss:120b":{"queued":0,"running":1}}}'
+D00='{"host":"studio-9","models":{"gpt-oss:120b":{"queued":0,"running":0}}}'
+Q0='{"channel":"mac","claimable":0,"running":0,"demand":0}'; Q1='{"channel":"mac","claimable":1,"running":0,"demand":1}'
+if [ -n "$PORT" ]; then
+  # running → stopped: no CI demand, an idle-only job queued
+  reset_gov; scen "{\"queue\":[[200,$Q0]],\"demand\":[[200,$DQ1]]}"
+  OUT="$(gov_once)"
+  [ "$(gstate)" = stopped ] && grep -q '^colima stop -p build$' "$G/calls" && grep -q '^kubectl config use-context colima$' "$G/calls" \
+    && ok "running → stopped: no mac demand and a queued idle-only job → colima stop -p build (kubectl context kept), then 'stopped'" || bad "running → stopped" "$OUT / $(cat "$G/calls" 2>/dev/null) / $(gstate)"
+  python3 -c 'import json,sys
+r = [json.loads(l) for l in open(sys.argv[1]) if "/demand" in l]
+assert r and all(x["sigOk"] for x in r), r
+x = r[0]; assert x["h"]["x-meshweaver-deployment"] == "studio-9" and x["h"]["x-meshweaver-timestamp"] == "1763028000", x
+assert json.loads(x["body"]) == {"host": "studio-9", "models": ["gpt-oss:120b"]}, x' "$G/requests.jsonl" 2>/dev/null \
+    && ok "the demand read is signed with the Mac's own key over \"<dep>\\n<ts>\\nPOST /demand\\n\\n\\n<body>\" (verified by the stub control)" || bad "signed demand" "$(cat "$G/requests.jsonl")"
+  S="$(env MEMEX_LOCAL_HOME="$G/ml" python3 -I -c 'import importlib.util,sys
+s = importlib.util.spec_from_file_location("bi", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(repr(m.signed_text("studio-9", "1763028000", "/demand", "{\"host\":\"studio-9\",\"models\":[\"gpt-oss:120b\"]}")))
+print(m.sign("a\nb", "k"))' "$IDLE")"
+  [ "$(sed -n 1p <<<"$S")" = "'studio-9\\n1763028000\\nPOST /demand\\n\\n\\n{\"host\":\"studio-9\",\"models\":[\"gpt-oss:120b\"]}'" ] \
+    && [ "$(sed -n 2p <<<"$S")" = "sha256=$(printf 'a\nb' | openssl dgst -sha256 -hmac k | awk '{ print $NF }')" ] \
+    && ok "the signed text has the two empty lines (residency, user) and the signature is sha256=hex(HMAC-SHA256) (checked against openssl)" || bad "signed text" "$S"
+  # every file must exist (a missing operand is no pass), and the governor's own output is searched too (review on #293)
+  # grep's exit is read whole: 1 = no match is the only pass, 0 = a leak, 2 = an error (an unreadable operand) is no pass
+  KL=("$G/ml/buildhost-idle.log" "$G/ml/backlease/buildhost.json" "$G/ml/buildhost-idle.memory.json")
+  grep -qF "$KEY" "${KL[@]}"; KRC=$?
+  grep -qF "$KEY" <<<"$OUT"; KRO=$?
+  if [ "$KRC" = 1 ] && [ "$KRO" = 1 ]; then ok "the key appears in no log, state, memory file or governor output"
+  elif [ "$KRC" = 0 ] || [ "$KRO" = 0 ]; then bad "the key leaked" ""
+  else bad "key-leak check: grep could not read every file (exit $KRC)" "${KL[*]}"; fi
+  python3 -c 'import json,re,sys; d = json.load(open(sys.argv[1])); assert set(d) == {"state","since","reason"} and re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", d["since"])' "$G/ml/backlease/buildhost.json" \
+    && [ -z "$(find "$G/ml/backlease" -name '.*tmp' -print)" ] && grep -q 'os.replace(tmp, path)' "$IDLE" && grep -q 'os.path.dirname(path)' "$IDLE" \
+    && ok "the state file is {state, since (ISO-8601 UTC), reason}, written as a temp file in the same directory and renamed — no temp left behind" || bad "atomic state file" "$(cat "$G/ml/backlease/buildhost.json")"
+  # stopped → draining → running: CI asks
+  : > "$G/calls"; scen "{\"queue\":[[200,$Q1]],\"demand\":[[200,$DR1]]}"
+  NOW=1763028060 gov_once >/dev/null
+  [ "$(gstate)" = draining ] && ! grep -q '^colima' "$G/calls" && ok "stopped → draining the moment the mac queue has demand; nothing started while a step runs" || bad "stopped → draining" "$(gstate) $(cat "$G/calls")"
+  NOW=1763028075 gov_once >/dev/null
+  [ "$(gstate)" = draining ] && ! grep -q '^colima' "$G/calls" && ok "draining holds while an idle-only step is still running (never preempted)" || bad "draining holds" "$(gstate) $(cat "$G/calls")"
+  scen "{\"queue\":[[200,$Q1]],\"demand\":[[200,$D00]]}"
+  NOW=1763028090 gov_once >/dev/null
+  python3 -c 'import json,sys
+g = [json.loads(json.loads(l)["body"]) for l in open(sys.argv[1]) if "/api/generate" in l]
+assert g == [{"model": "gpt-oss:120b", "keep_alive": 0}], g' "$G/requests.jsonl" 2>/dev/null \
+    && [ "$(gstate)" = running ] && grep -q '^colima start -p build$' "$G/calls" \
+    && ok "draining → running once no idle-only step runs: ONLY the idle-only model unloaded (keep_alive 0), colima start -p build, then 'running'" || bad "draining → running" "$(gstate) $(cat "$G/calls") $(grep generate "$G/requests.jsonl")"
+  # a model that does not unload holds the drain: the VM never starts under it (review on #293)
+  reset_gov; printf '{"state":"draining","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$G/ml/backlease/buildhost.json"
+  printf '{"drainSince":1763028000}' > "$G/ml/buildhost-idle.memory.json"
+  scen "{\"queue\":[[200,$Q1]],\"demand\":[[200,$D00]],\"ps\":[[200,{\"models\":[{\"name\":\"gpt-oss:120b\"},{\"name\":\"qwen3.8:27b-mlx\"}]}]]}"
+  NOW=1763028100 gov_once >/dev/null
+  [ "$(gstate)" = draining ] && ! grep -q '^colima start' "$G/calls" 2>/dev/null && grep -q 'gpt-oss:120b still resident' "$G/ml/buildhost-idle.log" \
+    && ok "an idle-only model still resident after the unload keeps the state 'draining': the VM is not started under it" || bad "resident holds drain" "$(gstate) $(cat "$G/calls" 2>/dev/null)"
+  scen "{\"queue\":[[200,$Q1]],\"demand\":[[200,$D00]],\"ps\":[[200,{\"models\":[{\"name\":\"qwen3.8:27b-mlx\"}]}]]}"
+  NOW=1763028115 gov_once >/dev/null
+  [ "$(gstate)" = running ] && grep -q '^colima start -p build$' "$G/calls" \
+    && ok "…and once only other models are resident (qwen3.8 is left alone) the VM starts" || bad "resident cleared" "$(gstate)"
+  reset_gov; printf '{"state":"draining","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$G/ml/backlease/buildhost.json"
+  printf '{"drainSince":1763028000}' > "$G/ml/buildhost-idle.memory.json"
+  scen "{\"queue\":[[200,$Q1]],\"demand\":[[200,$D00]],\"ps\":[[200,{\"models\":[{\"name\":\"gpt-oss:120b\"}]}]]}"
+  NOW=1763029900 gov_once >/dev/null
+  [ "$(gstate)" = running ] && grep -q 'starting the VM anyway, CI first' "$G/ml/buildhost-idle.log" \
+    && ok "a model that never unloads holds the drain at most 30 min, then CI wins (logged)" || bad "resident bounded" "$(gstate)"
+  # CI first when control cannot answer: the queue 404s, or nothing listens
+  reset_gov; scen "{\"queue\":[[404,\"\"]],\"demand\":[[200,$DQ1]]}"
+  gov_once >/dev/null
+  [ "$(gstate)" = running ] && ! grep -q '^colima stop' "$G/calls" 2>/dev/null && ok "the build queue answering 404: state stays 'running', nothing stops (CI first)" || bad "queue 404" "$(gstate) $(cat "$G/calls" 2>/dev/null)"
+  reset_gov; scen "{\"queue\":[[200,$Q0]],\"demand\":[[404,\"\"]]}"
+  gov_once >/dev/null
+  [ "$(gstate)" = running ] && ! grep -q '^colima' "$G/calls" 2>/dev/null && ok "the demand route answering 404 (a control before 3.1.x): no idle demand, state 'running', nothing stops" || bad "demand 404" "$(gstate)"
+  reset_gov; layer "$(printf "$DECL")" ; sed -i.bak "s|127.0.0.1:$PORT|127.0.0.1:1|" "$G/ml/backlease.yaml"
+  gov_once >/dev/null
+  [ "$(gstate)" = running ] && ! grep -q '^colima' "$G/calls" 2>/dev/null && ok "control unreachable: state 'running', nothing stops" || bad "unreachable" "$(gstate)"
+  printf '{"state":"stopped","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$G/ml/backlease/buildhost.json"
+  gov_once >/dev/null
+  [ "$(gstate)" = draining ] && ok "control unreachable while stopped: the VM is given back to CI (draining) — an unread queue counts as demand" || bad "unreachable while stopped" "$(gstate)"
+  layer "$(printf "$DECL")"
+  # the re-check right before the stop
+  reset_gov; scen "{\"queue\":[[200,$Q0],[200,$Q1]],\"demand\":[[200,$DQ1]]}"
+  gov_once >/dev/null
+  [ "$(gstate)" = running ] && ! grep -q '^colima stop' "$G/calls" 2>/dev/null && grep -q 'stop cancelled' "$G/ml/buildhost-idle.log" \
+    && ok "a mac build queued between the read and the stop cancels the stop (the queue is read again right before colima stop)" || bad "stop recheck" "$(gstate) $(cat "$G/calls" 2>/dev/null)"
+  # a failed colima stop leaves it running
+  reset_gov; scen "{\"queue\":[[200,$Q0]],\"demand\":[[200,$DQ1]]}"
+  FAKE_COLIMA_RC=1 gov_once >/dev/null
+  [ "$(gstate)" = running ] && grep -q 'ERROR: colima stop' "$G/ml/buildhost-idle.log" && ok "a failed colima stop is logged and the state stays 'running' (never 'stopped' with the VM up)" || bad "stop fails" "$(gstate)"
+  # give back after ten minutes without idle-only demand
+  reset_gov; scen "{\"queue\":[[200,$Q0]],\"demand\":[[200,$DQ1]]}"; gov_once >/dev/null
+  scen "{\"queue\":[[200,$Q0]],\"demand\":[[200,$DR1]]}"; NOW=1763028500 gov_once >/dev/null
+  scen "{\"queue\":[[200,$Q0]],\"demand\":[[200,$D00]]}"; NOW=1763029000 gov_once >/dev/null
+  [ "$(gstate)" = stopped ] && ok "stopped holds while the model was in use within the last 10 min" || bad "giveback too early" "$(gstate)"
+  NOW=1763029101 gov_once >/dev/null
+  [ "$(gstate)" = draining ] && ok "stopped → draining after 10 min with no idle-only job queued or running (the VM goes back to CI)" || bad "giveback" "$(gstate)"
+  # no queued idle job: nothing stops; no build profile: nothing at all
+  reset_gov; scen "{\"queue\":[[200,$Q0]],\"demand\":[[200,$D00]]}"; gov_once >/dev/null
+  [ "$(gstate)" = running ] && ! grep -q '^colima' "$G/calls" 2>/dev/null && ok "no idle-only job queued: the build VM keeps running for CI" || bad "no idle demand" "$(gstate)"
+  reset_gov; rmdir "$G/colima/build"; scen "{\"queue\":[[200,$Q0]],\"demand\":[[200,$DQ1]]}"; gov_once >/dev/null
+  ! grep -q '^colima' "$G/calls" 2>/dev/null && [ "$(gstate)" = running ] && ok "no build profile on the Mac: no colima call, the state says 'running'" || bad "no profile" "$(cat "$G/calls" 2>/dev/null)"
+  mkdir -p "$G/colima/build"
+  # withdrawn while stopped: drains and restarts; nothing declared and no state: no file at all
+  printf '{"state":"stopped","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$G/ml/backlease/buildhost.json"; layer ""
+  gov_once >/dev/null; gov_once >/dev/null
+  [ "$(gstate)" = running ] && grep -q '^colima start -p build$' "$G/calls" && ok "a declaration withdrawn while stopped: draining, then the VM starts and the state is 'running'" || bad "withdrawn while stopped" "$(gstate) $(cat "$G/calls")"
+  reset_gov; gov_once >/dev/null
+  [ ! -e "$G/ml/backlease/buildhost.json" ] && ok "nothing declared and no state: no state file is written (absent = no idle-only model served)" || bad "no decl writes" ""
+  printf 'garbage' > "$G/ml/backlease/buildhost.json"
+  [ "$(env MEMEX_LOCAL_HOME="$G/ml" python3 -I -c 'import importlib.util,sys
+s = importlib.util.spec_from_file_location("bi", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.read_state())' "$IDLE")" = None ] \
+    && ok "an unreadable state file reads as no state" || bad "garbage state" ""
+else
+  bad "the stub control did not start" ""
+fi
+kill "$GSRV" 2>/dev/null; wait "$GSRV" 2>/dev/null
+rm -rf "$IO"
+
+echo "── token slots: the machine's capacity; the owner's ceiling is optional (Hosting/BackLease §14.5) ──"
+TS="$(mktemp -d)"; mkdir -p "$TS/home"
+printf '#!/bin/bash\nexit 0\n' > "$TS/launchctl"; chmod +x "$TS/launchctl"
+ts() { env PATH="$TS:$STUBS:$PATH" HOME="$TS/home" MEMEX_LOCAL_HOME="$TS/home/.memex-local" "$@"; }
+TSF="$TS/home/.memex-local/backlease.yaml"; tsh() { grep -qF "$1" "$TSF" 2>/dev/null; }
+ts "$CLI" registry https://memex.example.test --id ci-ts >/dev/null 2>&1
+ts env MEMEX_PROFILE=mac-studio "$CLI" backlease enroll --control https://control.example.test --deployment studio-1 --accept-tokens='*.meshweaver.cloud' --token-models qwen3.8:27b-mlx --residency CH </dev/null >/dev/null 2>&1
+tsh 'Hosting__BackLease__Accept__Tokens__Slots: "2"' && ! tsh 'Tokens__MaxConcurrency' && ! tsh 'Tokens__YieldAtPercent' \
+  && ok "a mac-studio with tokens on gets Slots 2 and NO owner ceiling (the whole machine); no YieldAtPercent unless asked" || bad "mac-studio slots" "$(grep Tokens "$TSF")"
+ts env MEMEX_PROFILE= MEMEX_HOST_MODEL_NAME="Mac Studio" "$CLI" backlease accept tokens --slots none </dev/null >/dev/null 2>&1
+tsh 'Hosting__BackLease__Accept__Tokens__Slots: "2"' && ok "with no profile, Mac Studio hardware is measured as 2 slots" || bad "hardware slots" "$(grep Tokens "$TSF")"
+ts env MEMEX_PROFILE= MEMEX_HOST_MODEL_NAME="MacBook Pro" "$CLI" backlease accept tokens --slots none </dev/null >/dev/null 2>&1
+! tsh 'Tokens__Slots' && ok "a host nobody measured writes no Slots (the code's default applies)" || bad "no slots on other hosts" "$(grep Tokens "$TSF")"
+ts "$CLI" backlease accept tokens --slots 4 --max-concurrency 1 --yield-at 150 </dev/null >/dev/null 2>&1
+tsh 'Tokens__Slots: "4"' && tsh 'Tokens__MaxConcurrency: "1"' && tsh 'Tokens__YieldAtPercent: "150"' \
+  && ok "--slots (calibrated), --max-concurrency (owner ceiling) and --yield-at are written as given" || bad "slots overrides" "$(grep Tokens "$TSF")"
+ts "$CLI" backlease accept tokens --max-concurrency none --yield-at none </dev/null >/dev/null 2>&1
+! tsh 'Tokens__MaxConcurrency' && ! tsh 'Tokens__YieldAtPercent' && tsh 'Tokens__Slots: "4"' \
+  && ok "'none' clears the owner ceiling and the yield threshold; the calibrated slots stand" || bad "none clears" "$(grep Tokens "$TSF")"
+OUT="$(ts "$CLI" backlease accept tokens --slots 40 </dev/null 2>&1)" && bad "40 slots accepted" "$OUT" || ok "slots outside 1–32 are refused"
+# a layer from the first opt-in release (tokens on, MaxConcurrency 1 by default, no Slots): update adds the slots and keeps the ceiling
+sed -i '' -e '/Tokens__Slots/d' -e 's/Tokens__MaxConcurrency: .*/Tokens__MaxConcurrency: "1"/' "$TSF" 2>/dev/null
+grep -q 'Tokens__MaxConcurrency' "$TSF" || printf '    Hosting__BackLease__Accept__Tokens__MaxConcurrency: "1"\n' >> "$TSF"
+ts env MEMEX_PROFILE=mac-studio MEMEX_LOCAL_LIB=1 bash -c '. "$0"; backlease_migrate_accept' "$CLI" >/dev/null 2>&1
+tsh 'Tokens__Slots: "2"' && tsh 'Tokens__MaxConcurrency: "1"' \
+  && ok "update gives a pre-slots layer its measured slots and keeps the recorded ceiling (never widened without the owner)" || bad "pre-slots migration" "$(grep Tokens "$TSF")"
+OUT="$(ts "$CLI" backlease accept tokens --yield-at 5 </dev/null 2>&1)" && bad "yield-at 5 accepted" "$OUT" || ok "a yield threshold outside 10–3200 % is refused"
+rm -rf "$TS"
+
+echo "── vm network shaper: fleet traffic yields to the owner's network ──"
+NS="$HERE/../share/vm-netshape.sh"
+NSHOME="$(mktemp -d)"
+ns() { env -u MEMEX_NET_UP_KBIT -u MEMEX_NET_DOWN_KBIT -u MEMEX_NET_SHARE_PCT -u MEMEX_NET_LINK_UP_KBIT -u MEMEX_NET_LINK_DOWN_KBIT \
+  MEMEX_LOCAL_HOME="$NSHOME" MEMEX_NETSHAPE_LIB=1 bash -c 'set -u; . "$0"; shift; "$@"' "$NS" _ "$@"; }
+[ "$(ns caps 40000 200000 25 '' '')" = "10000 50000" ] && ok "the caps are the declared share of the measured link, each direction" || bad "share caps" "$(ns caps 40000 200000 25 '' '')"
+[ "$(ns caps 40000 200000 25 3000 0)" = "3000 0" ] && ok "a declared rate wins over the share; 0 means uncapped" || bad "declared caps" "$(ns caps 40000 200000 25 3000 0)"
+[ "$(ns caps 0 0 25 '' '')" = "4000 40000" ] && ok "an unknown link takes the fallback caps, never no cap" || bad "fallback caps" "$(ns caps 0 0 25 '' '')"
+[ "$(ns caps 500 800 10 '' '')" = "2000 2000" ] && ok "a share below the floor is floored (2000 kbit/s: a bad probe must not throttle the line)" || bad "floor" "$(ns caps 500 800 10 '' '')"
+R="$(env MEMEX_LOCAL_HOME="$NSHOME" MEMEX_NET_UP_KBIT=3000 MEMEX_NET_DOWN_KBIT=20000 bash "$NS" --render)"
+sh -n <<<"$R" && ok "the in-VM script parses as POSIX sh" || bad "render parse" ""
+case "$R" in *'UP_KBIT=3000'*'DOWN_KBIT=20000'*'match ip "$3" "$LOCALNET" flowid 1:10'*'stop) clear'*'mirred egress redirect dev "$IFB"'*'--set-dscp-class CS1'*) ok "the in-VM script caps both directions, exempts the Mac's subnet, marks DSCP CS1 and can remove itself" ;; *) bad "render content" "$R" ;; esac
+OUT="$(env MEMEX_LOCAL_HOME="$NSHOME" MEMEX_NET_UP_KBIT=fast bash "$NS" --render 2>&1)" && bad "a non-numeric rate was accepted" "$OUT" || ok "a rate that is not a whole number is refused"
+OUT="$(env MEMEX_LOCAL_HOME="$NSHOME" bash "$NS" --apply --profile 'Bad Name' 2>&1)" && bad "a bad profile was accepted" "$OUT" || ok "the shaper refuses a profile that is not a Colima profile name"
+mkdir -p "$NSHOME/.ml"; printf '[ -n "${MEMEX_NET_LINK_UP_KBIT:-}" ] || MEMEX_NET_LINK_UP_KBIT=20000\n[ -n "${MEMEX_NET_LINK_DOWN_KBIT:-}" ] || MEMEX_NET_LINK_DOWN_KBIT=100000\n' > "$NSHOME/.ml/netshape-build.env"
+[ "$(env -u MEMEX_NET_LINK_UP_KBIT -u MEMEX_NET_LINK_DOWN_KBIT MEMEX_LOCAL_HOME="$NSHOME/.ml" MEMEX_NET_PROFILE=default MEMEX_NETSHAPE_LIB=1 MEMEX_NET_NO_MEASURE=1 bash -c '. "$0"; link_rates' "$NS")" = "20000 100000" ] \
+  && ok "another profile's measurement is reused (one uplink per Mac — the line is measured once)" || bad "link reuse" ""
+# a 0/0 record (a failed measurement, as recorded before) is no reading: the sibling's measurement is reused instead
+printf '[ -n "${MEMEX_NET_LINK_UP_KBIT:-}" ] || MEMEX_NET_LINK_UP_KBIT=0\n[ -n "${MEMEX_NET_LINK_DOWN_KBIT:-}" ] || MEMEX_NET_LINK_DOWN_KBIT=0\n' > "$NSHOME/.ml/netshape-default.env"
+[ "$(env MEMEX_NET_LINK_UP_KBIT=0 MEMEX_NET_LINK_DOWN_KBIT=0 MEMEX_LOCAL_HOME="$NSHOME/.ml" MEMEX_NET_PROFILE=default MEMEX_NETSHAPE_LIB=1 MEMEX_NET_NO_MEASURE=1 bash -c '. "$0"; link_rates' "$NS")" = "20000 100000" ] \
+  && ok "a recorded 0/0 link does not stick: another profile's measurement is reused" || bad "0/0 record sticks" ""
+# apply against a stub VM: a failed measurement records NO link (so the next apply measures or reuses again), and
+# MEMEX_NET_SHAPE=off — read by the shaper itself, so first-attach.sh honours it too — touches neither the VM nor the record
+NSV="$(mktemp -d)"; mkdir -p "$NSV/bin" "$NSV/home"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/colima.log"; cat >/dev/null; exit 0\n' "$NSV" > "$NSV/bin/colima"; chmod +x "$NSV/bin/colima"
+nsapply() { env -u MEMEX_NET_UP_KBIT -u MEMEX_NET_DOWN_KBIT -u MEMEX_NET_LINK_UP_KBIT -u MEMEX_NET_LINK_DOWN_KBIT PATH="$NSV/bin:$PATH" \
+  MEMEX_LOCAL_HOME="$NSV/home" MEMEX_NET_NO_MEASURE=1 "$@" bash "$NS" --apply --profile build </dev/null 2>&1; }
+OUT="$(nsapply env)"
+{ [ -s "$NSV/colima.log" ] && [ -f "$NSV/home/netshape-build.env" ] && ! grep -q 'MEMEX_NET_LINK_UP_KBIT' "$NSV/home/netshape-build.env"; } \
+  && ok "apply installs the shaper in the VM and records no link when the measurement failed" || bad "apply after a failed measurement" "$OUT | $(cat "$NSV/home/netshape-build.env" 2>/dev/null)"
+rm -f "$NSV/colima.log" "$NSV/home/netshape-build.env"
+OUT="$(nsapply env MEMEX_NET_SHAPE=off)"; RC=$?
+{ [ "$RC" = 0 ] && [ ! -e "$NSV/colima.log" ] && [ ! -e "$NSV/home/netshape-build.env" ]; } && case "$OUT" in *"MEMEX_NET_SHAPE=off"*) true ;; *) false ;; esac \
+  && ok "MEMEX_NET_SHAPE=off is honoured by the shaper itself: no VM call, no record, exit 0" || bad "MEMEX_NET_SHAPE=off in vm-netshape.sh" "rc=$RC $OUT"
+case "$(cat "$HERE/../../backlease/first-attach.sh")" in *'homebrew/share/vm-netshape.sh" --apply'*) ok "first-attach.sh shapes through vm-netshape.sh --apply (so the switch above covers it)" ;; *) bad "first-attach shaper call" "" ;; esac
+rm -rf "$NSV"
+# `memex-local net --profile build` (no subcommand) is `status` for that profile, as vm-netshape.sh defaults a bare flag
+NSS="$(mktemp -d)"; printf '#!/bin/bash\nprintf "%%s" "$*"\n' > "$NSS/vm-netshape.sh"
+netbare() { env NSS_DIR="$NSS" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; resolve_share() { printf "%s" "$NSS_DIR"; }; shift_net_cmd default --profile build' "$CLI" 2>&1; }
+[ "$(netbare)" = "--status --profile build" ] \
+  && ok "'net --profile build' with no subcommand runs status for that profile" || bad "net bare flag" "$(netbare)"
+rm -rf "$NSS"
+# The measurement (2026-11-10, the second Mac Studio: one combined run recorded 370 kbit/s up on a symmetric fibre
+# line and capped uploads at a trickle). networkQuality is stubbed: each run answers the next line of a script, per
+# direction (-d = upload only, -u = download only); "fail" answers nothing.
+NQ="$(mktemp -d)"; mkdir -p "$NQ/bin" "$NQ/home"
+cat > "$NQ/bin/networkQuality" <<'NQEOF'
+#!/bin/bash
+case " $* " in *" -d "*) dir=up ;; *" -u "*) dir=down ;; *) echo "combined run: $*" >> "$NQ_DIR/combined"; dir=down ;; esac
+n=$(( $(cat "$NQ_DIR/n.$dir" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$NQ_DIR/n.$dir"
+v="$(sed -n "${n}p" "$NQ_DIR/$dir")"
+[ "$v" = fail ] || [ -z "$v" ] && exit 1
+if [ "$dir" = up ]; then printf '{"ul_throughput": %s}' "$(( v * 1000 ))"; else printf '{"dl_throughput": %s}' "$(( v * 1000 ))"; fi
+NQEOF
+chmod +x "$NQ/bin/networkQuality"
+nq() { rm -f "$NQ"/n.* "$NQ/combined"; printf '%s\n' $1 > "$NQ/up"; printf '%s\n' $2 > "$NQ/down"; shift 2
+  env -u MEMEX_NET_LINK_UP_KBIT -u MEMEX_NET_LINK_DOWN_KBIT -u MEMEX_NET_MIN_KBIT PATH="$NQ/bin:$PATH" NQ_DIR="$NQ" MEMEX_LOCAL_HOME="$NQ/home" \
+    MEMEX_NETSHAPE_LIB=1 "$@" bash -c '. "$0"; measure_link' "$NS" 2>"$NQ/err"; }
+M="$(nq "370 980000 950000" "937000 940000 fail")"
+[ "$M" = "950000 938500" ] && [ ! -e "$NQ/combined" ] \
+  && ok "the link is the MEDIAN of per-direction runs: one bad upload probe (370 kbit/s) cannot set the cap" || bad "median of samples" "got '$M' $(cat "$NQ/combined" 2>/dev/null)"
+grep -q 'up 370 980000 950000 -> median 950000; down 937000 940000 -> median 938500' "$NQ/err" \
+  && ok "the raw samples are logged, per direction, with the median taken" || bad "samples logged" "$(cat "$NQ/err")"
+[ "$(cat "$NQ/n.up")" = 3 ] && [ "$(cat "$NQ/n.down")" = 3 ] \
+  && ok "three runs per direction by default (MEMEX_NET_SAMPLES)" || bad "sample count" "up=$(cat "$NQ/n.up") down=$(cat "$NQ/n.down")"
+M="$(nq "fail fail fail" "937000 940000 941000")"
+[ -z "$M" ] && grep -q 'up none -> median none' "$NQ/err" \
+  && ok "no upload run answered → no reading (the fallback caps apply), and the log says so" || bad "all upload runs fail" "got '$M' $(cat "$NQ/err")"
+M="$(nq "370 400 380" "237972 240000 239000")"
+[ "$M" = "380 239000" ] && grep -q 'WARN: the measured uplink 380 kbit/s is under 1/50' "$NQ/err" \
+  && ok "an implausible asymmetry (uplink < 1/50 of the downlink) is warned about by name" || bad "asymmetry warn" "got '$M' $(cat "$NQ/err")"
+[ "$(ns caps 380 239000 25 '' '')" = "2000 59750" ] && ok "a cap derived from a bad uplink is held at the floor (MEMEX_NET_MIN_KBIT, default 2000), never 95 kbit/s" || bad "floor on derived cap" "$(ns caps 380 239000 25 '' '')"
+[ "$(MEMEX_NET_MIN_KBIT=500 ns caps 380 239000 25 '' '')" = "500 59750" ] && ok "the floor is the owner's to set (MEMEX_NET_MIN_KBIT)" || bad "floor override" ""
+[ "$(ns caps 380 239000 25 300 '')" = "300 59750" ] && ok "a DECLARED rate is not raised by the floor (it is the owner's)" || bad "declared below floor" ""
+# the record the second Mac Studio carries (370/237972) is not reused: it is re-measured (and here, with measuring
+# off, it reads as no link → fallback), and a sibling profile's implausible record is not borrowed either
+[ "$(env MEMEX_NET_LINK_UP_KBIT=370 MEMEX_NET_LINK_DOWN_KBIT=237972 MEMEX_LOCAL_HOME="$NQ/home" MEMEX_NETSHAPE_LIB=1 MEMEX_NET_NO_MEASURE=1 bash -c '. "$0"; link_rates' "$NS" 2>"$NQ/err")" = "0 0" ] \
+  && grep -q 'implausible — measuring again' "$NQ/err" && ok "an implausible RECORD (370 up / 237972 down) is said and measured again, never reused" || bad "implausible record reused" "$(cat "$NQ/err")"
+printf '[ -n "${MEMEX_NET_LINK_UP_KBIT:-}" ] || MEMEX_NET_LINK_UP_KBIT=370\n[ -n "${MEMEX_NET_LINK_DOWN_KBIT:-}" ] || MEMEX_NET_LINK_DOWN_KBIT=237972\n' > "$NQ/home/netshape-build.env"
+[ "$(env -u MEMEX_NET_LINK_UP_KBIT -u MEMEX_NET_LINK_DOWN_KBIT MEMEX_LOCAL_HOME="$NQ/home" MEMEX_NET_PROFILE=default MEMEX_NETSHAPE_LIB=1 MEMEX_NET_NO_MEASURE=1 bash -c '. "$0"; link_rates' "$NS" 2>/dev/null)" = "0 0" ] \
+  && ok "another profile's implausible record is not borrowed" || bad "implausible sibling borrowed" ""
+# end to end through --measure: the record keeps the raw samples as a comment
+NQV="$NQ/vm"; mkdir -p "$NQV"; printf '#!/bin/bash\ncat >/dev/null; exit 0\n' > "$NQ/bin/colima"; chmod +x "$NQ/bin/colima"
+rm -f "$NQ"/n.*; printf '%s\n' 900000 920000 910000 > "$NQ/up"; printf '%s\n' 930000 940000 950000 > "$NQ/down"
+OUT="$(env -u MEMEX_NET_UP_KBIT -u MEMEX_NET_DOWN_KBIT -u MEMEX_NET_LINK_UP_KBIT -u MEMEX_NET_LINK_DOWN_KBIT PATH="$NQ/bin:$PATH" NQ_DIR="$NQ" MEMEX_LOCAL_HOME="$NQ/home" bash "$NS" --measure --profile build </dev/null 2>&1)"
+grep -q 'MEMEX_NET_LINK_UP_KBIT=910000' "$NQ/home/netshape-build.env" && grep -q '^# networkQuality samples .*up 900000 920000 910000 -> median 910000' "$NQ/home/netshape-build.env" \
+  && case "$OUT" in *"capped at 227500 kbit/s up, 235000 kbit/s down"*) true ;; *) false ;; esac \
+  && ok "--measure records the medians, keeps the raw samples in the record, and caps at the share of the medians" || bad "--measure record" "$OUT | $(cat "$NQ/home/netshape-build.env")"
+rm -rf "$NQ"
+rm -rf "$NSHOME"
+
+echo "── the second Mac Studio's defects, pinned (2026-11-09) ─────────────"
+OB="$(mktemp -d)"; mkdir -p "$OB/stubs" "$OB/brewbin" "$OB/home/.memex-local" "$OB/sys"
+# a PATH with the system's tools but NO kubectl/colima (and none of Homebrew's): what the person's shell had
+for f in /usr/bin/* /bin/*; do b="$(basename "$f")"; case "$b" in kubectl|colima|helm|mkcert|security|open) continue ;; esac; [ -e "$OB/sys/$b" ] || ln -s "$f" "$OB/sys/$b"; done
+# kubectl that serves the setup banner; curl that says the portal answers
+printf '#!/usr/bin/env bash\ncase "$*" in *logs*) printf "info: Setup\\n  Token: tok-ob-123\\n" ;; *version*) echo "Client Version: v1.37.1" ;; esac\nexit 0\n' > "$OB/brewbin/kubectl"
+printf '#!/usr/bin/env bash\nprintf 302\n' > "$OB/stubs/curl"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$FAKE_OPEN_LOG"\n' > "$OB/stubs/open"
+printf '#!/usr/bin/env bash\n[ "$1" = verify-cert ] && [ -z "${FAKE_UNTRUSTED:-}" ]\n' > "$OB/stubs/security"
+chmod +x "$OB/stubs/"* "$OB/brewbin/"*
+PGPW="pgsecret-$(openssl rand -hex 12)"
+printf 'secrets:\n  memex_postgres_password: "%s"\n' "$PGPW" > "$OB/home/.memex-local/values.local.yaml"
+obrun() { OUT="$(env -i HOME="$OB/home" MEMEX_LOCAL_HOME="$OB/home/.memex-local" PATH="$OB/stubs:$OB/sys" FAKE_OPEN_LOG="$OB/open.log" "$@" bash "$CLI" setup 2>&1)"; RC=$?; : ; }
+# Defect 5 (the PATH half is memex_toolchain_path, #217): a command that needs kubectl/colima and finds none FAILS
+# naming it — never an empty answer. Sourced, so no toolchain directory is added: the PATH is exactly this one.
+obsrc() { OUT="$(env -i HOME="$OB/home" MEMEX_LOCAL_HOME="$OB/home/.memex-local" PATH="$OB/stubs:$OB/sys" MEMEX_LOCAL_LIB=1 bash -c '. "$0"; '"$1" "$CLI" 2>&1)"; RC=$?; }
+obsrc 'cmd_setup --no-open'
+case "$RC:$OUT" in 0:*) bad "setup without kubectl fails" "$OUT" ;; *"required tool 'kubectl' not found"*"brew install kubernetes-cli"*) ok "setup without kubectl FAILS naming kubectl (defect 5: it used to print nothing)" ;; *) bad "setup names kubectl" "rc=$RC $OUT" ;; esac
+for c in verify status logs; do
+  obsrc "cmd_$c"
+  case "$RC:$OUT" in 0:*) bad "$c without the tools fails" "$OUT" ;; *"required tool '"*"' not found"*) ok "$c without colima/kubectl FAILS naming the missing tool" ;; *) bad "$c names the tool" "rc=$RC $OUT" ;; esac
+done
+cp "$OB/brewbin/kubectl" "$OB/stubs/kubectl"
+# Defect 7: setup never prints the in-cluster Postgres password — only where it is and its fingerprint.
+obrun FAKE_UNTRUSTED=1
+case "$OUT" in *"$PGPW"*) bad "setup never prints the Postgres password" "the value is in the output" ;; *) ok "setup never prints the in-cluster Postgres password (defect 7)" ;; esac
+case "$OUT" in *"Password=<memex_postgres_password in $OB/home/.memex-local/values.local.yaml>"*"its fingerprint: sha256:"*) ok "…it names where the password is, with its fingerprint" ;; *) bad "password pointer" "$OUT" ;; esac
+# Defect 10: the browser is never opened into an untrusted certificate.
+[ ! -s "$OB/open.log" ] && case "$OUT" in *"not opening the browser"*"not trusted"*) true ;; *) false ;; esac \
+  && ok "setup does NOT open the wizard while the served certificate is untrusted, and says what is missing (defect 10)" || bad "no open when untrusted" "open: $(cat "$OB/open.log") $OUT"
+: > "$OB/open.log"; obrun
+[ "$(cat "$OB/open.log")" = "https://memex.localhost:8443/setup?token=tok-ob-123" ] && ok "…and opens it once the certificate is trusted" || bad "open when trusted" "$(cat "$OB/open.log") $OUT"
+! grep -nE '(^|[^_])open "\$\{url\}\?token' "$CLI" && ok "no code path opens the token URL without the trust check" || bad "unguarded open" "$(grep -n 'open "${url}?token' "$CLI")"
+
+# Participation (contract §5): the build host only on the owner's YES to jobs; no extra token models after a NO.
+pb() { env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$OB/home/.memex-local" HOME="$OB/home" bash -c '. "$0"; '"$1" "$CLI" 2>&1; }
+BL="$OB/home/.memex-local/backlease.yaml"
+rm -f "$BL"
+[ "$(pb 'participation_build_host yes && echo BUILD || echo NONE')" = NONE ] && ok "no recorded answer → no build host (no answer is not a yes)" || bad "unanswered builds" ""
+[ "$(pb 'ACC_JOBS_ANSWERED=yes; ACC_JOBS_ENABLED=true; participation_build_host yes && echo BUILD || echo NONE')" = BUILD ] && ok "no layer, but --accept-jobs on this join → build host" || bad "flag yes" ""
+printf 'config:\n  memex_portal:\n    Hosting__BackLease__Accept__Jobs__Enabled: "false"\n    Hosting__BackLease__Accept__Tokens__Enabled: "false"\n' > "$BL"
+[ "$(pb 'participation_build_host yes && echo BUILD || echo NONE')" = NONE ] && ok "jobs NO recorded → no build host" || bad "jobs no builds" ""
+[ "$(pb 'ACC_JOBS_ANSWERED=yes; ACC_JOBS_ENABLED=true; participation_build_host yes && echo BUILD || echo NONE')" = NONE ] && ok "…the recorded NO wins over a stale flag value" || bad "recorded no" ""
+OUT="$(pb 'MEMEX_HOST_CORES=8 MEMEX_HOST_MEM_GIB=64 cmd_buildhost apply; echo SURVIVED')"
+case "$OUT" in *SURVIVED*) bad "buildhost apply refused after a NO to jobs" "$OUT" ;; *"owner said NO to fleet jobs"*) ok "buildhost apply is REFUSED after the owner's NO to jobs" ;; *) bad "buildhost refusal" "$OUT" ;; esac
+[ "$(pb 'participation_answer Tokens')" = false ] && ok "the recorded token answer is read" || bad "token answer" ""
+printf 'config:\n  memex_portal:\n    Hosting__BackLease__Accept__Jobs__Enabled: "true"\n' > "$BL"
+[ "$(pb 'participation_build_host yes && echo BUILD || echo NONE')" = BUILD ] && ok "jobs YES recorded → build host" || bad "jobs yes" ""
+[ "$(pb 'participation_build_host no && echo BUILD || echo NONE')" = NONE ] && ok "--no-buildhost wins over a YES" || bad "no-buildhost" ""
+grep -q '^        if participation_build_host "\$with_build"; then$' "$CLI" && ok "fleet join installs the build host only through participation_build_host" || bad "join gate" ""
+case "$(fn_body setup_ollama)" in *'"$(participation_answer Tokens)" = false'*"are not pulled"*) ok "setup_ollama pulls no extra token models after the owner's NO to tokens" ;; *) bad "extras gate" "" ;; esac
+rm -f "$BL"
+
+# Defect 4 (Mac half): `memex-local ca adopt` — the fleet local CA, name-constrained, key never printed.
+MINT="$HERE/../../macos/fleet-ca/mint-fleet-ca.sh"
+CA="$OB/ca"; mkdir -p "$CA/caroot" "$CA/bin" "$CA/home/.memex-local/enrol"
+bash "$MINT" --key-file "$CA/fleet.key" --cert-out "$CA/fleet.pem" >/dev/null 2>&1
+bash "$MINT" --key-file "$CA/other.key" --cert-out "$CA/other.pem" >/dev/null 2>&1
+FSHA="$(openssl x509 -in "$CA/fleet.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)"
+KEYB64="$(cat "$CA/fleet.key")"
+# mkcert: CAROOT from the environment; a leaf "issued" by signing nothing — the test is about what adopt does
+cat > "$CA/bin/mkcert" <<'MK'
+#!/usr/bin/env bash
+case "$1" in -CAROOT) printf '%s\n' "$CAROOT"; exit 0 ;; esac
+printf '%s\n' "$*" >> "$FAKE_MKCERT_LOG"
+[ -f "$CAROOT/rootCA-key.pem" ] || exit 1
+c=""; k=""; prev=""; for a in "$@"; do [ "$prev" = -cert-file ] && c="$a"; [ "$prev" = -key-file ] && k="$a"; prev="$a"; done
+printf 'leaf\n' > "$c"; printf 'leafkey\n' > "$k"
+MK
+chmod +x "$CA/bin/mkcert"
+adopt() { OUT="$(env PATH="$CA/bin:$PATH" CAROOT="$CA/caroot" HOME="$CA/home" MEMEX_LOCAL_HOME="$CA/home/.memex-local" FAKE_MKCERT_LOG="$CA/mkcert.log" MEMEX_KUBE_CONTEXT=none "$@" 2>&1)"; RC=$?; }
+printf 'old\n' > "$CA/caroot/rootCA.pem"; printf 'oldkey\n' > "$CA/caroot/rootCA-key.pem"
+cp "$CA/fleet.key" "$CA/home/.memex-local/enrol/fleet-ca.key"; chmod 600 "$CA/home/.memex-local/enrol/fleet-ca.key"
+# the forms the minted fleet CA is stored in: the key as ONE line of base64 PKCS#8 DER (the vault object, enrolment
+# item `a`), the certificate permitting DNS:localhost alone (RFC 5280: it covers every name below localhost)
+[ "$(wc -l < "$CA/fleet.key" | tr -d ' ')" = 1 ] && ! grep -q -- '-----BEGIN' "$CA/fleet.key" \
+  && openssl x509 -in "$CA/fleet.pem" -noout -text | grep -q '^ *DNS:localhost$' && ! openssl x509 -in "$CA/fleet.pem" -noout -text | grep -q 'DNS:\.localhost' \
+  && ok "the adopted pair is in the stored form: one line of base64 PKCS#8 DER, a CA permitting DNS:localhost alone" || bad "stored form" "$(cat "$CA/fleet.key" | wc -l)"
+adopt "$CLI" ca adopt --cert "$CA/fleet.pem" --sha256 "$FSHA"
+case "$RC:$OUT" in 0:*"fleet local CA adopted"*"re-issued under the fleet CA"*) ok "ca adopt installs the fleet CA (the join's drop, the declared sha256) and re-issues the portal's certificate" ;; *) bad "ca adopt" "rc=$RC $OUT" ;; esac
+case "$OUT" in *"$KEYB64"*|*"PRIVATE KEY"*) bad "ca adopt never prints the key" "$OUT" ;; *) ok "ca adopt never prints the key (fingerprints only)" ;; esac
+[ "$(openssl x509 -in "$CA/caroot/rootCA.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)" = "$FSHA" ] \
+  && [ "$(openssl pkey -in "$CA/caroot/rootCA-key.pem" -pubout -outform DER | shasum -a 256)" = "$(openssl x509 -in "$CA/fleet.pem" -noout -pubkey | openssl pkey -pubin -outform DER | shasum -a 256)" ] \
+  && ok "mkcert's CAROOT now holds the fleet CA and its key" || bad "caroot contents" "$(ls -la "$CA/caroot")"
+[ "$(ls -l "$CA/caroot/rootCA-key.pem" | cut -c1-10)" = "-r--------" ] && ok "the CA key is 0400" || bad "key mode" "$(ls -l "$CA/caroot/rootCA-key.pem")"
+ls "$CA/caroot"/replaced-*/rootCA.pem >/dev/null 2>&1 && [ "$(cat "$CA/caroot"/replaced-*/rootCA.pem)" = old ] && ok "the previous local CA is moved aside, never deleted" || bad "previous CA kept" "$(ls -R "$CA/caroot")"
+[ ! -e "$CA/home/.memex-local/enrol/fleet-ca.key" ] && ok "the join's key drop is removed once adopted" || bad "drop removed" ""
+grep -q -- "-cert-file $CA/home/.memex-local/memex.localhost.pem -key-file $CA/home/.memex-local/memex.localhost-key.pem memex.localhost \*.memex.localhost" "$CA/mkcert.log" \
+  && ok "the portal's certificate (memex.localhost, *.memex.localhost) is re-issued under the adopted CA" || bad "re-issue" "$(cat "$CA/mkcert.log")"
+adopt bash -c 'cat "$1" | "$2" ca adopt --key-stdin --cert "$3" --sha256 "$4"' _ "$CA/fleet.key" "$CLI" "$CA/fleet.pem" "$FSHA"
+case "$RC:$OUT" in 0:*"adopted"*) ok "--key-stdin adopts (idempotent: the same CA again)" ;; *) bad "key stdin" "rc=$RC $OUT" ;; esac
+[ "$(ls -d "$CA/caroot"/replaced-* | wc -l | tr -d ' ')" = 1 ] && ok "re-adopting the same CA moves nothing aside" || bad "re-adopt aside" "$(ls "$CA/caroot")"
+chmod 600 "$CA/other.key"
+adopt "$CLI" ca adopt --key-file "$CA/other.key" --cert "$CA/fleet.pem" --sha256 "$FSHA"
+case "$RC:$OUT" in 0:*) bad "a key of another CA is refused" "$OUT" ;; *"does not belong to the certificate"*) ok "a key that does not belong to the declared certificate is REFUSED" ;; *) bad "wrong key" "rc=$RC $OUT" ;; esac
+adopt "$CLI" ca adopt --key-file "$CA/fleet.key" --cert "$CA/other.pem" --sha256 "$FSHA"
+case "$RC:$OUT" in 0:*) bad "a certificate other than the declared one is refused" "$OUT" ;; *"not the declared"*) ok "a certificate whose sha256 is not the declared one is REFUSED" ;; *) bad "wrong cert" "rc=$RC $OUT" ;; esac
+chmod 644 "$CA/fleet.key"
+adopt "$CLI" ca adopt --key-file "$CA/fleet.key" --cert "$CA/fleet.pem" --sha256 "$FSHA"
+case "$RC:$OUT" in 0:*) bad "a key file readable by others is refused" "$OUT" ;; *"not 0600"*) ok "a key file others can read is REFUSED" ;; *) bad "key mode refusal" "rc=$RC $OUT" ;; esac
+chmod 600 "$CA/fleet.key"
+adopt "$CLI" ca adopt --key-file "$CA/fleet.key" --cert "$CA/fleet.pem"
+case "$RC:$OUT" in 0:*) bad "no declared fingerprint is refused" "$OUT" ;; *"no declared fleet CA fingerprint"*) ok "without a declared fingerprint (--sha256 / FleetCaSha256) nothing is adopted" ;; *) bad "no sha" "rc=$RC $OUT" ;; esac
+# a CA that is NOT name-constrained to the loopback names — the right key for it, still refused
+mkca() { printf '[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=t\n[v3]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign\n%s\n' "$2" > "$CA/$1.cnf"
+  openssl ecparam -name prime256v1 -genkey -noout -out "$CA/$1.ec" 2>/dev/null
+  openssl req -new -x509 -key "$CA/$1.ec" -config "$CA/$1.cnf" -extensions v3 -days 2 -out "$CA/$1.pem" 2>/dev/null
+  ( umask 077; openssl pkcs8 -topk8 -nocrypt -in "$CA/$1.ec" -outform DER | openssl base64 -A > "$CA/$1.key" ); }
+mkca wide 'nameConstraints=critical,permitted;DNS:localhost,permitted;DNS:example.com'
+adopt "$CLI" ca adopt --key-file "$CA/wide.key" --cert "$CA/wide.pem" --sha256 "$(openssl x509 -in "$CA/wide.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)"
+case "$RC:$OUT" in 0:*) bad "a CA permitting more than the loopback names is refused" "$OUT" ;; *"permit 'DNS:example.com'"*) ok "a CA that permits a name beyond localhost is REFUSED" ;; *) bad "wide CA" "rc=$RC $OUT" ;; esac
+mkca bare ''
+adopt "$CLI" ca adopt --key-file "$CA/bare.key" --cert "$CA/bare.pem" --sha256 "$(openssl x509 -in "$CA/bare.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)"
+case "$RC:$OUT" in 0:*) bad "an unconstrained CA is refused" "$OUT" ;; *"no CRITICAL Name Constraints"*) ok "an UNCONSTRAINED CA is refused" ;; *) bad "bare CA" "rc=$RC $OUT" ;; esac
+mkca soft 'nameConstraints=permitted;DNS:localhost'
+adopt "$CLI" ca adopt --key-file "$CA/soft.key" --cert "$CA/soft.pem" --sha256 "$(openssl x509 -in "$CA/soft.pem" -outform DER | shasum -a 256 | cut -d' ' -f1)"
+case "$RC:$OUT" in 0:*) bad "non-critical constraints are refused" "$OUT" ;; *"no CRITICAL Name Constraints"*) ok "Name Constraints that are not CRITICAL are refused" ;; *) bad "soft CA" "rc=$RC $OUT" ;; esac
+[ "$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; norm_sha256 "$1"' "$CLI" "sha256:$(printf '%s' "$FSHA" | tr a-f A-F | sed 's/../&:/g; s/:$//')")" = "$FSHA" ] \
+  && ok "a fingerprint with colons, upper case or a sha256: prefix is normalised" || bad "norm_sha256" ""
+# setup_tls does not ask for a trust change when the CA is already trusted (the adopted fleet CA)
+case "$(fn_body setup_tls)" in *'ca_cert_trusted "$caroot/rootCA.pem"; then'*'no trust change needed'*'MEMEX_CA_TRUST:-}" = defer'*'TRUST_STORES=nss mkcert -install'*'else'*'mkcert -install'*) ok "up runs 'mkcert -install' only when the local CA is not already trusted (and never under MEMEX_CA_TRUST=defer)" ;; *) bad "setup_tls trust" "$(fn_body setup_tls)" ;; esac
+rm -rf "$OB"
+
 echo "── the CLI still knows every command it documents ────────────────"
 
 help_out="$("$CLI" help 2>&1)"
-for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease buildhost fleet llm relay publish autoupdate; do
+for cmd in up down status setup logs update registry verify port-forward observability doctor profile channel cert internal backlease buildhost net fleet llm residency relay publish autoupdate instances ca; do
   case "$help_out" in
     *"$cmd"*) ;;
     *) bad "help documents '$cmd'" "not in the usage text"; continue ;;
@@ -2154,6 +3388,480 @@ for cmd in up down status setup logs update registry verify port-forward observa
   if grep -q "^    ${cmd})" "$CLI"; then ok "help documents '$cmd', and main dispatches it"
   else bad "help documents '$cmd'" "no dispatch arm in main()"; fi
 done
+
+echo "── the toolchain is found from the install, not the caller's PATH ──"
+KEG="$(mktemp -d)"; mkdir -p "$KEG/Cellar/memex-local/9.9.9/libexec" "$KEG/bin"; cp "$CLI" "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local"
+cp -R "$(dirname "$CLI")/../share" "$KEG/Cellar/memex-local/9.9.9/libexec/share" 2>/dev/null || true
+KB="$(cd "$KEG/bin" && pwd -P)"
+TP="$(env -i HOME="$HOME" PATH=/usr/bin:/bin MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(cd "$(dirname "$CLI")/../share" && pwd)" bash -c '. "$0"; memex_toolchain_path; printf "%s" "$PATH"' "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local" 2>/dev/null)"
+case ":$TP:" in *":$KB:"*) ok "an installed keg finds its Homebrew prefix's bin/ even from a shell without it on PATH (memex-local setup finds kubectl)" ;; *) bad "toolchain PATH from the keg" "$TP" ;; esac
+TP2="$(env -i HOME="$HOME" PATH="$KB:/usr/bin:/bin" MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_SHARE="$(cd "$(dirname "$CLI")/../share" && pwd)" bash -c '. "$0"; memex_toolchain_path; memex_toolchain_path; printf "%s" "$PATH"' "$KEG/Cellar/memex-local/9.9.9/libexec/memex-local" 2>/dev/null)"
+[ "$(printf '%s' "$TP2" | tr ':' '\n' | grep -cx "$KB")" = "1" ] && ok "the prefix's bin/ is added once (idempotent), and a caller's PATH keeps its order" || bad "toolchain PATH idempotent" "$TP2"
+TP3="$(env -i HOME="$HOME" PATH=/usr/bin:/bin MEMEX_LOCAL_LIB=1 bash -c '. "$0"; memex_toolchain_path; printf "%s" "$PATH"' "$CLI" 2>/dev/null)"
+want="/usr/bin:/bin"; [ "$(uname -s)" = Darwin ] && [ -d /usr/local/bin ] && want="$want:/usr/local/bin"
+[ "$TP3" = "$want" ] && ok "a source checkout gets no prefix (only a Mac's /usr/local/bin): the test stubs and a Linux runner are untouched" || bad "checkout PATH unchanged" "$TP3"
+rm -rf "$KEG"
+grep -q 'need kubectl kubernetes-cli' <(sed -n '/^cmd_setup() {/,/^}/p' "$CLI") && grep -q 'could not read the portal log with kubectl' "$CLI" \
+  && ok "setup resolves kubectl and FAILS naming it — never an empty token" || bad "setup kubectl loud" "missing"
+! grep -q 'Password=\${pg_pw}' "$CLI" && grep -q 'Password=<memex_postgres_password in' "$CLI" \
+  && ok "setup never prints the in-cluster Postgres password" || bad "postgres password masked" "still printed"
+
+echo "── setup --apply: the first-run setup through its API, consent explicit ──"
+SAPY="$(env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; printf "%s" "$SETUP_ANSWERS_PY"' "$CLI")"
+SA="$(mktemp -d)"
+if env SETUP_NAME=studio-2 SETUP_COMPANY=Acme SETUP_OWNER_NAME="Jane Roe" SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=no \
+     SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/a.json" 2>"$SA/err"; then bad "no consent → nothing sent" "accepted"
+else grep -q 'identity.consent' "$SA/err" && [ ! -e "$SA/a.json" ] && ok "setup --apply without --accept-terms sends nothing and names identity.consent" || bad "consent named" "$(cat "$SA/err")"; fi
+env SETUP_NAME=studio-2 SETUP_COMPANY= SETUP_OWNER_NAME= SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=yes \
+  SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/b.json" 2>"$SA/err2" \
+  && bad "missing company/owner → refused" "accepted" || { grep -q 'identity.company' "$SA/err2" && grep -q 'identity.ownerName' "$SA/err2" && ok "every missing answer is named by its field" || bad "missing fields named" "$(cat "$SA/err2")"; }
+env SETUP_NAME=studio-2 SETUP_COMPANY=Acme SETUP_OWNER_NAME="Jane Roe" SETUP_OWNER_EMAIL=jane.roe@example.com SETUP_ACCEPT=yes SETUP_REGISTRY=https://registry.example.com \
+  SETUP_EMBED_ENDPOINT=http://e/v1 SETUP_EMBED_MODEL=m python3 -I -c "$SAPY" "$SA/c.json" \
+  && python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); i=d["identity"]; assert i["consent"] is True and i["name"]=="studio-2" and i["company"]=="Acme" and i["registry"]=="https://registry.example.com"; assert d["embedding"]=={"endpoint":"http://e/v1","model":"m"}; assert "storage" not in d' "$SA/c.json" \
+  && ok "a complete answer carries identity + consent + this install's embeddings, and leaves storage to the wizard's pre-selected default" || bad "complete answers" "$(cat "$SA/c.json" 2>/dev/null)"
+grep -q 'X-Setup-Token: %s' "$CLI" && ! grep -qE 'curl[^\n]*X-Setup-Token: \$' "$CLI" && ok "the setup token travels in a 0600 header file, never on a command line" || bad "token header file" "missing"
+rm -rf "$SA"
+
+# fleet join: the enrolment's registry-plan coupon (item r) becomes this install's registration key — so its portal
+# registers on, or redeems itself up to, the fleet's plan without a global administrator raising it by hand.
+RK="$(mktemp -d)"; mkdir -p "$RK/home/.memex-local" "$RK/items"
+rk() { env HOME="$RK/home" MEMEX_LOCAL_HOME="$RK/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c ". \"$CLI\"; fleet_apply_registry_key \"\$0\"" "$RK/items" 2>&1; }
+rk_file() { cat "$RK/home/.memex-local/registry.yaml" 2>/dev/null; }
+rk_open() { env HOME="$RK/home" MEMEX_LOCAL_HOME="$RK/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c ". \"$CLI\"; write_registry_file \"\$0\" '' \"\$1\"" "$1" "$2"; }
+rk_open https://registry.example.test 595714be-0000-4000-8000-000000000001
+printf 'mwr_fleet-coupon-NEVER-PRINTED' > "$RK/items/r"
+RKO="$(rk)"
+rk_file | grep -q '^    PluginCatalog__BootstrapKey: "mwr_fleet-coupon-NEVER-PRINTED"$' \
+  && ok "fleet join: the coupon (item r) is written as the registry file's bootstrap key" || bad "coupon written" "$(rk_file)"
+rk_file | grep -q 'registryUrl: "https://registry.example.test"' && rk_file | grep -q 'instanceId: "595714be-0000-4000-8000-000000000001"' \
+  && ok "…keeping the registry URL and the pinned instance id" || bad "url and id kept" "$(rk_file)"
+# GNU first: GNU `stat -f` is the FILESYSTEM report and exits 0, so a BSD-first fallback never reaches `-c` on Linux
+[ "$(stat -c '%a' "$RK/home/.memex-local/registry.yaml" 2>/dev/null || stat -f '%Lp' "$RK/home/.memex-local/registry.yaml")" = "600" ] \
+  && ok "…in a 0600 file" || bad "registry file mode" "$(ls -l "$RK/home/.memex-local/registry.yaml")"
+case "$RKO" in *NEVER-PRINTED*|*mwr_*) bad "…and the coupon is never printed" "said: $RKO" ;; *"registry plan:"*sha256:*) ok "…and the coupon is never printed (a fingerprint only)" ;; *) bad "coupon fingerprint said" "said: $RKO" ;; esac
+[ "$(printf '%s' "$RKO" | grep -o 'sha256:[0-9a-f]*')" = "$(printf 'sha256:%s' "$(printf '%s' 'mwr_fleet-coupon-NEVER-PRINTED' | shasum -a 256 | cut -c1-12)")" ] \
+  && ok "…and the fingerprint said is the one of the key written" || bad "fingerprint of the written key" "said: $RKO"
+printf '  mwr_fleet-coupon-NEVER-PRINTED \n' > "$RK/items/r"; RKO="$(rk)"
+rk_file | grep -q '^    PluginCatalog__BootstrapKey: "mwr_fleet-coupon-NEVER-PRINTED"$' \
+  && [ "$(printf '%s' "$RKO" | grep -o 'sha256:[0-9a-f]*' | tail -n1)" = "$(printf 'sha256:%s' "$(printf '%s' 'mwr_fleet-coupon-NEVER-PRINTED' | shasum -a 256 | cut -c1-12)")" ] \
+  && ok "fleet join: a padded drop is trimmed, and the fingerprint is of the trimmed key" || bad "trimmed key" "$RKO / $(rk_file)"
+env HOME="$RK/home" MEMEX_LOCAL_HOME="$RK/home/.memex-local" MEMEX_LOCAL_LIB=1 bash -c ". \"$CLI\"; write_registry_file https://registry.example.test mwr_older-key-NEVER-PRINTED ''"
+printf 'mwr_fleet-coupon-NEVER-PRINTED' > "$RK/items/r"; RKO="$(rk)"
+rk_file | grep -q 'BootstrapKey: "mwr_fleet-coupon-NEVER-PRINTED"' && case "$RKO" in *"replacing the registration key already in"*) true ;; *) false ;; esac \
+  && case "$RKO" in *NEVER-PRINTED*|*mwr_*) false ;; *) true ;; esac \
+  && ok "fleet join: a key already in the file is replaced by the coupon, and that is SAID (fingerprints only)" || bad "replace said" "$RKO / $(rk_file)"
+RKO="$(rk)"
+case "$RKO" in *"replacing"*) bad "re-applying the same coupon is silent" "said: $RKO" ;; *) ok "…while re-applying the same coupon says nothing about replacing" ;; esac
+rk_open https://registry.example.test ""
+RKO="$(rk)"
+rk_file | grep -q 'PluginCatalog__BootstrapKey: "mwr_' && ! rk_file | grep -q 'instanceId:' \
+  && ok "fleet join: with no pinned id the wizard's id stays in charge (no id is invented)" || bad "no id invented" "$(rk_file)"
+rk_open https://registry.example.test ""; rm -f "$RK/items/r"; RKO="$(rk)"
+! rk_file | grep -q 'BootstrapKey' && case "$RKO" in *"no coupon in the code"*) true ;; *) false ;; esac \
+  && ok "fleet join: a code without item r leaves the registry file as it was, and says so" || bad "no r" "$RKO / $(rk_file)"
+printf 'mwi_not-a-registration-key' > "$RK/items/r"; RKO="$(rk)"
+! rk_file | grep -q 'BootstrapKey' && case "$RKO" in *"not a registration key"*) true ;; *) false ;; esac \
+  && ok "fleet join: an item r that is not mwr_ is refused and nothing is written" || bad "non-mwr r" "$RKO / $(rk_file)"
+rm -f "$RK/home/.memex-local/registry.yaml"; printf 'mwr_fleet-coupon-NEVER-PRINTED' > "$RK/items/r"; RKO="$(rk)"
+[ ! -e "$RK/home/.memex-local/registry.yaml" ] && case "$RKO" in *"not in REGISTRY MODE"*) true ;; *) false ;; esac \
+  && ok "fleet join: outside registry mode the coupon is not kept, and that is said" || bad "not registry mode" "$RKO"
+grep -q '        fleet_apply_registry_key "$items"' "$CLI" && ok "fleet join applies the coupon with the other items" || bad "join applies r" "missing"
+rm -rf "$RK"
+echo "── kubelet's root on the portal VM's data disk (2026-11-10) ──────────"
+KR="$(mktemp -d)"; mkdir -p "$KR/stubs" "$KR/home/.memex-local" "$KR/colima/default"
+cat > "$KR/stubs/colima" <<'KEOF'
+#!/bin/bash
+echo "$*" >> "$KR_DIR/colima.log"
+case "$1" in
+  status) [ "${KR_RUNNING:-yes}" = yes ] ;;
+  ssh) cat >/dev/null
+       # KR_SSH_EMPTY_FIRST=N: the first N reads see no pods/ yet (kubelet still starting)
+       n=$(( $(grep -c '^ssh' "$KR_DIR/colima.log") ))
+       [ -n "${KR_SSH_ERR:-}" ] && { echo "$KR_SSH_ERR" >&2; exit 1; }
+       [ "$n" -le "${KR_SSH_EMPTY_FIRST:-0}" ] && exit 1
+       printf '%s' "${KR_SSH-81G free of 98G}" ;;
+  *) exit 0 ;;
+esac
+KEOF
+printf '#!/bin/bash\necho "$*" >> "$KR_DIR/kubectl.log"; exit 0\n' > "$KR/stubs/kubectl"; chmod +x "$KR/stubs/colima" "$KR/stubs/kubectl"
+kr() { env PATH="$KR/stubs:$PATH" HOME="$KR/home" COLIMA_HOME="$KR/colima" MEMEX_LOCAL_HOME="$KR/home/.memex-local" KR_DIR="$KR" MEMEX_LOCAL_LIB=1 "$@"; }
+printf 'cpu: 12\nkubernetes:\n  enabled: true\n  version: v1.35.0+k3s1\n  k3sArgs:\n    - --disable=traefik\n\n  port: 0\nnetwork:\n  address: false\n' > "$KR/old.yaml"
+# a NEW profile: both args, because a --k3s-arg replaces colima's default list (--disable=traefik)
+rm -f "$KR/colima.log"; OUT="$(kr KR_RUNNING=no bash -c '. "$0"; start_colima' "$CLI" 2>&1)"
+grep -q -- 'start --kubernetes --cpu .* --k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet$' "$KR/colima.log" \
+  && ok "a new portal VM starts with kubelet's root on the data disk (and traefik still disabled)" || bad "start_colima k3s args" "$(cat "$KR/colima.log")"
+# an EXISTING profile without root-dir is detected, and the warning names the repair
+cp "$KR/old.yaml" "$KR/colima/default/colima.yaml"
+OUT="$(kr bash -c '. "$0"; kubelet_root_check' "$CLI" 2>&1)"
+case "$OUT" in *"ROOT disk"*"memex-local kubelet-root apply"*) ok "an existing profile without root-dir is warned about, naming 'kubelet-root apply'" ;; *) bad "kubelet root warn" "$OUT" ;; esac
+for f in cmd_doctor cmd_verify; do fn_body "$f" | grep -q kubelet_root_check && ok "$f reports where kubelet's root is" || bad "$f kubelet check" "missing"; done
+sed -n '/^cmd_fleet() {/,/^}/p' "$CLI" | sed -n '/Preflight (MacStudioFleet/,/throw-away key for this join/p' | grep -q kubelet_root_check \
+  && ok "fleet join's preflight reports where kubelet's root is" || bad "fleet join preflight kubelet" "missing"
+# the repair refuses unattended without --yes, and changes nothing
+OUT="$(kr bash -c '. "$0"; cmd_kubelet_root apply' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" != 0 ] && cmp -s "$KR/old.yaml" "$KR/colima/default/colima.yaml" && case "$OUT" in *"--yes"*) true ;; *) false ;; esac \
+  && ok "kubelet-root apply without a terminal refuses unless --yes, and edits nothing" || bad "apply needs --yes" "rc=$RC $OUT"
+rm -f "$KR/colima.log" "$KR/kubectl.log"
+OUT="$(kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+A="$(kr bash -c '. "$0"; colima_k3s_args "$1"' "$CLI" "$KR/colima/default/colima.yaml")"
+{ [ "$RC" = 0 ] && [ "$A" = "$(printf -- '--disable=traefik\n--kubelet-arg=root-dir=/var/lib/rancher/kubelet')" ] \
+  && compgen -G "$KR/colima/default/colima.yaml.bak-*" >/dev/null && grep -q '^  port: 0$' "$KR/colima/default/colima.yaml" \
+  && [ "$(grep -c '' "$KR/colima/default/colima.yaml")" = "$(( $(grep -c '' "$KR/old.yaml") + 1 ))" ] \
+  && [ "$(grep -E '^(stop|start)' "$KR/colima.log" | tr '\n' ' ')" = "stop start " ]; } \
+  && case "$OUT" in *"portal and everything in it is DOWN"*"81G free of 98G"*) true ;; *) false ;; esac \
+  && ok "kubelet-root apply adds the arg (one line, the rest untouched, a backup beside it), says the portal is down, restarts the VM and proves the data disk" \
+  || bad "kubelet-root apply" "rc=$RC args=[$A] log=$(tr '\n' ' ' < "$KR/colima.log") $OUT"
+grep -q '^ssh -- sudo sh -c test -d /var/lib/rancher/kubelet/pods' "$KR/colima.log" \
+  && ok "kubelet-root apply reads the root-owned kubelet dir AS ROOT (an unprivileged test -d read 'permission denied' as absent — moench)" \
+  || bad "kubelet-root apply sudo" "$(grep '^ssh' "$KR/colima.log")"
+cp "$KR/old.yaml" "$KR/colima/default/colima.yaml"; rm -f "$KR/colima.log"
+OUT="$(KR_SSH_EMPTY_FIRST=2 MEMEX_KUBELET_ROOT_WAIT_S=0 kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" = 0 ] && [ "$(grep -c '^ssh -- sudo' "$KR/colima.log")" = 3 ] \
+  && ok "kubelet-root apply waits for kubelet to create pods/ instead of failing on the first read" \
+  || bad "kubelet-root apply wait" "rc=$RC $(grep -c '^ssh' "$KR/colima.log") reads $OUT"
+cp "$KR/old.yaml" "$KR/colima/default/colima.yaml"; rm -f "$KR/colima.log"
+OUT="$(KR_SSH_ERR='sudo: a password is required' MEMEX_KUBELET_ROOT_WAIT_TRIES=2 MEMEX_KUBELET_ROOT_WAIT_S=0 kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" != 0 ] && case "$OUT" in *"UNKNOWN"*"a password is required"*) true ;; *) false ;; esac && case "$OUT" in *"did not take the root-dir"*) false ;; *) true ;; esac \
+  && ok "a read that ERRORS is reported as unknown with its answer, never as 'kubelet did not take the root-dir'" \
+  || bad "kubelet-root apply read error" "rc=$RC $OUT"
+cp "$KR/old.yaml" "$KR/colima/default/colima.yaml"; rm -f "$KR/colima.log"
+OUT="$(MEMEX_KUBELET_ROOT_WAIT_TRIES=0 kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" = 0 ] && [ "$(grep -c '^ssh -- sudo' "$KR/colima.log")" = 1 ] \
+  && ok "MEMEX_KUBELET_ROOT_WAIT_TRIES=0 still reads once (no verdict without a read)" || bad "wait tries 0" "rc=$RC $OUT"
+cp "$KR/colima/default/colima.yaml" "$KR/after.yaml"; rm -f "$KR/colima.log"
+OUT="$(kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" = 0 ] && cmp -s "$KR/after.yaml" "$KR/colima/default/colima.yaml" && ! grep -qE '^(stop|start)' "$KR/colima.log" 2>/dev/null \
+  && ok "kubelet-root apply is idempotent: a profile that has the arg is left alone and the VM is not restarted" || bad "apply idempotent" "rc=$RC $OUT"
+# the VM restarted but kubelet did not take the root-dir → loud, never a green line
+cp "$KR/old.yaml" "$KR/colima/default/colima.yaml"
+OUT="$(kr KR_SSH= bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" != 0 ] && case "$OUT" in *"did not take the root-dir"*) true ;; *) false ;; esac \
+  && ok "a restart after which kubelet's root is not on the data disk FAILS, naming it" || bad "apply unverified" "rc=$RC $OUT"
+cp "$KR/old.yaml" "$KR/colima/default/colima.yaml"; sed -i.x 's/    - --disable=traefik/    - --kubelet-arg=root-dir=\/var\/lib\/kubelet-elsewhere/' "$KR/colima/default/colima.yaml"; rm -f "$KR/colima/default/colima.yaml.x" "$KR/colima.log"
+OUT="$(kr bash -c '. "$0"; cmd_kubelet_root apply --yes' "$CLI" </dev/null 2>&1)"; RC=$?
+[ "$RC" != 0 ] && grep -q 'kubelet-elsewhere' "$KR/colima/default/colima.yaml" && ! grep -qE '^stop' "$KR/colima.log" 2>/dev/null \
+  && ok "a profile with a DIFFERENT root-dir is not overwritten and the VM is not restarted" || bad "different root-dir" "rc=$RC $OUT"
+rm -rf "$KR"
+
+echo "── fleet join waits for this Mac's first heartbeat (2026-11-10) ────────"
+HB="$(mktemp -d)"; mkdir -p "$HB/stubs" "$HB/home/.memex-local"
+cat > "$HB/stubs/kubectl" <<'KEOF'
+#!/bin/bash
+r="$(cat "$HB_DIR/restarts" 2>/dev/null || echo 0)"
+case "$*" in
+  *"rollout restart"*) echo $(( r + 1 )) > "$HB_DIR/restarts" ;;
+  *" logs "*) f="$HB_DIR/log.$r"; [ -f "$f" ] || f="$HB_DIR/log.last"; cat "$f" 2>/dev/null ;;
+esac
+exit 0
+KEOF
+chmod +x "$HB/stubs/kubectl"
+REC='info: MeshWeaver.PluginCatalog.InstanceAutoRegistrationService[0]
+      [DefaultInstall] reconciled: 3 installed, 9 up to date, 0 failed [DefaultViews, GraphViews, Plugins/Hosting] — MODULES LANDED ahead of content: [MeshWeaver.Hosting] — MODULE SET proposed: sequence 4 — the landed modules load at the next restart'
+POSTED='dbug: Hosting[0]
+      [BackLease] heartbeat armed on mesh/x: every 00:00:30 to https://control.example.test/api/hooks/Hosting/Heartbeats, readings from /host-readings/readings.json
+dbug: Hosting[0]
+      [BackLease] heartbeat posted to https://control.example.test/api/hooks/Hosting/Heartbeats: HTTP 200'
+hbw() { rm -f "$HB/restarts" "$HB"/log.*; printf '%s\n' "$1" > "$HB/log.0"; printf '%s\n' "$2" > "$HB/log.1"; printf '%s\n' "$2" > "$HB/log.last"; shift 2
+  OUT="$(env PATH="$HB/stubs:$PATH" HOME="$HB/home" MEMEX_LOCAL_HOME="$HB/home/.memex-local" HB_DIR="$HB" MEMEX_HEARTBEAT_POLL_SEC=0 MEMEX_LOCAL_LIB=1 "$@" \
+    bash -c '. "$0"; fleet_wait_heartbeat "${HBW_MIN:-1}"' "$CLI" 2>&1)"; RC=$?; RESTARTS="$(cat "$HB/restarts" 2>/dev/null || echo 0)"; }
+hbw "$REC" "$REC
+$POSTED"
+[ "$RC" = 0 ] && [ "$RESTARTS" = 1 ] && case "$OUT" in *"restarting the portal once"*"heartbeat posted to https://control.example.test/api/hooks/Hosting/Heartbeats HTTP 200"*) true ;; *) false ;; esac \
+  && ok "Hosting landed for the next restart → ONE restart → ends ok naming the heartbeat's POST and its HTTP 200" || bad "restart then heartbeat" "rc=$RC restarts=$RESTARTS $OUT"
+hbw "$REC" "$(printf '%s\n' "$REC" | sed 's/sequence 4/sequence 5/')" HBW_MIN=0
+[ "$RC" != 0 ] && [ "$RESTARTS" = 1 ] && case "$OUT" in *"not restarting a second time"*"no heartbeat after 0 min"*"memex-local fleet heartbeat"*) true ;; *) false ;; esac \
+  && ok "the portal is restarted at most ONCE; a wait that runs out FAILS naming the last state and the way to resume" || bad "single restart + timeout" "rc=$RC restarts=$RESTARTS $OUT"
+TIER='warn: MeshWeaver.PluginCatalog.InstanceAutoRegistrationService[0]
+      [DefaultInstall] 1 package(s) the registry declares in this instance'"'"'s default set are REFUSED by its plan tier and are not installed: ⛔ Not installed on this instance: Hosting needs plan tier enterprise, this instance is on free.. Raise the instance'"'"'s plan on the registry to receive them; nothing on this instance can.
+      [DefaultInstall] reconciled: 0 installed, 9 up to date, 0 failed [DefaultViews, GraphViews]'
+hbw "$TIER" "$TIER"
+[ "$RC" != 0 ] && [ "$RESTARTS" = 0 ] && case "$OUT" in *"REFUSES Hosting"*"plan tier enterprise"*"is on free"*"Remedy:"*) true ;; *) false ;; esac \
+  && ok "a plan tier that refuses Hosting STOPS the wait at once, naming the tier, the plan and the remedy — no restart" || bad "tier refusal" "rc=$RC restarts=$RESTARTS $OUT"
+hs() { printf '%s\n' "$1" | env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; heartbeat_state' "$CLI"; }
+# the registry does not LIST Hosting to this instance (2026-11-12: a fleet Mac on plan free waited 13 days on "absent")
+printf 'plugins:\n  registry:\n    registryUrl: "https://registry.example.test"\n    instanceId: "mini-7"\n' > "$HB/home/.memex-local/registry.yaml"
+NOTLISTED_OLD='warn: MeshWeaver.PluginCatalog.InstanceAutoRegistrationService[0]
+      The default install matched no packages for the operator'"'"'s patterns (wanted [Plugins/Hosting]; 40 pre-installed package(s) were still selected). Check PluginCatalog:InstallByDefault against the registry listing.
+      [DefaultInstall] reconciled: 0 installed, 40 up to date, 0 failed [DefaultViews, GraphViews]'
+hbw "$NOTLISTED_OLD" "$NOTLISTED_OLD"
+[ "$RC" != 0 ] && [ "$RESTARTS" = 0 ] && case "$OUT" in *"does not LIST Hosting"*"'mini-7'"*"plan unknown"*"Instance grants"*"memex-local registry https://registry.example.test --key mwr_"*"memex-local update"*"memex-local fleet heartbeat"*) true ;; *) false ;; esac \
+  && ok "platform ≤ 3.1.13051's 'matched no packages (wanted [Plugins/Hosting])' STOPS the wait at once: not listed, instance id, plan unknown, the tier remedy" || bad "not listed (old line)" "rc=$RC restarts=$RESTARTS $OUT"
+NOTLISTED_NEW='fail: MeshWeaver.PluginCatalog.InstanceAutoRegistrationService[0]
+      [DefaultInstall] PluginCatalog:InstallByDefault names Plugins/Hosting exactly, and the default install selects NOTHING for it: the registry'"'"'s listing for this instance does not carry that package (this instance is on plan free; listing complete: True). Raise the plan on the registry.
+      [DefaultInstall] reconciled: 0 installed, 40 up to date, 0 failed [DefaultViews, GraphViews]'
+hbw "$NOTLISTED_NEW" "$NOTLISTED_NEW"
+[ "$RC" != 0 ] && [ "$RESTARTS" = 0 ] && case "$OUT" in *"does not LIST Hosting"*"'mini-7'"*"plan free"*"Instance grants"*"--key mwr_"*"memex-local fleet heartbeat"*) true ;; *) false ;; esac \
+  && ok "MeshWeaver#8128's 'selects NOTHING for it' Error line STOPS the wait at once, naming the instance, the plan read from the line and the remedy" || bad "not listed (new line)" "rc=$RC restarts=$RESTARTS $OUT"
+[ "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's/on plan free;/on plan unknown (the registry'"'"'s answer named no plan);/')")" = "notlisted|unknown" ] \
+  && ok "…a plan the registry did not name reads 'unknown'" || bad "not listed unknown plan" "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's/on plan free;/on plan unknown (the registry answer named no plan);/')")"
+[ "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's/on plan free; listing complete: True)/on plan pro)/')")" = "notlisted|pro" ] \
+  && ok "…a plan closed by ')' with no listing tail is still read" || bad "not listed plan without tail" "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's/on plan free; listing complete: True)/on plan pro)/')")"
+[ "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's|names Plugins/Hosting|names Hosting|')")" = "notlisted|free" ] \
+  && ok "…and Hosting is matched bare as well as under a source prefix" || bad "not listed bare id" "$(hs "$(printf '%s\n' "$NOTLISTED_NEW" | sed 's|names Plugins/Hosting|names Hosting|')")"
+REFUSED_NEW='fail: MeshWeaver.PluginCatalog.InstanceAutoRegistrationService[0]
+      [DefaultInstall] PluginCatalog:InstallByDefault names Plugins/Hosting exactly, and the registry REFUSES it by plan tier: Hosting needs plan tier enterprise, this instance is on free. Raise the plan on the registry.'
+[ "$(hs "$REFUSED_NEW")" = "tier|enterprise|free" ] && ok "MeshWeaver#8128's 'REFUSES it by plan tier' line is the tier state (tier enterprise, plan free)" || bad "refused new line" "$(hs "$REFUSED_NEW")"
+hbw "$REFUSED_NEW" "$REFUSED_NEW"
+[ "$RC" != 0 ] && case "$OUT" in *"REFUSES Hosting"*"plan tier enterprise"*"is on free"*"Instance grants"*) true ;; *) false ;; esac \
+  && ok "…and it STOPS the wait with the tier remedy" || bad "refused new line wait" "rc=$RC $OUT"
+[ "$(hs 'The default install matched no packages for the operator'"'"'s patterns (wanted [Plugins/*]; 40 pre-installed package(s) were still selected).
+[DefaultInstall] reconciled: 0 installed, 40 up to date, 0 failed [DefaultViews]' | cut -d'|' -f1)" = absent ] \
+  && ok "a 'matched no packages' line whose wanted list names no Hosting (a wildcard) stays absent" || bad "wildcard not Hosting" ""
+[ "$(hs 'The default install matched no packages for the operator'"'"'s patterns (wanted [Plugins/HostingExtras]; 1 pre-installed package(s) were still selected).
+[DefaultInstall] reconciled: 0 installed, 1 up to date, 0 failed [DefaultViews]' | cut -d'|' -f1)" = absent ] \
+  && ok "…nor one wanting a package that merely starts with 'Hosting'" || bad "HostingExtras wanted" ""
+[ "$(hs "$NOTLISTED_OLD
+$REC" | cut -d'|' -f1)" = restart ] && ok "a later reconcile that DID select Hosting wins over an earlier not-listed line" || bad "not listed then installed" "$(hs "$NOTLISTED_OLD
+$REC")"
+rm -f "$HB/home/.memex-local/registry.yaml"
+hbw "" "" HBW_MIN=0
+[ "$RC" != 0 ] && case "$OUT" in *"last state: reconciling"*) true ;; *) false ;; esac && ok "no reconcile at all: the bounded wait ends red, never hangs" || bad "no reconcile" "rc=$RC $OUT"
+hbw "$(printf '%s\n' "$REC" | sed 's/ — MODULE SET.*//')
+$POSTED" "" 
+[ "$RC" = 0 ] && [ "$RESTARTS" = 0 ] && ok "Hosting already loaded (no restart pending): no restart, ends at the heartbeat" || bad "no restart needed" "rc=$RC restarts=$RESTARTS $OUT"
+hbw "$(printf '%s\n' "$POSTED" | sed '$d' | sed '$d')" "" MEMEX_LOG_LEVEL=Information
+[ "$RC" = 0 ] && case "$OUT" in *"ARMED"*"Debug line"*"level Information"*) true ;; *) false ;; esac \
+  && ok "at a log level that hides the Debug 'posted' line, an armed heartbeat ends it and says to confirm on control" || bad "armed at Information" "rc=$RC $OUT"
+[ "$(hs '[DefaultInstall] reconciled: 1 installed, 0 up to date, 0 failed [HostingExtras] — MODULE SET proposed: sequence 2 — the landed modules load at the next restart' | cut -d'|' -f1)" = absent ] \
+  && ok "a package that merely starts with 'Hosting' is not Hosting" || bad "Hosting id match" "$(hs '[DefaultInstall] reconciled: 1 installed, 0 up to date, 0 failed [HostingExtras]')"
+[ "$(hs '[BackLease] heartbeat posted to https://c.example.test/x: HTTP 401' | cut -d'|' -f1)" != posted ] && ok "a POST answered 401 is not a heartbeat that reached control" || bad "401 counted" ""
+[ "$(hs '[BackLease] heartbeat NOT accepted by https://c.example.test/x: HTTP 401 unknown deployment' )" = "rejected|https://c.example.test/x: HTTP 401 unknown deployment" ] \
+  && ok "a heartbeat control did not accept is reported with control's answer" || bad "rejected detail" "$(hs '[BackLease] heartbeat NOT accepted by https://c.example.test/x: HTTP 401 unknown deployment')"
+sed -n '/^cmd_fleet() {/,/^}/p' "$CLI" | sed -n '/^    join)/,/^      ;;/p' | grep -q 'fleet_wait_heartbeat "\$hb_min"' \
+  && ok "fleet join's tail waits for the heartbeat" || bad "join tail wiring" "missing"
+OUT="$(env PATH="$HB/stubs:$PATH" HOME="$HB/home" MEMEX_LOCAL_HOME="$HB/home/.memex-local" "$CLI" fleet heartbeat --wait x 2>&1)" && bad "--wait x accepted" "$OUT" || ok "fleet heartbeat refuses a --wait that is not whole minutes"
+rm -rf "$HB"
+
+echo "── first-attach brings PyYAML when python3 has none (2026-11-10) ──────"
+PY="$(mktemp -d)"; mkdir -p "$PY/bin"; REALPY="$(command -v python3)"
+cat > "$PY/bin/python3" <<STUB
+#!/bin/bash
+if [ "\$1" = -c ] && [ "\$2" = 'import yaml' ]; then exit 1; fi
+if [ "\$1" = -m ] && [ "\$2" = venv ]; then
+  mkdir -p "\$3/bin"
+  printf '#!/bin/bash\nexit 0\n' > "\$3/bin/python3"
+  printf '#!/bin/bash\necho "\$*" >> "$PY/pip.log"\nexit 0\n' > "\$3/bin/pip"
+  chmod +x "\$3/bin/python3" "\$3/bin/pip"; exit 0
+fi
+exec "$REALPY" "\$@"
+STUB
+chmod +x "$PY/bin/python3"
+OUT="$(PATH="$PY/bin:$FAO/bin:$PATH" MEMEX_ATTACH_VENV="$PY/venv" MEMEX_HEADLESS=1 bash "$FA" "${FA_ARGS[@]}" --owner bob --owner-email bob@example.com </dev/null 2>&1)"
+grep -q "PyYAML for the attach" <<<"$OUT" && grep -q "install -q --disable-pip-version-check pyyaml" "$PY/pip.log" 2>/dev/null && ! grep -q "No module named 'yaml'" <<<"$OUT" \
+  && ok "first-attach creates a private venv with PyYAML when python3 lacks it (the second Mac Studio died at 0/6 without it)" \
+  || bad "first-attach pyyaml" "$(tail -c 700 <<<"$OUT") | pip: $(cat "$PY/pip.log" 2>/dev/null)"
+OUT2="$(PATH="$PY/bin:$FAO/bin:$PATH" MEMEX_ATTACH_VENV="$PY/venv" MEMEX_HEADLESS=1 bash "$FA" "${FA_ARGS[@]}" --owner bob --owner-email bob@example.com </dev/null 2>&1)"
+[ "$(grep -c pyyaml "$PY/pip.log")" = 1 ] && ! grep -q "PyYAML for the attach" <<<"$OUT2" \
+  && ok "…and reuses that venv on the next attach (no second install)" || bad "first-attach pyyaml reuse" "$(cat "$PY/pip.log")"
+rm -rf "$PY"
+
+echo "── fleet join attaches the build host WITHOUT the registry bundle index by default (2026-11-10) ──────"
+JH="$(mktemp -d)"; mkdir -p "$JH/code"
+printf '{"f":{"buildApi":"https://ops.example.test/api/builds","buildRegistry":"r.example.test","pullUser":"u","pluginsRegistry":"https://reg.example.test"}}' > "$JH/code/code.json"
+printf 'w' > "$JH/code/w"; printf 'p' > "$JH/code/p"; printf 'mwi_k' > "$JH/code/k"
+printf '#!/bin/bash\necho "$*" > "%s/args"\nls "%s/code/build" > "%s/files"\n' "$JH" "$JH" "$JH" > "$JH/fa.sh"
+fja() { env MEMEX_LOCAL_LIB=1 MEMEX_FIRST_ATTACH="$JH/fa.sh" "$@" bash -c '. "$0"; ACC_JOBS_ENABLED=true; ACC_TOK_ENABLED=false; fleet_apply_buildhost "$1"' "$CLI" "$JH/code" 2>&1; }
+OUT="$(fja)"
+! grep -q -- "--plugins-registry" "$JH/args" && ! grep -qx instance-key "$JH/files" && grep -q "bundle index stays off" <<<"$OUT" \
+  && ok "fleet join's build-host attach leaves the registry bundle index OFF by default (an H8 host never claims on the assemblies-only AI bundle)" \
+  || bad "join h8 default" "args=$(cat "$JH/args") files=$(tr '\n' ' ' < "$JH/files") $OUT"
+rm -rf "$JH/code/build"
+OUT="$(fja MEMEX_BUILDHOST_REGISTRY_BUNDLES=1)"
+grep -q -- "--plugins-registry https://reg.example.test" "$JH/args" && grep -qx instance-key "$JH/files" \
+  && ok "…and MEMEX_BUILDHOST_REGISTRY_BUNDLES=1 opts in (key file + --plugins-registry)" || bad "join h8 opt-in" "args=$(cat "$JH/args") $OUT"
+rm -rf "$JH"
+
+echo "── the tap tarball carries every directory the formula installs (2026-11-10) ──────"
+TB="$(mktemp -d)"
+if out="$(bash "$HERE/../../../deploy/homebrew/scripts/make-tarball.sh" 0.0.0-test "$TB/t.tar.gz" HEAD 2>&1)"; then
+  E="$(tar -tzf "$TB/t.tar.gz")"
+  grep -qxF "memex-local-0.0.0-test/deploy/backlease/first-attach.sh" <<<"$E" \
+    && ok "the tarball ships deploy/backlease/first-attach.sh (fleet join's build-host attach skipped without it on the second Mac Studio)" \
+    || bad "tarball backlease" "$(grep -c '' <<<"$E") entries, no first-attach.sh"
+  miss=""
+  for d in $(grep -oE 'Dir\["deploy/[A-Za-z0-9_.-]+' "$HERE/../../../deploy/homebrew/Formula/memex-local.rb" | sed 's/^Dir\["//' | sort -u); do
+    grep -qE "^memex-local-0.0.0-test/$d/." <<<"$E" || miss="$miss $d"
+  done
+  [ -z "$miss" ] && ok "every Dir[] the formula installs from is in the tarball" || bad "tarball dirs" "missing:$miss"
+else
+  bad "make-tarball" "$out"
+fi
+rm -rf "$TB"
+
+echo "── the token models and the default chat model fit THIS Mac's memory (2026-11-11) ──────"
+tm() { env MEMEX_LOCAL_LIB=1 MEMEX_TOKEN_MODELS_UNCHECKED=0 PATH="$STUBS:$PATH" bash -c '. "$0"; ollama() { return 1; }; ACC_TOK_MODELS="$1"; ACC_JOBS_ENABLED="$2"; token_models_fit 2>/dev/null; printf "%s" "$ACC_TOK_MODELS"' "$CLI" "$@"; }
+[ "$(MEMEX_HOST_MEM_GIB=128 MEMEX_COLIMA_MEM=16 tm 'qwen3.8:27b-mlx qwen3.6' true)" = "qwen3.8:27b-mlx qwen3.6" ] \
+  && ok "a 128 GB Mac Studio with jobs keeps both fleet token models" || bad "128 keeps" "$(MEMEX_HOST_MEM_GIB=128 MEMEX_COLIMA_MEM=16 tm 'qwen3.8:27b-mlx qwen3.6' true)"
+[ "$(MEMEX_HOST_MEM_GIB=56 MEMEX_COLIMA_MEM=16 tm 'qwen3.8:27b-mlx qwen3.6' true)" = "qwen3.8:27b-mlx" ] \
+  && ok "a 56 GB Mac with jobs keeps qwen3.8 (18 GiB) and drops qwen3.6 (22 GiB > 56−16−8−12 = 20)" || bad "56 drops" "$(MEMEX_HOST_MEM_GIB=56 MEMEX_COLIMA_MEM=16 tm 'qwen3.8:27b-mlx qwen3.6' true)"
+[ "$(MEMEX_HOST_MEM_GIB=48 MEMEX_COLIMA_MEM=16 MEMEX_OLLAMA_MODEL=qwen3:8b tm 'qwen3.8:27b-mlx qwen3.6' true)" = "qwen3:8b" ] \
+  && ok "a 48 GB Mac mini with jobs holds neither fleet model (budget 12 GiB) and serves its own qwen3:8b" || bad "48 none" "$(MEMEX_HOST_MEM_GIB=48 MEMEX_COLIMA_MEM=16 MEMEX_OLLAMA_MODEL=qwen3:8b tm 'qwen3.8:27b-mlx qwen3.6' true)"
+OUT="$(env MEMEX_LOCAL_LIB=1 MEMEX_TOKEN_MODELS_UNCHECKED=0 MEMEX_HOST_MEM_GIB=24 MEMEX_COLIMA_MEM=12 MEMEX_OLLAMA_MODEL=qwen3:8b bash -c '. "$0"; ollama() { return 1; }; ACC_TOK_MODELS="qwen3.8:27b-mlx qwen3.6"; ACC_JOBS_ENABLED=false; token_models_fit; printf "MODELS=%s" "$ACC_TOK_MODELS"' "$CLI" 2>&1)"
+case "$OUT" in *"cannot hold: qwen3.8:27b-mlx(18 GiB) qwen3.6(22 GiB)"*"serves its own chat model 'qwen3:8b'"*"MODELS=qwen3:8b") ok "a 24 GB Mac mini serves its own chat model when no declared token model fits, and says why" ;; *) bad "24 fallback" "$OUT" ;; esac
+[ "$(MEMEX_HOST_MEM_GIB=128 MEMEX_COLIMA_MEM=16 tm 'my-own:model' false)" = "my-own:model" ] && ok "a model of unknown size is kept (said as unchecked), never silently dropped" || bad "unknown kept" ""
+d() { env MEMEX_LOCAL_LIB=1 MEMEX_PROFILE= MEMEX_OLLAMA_MODEL= MEMEX_HOST_ARCH=arm64 MEMEX_COLIMA_MEM=16 "$@" bash -c '. "$0"; host_default_model' "$CLI"; }
+[ "$(d MEMEX_HOST_MEM_GIB=48 MEMEX_HOST_TAKES_JOBS=0)" = "qwen3.8:27b-mlx" ] && [ "$(d MEMEX_HOST_MEM_GIB=48 MEMEX_HOST_TAKES_JOBS=1)" = "qwen3:8b" ] && [ "$(d MEMEX_HOST_MEM_GIB=64 MEMEX_HOST_TAKES_JOBS=1)" = "qwen3.8:27b-mlx" ] \
+  && ok "the default chat model leaves room for a build VM on a jobs YES: 48 GB → qwen3:8b with jobs, qwen3.8 without; 64 GB → qwen3.8 either way" || bad "jobs-aware default" "$(d MEMEX_HOST_MEM_GIB=48 MEMEX_HOST_TAKES_JOBS=1)"
+
+echo "── fleet doctor: control's view of this Mac, each reading green or red with a remedy (2026-11-11) ──────"
+FD="$(mktemp -d)"; mkdir -p "$FD/home/.memex-local" "$FD/stubs"
+mkdir -p "$FD/state"; echo "escrowed 2026-11-12T09:00:00Z" > "$FD/state/bootstrap-token"; echo "ok 2026-11-12T09:00:00Z mini-owner" > "$FD/state/operator-ssh"
+printf 'config:\n  memex_portal:\n    Hosting__Deployment: "mini-1"\n    Hosting__ModuleReportSecret: "s3cr3t-heartbeat-key-value"\n    Hosting__ControlInbox__Url: "http://127.0.0.1:1/api/hooks/Hosting/PlatformBuilds"\n' > "$FD/home/.memex-local/fleet.yaml"
+cat > "$FD/srv.py" <<'PY'
+import hashlib, hmac, http.server, json, sys, time
+mode = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0)); body = self.rfile.read(n)
+        if mode == "404": self.send_response(404); self.end_headers(); return
+        want = "sha256=" + hmac.new(b"s3cr3t-heartbeat-key-value", body, hashlib.sha256).hexdigest()
+        d = json.loads(body)
+        if self.path != "/api/fleet/self-status" or self.headers.get("X-Hub-Signature-256") != want or d.get("deployment") != "mini-1" or abs(d["ts"] - time.time()) > 300:
+            self.send_response(401); self.end_headers(); return
+        out = {"deployment": "mini-1", "now": "2026-11-11T10:00:00Z", "heartbeat": {"lastAt": "2026-11-11T09:59:48Z", "ageSeconds": 12},
+               "record": {"present": mode != "norecord", "path": "Deployments/mini-1", "kind": "mac-host"},
+               "enrolment": {"path": "Admin/MachineEnrolments/mini-1-x", "state": "joined", "open": None},
+               "hostStatus": {"present": mode != "norecord", "at": "2026-11-11T09:59:48Z"}}
+        b = json.dumps(out).encode(); self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(b)
+import os
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+with open(sys.argv[2] + ".tmp", "w") as f: f.write(str(s.server_address[1]))
+os.replace(sys.argv[2] + ".tmp", sys.argv[2])
+s.serve_forever()
+PY
+printf '#!/bin/bash\nprintf "NAME ID SIZE MODIFIED\\nqwen3:8b abc 5.2 GB now\\n"\n' > "$FD/stubs/ollama"
+printf '#!/bin/bash\nexit 0\n' > "$FD/stubs/curl"; chmod +x "$FD/stubs/"*
+fd() { local port=""; rm -f "$FD/port" "$FD/port.tmp"; python3 "$FD/srv.py" "$1" "$FD/port" 2>"$FD/srv.err" & local pid=$!; for _ in $(seq 1 150); do [ -s "$FD/port" ] && port="$(cat "$FD/port")" && break; sleep 0.2; done
+  [ -n "$port" ] || { echo "the test server did not start: $(tail -c 400 "$FD/srv.err" 2>/dev/null)"; kill "$pid" 2>/dev/null; return 2; }
+  printf 'config:\n  memex_portal:\n    Hosting__ReportTo: "http://127.0.0.1:%s"\n    Hosting__Deployment: "mini-1"\n    Hosting__BackLease__Accept__Jobs__Enabled: "false"\n    Hosting__BackLease__Accept__Tokens__Enabled: "false"\n' "$port" > "$FD/home/.memex-local/backlease.yaml"
+  env PATH="$FD/stubs:$STUBS:$PATH" HOME="$FD/home" MEMEX_LOCAL_HOME="$FD/home/.memex-local" MEMEX_OLLAMA_MODEL=qwen3:8b MEMEX_FLEET_STATE_DIR="$FD/state" "$CLI" fleet doctor 2>&1; local rc=$?
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return "$rc"; }
+OUT="$(fd ok)"; RC=$?
+[ "$RC" = 0 ] && grep -q "control's last heartbeat from 'mini-1': 12 s ago" <<<"$OUT" && grep -q 'Deployments/mini-1 on control (kind mac-host)' <<<"$OUT" && grep -q 'enrolment: joined' <<<"$OUT" \
+  && grep -q 'model qwen3:8b: installed and answering' <<<"$OUT" && grep -q 'every reading is green' <<<"$OUT" \
+  && ok "fleet doctor reads control's signed view (heartbeat age, record, enrolment, host status) and the model, all green → exit 0" || bad "doctor green" "rc=$RC $OUT"
+case "$OUT" in *s3cr3t*) bad "fleet doctor printed the heartbeat key" "" ;; *) ok "fleet doctor never prints the heartbeat key (a fingerprint only)" ;; esac
+grep -q 'bootstrap token: escrowed to the MDM' <<<"$OUT" && grep -q "operator SSH: Remote Login on, the operator's keys installed" <<<"$OUT" \
+  && ok "fleet doctor reads the bootstrap's own readings: bootstrap token escrowed and operator SSH green" || bad "doctor bootstrap readings" "$OUT"
+echo "not-escrowed 2026-11-12T09:00:00Z command since 2026-11-12T08:00:00Z" > "$FD/state/bootstrap-token"
+OUT="$(fd ok)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'bootstrap token: NOT escrowed' <<<"$OUT" && grep -q 'remedy: sign out and back in.*sudo profiles install -type bootstraptoken' <<<"$OUT" \
+  && ok "an un-escrowed bootstrap token is RED: sign out and back in first, then 'sudo profiles install -type bootstraptoken'" || bad "doctor bootstrap token red" "rc=$RC $OUT"
+mkdir -p "$FD/home/.memex-local/enrol"; printf 'x' > "$FD/home/.memex-local/enrol/mini-1.signin"
+OUT="$(fd ok)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'sign-in: handed over by the join .* but NOT installed yet' <<<"$OUT" && ok "a handed-over sign-in that is not installed yet is RED in fleet doctor, with its remedy" || bad "doctor pending signin" "rc=$RC $OUT"
+rm -f "$FD/home/.memex-local/enrol/mini-1.signin"
+rm -f "$FD/state/bootstrap-token"
+OUT="$(fd ok)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'bootstrap token: no reading' <<<"$OUT" && ok "no bootstrap-token reading at all is RED (the bootstrap has not run here), never a pass" || bad "doctor no reading" "rc=$RC $OUT"
+echo "escrowed 2026-11-12T09:00:00Z" > "$FD/state/bootstrap-token"
+mv "$FD/home/.memex-local/fleet.yaml" "$FD/fleet.yaml.kept"
+printf 'failed 2026-11-12T11:00:00Z exit 1: err  setup --apply: the portal refused the answers — signIn: Choose at least one way to sign in\n' > "$FD/state/stage"
+printf 'skipped 2026-11-12T11:00:00Z the setup comes first\n' > "$FD/state/join"
+OUT="$(env PATH="$FD/stubs:$STUBS:$PATH" HOME="$FD/home" MEMEX_LOCAL_HOME="$FD/home/.memex-local" MEMEX_FLEET_STATE_DIR="$FD/state" "$CLI" fleet doctor 2>&1)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'not joined' <<<"$OUT" && grep -q "the fleet bootstrap is stuck at: failed .*signIn: Choose at least one way to sign in" <<<"$OUT" && grep -q "the fleet bootstrap's join: skipped" <<<"$OUT" \
+  && ok "not joined on a fleet Mac: fleet doctor names the bootstrap's join reading and the stage it is stuck at, with why" || bad "doctor not joined stage" "rc=$RC $OUT"
+mv "$FD/fleet.yaml.kept" "$FD/home/.memex-local/fleet.yaml"; rm -f "$FD/state/stage" "$FD/state/join"
+OUT="$(fd norecord)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'control has no Deployments/mini-1 record' <<<"$OUT" && grep -q 'remedy: the Approve opens it as a pull request' <<<"$OUT" \
+  && ok "a missing Deployments record is RED with its remedy, and the doctor exits 1" || bad "doctor no record" "rc=$RC $OUT"
+NL='[DefaultInstall] PluginCatalog:InstallByDefault names Plugins/Hosting exactly, and the default install selects NOTHING for it: the registry'"'"'s listing for this instance does not carry that package (this instance is on plan free; listing complete: True).'
+OUT="$(FAKE_MODULE_LOAD="$NL" fd ok)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'the registry does not LIST Hosting to this instance.*(plan free)' <<<"$OUT" && grep -q 'remedy: a platform admin of .*Instance grants.*--key mwr_.*memex-local update.*memex-local fleet heartbeat' <<<"$OUT" \
+  && ok "fleet doctor is RED when the portal log says the registry does not list Hosting, with the plan remedy" || bad "doctor not listed" "rc=$RC $OUT"
+OUT="$(FAKE_MODULE_LOAD='The default install matched no packages for the operator'"'"'s patterns (wanted [Plugins/Hosting]; 40 pre-installed package(s) were still selected).' fd ok)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'does not LIST Hosting.*(plan unknown)' <<<"$OUT" && ok "…also for platform ≤ 3.1.13051's 'matched no packages' line (plan unknown)" || bad "doctor not listed old" "rc=$RC $OUT"
+OUT="$(FAKE_MODULE_LOAD='[DefaultInstall] PluginCatalog:InstallByDefault names Plugins/Hosting exactly, and the registry REFUSES it by plan tier: Hosting needs plan tier enterprise, this instance is on free.' fd ok)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'REFUSES Hosting.*plan tier enterprise, this instance is on free' <<<"$OUT" && grep -q 'remedy: .*plan tier enterprise.*Instance grants' <<<"$OUT" \
+  && ok "…and RED with the tier named when the registry refuses Hosting by plan tier" || bad "doctor tier" "rc=$RC $OUT"
+OUT="$(fd 404)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'does not answer /api/fleet/self-status yet' <<<"$OUT" && ok "a control that does not serve the endpoint is RED (unread), never a pass" || bad "doctor 404" "rc=$RC $OUT"
+# a jobs-YES Mac whose runner logs carry no claim line (and no seed): the doctor still reads to the END — a grep that matches
+# nothing must never end it under set -e (the second Mac's first doctor stopped silently after "build disk", exit 1)
+cat > "$FD/stubs/colima" <<'STUB'
+#!/bin/bash
+case "$*" in
+  *version*) echo "colima version 0.10.3" ;;
+  "list --json") echo '{"name":"build","status":"Running","cpus":16,"memory":92341796864,"disk":214748364800}' ;;
+  ssh*df*) echo "155 GiB free of 196 GiB" ;;
+  *) : ;;
+esac
+exit 0
+STUB
+cat > "$FD/stubs/kubectl" <<'STUB'
+#!/bin/bash
+case "$*" in
+  *version*) echo "Client Version: v1.37.1" ;;
+  *"get pods"*) printf 'build-host-mac-a 1/1 Running 0 1m\nbuild-host-mac-b 1/1 Running 0 1m\n' ;;
+  *logs*) echo "build-run: nothing relevant" ;;
+esac
+exit 0
+STUB
+chmod +x "$FD/stubs/colima" "$FD/stubs/kubectl"
+fdj() { local port; rm -f "$FD/port"; python3 "$FD/srv.py" ok "$FD/port" 2>"$FD/srv.err" & local pid=$!; for _ in $(seq 1 150); do [ -s "$FD/port" ] && port="$(cat "$FD/port")" && break; sleep 0.2; done
+  printf 'config:\n  memex_portal:\n    Hosting__ReportTo: "http://127.0.0.1:%s"\n    Hosting__Deployment: "mini-1"\n    Hosting__BackLease__Accept__Jobs__Enabled: "true"\n    Hosting__BackLease__Accept__Tokens__Enabled: "false"\n' "$port" > "$FD/home/.memex-local/backlease.yaml"
+  env PATH="$FD/stubs:$STUBS:$PATH" HOME="$FD/home" MEMEX_LOCAL_HOME="$FD/home/.memex-local" MEMEX_OLLAMA_MODEL=qwen3:8b MEMEX_FLEET_STATE_DIR="$FD/state" "$CLI" fleet doctor 2>&1; local rc=$?
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return "$rc"; }
+OUT="$(fdj)"; RC=$?
+[ "$RC" = 1 ] && grep -q 'no release follower installed' <<<"$OUT" && grep -q 'reading(s) red' <<<"$OUT" && grep -q 'runner: no claim line in the last 400 log lines' <<<"$OUT" && grep -q 'package seed: not installed yet' <<<"$OUT" && grep -q 'model qwen3:8b' <<<"$OUT" && grep -q 'fleet doctor:' <<<"$OUT" \
+  && ok "fleet doctor on a jobs-YES Mac reads to the END when the runner logs carry no claim line (exit 1 for exactly its one red reading — no follower in the fixture — never a silent stop after the disk reading)" || bad "doctor jobs path" "rc=$RC $OUT"
+rm -rf "$FD"
+
+echo "── fleet join: a sign-in that cannot be installed yet is HANDED OVER by file; one that fails makes the join fail (2026-11-12) ──"
+SH="$(mktemp -d)"; mkdir -p "$SH/items" "$SH/home/.memex-local/enrol"
+printf 'super-secret-client-value-1234' > "$SH/items/e"
+printf '{"v":2,"d":"mini-1","f":{"tenant":"00000000-0000-0000-0000-0000000000aa","clientId":"11111111-1111-1111-1111-111111111111"},"s":{}}' > "$SH/items/code.json"
+sh_run() { env HOME="$SH/home" MEMEX_LOCAL_HOME="$SH/home/.memex-local" MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c '. "$0"; id=mini-1; '"$SHE" "$CLI" 2>&1; }
+# 1. no private-network name yet (the bootstrap brings the network up after the join): handed over, 0600, never printed
+SHE='tailnet_name() { :; }; rc=0; fleet_apply_signin "'"$SH/items"'" || rc=$?; echo "RC=$rc"'
+OUT="$(sh_run)"
+case "$OUT" in *"handed to the device bootstrap"*"RC=0"*) [ "$(cat "$SH/home/.memex-local/enrol/mini-1.signin")" = "super-secret-client-value-1234" ] && [ "$(ls -l "$SH/home/.memex-local/enrol/mini-1.signin" | cut -c1-10)" = "-rw-------" ] \
+  && grep -q '^clientId=11111111-1111-1111-1111-111111111111$' "$SH/home/.memex-local/enrol/mini-1.signin-facts" && grep -q '^tenant=00000000-0000-0000-0000-0000000000aa$' "$SH/home/.memex-local/enrol/mini-1.signin-facts" \
+  && ok "no private-network name yet: the sign-in is HANDED OVER (0600 secret + tenant/client id), never dropped" || bad "signin handover files" "$(ls -l "$SH/home/.memex-local/enrol")" ;; *) bad "signin handover" "$OUT" ;; esac
+case "$OUT" in *super-secret*) bad "the sign-in secret is never printed" "" ;; *) ok "the handed-over sign-in secret is never printed" ;; esac
+# 2. a name, and `internal on` fails: the step FAILS (the join turns non-zero)
+SHE='tailnet_name() { echo mini-1.net.example.test; }; cmd_internal() { return 1; }; rc=0; fleet_apply_signin "'"$SH/items"'" || rc=$?; echo "RC=$rc"'
+OUT="$(sh_run)"
+case "$OUT" in *"'internal on' failed — NOT installed"*"RC=1"*) ok "a sign-in that does not land fails the step (exit 1), never a warning that reads ok" ;; *) bad "signin failure" "$OUT" ;; esac
+# 3. a secret without its client id: NOT installed, failed
+printf '{"v":2,"d":"mini-1","f":{},"s":{}}' > "$SH/items/code.json"
+SHE='tailnet_name() { echo n; }; rc=0; fleet_apply_signin "'"$SH/items"'" || rc=$?; echo "RC=$rc"'
+OUT="$(sh_run)"; case "$OUT" in *"no tenant/clientId — NOT installed"*"RC=1"*) ok "a secret without its tenant/client id is NOT installed and fails the step" ;; *) bad "signin no facts" "$OUT" ;; esac
+grep -q 'fleet_apply_signin "\$items" || signin_failed=1' "$CLI" && grep -q 'exit 4' "$CLI" && ok "the join exits 4 when its sign-in did not land (a join without a sign-in never reads ok)" || bad "join exit 4" ""
+rm -rf "$SH"
+
+echo "── the local ingress never pins browsers to https for localhost: HSTS max-age=0 (2026-11-11) ──────"
+HS="$(mktemp -d)"; mkdir -p "$HS/stubs"
+cat > "$HS/stubs/helm" <<STUB
+#!/bin/bash
+echo "helm \$*" >> "$HS/log"; exit 0
+STUB
+cat > "$HS/stubs/kubectl" <<STUB
+#!/bin/bash
+echo "kubectl \$*" >> "$HS/log"
+case "\$*" in *"get configmap ingress-nginx-controller"*) cat "$HS/cm" 2>/dev/null || exit 1 ;; esac
+exit 0
+STUB
+chmod +x "$HS/stubs/"*
+hs() { env MEMEX_LOCAL_LIB=1 PATH="$HS/stubs:$PATH" bash -c '. "$0"; '"$1" "$CLI" 2>&1; }
+: > "$HS/log"; hs install_ingress_nginx >/dev/null
+grep -q -- '--set-string controller.config.hsts=true --set-string controller.config.hsts-max-age=0 --set-string controller.config.hsts-include-subdomains=true --set-string controller.config.hsts-preload=false' "$HS/log" \
+  && ok "a fresh install's ingress-nginx answers Strict-Transport-Security max-age=0; includeSubDomains (never the 1-year default that broke loopback OAuth)" || bad "install hsts" "$(cat "$HS/log")"
+printf 'allow-snippet-annotations=false\n' > "$HS/cm"; : > "$HS/log"
+OUT="$(hs ensure_ingress_no_hsts)"
+grep -q 'kubectl -n ingress-nginx patch configmap ingress-nginx-controller --type merge -p {"data":{"hsts":"true","hsts-max-age":"0","hsts-include-subdomains":"true","hsts-preload":"false"}}' "$HS/log" \
+  && ok "an EXISTING install gets the same keys patched into the controller's ConfigMap on update (no chart re-run)" || bad "update hsts patch" "$OUT / $(cat "$HS/log")"
+printf 'hsts=true\nhsts-include-subdomains=true\nhsts-max-age=0\nhsts-preload=false\n' > "$HS/cm"; : > "$HS/log"
+hs ensure_ingress_no_hsts >/dev/null; ! grep -q 'patch' "$HS/log" && ok "…and a ConfigMap that already says so is left alone (idempotent)" || bad "hsts idempotent" "$(cat "$HS/log")"
+rm -f "$HS/cm"; OUT="$(hs ensure_ingress_no_hsts)"
+grep -q 'no ConfigMap ingress-nginx/ingress-nginx-controller to set HSTS on' <<<"$OUT" && ok "a missing controller ConfigMap is SAID (a warning naming it), never a silent skip" || bad "hsts not found" "$OUT"
+grep -q 'ensure_ingress_no_hsts' <<<"$(sed -n '/^cmd_update() {/,/^}/p' "$CLI")" && ok "every update runs it (existing installs on eiger and the second Mac heal on their next update)" || bad "update calls hsts" ""
+A="$(sed -n '/^cmd_autoupdate() {/,/^}/p' "$CLI")"
+grep -q 'memex-local" settle' <<<"$A" && [ "$(grep -n 'memex-local" settle' <<<"$A" | cut -d: -f1)" -lt "$(grep -n 'chart and share assets unchanged' <<<"$A" | head -1 | cut -d: -f1)" ] \
+  && grep -q 'ensure_ingress_no_hsts' <<<"$(sed -n '/^cmd_settle() {/,/^}/p' "$CLI")" \
+  && ok "the autoupdate agent runs 'settle' after EVERY upgrade, before the assets-unchanged skip — a script-only repair (HSTS) reaches existing Macs" || bad "autoupdate settle" ""
+rm -rf "$HS"
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"

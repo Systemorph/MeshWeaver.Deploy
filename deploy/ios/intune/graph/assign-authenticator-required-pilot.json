@@ -1,0 +1,16 @@
+{
+  "mobileAppAssignments": [
+    {
+      "@odata.type": "#microsoft.graph.mobileAppAssignment",
+      "intent": "required",
+      "target": {
+        "@odata.type": "#microsoft.graph.groupAssignmentTarget",
+        "groupId": "b892bd0f-86ed-46ce-8593-3b9860f7a557"
+      },
+      "settings": {
+        "@odata.type": "#microsoft.graph.iosStoreAppAssignmentSettings",
+        "uninstallOnDeviceRemoval": false
+      }
+    }
+  ]
+}

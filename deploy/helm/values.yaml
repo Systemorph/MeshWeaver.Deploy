@@ -1084,6 +1084,14 @@ registry:
   validationUrl: ""
   notifications:
     url: ""                       # registry events are POSTed here when set
+  # THE MAINTENANCE WINDOW (MeshWeaver.Plugins#4370; deploy/aks/REGISTRY-MAINTENANCE.md). Set ONLY by
+  # `hosting-registry-maintenance`, run by the fleet cleanup while it holds the registry-maintenance
+  # lease — never a standing value in a record or an overlay, and never by a hand `helm upgrade`.
+  maintenance:
+    readOnly: false               # true → storage.maintenance.readonly: pushes and DELETEs refused, pulls served
+    garbageCollect: ""            # a run id → the Job memex-registry-gc-<run> (`registry garbage-collect`,
+                                  #            no --delete-untagged); refused unless readOnly is true
+    gcDeadlineSeconds: 1500       # the collect Job's activeDeadlineSeconds (60..1500 — the window's budget)
   ingress:
     className: "nginx"
     clusterIssuer: ""             # cert-manager ClusterIssuer; empty = tlsSecret is pre-created
@@ -1226,6 +1234,11 @@ database:
 # job `build-host-latest`) into the operations record through its signed inbox — never by hand.
 buildHosts:
   enabled: false
+  # The MACHINE these hosts run on — its Deployments/<id> on the control instance (a leased Mac's back-lease
+  # deployment), or empty. Set, every host names itself `<machine>-<pod>` in the runs it claims, so the fleet's price
+  # list credits the run to that machine by host prefix (`hosts: ["<machine>-"]`); two Macs serving one queue are
+  # otherwise the same `build-host-<channel>-…` and their work is credited to neither. A lower-case DNS label.
+  machine: ""
   # The build API base the host claims from, in-cluster (http is accepted only for a cluster-local
   # host), e.g. http://memex-portal-service:8080/api/builds. The KEDA trigger reads `<apiUrl>/queue`.
   apiUrl: ""
@@ -1248,8 +1261,25 @@ buildHosts:
     accessMode: "ReadWriteMany"
     # claim (default): the claim above, shared by every replica. node: a node-local emptyDir (sized by `size`, no
     # claim) — what a host in its own user namespace (sandbox.userNamespace) needs, since an SMB/NFS claim cannot be
-    # ID-mapped into it.
+    # ID-mapped into it. host: a hostPath directory on the node (`path`, absolute; `size` and `create` are refused, no
+    # claim is made, and storageClass/accessMode are unused) shared by every host on
+    # that node and outliving restarts and scale-in — node setup must prepare it owned by the host's uid (1654), since
+    # it is mounted as type Directory.
     medium: "claim"
+    # cache.medium host only: the node directory (e.g. /var/lib/mw-build-cache). Refused with any other medium.
+    path: ""
+    # THE CACHE BUDGET (deploy/build-host/CACHE-BUDGET.md): the whole cache's total in whole GiB, never above `size`. Unset
+    # (null) = the declared `size` less 10 % (the margin holds the masters, outputs and markers no share covers); with no
+    # size and no maxGi (a claim made elsewhere, cache.medium host) there is no budget and only `sliceCacheMaxGi` applies.
+    # The runner keeps every area under its share, least recently used first, never an entry a run or a writer holds — a
+    # local-path claim never enforces its capacity itself (a Mac's 20Gi claim held 43 GiB on 2026-11-11).
+    maxGi: null
+    # Each area's share of the budget, whole GiB (null = the default percentage of the budget). The chart REFUSES a share
+    # above the budget and shares that sum above it. treeGi: the deployment trees (warm workspace; 0 = no tree is kept and
+    # no warm build starts), default 50 %; slicesGi: the module-slice cache (at least 1; `sliceCacheMaxGi` is its older
+    # name), 20 %; nugetGi: the warm NuGet cache, 15 %; refsetsGi: the staged reference sets, 5 %; preparedGi: the
+    # prepared inputs, 5 %.
+    shares: {treeGi: null, slicesGi: null, nugetGi: null, refsetsGi: null, preparedGi: null}
   # Opt-in channels beyond latest/stable, each configured like them under `buildHosts.<name>` (e.g. a leased-back
   # Mac's `mac`: only jobs routed to that channel land there).
   extraChannels: []
@@ -1295,17 +1325,59 @@ buildHosts:
   # cgroup, and the runner REFUSES TO START when the declared slots exceed that (MW_BUILD_STAGE_SLOTS, build-run.py
   # `stage_slots_refusal`) — so lowering `resources` means lowering this too. 1 = every run serial.
   stageSlots: 8
-  # The WARM WORKSPACE (MeshWeaver.Plugins Hosting/BuildQueue.md §7.2): a replica keeps one MAIN workspace per repository
-  # under its work volume, written only by the host — moved to the default branch's tip and built by the tip's declared
-  # `warmBuild` while idle — and every run builds in a disposable COPY of it moved to its own sha (obj/ and bin/ carried),
-  # so a pull request never writes what a later run reads. Wiped whenever the platform set or images change; a fresh clone
-  # on any failure. Every run's plan says how its tree was seeded. Off by default; turned on per host once measured.
+  # The WARM WORKSPACE (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3b): ONE master per host (the bare mirrors under the cache,
+  # updated only by `git fetch`) and ONE persistent tree per repository per host (MeshWeaver.Plugins Hosting/OneBuildTree.md),
+  # `<cache>/deploy/<channel>-tree/<repo>`, written only by its single writer — moved IN PLACE to the default branch's tip and
+  # built by the tip's declared `warmBuild` while idle, then hashed into an integrity manifest. A platform update (a new
+  # compiler) rebuilds that same tree WHOLE in place; a runner roll rebuilds nothing. NOTHING IS EVER COPIED: a
+  # run overlays that tree (runOverlay, below) or takes a cold `git worktree add` off the master, said; every run's plan
+  # states `bytes copied = 0`. Off by default; turned on per host once measured.
   warmWorkspace: false
   # The MODULE-HUB BROKER (MeshWeaver.Plugins Hosting/BuildQueue.md §7.4): a stage names a module and the HOST asks that
   # module's build hub on the control instance (Hit → the output is fetched and verified; Grant → the stage builds it and the
   # host uploads it by its hash). Identity is the host's: fingerprints from the pristine tree under the DEFAULT BRANCH's
   # `moduleHub` declaration, lane and commit from the run. Inert unless a repository declares `moduleHub`. Off by default.
   moduleHub: false
+  # The BOUND of the host's module-slice cache (`<cache>/module-slices`), whole GiB in [1, 4096]: above it the runner evicts the
+  # least-recently-used slices (never one a run is copying, never one used in the last 10 minutes). The slices are a cache of
+  # the control instance's content-addressed, append-only module store, so an evicted one is fetched again by its hash.
+  # Unbounded, it reached 117 GB on a Mac (2026-11-10) and put the node at DiskPressure (MeshWeaver.Plugins Hosting/OneBuildTree.md).
+  # null = 32 without a cache budget; with one, the slices' share (cache.shares.slicesGi, default 20 % of the budget) — and
+  # a value set here is that share, refused above the budget.
+  sliceCacheMaxGi: null
+  # The port the runner answers the kubelet's readiness probe on (GET /ready: 200 once the host is staged, else 503), whole
+  # number in [1024, 65535]. An httpGet probe, never an exec: on the Mac hosts every exec into the user-namespaced build
+  # container fails (runc 1.4.0 + `hostUsers: false`), so an exec probe never passed. No Service exposes it.
+  readyPort: 8090
+  # NO NETWORK DURING A RUN (MeshWeaver.Plugins Hosting/OneBuildTree.md): `offline` runs every stage in its own network
+  # namespace (loopback only) with the prepared package folder as NuGet's ONLY source, and a package restored per run is an
+  # ERROR (MWPREP001). `open` keeps today's network and says what a run still fetched. Turn `offline` on once a run's whole
+  # package closure is prepared (the seed / warm restore) — before that, every run that restores per run goes red.
+  stageNetwork: "open"
+  # THE NODE'S DISK. Every replica's work volume (workSizeLimit), the cache and the images share one disk; replicas ×
+  # workSizeLimit may exceed it (a 98 GB Mac with 3 × 52 GiB evicted 17 pods for DiskPressure, 2026-11-10). A host therefore
+  # claims a run only when, measured on the node at claim time, `runDiskGi` (what one run may write) still leaves
+  # `diskHeadroomPercent` of the disk free (above the kubelet's default hard threshold, nodefs.available < 10 %). 0 / 0
+  # turns the guard off.
+  runDiskGi: 20
+  diskHeadroomPercent: 15
+  # The SHARED TREE switch — INERT since §7.3b, kept only so existing values still render (retire it in a later chart change).
+  # The deployment trees always live on the cache volume, so the warm path is chosen by the two other switches alone:
+  #   warmWorkspace  runOverlay  →  a run's tree
+  #   false          (any)          a fresh clone per run; no master worktree, no deployment tree is built
+  #   true           false          the deployment tree is built while idle, but every run takes a COLD `git worktree add`
+  #                                 off the master (said in its log and plan) — measure the writer before turning runs on
+  #   true           true           an OVERLAY of the verified deployment tree; a busy, unbuilt or refused tree → cold, said
+  # sharedTree changes none of these rows. A host that ran §7.3 with sharedTree: true keeps its old generations under
+  # `<cache>/shared` only until the new runner's first idle pass, which deletes them (`retire_legacy_shared`).
+  sharedTree: false
+  # The RUN OVERLAY (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3b): with the warm workspace on, a run's tree is an OVERLAY —
+  # its deployment tree read-only beneath (held by a shared lock for the whole run, verified against its integrity manifest
+  # first), the run's own upper layer taking every write; its .git is made by git, not copied (measured on the Mac,
+  # 2026-11-08: 32 s and 18 GiB per run copied → 3 s and 20 KiB mounted). The runner re-enters itself in its own user +
+  # mount namespace (`unshare -Urm`) to mount it. Where it cannot — or the tree is busy, not built, or refused — the run
+  # takes a cold worktree off the master, said; never a copy. Off by default.
+  runOverlay: false
   # KEDA: polling, the scale-to-zero calm window, and the scale-down stabilization window (longer
   # than a claim's round trip, so a replica is not removed between two runs).
   pollingInterval: 15

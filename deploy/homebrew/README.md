@@ -167,6 +167,37 @@ After the wizard the portal restarts and installs the packages you chose. While 
 packages — this finishes by itself"*. That is a state, not an error; only exit 1 (a red with a
 remedy) means something is broken.
 
+### The owner — collected at onboarding, the instance's global administrator
+
+**The general onboarding rule (maintainer, 2026-11-08): every onboarding collects the OWNER, and the owner is the
+instance's global administrator.** `up`, `fleet join`, the `.pkg`'s unattended daemon and
+`deploy/backlease/first-attach.sh` all collect it. It is a MeshWeaver **user id**, the id the owner signs in as
+(for example `rbuergi`, not the e-mail), plus their **e-mail**. Both are written into this install's OWN overlay,
+never into the image or a shared values file:
+
+| overlay key (`config.memex_portal`) | what it does |
+|---|---|
+| `Auth__GlobalAdmins__0` | the portal seeds `Admin/_Access/<id>_Access`: the owner is global administrator and can install packages (such as ClaudeCode) from Admin |
+| `Instance__Owner__Id`, `Instance__Owner__Email` | the owner as recorded on the instance |
+
+Sources, first that answers: `--owner <id> --owner-email <e-mail>` on `up` / `fleet join` (or `first-attach.sh`),
+`MEMEX_OWNER` / `MEMEX_OWNER_EMAIL`, the managed preferences `OwnerId` / `OwnerEmail` (an MDM profile), what the
+overlay already records, and on a terminal a question that suggests your login name. **An unattended install with no
+owner fails**: an instance never comes up without an administrator. An `update` of an older, ownerless install warns
+loudly instead, so an auto-update never halts.
+
+**On an Intune-managed Mac the work account is the default owner.** Before anyone is asked, the Mac's **work
+identity** answers: the managed preference `UserPrincipalName` (Intune token `{{userprincipalname}}`, profile
+`deploy/macos/intune/profiles/com.memex.local.mobileconfig`) or, on a Platform-SSO-registered Mac, `app-sso
+platform -s`. Its prefix is the owner id and the UPN the e-mail; the overlay then also gets
+`Authentication__Microsoft__LoginHint` / `__DomainHint`, so Microsoft sign-in offers that work account first and
+never silently picks a personal one. Every source above it still wins. Details: `deploy/macos/intune/README.md`,
+"Microsoft sign-in".
+
+Change the owner later with `memex-local owner --id <user-id> --email <e-mail>`, then `memex-local update --skip-image`.
+Never edit the YAML by hand. `memex-local owner status` shows the owner. Re-running any of these is idempotent.
+The same owner answers the fleet opt-in questions (`backlease accept`).
+
 ### First-run secrets & OAuth
 
 On first `up`, the CLI generates `~/.memex-local/values.local.yaml` from the
@@ -194,13 +225,53 @@ platform image in Colima's VM, sized for the host
 A Mac Studio's chat model is `qwen3.8:27b-mlx` itself. Any further model to offer is listed in `MEMEX_OLLAMA_EXTRA_MODELS`
 (`none` pulls none). Pulling a model does not offer it. A Mac serves the fleet only when its owner opts in.
 
+**Where the local models process prompts — the install's residency.** Every install declares ONE processing
+location, and the portal stamps it on each local (Ollama) model as its data residency
+(`OpenAICompatible__DataResidency` — `Eu`, `Global`, or a two-letter ISO code such as `CH`; only `Eu` counts as
+EU-only). Without it a local model reads as Unknown, and the model picker shows only its maker's flag: a Swiss
+Mac's `qwen` looks as if its prompts went to China, and a model whose residency is Unknown is never used for mail
+triage.
+
+- The first interactive `up` asks *"Where is this machine?"*. The macOS region (`AppleLocale`) only suggests the
+  default: an EU member state suggests `Eu`, Switzerland `CH`, anywhere else its ISO code. Type `none` to declare
+  nothing. Once answered, `up` does not ask again.
+- A headless install passes `up --residency CH` (or `MEMEX_RESIDENCY=CH`). With neither, nothing is declared and
+  the models stay Unknown. Nothing is ever guessed, and `Eu` is never applied silently.
+- On an existing install: `memex-local residency CH`, then `memex-local update --skip-image`
+  (`update --residency CH` does both). `memex-local residency` prints the declaration, `residency --clear` removes it,
+  and `status` and `llm status` print it.
+- It is kept in `~/.memex-local/residency` and written into the per-install layer `llm.auto.yaml`. An
+  `OpenAICompatible__DataResidency` line in the overlay `values.local.yaml` still wins.
+- `llm use --residency X` (any residency: `Eu`, `Global`, an ISO code) overrides it for the `llm` layer alone.
+  Without the flag, the layer copies nothing and the declaration applies. `backlease accept tokens` and
+  `fleet join` offer the declaration as the token residency when `--residency` is not given.
+
 **The owner's opt-in** (MeshWeaver.Plugins `Hosting/BackLease` §13). An enrolled Mac takes NO fleet jobs and serves
 NO token requests until its owner says yes and names the instances it takes each from. `fleet join` and
 `backlease enroll` ask both questions. The defaults are offered, not applied: jobs from `control.systemorph.com`,
-tokens from `*.meshweaver.cloud`, and the models `qwen3.8:27b-mlx qwen3.6`. The residency has no default; type
-where the machine is. A headless run passes `--accept-jobs=<patterns>` / `--no-accept-jobs` and
+tokens from `*.meshweaver.cloud`, and the models `qwen3.8:27b-mlx qwen3.6`. The residency defaults to the
+install's declaration (`memex-local residency`, above); with none declared, type where the machine is. A headless run passes `--accept-jobs=<patterns>` / `--no-accept-jobs` and
 `--accept-tokens=<patterns>` / `--no-accept-tokens` (with `--token-models`, `--residency`), and with no answer
-both stay off. Change an answer later with `memex-local backlease accept jobs|tokens [--from …] [--off] …`,
+both stay off. **Token slots.** How many requests the machine serves at once is the machine's capacity, not an owner choice.
+A Mac Studio is 2. It is measured: Ollama 0.40's MLX runner decodes one request at a time, and one stream saturates
+an M5 Max at about 65 tok/s. memex-local writes `Tokens__Slots` whenever tokens are on. `--token-slots <n>` is a
+calibrated override (1–32), and `--token-max-concurrency <n>` is the owner's optional ceiling below it. When the
+ceiling is unset the Mac serves at its full slot count. `--token-yield-at <pct>` sets the owner-CPU threshold
+(percent of one core; the code's default is 200) and is written only when given. `none` clears either. The host
+sampler reports `host.ownerCpuPercent`: the owner's CPU over the interval, excluding Ollama, the build VM, the
+portal VM and `kernel_task` (which can take whole cores under thermal pressure). That is what the Mac yields to.
+It also reports `host.cpuPercent` (the host's CPU busy across all cores, from a one-second `top` delta) and
+`host.netInBytesPerSec` / `host.netOutBytesPerSec` (bytes over the physical `en*` interfaces, averaged since the previous
+sample). Control records them with the rest of the readings in the fleet's 30-day metric history (MeshWeaver.Plugins
+`Hosting/FleetMetricHistory`), so a home-network burst can be lined up with what the Mac was doing. A reading that cannot
+be taken (first sample, a gap, a counter reset) is left out, never sent as 0.
+
+**Upgrading a Mac enrolled before token slots existed.** `memex-local update` adds the measured `Tokens__Slots`. A
+recorded `Tokens__MaxConcurrency` is kept as the owner's ceiling. That includes the `1` the first opt-in release
+wrote by default, because it cannot be told apart from a chosen 1. Lift it with
+`memex-local backlease accept tokens --max-concurrency none`.
+
+Change an answer later with `memex-local backlease accept jobs|tokens [--from …] [--off] …`,
 then `memex-local update`. `backlease status` prints the answers. They are written as
 `Hosting__BackLease__Accept__*` into `~/.memex-local/backlease.yaml`. The heartbeat carries them to control,
 which enforces them and can never switch them on.
@@ -247,7 +318,30 @@ memex-local fleet join --control https://<control-instance> --id studio-2
    `update` pulls the **public GHCR** images anonymously, so no `az login` is needed (`--from-acr`
    still works).
 
+6. It **waits for this Mac's first heartbeat** (bounded: `--heartbeat-wait <min>`, default 20; `0` skips;
+   `memex-local fleet heartbeat` waits again later). The heartbeat ships in the Hosting module, which the
+   default install lands *after* the update — and a landed module loads only at the next process start
+   (`[DefaultInstall] … MODULE SET proposed: sequence N — the landed modules load at the next restart`). So
+   when that line names Hosting, the join restarts the portal **once** itself, then ends on
+   `ok heartbeat posted to https://<control>/api/hooks/Hosting/Heartbeats HTTP 200`. A registry plan
+   that refuses Hosting (`Hosting needs plan tier enterprise, this instance is on free`) stops the join
+   at once with that cause and its remedy (raise the instance's plan on the registry, or register with
+   a key minted for that plan), never a wait that cannot end. Measured on the second Mac Studio
+   (2026-11-10): before this, no heartbeat left the Mac until a person ran `kubectl rollout restart`.
+
 `memex-local fleet status` shows the join and both fingerprints.
+
+**Kubelet's root lives on the VM's data disk.** A Colima VM has a ~19 GiB root disk and a large data disk
+at `/var/lib/rancher`. k3s puts kubelet's root (its "nodefs", what the node — and the Hosting heartbeat's
+`vm.diskFreeGi` — reports as its disk) on the root disk unless told otherwise, and control's placement
+(`minDiskGi: 20`) then refuses the Mac (the second Mac Studio reported 15.7). `up` therefore starts a NEW
+portal VM with `--k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet`,
+exactly as `buildhost apply` always started the build VM (both args, because a `--k3s-arg` replaces
+colima's default list). An EXISTING VM keeps its root disk: `fleet join`, `doctor` and `verify` warn about
+it, and `memex-local kubelet-root apply` repairs it — it adds the arg to `~/.colima/default/colima.yaml`
+(a backup beside it), restarts the VM (the portal is down for a few minutes; the database volume lives
+under `/var/lib/rancher` and is kept), and proves `/var/lib/rancher/kubelet/pods` exists afterwards.
+It is idempotent; `kubelet-root status` reports.
 
 **A fleet Mac's template carries the Hosting app.** In registry mode, a joined (`fleet join`) or
 back-leased (`backlease enroll`) Mac layers `share/values.local.fleet-host.yaml`. That layer names
@@ -259,6 +353,130 @@ opts out). A template that needs a newer platform, such as a package's `minMeshV
 with no hand on the machine. What the registry serves the instance is still its plan's decision.
  On the control instance,
 `Hosting/Heartbeats/Enrolments` lists every join with the first step not yet measured done.
+
+## Further instances on this Mac (`memex-local instances`)
+
+A Mac's FIRST instance (release `memex`) is its local control instance; further private instances are created
+from it (MeshWeaver.Plugins `Hosting/MacStudioFleet` §3). Each is its own helm release `memex-<name>` of the same
+chart in its own namespace `memex-<name>`, with its own Postgres (the chart's), its own data volume (a `local-path`
+claim, `persistence.data.create` — never the first instance's `/var/lib/memex-portal-data` hostPath) and its own
+generated `Ai__KeyProtection__MasterKey`.
+
+```bash
+memex-local instances create proof --host proof.<machine>.net.<domain> --owner-id <id> --owner-email <e-mail> \
+    [--display-name "Proof"] [--cpu 2] [--memory-gi 6] [--storage-gi 20] [--package Plugins/Notes]… \
+    [--chat-model <model>] [--no-embeddings]
+memex-local instances list [--json]          # the inventory (below)
+memex-local instances stop proof             # portal + database scaled to 0, data kept
+memex-local instances start proof            # capacity-checked, scaled back to 1
+memex-local instances update proof [--cpu 3] # re-layers, onto the image the first instance runs now
+memex-local instances remove proof --confirm proof   # helm uninstall + the namespace, database and data volumes
+```
+
+**The layers**, in order: the chart's defaults, the shared local defaults, the Mac's model layer (`llm.auto.yaml`,
+`llm.yaml`), registry mode, the fleet-host template, then the instance's own two layers in
+`~/.memex-local/instance-state/<name>/` — `values.json` (registry id `<machine>-<name>` at the SAME registry as
+the first instance, OPEN registration; `PluginCatalog__InstallByDefault__N` = `Plugins/Hosting` then the spec's
+packages, with `InstallPreInstalledPackages`; the owner as `Auth__GlobalAdmins__0` + `Instance__Owner__Id/Email`;
+`Portal__InstanceName`; the resources as requests and limits; the Ingress for the host with its TLS Secret; the
+first instance's Microsoft sign-in, invitation-only, development sign-in off; the model endpoints pointed at the
+instance's OWN namespace) and `secret-values.json` (0600: its Postgres password, master key, the sign-in secret).
+The sign-in and the inherited model keys are read from the first instance's RENDERED configuration (its
+ConfigMap and Secret), so they are what it actually runs, whichever layer set them. **Excluded:** the back-lease,
+fleet, build-host, publish, internal and bridge layers and the first instance's overlay — those are the first
+instance's own (its heartbeat, its keys, its names).
+
+**Refused** (nothing changed, exit 3): a name not `^[a-z][a-z0-9-]{1,22}[a-z0-9]$`, a reserved one (`memex
+control build e2e www api default monitoring ingress-nginx kube-system`, `kube-*`), a package not
+`<Source>/<Package>` or more than 40, a remove without `--confirm <name>`, and a create/start whose CPU or memory
+exceeds what the Colima VM has left (allocatable minus the running pods' REQUESTS — the numbers are named).
+
+**Certificate.** Through the Mac's `cert` configuration (lego, DNS-01): the host must lie inside its zone; the
+certificate becomes the instance's TLS Secret and `cert issue` (the daily renewal agent) renews every instance's
+too. Without a configuration the instance is still created and the result says which step is missing.
+
+**What the owner does** (printed as `actionsForOwner`, never done here): register
+`https://<host>/signin-microsoft`, `/auth/callback/Microsoft` and `/auth/ea/callback` on the sign-in app (and
+remove them after a remove); declare the private-network name — MagicDNS is authoritative for the network's zone, so
+a public DNS record does nothing: one Headscale `dns.extraRecords` entry per instance, `<host>` → this Mac's
+network address (`deploy/headscale/README.md`). A remove does NOT release the registry claim `<machine>-<name>`
+(the registry has no unregister API): re-creating the same name needs a registry administrator.
+
+### The executor — the bridge to the first instance's GUI (schema 1)
+
+In registry mode `up`/`update` (1) layer `~/.memex-local/instances-host.yaml` on the FIRST instance only — a
+read-write hostPath mount of `~/.memex-local/instances` at `/host-instances` and `Hosting__LocalInstances__Root:
+"/host-instances"`, `…__Machine` (the fleet deployment id, else the short host name), `…__NetworkName` (the Mac's
+private-network name, or empty) — and (2) load the launchd agent `com.memex.local.instances`
+(`memex-local instances agent run`, KeepAlive). `instances agent off` removes it and keeps it off across updates;
+`agent on|status|run-once` do what they say. `MEMEX_LOCAL_INSTANCES=0` opts the Mac out of both.
+
+| File (under `~/.memex-local/instances`) | Written by | Shape |
+|---|---|---|
+| `jobs/<jobId>.json` | the portal, atomically (tmp + rename) | `{schema:1, jobId, operation: create\|start\|stop\|update\|remove, name, requestedBy, requestedAt, confirm (remove), spec (create, update)}`; `spec = {hostName, displayName, owner{id,email}, resources{cpu,memoryGi,storageGi}, packages[], ai{chatModel, embeddings}}`; `jobId` `^[a-z0-9-]{1,100}$` = the file name |
+| `running/<jobId>.json` | the executor: the claim (a rename — a job runs once) | the job, deleted at a terminal status |
+| `results/<jobId>.json` | the executor, atomically, rewritten as it progresses | `{schema, jobId, operation, name, status: Running\|Succeeded\|Failed\|Refused, message, startedAt, updatedAt, finishedAt, steps[{name, status: Done\|Running\|Failed\|Skipped\|Pending, detail}], log[≤200], url, actionsForOwner[]}` — the PORTAL deletes it after recording the terminal result |
+| `inventory.json` | the executor, every 30 s and after each job | `{schema, sampledAt, machine, networkName, agentVersion, capacity{vmCpu, vmMemoryGi, requestedCpu, requestedMemoryGi}, instances[{name, namespace, release, hostName, url, state: Running\|Stopped\|Starting\|Failed\|Removing, ready, health: Healthy\|Degraded\|Unreachable\|Unknown, healthDetail, nameResolves, certificateExpires, image, owner, resources, packages, createdAt, registeredAs}]}` — the first instance is not listed |
+
+A job file that is not valid JSON, fails validation, or whose name is not a job id gets a `Refused` result naming
+why (`invalid-<name>` for the last). A job whose id already has a terminal result is not re-run. A job left in
+`running/` by an executor that died is ended `Failed` at its restart, never re-run behind the requester's back.
+Health is the instance's own `/health` read THROUGH THE CLUSTER (the API server's service proxy), not the private
+network; `nameResolves` asks MagicDNS (100.100.100.100); `registeredAs` is the id the instance's own database
+holds a registry credential for.
+
+🚨 **The instances' state and secrets are NOT in the mounted directory** (`~/.memex-local/instance-state/<name>/`).
+Colima mounts the home directory with virtiofs, where every uid in the VM reads and writes as the Mac's user —
+measured on a Mac Studio (2026-11-08): `nobody` inside the VM created a file in a `0755` directory. A `0600` file
+inside the mount would therefore be readable by the first instance's pod.
+
+## Idle-only models — CI first, a large model when the build host is idle
+
+A Mac Studio that is a CI build host (Colima profile `build`) AND serves tokens cannot hold the build VM and a large
+model at once. Measured on a 128 GB M5 Max (2026-11-12): the build VM holds about 56 GB resident even when idle, and
+`gpt-oss:120b` needs about 70 GB. The owner therefore declares the models that may run ONLY while the build VM is
+stopped (MeshWeaver.Plugins `Hosting/BackLease` §15.9):
+
+```bash
+memex-local backlease accept tokens --idle-only-models gpt-oss:120b   # none withdraws them
+memex-local update                                                   # the portal re-renders with the key
+```
+
+That writes `Hosting__BackLease__Accept__Tokens__IdleOnlyModels__N` into `~/.memex-local/backlease.yaml` beside the
+other token keys (each idle-only model is added to `…__Tokens__Models__N` too — the claim names it, and control refuses
+a model the opt-in does not list), and loads the launchd agent `com.memex.local.buildhost-idle`
+(`memex-local buildhost idle run` → `share/buildhost-idle.py`). It is not asked interactively, like the token slots.
+`backlease status`, `buildhost idle status` and `fleet doctor` show the declaration and the current state.
+
+**The state file** — the ONLY thing the portal's token worker reads: `~/.memex-local/backlease/buildhost.json`,
+mounted read-only as `/host-readings/buildhost.json`, written atomically (a temp file in the same directory, then a
+rename): `{"state":"running|draining|stopped","since":"<ISO-8601 UTC>","reason":"<short text>"}`. The worker lists an
+idle-only model in a claim only while it reads `stopped`; an absent or unreadable file serves none.
+
+**The reads, every 15 s** (only while idle-only models are declared and the Mac has the build profile):
+
+| read | how | when it fails |
+|---|---|---|
+| CI demand | `GET {Hosting__ReportTo}/api/builds/queue?channel=mac`, anonymous → `demand` (claimable + running) | counts as DEMAND — CI first: nothing stops, a stopped VM drains |
+| idle-only demand | `POST {control}/api/fleet-models/demand {"host","models"}`, signed with the Mac's own key exactly as the token worker signs: `X-MeshWeaver-Deployment`, `X-MeshWeaver-Timestamp` (unix s), `X-Hub-Signature-256: sha256=hex(HMAC-SHA256(key, "<dep>\n<ts>\nPOST /demand\n\n\n<body>"))` | counts as NO idle demand — CI first (a control that does not serve the route yet answers 404) |
+
+The key is `Hosting__ModuleReportSecret` from `fleet.yaml` (else the overlay). It is never printed, logged or passed on
+an argument list.
+
+**The state machine** (it never preempts a running step, and never touches the Ollama server or another model):
+
+| from → to | when | what it does |
+|---|---|---|
+| running → stopped | CI demand 0 AND an idle-only job is queued for this Mac | re-reads the CI demand, then `colima stop -p build` (kubectl context kept), then writes `stopped` |
+| stopped → draining | CI demand > 0 or unread, OR no idle-only job queued or running for 10 min, OR the declaration withdrawn | writes `draining` FIRST: the worker claims no new idle-only job, the step in progress finishes |
+| draining → running | every idle-only model reports `running == 0` (or the demand is unread; or 30 min passed) | unloads each idle-only model (`POST 127.0.0.1:11434/api/generate {"model":m,"keep_alive":0}`); while `GET /api/ps` still lists one, it stays `draining` and retries (bounded by the 30 min); then `colima start -p build`, writes `running` |
+
+Every transition and every changed reading is logged to `~/.memex-local/buildhost-idle.log`. `buildhost apply` does not
+start a VM the governor stopped (it says so); `fleet doctor` reads a VM stopped for an idle-only model as green. The
+timings are overridable for a test: `MEMEX_IDLE_INTERVAL`, `MEMEX_IDLE_GIVEBACK`, `MEMEX_IDLE_DRAIN_MAX`.
+
+**Not covered:** a headless host (no GUI login session) gets no agent — it says so and serves no idle-only model; the
+release follower's helm calls against the stopped build VM fail and retry until it is back.
 
 ## Auto-update of the CLI and its chart — on by default
 
@@ -332,7 +550,7 @@ rolled in place; the **migration** is re-run as a Job (it has no Deployment).
 | Doc section | Manual step | CLI implementation (function in `bin/memex-local`) |
 |---|---|---|
 | §1 Prerequisites | `brew install colima kubectl helm mkcert ollama socket_vmnet` + .NET SDK | Formula `depends_on`; `preflight()` re-checks at runtime |
-| §2 Colima k3s | `colima start --kubernetes --cpu 8 --memory 16`; verify context/node | `start_colima()` |
+| §2 Colima k3s | `colima start --kubernetes --cpu 8 --memory 16 --k3s-arg=--disable=traefik --k3s-arg=--kubelet-arg=root-dir=/var/lib/rancher/kubelet`; verify context/node; warn when an existing VM lacks root-dir | `start_colima()`, `cmd_kubelet_root()` |
 | §3 Image (A) | pull multi-arch from ACR, verify `arm64` in manifest, retag | `image_pull_acr()` (`up --from-acr`) |
 | §3 Image (B) | `dotnet publish -t:PublishContainer` portal+migration, `docker tag` to chart name | `image_build_local()` (default) |
 | §4 Helm | `helm upgrade --install memex deploy/helm -f values.yaml -f overlay -n memex` | `helm_deploy()` + `ensure_overlay()` |
@@ -341,7 +559,7 @@ rolled in place; the **migration** is re-run as a Job (it has no Deployment).
 | §5 mkcert TLS | `mkcert -install` + mint cert + `kubectl create secret tls memex-portal-tls` | `setup_tls()` |
 | §6 Hostname | `memex.localhost` (auto-resolves), port `8443` | constants `HOSTNAME_LOCAL` / `HOST_PORT` |
 | §7 Durable access | `port-forward.sh` + `com.memex.local.plist`, `launchctl bootstrap` | `install_launchd()` (assets in `share/`) |
-| §10 Local LLM | `brew services start ollama` (loopback 127.0.0.1:11434, `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`; memex-local's own agent as the fallback; the VM reaches it through its gateway); `ollama pull qwen3.8:27b-mlx`; the portal calls `http://ollama.memex.svc.cluster.local:11434/v1` — a Host Ollama admits (the short name `ollama:11434` is answered 403) | `setup_ollama()` + `ensure_chat_model()` + tracked defaults (endpoint, `ollama.external`) + `~/.memex-local/llm.auto.yaml` (model, context window, `AI__Tiers__chat`, gateway IP) + `llm_chat_smoke()` (a real completion from inside the pod; `up`/`update` fail on a 403 or any non-200). **Embeddings are local too:** `ensure_embed_model()` pulls `bge-m3` (1024-dim, multilingual), `llm.auto.yaml` sets `Embedding__Provider=Ollama`, `Embedding__Endpoint` (the same host-safe endpoint) and `Embedding__Model` for the portal AND the migration Job (which sizes the vector columns and backfills), and `embed_smoke()` proves a vector of the platform's width from inside the pod — a Mac install never embeds in the cloud. **Every other AI service too:** `llm.auto.yaml` maps the `utility`, `reasoning` and `review` tiers to the chat model and `coding` to the code model when Ollama has it (an unmapped tier falls to a cloud default), and — when Ollama reports `vision` for the chat model — OCR (`Ocr__Engine=OllamaVision`, the same endpoint and model); `ocr_smoke()` proves an image read from inside the pod and gates `up`/`update` |
+| §10 Local LLM | `brew services start ollama` (loopback 127.0.0.1:11434, `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`; memex-local's own agent as the fallback; the VM reaches it through its gateway); `ollama pull qwen3.8:27b-mlx`; the portal calls `http://ollama.memex.svc.cluster.local:11434/v1` — a Host Ollama admits (the short name `ollama:11434` is answered 403) | `setup_ollama()` + `ensure_chat_model()` + tracked defaults (endpoint, `ollama.external`) + `~/.memex-local/llm.auto.yaml` (model, context window, `AI__Tiers__chat`, gateway IP) + `llm_chat_smoke()` (a real completion from inside the pod; `up`/`update` fail on a 403 or any non-200). **Embeddings are local too:** `ensure_embed_model()` pulls `bge-m3` (1024-dim, multilingual), `llm.auto.yaml` sets `Embedding__Provider=Ollama`, `Embedding__Endpoint` (the same host-safe endpoint) and `Embedding__Model` for the portal AND the migration Job (which sizes the vector columns and backfills), and `embed_smoke()` proves a vector of the platform's width from inside the pod — a Mac install never embeds in the cloud. **Every other AI service too:** `llm.auto.yaml` maps the `utility`, `reasoning` and `review` tiers to the chat model and `coding` to the code model when Ollama has it (an unmapped tier falls to a cloud default), and OCR stays on the vision model `resolve_ocr_vision()` picks (`Ocr__Engine=OllamaVision`, the same endpoint); `ocr_smoke()` proves an image read from inside the pod and gates `up`/`update` |
 | §11 Observability | `helm upgrade --install loki grafana/loki-stack -f share/values.observability.yaml` (sized for the VM; `fleet join` runs it) | `cmd_observability()` |
 | §12 Instance identity | `Portal__InstanceName/Color` | overlay `config.memex_portal` |
 | §14 Verify | assert the portal is USABLE — it serves, `/login` is routed, and the DefaultViews/GraphViews packs are present | `verify_usable()` (`up` / `update` / `verify`; behaviour-tested in `test/run-tests.sh`) |
@@ -395,6 +613,10 @@ strings from it).
 | `share/com.memex.local.plist` | the §7 launchd login-agent template |
 | `share/tools.manifest` | the ONE toolchain declaration: per tool its formula, version floor, vendored pin and probe; per vendored tool the sha256-pinned release asset (read by the CLI, the `.pkg` build and its postinstall; drift against the formula's `depends_on` is a red test) |
 | `share/tools.sh` | the resolver: existing installation first (floor met), the `.pkg`'s vendored copy second — `need`, `preflight`, `doctor` |
+| `share/instances.py` | further instances on this Mac (`memex-local instances`) and the executor of the first instance's "new instance" GUI — see *Further instances on this Mac* |
+| `share/com.memex.local.instances.plist` | the executor's launchd login-agent template |
+| `share/buildhost-idle.py` | the idle-only models governor — CI first, a large model only while the build VM is stopped for it — see *Idle-only models* |
+| `share/com.memex.local.buildhost-idle.plist` | its launchd login-agent template |
 
 State lives in `~/.memex-local/` (overlay, mkcert cert/key, port-forward script +
 log, ollama log, grafana password) — exactly the paths the doc uses.
@@ -409,7 +631,9 @@ log, ollama log, grafana password) — exactly the paths the doc uses.
 | `MEMEX_COLIMA_CPU` / `MEMEX_COLIMA_MEM` | `8` / `16` (or the profile's) | VM sizing (§2) |
 | `MEMEX_OLLAMA_MODEL` | `qwen3.8:27b-mlx` / `qwen3:8b` by host memory (or the profile's) | the default chat model `up`/`update` pull and the portal names; `none` skips it |
 | `MEMEX_EMBED_MODEL` | `bge-m3` | the local embedding model (semantic search + content indexing) `up`/`update` pull and the portal and migration name; `nomic-embed-text` and `mxbai-embed-large` are the others the platform sizes; any other is refused; `none` leaves embeddings OFF (said, not silent) |
+| `MEMEX_RESIDENCY` | unset (none declared) | where this install processes prompts (`Eu`, `Global`, ISO code such as `CH`); `up` persists it (above) |
 | `MEMEX_LLM_SMOKE` | `1` | `0` skips the post-install chat smoke (loudly) |
+| `MEMEX_OCR` | unset | `none` turns the local OCR engine off. Unset: when the chat model reports the `vision` capability, `llm.auto.yaml` declares `Ocr__Engine=OllamaVision` on the same host-safe endpoint and model, so every instance on the Mac reads and describes pictures and scanned pages (MeshWeaver.Plugins `Indexing/DocumentEnrichment`); a chat model without vision is said loudly by `up`/`update` and reported red by `status`/`doctor` |
 | `MEMEX_PROFILE` | unset | Mac host profile, `mac-studio` or `mac-mini` (below) |
 | `MEMEX_CHANNEL` | unset (`main`) | release-channel label `up`/`update`/`autoroll` follow (below) |
 | `MEMEX_PORT` | `8443` | host port for the forward (§6/§7) |
@@ -500,3 +724,11 @@ tailnet name is still published beside it when tailscale reports one (without on
 published alone, and the command says so); each name gets its own marked site and needs its own redirect
 URI. A public name is never the default.
 
+
+## `fleet join`: environment switches
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MEMEX_BUILDHOST_REGISTRY_BUNDLES` | `0` | `1` attaches the build host with the registry bundle index (H8): the registry key and the `pluginsRegistry` URL are passed to `first-attach.sh`. It stays off by default because the registry serves the mixed AI package as an assemblies-only bundle, which module-fetch refuses, so an H8 host never claims a run (measured 2026-11-07 and 2026-11-10). |
+| `MEMEX_KUBELET_ROOT_WAIT_TRIES` / `MEMEX_KUBELET_ROOT_WAIT_S` | `12` / `5` | How often and how long `kubelet-root apply` re-reads the kubelet's pods directory (as root) before it reports it missing. |
+| `MEMEX_ATTACH_VENV` | `~/.mw-attach-venv` | Where `first-attach.sh` keeps its private PyYAML interpreter when `python3` has none. |

@@ -222,6 +222,11 @@ spec:
           # The composer REPLACES its output directory (rm -rf), so it writes a SUBDIRECTORY of the
           # emptyDir — the mount point itself cannot be removed.
           command: ["/bin/bash", "-c", "set -euo pipefail; bash /opt/build-host/compose-gate-host.sh /portal/app /tester /host/app; exec python3 /opt/build-host/build-run.py --host"]
+          # The runner's readiness endpoint (GET /ready) — read by the kubelet only. No Service selects this
+          # port and the NetworkPolicy admits no ingress; the kubelet's probe comes from the node, which a
+          # NetworkPolicy does not filter (Kubernetes: traffic from the pod's own node is always allowed).
+          ports:
+            - { name: "ready", containerPort: {{ $b.readyPort }}, protocol: "TCP" }
           env:
             - { name: BUILD_API, value: {{ $b.apiUrl | quote }} }
             # The worker token is a FILE read into the host process — never an environment variable
@@ -236,6 +241,28 @@ spec:
             # The module-hub broker (MeshWeaver.Plugins Hosting/BuildQueue.md §7.4): the host asks the per-module build hubs on a
             # stage's behalf, with fingerprints IT computes from a default-branch declaration (`moduleHub`).
             - { name: MW_BUILD_MODULE_HUB_ENABLED, value: {{ ternary "true" "false" $b.moduleHub | quote }} }
+            # The BOUND of the host's module-slice cache (<cache>/module-slices), in GiB: least-recently-used slices above it are
+            # evicted — a cache of control's append-only store, re-fetched by hash (MeshWeaver.Plugins Hosting/OneBuildTree.md §4, Deviations).
+            - { name: MW_BUILD_SLICE_CACHE_MAX_GIB, value: {{ $b.sliceCacheMaxGi | quote }} }
+            {{- if gt (int $b.cacheBudgetGi) 0 }}
+            # THE CACHE BUDGET (deploy/build-host/CACHE-BUDGET.md): the whole cache's total and each area's share of it (the slices'
+            # is MW_BUILD_SLICE_CACHE_MAX_GIB above); the chart refuses shares above the budget or summing above it.
+            - { name: MW_BUILD_CACHE_MAX_GIB, value: {{ $b.cacheBudgetGi | quote }} }
+            - { name: MW_BUILD_CACHE_TREE_GIB, value: {{ $b.cacheShares.tree | quote }} }
+            - { name: MW_BUILD_CACHE_NUGET_GIB, value: {{ $b.cacheShares.nuget | quote }} }
+            - { name: MW_BUILD_CACHE_REFSETS_GIB, value: {{ $b.cacheShares.refsets | quote }} }
+            - { name: MW_BUILD_CACHE_PREPARED_GIB, value: {{ $b.cacheShares.prepared | quote }} }
+            {{- end }}
+            # NO NETWORK DURING A RUN (MeshWeaver.Plugins Hosting/OneBuildTree.md): open | offline.
+            - { name: MW_BUILD_STAGE_NETWORK, value: {{ $b.stageNetwork | quote }} }
+            # The node's disk: claim only when one run's footprint leaves the eviction headroom free (measured at claim time).
+            - { name: MW_BUILD_RUN_DISK_GIB, value: {{ $b.runDiskGi | quote }} }
+            - { name: MW_BUILD_DISK_HEADROOM_PERCENT, value: {{ $b.diskHeadroomPercent | quote }} }
+            # The shared tree (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3): the warm main tree once per repository on the
+            # shared cache volume, not once per replica.
+            - { name: MW_BUILD_SHARED_TREE, value: {{ ternary "true" "false" $b.sharedTree | quote }} }
+            # The run overlay (Hosting/BuildQueue.md §7.3b): a run's tree is the shared generation (read-only) + its own upper.
+            - { name: MW_BUILD_RUN_OVERLAY, value: {{ ternary "true" "false" $b.runOverlay | quote }} }
             {{- if eq $c.kind "channel" }}
             - { name: MW_BUILD_CHANNEL, value: {{ $c.name | quote }} }
             {{- else }}
@@ -249,11 +276,20 @@ spec:
             - { name: MW_BUILD_CORE_TESTS_DIGEST, value: {{ $c.coreTestsDigest | quote }} }
             {{- end }}
             - { name: MW_BUILD_IDENTITY_FILE, value: "/portal/app/meshweaver-framework.identity" }
+            {{- if $b.machine }}
+            # the claimed host name carries the MACHINE (`<machine>-<pod>`), so the price list credits the run to it by
+            # host prefix; `$(MW_BUILD_POD)` is expanded by the kubelet from the variable defined just above
+            - name: MW_BUILD_POD
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: MW_BUILD_HOST, value: {{ printf "%s-$(MW_BUILD_POD)" $b.machine | quote }} }
+            {{- else }}
             - name: MW_BUILD_HOST
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            {{- end }}
             - { name: MW_BUILD_CACHE, value: "/cache" }
             - { name: MW_BUILD_WORK, value: "/work" }
             - { name: MW_BUILD_READY_FILE, value: "/tmp/build-host-ready" }
+            - { name: MW_BUILD_READY_PORT, value: {{ $b.readyPort | quote }} }
             - { name: MW_BUILD_GATE_HOST, value: "/host/app" }
             - { name: MW_BUILD_PORTAL_DOTNET, value: "/portal/dotnet/dotnet" }
             - { name: MeshWeaverRefs, value: "/portal/app" }
@@ -276,8 +312,12 @@ spec:
             - { name: MW_REGISTRY_URL, value: {{ $b.registry.url | quote }} }
             - { name: MW_REGISTRY_KEY_FILE, value: "/run/registry-key/key" }
             {{- end }}
+          # readiness = staged, answered by the runner over HTTP — NEVER an exec probe: on the Mac hosts (k3s, runc 1.4.0,
+          # `hostUsers: false`) every exec into this container fails ("unable to setup user: chown /dev/stdout: invalid
+          # argument"), so `test -f <marker>` never passed and the pods sat 0/1 Ready forever (2026-11-11). The marker
+          # file is still written, for a reader that tests it.
           readinessProbe:
-            exec: { command: ["/bin/sh", "-c", "test -f /tmp/build-host-ready"] }
+            httpGet: { path: "/ready", port: "ready" }
             periodSeconds: 10
             failureThreshold: 3
           resources:
@@ -330,6 +370,10 @@ spec:
           {{- if eq $b.cache.medium "node" }}
           # Node-local (cache.medium: node): a host in its own user namespace cannot mount an SMB/NFS claim.
           emptyDir: {{- if $b.cache.size }} { sizeLimit: {{ $b.cache.size | quote }} }{{- else }} {}{{- end }}
+          {{- else if eq $b.cache.medium "host" }}
+          # Node-local and SHARED (cache.medium: host): every host on the node, across restarts and scale-in. `Directory`,
+          # never DirectoryOrCreate — node setup prepares it owned by the host's uid; a missing one keeps the pod failing.
+          hostPath: { path: {{ $b.cache.path | quote }}, type: Directory }
           {{- else }}
           persistentVolumeClaim: { claimName: {{ $b.cacheClaim | quote }} }
           {{- end }}

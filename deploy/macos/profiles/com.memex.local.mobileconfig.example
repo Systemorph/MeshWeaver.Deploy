@@ -3,7 +3,7 @@
 <!--
   EXAMPLE managed-preferences profile for a fleet rollout (deploy/macos/README.md §3). An MDM pushes
   this beside the .pkg; the keys land in the com.memex.local domain, which memex-local reads when a flag
-  is not given (`backlease enroll` → ControlUrl, DeploymentId; the daemon postinstall → ServiceUser,
+  is not given (`backlease enroll` → ControlUrl, DeploymentId; `up`/`fleet join` → OwnerId, OwnerEmail; the daemon postinstall → ServiceUser,
   Unattended). Every value below is a PLACEHOLDER — replace the hosts and ids, and regenerate the UUIDs.
 -->
 <plist version="1.0">
@@ -30,6 +30,44 @@
             <!-- The plugin registry the portal consumes (memex-local registry <url>). -->
             <key>RegistryUrl</key>
             <string>https://registry.example.com</string>
+            <!-- REQUIRED: the machine's OWNER — its instance's global administrator, and the person whose
+                 answers the fleet opt-in records. The MeshWeaver user id they sign in as (not the e-mail), and
+                 their e-mail. An unattended install with no owner FAILS rather than run without an administrator.
+                 In Intune, a user-affinity device can fill these from the primary user: {{partialupn}} when the
+                 user id is the UPN prefix, and {{mail}}. -->
+            <!-- A person's managed Mac needs neither: memex-local derives the owner from UserPrincipalName
+                 (deploy/macos/intune/profiles/com.memex.local.mobileconfig, Intune token {{userprincipalname}}),
+                 id = its prefix, e-mail = the UPN. An explicit OwnerId / OwnerEmail here wins over it. -->
+            <key>OwnerId</key>
+            <string>jane.roe</string>
+            <key>OwnerEmail</key>
+            <string>jane.roe@example.com</string>
+            <!-- REQUIRED for the fleet bootstrap: the owner's participation answers, never defaulted (a run
+                 without AcceptJobs or AcceptTokens fails). NO to jobs = no build host; NO to tokens = no token
+                 models beyond the chat model. A YES names from whom (and, for tokens, which models). -->
+            <key>AcceptJobs</key>
+            <false/>
+            <key>AcceptTokens</key>
+            <true/>
+            <key>AcceptTokensFrom</key>
+            <array>
+                <string>*.example.cloud</string>
+            </array>
+            <key>AcceptTokensModels</key>
+            <array>
+                <string>qwen3.8:27b-mlx</string>
+            </array>
+            <key>AcceptTokensResidency</key>
+            <string>CH</string>
+            <!-- Optional: the fleet operator's PUBLIC SSH keys. The bootstrap turns Remote Login on and appends each
+                 to the console user's ~/.ssh/authorized_keys (only when absent). Omit to leave SSH alone. -->
+            <key>OperatorSshKeys</key>
+            <array>
+                <string>ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDH5AD0ellP162c2ThMr3M79UFF5xWm4cAqHv5xf2coD operator@example.com</string>
+            </array>
+            <!-- The fleet local CA's certificate SHA-256 (its trusted-root profile is a separate payload). -->
+            <key>FleetCaSha256</key>
+            <string>0000000000000000000000000000000000000000000000000000000000000000</string>
             <!-- Optional: a release-channel label and a host profile (mac-studio | mac-mini). -->
             <key>Channel</key>
             <string>3-latest</string>

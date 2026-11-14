@@ -10,7 +10,7 @@
 #      estate changes until its record turns the hosts on;
 #   3. the fixture renders, per enabled channel, a Deployment with no `replicas` (KEDA owns it),
 #      images by DIGEST, the ci-build toleration + nodeSelector, the worker token from a Secret, the
-#      build-cache claim, readiness on the staged marker, and a ScaledObject with minReplicaCount = the
+#      build-cache claim, readiness on the runner's GET /ready (httpGet on the named port `ready`, never exec), and a ScaledObject with minReplicaCount = the
 #      channel's declared floor (minReplicas, default 0),
 #      the channel's maxReplicaCount and a metrics-api trigger on <apiUrl>/queue?channel=<c> with
 #      valueLocation demand and a scale-down stabilization window, the worker token as a mounted
@@ -22,6 +22,9 @@
 #      the release-named ServiceAccount + NetworkPolicy and NOTHING of the portal, and two such
 #      releases and the portal's own never name one object twice;
 #   3f. artifactStore.upload renders MW_BUILD_ARTIFACT_STORE=api: and mounts no store; beside a claim it is refused;
+#   3h. THE CACHE BUDGET (deploy/build-host/CACHE-BUDGET.md): every render whose cache has a declared size carries
+#      MW_BUILD_CACHE_MAX_GIB (the size less 10 %, never above it) and a share per area, no share above the budget and the
+#      shares not summing above it — the shipped Mac values included (18 GiB on its 20Gi claim, the slices 5, not 32);
 #   4. the refusals hold: a tag instead of a digest, plain http to a public host, and a registry
 #      credential for the host, fail
 #      `helm template` naming why.
@@ -221,6 +224,10 @@ for ch, (tester, portal, runner, mx, pv, mn) in want.items():
     env = {e["name"]: e for e in build.get("env", [])}
     if env.get("MW_BUILD_WARM_WORKSPACE", {}).get("value") != "false":
         problems.append(f"{ch}: the warm workspace is not OFF by default (MW_BUILD_WARM_WORKSPACE={env.get('MW_BUILD_WARM_WORKSPACE')})")
+    if env.get("MW_BUILD_SHARED_TREE", {}).get("value") != "false":
+        problems.append(f"{ch}: the shared tree is not OFF by default (MW_BUILD_SHARED_TREE={env.get('MW_BUILD_SHARED_TREE')})")
+    if env.get("MW_BUILD_RUN_OVERLAY", {}).get("value") != "false":
+        problems.append(f"{ch}: the run overlay is not OFF by default (MW_BUILD_RUN_OVERLAY={env.get('MW_BUILD_RUN_OVERLAY')})")
     if env.get("MW_BUILD_MODULE_HUB_ENABLED", {}).get("value") != "false":
         problems.append(f"{ch}: the module-hub broker is not OFF by default (MW_BUILD_MODULE_HUB_ENABLED={env.get('MW_BUILD_MODULE_HUB_ENABLED')})")
     if "BUILD_TOKEN" in env:
@@ -229,6 +236,11 @@ for ch, (tester, portal, runner, mx, pv, mn) in want.items():
         problems.append(f"{ch}: BUILD_TOKEN_FILE is not /run/build-worker/token")
     if env.get("MW_BUILD_STAGE_SLOTS", {}).get("value") != "8":
         problems.append(f"{ch}: MW_BUILD_STAGE_SLOTS is not the chart's default 8 (fan-out): {env.get('MW_BUILD_STAGE_SLOTS')}")
+    if env.get("MW_BUILD_SLICE_CACHE_MAX_GIB", {}).get("value") != "32":
+        problems.append(f"{ch}: MW_BUILD_SLICE_CACHE_MAX_GIB is not the chart's default bound 32 (the slice cache): {env.get('MW_BUILD_SLICE_CACHE_MAX_GIB')}")
+    if any(k.startswith("MW_BUILD_CACHE_") for k in env if k != "MW_BUILD_CACHE"):
+        problems.append(f"{ch}: a cache budget rendered although the fixture's claim declares no size (made elsewhere): "
+                        f"{sorted(k for k in env if k.startswith('MW_BUILD_CACHE_'))}")
     if pod.get("terminationGracePeriodSeconds") != 7200 or env.get("MW_BUILD_RUN_DEADLINE_SECONDS", {}).get("value") != "7200":
         problems.append(f"{ch}: terminationGracePeriodSeconds / the run deadline are not the same 7200 s (the default run budget)")
     if build.get("securityContext", {}).get("seccompProfile", {}) != {"type": "Unconfined"}:
@@ -241,8 +253,20 @@ for ch, (tester, portal, runner, mx, pv, mn) in want.items():
         problems.append(f"{ch}: BUILD_API not the trimmed apiUrl: {env.get('BUILD_API')}")
     if "exec python3 /opt/build-host/build-run.py --host" not in " ".join(build.get("command", [])):
         problems.append(f"{ch}: the runner is not exec'd (SIGTERM would not reach it)")
-    if "test -f /tmp/build-host-ready" not in " ".join(build.get("readinessProbe", {}).get("exec", {}).get("command", [])):
-        problems.append(f"{ch}: readiness is not the staged marker")
+    # READINESS = staged, answered by the runner over HTTP on its named port — never an exec probe: on the Mac hosts
+    # (runc 1.4.0 + `hostUsers: false`) every exec into the container fails, so an exec probe never passed (2026-11-11).
+    rp = build.get("readinessProbe", {})
+    _ports = {p.get("name"): p for p in build.get("ports", [])}
+    if rp.get("httpGet") != {"path": "/ready", "port": "ready"} or "exec" in rp:
+        problems.append(f"{ch}: readiness is not the runner's GET /ready on the named port `ready` (an exec probe fails on the Macs): {rp}")
+    if _ports.get("ready", {}).get("containerPort") != 8090 or _ports.get("ready", {}).get("protocol") != "TCP" \
+            or env.get("MW_BUILD_READY_PORT", {}).get("value") != "8090":
+        problems.append(f"{ch}: the readiness port is not 8090 on both the container port `ready` and MW_BUILD_READY_PORT: "
+                        f"{build.get('ports')} / {env.get('MW_BUILD_READY_PORT')}")
+    if any(d.get("kind") == "Service" and (d["spec"].get("selector") or {}).get("app.kubernetes.io/component") == "build-host" for d in docs):
+        problems.append(f"{ch}: a Service selects the build hosts — the readiness port is the kubelet's alone")
+    if env.get("MW_BUILD_READY_FILE", {}).get("value") != "/tmp/build-host-ready":
+        problems.append(f"{ch}: the staged marker file is no longer named to the runner (kept for older readers)")
     cmd = " ".join(build.get("command", []))
     if "compose-gate-host.sh /portal/app /tester /host/app" not in cmd or env.get("MW_BUILD_GATE_HOST", {}).get("value") != "/host/app":
         problems.append(f"{ch}: the gate host must be composed into /host/app (the composer removes its output; /host is a mount point)")
@@ -598,6 +622,8 @@ else:
     if env.get("MW_BUILD_CHANNEL") != "mac": problems.append(f"MW_BUILD_CHANNEL={env.get('MW_BUILD_CHANNEL')!r}")
     if env.get("MW_BUILD_WARM_WORKSPACE") != "true": problems.append(f"the Mac's warm workspace is not on: MW_BUILD_WARM_WORKSPACE={env.get('MW_BUILD_WARM_WORKSPACE')!r}")
     if env.get("MW_BUILD_MODULE_HUB_ENABLED") != "true": problems.append(f"the Mac's module-hub broker is not on: MW_BUILD_MODULE_HUB_ENABLED={env.get('MW_BUILD_MODULE_HUB_ENABLED')!r}")
+    if env.get("MW_BUILD_SHARED_TREE") != "true": problems.append(f"the Mac's shared tree is not on: MW_BUILD_SHARED_TREE={env.get('MW_BUILD_SHARED_TREE')!r}")
+    if env.get("MW_BUILD_RUN_OVERLAY") != "true": problems.append(f"the Mac's run overlay is not on: MW_BUILD_RUN_OVERLAY={env.get('MW_BUILD_RUN_OVERLAY')!r}")
     if env.get("BUILD_API") != "https://control.example.com/api/builds": problems.append(f"BUILD_API={env.get('BUILD_API')!r}")
     if env.get("MW_REGISTRY_URL") != "https://registry.example.com" or env.get("MW_REGISTRY_KEY_FILE") != "/run/registry-key/key":
         problems.append("the plugins layer is not read through the registry bundle index (H8)")
@@ -607,7 +633,10 @@ else:
     if vols.get("registry-key", {}).get("secret", {}).get("secretName") != "build-registry-key-mac": problems.append("no registry-key volume")
     builds = [c for c in spec["containers"] if c["name"] == "build"]
     if not builds or builds[0]["resources"]["requests"] != {"cpu": "4", "memory": "8Gi"}: problems.append(f"requests: {builds and builds[0]['resources']}")
-    if dep["spec"]["strategy"] != {"type": "Recreate"}: problems.append(f"strategy: {dep['spec']['strategy']}")
+    # one replica at a time on the Macs: the HTTP readiness probe passes there, so a rolling step completes (the values file)
+    if dep["spec"]["strategy"] != {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}}: problems.append(f"strategy: {dep['spec']['strategy']}")
+    if env.get("MW_BUILD_STAGE_NETWORK") != "open" or env.get("MW_BUILD_RUN_DISK_GIB") != "20" or env.get("MW_BUILD_DISK_HEADROOM_PERCENT") != "15":
+        problems.append(f"the stage network / disk guard defaults: {env.get('MW_BUILD_STAGE_NETWORK')!r} {env.get('MW_BUILD_RUN_DISK_GIB')!r} {env.get('MW_BUILD_DISK_HEADROOM_PERCENT')!r}")
 so = [d for d in docs if d["kind"] == "ScaledObject"]
 if len(so) != 1 or "channel=mac" not in str(so[0]): problems.append("the ScaledObject does not scale on channel=mac")
 pvc = by.get(("PersistentVolumeClaim", "build-cache-mac"))
@@ -620,6 +649,130 @@ sys.exit(1 if problems else 0)
 PY2
 else
   report "the mac first-attach values did not render:"; sed 's/^/    /' "$WORK/mac.err"
+fi
+
+# 3c-m. THE MACHINE in the claimed host name: unset, a host claims as its pod (`build-host-mac-…`, the default above); set,
+#       as `<machine>-<pod>` — the kubelet expands $(MW_BUILD_POD), defined BEFORE it — so the fleet's price list can credit
+#       two Macs serving one queue by host prefix (MeshWeaver.Plugins Hosting/BuildQueue §2a); a non-DNS-label is refused.
+if helm template build-host-mac "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-host-mac.yaml" --set-string buildHosts.machine=studio-1 \
+     --namespace memex > "$WORK/mac-machine.yaml" 2> "$WORK/mac-machine.err"; then
+  python3 - "$WORK/mac.yaml" "$WORK/mac-machine.yaml" <<'PYM' && ok "buildHosts.machine names the claimed host <machine>-<pod> (pod defined first); unset, the host stays its pod" || report "the machine host-name render is wrong (above)"
+import sys, yaml
+def env(path):
+    docs = [d for d in yaml.safe_load_all(open(path)) if d]
+    dep = next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "build-host-mac")
+    c = next(c for c in dep["spec"]["template"]["spec"]["containers"] if c["name"] == "build")
+    return c.get("env", [])
+problems = []
+plain = {e["name"]: e for e in env(sys.argv[1])}
+if plain.get("MW_BUILD_HOST", {}).get("valueFrom", {}).get("fieldRef", {}).get("fieldPath") != "metadata.name" or "MW_BUILD_POD" in plain:
+    problems.append(f"unset: MW_BUILD_HOST should be the pod name, got {plain.get('MW_BUILD_HOST')}")
+named = env(sys.argv[2])
+names = [e["name"] for e in named]
+by = {e["name"]: e for e in named}
+if by.get("MW_BUILD_HOST", {}).get("value") != "studio-1-$(MW_BUILD_POD)": problems.append(f"set: MW_BUILD_HOST={by.get('MW_BUILD_HOST')}")
+if by.get("MW_BUILD_POD", {}).get("valueFrom", {}).get("fieldRef", {}).get("fieldPath") != "metadata.name": problems.append("set: MW_BUILD_POD is not the pod name")
+if "MW_BUILD_POD" in names and "MW_BUILD_HOST" in names and names.index("MW_BUILD_POD") > names.index("MW_BUILD_HOST"):
+    problems.append("MW_BUILD_POD must be defined before MW_BUILD_HOST, or the kubelet does not expand it")
+for p in problems: print("   ", p)
+sys.exit(1 if problems else 0)
+PYM
+else
+  report "the machine values did not render:"; sed 's/^/    /' "$WORK/mac-machine.err"
+fi
+if helm template build-host-mac "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-host-mac.yaml" --set-string buildHosts.machine=Studio_1 \
+     --namespace memex > /dev/null 2> "$WORK/mac-machine-bad.err"; then
+  report "a machine that is not a DNS label rendered"
+elif grep -q "must be a lower-case DNS label" "$WORK/mac-machine-bad.err"; then
+  ok "a machine that is not a DNS label is refused by name"
+else
+  report "a bad machine failed for another reason:"; sed 's/^/    /' "$WORK/mac-machine-bad.err"
+fi
+
+# 3h. THE CACHE BUDGET: one total per cache, a share per area, none above it and together never above it — checked on every
+#     render below whose cache declares a size, the SHIPPED Mac values included. budget_check <render> <want budget|-> <claim size Gi|->
+budget_check() {
+  python3 - "$@" <<'PYB'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+want, size = sys.argv[2], sys.argv[3]
+problems, seen = [], 0
+AREAS = {"tree": "MW_BUILD_CACHE_TREE_GIB", "slices": "MW_BUILD_SLICE_CACHE_MAX_GIB", "nuget": "MW_BUILD_CACHE_NUGET_GIB",
+         "refsets": "MW_BUILD_CACHE_REFSETS_GIB", "prepared": "MW_BUILD_CACHE_PREPARED_GIB"}
+for d in docs:
+    if d.get("kind") != "Deployment" or (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") != "build-host":
+        continue
+    seen += 1
+    name = d["metadata"]["name"]
+    env = {e["name"]: e.get("value") for c in d["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
+    if env.get("MW_BUILD_CACHE_MAX_GIB") is None:
+        problems.append(f"{name}: no MW_BUILD_CACHE_MAX_GIB although the cache declares a size")
+        continue
+    budget = int(env["MW_BUILD_CACHE_MAX_GIB"])
+    shares = {a: int(env.get(v) or -1) for a, v in AREAS.items()}
+    if want != "-" and budget != int(want):
+        problems.append(f"{name}: the cache budget is {budget} GiB, want {want}")
+    if size != "-" and budget > int(size):
+        problems.append(f"{name}: the cache budget {budget} GiB exceeds the declared claim size {size}Gi")
+    for a, v in shares.items():
+        if v < 0 or v > budget:
+            problems.append(f"{name}: the {a} share {v} GiB is missing or above the cache budget {budget} GiB")
+    if sum(shares.values()) > budget:
+        problems.append(f"{name}: the shares sum to {sum(shares.values())} GiB, above the cache budget {budget} GiB: {shares}")
+    if shares["slices"] < 1:
+        problems.append(f"{name}: the slice cache share is {shares['slices']} (never zero)")
+if not seen:
+    problems.append("no build-host Deployment rendered")
+for p in problems: print("   ", p)
+sys.exit(1 if problems else 0)
+PYB
+}
+if [ -s "$WORK/mac.yaml" ]; then
+  budget_check "$WORK/mac.yaml" 54 60 && ok "the Mac fixture's 60Gi cache renders a 54 GiB budget (the size less 10 %) with every share within it and their sum too" \
+    || report "the Mac fixture's cache budget is wrong (above)"
+fi
+if [ -s "$WORK/cache.yaml" ]; then
+  budget_check "$WORK/cache.yaml" 90 100 && ok "a created 100Gi cache claim renders a 90 GiB budget with every share within it" \
+    || report "the created cache claim's budget is wrong (above)"
+fi
+# the SHIPPED Mac values (deploy/backlease/build-host-mac.values.yaml), with the estate values first-attach.sh supplies
+H1="sha256:$(printf '1%.0s' $(seq 64))"; H2="sha256:$(printf '2%.0s' $(seq 64))"; H3="sha256:$(printf '3%.0s' $(seq 64))"
+if helm template build-host-mac "$CHART" -f "$CHART/values.yaml" -f "$REPO/deploy/backlease/build-host-mac.values.yaml" --namespace memex \
+     --set-string buildHosts.apiUrl=https://control.example.com/api/builds --set-string buildHosts.testerRepository=cr.example.com/mw-plugin-test \
+     --set-string buildHosts.portalRepository=cr.example.com/memex-portal-ai --set-string buildHosts.runnerRepository=cr.example.com/mw-build-host \
+     --set-string buildHosts.mac.platformVersion=3.1.11641 --set-string "buildHosts.mac.testerDigest=$H1" \
+     --set-string "buildHosts.mac.portalDigest=$H2" --set-string "buildHosts.mac.runnerDigest=$H3" > "$WORK/mac-shipped.yaml" 2> "$WORK/mac-shipped.err"; then
+  if budget_check "$WORK/mac-shipped.yaml" 80 - \
+     && python3 - "$WORK/mac-shipped.yaml" <<'PYM'
+import sys, yaml
+hosts = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d and d.get("kind") == "Deployment"
+         and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "build-host"]
+if len(hosts) != 1:
+    print("   ", f"the shipped Mac values render {len(hosts)} build-host Deployments, want exactly 1"); sys.exit(1)
+env = {e["name"]: e.get("value") for c in hosts[0]["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
+want = {"MW_BUILD_CACHE_MAX_GIB": "80", "MW_BUILD_CACHE_TREE_GIB": "24", "MW_BUILD_SLICE_CACHE_MAX_GIB": "30",
+        "MW_BUILD_CACHE_NUGET_GIB": "8", "MW_BUILD_CACHE_REFSETS_GIB": "3", "MW_BUILD_CACHE_PREPARED_GIB": "2"}
+pvc = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d and d.get("kind") == "PersistentVolumeClaim"]
+if [p["spec"]["resources"]["requests"]["storage"] for p in pvc] != ["20Gi"]:
+    print("   ", "the Mac claim's REQUEST must stay 20Gi (a bound local-path claim cannot be expanded):", [p["spec"] for p in pvc]); sys.exit(1)
+bad = {k: (env.get(k), v) for k, v in want.items() if env.get(k) != v}
+if bad: print("   ", "the shipped Mac budget (got, want):", bad)
+sys.exit(1 if bad else 0)
+PYM
+  then ok "the SHIPPED Mac values render an 80 GiB budget over the UNCHANGED 20Gi local-path claim (sizeEnforced: false) — tree 24 (warm again), slices 30, nuget 8, refsets 3, prepared 2 — every share and their sum within it"
+  else report "the shipped Mac values' cache budget is wrong (above)"
+  fi
+else
+  report "the shipped Mac values did not render:"; sed 's/^/    /' "$WORK/mac-shipped.err"
+fi
+# NEGATIVE CONTROL: the check refuses a render whose shares exceed the budget (the fixture's default render, its budget patched)
+if [ -s "$WORK/mac.yaml" ]; then
+  sed 's/{ name: MW_BUILD_CACHE_MAX_GIB, value: "54" }/{ name: MW_BUILD_CACHE_MAX_GIB, value: "20" }/' "$WORK/mac.yaml" > "$WORK/mac-over.yaml"
+  if ! budget_check "$WORK/mac-over.yaml" - - > "$WORK/mac-over.out" 2>&1 && grep -q "above the cache budget 20 GiB" "$WORK/mac-over.out"; then
+    ok "negative control: the budget check refuses a render whose tree share (27) and share sum exceed a 20 GiB budget"
+  else
+    report "negative control: the budget check did not refuse shares above the budget:"; sed 's/^/    /' "$WORK/mac-over.out"
+  fi
 fi
 
 # 3d. the opt-in user-namespace sandbox: hostUsers false on the pod, procMount Unmasked on the build container, and on a
@@ -679,6 +832,46 @@ sys.exit(1 if problems else 0)
 PY4
 else
   report "the node-local cache values did not render:"; sed 's/^/    /' "$WORK/nodecache.err"
+fi
+
+# 3e2. a node-local SHARED cache (cache.medium: host): a hostPath of type Directory (never DirectoryOrCreate — node setup
+#      prepares it owned by the host's uid) at cache.path on every host, no emptyDir and no claim. Negative control: the
+#      same check run on the node render (3e) must FAIL, so it cannot pass vacuously.
+host_cache_check() {
+  python3 - "$1" <<'PY4H'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+problems = []
+hosts = [d for d in docs if d.get("kind") == "Deployment" and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "build-host"]
+if not hosts: problems.append("no build-host Deployment rendered")
+for d in hosts:
+    vols = {v["name"]: v for v in d["spec"]["template"]["spec"]["volumes"]}
+    cache = vols.get("cache", {})
+    if cache != {"name": "cache", "hostPath": {"path": "/var/lib/mw-build-cache", "type": "Directory"}}:
+        problems.append(f"{d['metadata']['name']}: cache volume {cache}")
+    mounts = {m["name"]: m["mountPath"] for c in d["spec"]["template"]["spec"]["containers"] for m in c.get("volumeMounts", [])}
+    if mounts.get("cache") != "/cache":
+        problems.append(f"{d['metadata']['name']}: the cache is not mounted at /cache ({mounts.get('cache')})")
+pvcs = [d["metadata"]["name"] for d in docs if d.get("kind") == "PersistentVolumeClaim"]
+if pvcs: problems.append(f"a claim rendered although the cache is a hostPath: {pvcs}")
+for p in problems: print("   ", p)
+sys.exit(1 if problems else 0)
+PY4H
+}
+if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.cache.medium=host \
+     --set buildHosts.cache.path=/var/lib/mw-build-cache --namespace check > "$WORK/hostcache.yaml" 2> "$WORK/hostcache.err"; then
+  host_cache_check "$WORK/hostcache.yaml" && ok "cache.medium host renders a hostPath (type Directory) cache at cache.path on every host and no claim" || report "the hostPath cache render is wrong (above)"
+else
+  report "the hostPath cache values did not render:"; sed 's/^/    /' "$WORK/hostcache.err"
+fi
+# The control must fail for the RIGHT reason — the cache volume comparison, naming the emptyDir — never a traceback, a
+# parse error or "no build-host Deployment rendered".
+if [ -s "$WORK/nodecache.yaml" ] && ! host_cache_check "$WORK/nodecache.yaml" > "$WORK/hostcheck-on-node.out" 2>&1 \
+     && grep -q ": cache volume {'name': 'cache', 'emptyDir': {'sizeLimit': '100Gi'}}" "$WORK/hostcheck-on-node.out" \
+     && ! grep -q "Traceback\|no build-host Deployment rendered" "$WORK/hostcheck-on-node.out"; then
+  ok "negative control: the hostPath check refuses the node medium's render, on its emptyDir cache volume"
+else
+  report "negative control failed: the hostPath check passed on the node medium's render, or failed for another reason:"; sed 's/^/    /' "$WORK/hostcheck-on-node.out" 2>/dev/null
 fi
 
 # 3f. artifactStore.upload: the hosts hand their artifacts to the BUILD API (MW_BUILD_ARTIFACT_STORE=api:) — no store claim, no
@@ -772,6 +965,21 @@ for entry in \
   "values.build-hosts-run-deadline-zero.yaml|RUN budget" \
   "values.build-hosts-stage-slots-zero.yaml|buildHosts.stageSlots 0 must be within" \
   "values.build-hosts-stage-slots-fraction.yaml|buildHosts.stageSlots 2.9 must be a whole number" \
+  "values.build-hosts-slice-cache-zero.yaml|buildHosts.sliceCacheMaxGi 0 must be within" \
+  "values.build-hosts-slice-cache-fraction.yaml|buildHosts.sliceCacheMaxGi 1.5 must be a whole number" \
+  "values.build-hosts-cache-share-above-budget.yaml|the slices share 32 GiB exceeds the cache budget 18 GiB" \
+  "values.build-hosts-cache-slice-bound-above-budget.yaml|the slices share 32 GiB exceeds the cache budget 18 GiB" \
+  "values.build-hosts-cache-shares-sum-above-budget.yaml|the shares sum to 21 GiB, above the cache budget 18 GiB" \
+  "values.build-hosts-cache-max-above-size.yaml|buildHosts.cache.maxGi 30 exceeds the declared cache.size 20Gi" \
+  "values.build-hosts-cache-unenforced-not-local-path.yaml|buildHosts.cache.sizeEnforced: false is only for a local-path claim" \
+  "values.build-hosts-cache-unenforced-not-bool.yaml|buildHosts.cache.sizeEnforced no must be true or false" \
+  "values.build-hosts-cache-size-unit.yaml|buildHosts.cache.size \"20000Mi\" must be whole Gi, Ti, G or T" \
+  "values.build-hosts-cache-shares-no-budget.yaml|buildHosts.cache.shares.treeGi needs a cache budget" \
+  "values.build-hosts-ready-port-low.yaml|buildHosts.readyPort 80 must be within [1024, 65535]" \
+  "values.build-hosts-ready-port-fraction.yaml|buildHosts.readyPort 8090.5 must be a whole number" \
+  "values.build-hosts-stage-network-bad.yaml|buildHosts.stageNetwork \"none\" must be open or offline" \
+  "values.build-hosts-run-disk-fraction.yaml|buildHosts.runDiskGi 2.5 must be a whole number" \
+  "values.build-hosts-disk-headroom-high.yaml|buildHosts.diskHeadroomPercent 95 must be within" \
   "values.build-hosts-alias-twice.yaml|an alias is ONE version" \
   "values.build-hosts-version-twice.yaml|one deployment per version" \
   "values.build-hosts-bad-version.yaml|must be MAJOR.MINOR.PATCH" \
@@ -790,10 +998,17 @@ for entry in \
   "values.build-hosts-cache-bad-access.yaml|must be ReadWriteMany or ReadWriteOnce" \
   "values.build-hosts-extra-channel-dash.yaml|ending in a letter or digit" \
   "values.build-hosts-userns-not-bool.yaml|sandbox.userNamespace" \
-  "values.build-hosts-cache-bad-medium.yaml|must be claim or node" \
-  "values.build-hosts-cache-medium-false.yaml|must be claim or node" \
-  "values.build-hosts-cache-medium-zero.yaml|must be claim or node" \
-  "values.build-hosts-cache-medium-empty.yaml|must be claim or node" \
+  "values.build-hosts-cache-bad-medium.yaml|must be claim, node or host" \
+  "values.build-hosts-cache-medium-false.yaml|must be claim, node or host" \
+  "values.build-hosts-cache-medium-zero.yaml|must be claim, node or host" \
+  "values.build-hosts-cache-medium-empty.yaml|must be claim, node or host" \
+  "values.build-hosts-cache-host-no-path.yaml|buildHosts.cache.path \"\" must be an absolute node directory" \
+  "values.build-hosts-cache-host-relative-path.yaml|buildHosts.cache.path \"var/lib/mw-build-cache\" must be an absolute node directory" \
+  "values.build-hosts-cache-host-dotdot-path.yaml|buildHosts.cache.path \"/var/lib/../etc\" must be an absolute node directory" \
+  "values.build-hosts-cache-host-root-path.yaml|buildHosts.cache.path \"/\" must be an absolute node directory" \
+  "values.build-hosts-cache-host-size.yaml|is not supported with cache.medium host" \
+  "values.build-hosts-cache-node-path.yaml|buildHosts.cache.path is only for cache.medium host" \
+  "values.build-hosts-cache-host-create.yaml|buildHosts.cache.create is not supported with cache.medium host" \
   "values.build-hosts-userns-empty-0.yaml|sandbox.userNamespace" \
   "values.build-hosts-userns-empty-string.yaml|sandbox.userNamespace" \
   "values.build-hosts-userns-empty-list.yaml|sandbox.userNamespace" \

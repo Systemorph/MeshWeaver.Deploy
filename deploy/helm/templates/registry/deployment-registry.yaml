@@ -38,6 +38,13 @@ spec:
         # template turns it into the same graceful roll an image change gets, and into nothing
         # when nothing changed (same idiom as memex-portal/deployment.yaml).
         checksum/config: {{ include (print $.Template.BasePath "/registry/configmap.yaml") . | sha256sum }}
+{{- if $r.readOnly }}
+        # Which side of a maintenance window this pod was started on. `hosting-registry-maintenance`
+        # verifies POD BY POD that every live registry pod carries the current template's
+        # checksum/config AND this annotation before a garbage-collect may start — a pod started
+        # read-write keeps serving pushes until it is gone, whatever the Deployment says now.
+        memex-registry/maintenance: "read-only"
+{{- end }}
 {{- if $r.workloadIdentityClientId }}
         # The workload-identity webhook injects the client id at pod CREATION and the pod template
         # names only the account, so a changed client id under the same account name must roll the

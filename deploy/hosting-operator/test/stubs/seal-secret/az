@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# A stand-in `az` for hosting-seal-secret. It plays ONE vault:
+#
+#   HOSTING_SS_STATE      directory: az.log (every argv)
+#   HOSTING_SS_OBJECTS    space-separated objects `secret list` names (default: dns01-ClientSecret)
+#   HOSTING_SS_VALUE      what `secret show --query value -o tsv` prints (az adds the newline)
+#   HOSTING_SS_LIST_FAIL=1  the listing is refused
+#   HOSTING_SS_SHOW_FAIL=1  the value read is refused
+set -uo pipefail
+state="${HOSTING_SS_STATE:?the az stub needs HOSTING_SS_STATE}"
+printf 'az %s\n' "$*" >> "$state/az.log"
+case "${1:-} ${2:-} ${3:-}" in
+  "keyvault secret list")
+    [ "${HOSTING_SS_LIST_FAIL:-0}" = "1" ] && { echo "ERROR: (Forbidden) secrets list permission" >&2; exit 1; }
+    for o in ${HOSTING_SS_OBJECTS-dns01-ClientSecret}; do printf '%s\n' "$o"; done
+    exit 0 ;;
+  "keyvault secret show")
+    [ "${HOSTING_SS_SHOW_FAIL:-0}" = "1" ] && { echo "ERROR: (Forbidden) secrets get permission" >&2; exit 1; }
+    printf '%s\n' "${HOSTING_SS_VALUE-dns01-secret-NEVERPRINTED-0123456789abcdefABCDEF}"; exit 0 ;;
+esac
+echo "az stub: unexpected invocation: $*" >&2
+exit 1

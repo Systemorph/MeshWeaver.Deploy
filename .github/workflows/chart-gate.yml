@@ -73,7 +73,7 @@ env:
   # at the point of use (MeshWeaver#3259). The publisher (`.github/scripts/push-bundle-publication.sh`)
   # is what main-cd.yml and every satellite's bake lane run against the fleet registry TODAY, i.e.
   # core's tip, so the harness tracks the tip. The repo VARIABLE MW_PLATFORM_REF wins over it.
-  MW_CHART_GATE_PLATFORM_REF: main
+  MW_CHART_GATE_PLATFORM_REF: main3
 
 # One live run per ref: a newer push to the same PR branch cancels the run it supersedes; main and
 # the merge queue never cancel (each main push is its own group, keyed on the commit).
@@ -118,7 +118,11 @@ jobs:
       - name: Install shellcheck (pinned, checksum-verified)
         run: |
           set -euo pipefail
-          curl -fsSLo "$RUNNER_TEMP/sc.tar.xz" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          # A release download through github.com's CDN answers 5xx for minutes at a time (measured 2026-11-08: 504/502 on
+          # every attempt for over an hour on ubuntu-latest while the same URL answered 200 elsewhere). Bounded retries ride
+          # out a transient one; the checksum below still decides what is installed.
+          curl -fsSL --retry 6 --retry-all-errors --retry-delay 20 --connect-timeout 20 --max-time 120 \
+            -o "$RUNNER_TEMP/sc.tar.xz" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
           echo "${SHELLCHECK_SHA256}  $RUNNER_TEMP/sc.tar.xz" | sha256sum -c -
           # The runner image carries no `xz`, so `tar -J` cannot exec it; python's stdlib reads xz.
           python3 -c 'import sys, tarfile; tarfile.open(sys.argv[1], "r:xz").extractall(sys.argv[2], filter="data")' \
@@ -230,6 +234,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 deploy/backlease/host-fits-node.py --self-test
 
+      # The leased-back Mac follows the sealed set (deploy/backlease/follow-set.py, first-attach.sh step 6): behind →
+      # exactly the four set values re-applied with --reuse-values on the profile's context; current → nothing; an
+      # unreachable control, an incomplete or malformed set, a pending release → nothing (fail closed). No cluster, no network.
+      - name: Assert the Mac build host follows the sealed set and fails closed
+        if: ${{ !cancelled() }}
+        run: python3 deploy/backlease/follow-set.py --self-test
+
       # The node-pool headroom (templates/node-headroom/, Memex#863): the defaults render nothing (the
       # negative control), a declared pool renders one negative, non-preempting PriorityClass and one
       # pinned requests==limits placeholder, and the refusals hold. No cluster, no network.
@@ -244,6 +255,15 @@ jobs:
       - name: Assert the registry runs as its own identity only when the record names one
         if: ${{ !cancelled() }}
         run: deploy/aks/scripts/test-registry-identity.sh
+
+      # The registry's maintenance window (registry.maintenance.*, MeshWeaver.Plugins#4370 slice 3): with no
+      # key the render is unchanged (the negative control); readOnly renders the read-only configuration and
+      # annotates the pod template; a collect renders ONE garbage-collect Job, never --delete-untagged, as the
+      # registry's own identity, without touching the registry pods; a collect outside a read-only window and
+      # malformed values are refused. No cluster, no network.
+      - name: Assert the registry maintenance window renders read-only and its collect only inside it
+        if: ${{ !cancelled() }}
+        run: deploy/aks/scripts/test-registry-maintenance.sh
 
       # The whisper and s1-extract service charts' top-level `enabled` switch (#38): ON by default with
       # a render byte-identical to an undeclared one (estates already run both), and `enabled: false`
@@ -413,7 +433,11 @@ jobs:
       - name: Install shellcheck (pinned, checksum-verified)
         run: |
           set -euo pipefail
-          curl -fsSLo "$RUNNER_TEMP/sc.tar.xz" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          # A release download through github.com's CDN answers 5xx for minutes at a time (measured 2026-11-08: 504/502 on
+          # every attempt for over an hour on ubuntu-latest while the same URL answered 200 elsewhere). Bounded retries ride
+          # out a transient one; the checksum below still decides what is installed.
+          curl -fsSL --retry 6 --retry-all-errors --retry-delay 20 --connect-timeout 20 --max-time 120 \
+            -o "$RUNNER_TEMP/sc.tar.xz" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
           echo "${SHELLCHECK_SHA256}  $RUNNER_TEMP/sc.tar.xz" | sha256sum -c -
           # The runner image carries no `xz`, so `tar -J` cannot exec it; python's stdlib reads xz.
           python3 -c 'import sys, tarfile; tarfile.open(sys.argv[1], "r:xz").extractall(sys.argv[2], filter="data")' \

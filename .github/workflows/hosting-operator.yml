@@ -49,7 +49,7 @@ concurrency:
 
 env:
   OPERATOR_DIR: deploy/hosting-operator
-  MW_HOSTING_OPERATOR_PLATFORM_REF: main
+  MW_HOSTING_OPERATOR_PLATFORM_REF: main3
   SHELLCHECK_VERSION: v0.10.0
   SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
 
@@ -99,14 +99,14 @@ jobs:
         run: |
           set -euo pipefail
           tracked=$(git ls-files "$OPERATOR_DIR/bin/" | wc -l | tr -d ' ')
-          if [ "$tracked" -lt 49 ]; then
-            echo "::error::only ${tracked} file(s) tracked under $OPERATOR_DIR/bin/ — expected at least 49 (43 commands + run.sh + _common.sh + _audit.jq + _values_half.py + _dump_analyze_pod.sh + _storage_prune_pod.sh). The floor is the REAL count — raise it with every file added, or a lost file passes."
+          if [ "$tracked" -lt 54 ]; then
+            echo "::error::only ${tracked} file(s) tracked under $OPERATOR_DIR/bin/ — expected at least 54 (the real count with hosting-seal-secret). The floor is the REAL count — raise it with every file added, or a lost file passes."
             exit 1
           fi
           nonexec=$(git ls-files -s "$OPERATOR_DIR"/bin/hosting-* "$OPERATOR_DIR/bin/run.sh" | awk '$1 != "100755"' | wc -l | tr -d ' ')
           [ "$nonexec" -eq 0 ] || { echo "::error::${nonexec} operator command(s) are not committed executable (mode 100755)"; exit 1; }
           stubs=$(git ls-files -s "$OPERATOR_DIR/test/stubs/" | wc -l | tr -d ' ')
-          [ "$stubs" -ge 55 ] || { echo "::error::only ${stubs} test stub(s) tracked under $OPERATOR_DIR/test/stubs/ — expected at least 55 (the real count; raise it with every stub added)"; exit 1; }
+          [ "$stubs" -ge 60 ] || { echo "::error::only ${stubs} test stub(s) tracked under $OPERATOR_DIR/test/stubs/ — expected at least 60 (the real count; raise it with every stub added)"; exit 1; }
           nonexec_stubs=$(git ls-files -s "$OPERATOR_DIR/test/stubs/" | awk '$1 != "100755"' | wc -l | tr -d ' ')
           [ "$nonexec_stubs" -eq 0 ] || { echo "::error::${nonexec_stubs} test stub(s) are not committed executable (mode 100755)"; exit 1; }
           echo "${tracked} bin files and ${stubs} stubs tracked, all executable"
@@ -162,7 +162,7 @@ jobs:
             set -e
             test -f /opt/hosting/chart/Chart.yaml    || { echo "chart missing"; exit 1; }
             test -f /opt/hosting/chart-db/Chart.yaml || { echo "db chart missing"; exit 1; }
-            command -v helm kubectl az pg_dump jq crane >/dev/null || { echo "a required tool is missing"; exit 1; }
+            command -v helm kubectl az pg_dump jq crane openssl >/dev/null || { echo "a required tool is missing"; exit 1; }
             test -f /opt/hosting/drift/check-chart-drift.sh && test -f /opt/hosting/drift/kind-not-served.sh || { echo "drift scripts missing"; exit 1; }
             python3 -c "import yaml" || { echo "python3/PyYAML missing"; exit 1; }
           '

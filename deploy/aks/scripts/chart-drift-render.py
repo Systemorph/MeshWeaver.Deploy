@@ -91,8 +91,10 @@ import argparse, copy, json, os, re, subprocess, sys, tempfile
 import yaml
 
 # The objects check-chart-drift.sh / chart-drift-compare.py read from the rendered chart, as
-# (kind, name, required). `name` of None means "whichever one of this kind the chart renders",
-# exactly as the comparator picks the PodDisruptionBudget and the ScaledObject.
+# (kind, name, required). `name` of None means "every one of this kind the chart renders": a
+# SUPERSET of what the comparator reads, which picks the portal's own PodDisruptionBudget and
+# ScaledObject by name (the build-host channels render ScaledObjects too — MeshWeaver#5844). Proving
+# every object of the kind independent of the placeholder is the stronger claim, so it stays wide.
 #
 # 🚨 `required` is not decoration. The first two are what the comparator REFUSES to run without
 # ("the rendered chart contains no memex-portal-config ConfigMap and/or no memex-portal-deployment

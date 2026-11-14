@@ -23,6 +23,8 @@ set -uo pipefail
 # hosting-operator lane, run 42454937015, where hosting::kv_exists did it in the script under test).
 # The "no grep -q behind a pipe" guard at the end of this suite holds bin/, the stubs and this file to it.
 grep_in() { local text="$1"; shift; grep "$@" <<< "$text"; }
+# SHA-256 hex of stdin, wherever the suite runs (sha256sum in the image, shasum on a bare macOS).
+hosting_sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -c1-64; else shasum -a 256 | cut -c1-64; fi; }
 BIN="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../bin" && pwd)"
 export PATH="$BIN:$PATH"
 
@@ -2110,6 +2112,124 @@ case "$_ie_out" in *"::hosting:: inline_env_retire=dry-run"*) ok "…and never c
 ie_no_value "…still printing no value"
 
 echo
+echo "── hosting-volume-retire: a retired LIVE-ONLY volume leaves, once nothing renders it or reads its path ──"
+# The volume twin of hosting-inline-env-retire (memex stuck rolls, 2026-11-10: a live-only Secret volume
+# `hosting-jobrunner-token` that every roll copied forward after its Secret was deleted). The stub answers the
+# Deployment, the release manifest and the configuration sources from a per-scenario fixture (falling back to
+# fixtures/volume-retire/base) and RECORDS the patch, so the decisions — refuse a volume the chart renders,
+# refuse a path a container still reads (its own spec, or a ConfigMap/Secret it reads), refuse a mount the
+# record does not describe, refuse mid-rollout unless folded, remove the volume and EVERY mount in one guarded
+# patch, read it back — are asserted without a cluster. Every invocation runs with the stubs FIRST on PATH.
+VR_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/volume-retire" && pwd)"
+VR_FIXTURES="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/fixtures/volume-retire" && pwd)"
+VR_TOKEN="hosting-jobrunner-token=/var/run/secrets/hosting-operator"
+_vr_args_state="$(mktemp -d)"
+VR_ENV=(env "PATH=$VR_STUBS:$PATH" "HOSTING_VR_FIXTURE=$VR_FIXTURES/base" "HOSTING_VR_BASE=$VR_FIXTURES/base" "HOSTING_VR_STATE=$_vr_args_state")
+vr() {  # vr <scenario> "<volume=path> […]" [env…] — sets $_vr_out $_vr_rc $_vr_log $_vr_patch
+  local scenario="$1" pairs="$2" pair
+  shift 2
+  local retire=()
+  for pair in $pairs; do retire+=(--retire "$pair"); done
+  _vr_state="$(mktemp -d)"
+  _vr_out="$(env "$@" PATH="$VR_STUBS:$PATH" HOSTING_VR_FIXTURE="$VR_FIXTURES/$scenario" HOSTING_VR_BASE="$VR_FIXTURES/base" \
+    HOSTING_VR_STATE="$_vr_state" hosting-volume-retire --namespace memex --release memex "${retire[@]}" ${VR_FLAGS:-} 2>&1)"; _vr_rc=$?
+  _vr_log="$(cat "$_vr_state/log" 2>/dev/null || true)"
+  _vr_patch="$(cat "$_vr_state/patch" 2>/dev/null || true)"
+  rm -rf "$_vr_state"
+}
+vr_no_patch() {  # the run wrote nothing to the Deployment
+  case "$_vr_log" in *" patch deployment "*) bad "$1" "kubectl saw a patch: ${_vr_log}" ;; *) ok "$1" ;; esac
+}
+
+refuses "volume-retire needs --namespace" "missing required flag --namespace" \
+  "${VR_ENV[@]}" hosting-volume-retire --release memex --retire "$VR_TOKEN"
+refuses "volume-retire needs --release (the chart's truth it measures against)" "missing required flag --release" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --retire "$VR_TOKEN"
+refuses "volume-retire needs a --retire" "missing required flag --retire" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --release memex
+refuses "volume-retire needs <volume>=<mount path>" "is not <volume>=<mount path>" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --release memex --retire hosting-jobrunner-token
+refuses "volume-retire refuses a volume named twice" "named twice" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --release memex --retire "$VR_TOKEN" --retire "$VR_TOKEN"
+refuses "volume-retire refuses the root as a mount path" "is '/'" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --release memex --retire hosting-jobrunner-token=/
+refuses_hard "volume-retire volume with a metacharacter" "is not a DNS label" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --release memex --retire 'v;kubectl delete deploy --all=/x'
+refuses_hard "volume-retire path with a metacharacter or '..'" "is not a plain absolute path" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --release memex --retire 'hosting-jobrunner-token=/var/../etc'
+refuses_hard "volume-retire relative path" "is not a plain absolute path" \
+  "${VR_ENV[@]}" hosting-volume-retire --namespace memex --release memex --retire 'hosting-jobrunner-token=var/run'
+case "$(cat "$_vr_args_state/log" 2>/dev/null)" in
+  "") ok "…and no argument refusal ever reached kubectl or helm" ;;
+  *) bad "argument refusals reach no cluster" "saw: $(cat "$_vr_args_state/log")" ;;
+esac
+rm -rf "$_vr_args_state"
+
+# The exact incident shape: the live-only Secret volume, mounted by the portal AND an init container.
+vr base "$VR_TOKEN"
+[ "$_vr_rc" -eq 0 ] && case "$_vr_out" in *"::hosting:: volume_retired=1"*"::hosting:: volume_absent=0"*) true ;; *) false ;; esac \
+  && ok "a live-only volume the record retires, read by nothing, is removed and READ BACK (volume_retired=1)" \
+  || bad "live-only volume retired" "rc ${_vr_rc}: ${_vr_out}"
+case "$_vr_out" in *"hosting-jobrunner-token  live-only (release memex does not render it), mounted at /var/run/secrets/hosting-operator on: memex-portal, wait-for-db; no container reads"*) ok "…naming what it measured: live-only, where, by whom, read by nothing" ;;
+  *) bad "the measurement is narrated" "said: ${_vr_out}" ;; esac
+_vr_ops="$(printf '%s' "$_vr_patch" | jq -r '.[] | "\(.op) \(.path)"' 2>/dev/null | tr '\n' ';')"
+case "$_vr_ops" in "test /metadata/resourceVersion;test /spec/template/spec/containers/0/volumeMounts/1/name;remove /spec/template/spec/containers/0/volumeMounts/1;test /spec/template/spec/initContainers/0/volumeMounts/0/name;remove /spec/template/spec/initContainers/0/volumeMounts/0;test /spec/template/spec/volumes/1/name;remove /spec/template/spec/volumes/1;")
+  ok "…in ONE patch guarded on resourceVersion and every entry's name: both mounts, then the volume" ;;
+  *) bad "the patch removes every mount and the volume, guarded" "ops: ${_vr_ops} patch: ${_vr_patch}" ;; esac
+case "$_vr_patch" in *"/data"*|*"memex-kv-secrets"*) bad "only the retired volume is touched" "patch: ${_vr_patch}" ;;
+  *) ok "…and touches nothing else (the data claim and the CSI volume stay)" ;; esac
+
+# Negative control: each refusal below is the SAME run with one fact changed — and each writes nothing.
+vr rendered "$VR_TOKEN"
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"is RENDERED by release memex"*) true ;; *) false ;; esac \
+  && ok "a volume the release's manifest renders is the chart's, not live-only — refused" || bad "a rendered volume is refused" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…and writes nothing"
+vr readenv "$VR_TOKEN"
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"READS     /var/run/secrets/hosting-operator: container memex-portal env.0.value"*"still reads /var/run/secrets/hosting-operator"*) true ;; *) false ;; esac \
+  && ok "a container whose own env still names the path refuses, naming the container and where" || bad "a path read by env is refused" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…and writes nothing"
+vr readsecret "$VR_TOKEN"
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"READS     /var/run/secrets/hosting-operator: container memex-portal through secret/memex-portal-keyvault key Hosting__JobRunner__TokenFile"*) true ;; *) false ;; esac \
+  && ok "a path read through a Secret the container reads (envFrom) refuses, naming the Secret and the KEY" || bad "a path read via a Secret is refused" "rc ${_vr_rc}: ${_vr_out}"
+case "${_vr_out}${_vr_log}" in *NEVER-PRINTED*) bad "a Secret's value is never printed" "out: ${_vr_out}" ;; *) ok "…never its value" ;; esac
+vr_no_patch "…and writes nothing"
+vr sibling "$VR_TOKEN"
+[ "$_vr_rc" -eq 0 ] && case "$_vr_out" in *"READS"*) false ;; *"::hosting:: volume_retired=1"*) true ;; *) false ;; esac \
+  && ok "negative control: a SIBLING path (…/hosting-operator-2, /mnt/…/hosting-operator) is not a read of the path — only the path itself or a file under it is" \
+  || bad "sibling paths are not reads" "rc ${_vr_rc}: ${_vr_out}"
+vr base "hosting-jobrunner-token=/var/run/secrets/elsewhere"
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"container memex-portal mounts it at /var/run/secrets/hosting-operator"*) true ;; *) false ;; esac \
+  && ok "a record whose mount path is not where the pod mounts it describes a different volume — refused" || bad "a mismatched path is refused" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…and writes nothing"
+vr base "$VR_TOKEN" MW_VR_HELM_FAIL=1
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"could not read the manifest of release 'memex'"*"UNKNOWN"*) true ;; *) false ;; esac \
+  && ok "no release manifest means 'live-only' is UNKNOWN — refused, never assumed" || bad "no manifest refused" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…and writes nothing"
+vr rolling "$VR_TOKEN"
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"a rollout is in progress"*) true ;; *) false ;; esac \
+  && ok "a rollout in flight is refused — a removal would supersede it" || bad "mid-rollout refused" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…and writes nothing"
+VR_FLAGS="--fold-into-rollout" vr rolling "$VR_TOKEN"
+[ "$_vr_rc" -eq 0 ] && case "$_vr_out" in *"::hosting:: volume_folded_generation=13"*"::hosting:: volume_retired=1"*) true ;; *) false ;; esac \
+  && ok "…unless the plan folds it into its OWN handed-off rollout (--fold-into-rollout)" || bad "fold into own rollout" "rc ${_vr_rc}: ${_vr_out}"
+VR_FLAGS="--fold-into-rollout" vr paused "$VR_TOKEN"
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"is PAUSED"*) true ;; *) false ;; esac \
+  && ok "a PAUSED Deployment is refused, even folded" || bad "paused refused" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…and writes nothing"
+
+vr stuck "$VR_TOKEN"
+[ "$_vr_rc" -ne 0 ] && case "$_vr_out" in *"still carries volume hosting-jobrunner-token"*) true ;; *) false ;; esac \
+  && ok "a patch the API accepted but that did not take is a FAILED step, naming what is left" || bad "an ineffective patch fails" "rc ${_vr_rc}: ${_vr_out}"
+vr absent "$VR_TOKEN"
+[ "$_vr_rc" -eq 0 ] && case "$_vr_out" in *"::hosting:: volume_retired=0"*"::hosting:: volume_absent=1"*) true ;; *) false ;; esac \
+  && ok "a volume the template no longer carries is a successful no-op (idempotent plan step)" || bad "already retired is a no-op" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…that writes nothing, so it rolls nothing"
+vr base "$VR_TOKEN" HOSTING_DRY_RUN=true
+[ "$_vr_rc" -eq 0 ] && case "$_vr_out" in *"DRY-RUN would run"*"patch deployment"*"::hosting:: volume_retire=dry-run"*) true ;; *) false ;; esac \
+  && ok "a dry run measures for real, narrates the patch and never claims a retirement" || bad "dry run" "rc ${_vr_rc}: ${_vr_out}"
+vr_no_patch "…and writes nothing"
+
+echo
 echo "── hosting-kv-synced: a newly mapped vault key reaches the PROCESS, not only the Secret ──"
 # MeshWeaver.Plugins#2778 — the CSI driver adds a key to an EXISTING synced Secret only on a rotation
 # pass, after the re-apply's pods resolved envFrom: a Reconcile reported Healthy while the key it was
@@ -2711,6 +2831,40 @@ else
 fi
 rm -rf "$_ap_dir"
 
+# ── hosting-deploy keeps the RECORD's ingress.tlsSecret ─────────────────────────────────────────
+# 🚨 Measured on an enterprise estate's instance, 2026-11-11 from 09:02Z: the record names `keyvault-memex-portal`
+# (the Key Vault CSI Secret), the deploy's `--set ingress.tlsSecret=<namespace>-tls` overrode it with
+# `memex-tls`, a Secret that did not exist, and nginx served its fake certificate on every ingress.
+# `--set` beats `-f`, so the flag itself is the defect — pinned on the argument list.
+echo
+echo "── hosting-deploy: the record's ingress.tlsSecret survives the flags ─"
+_tl_dir="$(mktemp -d)"; cp -R "$DP_FIXTURES/." "$_tl_dir/"; _tl_log="$_tl_dir/calls.log"
+_tl_vals="$_tl_dir/values.yaml"
+_tl_run() { : > "$_tl_log"; env PATH="$DP_STUBS:$PATH" HOSTING_CHART=/tmp HOSTING_DEPLOY_FIXTURE="$_tl_dir" HOSTING_DEPLOY_STUB_LOG="$_tl_log" "$@" \
+  hosting-deploy --namespace memex --release memex --database memex --values "$_tl_vals" --image cr.example.test/memex-portal-ai:1 >/dev/null 2>&1
+  grep '^helm upgrade' "$_tl_log" | head -1; }
+printf '# GENERATED from the Hosting/Deployment record by HelmValues\ningress:\n  className: "nginx"\n  tlsSecret: "keyvault-memex-portal"\nreplicas:\n  portal: 1\n' > "$_tl_vals"
+_tl_up="$(_tl_run env)"
+if grep_in "$_tl_up" -q -- 'ingress.tlsSecret=keyvault-memex-portal' && ! grep_in "$_tl_up" -q -- 'ingress.tlsSecret=memex-tls'; then
+  ok "a record that names its TLS Secret keeps it (no <namespace>-tls over it)"
+else
+  bad "the record's ingress.tlsSecret is kept" "upgrade line: '${_tl_up}'"
+fi
+_tl_up="$(_tl_run env HOSTING_TLS_SECRET=operator-override)"
+if grep_in "$_tl_up" -q -- 'ingress.tlsSecret=operator-override'; then
+  ok "an explicit HOSTING_TLS_SECRET still wins over the record"
+else
+  bad "HOSTING_TLS_SECRET wins" "upgrade line: '${_tl_up}'"
+fi
+printf '# GENERATED from the Hosting/Deployment record by HelmValues\nreplicas:\n  portal: 1\n' > "$_tl_vals"
+_tl_up="$(_tl_run env)"
+if grep_in "$_tl_up" -q -- 'ingress.tlsSecret=memex-tls'; then
+  ok "values with no ingress block fall back to <namespace>-tls"
+else
+  bad "the <namespace>-tls fallback" "upgrade line: '${_tl_up}'"
+fi
+rm -rf "$_tl_dir"
+
 # ── hosting-deploy layers the Key Vault VALUES HALF first, when the record declares one ─────────
 # 🚨 MeshWeaver#3780, measured twice on the control instance (helm revisions 44 and 55). The chart's
 # own Secrets render from `secrets.<half>.*`, which on an external database live ONLY in the vault
@@ -3307,6 +3461,16 @@ ma_refuses() {  # ma_refuses <what> <phrase> <parsed json>
 ma_refuses "a kind outside the lane's set is refused (a Deployment)" "kind Deployment is not one this lane applies" '{"kind":"Deployment","metadata":{"name":"d","namespace":"n"}}'
 ma_refuses "a Secret carrying data is refused" "carries data" '{"kind":"Secret","type":"kubernetes.io/service-account-token","metadata":{"name":"s"},"data":{"k":"dg=="}}'
 ma_refuses "an Opaque Secret is refused" "may only be an empty kubernetes.io/service-account-token" '{"kind":"Secret","type":"Opaque","metadata":{"name":"s"}}'
+# The one Opaque Secret admitted: an EMPTY placeholder, labelled as one, naming no service account — it lets a
+# pod that still names a retired Secret as a volume mount it, and carries nothing.
+ma_refuses "an Opaque placeholder carrying data is refused" "carries data" '{"kind":"Secret","type":"Opaque","metadata":{"name":"s","labels":{"hosting.meshweaver.io/placeholder":"true"}},"stringData":{"token":"x"}}'
+ma_refuses "an Opaque placeholder naming a service account is refused" "must authenticate as nobody" '{"kind":"Secret","type":"Opaque","metadata":{"name":"s","labels":{"hosting.meshweaver.io/placeholder":"true"},"annotations":{"kubernetes.io/service-account.name":"x"}}}'
+ma_refuses "an Opaque Secret labelled anything but placeholder=true is refused" "may only be an empty kubernetes.io/service-account-token" '{"kind":"Secret","type":"Opaque","metadata":{"name":"s","labels":{"hosting.meshweaver.io/placeholder":"yes"}}}'
+ma_fixture placeholder-ok 'kind: Secret # fixture' '{"apiVersion":"v1","kind":"Secret","type":"Opaque","metadata":{"name":"s","namespace":"acme","labels":{"hosting.meshweaver.io/placeholder":"true"}}}'
+ma check --manifest demo/placeholder-ok.yaml
+if [ "$_ma_rc" -eq 0 ] && case "$_ma_out" in *"object    Secret acme/s"*"::hosting:: manifest_check=sha256:"*) true ;; *) false ;; esac \
+   && ! grep_in "$_ma_log" -q '^kubectl apply -f'; then ok "an EMPTY labelled Opaque placeholder is admitted (negative control for the three refusals above)"
+else bad "empty Opaque placeholder" "rc ${_ma_rc}; kubectl: ${_ma_log}; ${_ma_out}"; fi
 ma_refuses "a wildcard rule is refused" "with * in its verbs" '{"kind":"ClusterRole","metadata":{"name":"c"},"rules":[{"apiGroups":[""],"resources":["*"],"verbs":["get"]}]}'
 ma_refuses "the escalate verb is refused" "verb escalate is refused" '{"kind":"Role","metadata":{"name":"c","namespace":"n"},"rules":[{"apiGroups":["rbac.authorization.k8s.io"],"resources":["roles"],"verbs":["escalate"]}]}'
 ma_refuses "an aggregated ClusterRole is refused" "aggregated ClusterRole" '{"kind":"ClusterRole","metadata":{"name":"c"},"aggregationRule":{"clusterRoleSelectors":[]}}'
@@ -3427,6 +3591,95 @@ md "" -- check --manifest demo/writer.yaml
 md $'serviceaccounts memex hosting-jobrunner\nsecrets control hosting-jobrunner-token-old' -- check --object ServiceAccount/memex/hosting-jobrunner --object Secret/control/hosting-jobrunner-token-old
 [ "$_md_rc" -eq 0 ] && case "$_md_out" in *"deletion_present=2"*) true ;; *) false ;; esac \
   && ok "negative control: objects outside the kept set (memex/hosting-jobrunner, a differently named control token) are admitted" || bad "deny list too wide" "rc ${_md_rc}; ${_md_out}"
+
+# 🚨 IN USE: nothing a live workload still needs is deleted. The EXACT incident: deletemanifest-jobrunner-20261110
+# deleted Secret memex/hosting-jobrunner-token while every memex portal pod mounted it as a live-only volume, and
+# every roll since stuck in FailedMount. The workloads fixture is that state as measured (the Deployment template,
+# three serving pods' ReplicaSet, the Pending new pod, a zero-replica ReplicaSet and a finished Job beside them).
+MD_FIX="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/fixtures/manifest-delete" && pwd)"
+md_fixture jobrunner \
+  '{"kind":"ServiceAccount","metadata":{"name":"hosting-jobrunner","namespace":"memex"}}
+{"kind":"Secret","type":"kubernetes.io/service-account-token","metadata":{"name":"hosting-jobrunner-token","namespace":"memex"}}
+{"kind":"Role","metadata":{"name":"hosting-jobrunner","namespace":"memex-ops"}}
+{"kind":"RoleBinding","metadata":{"name":"hosting-jobrunner","namespace":"memex-ops"}}
+{"kind":"ValidatingAdmissionPolicy","metadata":{"name":"hosting-jobrunner-no-privileged-identity"}}
+{"kind":"ValidatingAdmissionPolicyBinding","metadata":{"name":"hosting-jobrunner-no-privileged-identity"}}'
+_md_jr_live='serviceaccounts memex hosting-jobrunner
+secrets memex hosting-jobrunner-token
+roles.rbac.authorization.k8s.io memex-ops hosting-jobrunner
+rolebindings.rbac.authorization.k8s.io memex-ops hosting-jobrunner'
+md "$_md_jr_live" MW_MD_WORKLOADS="$MD_FIX/workloads-mounted.json" MW_MD_BINDINGS="$MD_FIX/bindings.json" -- check --manifest demo/jobrunner.yaml
+if [ "$_md_rc" -ne 0 ] && [ "$_md_live" = "$_md_jr_live" ] && case "$_md_out" in
+     *"IN USE    Secret memex/hosting-jobrunner-token — Deployment memex/memex-portal-deployment mounts it as volume hosting-jobrunner-token"*"::hosting:: deletion_in_use=1"*"still used by a live workload"*) true ;; *) false ;; esac; then
+  ok "the jobrunner-token case: a dry run refuses the Secret the portal Deployment still mounts, naming the Deployment and the volume"
+else bad "jobrunner-token in use (check)" "rc ${_md_rc}; ${_md_out}"; fi
+case "$_md_out" in *"IN USE    Secret memex/hosting-jobrunner-token — Pod memex/memex-portal-deployment-5d79dc75b6-fwtkc mounts it"*"IN USE    Secret memex/hosting-jobrunner-token — Pod memex/memex-portal-deployment-cf468fdd4-r289s mounts it"*) ok "…and every live pod that mounts it, the Pending one included" ;;
+  *) bad "jobrunner-token pods named" "${_md_out}" ;; esac
+case "$_md_out" in *"0ld0000000"*|*"hosting-op-old"*) bad "history is not a use" "a zero-replica ReplicaSet or a finished Job was named: ${_md_out}" ;;
+  *) ok "…but not a zero-replica ReplicaSet or a finished Job: history is not a use" ;; esac
+_md_jr_digest="$(md_sha_of "$(printf '%s\n' 'Role|memex-ops|hosting-jobrunner' 'RoleBinding|memex-ops|hosting-jobrunner' 'Secret|memex|hosting-jobrunner-token' \
+  'ServiceAccount|memex|hosting-jobrunner' 'ValidatingAdmissionPolicy||hosting-jobrunner-no-privileged-identity' \
+  'ValidatingAdmissionPolicyBinding||hosting-jobrunner-no-privileged-identity' | LC_ALL=C sort -u)"$'\n')"
+md "$_md_jr_live" MW_MD_WORKLOADS="$MD_FIX/workloads-mounted.json" MW_MD_BINDINGS="$MD_FIX/bindings.json" -- delete --manifest demo/jobrunner.yaml --sha256 "$_md_jr_digest"
+if [ "$_md_rc" -ne 0 ] && [ "$_md_live" = "$_md_jr_live" ] && ! grep_in "$_md_log" -q -- '--wait=true' \
+   && case "$_md_out" in *"IN USE    Secret memex/hosting-jobrunner-token"*"Nothing was deleted"*) true ;; *) false ;; esac; then
+  ok "…and the APPROVED delete refuses too, before deleting anything — an approval cannot release an object in use"
+else bad "jobrunner-token in use (delete)" "rc ${_md_rc}; kubectl: ${_md_log}; ${_md_out}"; fi
+# Negative control: the same plan once the volume is retired — nothing live references the token (a Failed pod of
+# the old ReplicaSet still names it, and is not live), so the check passes and the delete deletes.
+md "$_md_jr_live" MW_MD_WORKLOADS="$MD_FIX/workloads-fixed.json" MW_MD_BINDINGS="$MD_FIX/bindings.json" -- check --manifest demo/jobrunner.yaml
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"IN USE"*) false ;; *"::hosting:: deletion_in_use=0"*"::hosting:: deletion_check="*) true ;; *) false ;; esac \
+  && ok "negative control: with the volume retired the same plan is not in use (deletion_in_use=0) and the check passes" || bad "jobrunner-token not in use" "rc ${_md_rc}; ${_md_out}"
+md "$_md_jr_live" MW_MD_WORKLOADS="$MD_FIX/workloads-fixed.json" MW_MD_BINDINGS="$MD_FIX/bindings.json" -- delete --manifest demo/jobrunner.yaml --sha256 "$_md_jr_digest"
+[ "$_md_rc" -eq 0 ] && [ -z "$_md_live" ] && case "$_md_out" in *"deletion_absent=6"*) true ;; *) false ;; esac \
+  && ok "…and its delete runs and reads every object back absent" || bad "jobrunner delete after retirement" "rc ${_md_rc}; live: ${_md_live}; ${_md_out}"
+# An ABSENT object something still mounts is NAMED (that state is what wedges a roll), but deletes nothing, so it
+# does not refuse — the re-run of an already-executed plan is how the stuck state is diagnosed.
+md 'serviceaccounts memex hosting-jobrunner' MW_MD_WORKLOADS="$MD_FIX/workloads-mounted.json" -- check --object Secret/memex/hosting-jobrunner-token
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"dangling  Secret memex/hosting-jobrunner-token is ABSENT, yet Deployment memex/memex-portal-deployment mounts it as volume hosting-jobrunner-token"*"deletion_in_use=0"*) true ;; *) false ;; esac \
+  && ok "an absent object a live workload still mounts is named as DANGLING (the stuck-roll state), without refusing a no-op" || bad "dangling reference" "rc ${_md_rc}; ${_md_out}"
+# The identity edges: the ServiceAccount a live pod runs as, the RoleBinding whose subject it is, the Role that
+# binding grants — and, cluster-wide, a ClusterRoleBinding/ClusterRole reached the same way; a Namespace a live pod runs in.
+md "$_md_jr_live" MW_MD_WORKLOADS="$MD_FIX/workloads-runner.json" MW_MD_BINDINGS="$MD_FIX/bindings.json" -- check --manifest demo/jobrunner.yaml
+if [ "$_md_rc" -ne 0 ] && case "$_md_out" in
+     *"IN USE    RoleBinding memex-ops/hosting-jobrunner — Pod memex/hosting-jobrunner-live binds ServiceAccount memex/hosting-jobrunner, which it runs as"*) true ;; *) false ;; esac \
+   && case "$_md_out" in *"IN USE    Role memex-ops/hosting-jobrunner — Pod memex/hosting-jobrunner-live is granted it through RoleBinding memex-ops/hosting-jobrunner"*) true ;; *) false ;; esac \
+   && case "$_md_out" in *"IN USE    ServiceAccount memex/hosting-jobrunner — Pod memex/hosting-jobrunner-live runs as it"*"deletion_in_use=3"*) true ;; *) false ;; esac; then
+  ok "a ServiceAccount a live pod runs as is in use — and so are the RoleBinding naming it as subject and the Role it grants"
+else bad "identity in use" "rc ${_md_rc}; ${_md_out}"; fi
+md $'clusterroles.rbac.authorization.k8s.io - hosting-operator\nclusterrolebindings.rbac.authorization.k8s.io - hosting-operator' \
+  MW_MD_WORKLOADS="$MD_FIX/workloads-runner.json" MW_MD_BINDINGS="$MD_FIX/bindings.json" -- check --object ClusterRole/hosting-operator --object ClusterRoleBinding/hosting-operator
+[ "$_md_rc" -ne 0 ] && case "$_md_out" in *"IN USE    ClusterRoleBinding hosting-operator — Pod memex-ops/hosting-op-live binds ServiceAccount memex-ops/hosting-operator"*"deletion_in_use=2"*) true ;; *) false ;; esac \
+  && ok "…cluster-wide too: a ClusterRoleBinding (and its ClusterRole) whose subject a live pod runs as" || bad "cluster identity in use" "rc ${_md_rc}; ${_md_out}"
+md $'clusterroles.rbac.authorization.k8s.io - hosting-operator\nclusterrolebindings.rbac.authorization.k8s.io - hosting-operator' \
+  MW_MD_WORKLOADS="$MD_FIX/workloads-fixed.json" MW_MD_BINDINGS="$MD_FIX/bindings.json" -- check --object ClusterRole/hosting-operator --object ClusterRoleBinding/hosting-operator
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"deletion_in_use=0"*) true ;; *) false ;; esac \
+  && ok "negative control: the same binding is NOT in use when no live pod runs as its subject" || bad "cluster identity not in use" "rc ${_md_rc}; ${_md_out}"
+md_fixture opsns '{"kind":"Namespace","metadata":{"name":"memex-ops"}}'
+md 'namespaces - memex-ops' MW_MD_WORKLOADS="$MD_FIX/workloads-runner.json" -- check --manifest demo/opsns.yaml
+[ "$_md_rc" -ne 0 ] && case "$_md_out" in *"IN USE    Namespace memex-ops — Pod memex-ops/hosting-op-live runs in it"*) true ;; *) false ;; esac \
+  && ok "a Namespace a live pod still runs in is in use" || bad "namespace in use" "rc ${_md_rc}; ${_md_out}"
+# A volume's own CREDENTIAL is a use too: the kubelet needs it to mount (CSI nodePublishSecretRef, azureFile
+# secretName) — deleting it wedges new pods in ContainerCreating exactly as the incident did. So is a Secret the
+# ServiceAccount a pod runs as carries as imagePullSecrets: admission copies it into every NEW pod.
+md $'secrets memex kv-creds\nsecrets memex files-creds\nsecrets memex registry-pull' \
+  MW_MD_WORKLOADS="$MD_FIX/workloads-csi.json" MW_MD_SERVICEACCOUNTS="$MD_FIX/serviceaccounts.json" \
+  -- check --object Secret/memex/kv-creds --object Secret/memex/files-creds --object Secret/memex/registry-pull
+if [ "$_md_rc" -ne 0 ] && case "$_md_out" in *"deletion_in_use=3"*) true ;; *) false ;; esac \
+   && case "$_md_out" in *"IN USE    Secret memex/kv-creds — Deployment memex/memex-portal-deployment mounts volume memex-kv-secrets with it (CSI nodePublishSecretRef)"*) true ;; *) false ;; esac \
+   && case "$_md_out" in *"IN USE    Secret memex/files-creds — Deployment memex/memex-portal-deployment mounts volume files with it (azureFile secretName)"*) true ;; *) false ;; esac \
+   && case "$_md_out" in *"IN USE    Secret memex/registry-pull — Deployment memex/memex-portal-deployment pulls its image with it through ServiceAccount memex/memex-portal, which it runs as"*) true ;; *) false ;; esac; then
+  ok "a volume's mount credential (CSI, azureFile) and the pull secret of the ServiceAccount a pod runs as are in use"
+else bad "volume credential / ServiceAccount pull secret in use" "rc ${_md_rc}; ${_md_out}"; fi
+md 'secrets memex idle-pull' MW_MD_WORKLOADS="$MD_FIX/workloads-csi.json" MW_MD_SERVICEACCOUNTS="$MD_FIX/serviceaccounts.json" -- check --object Secret/memex/idle-pull
+[ "$_md_rc" -eq 0 ] && case "$_md_out" in *"deletion_in_use=0"*) true ;; *) false ;; esac \
+  && ok "negative control: the pull secret of a ServiceAccount NO live pod runs as is not in use" || bad "idle SA pull secret" "rc ${_md_rc}; ${_md_out}"
+md "$_md_jr_live" MW_MD_REFUSE_READ=serviceaccounts -- check --object Secret/memex/hosting-jobrunner-token
+[ "$_md_rc" -ne 0 ] && case "$_md_out" in *"could not list the cluster's ServiceAccounts"*"UNKNOWN"*) true ;; *) false ;; esac \
+  && ok "a refused ServiceAccount read is UNKNOWN too" || bad "refused SA read" "rc ${_md_rc}; ${_md_out}"
+md "$_md_jr_live" MW_MD_REFUSE_READ=pods -- delete --manifest demo/jobrunner.yaml --sha256 "$_md_jr_digest"
+[ "$_md_rc" -ne 0 ] && [ "$_md_live" = "$_md_jr_live" ] && case "$_md_out" in *"could not list the cluster's pods and workloads"*"UNKNOWN"*) true ;; *) false ;; esac \
+  && ok "a refused workload read is UNKNOWN, never 'nobody uses it' — and nothing is deleted" || bad "refused workload read" "rc ${_md_rc}; live: ${_md_live}; ${_md_out}"
 
 refuses_hard "a typed Namespace is refused (only a committed manifest may name one)" "a Namespace is deleted only when a committed manifest names it" hosting-manifest-delete check --object Namespace/memex
 refuses_hard "a cluster-scoped kind with a namespace is refused" "is cluster-scoped" hosting-manifest-delete check --object ClusterRole/ns/x
@@ -5639,6 +5892,100 @@ refuses_hard "chart drift cluster with a metacharacter" "is not a plain name" \
 rm -rf "$_cd"; unset _cd _cd_out _cd_rc
 
 echo
+echo "── hosting-registry-maintenance: the blob collect inside a read-only window, read-write restored on every exit ──"
+# MeshWeaver.Plugins#4370 slice 3 (the owner's decision 1A; deploy/aks/REGISTRY-MAINTENANCE.md). The stubs keep a
+# two-pod registry whose side follows the last apply; what is asserted is the ORDER of the script's writes, that the
+# collect starts only once every pod is read-only, and that every exit path after the first write restores read-write.
+RM_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/registry-maintenance" && pwd)"
+RM_CHART="$(mktemp -d)"
+_rm_run() {  # _rm_run [ENV=…] -- <args…>   → _rm_out, _rm_rc, _rm_helm (non-dry-run upgrades only), _rm_kube
+  local envs=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  [ "${1:-}" = "--" ] && shift
+  _rm_st="$(mktemp -d)"
+  _rm_out="$(env PATH="$RM_STUBS:$PATH" HOSTING_RM_STATE="$_rm_st" HOSTING_CHART="$RM_CHART" \
+    HOSTING_REGISTRY_SETTLE_WAIT=0 HOSTING_REGISTRY_SETTLE_INTERVAL=0 HOSTING_REGISTRY_GC_INTERVAL=0 \
+    "${envs[@]}" hosting-registry-maintenance "$@" 2>&1)"; _rm_rc=$?
+  _rm_helm="$(grep '^upgrade ' "$_rm_st/helm.log" 2>/dev/null | grep -v -- '--dry-run=server' | sed -E 's/.*readOnly=([a-z]+).*garbageCollect=([^ ]*).*/ro=\1 gc=\2/' | tr '\n' ';')"
+  _rm_kube="$(cat "$_rm_st/kubectl.log" 2>/dev/null)"
+  _rm_mode="$(cat "$_rm_st/mode" 2>/dev/null)"
+  rm -rf "$_rm_st"
+}
+_rm_last() { printf '%s\n' "$_rm_out" | sed -n 's/^::hosting:: registry_window=//p' | tail -1; }
+RM_ARGS=(--namespace memex-registry-host --release memex --run 20261110101500)
+if command -v jq >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
+  _rm_run -- window "${RM_ARGS[@]}"
+  [ "$_rm_rc" -eq 0 ] && [ "$(_rm_last)" = closed ] \
+    && ok "window: a clean run ends registry_window=closed, exit 0" || bad "window clean run" "rc ${_rm_rc}; out: ${_rm_out}"
+  [ "$_rm_helm" = "ro=true gc=;ro=true gc=20261110101500;ro=false gc=;" ] \
+    && ok "window: the writes are read-only, then the collect inside it, then read-write — in that order and no others" \
+    || bad "window write order" "upgrades: ${_rm_helm}"
+  case "$_rm_out" in *"registry_window=read-only"*"registry_gc=complete"*"registry_gc_summary=41 blobs marked, 7 blobs and 0 manifests eligible for deletion"*"registry_window=read-write"*"registry_window=closed"*) ok "window: read-only verified, collect complete with distribution's own summary, read-write verified, closed" ;;
+    *) bad "window facts" "out: ${_rm_out}" ;; esac
+  case "$_rm_out" in *"registry_gc_summary=blob eligible"*) bad "the summary is the closing line, never a per-blob line" "out: ${_rm_out}" ;; *) ok "the summary is the closing line, never a per-blob line" ;; esac
+  [ "$_rm_mode" = read-write ] && ok "window: the registry is read-write at the end" || bad "window end state" "mode ${_rm_mode}"
+  case "$_rm_kube" in *"get job memex-registry-gc-20261110101500"*"delete jobs -l app.kubernetes.io/component=memex-registry-gc,app.kubernetes.io/instance=memex --ignore-not-found --cascade=foreground --wait=true"*) ok "window: the collect Job is followed, then deleted in the foreground before read-write" ;;
+    *) bad "collect followed then stopped" "kubectl: ${_rm_kube}" ;; esac
+  case "$_rm_out" in *"--delete-untagged"*) bad "never --delete-untagged" "out: ${_rm_out}" ;; *) ok "never --delete-untagged" ;; esac
+
+  # The collect waits for EVERY pod: one registry pod still on the read-write configuration stops the window before
+  # the collect is rendered — and the registry is restored.
+  _rm_run HOSTING_RM_LAG=1 -- window "${RM_ARGS[@]}"
+  [ "$_rm_rc" -ne 0 ] && [ "$(_rm_last)" = restored ] \
+    && ok "a pod left read-write: the window is RED and read-write is restored" || bad "lagging pod" "rc ${_rm_rc}; out: ${_rm_out}"
+  case "$_rm_helm" in *"gc=2026"*) bad "a pod left read-write: the collect is never rendered" "upgrades: ${_rm_helm}" ;; *) ok "a pod left read-write: the collect is never rendered" ;; esac
+  case "$_rm_kube" in *"get job "*) bad "a pod left read-write: no collect Job is followed" "kubectl: ${_rm_kube}" ;; *) ok "a pod left read-write: no collect Job is followed" ;; esac
+  case "$_rm_out" in *"memex-registry-b is not read-only"*|*"memex-registry-b was started from another configuration"*) ok "…naming the pod that is not read-only" ;; *) bad "names the pod" "out: ${_rm_out}" ;; esac
+
+  # A collect that FAILS: the window is RED, the restore stops the Job and applies read-write.
+  _rm_run HOSTING_RM_GC=failed -- window "${RM_ARGS[@]}"
+  [ "$_rm_rc" -ne 0 ] && [ "$(_rm_last)" = restored ] && [ "$_rm_mode" = read-write ] \
+    && ok "a failed collect: RED, and read-write restored" || bad "failed collect" "rc ${_rm_rc}; mode ${_rm_mode}; out: ${_rm_out}"
+  case "$_rm_out" in *"registry_gc=complete"*|*"registry_window=closed"*) bad "a failed collect never reads complete or closed" "out: ${_rm_out}" ;; *) ok "a failed collect never reads complete or closed" ;; esac
+  case "$_rm_helm" in *"ro=false gc=;") ok "a failed collect: the LAST write is read-write" ;; *) bad "restore is the last write" "upgrades: ${_rm_helm}" ;; esac
+
+  # A collect that completes with no summary: its outcome is not claimed from silence — RED, restored.
+  _rm_run HOSTING_RM_NO_SUMMARY=1 -- window "${RM_ARGS[@]}"
+  [ "$_rm_rc" -ne 0 ] && [ "$(_rm_last)" = restored ] \
+    && case "$_rm_out" in *"printed no summary"*) true ;; *) false ;; esac \
+    && ok "a collect with no summary: RED, restored, never claimed from silence" || bad "no summary" "rc ${_rm_rc}; out: ${_rm_out}"
+
+  # The restore never applies read-write while a collect pod may still run.
+  _rm_run HOSTING_RM_GC=failed HOSTING_RM_GC_STUCK=1 -- window "${RM_ARGS[@]}"
+  [ "$_rm_rc" -ne 0 ] && [ "$(_rm_last)" = restore_failed ] && [ "$_rm_mode" = read-only ] \
+    && ok "a collect pod still present: read-write is NOT applied and the window says restore_failed" \
+    || bad "stuck collect pod" "rc ${_rm_rc}; mode ${_rm_mode}; out: ${_rm_out}"
+
+  # The window is applied over the release's own values; a chart that moved since would ride along. Refused before
+  # the first write — and then there is nothing to restore.
+  _rm_run HOSTING_RM_DRIFT=1 -- window "${RM_ARGS[@]}"
+  [ "$_rm_rc" -ne 0 ] && [ -z "$_rm_helm" ] && [ "$(_rm_last)" = unchanged ] \
+    && case "$_rm_out" in *"Deployment//memex-portal-deployment would CHANGE"*) true ;; *) false ;; esac \
+    && ok "a chart that would change the portal: refused before any write, naming it; registry_window=unchanged" \
+    || bad "drift refused" "rc ${_rm_rc}; upgrades: ${_rm_helm}; out: ${_rm_out}"
+
+  # …and the restore holds to the same guard: a drifting read-write apply after the collect leaves it read-only, RED.
+  _rm_run HOSTING_RM_DRIFT_RW=1 -- window "${RM_ARGS[@]}"
+  [ "$_rm_rc" -ne 0 ] && [ "$(_rm_last)" = restore_failed ] \
+    && ok "a read-write apply that would change more than the window: restore_failed, never a silent portal change" \
+    || bad "restore drift" "rc ${_rm_rc}; out: ${_rm_out}"
+
+  # restore on its own: stop every collect, then read-write, verified.
+  _rm_run -- restore --namespace memex-registry-host --release memex
+  [ "$_rm_rc" -eq 0 ] && [ "$(_rm_last)" = restored ] && [ "$_rm_helm" = "ro=false gc=;" ] \
+    && case "$_rm_kube" in "delete jobs -l app.kubernetes.io/component=memex-registry-gc"*|*$'\n'"-n memex-registry-host delete jobs -l"*|"-n memex-registry-host delete jobs -l"*) true ;; *) false ;; esac \
+    && ok "restore: every collect stopped first, then ONE read-write write, verified" || bad "restore" "rc ${_rm_rc}; upgrades: ${_rm_helm}; kubectl: ${_rm_kube}; out: ${_rm_out}"
+else
+  bad "hosting-registry-maintenance tests need jq and python3 with PyYAML" "missing"
+fi
+refuses_hard "registry maintenance: window or restore" "is 'window' or 'restore'" hosting-registry-maintenance collect --namespace a --release b
+refuses_hard "registry maintenance: window needs --run" "window needs --run" env HOSTING_CHART="$RM_CHART" hosting-registry-maintenance window --namespace a --release b
+refuses_hard "registry maintenance: restore takes no --run" "restore takes no --run" env HOSTING_CHART="$RM_CHART" hosting-registry-maintenance restore --namespace a --release b --run x
+refuses_hard "registry maintenance: a namespace with a metacharacter" "is not a Kubernetes name" hosting-registry-maintenance window --namespace 'a; kubectl delete ns --all' --release b --run x
+refuses_hard "registry maintenance: a run id with a metacharacter" "is not a run id" env HOSTING_CHART="$RM_CHART" hosting-registry-maintenance window --namespace a --release b --run 'x;y'
+rm -rf "$RM_CHART"
+unset _rm_out _rm_rc _rm_helm _rm_kube _rm_mode _rm_st RM_CHART
+
 echo "── hosting-runner-reap: runners ARC reports Running whose pods exited; the remedy restarts their controller ──"
 # The RunnerReap action's one step (MeshWeaver.Plugins Hosting/InstanceAction, kind RunnerReap; Memex#879).
 # The fixture is the 2026-10-26 shape: runner pods Completed / with an exited runner container / gone,
@@ -5821,6 +6168,217 @@ refuses_hard "tailnet key: five tags are refused" "1–4 tags" hosting-tailnet-k
 refuses_hard "tailnet key: a duplicate tag is refused" "named twice" hosting-tailnet-key "${TK_ARGS[@]/tag:observability/tag:a,tag:a}"
 refuses_hard "tailnet key: a namespace with a metacharacter is refused" "not a plain name" hosting-tailnet-key "${TK_ARGS[@]/control/con;trol}"
 unset _tk_out _tk_rc _tk_kube _tk_az _tk_st
+
+echo "── sealing for an enrolling Mac: tailnet key, per-machine sign-in app, vault objects — ciphertext only ──"
+# Hosting/MacStudioFleet §2b (enrolment v2): each value is sealed INSIDE the job to the Mac's throw-away RSA key
+# (OAEP-SHA256, one block) and only `::hosting:: sealed_item item=<x> fp=… b64=…` leaves. These cases DECRYPT what the
+# scripts emit with the private half and compare it byte for byte — a round trip, not a shape check — and hold that
+# no plaintext reaches stdout, stderr or any argv a stub recorded.
+if command -v openssl >/dev/null 2>&1; then
+  SEAL_DIR="$(mktemp -d)"
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$SEAL_DIR/k.pem" >/dev/null 2>&1
+  SEAL_SPKI="$(openssl pkey -in "$SEAL_DIR/k.pem" -pubout -outform DER 2>/dev/null | base64 | tr -d '\n')"
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$SEAL_DIR/small.pem" >/dev/null 2>&1
+  SEAL_SMALL="$(openssl pkey -in "$SEAL_DIR/small.pem" -pubout -outform DER 2>/dev/null | base64 | tr -d '\n')"
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$SEAL_DIR/ec.pem" >/dev/null 2>&1
+  SEAL_EC="$(openssl pkey -in "$SEAL_DIR/ec.pem" -pubout -outform DER 2>/dev/null | base64 | tr -d '\n')"
+  # An openssl that refuses to ENCRYPT (everything else passes through): the "minted but could not be sealed" branch.
+  mkdir -p "$SEAL_DIR/broken"
+  printf '#!/usr/bin/env bash\n[ "${1:-}" = pkeyutl ] && { echo "pkeyutl: refused" >&2; exit 1; }\nexec %q "$@"\n' "$(command -v openssl)" > "$SEAL_DIR/broken/openssl"
+  chmod +x "$SEAL_DIR/broken/openssl"
+  # seal_open <output> <item> — the plaintext of the item's sealed_item line, opened with the private key.
+  seal_open() {
+    local line b64
+    line="$(grep -E "^::hosting:: sealed_item item=$2 " <<< "$1" | tail -n1)"
+    b64="${line##* b64=}"
+    [ -n "$line" ] && [ -n "$b64" ] || return 1
+    printf '%s' "$b64" | base64 -d 2>/dev/null > "$SEAL_DIR/ct" || return 1
+    openssl pkeyutl -decrypt -inkey "$SEAL_DIR/k.pem" -in "$SEAL_DIR/ct" \
+      -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 2>/dev/null
+  }
+  seal_fp() { local line; line="$(grep -E "^::hosting:: sealed_item item=$2 " <<< "$1" | tail -n1)"; line="${line#* fp=}"; printf '%s' "${line%% *}"; }
+
+  # ── hosting-tailnet-key --seal-to ──
+  TK_SEAL=(--namespace control --release headscale --tags tag:observability --expiration 2h --seal-to "$SEAL_SPKI" --item t)
+  if command -v jq >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    tk -- "${TK_SEAL[@]}"
+    [ "$_tk_rc" -eq 0 ] && ok "sealed tailnet key: minted and sealed" || bad "sealed tailnet key" "exited ${_tk_rc}: ${_tk_out}"
+    [ "$(seal_open "$_tk_out" t)" = "hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef" ] \
+      && ok "…the sealed_item opens with the Mac's private key to exactly the minted key (OAEP-SHA256 round trip)" \
+      || bad "sealed tailnet round trip" "said: ${_tk_out}"
+    [ "$(seal_fp "$_tk_out" t)" = "sha256:$(printf '%s' 'hskey-auth-NEVERPRINTED-0123456789abcdef0123456789abcdef' | hosting_sha | cut -c1-12)" ] \
+      && ok "…its fp is the sha256:<12 hex> of the plaintext, comparable on the Mac" || bad "sealed tailnet fp" "fp: $(seal_fp "$_tk_out" t)"
+    case "${_tk_out}${_tk_kube}${_tk_az}" in *NEVERPRINTED*|*hskey-auth-*) bad "sealed tailnet key: no plaintext on stdout, stderr or any argv" "seen: ${_tk_out}" ;; *) ok "sealed tailnet key: no plaintext on stdout, stderr or any argv" ;; esac
+    [ -z "$_tk_az" ] && ok "…and nothing is written to a vault" || bad "sealed key writes no vault" "az saw: ${_tk_az}"
+    case "$_tk_out" in *"::hosting:: tailnet_key=sealed"*"::hosting:: tailnet_key_id=7"*"::hosting:: enrol_fact key=tailnetTags value=tag:observability"*) ok "…reported sealed, by id, with the tags as an enrolment fact" ;; *) bad "sealed facts" "said: ${_tk_out}" ;; esac
+    tk_done
+    tk -- "${TK_SEAL[@]/tag:observability/tag:undeclared}"
+    [ "$_tk_rc" -ne 0 ] && case "$_tk_kube" in *"preauthkeys create"*) false ;; *) true ;; esac \
+      && ok "sealed tailnet key: an undeclared tag is still refused before anything is minted" || bad "sealed undeclared" "rc ${_tk_rc}: ${_tk_kube}"
+    tk_done
+    _seal_path="$PATH"; PATH="$SEAL_DIR/broken:$PATH"; tk -- "${TK_SEAL[@]}"; PATH="$_seal_path"
+    [ "$_tk_rc" -ne 0 ] && case "$_tk_out" in *"could not be sealed"*"The key was expired"*) true ;; *) false ;; esac \
+      && ok "sealed tailnet key: a key that could not be sealed fails the step" || bad "seal failure" "rc ${_tk_rc}: ${_tk_out}"
+    case "$_tk_kube" in *"preauthkeys expire --id 7"*) ok "…and is EXPIRED in headscale — nobody holds a live key" ;; *) bad "seal failure expires" "kubectl saw: ${_tk_kube}" ;; esac
+    case "$_tk_out" in *NEVERPRINTED*|*"sealed_item"*) bad "…printing neither the key nor a sealed item" "said: ${_tk_out}" ;; *) ok "…printing neither the key nor a sealed item" ;; esac
+    tk_done
+    tk -- "${TK_SEAL[@]/$SEAL_SPKI/$SEAL_SMALL}"
+    [ "$_tk_rc" -ne 0 ] && case "$_tk_out" in *"RSA-2048"*) true ;; *) false ;; esac && case "$_tk_kube" in *"preauthkeys create"*) false ;; *) true ;; esac \
+      && ok "sealed tailnet key: an RSA-2048 recipient is refused before anything is minted" || bad "rsa-2048" "rc ${_tk_rc}: ${_tk_out}"
+    tk_done
+    tk -- "${TK_SEAL[@]/$SEAL_SPKI/$SEAL_EC}"
+    [ "$_tk_rc" -ne 0 ] && case "$_tk_out" in *"hosting-tailnet-key: ERROR: seal-to"*) true ;; *) false ;; esac && case "$_tk_kube" in *"preauthkeys create"*) false ;; *) true ;; esac \
+      && ok "sealed tailnet key: an EC recipient is refused before anything is minted" || bad "ec recipient" "rc ${_tk_rc}: ${_tk_out}"
+    tk_done
+    tk HOSTING_DRY_RUN=true -- "${TK_SEAL[@]}"
+    [ "$_tk_rc" -eq 0 ] && case "$_tk_kube" in *"preauthkeys create"*) false ;; *) true ;; esac \
+      && ok "sealed tailnet key: a dry run checks the key and the tags and mints nothing" || bad "sealed dry run" "rc ${_tk_rc}: ${_tk_kube}"
+    tk_done
+  else
+    bad "sealed tailnet key tests need jq and python3" "missing"
+  fi
+  refuses_hard "sealed tailnet key: a seal-to that is not base64 is refused" "is not the base64" \
+    hosting-tailnet-key "${TK_SEAL[@]/$SEAL_SPKI/'not;base64'}"
+  refuses_hard "sealed tailnet key: --seal-to with --vault/--object is refused (one destination)" "two destinations" \
+    hosting-tailnet-key "${TK_SEAL[@]}" --vault kv-example --object o
+  refuses_hard "sealed tailnet key: --seal-to needs --item" "missing required flag --item" \
+    hosting-tailnet-key --namespace control --release headscale --tags tag:observability --expiration 2h --seal-to "$SEAL_SPKI"
+  refuses_hard "sealed tailnet key: an item of two letters is refused" "one lower-case letter" \
+    hosting-tailnet-key "${TK_SEAL[@]/%t/tt}"
+  refuses_hard "sealed tailnet key: the expiry bound still holds" "must be 10m–24h" \
+    hosting-tailnet-key "${TK_SEAL[@]/2h/25h}"
+
+  # ── hosting-signin-app --per-machine ──
+  PM_ARGS=(--per-machine studio-2 --domain example.com --seal-to "$SEAL_SPKI" --item e)
+  PM_URIS="https://studio-2.net.example.com/signin-microsoft https://studio-2.net.example.com/auth/callback/Microsoft https://studio-2.net.example.com/auth/ea/callback https://localhost:8443/signin-microsoft https://localhost:8443/auth/callback/Microsoft https://localhost:8443/auth/ea/callback https://memex.localhost/signin-microsoft https://memex.localhost/auth/callback/Microsoft https://memex.localhost/auth/ea/callback"
+  sa -- "${PM_ARGS[@]}"
+  [ "$_sa_rc" -eq 0 ] && ok "per-machine app: created, secret sealed" || bad "per-machine create" "exited ${_sa_rc}: ${_sa_out}"
+  case "$_sa_log" in *"ad app list --display-name MeshWeaver studio-2 (Mac) --query [].appId -o tsv"*"ad app create --display-name MeshWeaver studio-2 (Mac) --sign-in-audience AzureADMultipleOrgs --web-redirect-uris ${PM_URIS} --query appId -o tsv"*) ok "…looked up by display name, then created with ALL nine redirect URIs (net host, localhost:8443, memex.localhost)" ;; *) bad "per-machine create argv" "az saw: ${_sa_log}" ;; esac
+  case "$_sa_log" in *"ad sp create --id 0e5a1d2c-0000-4000-8000-0000000000b1"*) ok "…its service principal is created" ;; *) bad "sp create" "az saw: ${_sa_log}" ;; esac
+  case "$_sa_log" in *"ad app credential reset --id 0e5a1d2c-0000-4000-8000-0000000000b1 --append --display-name enrol-studio-2-"*) ok "…a secret is APPENDED (nothing rotated)" ;; *) bad "append" "az saw: ${_sa_log}" ;; esac
+  [ "$(seal_open "$_sa_out" e)" = "fake-client-secret-NEVER-PRINTED" ] && ok "…the sealed_item opens to exactly the client secret, without its trailing newline" || bad "per-machine round trip" "said: ${_sa_out}"
+  case "${_sa_out}${_sa_log}" in *NEVER-PRINTED*) bad "per-machine app: the secret never reaches stdout, stderr or an argv (az's stderr echo discarded)" "seen: ${_sa_out}" ;; *) ok "per-machine app: the secret never reaches stdout, stderr or an argv (az's stderr echo discarded)" ;; esac
+  case "$_sa_log" in *"keyvault"*) bad "…and no vault is touched" "az saw: ${_sa_log}" ;; *) ok "…and no vault is touched" ;; esac
+  case "$_sa_out" in *"enrol_fact key=clientId value=0e5a1d2c-0000-4000-8000-0000000000b1"*"enrol_fact key=tenant value=00000000-0000-4000-8000-0000000000aa"*"enrol_fact key=redirectUris value=https://studio-2.net.example.com/signin-microsoft,"*"https://localhost:8443/signin-microsoft"*) ok "…reported: clientId, tenant and the redirect URIs as enrolment facts" ;; *) bad "per-machine facts" "said: ${_sa_out}" ;; esac
+  case "$_sa_out" in *"::hosting:: signin_app=created"*"::hosting:: signin_secret=sealed"*) ok "…and signin_app=created, signin_secret=sealed" ;; *) bad "per-machine outcome facts" "said: ${_sa_out}" ;; esac
+  rm -rf "$_sa_state"
+
+  # Found (idempotent): an app of that name exists with a foreign URI; the missing ones are ADDED, the existing kept.
+  sa HOSTING_SA_APPS=0e5a1d2c-0000-4000-8000-0000000000c3 HOSTING_SA_REDIRECTS="https://keep.example.test/signin-microsoft" HOSTING_SA_SP=1 -- "${PM_ARGS[@]}"
+  [ "$_sa_rc" -eq 0 ] && ok "per-machine app: an existing app of that name is reused" || bad "per-machine found" "exited ${_sa_rc}: ${_sa_out}"
+  case "$_sa_log" in *"ad app create"*) bad "…never created twice" "az saw: ${_sa_log}" ;; *) ok "…never created twice" ;; esac
+  case "$_sa_log" in *"ad app update --id 0e5a1d2c-0000-4000-8000-0000000000c3 --web-redirect-uris https://keep.example.test/signin-microsoft ${PM_URIS}"*) ok "…its URIs are KEPT and the missing ones added in one update" ;; *) bad "union update" "az saw: ${_sa_log}" ;; esac
+  case "$_sa_log" in *"ad sp create"*) bad "…an existing service principal is not re-created" "az saw: ${_sa_log}" ;; *) ok "…an existing service principal is not re-created" ;; esac
+  case "$_sa_out" in *"signin_app=found"*"enrol_fact key=clientId value=0e5a1d2c-0000-4000-8000-0000000000c3"*) ok "…and reported found, with that app's client id" ;; *) bad "found facts" "said: ${_sa_out}" ;; esac
+  rm -rf "$_sa_state"
+
+  sa HOSTING_SA_APPS=$'0e5a1d2c-0000-4000-8000-0000000000c3\n0e5a1d2c-0000-4000-8000-0000000000c4' -- "${PM_ARGS[@]}"
+  [ "$_sa_rc" -ne 0 ] && case "$_sa_out" in *"2 applications are named"*) true ;; *) false ;; esac && case "$_sa_log" in *"credential reset"*) false ;; *) true ;; esac \
+    && ok "per-machine app: two apps of that name are a refusal, and no secret is minted" || bad "two apps" "rc ${_sa_rc}: ${_sa_out}"
+  rm -rf "$_sa_state"
+  sa HOSTING_SA_GRAPH_DENIED=1 -- "${PM_ARGS[@]}"
+  [ "$_sa_rc" -ne 0 ] && case "$_sa_out" in *"Application.ReadWrite.OwnedBy"*"Insufficient privileges"*) true ;; *) false ;; esac \
+    && ok "per-machine app: an identity without Graph rights is RED, naming the right and Graph's answer" || bad "graph denied" "rc ${_sa_rc}: ${_sa_out}"
+  rm -rf "$_sa_state"
+  _seal_path="$PATH"; PATH="$SEAL_DIR/broken:$PATH"; sa -- "${PM_ARGS[@]}"; PATH="$_seal_path"
+  [ "$_sa_rc" -ne 0 ] && [ -f "$_sa_state/credential-deleted" ] && ok "per-machine app: a secret that could not be sealed is DELETED from the app again" || bad "seal failure deletes" "rc ${_sa_rc}: ${_sa_out}"
+  case "$_sa_out" in *NEVER-PRINTED*|*sealed_item*) bad "…and nothing is printed" "said: ${_sa_out}" ;; *) ok "…and nothing is printed" ;; esac
+  rm -rf "$_sa_state"
+  sa HOSTING_DRY_RUN=true -- "${PM_ARGS[@]}"
+  [ "$_sa_rc" -eq 0 ] && case "$_sa_log" in *"ad app"*) false ;; *) true ;; esac && case "$_sa_out" in *"signin_app=dry-run"*) true ;; *) false ;; esac \
+    && ok "per-machine app: a dry run calls Graph not at all" || bad "per-machine dry run" "rc ${_sa_rc}: ${_sa_log} ${_sa_out}"
+  rm -rf "$_sa_state"
+  refuses_hard "per-machine app: shared-app flags beside --per-machine are refused" "are refused beside it" hosting-signin-app "${PM_ARGS[@]}" --vault V
+  refuses_hard "per-machine app: an id that is not a DNS label is refused" "is not a DNS label" hosting-signin-app "${PM_ARGS[@]/studio-2/Studio_2}"
+  refuses_hard "per-machine app: --domain is required" "missing required flag --domain" hosting-signin-app --per-machine studio-2 --seal-to "$SEAL_SPKI" --item e
+  refuses_hard "per-machine app: a domain with a metacharacter is refused" "is not a hostname" hosting-signin-app "${PM_ARGS[@]/example.com/ex;ample.com}"
+  refuses_hard "per-machine app: an RSA-2048 recipient is refused" "RSA-2048" hosting-signin-app "${PM_ARGS[@]/$SEAL_SPKI/$SEAL_SMALL}"
+
+  # ── hosting-seal-secret ──
+  SS_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/seal-secret" && pwd)"
+  ss() {  # ss [env…] -- <args…>
+    local envs=()
+    while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+    _ss_st="$(mktemp -d)"
+    _ss_out="$(env "${envs[@]}" PATH="$SS_STUBS:$PATH" HOSTING_SS_STATE="$_ss_st" hosting-seal-secret "$@" 2>&1)"; _ss_rc=$?
+    _ss_log="$(cat "$_ss_st/az.log" 2>/dev/null || true)"; rm -rf "$_ss_st"
+  }
+  SS_ARGS=(--vault kv-example --object dns01-ClientSecret --seal-to "$SEAL_SPKI" --item n)
+  ss -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -eq 0 ] && ok "seal-secret: an existing object is sealed" || bad "seal-secret" "exited ${_ss_rc}: ${_ss_out}"
+  [ "$(seal_open "$_ss_out" n)" = "dns01-secret-NEVERPRINTED-0123456789abcdefABCDEF" ] && ok "…and opens to exactly its value (az's trailing newline stripped)" || bad "seal-secret round trip" "said: ${_ss_out}"
+  case "$_ss_out" in *NEVERPRINTED*) bad "seal-secret: the value never reaches stdout or stderr" "said: ${_ss_out}" ;; *) ok "seal-secret: the value never reaches stdout or stderr" ;; esac
+  case "$_ss_log" in *"secret set"*) bad "…and nothing is written" "az saw: ${_ss_log}" ;; *) ok "…and nothing is written" ;; esac
+  case "$_ss_out" in *"::hosting:: sealed_secret=n:dns01-ClientSecret"*) ok "…reported by item and object name" ;; *) bad "seal-secret fact" "said: ${_ss_out}" ;; esac
+  # The OAEP block limit: RSA-3072 holds 318 bytes; 319 is refused naming the size, 318 seals.
+  ss HOSTING_SS_VALUE="$(printf 'A%.0s' $(seq 1 319))" -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -ne 0 ] && case "$_ss_out" in *"is 319 bytes"*"at most 318"*) true ;; *) false ;; esac \
+    && ok "seal-secret: a value over one OAEP block is refused, naming its size and the limit" || bad "oversize" "rc ${_ss_rc}: ${_ss_out}"
+  ss HOSTING_SS_VALUE="$(printf 'A%.0s' $(seq 1 318))" -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -eq 0 ] && [ "$(seal_open "$_ss_out" n | wc -c | tr -d ' ')" = "318" ] && ok "…negative control: exactly 318 bytes seals and opens" || bad "318 bytes" "rc ${_ss_rc}: ${_ss_out}"
+  # A PEM-shaped value keeps its own trailing newline: only the ONE newline `-o tsv` appends is cut.
+  ss HOSTING_SS_VALUE=$'-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg\n-----END PRIVATE KEY-----\n' -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -eq 0 ] && [ "$(seal_open "$_ss_out" n | tail -c 6 | od -An -tx1 | tr -d ' \n')" = "2d2d2d2d2d0a" ] \
+    && ok "seal-secret: a value's own trailing newline survives — exactly one byte is cut" || bad "pem newline" "rc ${_ss_rc}: $(seal_open "$_ss_out" n | od -An -c | tail -n2)"
+  ss HOSTING_SS_VALUE="" -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -ne 0 ] && case "$_ss_out" in *"is EMPTY"*) true ;; *) false ;; esac && ok "seal-secret: an empty object is refused" || bad "empty" "rc ${_ss_rc}: ${_ss_out}"
+  ss HOSTING_SS_OBJECTS="other" -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -ne 0 ] && case "$_ss_out" in *"holds no object dns01-ClientSecret"*) true ;; *) false ;; esac && case "$_ss_log" in *"--query value"*) false ;; *) true ;; esac \
+    && ok "seal-secret: an absent object is refused and no value is read" || bad "absent" "rc ${_ss_rc}: ${_ss_out}"
+  ss HOSTING_SS_LIST_FAIL=1 -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -ne 0 ] && case "$_ss_out" in *"UNKNOWN"*) true ;; *) false ;; esac && ok "seal-secret: a refused listing is UNKNOWN, never absent" || bad "list refused" "rc ${_ss_rc}: ${_ss_out}"
+  ss HOSTING_SS_SHOW_FAIL=1 -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -ne 0 ] && case "$_ss_out" in *"secret GET"*) true ;; *) false ;; esac && ok "seal-secret: a refused value read names the right" || bad "show refused" "rc ${_ss_rc}: ${_ss_out}"
+  ss HOSTING_DRY_RUN=true -- "${SS_ARGS[@]}"
+  [ "$_ss_rc" -eq 0 ] && case "$_ss_log" in *"--query value"*) false ;; *) true ;; esac && ok "seal-secret: a dry run reads no value" || bad "dry run" "rc ${_ss_rc}: ${_ss_log}"
+  ss -- "${SS_ARGS[@]/$SEAL_SPKI/$SEAL_SMALL}"
+  [ "$_ss_rc" -ne 0 ] && case "$_ss_log" in *"keyvault"*) false ;; *) true ;; esac && ok "seal-secret: an RSA-2048 recipient is refused before the vault is touched" || bad "small key" "rc ${_ss_rc}: ${_ss_log}"
+  refuses_hard "seal-secret needs --seal-to"            "missing required flag --seal-to" hosting-seal-secret --vault V --object o --item n
+  refuses_hard "seal-secret needs --object"             "missing required flag --object"  hosting-seal-secret --vault V --seal-to "$SEAL_SPKI" --item n
+  refuses_hard "seal-secret refuses an object with a metacharacter" "is not a plain name"  hosting-seal-secret --vault V --object 'o;id' --seal-to "$SEAL_SPKI" --item n
+  refuses_hard "seal-secret refuses an item that is not one letter" "one lower-case letter" hosting-seal-secret --vault V --object o --seal-to "$SEAL_SPKI" --item N
+  refuses_hard "seal-secret rejects unknown flags"      "unknown argument"                hosting-seal-secret "${SS_ARGS[@]}" --nope 1
+
+  # ── hosting-registry-coupon --seal-to (the enrolment's registry-plan coupon, item r) ──
+  # Minted exactly as the vault mode mints, then SEALED to the Mac's key and stored nowhere: an enrolled Mac writes it
+  # as its PluginCatalog:BootstrapKey and registers on (or redeems itself up to) the fleet's plan.
+  RCS_ARGS=(--registry-url https://registry.test --vault kv-example --tier dedicated --description "fleet enrolment studio-2" \
+    --expires-days 2 --max-usages 1 --mint-secret registry-Coupon-MintSecret --seal-to "$SEAL_SPKI" --item r)
+  if command -v jq >/dev/null 2>&1; then
+    rc normal "$RC_CRED" -- "${RCS_ARGS[@]}"
+    [ "$_rc_rc" -eq 0 ] && ok "sealed coupon: minted at the registry and sealed" || bad "sealed coupon" "exited ${_rc_rc}: ${_rc_out}"
+    case "$_rc_reglog" in *"MINT tier=dedicated uses=1 days=2 cred=ok"*) ok "…single-use, two days, with the mint credential" ;; *) bad "sealed coupon mint" "registry saw: ${_rc_reglog}" ;; esac
+    [ "$(seal_open "$_rc_out" r)" = "mwr_fake-coupon-NEVER-PRINTED-dedicated" ] && ok "…and opens to exactly the coupon" || bad "sealed coupon round trip" "said: ${_rc_out}"
+    case "$_rc_azlog" in *"secret set"*) bad "…and NOTHING is written to the vault" "az saw: ${_rc_azlog}" ;; *) ok "…and NOTHING is written to the vault" ;; esac
+    case "$_rc_azlog" in *"secret list"*) bad "…nor an object looked for (it is stored nowhere)" "az saw: ${_rc_azlog}" ;; *) ok "…nor an object looked for (it is stored nowhere)" ;; esac
+    case "${_rc_out}${_rc_azlog}" in *NEVER-PRINTED*|*mwr_*) bad "sealed coupon: neither the coupon nor the credential is printed" "seen: ${_rc_out} ${_rc_azlog}" ;; *) ok "sealed coupon: neither the coupon nor the credential is printed" ;; esac
+    case "$_rc_out" in *"::hosting:: registry_coupon=sealed"*"registry_coupon_plan=dedicated"*"registry_coupon_id=c0ffee123456"*) ok "…reported as sealed, with its plan and id" ;; *) bad "sealed coupon facts" "said: ${_rc_out}" ;; esac
+    rc_done
+    rc normal "$RC_CRED" -- "${RCS_ARGS[@]/$SEAL_SPKI/$SEAL_SMALL}"
+    [ "$_rc_rc" -ne 0 ] && [ -z "$_rc_reglog" ] && case "$_rc_azlog" in *keyvault*) false ;; *) true ;; esac \
+      && ok "sealed coupon: an RSA-2048 recipient is refused before the credential is read or anything minted" || bad "sealed coupon small key" "rc ${_rc_rc}: ${_rc_reglog} ${_rc_azlog}"
+    rc_done
+    _seal_path="$PATH"; PATH="$SEAL_DIR/broken:$PATH"; rc normal "$RC_CRED" -- "${RCS_ARGS[@]}"; PATH="$_seal_path"
+    [ "$_rc_rc" -ne 0 ] && case "$_rc_out" in *"could not be sealed"*"revoke it on the registry"*c0ffee123456*) true ;; *) false ;; esac \
+      && ok "sealed coupon: a coupon that could not be sealed is RED, naming the coupon id to revoke" || bad "sealed coupon seal failure" "rc ${_rc_rc}: ${_rc_out}"
+    case "$_rc_out" in *NEVER-PRINTED*|*sealed_item*) bad "…and nothing is printed" "said: ${_rc_out}" ;; *) ok "…and nothing is printed" ;; esac
+    rc_done
+    rc normal "$RC_CRED" HOSTING_DRY_RUN=true -- "${RCS_ARGS[@]}"
+    [ "$_rc_rc" -eq 0 ] && [ -z "$_rc_reglog" ] && case "$_rc_azlog" in *"--query value"*) false ;; *) true ;; esac \
+      && case "$_rc_out" in *"registry_coupon=dry-run"*) true ;; *) false ;; esac \
+      && ok "sealed coupon: a dry run checks the key and mints nothing" || bad "sealed coupon dry run" "rc ${_rc_rc}: ${_rc_reglog} ${_rc_azlog} ${_rc_out}"
+    rc_done
+  else
+    bad "the sealed-coupon tests need jq" "missing"
+  fi
+  refuses_hard "sealed coupon: --object beside --seal-to is refused" "refused beside --seal-to" hosting-registry-coupon "${RCS_ARGS[@]}" --object o
+  refuses_hard "sealed coupon: --seal-to needs --item" "missing required flag --item" hosting-registry-coupon --registry-url https://r.test --vault V --tier pro --description d --mint-secret m --seal-to "$SEAL_SPKI"
+  refuses_hard "sealed coupon: the item is one letter" "one lower-case letter" hosting-registry-coupon --registry-url https://r.test --vault V --tier pro --description d --mint-secret m --seal-to "$SEAL_SPKI" --item R
+  rm -rf "$SEAL_DIR"
+  unset SEAL_DIR SEAL_SPKI SEAL_SMALL SEAL_EC TK_SEAL PM_ARGS PM_URIS SS_ARGS _ss_out _ss_rc _ss_log
+else
+  bad "the sealing tests need openssl" "missing"
+fi
 
 echo
 echo "── no grep -q behind a pipe (SIGPIPE under pipefail reads a match as FALSE) ──"

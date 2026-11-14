@@ -3,7 +3,9 @@
 # Does the boot page ANSWER what it promises? Renders the chart's boot page (memex-local layers),
 # runs its nginx config and HTML in the image the chart names, and asserts every path — root,
 # non-root, a POST with a body over nginx's 1m default — answers 503 with Retry-After: 5,
-# Cache-Control: no-store and the spinner page.
+# Cache-Control: no-store and the spinner page; and that /_boot/progress, with no portal to reach,
+# answers the retryable 503 with {"reachable":false} — the page's "not answering yet" — rather than
+# an nginx error page or a config that never started.
 #
 #   deploy/aks/scripts/check-boot-page-serves.sh     exit 0 = the contract holds, 1 = it does not
 #
@@ -40,8 +42,9 @@ IMAGE="$(cat "$WORK/image")"
 # Copied in rather than bind-mounted, so the check runs on any docker host (a VM-backed daemon does
 # not see the runner's temp directory).
 docker pull -q "$IMAGE" >/dev/null || { echo "::error::could not pull $IMAGE"; exit 1; }
-docker create --name "$NAME" "$IMAGE" >/dev/null \
-  && docker cp "$WORK/default.conf" "$NAME:/etc/nginx/conf.d/default.conf" \
+docker create --name "$NAME" -e NGINX_ENTRYPOINT_LOCAL_RESOLVERS=1 "$IMAGE" >/dev/null \
+  && mkdir -p "$WORK/templates" && cp "$WORK/default.conf.template" "$WORK/templates/" \
+  && docker cp "$WORK/templates" "$NAME:/etc/nginx/templates" \
   && docker cp "$WORK/boot.html" "$NAME:/usr/share/nginx/html/boot.html" \
   && docker start "$NAME" >/dev/null \
   || { echo "::error::could not start $IMAGE with the rendered boot page"; exit 1; }
@@ -71,5 +74,13 @@ check "GET /some/deep/path?x=1" 'http://127.0.0.1:8080/some/deep/path?x=1' < /de
 # `fail` would never reach the exit status.
 head -c 2000000 /dev/zero > "$WORK/big.bin"
 check "POST 2 MB body" -X POST --data-binary @- http://127.0.0.1:8080/api/upload < "$WORK/big.bin"
+# The progress proxy with nothing behind it: the page's "not answering yet", never an nginx page.
+out="$(dcurl -s -D - -w '\n%{http_code}' http://127.0.0.1:8080/_boot/progress < /dev/null)"
+code="$(printf '%s' "$out" | tail -n1)"
+before=$fail
+[ "$code" = 503 ] || report "GET /_boot/progress without a portal answered $code, want 503"
+printf '%s' "$out" | grep -q '"reachable":false' || report "GET /_boot/progress without a portal is not {\"reachable\":false}"
+printf '%s' "$out" | grep -qi '^Cache-Control: no-store' || report "GET /_boot/progress lacks Cache-Control: no-store"
+[ "$fail" -eq "$before" ] && echo "✅ GET /_boot/progress, no portal → 503 {\"reachable\":false}, no-store"
 [ "$fail" -ne 0 ] && docker logs "$NAME" 2>&1 | tail -20
 exit "$fail"

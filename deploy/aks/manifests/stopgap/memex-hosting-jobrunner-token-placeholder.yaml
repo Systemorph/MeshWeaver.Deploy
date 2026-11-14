@@ -1,0 +1,26 @@
+# 🚧 TEMPORARY STOPGAP. An EMPTY Opaque placeholder for Secret memex/hosting-jobrunner-token.
+#
+# Why it exists: the jobrunner retirement (Systemorph/Memex#314 step 3) deleted the real token Secret. But the
+# memex portal Deployment still carries a LIVE-ONLY volume `hosting-jobrunner-token` with its mount at
+# /var/run/secrets/hosting-operator. The record's render no longer has it, and a helm roll never removes a
+# field helm did not set. So every new portal pod fails FailedMount and never starts, while the old pods
+# serve on.
+#
+# What it is: no data, no stringData, no service account, no RBAC binding. It authenticates as nobody and
+# grants nothing; it only lets the stale volume mount.
+#
+# What removes it: the root fix, a governed remedy that retires the live-only volume and mount. Once no
+# memex pod mounts the volume, delete this placeholder with DeleteClusterManifest and delete this file.
+# Evidence: https://control.systemorph.com/rbuergi/Feedback/memex-pending-pod-cause-jobrunner-token-20261111
+apiVersion: v1
+kind: Secret
+type: Opaque
+metadata:
+  name: hosting-jobrunner-token
+  namespace: memex
+  labels:
+    hosting.meshweaver.io/placeholder: "true"
+    hosting.meshweaver.io/stopgap: "memex-314"
+  annotations:
+    hosting.meshweaver.io/stopgap: "TEMPORARY empty placeholder; the live-only volume hosting-jobrunner-token must be retired, then this Secret deleted (Systemorph/Memex#314)"
+    hosting.meshweaver.io/evidence: "https://control.systemorph.com/rbuergi/Feedback/memex-pending-pod-cause-jobrunner-token-20261111"

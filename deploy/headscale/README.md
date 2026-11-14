@@ -91,6 +91,29 @@ sequenceDiagram
   runs the loop in the build against a real server and a stand-in API server (`test/kube-stub.py`): 20
   assertions, including a changed declaration, a refused Secret write, and no key in the log.
 
+## Declared names — `dns.extraRecords`
+
+MagicDNS answers every machine as `<machine>.<dns.baseDomain>`, and is AUTHORITATIVE for that zone: a name under
+it that no machine holds answers NXDOMAIN on a member, whatever public DNS says. A second service on one machine —
+a second portal a Mac runs beside its first (`memex-local instances`, at `<instance>.<machine>.<baseDomain>`) —
+therefore needs its name DECLARED here, pointing at that machine's network address:
+
+```yaml
+dns:
+  baseDomain: tailnet.internal
+  extraRecords:
+    - { name: proof.mac.tailnet.internal, type: A, value: 100.64.0.7 }
+```
+
+Rendered into Headscale's `dns.extra_records` (served since 0.23; 0.29.7 measured: a stock Tailscale client's
+`tailscale dns query` answers the declared name, and an undeclared sibling does not — the lane asserts both). One
+record per name: a Tailscale client matches MagicDNS names EXACTLY, so a wildcard would never be served, and the
+render refuses one. It also refuses a name with a label over 63 characters or over 253 in all, a name outside `dns.baseDomain` (it would shadow a public name — and since
+`baseDomain` may never contain `host`, the server's own name can never be declared), a type other than `A`/`AAAA`,
+a value that is not an address of that type (IPv4 dotted quad; IPv6 lower-case, eight groups or one `::`), and a
+name+type declared twice.
+A change rolls the pod (`checksum/config`), as every config change does.
+
 ## Relays (DERP)
 
 Machines that cannot reach each other directly relay through **Tailscale's public DERP servers**
@@ -152,6 +175,24 @@ The expiration is bounded to **10 minutes – 24 hours**: the key's one consumer
 and a single-use key that outlives that window is a standing credential in the vault for nothing. The server
 keeps its identity on its own volume afterwards. It runs on the operations lane with that lane's cluster
 credential; the in-cluster operator ServiceAccount holds no `pods/exec` and is not widened for it.
+
+### Sealed for an enrolling Mac (enrolment v2)
+
+A Mac Studio enrolling in the fleet (MeshWeaver.Plugins `Hosting/MacStudioFleet.md` §2b) gets its key SEALED
+instead of stored: the same verb, with the Mac's throw-away public key in place of the vault object.
+
+```
+hosting-tailnet-key --namespace <ns> --release <headscale release> --tags tag:<a>[,…] --expiration <N>m
+                    --seal-to <base64 SubjectPublicKeyInfo of an RSA-3072+ key> --item t
+```
+
+Every rule above holds (declared tags, single use, 10m–24h). The recipient key is checked BEFORE anything is
+minted; the key is encrypted inside the job (`openssl pkeyutl -encrypt`, RSA-OAEP with SHA-256 and MGF1-SHA-256,
+one block) and the only trace of it is `::hosting:: sealed_item item=t fp=sha256:<12 hex> b64=<ciphertext>`;
+nothing is written to a vault (`--vault`/`--object` are refused beside `--seal-to`). A key that could not be
+sealed is expired in Headscale before the step fails. The two sibling verbs of an enrolment seal the same way:
+`hosting-signin-app --per-machine <id> --domain <domain> --seal-to … --item e` (the Mac's own Entra app) and
+`hosting-seal-secret --vault <v> --object <o> --seal-to … --item n|a|w|p|k` (an existing vault object).
 
 ## Joining a machine
 
