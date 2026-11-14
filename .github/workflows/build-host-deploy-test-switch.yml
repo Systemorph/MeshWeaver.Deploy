@@ -249,10 +249,21 @@ jobs:
           python3 deploy/.github/scripts/deploy-test-switch-trigger.py record --record "$RUNNER_TEMP/record/promotion-record.json" \
             --version "$V" --core7 "$CORE7" > "$RUNNER_TEMP/rec"
           core=$(sed -n 's/^core_sha=//p' "$RUNNER_TEMP/rec")
-          # Believed only once the platform's own history contains it (the build-host lane's rule).
-          st=$(gh api "repos/$PLATFORM_REPO/compare/$core...main" --jq .status) \
-            || { echo "::error::could not compare $core with the platform's main"; exit 1; }
-          case "$st" in identical|ahead) ;; *) echo "::error::the candidate's core commit $core is not on the platform's main (compare: $st)"; exit 1 ;; esac
+          # Believed only once the platform's own history contains it (the build-host lane's rule):
+          # on one of the platform's DELIVERY LINES (.github/delivery-lines.json on its default
+          # branch — main = v4, main3 = v3), since each line seals its own sets.
+          lines=$(gh api "repos/$PLATFORM_REPO/contents/.github/delivery-lines.json" -H "Accept: application/vnd.github.raw" \
+            | jq -r '.lines[].branch') \
+            || { echo "::error::could not read the platform's delivery lines"; exit 1; }
+          [ -n "$lines" ] || { echo "::error::the platform's delivery-lines.json declares no line"; exit 1; }
+          placed=""; seen=""
+          for line in $lines; do
+            st=$(gh api "repos/$PLATFORM_REPO/compare/$core...$line" --jq .status) \
+              || { echo "::error::could not compare $core with the platform's $line"; exit 1; }
+            seen="$seen $line:$st"
+            case "$st" in identical|ahead) placed="$line"; break ;; esac
+          done
+          [ -n "$placed" ] || { echo "::error::the candidate's core commit $core is on none of the platform's delivery lines (${seen# })"; exit 1; }
           tee -a "$GITHUB_OUTPUT" < "$RUNNER_TEMP/rec"
 
   apply:

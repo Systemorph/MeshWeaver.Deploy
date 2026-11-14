@@ -362,21 +362,31 @@ jobs:
             python3 .github/scripts/platform-set-dispatch.py read --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" | tee -a "$GITHUB_OUTPUT"
           fi
       # A commit the event names is believed only once the platform's own history contains it:
-      # GitHub's compare of <sha>...main on the PUBLIC platform repository answers `identical` or
-      # `ahead` for a commit on main. Anything else — behind, diverged, unknown — is red.
-      - name: Every platform commit the hand-over names is on the platform's main
+      # GitHub's compare of <sha>...<branch> on the PUBLIC platform repository answers `identical` or
+      # `ahead` for a commit on that branch. The branches are the platform's DELIVERY LINES, read
+      # from its default branch's .github/delivery-lines.json (main = v4, main3 = v3): each line
+      # seals its own sets, and the build host carries both runtimes, so a main3 set is as genuine
+      # as a main one. A commit on no declared line — behind, diverged, unknown everywhere — is red.
+      - name: Every platform commit the hand-over names is on one of the platform's delivery lines
         env:
           GH_TOKEN: ${{ github.token }}
           SHAS: ${{ steps.claim.outputs.shas }}
         run: |
           set -euo pipefail
+          lines=$(gh api "repos/$PLATFORM_REPO/contents/.github/delivery-lines.json" -H "Accept: application/vnd.github.raw" \
+            | jq -r '.lines[].branch') \
+            || { echo "::error::could not read the platform's delivery lines — refusing commits that cannot be placed"; exit 1; }
+          [ -n "$lines" ] || { echo "::error::the platform's delivery-lines.json declares no line — refusing commits that cannot be placed"; exit 1; }
           for sha in $SHAS; do
-            st=$(gh api "repos/$PLATFORM_REPO/compare/$sha...main" --jq .status) \
-              || { echo "::error::could not compare $sha with the platform's main — refusing a commit that cannot be placed"; exit 1; }
-            case "$st" in
-              identical|ahead) echo "platform commit $sha is on main ($st)" ;;
-              *) echo "::error::platform commit $sha is not on the platform's main (compare: $st) — the hand-over is refused"; exit 1 ;;
-            esac
+            placed=""; seen=""
+            for line in $lines; do
+              st=$(gh api "repos/$PLATFORM_REPO/compare/$sha...$line" --jq .status) \
+                || { echo "::error::could not compare $sha with the platform's $line — refusing a commit that cannot be placed"; exit 1; }
+              seen="$seen $line:$st"
+              case "$st" in identical|ahead) placed="$line ($st)"; break ;; esac
+            done
+            [ -n "$placed" ] || { echo "::error::platform commit $sha is on none of the platform's delivery lines (${seen# }) — the hand-over is refused"; exit 1; }
+            echo "platform commit $sha is on line $placed"
           done
 
   # ONE PLATFORM PER LEG, built natively: linux/amd64 (the build pool's nodes) and linux/arm64 (a
