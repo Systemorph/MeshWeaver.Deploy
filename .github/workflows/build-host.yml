@@ -33,7 +33,7 @@ name: Build host — runner image and the build-latest hand-over
 #                   ONLY ONCE IT IS SEALED: arming does not wait for the platform bake, and every
 #                   MeshWeaver.Plugins run takes the channel's set through core's resolver freeze
 #                   path (that set, sealed, or RED). So the hand-over asks that same resolver, at
-#                   core `main3`, first (`platform-set-dispatch.py seal-gate`); not sealed yet → it
+#                   core `main`, first (`platform-set-dispatch.py seal-gate`); not sealed yet → it
 #                   HOLDS, and build-latest keeps its previous sealed set (the receiver never moves
 #                   backwards) until a later tick finds this one sealed.
 #   3. `report`   — the lane's own alert issue (label `build-host-latest`) in THIS repository.
@@ -166,7 +166,7 @@ jobs:
           python3 deploy/.github/scripts/acr-data-plane.py --self-test
           python3 deploy/.github/scripts/acr-data-plane.py check-workflow deploy/.github/workflows/build-host.yml
       # The platform commit the image is composed against: the set's own commit when a hand-over
-      # names one, the platform's main3 (core's v3 line) otherwise (a change here is tested against the platform it
+      # names one, the platform's main otherwise (a change here is tested against the platform it
       # will next be built with).
       - name: Which platform commit to compose against
         id: platform
@@ -179,7 +179,7 @@ jobs:
             ref=$(sed -n 's/^set_core_sha=//p' "$RUNNER_TEMP/claim")
             [ -n "$ref" ] || ref=$(sed -n 's/^run_core_sha=//p' "$RUNNER_TEMP/claim")
           else
-            ref=main3   # core's v3 line (policy major-lines-run-separately)
+            ref=main
           fi
           [ -n "$ref" ] || { echo "::error::no platform ref resolved"; exit 1; }
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
@@ -777,11 +777,11 @@ jobs:
           # 🚨 THE CHANNEL NAMES ONLY A SEALED SET. Arming does not wait for the platform bake or
           # verify-images, and every MeshWeaver.Plugins run takes the channel's set through core's
           # resolver FREEZE path (that set, sealed, or RED) — so the set is handed over only once that
-          # SAME resolver, at core `main3` (the copy Plugins fetches), calls it sealed. Not sealed yet →
+          # SAME resolver, at core `main` (the copy Plugins fetches), calls it sealed. Not sealed yet →
           # hold: the receiver never moves backwards, so build-latest keeps its previous sealed set and a
           # later tick hands this one over. A resolver that cannot answer is RED (platform-set-dispatch.py
           # seal-gate). GITHUB_OUTPUT/GITHUB_STEP_SUMMARY are withheld: the resolver writes its own outputs.
-          gh api "repos/$PLATFORM_REPO/contents/.github/scripts/resolve-platform.py?ref=main3" \
+          gh api "repos/$PLATFORM_REPO/contents/.github/scripts/resolve-platform.py?ref=main" \
             -H "Accept: application/vnd.github.raw" > "$RUNNER_TEMP/resolve-platform.py"
           rc=0
           env -u GITHUB_OUTPUT -u GITHUB_STEP_SUMMARY python3 "$RUNNER_TEMP/resolve-platform.py" --no-registry \

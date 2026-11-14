@@ -18,7 +18,7 @@
   <PropertyGroup>
     <MeshWeaverRoot Condition="'$(MeshWeaverRoot)' == ''">$(MSBuildThisFileDirectory)../../MeshWeaver</MeshWeaverRoot>
     <MeshWeaverPluginsRoot Condition="'$(MeshWeaverPluginsRoot)' == ''">$(MSBuildThisFileDirectory)../../MeshWeaver.Plugins</MeshWeaverPluginsRoot>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net11.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>

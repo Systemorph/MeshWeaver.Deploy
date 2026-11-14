@@ -3516,6 +3516,8 @@ ENV_ALLOW = ("PATH", "LANG", "LC_ALL", "TZ", "DOTNET_ROOT", "DOTNET_CLI_TELEMETR
              "DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "SSL_CERT_FILE", "SSL_CERT_DIR", "MeshWeaverRefs",
              "MW_BUILD_GATE_HOST", "MW_BUILD_PORTAL_DOTNET", "MW_BUILD_MODULE_LIBS", "MW_BUILD_EXTENSIONS",
              "MW_BUILD_COMPILE_REFS",
+             # The SDK major the set's line runs (select_platform_dotnet), beside the PATH and DOTNET_ROOT that select it.
+             "MW_BUILD_DOTNET_SDK",
              # The image's headless browser (deploy/build-host/Dockerfile): core's `test` shards export
              # MESHWEAVER_CHROMIUM_PATH for the tests, so the renderer resolves THAT binary, never another
              # browser on the machine; a stage gets the same three facts the image declares.
@@ -4185,7 +4187,7 @@ PLATFORM_REPO = "MeshWeaver"
 #   * the platform set (MW_BUILD_PLATFORM_VERSION), its framework identity and its tester and portal image digests: the
 #     compiler and the reference set a build compiles against (determined by the set; listed so a re-sealed set with the same
 #     version still rebuilds);
-#   * the .NET SDKs the runner image carries: the floating `dotnet/sdk:10.0` base can move under an unchanged Dockerfile, and
+#   * the .NET SDKs the runner image carries: the floating `dotnet/sdk:11.0` base can move under an unchanged Dockerfile, and
 #     the SDK is the compiler too;
 #   * the CPU architecture (a property of the machine, never of the set);
 #   * WARM_LAYOUT, bumped BY HAND for a change to this runner that changes what a tree's outputs mean (rare).
@@ -4211,6 +4213,93 @@ def build_toolchain(which: Callable[[str], Optional[str]] = shutil.which) -> str
         sdks = ["unreadable"]
     parts.append("sdk=" + ",".join(sdks))
     return ";".join(parts)
+
+
+# TWO PLATFORM LINES, ONE IMAGE (policy `major-lines-run-separately`): the runner image carries the .NET 10 AND the .NET 11
+# SDK side by side, each in a root of its own (deploy/build-host/Dockerfile), and a host runs the SDK the LINE of the set it
+# was given needs — a v3 set (latest3, .NET 10) the 10 SDK, a v4 set (latest4, .NET 11) the 11 SDK. Selected by PATH and
+# DOTNET_ROOT, never a global.json: core's own global.json (it names the test runner and no SDK) is the nearest one to every
+# stage, the muxer reads no other, and writing one into a checkout would change the tree a stage builds. A major this table
+# does not name is REFUSED at start, naming it — never the image's default SDK, which would build a v3 set with .NET 11.
+# The Dockerfile's sources stage spells the same table for the one tool it publishes (MeshWeaver.Plugin.Build).
+DOTNET_LINES = {"3": ("10", "/opt/dotnet/10"), "4": ("11", "/opt/dotnet/11")}
+DOTNET_SDK_ENV = "MW_BUILD_DOTNET_SDK"
+
+
+def platform_dotnet(platform_version: str, lines: Optional[dict] = None) -> "tuple[str, str]":
+    """(SDK major, dotnet root) the set `platform_version` needs, by its platform MAJOR. Refusal on a version without a major
+    or a major `DOTNET_LINES` does not name. Pure."""
+    lines = DOTNET_LINES if lines is None else lines
+    m = re.match(r"^\s*(\d+)\.", platform_version or "")
+    if not m:
+        raise Refusal(f"MW_BUILD_PLATFORM_VERSION {platform_version!r} names no platform major — the host cannot tell which "
+                      f".NET SDK its set needs")
+    major = str(int(m.group(1)))
+    if major not in lines:
+        raise Refusal(f"platform major {major} (MW_BUILD_PLATFORM_VERSION {platform_version!r}) has no .NET SDK on this runner "
+                      f"image — it carries the lines {', '.join(f'{k}.x → SDK {v[0]}' for k, v in sorted(lines.items()))}; "
+                      f"add the line to DOTNET_LINES and its SDK to deploy/build-host/Dockerfile")
+    return lines[major]
+
+
+def dotnet_root_refusal(sdk: str, root: str) -> Optional[str]:
+    """Why `root` is not a dotnet root carrying ONLY SDK `sdk`.x, or None. Only that major: a root that also carried the other
+    line's SDK would let the muxer pick the newest, which is the very thing the split prevents. Reads the tree only."""
+    if not os.path.isfile(os.path.join(root, "dotnet")):
+        return f"the .NET {sdk} root {root} has no dotnet executable"
+    try:
+        sdks = sorted(n for n in os.listdir(os.path.join(root, "sdk")) if not n.startswith("."))
+    except OSError:
+        sdks = []
+    if not sdks:
+        return f"the .NET {sdk} root {root} carries no SDK (no {root}/sdk/<version>)"
+    other = [s for s in sdks if s.split(".")[0] != sdk]
+    if other:
+        return f"the .NET {sdk} root {root} also carries SDK(s) {other} — the muxer would pick the newest, not {sdk}"
+    return None
+
+
+def select_platform_dotnet(env: dict, lines: Optional[dict] = None) -> dict:
+    """`env` with the dotnet root of its set's line FIRST on PATH, as DOTNET_ROOT, and named in MW_BUILD_DOTNET_SDK — the
+    environment the host, its own tools and (through ENV_ALLOW) every stage run with.
+
+    The other line's SDK is UNREACHABLE, not merely shadowed by ordering, and every comparison is by RESOLVED path (a root
+    may be a symlink — /opt/dotnet/11 is the base image's /usr/share/dotnet): a PATH entry that IS a dotnet root under any
+    name is dropped (so a re-exec, enter_run_namespace, applies it again to the same result), and a PATH entry that only
+    EXPOSES a `dotnet` resolving anywhere but the line's root (the base image's /usr/bin/dotnet symlink) is REFUSED — that
+    directory carries other tools, so it cannot be dropped, and the image must not ship the link. Refusal, naming why, on a
+    version whose line has no SDK or a root that is not that SDK's alone. Unset MW_BUILD_PLATFORM_VERSION is left to
+    `preflight`, and a leftover MW_BUILD_DOTNET_SDK is dropped so no stage reads a major nobody selected."""
+    lines = DOTNET_LINES if lines is None else lines
+    version = (env.get("MW_BUILD_PLATFORM_VERSION") or "").strip()
+    if not version:
+        return {k: v for k, v in env.items() if k != DOTNET_SDK_ENV}
+    sdk, root = platform_dotnet(version, lines)
+    why = dotnet_root_refusal(sdk, root)
+    if why:
+        raise Refusal(f"the set {version} needs the .NET {sdk} SDK: {why}")
+    real = os.path.realpath
+    line_root = real(root)
+    roots = {real(r) for _s, r in lines.values()}
+    rest = []
+    for p in (env.get("PATH") or "").split(os.pathsep):
+        if not p or real(p) in roots:
+            continue
+        exe = os.path.join(p, "dotnet")
+        if os.path.lexists(exe) and os.path.dirname(real(exe)) != line_root:
+            raise Refusal(f"the set {version} needs the .NET {sdk} SDK alone, but PATH entry {p} exposes {exe} → {real(exe)}, "
+                          f"a dotnet outside the line's root {root} ({line_root}) — the other line's SDK would stay reachable; "
+                          f"the runner image must not ship that dotnet")
+        rest.append(p)
+    return dict(env, PATH=os.pathsep.join([root] + rest), DOTNET_ROOT=root, **{DOTNET_SDK_ENV: sdk})
+
+
+def check_dotnet_roots(lines: Optional[dict] = None) -> list:
+    """Every line's root that is not that SDK's alone (the image build's check: an image missing a line fails its BUILD,
+    never a run). Empty = every line is served."""
+    lines = DOTNET_LINES if lines is None else lines
+    return [f"{major}.x: {why}" for major, (sdk, root) in sorted(lines.items())
+            for why in [dotnet_root_refusal(sdk, root)] if why]
 
 
 def warm_key(env: dict, identity: str) -> str:
@@ -5357,8 +5446,9 @@ class Host:
                  nuget_feeds: Optional[NugetFeeds] = None) -> None:
         self.env = env
         # the build toolchain by CONTENT, once per process (the warm key and the module fingerprints read it)
+        # — the dotnet on the HOST's PATH (select_platform_dotnet put its set's line first), never the process's own
         if TOOLCHAIN_ENV not in self.env:
-            self.env[TOOLCHAIN_ENV] = build_toolchain()
+            self.env[TOOLCHAIN_ENV] = build_toolchain(lambda n: shutil.which(n, path=self.env.get("PATH")))
         # Where a package promoted into the warm NuGet cache is checked against its source feed (promote_nuget).
         self.nuget_feeds = nuget_feeds or NugetFeeds(trusted=nuget_trusted_sources(env))
         self.api = api
@@ -7677,12 +7767,21 @@ def main(argv: list[str]) -> int:
     g.add_argument("--host", action="store_true")
     g.add_argument("--once", action="store_true")
     g.add_argument("--self-test", action="store_true")
+    g.add_argument("--check-dotnet-roots", action="store_true",
+                   help="the image build's check: every platform line's .NET SDK root is there and carries that SDK alone")
     g.add_argument("--cache-key", metavar="SPEC.json",
                    help="print the cross-run cache key of the output SPEC describes (a stage's "
                         ".cache-key.json), computed exactly as the host recomputes it; cwd = the checkout")
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
+    if a.check_dotnet_roots:
+        bad = check_dotnet_roots()
+        for why in bad:
+            print(f"build-run: {why}", file=sys.stderr)
+        if not bad:
+            print("build-run: dotnet roots: " + "; ".join(f"{k}.x → SDK {v[0]} at {v[1]}" for k, v in sorted(DOTNET_LINES.items())))
+        return 1 if bad else 0
     if a.cache_key:
         try:
             with (sys.stdin if a.cache_key == "-" else open(a.cache_key)) as fh:
@@ -7695,6 +7794,12 @@ def main(argv: list[str]) -> int:
     if a.host or a.once:
         enter_run_namespace(argv, env, lambda m: print(f"build-run: {m}", flush=True))
     try:
+        # the .NET SDK of the set's LINE, before anything reads PATH (the toolchain, the host's tools, every stage)
+        env = select_platform_dotnet(env)
+        # and for what the host starts without an explicit environment (a subprocess inherits os.environ)
+        os.environ.update({k: env[k] for k in ("PATH", "DOTNET_ROOT", DOTNET_SDK_ENV) if env.get(k)})
+        if (env.get("MW_BUILD_PLATFORM_VERSION") or "").strip():
+            print(f"build-run: platform {env['MW_BUILD_PLATFORM_VERSION']} → .NET SDK {env[DOTNET_SDK_ENV]} ({env['DOTNET_ROOT']})", flush=True)
         host = Host(env, Api(env.get("BUILD_API", ""), read_worker_token(env)))
         if a.host:
             port = ready_port(env)
@@ -7807,6 +7912,101 @@ def self_test() -> int:
                 {"labels": ["x" * 51]}, {"labels": ["a\nb"]}, {"labels": ["full-\x7frun"]}, {"labels": ["full-run\x85"]}):
         check(f"labels/{str(bad)[:30]} is unknown (None), never a partial set", claim_labels(bad) is None, claim_labels(bad))
 
+    # ── 0b. the .NET SDK of the set's LINE (policy major-lines-run-separately): v3 → 10, v4 → 11, anything else refused ──
+    check("dotnet/a v3 set (latest3) runs the .NET 10 SDK", platform_dotnet("3.1.12258") == ("10", "/opt/dotnet/10")
+          and platform_dotnet("3.1.0-ci.7") == ("10", "/opt/dotnet/10"), platform_dotnet("3.1.12258"))
+    check("dotnet/a v4 set (latest4) runs the .NET 11 SDK", platform_dotnet("4.0.0") == ("11", "/opt/dotnet/11")
+          and platform_dotnet("4.0.12-ci.3") == ("11", "/opt/dotnet/11"), platform_dotnet("4.0.0"))
+    for bad_v, said in (("5.0.0", "platform major 5"), ("2.9.1", "platform major 2"), ("x.1", "names no platform major"),
+                        ("4", "names no platform major")):
+        try:
+            got = platform_dotnet(bad_v)
+            check(f"dotnet/NEGATIVE CONTROL: {bad_v!r} is refused, never the image's default SDK", False, got)
+        except Refusal as e:
+            check(f"dotnet/NEGATIVE CONTROL: {bad_v!r} is refused BY NAME", said in str(e) and "SDK" in str(e), e)
+    with tempfile.TemporaryDirectory() as dn_tmp:
+        def fake_root(name: str, *sdks: str) -> str:
+            r_ = os.path.join(dn_tmp, name)
+            for s_ in sdks:
+                os.makedirs(os.path.join(r_, "sdk", s_))
+            os.makedirs(r_, exist_ok=True)
+            with open(os.path.join(r_, "dotnet"), "w") as fh_:
+                fh_.write("#!/bin/sh\n")
+            os.chmod(os.path.join(r_, "dotnet"), 0o755)
+            return r_
+        r10, r11 = fake_root("d10", "10.0.100"), fake_root("d11", "11.0.100")
+        lines_ = {"3": ("10", r10), "4": ("11", r11)}
+        # the machine's own /usr/bin may carry a dotnet (a GitHub runner's does): the cases build their own tool dirs
+        ub, bn = os.path.join(dn_tmp, "usr-bin"), os.path.join(dn_tmp, "bin")
+        os.makedirs(ub)
+        os.makedirs(bn)
+        open(os.path.join(ub, "python3"), "w").close()
+        tools_ = f"{ub}:{bn}"
+        base_ = {"PATH": tools_, "MW_BUILD_PLATFORM_VERSION": "3.1.12258"}
+        e3 = select_platform_dotnet(base_, lines_)
+        check("dotnet/v3: the 10 root FIRST on PATH, as DOTNET_ROOT, named in MW_BUILD_DOTNET_SDK",
+              e3["PATH"] == f"{r10}:{tools_}" and e3["DOTNET_ROOT"] == r10 and e3[DOTNET_SDK_ENV] == "10", e3)
+        e4 = select_platform_dotnet(dict(base_, MW_BUILD_PLATFORM_VERSION="4.0.0"), lines_)
+        check("dotnet/v4: the 11 root FIRST on PATH, as DOTNET_ROOT, named in MW_BUILD_DOTNET_SDK",
+              e4["PATH"] == f"{r11}:{tools_}" and e4["DOTNET_ROOT"] == r11 and e4[DOTNET_SDK_ENV] == "11", e4)
+        check("dotnet/the input environment is not mutated", base_ == {"PATH": tools_, "MW_BUILD_PLATFORM_VERSION": "3.1.12258"}, base_)
+        again_ = select_platform_dotnet(dict(e3, MW_BUILD_PLATFORM_VERSION="4.0.0"), lines_)
+        check("dotnet/re-applied (a re-exec, or another line) it leaves ONE root on PATH — the other line's is removed",
+              again_["PATH"] == f"{r11}:{tools_}" and select_platform_dotnet(e3, lines_)["PATH"] == e3["PATH"], again_)
+        check("dotnet/the dotnet the PATH resolves is the line's — the build identity names its SDK, not the other's",
+              "sdk=10.0.100" in build_toolchain(lambda n: shutil.which(n, path=e3["PATH"]))
+              and "sdk=11.0.100" in build_toolchain(lambda n: shutil.which(n, path=e4["PATH"])),
+              (build_toolchain(lambda n: shutil.which(n, path=e3["PATH"])), build_toolchain(lambda n: shutil.which(n, path=e4["PATH"]))))
+        se_ = sandbox_env(e3, {}, "/cache")
+        check("dotnet/a STAGE gets the line's PATH, DOTNET_ROOT and SDK through the allow-list",
+              se_.get("PATH") == e3["PATH"] and se_.get("DOTNET_ROOT") == r10 and se_.get(DOTNET_SDK_ENV) == "10", se_)
+        check("dotnet/no platform version: the environment is left as it is (preflight names the missing variable)",
+              select_platform_dotnet({"PATH": "/bin"}, lines_) == {"PATH": "/bin"})
+        check("dotnet/no platform version: a LEFTOVER MW_BUILD_DOTNET_SDK is dropped — no stage reads a major nobody selected",
+              select_platform_dotnet({"PATH": "/bin", DOTNET_SDK_ENV: "11"}, lines_) == {"PATH": "/bin"})
+        # THE SYMLINK SHAPE the image has: /opt/dotnet/11 → /usr/share/dotnet, and /usr/bin/dotnet → /usr/share/dotnet/dotnet
+        link11, alias11 = os.path.join(dn_tmp, "opt-dotnet-11"), os.path.join(dn_tmp, "alias-11")
+        os.symlink(r11, link11)
+        os.symlink(r11, alias11)
+        lines_s = {"3": ("10", r10), "4": ("11", link11)}
+        p_alias = f"{r11}:{alias11}:{tools_}"
+        es3 = select_platform_dotnet(dict(base_, PATH=p_alias), lines_s)
+        check("dotnet/v3: the 11 root is DROPPED from PATH under every name it resolves to (its real path, another link)",
+              es3["PATH"] == f"{r10}:{tools_}", es3["PATH"])
+        literal_ = [q for q in p_alias.split(":") if os.path.normpath(q) not in {os.path.normpath(r) for _s, r in lines_s.values()}]
+        check("dotnet/NEGATIVE CONTROL: a literal-path filter keeps both — the case discriminates the resolved filter from it",
+              r11 in literal_ and alias11 in literal_, literal_)
+        binl = os.path.join(dn_tmp, "usr-bin-link")
+        os.makedirs(binl)
+        os.symlink(os.path.join(link11, "dotnet"), os.path.join(binl, "dotnet"))
+        try:
+            got = select_platform_dotnet(dict(base_, PATH=f"{binl}:{tools_}"), lines_s)
+            check("dotnet/v3: a PATH dir exposing a dotnet that resolves into the 11 root is REFUSED, never shadowed", False, got)
+        except Refusal as e:
+            check("dotnet/v3: a PATH dir exposing a dotnet that resolves into the 11 root is REFUSED by name",
+                  binl in str(e) and "outside the line's root" in str(e) and "3.1.12258" in str(e), e)
+        es4 = select_platform_dotnet(dict(base_, PATH=f"{binl}:{tools_}", MW_BUILD_PLATFORM_VERSION="4.0.0"), lines_s)
+        check("dotnet/v4: the same dir is harmless — its dotnet resolves into the line's own root, so it is kept",
+              es4["PATH"] == f"{link11}:{binl}:{tools_}" and es4["DOTNET_ROOT"] == link11, es4["PATH"])
+        check("dotnet/the image check passes when every line's root is there and its own", check_dotnet_roots(lines_) == [],
+              check_dotnet_roots(lines_))
+        for why_, lines_bad in (("no dotnet executable", {"3": ("10", os.path.join(dn_tmp, "absent")), "4": ("11", r11)}),
+                                ("also carries SDK", {"3": ("10", fake_root("both", "10.0.100", "11.0.100")), "4": ("11", r11)}),
+                                ("carries no SDK", {"3": ("10", fake_root("empty")), "4": ("11", r11)})):
+            try:
+                got = select_platform_dotnet(base_, lines_bad)
+                check(f"dotnet/NEGATIVE CONTROL: a v3 set on a root with {why_} is refused", False, got)
+            except Refusal as e:
+                check(f"dotnet/NEGATIVE CONTROL: a v3 set on a root with {why_} is refused BY NAME",
+                      why_ in str(e) and "3.1.12258" in str(e) and "10" in str(e), e)
+            check(f"dotnet/the image check names a root with {why_}", any(why_ in w for w in check_dotnet_roots(lines_bad)),
+                  check_dotnet_roots(lines_bad))
+        try:
+            got = select_platform_dotnet(dict(base_, MW_BUILD_PLATFORM_VERSION="5.0.0"), lines_)
+            check("dotnet/NEGATIVE CONTROL: a v5 set is refused at selection, never run on either SDK", False, got)
+        except Refusal as e:
+            check("dotnet/NEGATIVE CONTROL: a v5 set is refused at selection BY NAME", "platform major 5" in str(e), e)
+
     # ── 1. compiler diagnostics ─────────────────────────────────────────────────────────────
     p = OutputParser("/work/run1/src", "compile-check")
     pin = OutputParser("/work/run1/src", "compile-check", inside=SANDBOX_CHECKOUT)
@@ -7836,7 +8036,7 @@ def self_test() -> int:
     t = OutputParser("/work/run2/src", "portal-hosts")
     out: list[dict] = []
     for ln in [
-        "Test run for /work/run2/src/bin/MeshWeaver.Hosting.Test.dll (.NETCoreApp,Version=v10.0)",
+        "Test run for /work/run2/src/bin/MeshWeaver.Hosting.Test.dll (.NETCoreApp,Version=v11.0)",
         "  Passed MeshWeaver.Hosting.Test.QueueTest.Claims [12 ms]",
         "  Failed MeshWeaver.Hosting.Test.QueueTest.Orders [1 s]",
         "  Error Message:",
@@ -7864,9 +8064,9 @@ def self_test() -> int:
     il = OutputParser("/work/run2/src", "portal-hosts")
     io_: list[dict] = []
     for ln in [
-        "::mw-lane::1::Test run for /work/run2/src/bin/Alpha.Test.dll (.NETCoreApp,Version=v10.0)",
+        "::mw-lane::1::Test run for /work/run2/src/bin/Alpha.Test.dll (.NETCoreApp,Version=v11.0)",
         "::mw-lane::1::  Failed Alpha.Test.Suite.Breaks [1 s]",
-        "::mw-lane::2::Test run for /work/run2/src/bin/Beta.Test.dll (.NETCoreApp,Version=v10.0)",
+        "::mw-lane::2::Test run for /work/run2/src/bin/Beta.Test.dll (.NETCoreApp,Version=v11.0)",
         "::mw-lane::1::  Error Message:",
         "::mw-lane::2::  Passed Beta.Test.Suite.Holds [3 ms]",
         "::mw-lane::1::   alpha went wrong",
@@ -8223,7 +8423,7 @@ def self_test() -> int:
     # The host's OWN sandbox binds every staged image root read-only — /core-tests included: core's
     # shard and doc-gate stages run `python3 /core-tests/core-tests.py …` (core .github/build-stages.json).
     hav = " ".join(Host({}, None, log=lambda s: None).sandbox.argv("true", "/w/s", "/w/o", {}))
-    long_unit = "diagnostics/portal-hosts/test-logs/src__MeshWeaver.Fleet.Control.Test__bin__Release__net10.0__test-logs__" + "A" * 300 + ".log"
+    long_unit = "diagnostics/portal-hosts/test-logs/src__MeshWeaver.Fleet.Control.Test__bin__Release__net11.0__test-logs__" + "A" * 300 + ".log"
     short_unit = artifact_unit(long_unit)
     check("artifact/a unit too long for the store's receipt is shortened deterministically, its directory and extension kept",
           len(short_unit) <= ARTIFACT_UNIT_MAX and short_unit.startswith("diagnostics/portal-hosts/test-logs/") and short_unit.endswith(".log")
@@ -8921,26 +9121,26 @@ def self_test() -> int:
                   warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.1"}, "c003") != warm_key({"MW_BUILD_PLATFORM_VERSION": "3.1.2"}, "c003")
                   and warm_key({}, "a") != warm_key({}, "b")
                   and warm_key({"MW_BUILD_TESTER_DIGEST": "t"}, "a") != warm_key({}, "a")
-                  and warm_key({TOOLCHAIN_ENV: "sdk=10.0.403"}, "a") != warm_key({TOOLCHAIN_ENV: "sdk=10.0.404"}, "a"))
+                  and warm_key({TOOLCHAIN_ENV: "sdk=11.0.100"}, "a") != warm_key({TOOLCHAIN_ENV: "sdk=11.0.101"}, "a"))
             check("warm/the RUNNER IMAGE DIGEST keys nothing: a rebuilt runner with the same compiler keeps the tree's obj/ and bin/",
                   warm_key({"MW_BUILD_RUNNER_DIGEST": "sha256:" + "a" * 64, TOOLCHAIN_ENV: "x"}, "a")
                   == warm_key({"MW_BUILD_RUNNER_DIGEST": "sha256:" + "b" * 64, TOOLCHAIN_ENV: "x"}, "a"))
             # the compiler part: the SDKs and the architecture; NOT the runner's code or its helpers (a Deploy merge moves those)
             tc_dn = os.path.join(wroot, "tc-dotnet")
-            os.makedirs(os.path.join(tc_dn, "sdk", "10.0.403"))
+            os.makedirs(os.path.join(tc_dn, "sdk", "11.0.100"))
             open(os.path.join(tc_dn, "dotnet"), "w").close()
             tc_which = lambda n: os.path.join(tc_dn, "dotnet") if n == "dotnet" else None
             tc0 = build_toolchain(tc_which)
             check("toolchain/it names the layout, the architecture and the SDKs — and nothing of the runner (no code, no helpers)",
-                  f"layout={WARM_LAYOUT}" in tc0 and "arch=" in tc0 and "sdk=10.0.403" in tc0
+                  f"layout={WARM_LAYOUT}" in tc0 and "arch=" in tc0 and "sdk=11.0.100" in tc0
                   and "code=" not in tc0 and "helpers=" not in tc0, tc0)
             real_wk = globals()["WARM_KEEP"]
             globals()["WARM_KEEP"] = real_wk + ("planted/",)
             check("toolchain/a change to the runner's build code (a Deploy merge) leaves it unchanged — no whole rebuild",
                   build_toolchain(tc_which) == tc0)
             globals()["WARM_KEEP"] = real_wk
-            os.makedirs(os.path.join(tc_dn, "sdk", "10.0.404"))
-            check("toolchain/another .NET SDK in the image changes it (a new compiler)", "sdk=10.0.403,10.0.404" in build_toolchain(tc_which))
+            os.makedirs(os.path.join(tc_dn, "sdk", "11.0.101"))
+            check("toolchain/another .NET SDK in the image changes it (a new compiler)", "sdk=11.0.100,11.0.101" in build_toolchain(tc_which))
             no_root = build_toolchain(lambda n: None)
             check("toolchain/no dotnet is NAMED in the value (never an exception, never the empty digest)", "sdk=no-dotnet" in no_root, no_root)
             check("warm/opt-in only", warm_enabled({"MW_BUILD_WARM_WORKSPACE": "true"}) and not warm_enabled({}))
@@ -10416,7 +10616,7 @@ def self_test() -> int:
         def fixture_zip(signed_: bool, encrypted_: bool = False) -> bytes:
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-                for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net10.0/Demo.dll", b"the-real-dll"),
+                for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net11.0/Demo.dll", b"the-real-dll"),
                                ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
                     z.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_)
                 if signed_:
@@ -10443,11 +10643,11 @@ def self_test() -> int:
         # match what the fixture records) — extraction raises zlib.error, which must be a refusal, never a crash.
         _cz = io.BytesIO()
         with zipfile.ZipFile(_cz, "w", zipfile.ZIP_DEFLATED) as z:
-            for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net10.0/Demo.dll", b"the-real-dll" * 64),
+            for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net11.0/Demo.dll", b"the-real-dll" * 64),
                            ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
                 z.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_, compress_type=zipfile.ZIP_DEFLATED)
         corrupt_zip = bytearray(_cz.getvalue())
-        _at = corrupt_zip.find(b"PK\x03\x04", corrupt_zip.find(b"lib/net10.0/Demo.dll") - 30)
+        _at = corrupt_zip.find(b"PK\x03\x04", corrupt_zip.find(b"lib/net11.0/Demo.dll") - 30)
         _data = _at + 30 + struct.unpack_from("<H", corrupt_zip, _at + 26)[0] + struct.unpack_from("<H", corrupt_zip, _at + 28)[0]
         corrupt_zip[_data:_data + 4] = b"\xff\xff\xff\xff"
         corrupt_zip = bytes(corrupt_zip)
@@ -10483,7 +10683,7 @@ def self_test() -> int:
             return root_
         _fz = io.BytesIO()
         with zipfile.ZipFile(_fz, "w", zipfile.ZIP_DEFLATED) as z:
-            for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net10.0/Demo.dll", b"NOT-the-published-dll"),
+            for n_, b_ in (("Demo.Pkg.nuspec", b"<package/>"), ("lib/net11.0/Demo.dll", b"NOT-the-published-dll"),
                            ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
                 z.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_)
         forged_zip = _fz.getvalue()
@@ -10662,15 +10862,15 @@ def self_test() -> int:
             root_ = os.path.join(tmp, f"pkg-{kind_}")
             d_ = os.path.join(root_, "demo.pkg", "1.0.0")
             shutil.rmtree(root_, ignore_errors=True)
-            os.makedirs(os.path.join(d_, "lib", "net10.0"))
+            os.makedirs(os.path.join(d_, "lib", "net11.0"))
             b_ = (signed_zip if kind_ == "signed" else encrypted_zip if kind_ == "encrypted"
                   else corrupt_zip if kind_ == "corrupt" else unsigned_)
             open(os.path.join(d_, "demo.pkg.1.0.0.nupkg"), "wb").write(b_)
             open(os.path.join(d_, "demo.pkg.1.0.0.nupkg.sha512"), "w").write(b64sha(b_))
             open(os.path.join(d_, "demo.pkg.nuspec"), "wb").write(b"<package/>")
-            open(os.path.join(d_, "lib", "net10.0", "Demo.dll"), "wb").write(b"POISONED" if kind_ == "tamper" else b"the-real-dll")
+            open(os.path.join(d_, "lib", "net11.0", "Demo.dll"), "wb").write(b"POISONED" if kind_ == "tamper" else b"the-real-dll")
             if kind_ == "tamper":
-                open(os.path.join(d_, "lib", "net10.0", "Extra.targets"), "w").write("<Project/>")
+                open(os.path.join(d_, "lib", "net11.0", "Extra.targets"), "w").write("<Project/>")
             json.dump({"version": 2, "contentHash": "forged" if kind_ == "forged" else nupkg_content_hash(b_),
                        "source": "https://api.nuget.org/v3/index.json"},
                       open(os.path.join(d_, ".nupkg.metadata"), "w"))
@@ -10736,9 +10936,9 @@ def self_test() -> int:
         check("prepared/negative control: a package whose hash is not what NuGet recorded is NOT promoted", not os.path.exists(warm))
         host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [{"name": "a", "kind": "build", "command": pkg_fixture("tamper")}]})).run(dict(claim, isTrunk=True))
         check("prepared/negative control: an ALTERED extracted file never reaches the warm cache — it is rebuilt from the verified archive",
-              os.path.isfile(os.path.join(warm, "lib", "net10.0", "Demo.dll"))
-              and open(os.path.join(warm, "lib", "net10.0", "Demo.dll"), "rb").read() == b"the-real-dll"
-              and not os.path.exists(os.path.join(warm, "lib", "net10.0", "Extra.targets")))
+              os.path.isfile(os.path.join(warm, "lib", "net11.0", "Demo.dll"))
+              and open(os.path.join(warm, "lib", "net11.0", "Demo.dll"), "rb").read() == b"the-real-dll"
+              and not os.path.exists(os.path.join(warm, "lib", "net11.0", "Extra.targets")))
         shutil.rmtree(os.path.join(cache, "nuget"))
         # what an EARLIER stage restored (present before the build stage started) is promoted by the build stage too
         host(api_ev(), env=keyed_env, checkout=checkout_with({"stages": [
@@ -10848,7 +11048,7 @@ def self_test() -> int:
         # MODE MIGRATION (review of #109): a package an OLDER runner rebuilt lives ONLY in the cache — the stage reads it
         # in place from the fallback folder, so it never reaches `restored`, and the held warm key skips promotion. The
         # run still repairs its modes before any stage (a 0644 protoc stays unexecutable otherwise).
-        legacy_ = os.path.join(warm_pkg, "lib", "net10.0", "Demo.dll")
+        legacy_ = os.path.join(warm_pkg, "lib", "net11.0", "Demo.dll")
         os.remove(os.path.join(warm_pkg, NUGET_MATERIALIZED_MARK))
         os.chmod(legacy_, 0o644)
         posted.clear()
@@ -12768,7 +12968,7 @@ def self_test() -> int:
             except Refusal as e:
                 check("compile refs/the portal's /app alone (the old staging) is refused",
                       "NO shared frameworks" in str(e) and "MW_BUILD_COMPILE_REFS" in str(e), e)
-            fx = os.path.join(cr, "shared-frameworks", "Microsoft.NETCore.App", "10.0.0")
+            fx = os.path.join(cr, "shared-frameworks", "Microsoft.NETCore.App", "11.0.0")
             os.makedirs(fx)
             open(os.path.join(fx, "System.Private.CoreLib.dll"), "wb").close()
             check("compile refs/NEGATIVE CONTROL: a set without System.Reactive.dll is refused (core's checker refuses it too)",
@@ -12920,7 +13120,7 @@ def self_test() -> int:
         def seed_pkg(name_: str) -> bytes:
             buf_ = io.BytesIO()
             with zipfile.ZipFile(buf_, "w", zipfile.ZIP_DEFLATED) as z_:
-                for n_, b_ in ((f"{name_}.nuspec", b"<package/>"), (f"lib/net10.0/{name_}.dll", name_.encode()),
+                for n_, b_ in ((f"{name_}.nuspec", b"<package/>"), (f"lib/net11.0/{name_}.dll", name_.encode()),
                                ("[Content_Types].xml", b"<Types/>"), ("_rels/.rels", b"<Relationships/>")):
                     z_.writestr(zipfile.ZipInfo(n_, (2020, 1, 1, 0, 0, 0)), b_)
             return buf_.getvalue()

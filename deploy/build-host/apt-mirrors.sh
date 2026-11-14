@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The runner image's Ubuntu package sources, as MIRROR LISTS — never one host (MeshWeaver.Deploy#235).
 #
-# WHY. The base image (`mcr.microsoft.com/dotnet/sdk:10.0`, Ubuntu noble) names ONE host per source:
+# WHY. The base image (`mcr.microsoft.com/dotnet/sdk:11.0`, Ubuntu noble) names ONE host per source:
 # `archive.ubuntu.com` + `security.ubuntu.com` on amd64, `ports.ubuntu.com` on arm64. When that one host
 # stalls, every `apt-get` in the build stalls with it: on 2026-11-10 five consecutive amd64 builds sat
 # for the whole 30-minute job cap in ~30 s connect timeouts against `archive.ubuntu.com`, while the arm64

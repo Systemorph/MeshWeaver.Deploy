@@ -154,10 +154,16 @@ def _ladder_budget() -> int:
     rel = "src/MeshWeaver.Mesh.Contract/Services/MeshOperationOptions.cs"
     path = Path(os.environ["MW_PLATFORM_ROOT"]).resolve() / rel
     src = path.read_text() if path.is_file() else ""
+    # Each default is matched in EITHER declaration shape the platform has shipped: a private
+    # backing field (v3), or the C# 14 `field`-keyword property with an initializer (v4, core
+    # #8179). Exactly one capture group per key either way; any third shape is RED below.
+    def prop(name: str, value: str) -> str:
+        return r"public \w+ " + name + r"\s*\{[^}]*\}\s*=\s*" + value + ";"
+    seconds, number = r"TimeSpan\.FromSeconds\((\d+)\)", r"([0-9.]+)"
     shapes = {
-        "timeout": r"private readonly TimeSpan timeout = TimeSpan\.FromSeconds\((\d+)\);",
-        "reserve": r"private readonly TimeSpan nestingReserve = TimeSpan\.FromSeconds\((\d+)\);",
-        "fraction": r"private readonly double minNestingFraction = ([0-9.]+);",
+        "timeout": "(?:" + r"private readonly TimeSpan timeout = " + seconds + ";|" + prop("Timeout", seconds) + ")",
+        "reserve": "(?:" + r"private readonly TimeSpan nestingReserve = " + seconds + ";|" + prop("NestingReserve", seconds) + ")",
+        "fraction": "(?:" + r"private readonly double minNestingFraction = " + number + ";|" + prop("MinNestingFraction", number) + ")",
     }
     chain = [
         r"public TimeSpan NestedTimeout => Nest\(Timeout\);",
@@ -171,7 +177,9 @@ def _ladder_budget() -> int:
     if missing:
         raise SystemExit(f"::error::cannot derive QueryInitialBudget from {rel} in MW_PLATFORM_ROOT — /{missing[0]}/ no longer "
                          "matches; the ladder moved: re-derive registry-validate.sh's EXCHANGE_ANSWER_LIMIT and update this harness")
-    t, reserve, fraction = float(found["timeout"].group(1)), float(found["reserve"].group(1)), float(found["fraction"].group(1))
+    def value(m: re.Match) -> float:
+        return float(next(g for g in m.groups() if g is not None))
+    t, reserve, fraction = value(found["timeout"]), value(found["reserve"]), value(found["fraction"])
     for _ in range(3):
         t = max(t - reserve, t * fraction)
     return math.ceil(t)

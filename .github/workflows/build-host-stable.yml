@@ -59,7 +59,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: Systemorph/MeshWeaver
-          ref: main3
+          ref: main
           path: platform
           sparse-checkout: |
             .github/scripts

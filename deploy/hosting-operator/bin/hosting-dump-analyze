@@ -64,7 +64,11 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
 HOSTING_CMD="hosting-dump-analyze"
 
 # ── declared ────────────────────────────────────────────────────────────────────────────────────
-ANALYZER_IMAGE="${HOSTING_DUMP_ANALYZER_IMAGE:-mcr.microsoft.com/dotnet/sdk:10.0}"
+ANALYZER_IMAGE="${HOSTING_DUMP_ANALYZER_IMAGE:-mcr.microsoft.com/dotnet/sdk:11.0}"
+# 10.0.750501 is the newest dotnet-dump on nuget.org, prereleases included: no 11.x exists yet. The tool itself runs
+# on the 11 runtime (its runtimeconfig: net8.0, rollForward major). Whether its SOS reads a .NET 11 dump is NOT
+# verified: Microsoft's dotnet-dump documentation states no runtime-version compatibility. So the first analysis of
+# a v4 (.NET 11) dump may fail at run time. Move this pin to the first 11.x release once one is published.
 DOTNET_DUMP_VERSION="${HOSTING_DOTNET_DUMP_VERSION:-10.0.750501}"
 # The Job's own budget, and the per-command bound inside it (a heap walk over a 16 GiB dump is the
 # slow one — `dumpheap -stat` and `dumpasync` each walk it once). Both sit well inside the operations

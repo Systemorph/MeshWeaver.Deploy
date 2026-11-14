@@ -42,10 +42,13 @@ env:
   # Which platform the guards compile against — DECLARED, never defaulted at the point of use
   # (MeshWeaver#3259). The chart is deployed against the platform's tip, so the guards track it.
   # The repo VARIABLE MW_PLATFORM_REF wins over it.
-  MW_CHART_GUARDS_PLATFORM_REF: main3
+  MW_CHART_GUARDS_PLATFORM_REF: main
   # Which MeshWeaver.Plugins the guards read the portal hosts' service defaults from — declared the
-  # same way; the repo VARIABLE MW_PLUGINS_REF wins over it.
-  MW_CHART_GUARDS_PLUGINS_REF: main
+  # same way; the repo VARIABLE MW_PLUGINS_REF wins over it. `delivery-line` means: the pluginsRef
+  # the platform's own .github/delivery-lines.json pairs with the platform ref above, so the two
+  # checkouts are always one line (one major, one target framework) — a literal `main` here paired
+  # core's v4 line with Plugins' v3 branch and every guard failed NU1201 (net10 vs net11).
+  MW_CHART_GUARDS_PLUGINS_REF: delivery-line
   # 21 guard classes are deterministic (70 tests); 3 more render the chart with `helm template`
   # (17). The floor is the REAL count (87): 88 at the move, less SetupProbeEndpointsTest's one,
   # which left with its subject (Memex.Portal.Shared moved to MeshWeaver.Plugins, MeshWeaver#7125).
@@ -136,6 +139,30 @@ jobs:
           repository: Systemorph/MeshWeaver
           ref: ${{ steps.platform-ref.outputs.ref }}
           path: meshweaver
+      - name: Resolve the Plugins ref from the platform's delivery line
+        id: plugins-ref
+        env:
+          PLATFORM_REF: ${{ steps.platform-ref.outputs.ref }}
+          PLUGINS_REF: ${{ steps.platform-ref.outputs.plugins_ref }}
+        run: |
+          set -euo pipefail
+          if [ "$PLUGINS_REF" != "delivery-line" ]; then
+            echo "plugins ref $PLUGINS_REF (declared)"
+            echo "ref=$PLUGINS_REF" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          lines=meshweaver/.github/delivery-lines.json
+          if [ ! -f "$lines" ]; then
+            echo "::error title=No delivery lines::platform ref $PLATFORM_REF carries no $lines, so MW_CHART_GUARDS_PLUGINS_REF=delivery-line has nothing to read. Declare a literal Plugins ref (repo variable MW_PLUGINS_REF or this workflow's env)."
+            exit 1
+          fi
+          ref=$(jq -r --arg b "$PLATFORM_REF" '[.lines[] | select(.branch == $b) | .pluginsRef] | if length == 1 then .[0] else "" end' "$lines")
+          if [ -z "$ref" ] || [ "$ref" = "null" ]; then
+            echo "::error title=Platform ref is not a delivery line::$lines declares no single line with branch '$PLATFORM_REF' (declared: $(jq -r '[.lines[].branch] | join(", ")' "$lines")). Name a line branch as the platform ref, or declare a literal Plugins ref."
+            exit 1
+          fi
+          echo "plugins ref $ref (delivery line $PLATFORM_REF)"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
       # PRIVATE: a contents:read token for MeshWeaver.Plugins alone, minted from the App the
       # preflight asserted. A token the App cannot issue fails HERE, naming the permission.
       - name: A read token for MeshWeaver.Plugins (meshweaver-cloud App)
@@ -151,13 +178,13 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: Systemorph/MeshWeaver.Plugins
-          ref: ${{ steps.platform-ref.outputs.plugins_ref }}
+          ref: ${{ steps.plugins-ref.outputs.ref }}
           path: meshweaver-plugins
           token: ${{ steps.plugins-token.outputs.token }}
           persist-credentials: false
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: 11.0.x
       # Three guard classes parse `helm template`'s render of this chart.
       - name: Install helm
         uses: azure/setup-helm@v5
@@ -176,7 +203,7 @@ jobs:
           set -euo pipefail
           out="$RUNNER_TEMP/guards.log"
           set +e
-          test/MeshWeaver.Deploy.ChartGuards/bin/Release/net10.0/MeshWeaver.Deploy.ChartGuards > "$out" 2>&1
+          test/MeshWeaver.Deploy.ChartGuards/bin/Release/net11.0/MeshWeaver.Deploy.ChartGuards > "$out" 2>&1
           rc=$?
           set -e
           cat "$out"
