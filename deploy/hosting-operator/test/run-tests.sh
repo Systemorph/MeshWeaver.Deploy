@@ -2151,6 +2151,8 @@ refuses_hard "despite: a value that is not a plain token" "is not a plain token"
   "${IE_ENV[@]}" hosting-inline-env-retire --namespace memex --remove-despite-difference "$IE_RD_KEY=memex-portal-config" --expect-inline 'x;rm -rf /' --expect-shadow "$IE_RD_CANON"
 refuses "the expect flags never reach a plain --retire" "belong to --remove-despite-difference" \
   "${IE_ENV[@]}" hosting-inline-env-retire --namespace memex --retire "$IE_TOKEN" --expect-shadow "$IE_RD_CANON"
+refuses "despite: --rollout-handed-off is refused on a removal (it belongs to the read-back)" "belongs to --verify-reads" \
+  "${IE_ENV[@]}" hosting-inline-env-retire --namespace memex "${IE_RD[@]}" --rollout-handed-off
 refuses "the read-back takes no --expect-inline" "takes no --expect-inline" \
   "${IE_ENV[@]}" hosting-inline-env-retire --namespace memex "${IE_VR[@]}" --expect-inline "$IE_RD_LEGACY"
 case "$(cat "$_ie_args_state/log" 2>/dev/null)" in
@@ -2219,7 +2221,7 @@ case "$_ie_out" in *"::hosting:: inline_env_removed_despite_difference=0"*"::hos
 ierd despite-after "${IE_VR[@]}"
 [ "$_ie_rc" -eq 0 ] && ok "read-back: a settled Deployment whose pods all started without the entry reads the ConfigMap" \
   || bad "read-back: the settled clean case passes" "exited ${_ie_rc}: ${_ie_out}"
-case "$_ie_out" in *"::hosting:: inline_env_reads_configmap=2"*"::hosting:: inline_env_pods_pending=0"*) ok "…counting the two live pods and ignoring the terminating one" ;;
+case "$_ie_out" in *"::hosting:: inline_env_reads_configmap=2"*"::hosting:: inline_env_pods_pending=0"*"::hosting:: inline_env_pods_terminating=1"*) ok "…counting the two live pods, and the terminating one apart, never hidden" ;;
   *) bad "read-back: the counts are reported" "said: ${_ie_out}" ;; esac
 ie_no_patch "…and writes nothing"
 

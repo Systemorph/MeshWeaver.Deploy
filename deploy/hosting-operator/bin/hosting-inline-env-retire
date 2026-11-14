@@ -103,6 +103,7 @@
 #                               declaration (the live and ConfigMap values matched the plan)
 #   inline_env_reads_configmap=<n>  --verify-reads: pods started without the entry, reading the ConfigMap
 #   inline_env_pods_pending=<n>  --verify-reads under --rollout-handed-off: pods still to be replaced
+#   inline_env_pods_terminating=<n>  --verify-reads: terminating pods, counted in neither of the above
 #   inline_env_verify=dry-run   --verify-reads in a rehearsal: nothing was removed, so nothing is read back
 
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
@@ -179,6 +180,9 @@ if $despite || $verify; then
   fi
   if $verify && $fold; then
     hosting::die "--verify-reads writes nothing, so it has no rollout to fold into — pass --rollout-handed-off when the plan handed the rollout to the control plane. Nothing was changed."
+  fi
+  if $despite && $handed_off; then
+    hosting::die "--rollout-handed-off belongs to --verify-reads — a removal meets a rollout in flight only through --fold-into-rollout. Nothing was changed."
   fi
 elif $have_expect_inline || $have_expect_shadow || $handed_off; then
   hosting::die "--expect-inline, --expect-shadow and --rollout-handed-off belong to --remove-despite-difference / --verify-reads — a plain --retire compares the two values in the cluster and must find them EQUAL. Nothing was changed."
@@ -331,7 +335,10 @@ if $verify; then
     || hosting::die "deployment/${deployment} has no plain matchLabels selector ('${selector}') — its pods cannot be listed safely, so none is confirmed"
   pods="$(hosting::read kubectl -n "$namespace" get pods -l "$selector" -o json 2>"$err")" \
     || hosting::die "could not list the pods of deployment/${deployment} ($(tr -d '\n' < "$err"))"
-  # A terminating pod is leaving and reads nothing the instance serves from; it is not counted.
+  # A terminating pod is not counted as clean or stale: Kubernetes takes it out of the Service's ready
+  # endpoints once deletionTimestamp is set, so it serves no new request — but it may still run the old
+  # value until its grace period ends, so it is COUNTED and named in the output, never hidden.
+  terminating="$(printf '%s' "$pods" | jq -r '[.items[] | select(.metadata.deletionTimestamp != null)] | length')"
   clean="$(printf '%s' "$pods" | jq -r --arg k "$key" \
     '[.items[] | select(.metadata.deletionTimestamp == null) | select(all(.spec.containers[]; all(.env[]?; .name != $k)))] | length')"
   stale="$(printf '%s' "$pods" | jq -r --arg k "$key" \
@@ -344,12 +351,15 @@ if $verify; then
       || hosting::die "${key}: deployment/${deployment} is settled but pod(s) ${stale} still carry the entry inline — they read the old value"
     [ "$clean" -gt 0 ] \
       || hosting::die "${key}: deployment/${deployment} lists no running pod — nothing reads the value yet, so nothing is confirmed"
-    hosting::log "${key}  ${clean} pod(s) started without the entry — each reads configmap/${shadow}"
+    hosting::log "${key}  ${clean} pod(s) started without the entry — in each, ${container} reads configmap/${shadow} (the sidecars carry no envFrom: the removal only takes a copied entry off them)"
   else
     hosting::log "${key}  ${clean} pod(s) started without the entry; ${pending} still to be replaced by the rollout the control plane observes${stale:+ (${stale})}"
   fi
+  [ "$terminating" -eq 0 ] \
+    || hosting::log "${key}  ${terminating} terminating pod(s) not counted — out of the Service's endpoints, still running until their grace period ends"
   hosting::say inline_env_reads_configmap "$clean"
   hosting::say inline_env_pods_pending "$pending"
+  hosting::say inline_env_pods_terminating "$terminating"
   exit 0
 fi
 
