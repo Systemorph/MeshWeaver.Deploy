@@ -31,6 +31,6 @@ jobs:
       checks: read       # check-runs/<job>/annotations — the ONLY record of a runner death
       contents: read
     with:
-      # Scripts-only lane: it fetches its decision script at `scripts-ref`, and `main` keeps that
-      # script one vintage with the `@main` lane that fetches it (scripts/check-shared-lanes.py).
+      # Scripts-only lane: it fetches its decision script at `scripts-ref`, and `main3` keeps that
+      # script one vintage with the `@main3` lane that fetches it (scripts/check-shared-lanes.py).
       scripts-ref: main3
