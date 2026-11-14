@@ -1,0 +1,12 @@
+{
+  "apiVersion": "v1",
+  "kind": "ConfigMap",
+  "metadata": {
+    "name": "memex-portal-config",
+    "namespace": "memex"
+  },
+  "data": {
+    "Modules__Root": "/data/modules",
+    "PluginCatalog__Sources__1__RepoPath": "https://git.example.invalid/acme/canonical"
+  }
+}

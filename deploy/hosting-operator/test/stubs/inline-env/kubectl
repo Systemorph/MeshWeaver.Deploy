@@ -9,6 +9,7 @@
 #                                                   deployment.after.json (the API's answer)
 #   kubectl -n <ns> get secret <name> -o json     → secret_<name>.json, else NotFound, exit 1
 #   kubectl -n <ns> get configmap <name> -o json  → configmap_<name>.json, else NotFound, exit 1
+#   kubectl -n <ns> get pods -l <selector> -o json → pods.json (the --verify-reads read-back)
 #   kubectl -n <ns> patch deployment <name> --type json -p <patch>
 #                                                 → the patch lands in $HOSTING_IE_STATE/patch
 #
@@ -40,6 +41,9 @@ case "$verb $kind" in
   "get configmap")
     pick "configmap_${name}.json" \
       || { echo "Error from server (NotFound): configmaps \"${name}\" not found" >&2; exit 1; } ;;
+  "get pods")
+    pick pods.json \
+      || { echo "kubectl stub (inline-env): this scenario carries no pods.json" >&2; exit 1; } ;;
   "patch deployment")
     shift 3
     while [ $# -gt 0 ]; do
