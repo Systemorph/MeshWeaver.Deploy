@@ -185,6 +185,11 @@ Environment (rendered by the chart from `buildHosts.*`):
   MW_BUILD_STAGE_SLOTS         how many of a `parallel` run's stages run at once  default 1 (serial); the host
                                refuses to START when its cgroup cannot give each slot 1 CPU and 2 GiB, or
                                when neither the cgroup v2 nor the v1 limits can be read (more than 1 slot)
+  MW_BUILD_STAGE_PROCESSOR_COUNT  DECLARED DOTNET_PROCESSOR_COUNT for every stage (a whole number in [1, 1024]);
+                               unset = each stage gets max(1, floor(cgroup CPUs / stages that may run beside it)) —
+                               1 for a serial run and for a `build` stage (which runs alone), the host's slots for a
+                               test stage of a fanned-out run. The sandbox hides /sys, so without it .NET sizes its
+                               compile lane, GC and thread pool for the whole VM (stage_processor_count)
   BWRAP                        the bubblewrap binary                       default bwrap
   MW_PLUGINS_REGISTRY          registry host the plugins publication is pulled from
   MW_PLUGINS_SOURCE            the publication's source name               default plugins
@@ -2725,6 +2730,56 @@ def stage_slots_refusal(slots_text: str, capacity: "tuple[float, Optional[int]] 
         return (f"MW_BUILD_STAGE_SLOTS {slots} in {mem / 1024 ** 3:.1f} GiB — each concurrent stage needs at least "
                 f"{MIN_MEMORY_PER_SLOT // 1024 ** 3} GiB; declare fewer slots or more memory (buildHosts.stageSlots / resources)")
     return None
+
+
+# THE CPU A STAGE IS ALLOWED, handed to .NET explicitly. The sandbox (`Sandbox.argv`) mounts a fresh /proc and /dev but
+# NO /sys and unshares the cgroup namespace, so the .NET runtime inside a stage finds no cgroup limit and
+# `Environment.ProcessorCount` answers the whole VM (16 on a 16-CPU VM whose runner is limited to 4) — while the kernel
+# still enforces the runner's limit. Everything .NET sizes from it is then oversized for the CPU the stage really has:
+# core's NodeType compile lane (`IoPoolOptions.CompileCpu`), the server GC's heaps, the thread pool's minimum — 16
+# compile slots on 4 CPUs, times the stages in flight (MeshWeaver.Plugins#4478). The host KNOWS both facts — the cgroup
+# it runs in (`cgroup_capacity`) and how many stages run at once (`MW_BUILD_STAGE_SLOTS`, the run's `parallel`) — so it
+# hands every stage `DOTNET_PROCESSOR_COUNT` = max(1, floor(CPUs / stages that may run beside it)), through the
+# sandbox's explicit env (it survives `--clearenv` because the host adds it, not the allow-list). An operator who wants
+# another number DECLARES it (`MW_BUILD_STAGE_PROCESSOR_COUNT`, chart `buildHosts.stageProcessorCount`), and that wins.
+STAGE_PROCESSOR_COUNT_ENV = "MW_BUILD_STAGE_PROCESSOR_COUNT"
+MAX_STAGE_PROCESSOR_COUNT = 1024
+
+
+def stage_processor_count_refusal(declared: str) -> Optional[str]:
+    """Why a declared MW_BUILD_STAGE_PROCESSOR_COUNT cannot be used, or None (also None when it is not declared)."""
+    text = (declared or "").strip()
+    if not text:
+        return None
+    if not re.fullmatch(r"[0-9]+", text) or not (1 <= int(text) <= MAX_STAGE_PROCESSOR_COUNT):
+        return (f"{STAGE_PROCESSOR_COUNT_ENV} as a whole number in [1, {MAX_STAGE_PROCESSOR_COUNT}] (got {declared!r}) — "
+                f"the DOTNET_PROCESSOR_COUNT every stage gets; unset sizes it from the cgroup and the stage slots")
+    return None
+
+
+def stage_processor_count(capacity: "tuple[float, Optional[int]] | str", concurrent: int, declared: str = "",
+                          visible: Optional[int] = None) -> tuple[int, str]:
+    """(DOTNET_PROCESSOR_COUNT for one stage, where it came from). `concurrent` = how many stages may run at once
+    beside this one, itself included (1 for a serial run and for a build stage). A declared count wins; otherwise
+    max(1, floor(the cgroup's CPUs / concurrent)); an unreadable cgroup (`capacity` a string) falls back to the CPUs
+    this process can see — said, never presented as a measured limit. Pure apart from `os.cpu_count` when `visible`
+    is not given. A declaration `stage_processor_count_refusal` refuses raises Refusal (the host refuses at start)."""
+    why = stage_processor_count_refusal(declared)
+    if why:
+        raise Refusal(why)
+    concurrent = max(1, int(concurrent))
+    text = (declared or "").strip()
+    if text:
+        return int(text), f"declared {STAGE_PROCESSOR_COUNT_ENV}={text}"
+    seen = int(visible if visible is not None else (os.cpu_count() or 1))
+    if isinstance(capacity, str):
+        cpus, basis = float(seen), f"{seen} visible CPU(s) — no cgroup limit was measured: {capacity}"
+    else:
+        cpus = float(capacity[0])
+        # cgroup_capacity folds an unlimited `cpu.max` into the visible count, so a limit EQUAL to it reads the same: the line
+        # states the number the cgroup answers, never a guess at which of the two it was
+        basis = f"the cgroup's {cpus:g} CPU(s)"
+    return max(1, int(cpus // concurrent)), f"{basis} / {concurrent} stage(s) at once"
 
 
 # ───────────────────────────────── the build API ──────────────────────────────────────────
@@ -5381,6 +5436,8 @@ class Host:
         except ValueError:
             self.stage_slots = 1
         self.capacity = capacity or cgroup_capacity
+        # DECLARED DOTNET_PROCESSOR_COUNT for every stage, or empty = sized from the cgroup and the slots (stage_processor_count)
+        self.stage_processor_declared = (env.get(STAGE_PROCESSOR_COUNT_ENV, "") or "").strip()
         self.plugins_digest: Optional[str] = None
         self.plugins_dir: Optional[str] = None
         self.plugins_known = False
@@ -5790,6 +5847,9 @@ class Host:
         why_slots = stage_slots_refusal(self.stage_slots_text, self.capacity())
         if why_slots:
             missing.append(why_slots)
+        why_cpu = stage_processor_count_refusal(self.stage_processor_declared)
+        if why_cpu:
+            missing.append(why_cpu)
         if not (MIN_RUN_DEADLINE <= self.run_deadline <= MAX_RUN_DEADLINE):
             missing.append(f"MW_BUILD_RUN_DEADLINE_SECONDS within [{MIN_RUN_DEADLINE}, {MAX_RUN_DEADLINE}] — the RUN budget "
                            f"(the contract's budgetMinutes is 10..720), which must cover the stages a repository declares")
@@ -6546,7 +6606,9 @@ class Host:
                                                                                        cancel=cancel),
                                             cancel=cancel,
                                             hand_over_failed=lambda: self.hand_over_failed_stage(
-                                                repo, sha, name, art, art_before, deadline=run_end, cancel=cancel))
+                                                repo, sha, name, art, art_before, deadline=run_end, cancel=cancel),
+                                            # a build stage runs ALONE (next_stages); any other shares the run's slots
+                                            concurrent=1 if st["kind"] == "build" else slots)
                         done.put((name, ok, None))
                     except BaseException as e:     # Lost, or a host defect: the scheduler decides, never a dead thread
                         # The run is abandoned the moment a worker KNOWS it — not when the scheduler reads this from the
@@ -6973,6 +7035,12 @@ class Host:
                                            f"{secs} s): {np_} package(s) promoted, {nk} already present — later runs restore nothing"}])
         self.deliver(sink)
 
+    def stage_processor_env(self, concurrent: int) -> tuple[dict, str]:
+        """`{"DOTNET_PROCESSOR_COUNT": n}` for a sandboxed process with `concurrent` stages in flight (itself included),
+        and the line that says what was chosen and why (`stage_processor_count`)."""
+        n, why = stage_processor_count(self.capacity(), concurrent, self.stage_processor_declared)
+        return {"DOTNET_PROCESSOR_COUNT": str(n)}, f"DOTNET_PROCESSOR_COUNT={n} — {why}"
+
     def _sandboxed_capture(self, command: str, tree: str, out: str, workdir: str, extra: dict, readonly: list,
                            writable: list, timeout: float, cancel: Optional[threading.Event] = None,
                            mount: Optional[str] = None, binds: Iterable[tuple[str, str]] = ()) -> tuple[int, str]:
@@ -6981,7 +7049,10 @@ class Host:
         exhaust the host's memory and end the worker without a verdict. Returns (exit code, stderr tail + stdout tail).
         `cancel` set (the heartbeat met the 409 — the run is not this host's claim any more) kills the sandbox's whole
         tree at once and raises Lost: a build for a run another host now owns is never waited out (Deploy#49)."""
-        argv = self.sandbox.argv(command, tree, out, sandbox_env(self.env, extra, self.cache),
+        # a warm build, the warm NuGet fill and a prepared input each run with no stage beside them: sized for ONE
+        cpu_env, cpu_line = self.stage_processor_env(1)
+        self.log(f"sandboxed host step: {cpu_line}")
+        argv = self.sandbox.argv(command, tree, out, sandbox_env(self.env, {**extra, **cpu_env}, self.cache),
                                  readonly=readonly, writable=writable, mount=mount, binds=binds)
         logs = tempfile.mkdtemp(prefix=".prep-log-", dir=workdir)
         try:
@@ -7207,12 +7278,14 @@ class Host:
                   readonly: Iterable[str] = (), writable: Iterable[str] = (), binds: Iterable[tuple[str, str]] = (),
                   hand_over: Callable[[], tuple[list[dict], Optional[str]]] = None,
                   cancel: Optional[threading.Event] = None,
-                  hand_over_failed: Callable[[], tuple[list[dict], Optional[str]]] = None) -> bool:
+                  hand_over_failed: Callable[[], tuple[list[dict], Optional[str]]] = None,
+                  concurrent: int = 1) -> bool:
         """Run ONE stage in a fresh sandboxed process tree; post its events; return success. `cancel` (fan-out): set
         when a sibling stage found the run is no longer this host's — the stage is killed and Lost raised.
         `hand_over_failed`: what a RED stage still hands over — everything it added or rewrote (red_stage_artifacts),
         every receipt marked failed; its receipts are posted before the failed verdict, and a problem with them is named
-        but never turns red green."""
+        but never turns red green. `concurrent`: how many stages may be in flight beside this one, itself included — what
+        its DOTNET_PROCESSOR_COUNT is sized by (stage_processor_count)."""
         name, started = st["name"], self.clock()
 
         def abandoned() -> None:
@@ -7229,6 +7302,10 @@ class Host:
             # OFFLINE (MW_BUILD_STAGE_NETWORK=offline): no network namespace beyond loopback, and NuGet's ONLY source is the
             # prepared package folder — a package the preparation did not fetch is NU1101 naming it, never a download
             stage_extra = {**extra, **offline_restore_env(self.cache)} if self.stage_offline else extra
+            # the CPU this stage is ALLOWED, named to .NET: the sandbox hides /sys, so the runtime would size for the VM
+            cpu_env, cpu_line = self.stage_processor_env(concurrent)
+            stage_extra = {**stage_extra, **cpu_env}
+            sink.add([{"kind": "line", "text": f"[00:00:00] {cpu_line}"}])
             argv = self.sandbox.argv(st["command"], checkout, outputs, sandbox_env(self.env, stage_extra, self.cache),
                                      readonly=readonly, writable=writable, mount=SANDBOX_CHECKOUT, binds=binds,
                                      **({"network": False} if self.stage_offline else {}))
@@ -11584,6 +11661,37 @@ def self_test() -> int:
         # The host's slots are DECLARED and checked against the cgroup it runs in — refused at start, never clamped.
         gib = 1024 ** 3
         check("fanout/8 slots fit the chart's default host (15 CPU, 52 GiB)", stage_slots_refusal("8", (15.0, 52 * gib)) is None)
+        # THE CPU A STAGE IS ALLOWED (stage_processor_count): max(1, floor(cgroup CPUs / stages at once)); a declaration wins.
+        for cap_, conc_, want_ in (((4.0, 24 * gib), 4, 1), ((4.0, 24 * gib), 1, 4), ((16.0, 52 * gib), 4, 4),
+                                   ((3.5, 20 * gib), 2, 1), ((15.0, 52 * gib), 8, 1), ((2.0, 4 * gib), 4, 1)):
+            got_ = stage_processor_count(cap_, conc_, "", visible=16)
+            check(f"cpu/{cap_[0]:g} cgroup CPU(s) / {conc_} slot(s) -> {want_}", got_[0] == want_ and "cgroup's" in got_[1], got_)
+        got_ = stage_processor_count((16.0, None), 4, "", visible=16)
+        got_ = stage_processor_count((4.0, None), 4, "", visible=4)
+        check("cpu/a limit EQUAL to the visible count is stated as the cgroup's count, never called 'no limit'",
+              got_ == (1, "the cgroup's 4 CPU(s) / 4 stage(s) at once"), got_)
+        got_ = stage_processor_count((16.0, None), 4, "", visible=16)
+        check("cpu/no CPU limit (cgroup_capacity answers the visible count): the visible count / slots", got_[0] == 4, got_)
+        got_ = stage_processor_count("the cgroup limits under /x (unreadable)", 4, "", visible=6)
+        check("cpu/an unreadable cgroup: floor(visible / slots), said as visible — never as a measured limit",
+              got_[0] == 1 and "visible" in got_[1] and "no cgroup limit was measured" in got_[1], got_)
+        got_ = stage_processor_count("unreadable", 8, "", visible=3)
+        check("cpu/never below 1", got_[0] == 1, got_)
+        got_ = stage_processor_count((4.0, 24 * gib), 4, " 3 ", visible=16)
+        check("cpu/the DECLARED count wins and says so", got_ == (3, f"declared {STAGE_PROCESSOR_COUNT_ENV}=3"), got_)
+        for bad_ in ("0", "-1", "2.5", "four", str(MAX_STAGE_PROCESSOR_COUNT + 1)):
+            check(f"cpu/a declared {bad_!r} is refused", stage_processor_count_refusal(bad_) is not None, bad_)
+            try:
+                stage_processor_count((4.0, None), 1, bad_)
+                check(f"cpu/a declared {bad_!r} raises", False, "accepted")
+            except Refusal:
+                pass
+        check("cpu/an undeclared count is no refusal", stage_processor_count_refusal("") is None)
+        try:
+            host(_FakeApi({}), env=dict(env_s, **{STAGE_PROCESSOR_COUNT_ENV: "0"}), capacity=lambda: (4.0, 24 * gib)).preflight()
+            check("cpu/a host declaring 0 refuses to start", False, "started")
+        except Refusal as ex:
+            check("cpu/the start refusal names the declaration", STAGE_PROCESSOR_COUNT_ENV in str(ex), ex)
         check("fanout/one slot needs no capacity check", stage_slots_refusal("1", (0.5, gib)) is None)
         for txt, cap, what in (("8", (6.0, 12 * gib), "CPU"), ("8", (15.0, 12 * gib), "GiB"), ("x", (15.0, None), "whole number"),
                                ("0", (15.0, None), "within"), ("33", (64.0, None), "within")):
@@ -11711,6 +11819,71 @@ def self_test() -> int:
         check("fanout/negative control: `parallel` on a ONE-slot host runs serially too",
               state(one, "s0") == "failed" and state(one, "s1") == "failed"
               and any(e["kind"] == "line" and e["text"].startswith("serial:") for e in one["by"].get("build", [])), one["by"])
+
+        # DOTNET_PROCESSOR_COUNT reaches EVERY stage through the sandbox's explicit env (it survives --clearenv because the
+        # host adds it, never the allow-list), sized by the stages that may run beside it, and each stage's log says so.
+        # Asserted on what the sandbox was HANDED (the argv's env) and on what the stage itself SAW (`echo` into a file).
+        def cpu_run(env_add: dict, doc: dict, disable: bool = False) -> tuple[dict, dict, dict]:
+            seen_dir = tempfile.mkdtemp(prefix="cpu-", dir=tmp)
+            handed: dict = {}
+
+            class _CpuSandbox(_EnvSandbox):
+                def argv(self, command, checkout, outputs, env, readonly=(), writable=(), mount=None, binds=()):
+                    if env.get("MW_BUILD_STAGE"):
+                        handed[env["MW_BUILD_STAGE"]] = env.get("DOTNET_PROCESSOR_COUNT")
+                    return super().argv(command, checkout, outputs, env, readonly, writable, mount, binds)
+            for st_ in doc["stages"]:
+                st_["command"] = f"echo \"${{DOTNET_PROCESSOR_COUNT:-absent}}\" > {seen_dir}/{st_['name']}"
+            posted.clear()
+            hc = host(api_ev(), env=dict(env_s, MW_BUILD_ARTIFACT_STORE="file:" + store_dir, **env_add),
+                      store_runner=fake_store, checkout=checkout_with(doc), capacity=lambda: (4.0, 24 * gib))
+            hc.sandbox = _CpuSandbox()
+            if disable:
+                # the NEGATIVE CONTROL: the same run with the injection switched off — the stage must then lack it
+                hc.stage_processor_env = lambda concurrent: ({}, "DOTNET_PROCESSOR_COUNT not handed (negative control)")
+            hc.run(claim)
+            saw = {}
+            for n_ in os.listdir(seen_dir):
+                with open(os.path.join(seen_dir, n_)) as fh:
+                    saw[n_] = fh.read().strip()
+            lines_ = {}
+            for pth, es in posted:
+                for e in es:
+                    if e["kind"] == "line" and "DOTNET_PROCESSOR_COUNT" in e["text"]:
+                        lines_.setdefault(pth.split("/")[-2], []).append(e["text"])
+            return handed, saw, lines_
+
+        def cpu_doc(parallel_: bool) -> dict:
+            d_ = {"stages": [{"name": "build", "kind": "build", "command": ""},
+                             {"name": "t0", "kind": "test", "after": ["build"], "command": ""},
+                             {"name": "t1", "kind": "test", "after": ["build"], "command": ""}]}
+            if parallel_:
+                d_["parallel"] = True
+            return d_
+        handed, saw, lines_ = cpu_run({"MW_BUILD_STAGE_SLOTS": "4"}, cpu_doc(True))
+        check("cpu/fan-out on 4 CPU / 4 slots: each test stage is HANDED DOTNET_PROCESSOR_COUNT=1, the lone build 4",
+              handed == {"build": "4", "t0": "1", "t1": "1"}, handed)
+        check("cpu/...and the stage process SEES it (survives --clearenv)", saw == {"build": "4", "t0": "1", "t1": "1"}, saw)
+        check("cpu/each stage's log names the count and where it came from, ONCE",
+              sorted(lines_) == ["build", "t0", "t1"] and all(len(v) == 1 for v in lines_.values())
+              and "DOTNET_PROCESSOR_COUNT=1 — the cgroup's 4 CPU(s) / 4 stage(s) at once" in lines_["t0"][0], lines_)
+        handed, saw, _ = cpu_run({"MW_BUILD_STAGE_SLOTS": "4"}, cpu_doc(False))
+        check("cpu/a serial run on 4 CPU: every stage gets 4", handed == {"build": "4", "t0": "4", "t1": "4"} and saw == handed, (handed, saw))
+        handed, saw, lines_ = cpu_run({"MW_BUILD_STAGE_SLOTS": "4", STAGE_PROCESSOR_COUNT_ENV: "2"}, cpu_doc(True))
+        check("cpu/the DECLARED count wins in every stage, and the log says it was declared",
+              handed == {"build": "2", "t0": "2", "t1": "2"} and saw == handed
+              and all(f"declared {STAGE_PROCESSOR_COUNT_ENV}=2" in v[0] for v in lines_.values()), (handed, lines_))
+        handed, saw, _ = cpu_run({"MW_BUILD_STAGE_SLOTS": "4"}, cpu_doc(True), disable=True)
+        check("cpu/negative control: with the injection off, the sandbox is handed NO DOTNET_PROCESSOR_COUNT and the stage lacks it",
+              handed == {"build": None, "t0": None, "t1": None} and saw == {"build": "absent", "t0": "absent", "t1": "absent"}, (handed, saw))
+        av_cpu = Sandbox("bwrap", []).argv("x", "/w/s", "/w/o", sandbox_env({"PATH": "/bin", "DOTNET_PROCESSOR_COUNT": "16"},
+                                                                         {"DOTNET_PROCESSOR_COUNT": "1"}, "/cache"))
+        i_cpu = av_cpu.index("DOTNET_PROCESSOR_COUNT")
+        check("cpu/the real bwrap argv sets the HOST's value after --clearenv (a host env value is never inherited)",
+              av_cpu[i_cpu - 1:i_cpu + 2] == ["--setenv", "DOTNET_PROCESSOR_COUNT", "1"]
+              and av_cpu.count("DOTNET_PROCESSOR_COUNT") == 1 and av_cpu.index("--clearenv") < i_cpu, av_cpu)
+        check("cpu/the allow-list does not pass a host DOTNET_PROCESSOR_COUNT through",
+              "DOTNET_PROCESSOR_COUNT" not in sandbox_env({"PATH": "/bin", "DOTNET_PROCESSOR_COUNT": "16"}, {}, "/cache"))
 
         # A RED stage in flight beside a green one: its artifacts are handed over MARKED FAILED (MeshWeaver.Deploy#52) and
         # then quarantined whole, and they never reach the green sibling's hand-over (each stage has its own directory) —

@@ -236,6 +236,9 @@ for ch, (tester, portal, runner, mx, pv, mn) in want.items():
         problems.append(f"{ch}: BUILD_TOKEN_FILE is not /run/build-worker/token")
     if env.get("MW_BUILD_STAGE_SLOTS", {}).get("value") != "8":
         problems.append(f"{ch}: MW_BUILD_STAGE_SLOTS is not the chart's default 8 (fan-out): {env.get('MW_BUILD_STAGE_SLOTS')}")
+    if "MW_BUILD_STAGE_PROCESSOR_COUNT" in env:
+        problems.append(f"{ch}: MW_BUILD_STAGE_PROCESSOR_COUNT rendered although nothing declares it (null = the runner sizes "
+                        f"DOTNET_PROCESSOR_COUNT from its cgroup and the slots): {env.get('MW_BUILD_STAGE_PROCESSOR_COUNT')}")
     if env.get("MW_BUILD_SLICE_CACHE_MAX_GIB", {}).get("value") != "32":
         problems.append(f"{ch}: MW_BUILD_SLICE_CACHE_MAX_GIB is not the chart's default bound 32 (the slice cache): {env.get('MW_BUILD_SLICE_CACHE_MAX_GIB')}")
     if any(k.startswith("MW_BUILD_CACHE_") for k in env if k != "MW_BUILD_CACHE"):
@@ -775,6 +778,27 @@ if [ -s "$WORK/mac.yaml" ]; then
   fi
 fi
 
+# 3d-cpu. THE CPU A STAGE IS ALLOWED (deploy/build-host/STAGE-CPU.md): a declared buildHosts.stageProcessorCount renders
+#     MW_BUILD_STAGE_PROCESSOR_COUNT on every build container, verbatim; undeclared (the default, checked above) it is absent.
+if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.stageProcessorCount=3 \
+     --namespace check > "$WORK/cpu.yaml" 2> "$WORK/cpu.err"; then
+  python3 - "$WORK/cpu.yaml" <<'PYCPU' && ok "buildHosts.stageProcessorCount 3 renders MW_BUILD_STAGE_PROCESSOR_COUNT=3 on every build container" || report "the declared stage processor count render is wrong (above)"
+import sys, yaml
+hosts = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d and d.get("kind") == "Deployment"
+         and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "build-host"]
+problems = [] if hosts else ["no build-host Deployment rendered"]
+for d in hosts:
+    build = next(c for c in d["spec"]["template"]["spec"]["containers"] if c["name"] == "build")
+    got = {e["name"]: e.get("value") for e in build.get("env", [])}.get("MW_BUILD_STAGE_PROCESSOR_COUNT")
+    if got != "3":
+        problems.append(f"{d['metadata']['name']}: MW_BUILD_STAGE_PROCESSOR_COUNT={got!r}, want '3'")
+for p in problems: print("   ", p)
+sys.exit(1 if problems else 0)
+PYCPU
+else
+  report "the declared stage processor count did not render:"; sed 's/^/    /' "$WORK/cpu.err"
+fi
+
 # 3d. the opt-in user-namespace sandbox: hostUsers false on the pod, procMount Unmasked on the build container, and on a
 #     node pool the selector narrowed to kernel-userns nodes. Off (the default), none of it renders.
 if helm template r "$CHART" -f "$CHART/values.yaml" -f "$TD/values.build-hosts.yaml" --set buildHosts.sandbox.userNamespace=true \
@@ -965,6 +989,8 @@ for entry in \
   "values.build-hosts-run-deadline-zero.yaml|RUN budget" \
   "values.build-hosts-stage-slots-zero.yaml|buildHosts.stageSlots 0 must be within" \
   "values.build-hosts-stage-slots-fraction.yaml|buildHosts.stageSlots 2.9 must be a whole number" \
+  "values.build-hosts-stage-cpu-zero.yaml|buildHosts.stageProcessorCount 0 must be within [1, 1024]" \
+  "values.build-hosts-stage-cpu-fraction.yaml|buildHosts.stageProcessorCount 1.5 must be a whole number" \
   "values.build-hosts-slice-cache-zero.yaml|buildHosts.sliceCacheMaxGi 0 must be within" \
   "values.build-hosts-slice-cache-fraction.yaml|buildHosts.sliceCacheMaxGi 1.5 must be a whole number" \
   "values.build-hosts-cache-share-above-budget.yaml|the slices share 32 GiB exceeds the cache budget 18 GiB" \

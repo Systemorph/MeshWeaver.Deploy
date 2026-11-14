@@ -1325,6 +1325,14 @@ buildHosts:
   # cgroup, and the runner REFUSES TO START when the declared slots exceed that (MW_BUILD_STAGE_SLOTS, build-run.py
   # `stage_slots_refusal`) — so lowering `resources` means lowering this too. 1 = every run serial.
   stageSlots: 8
+  # The CPU each stage is ALLOWED, named to .NET (DOTNET_PROCESSOR_COUNT, MW_BUILD_STAGE_PROCESSOR_COUNT): the stage sandbox
+  # mounts no /sys, so without it the .NET runtime finds no cgroup limit and sizes the NodeType compile lane, the GC and the
+  # thread pool for the whole VM — 16 compile slots on a 4-CPU replica (MeshWeaver.Plugins#4478). null = the runner sizes it:
+  # max(1, floor(the container cgroup's CPUs / the stages that may run at once)) — the stage slots for a test stage of a
+  # `parallel` run, 1 for a serial run and for a build stage (which runs alone). A whole number in [1, 1024] here DECLARES
+  # one count for every stage instead. Each stage's log names the count and where it came from
+  # (deploy/build-host/STAGE-CPU.md).
+  stageProcessorCount: null
   # The WARM WORKSPACE (MeshWeaver.Plugins Hosting/BuildQueue.md §7.3b): ONE master per host (the bare mirrors under the cache,
   # updated only by `git fetch`) and ONE persistent tree per repository per host (MeshWeaver.Plugins Hosting/OneBuildTree.md),
   # `<cache>/deploy/<channel>-tree/<repo>`, written only by its single writer — moved IN PLACE to the default branch's tip and
