@@ -1,9 +1,17 @@
 # MeshWeaver.Deploy
 
-The public deployment reference for [MeshWeaver](https://github.com/Systemorph/MeshWeaver):
+The public deployment reference for [MeshWeaver](https://github.com/Systemorph/MeshWeaver).
+
+**Just want to try it?** Two lines, no build, no account. The images are public on GHCR:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Systemorph/MeshWeaver.Deploy/main/deploy/quickstart/docker-compose.yml -o docker-compose.yml
+docker compose up -d        # then open http://localhost:8080 and sign in with DevLogin
+```
 
 | Path | What |
 |---|---|
+| `deploy/quickstart` | a hand-written, single-file Docker Compose for your own machine: PostgreSQL, the one-shot migration and the portal from the public GHCR images, DevLogin on a loopback-only port. Not generated, and not for serving other people (that is `deploy/compose`) |
 | `deploy/helm` | the Helm chart that runs a MeshWeaver portal (portal, migration Job, optional registry, KEDA, PDB, ingress) |
 | `deploy/helm-db` | the per-instance PostgreSQL chart |
 | `deploy/aks` | an example AKS overlay, the cluster manifests, and the chart / drift / observability tooling |
