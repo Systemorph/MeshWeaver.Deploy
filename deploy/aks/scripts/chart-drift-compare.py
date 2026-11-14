@@ -718,7 +718,11 @@ if informational:
     print(f"{len(informational)} informational difference(s), not counted as drift.")
 
 if not findings:
-    print(f"No drift: {comparisons} fields compared, the cluster matches the rendered chart.")
+    # The prefix `No drift: N fields compared` is the contract hosting-chart-drift greps — only the
+    # tail may vary, and it must not claim an exact match when an inert difference was measured.
+    tail = ("the cluster matches the rendered chart apart from the informational difference(s) above"
+            if informational else "the cluster matches the rendered chart")
+    print(f"No drift: {comparisons} fields compared, {tail}.")
     sys.exit(0)
 
 # Worst first. COLLIDES and SHADOWS are live-wrong RIGHT NOW; the rest are hygiene that a deploy
