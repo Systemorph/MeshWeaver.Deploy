@@ -2,6 +2,10 @@
 # hosting-inline-env-retire --namespace <ns> --retire <KEY>=<shadowed source> [--retire …]
 #                           [--deployment memex-portal-deployment] [--container memex-portal]
 #                           [--fold-into-rollout]
+# hosting-inline-env-retire --namespace <ns> --remove-despite-difference <KEY>=<configmap>
+#                           --expect-inline <value> --expect-shadow <value> [--fold-into-rollout]
+# hosting-inline-env-retire --namespace <ns> --verify-reads <KEY>=<configmap>
+#                           --expect-shadow <value> [--rollout-handed-off]
 #
 # Remove inline `env:` entries from the portal Deployment — the entries a Hosting/Deployment record
 # marks RETIRED (`inlineEnv[].retiredBy`) — and only after proving, in the cluster and immediately
@@ -62,23 +66,59 @@
 # nothing to remove does not roll the Deployment. The rollout this starts is WAITED FOR by the plan
 # step that follows, and the run ends in the same re-audit and generation check as every Reconcile.
 #
+# 🚨 REMOVING AN ENTRY DESPITE A DIFFERENCE (`--remove-despite-difference`). The record may DECLARE
+# that one retired entry goes although its ConfigMap twin carries a different value
+# (`inlineEnv[].removeDespiteDifference`, with the twin's value in `shadowedValue` — a legacy value
+# the record already replaced in the ConfigMap; Doc/Architecture/ChartDriftSemantics → "Removing an
+# entry despite a difference"). The Hosting plugin renders it as its own destructive, approved step,
+# one key per run, never mixed with `--retire`, and puts BOTH values on the command line so the plan
+# the approver signs shows them. Both values are non-credential by construction: the plugin refuses a
+# credential row, and this command refuses a Secret twin. Every other check still runs; the equality
+# check is replaced by two stricter ones:
+#   * the fall-through must be a ConfigMap — a Secret twin, or no twin at all (the SOLE-source
+#     refusal), is refused: removing the entry would then hide or drop the value instead of applying
+#     the declared one;
+#   * the live inline value must be exactly `--expect-inline` (the value the plan says it removes) and
+#     the ConfigMap must carry exactly `--expect-shadow` (the value the plan says then applies). A
+#     mismatch means the record no longer describes the cluster: refused, nothing written.
+# Still only lengths and verdicts are printed; the values are already on the signed plan.
+#
+# 🚨 THE READ-BACK (`--verify-reads`). Run after the rollout the removal started. It writes nothing,
+# and confirms that the pod now reads the ConfigMap value: no container of the Deployment carries the
+# entry, the portal container falls through to the named ConfigMap, that ConfigMap carries exactly
+# `--expect-shadow`, and every pod of the SETTLED Deployment was started without the entry — env from
+# a ConfigMap is resolved at container start, so each such pod reads that value. `pods/exec` is not
+# granted to the operator and is not needed: the pod's own spec says where its env comes from. With
+# `--rollout-handed-off` (the plan handed the rollout to the control plane, so it is still in flight)
+# an unsettled Deployment is accepted: the template and the ConfigMap are proved, and the pods not yet
+# replaced are counted, never claimed.
+#
 # Output contract (the ::hosting:: lines):
 #   inline_env_retired=<n>      keys removed from the pod spec — read back, not assumed
 #   inline_env_absent=<n>       retired keys no container carried any more
 #   inline_env_retire=dry-run   a rehearsal: every check ran, nothing was written
 #   inline_env_folded_generation=<n>  --fold-into-rollout met the plan's own rollout in flight at
 #                               generation <n> and wrote the removal into it
+#   inline_env_removed_despite_difference=<n>  of the keys removed, how many under the record's
+#                               declaration (the live and ConfigMap values matched the plan)
+#   inline_env_reads_configmap=<n>  --verify-reads: pods started without the entry, reading the ConfigMap
+#   inline_env_pods_pending=<n>  --verify-reads under --rollout-handed-off: pods still to be replaced
+#   inline_env_pods_terminating=<n>  --verify-reads: terminating pods, counted in neither of the above
+#   inline_env_verify=dry-run   --verify-reads in a rehearsal: nothing was removed, so nothing is read back
 
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
 # shellcheck disable=SC2034  # read by hosting::die in _common.sh, which shellcheck does not follow here
 HOSTING_CMD="hosting-inline-env-retire"
 
 namespace="" deployment="memex-portal-deployment" container="memex-portal"
-fold=false
+fold=false handed_off=false
+despite=false verify=false expect_inline="" expect_shadow="" have_expect_inline=false have_expect_shadow=false
+retire_flags=0
 keys=() shadows=()
 while [ $# -gt 0 ]; do
   # A boolean flag takes no value, so it is matched before the flag/value pair is shifted.
   if [ "$1" = "--fold-into-rollout" ]; then fold=true; shift; continue; fi
+  if [ "$1" = "--rollout-handed-off" ]; then handed_off=true; shift; continue; fi
   flag="$1" value="${2:-}"
   # Shift the value only when there is one: a trailing flag with no value must reach the
   # need_flag refusal below, not spin on a `shift 2` that cannot shift.
@@ -90,8 +130,17 @@ while [ $# -gt 0 ]; do
     --retire)
       [[ "$value" == *=* ]] \
         || hosting::die "--retire '${value}' is not KEY=<shadowed source> — the record names what every retired entry falls through to"
+      retire_flags=$((retire_flags + 1))
       keys+=("${value%%=*}")
       shadows+=("${value#*=}") ;;
+    --remove-despite-difference|--verify-reads)
+      [[ "$value" == *=* ]] \
+        || hosting::die "${flag} '${value}' is not KEY=<configmap> — the record names the ConfigMap the entry falls through to"
+      if [ "$flag" = "--verify-reads" ]; then verify=true; else despite=true; fi
+      keys+=("${value%%=*}")
+      shadows+=("${value#*=}") ;;
+    --expect-inline) expect_inline="$value" have_expect_inline=true ;;
+    --expect-shadow) expect_shadow="$value" have_expect_shadow=true ;;
     *) hosting::die "unknown argument '${flag}'" ;;
   esac
 done
@@ -102,6 +151,42 @@ hosting::safe_name deployment "$deployment"
 hosting::safe_name container "$container"
 [ "${#keys[@]}" -gt 0 ] \
   || hosting::die "missing required flag --retire — name at least one KEY=<shadowed source>: the record's inlineEnv entries that carry retiredBy"
+
+# A plain token, as the Hosting plugin's plan admits one (InstanceActionPlan.SafeToken): a declared value
+# reaches this command line, so anything else is refused rather than quoted.
+safe_value() {  # safe_value <what> <value>
+  [[ "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._@:/-]{0,252}$ ]] \
+    || hosting::die "$1 is not a plain token — a value on this command line must be letters, digits and . _ @ : / - only, starting with a letter or digit. Nothing was changed."
+}
+if $despite || $verify; then
+  if $despite && $verify; then
+    hosting::die "--remove-despite-difference and --verify-reads are separate steps: the removal, then (after its rollout) the read-back. Nothing was changed."
+  fi
+  mode_flag="--remove-despite-difference"
+  if $verify; then mode_flag="--verify-reads"; fi
+  [ "$retire_flags" -eq 0 ] \
+    || hosting::die "${mode_flag} is never combined with --retire — a removal despite a difference is its own approved step, one key per run. Nothing was changed."
+  [ "${#keys[@]}" -eq 1 ] \
+    || hosting::die "${mode_flag} names exactly one key per run — got ${#keys[@]}. Nothing was changed."
+  $have_expect_shadow \
+    || hosting::die "${mode_flag} needs --expect-shadow <value> — the ConfigMap value the record declares (inlineEnv[].shadowedValue), which the pod reads afterwards. Nothing was changed."
+  safe_value "--expect-shadow" "$expect_shadow"
+  if $despite; then
+    $have_expect_inline \
+      || hosting::die "--remove-despite-difference needs --expect-inline <value> — the inline value the record states (inlineEnv[].value), which this removal takes off the pod. Nothing was changed."
+    safe_value "--expect-inline" "$expect_inline"
+  elif $have_expect_inline; then
+    hosting::die "--verify-reads takes no --expect-inline — after the removal there is no inline value to compare. Nothing was changed."
+  fi
+  if $verify && $fold; then
+    hosting::die "--verify-reads writes nothing, so it has no rollout to fold into — pass --rollout-handed-off when the plan handed the rollout to the control plane. Nothing was changed."
+  fi
+  if $despite && $handed_off; then
+    hosting::die "--rollout-handed-off belongs to --verify-reads — a removal meets a rollout in flight only through --fold-into-rollout. Nothing was changed."
+  fi
+elif $have_expect_inline || $have_expect_shadow || $handed_off; then
+  hosting::die "--expect-inline, --expect-shadow and --rollout-handed-off belong to --remove-despite-difference / --verify-reads — a plain --retire compares the two values in the cluster and must find them EQUAL. Nothing was changed."
+fi
 
 i=0
 while [ "$i" -lt "${#keys[@]}" ]; do
@@ -146,6 +231,10 @@ if [ "$observed" -lt "$gen" ] || [ "$total" -ne "$want" ] || [ "$updated" -ne "$
 fi
 if $settled; then
   hosting::log "rollout   deployment/${deployment} is settled (generation ${gen}, ${available}/${want} available)"
+elif $verify && $handed_off; then
+  hosting::log "rollout   deployment/${deployment} is still rolling (generation ${gen}, observed ${observed}; ${updated}/${want} updated, ${available} available) — the plan handed this rollout to the control plane (--rollout-handed-off), so the template and the ConfigMap are proved here and the pods not yet replaced are counted, not claimed"
+elif $verify; then
+  hosting::die "deployment/${deployment} in ${namespace} has not settled (generation ${gen}, observed ${observed}; ${want} desired, ${updated} updated, ${available} available, ${unavailable} unavailable) — the read-back runs after the rollout the removal started, and the step before it waits for that rollout. A pod that has not been replaced may still carry the entry, so nothing can be confirmed yet."
 elif $fold; then
   hosting::log "rollout   deployment/${deployment} is mid-rollout (generation ${gen}, observed ${observed}; ${updated}/${want} updated, ${available} available) — the plan's own re-apply started it and handed it to the control plane, so this removal is FOLDED into it (--fold-into-rollout): one rollout carries both changes"
   hosting::say inline_env_folded_generation "$gen"
@@ -185,9 +274,99 @@ env_from="$(printf '%s' "$dep" | jq -r --arg c "$container" '
   elif .secretRef then ["secret", .secretRef.name, (.prefix // ""), ((.secretRef.optional // false) | tostring)]
   else empty end | join("|")')"
 
+# The LAST envFrom source of ${container} that carries $1, as kind|name|data-key — empty when none does.
+# Kubernetes keeps the last envFrom on a clash, so this is what the container reads once no inline entry
+# stands over it. A source that cannot be read is fatal unless it is optional.
+fall_through() {  # fall_through <key>
+  local key="$1" kind name prefix optional data_key obj winner=""
+  while IFS='|' read -r kind name prefix optional; do
+    [ -n "$kind" ] || continue
+    hosting::safe_name "envFrom source" "$name"
+    if [ -z "$prefix" ]; then
+      data_key="$key"
+    elif [ "${key#"$prefix"}" != "$key" ]; then
+      data_key="${key#"$prefix"}"
+    else
+      continue
+    fi
+    if ! obj="$(source_json "$kind" "$name" 2>"$err")"; then
+      [ "$optional" = "true" ] && continue
+      hosting::die "could not read ${kind}/${name}, an envFrom source of ${container} ($(tr -d '\n' < "$err")) — the fall-through cannot be measured, so nothing is concluded"
+    fi
+    if printf '%s' "$obj" | jq -e --arg k "$data_key" '(.data // {}) | has($k)' >/dev/null; then
+      winner="${kind}|${name}|${data_key}"
+    fi
+  done <<EOF_FALL
+$env_from
+EOF_FALL
+  printf '%s' "$winner"
+}
+
+# ── the read-back (--verify-reads): writes nothing, confirms what the pods read ─────────────────
+if $verify; then
+  key="${keys[0]}" shadow="${shadows[0]}"
+  if hosting::dry; then
+    hosting::log "${key}  dry run: the removal before this step wrote nothing, so there is nothing to read back"
+    hosting::say inline_env_verify dry-run
+    exit 0
+  fi
+  carriers="$(printf '%s' "$dep" | jq -r --arg k "$key" \
+    '[.spec.template.spec.containers[] | select(any(.env[]?; .name == $k)) | .name] | join(", ")')"
+  [ -z "$carriers" ] \
+    || hosting::die "${key} is still set inline on ${carriers} in deployment/${deployment}'s pod template — the removal did not hold, so the pods cannot be reading the ConfigMap value"
+  winner="$(fall_through "$key")"
+  [ -n "$winner" ] \
+    || hosting::die "${key}: no envFrom source of ${container} carries it any more — the key is now BLANK on the pod, not the declared ConfigMap value"
+  IFS='|' read -r winner_kind winner_name winner_key <<<"$winner"
+  [ "$winner_kind" = "configmap" ] && [ "$winner_name" = "$shadow" ] \
+    || hosting::die "${key}: ${container} falls through to ${winner_kind}/${winner_name}, not configmap/${shadow} — the pod reads a value the record did not declare"
+  obj="$(source_json configmap "$shadow" 2>"$err")" \
+    || hosting::die "lost configmap/${shadow} while reading ${key} back ($(tr -d '\n' < "$err"))"
+  shadow_len="$(shadow_value configmap "$obj" "$winner_key" | wc -c | tr -d ' ')"
+  shadow_sum="$(shadow_value configmap "$obj" "$winner_key" | sha256sum | cut -c1-64)"
+  expect_sum="$(printf '%s' "$expect_shadow" | sha256sum | cut -c1-64)"
+  unset obj
+  [ "$shadow_sum" = "$expect_sum" ] \
+    || hosting::die "${key}: configmap/${shadow} no longer carries the declared value (${shadow_len} bytes, expected ${#expect_shadow}) — the ConfigMap changed after the removal; the pods read what it carries now, which the record does not state"
+  hosting::log "${key}  template: no container carries it; ${container} falls through to configmap/${shadow}, which carries the declared value (len ${shadow_len})"
+
+  selector="$(printf '%s' "$dep" | jq -r '(.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")')"
+  [[ "$selector" =~ ^[A-Za-z0-9][A-Za-z0-9._/=,-]*$ ]] \
+    || hosting::die "deployment/${deployment} has no plain matchLabels selector ('${selector}') — its pods cannot be listed safely, so none is confirmed"
+  pods="$(hosting::read kubectl -n "$namespace" get pods -l "$selector" -o json 2>"$err")" \
+    || hosting::die "could not list the pods of deployment/${deployment} ($(tr -d '\n' < "$err"))"
+  # A terminating pod is not counted as clean or stale: Kubernetes takes it out of the Service's ready
+  # endpoints once deletionTimestamp is set, so it serves no new request — but it may still run the old
+  # value until its grace period ends, so it is COUNTED and named in the output, never hidden.
+  terminating="$(printf '%s' "$pods" | jq -r '[.items[] | select(.metadata.deletionTimestamp != null)] | length')"
+  clean="$(printf '%s' "$pods" | jq -r --arg k "$key" \
+    '[.items[] | select(.metadata.deletionTimestamp == null) | select(all(.spec.containers[]; all(.env[]?; .name != $k)))] | length')"
+  stale="$(printf '%s' "$pods" | jq -r --arg k "$key" \
+    '[.items[] | select(.metadata.deletionTimestamp == null) | select(any(.spec.containers[]; any(.env[]?; .name == $k))) | .metadata.name] | join(", ")')"
+  unset pods
+  pending=0
+  [ -z "$stale" ] || pending="$(printf '%s' "$stale" | tr ',' '\n' | grep -c .)"
+  if $settled; then
+    [ "$pending" -eq 0 ] \
+      || hosting::die "${key}: deployment/${deployment} is settled but pod(s) ${stale} still carry the entry inline — they read the old value"
+    [ "$clean" -gt 0 ] \
+      || hosting::die "${key}: deployment/${deployment} lists no running pod — nothing reads the value yet, so nothing is confirmed"
+    hosting::log "${key}  ${clean} pod(s) started without the entry — in each, ${container} reads configmap/${shadow} (the sidecars carry no envFrom: the removal only takes a copied entry off them)"
+  else
+    hosting::log "${key}  ${clean} pod(s) started without the entry; ${pending} still to be replaced by the rollout the control plane observes${stale:+ (${stale})}"
+  fi
+  [ "$terminating" -eq 0 ] \
+    || hosting::log "${key}  ${terminating} terminating pod(s) not counted — out of the Service's endpoints, still running until their grace period ends"
+  hosting::say inline_env_reads_configmap "$clean"
+  hosting::say inline_env_pods_pending "$pending"
+  hosting::say inline_env_pods_terminating "$terminating"
+  exit 0
+fi
+
 # ── every key is measured before anything is written ───────────────────────────────────────────
 remove=()
 absent=0
+despite_removed=0
 i=0
 while [ "$i" -lt "${#keys[@]}" ]; do
   key="${keys[$i]}" shadow="${shadows[$i]}"
@@ -234,6 +413,9 @@ EOF_SOURCES
 
     [ -n "$winner_kind" ] \
       || hosting::die "${key} is the SOLE source of its value: no envFrom source of ${container} carries it, so removing the inline entry would BLANK the key rather than fall back. Give the key a declared home first (a Key Vault class, or the record's configuration), then re-run. Nothing was changed."
+    if $despite && [ "$winner_kind" != "configmap" ]; then
+      hosting::die "${key} falls through to ${winner_kind}/${winner_name}, not a ConfigMap — a removal despite a difference applies only to the chart's ConfigMap twin, whose value the plan shows; over a ${winner_kind} it would switch the portal onto a value nobody reviewed. Nothing was changed."
+    fi
     [ "$winner_name" = "$shadow" ] \
       || hosting::die "the record says ${key} shadows '${shadow}', but ${container} would fall through to ${winner_kind}/${winner_name} — the LAST envFrom source that carries it. An equality recorded against a source the pod would not read has measured nothing: correct inlineEnv[].shadows on the record and re-run. Nothing was changed."
 
@@ -244,12 +426,28 @@ EOF_SOURCES
     inline_sum="$(inline_value "$key" | sha256sum | cut -c1-64)"
     shadow_sum="$(shadow_value "$winner_kind" "$obj" "$winner_key" | sha256sum | cut -c1-64)"
     unset obj
-    if [ "$inline_sum" != "$shadow_sum" ]; then
+    if $despite; then
+      # The record DECLARED this removal (inlineEnv[].removeDespiteDifference): the two values may
+      # differ, but each must be exactly the one the signed plan names.
+      [ "$inline_sum" = "$(printf '%s' "$expect_inline" | sha256sum | cut -c1-64)" ] \
+        || hosting::die "${key}: the live inline value (${inline_len} bytes) is not the one the plan removes (--expect-inline, ${#expect_inline} bytes) — the record's inlineEnv[].value no longer describes the pod. Re-measure and correct the record, then re-run. Nothing was changed."
+      [ "$shadow_sum" = "$(printf '%s' "$expect_shadow" | sha256sum | cut -c1-64)" ] \
+        || hosting::die "${key}: ${winner_kind}/${winner_name} carries ${shadow_len} bytes, not the value the plan says then applies (--expect-shadow, ${#expect_shadow} bytes) — the record's inlineEnv[].shadowedValue no longer describes the ConfigMap. Re-apply the record or correct it, then re-run. Nothing was changed."
+      if [ "$inline_sum" = "$shadow_sum" ]; then
+        hosting::log "${key}  EQUAL now (len ${inline_len}) — the declared difference is gone; removing it as a plain retirement"
+      else
+        hosting::log "${key}  DIFFER as DECLARED (inline ${inline_len} bytes → ${winner_kind}/${winner_name} ${shadow_len} bytes), both matching the plan — removing despite the difference"
+      fi
+      despite_removed=$((despite_removed + 1))
+    elif [ "$inline_sum" != "$shadow_sum" ]; then
       hosting::die "${key}: DIFFER (inline ${inline_len} bytes, ${winner_kind}/${winner_name} ${shadow_len} bytes) — removing the inline entry would change the value the portal reads. Promote the IN-USE value into the declared source first (never the other way round, and never mint a replacement as part of a cleanup), then re-run. Nothing was changed."
+    else
+      hosting::log "${key}  EQUAL (len ${inline_len}) — ${container} falls through to ${winner_kind}/${winner_name}"
     fi
     unset inline_sum shadow_sum
-    hosting::log "${key}  EQUAL (len ${inline_len}) — ${container} falls through to ${winner_kind}/${winner_name}"
   else
+    $despite \
+      && hosting::die "${key} is not set on ${container}, so there is no inline value to compare with the plan's — a removal despite a difference acts only on the portal container's own entry. Nothing was changed."
     hosting::log "${key}  not set on ${container} — the portal already reads its declared source"
   fi
 
@@ -261,6 +459,7 @@ if [ "${#remove[@]}" -eq 0 ]; then
   hosting::log "nothing to remove — the Deployment is not rolled"
   hosting::say inline_env_retired 0
   hosting::say inline_env_absent "$absent"
+  $despite && hosting::say inline_env_removed_despite_difference 0
   exit 0
 fi
 
@@ -286,6 +485,7 @@ hosting::do kubectl -n "$namespace" patch deployment "$deployment" --type json -
 if hosting::dry; then
   hosting::say inline_env_retired 0
   hosting::say inline_env_absent "$absent"
+  $despite && hosting::say inline_env_removed_despite_difference 0
   hosting::say inline_env_retire dry-run
   exit 0
 fi
@@ -302,3 +502,5 @@ unset after
 hosting::log "retired   ${remove[*]} from every container (read back); the rollout this started is waited for by the next step"
 hosting::say inline_env_retired "${#remove[@]}"
 hosting::say inline_env_absent "$absent"
+$despite && hosting::say inline_env_removed_despite_difference "$despite_removed"
+exit 0

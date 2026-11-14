@@ -1,0 +1,58 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "name": "memex-portal-deployment",
+    "namespace": "memex",
+    "generation": 8,
+    "resourceVersion": "5150"
+  },
+  "spec": {
+    "replicas": 2,
+    "selector": {
+      "matchLabels": {
+        "app.kubernetes.io/name": "memex-portal"
+      }
+    },
+    "template": {
+      "spec": {
+        "containers": [
+          {
+            "name": "memex-portal",
+            "image": "cr.example.invalid/memex-portal-ai:test",
+            "env": [
+              {
+                "name": "DOTNET_DbgEnableMiniDump",
+                "value": "1"
+              }
+            ],
+            "envFrom": [
+              {
+                "configMapRef": {
+                  "name": "memex-portal-config"
+                }
+              },
+              {
+                "secretRef": {
+                  "name": "memex-portal-secrets"
+                }
+              },
+              {
+                "secretRef": {
+                  "name": "memex-portal-keyvault"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "status": {
+    "observedGeneration": 7,
+    "replicas": 2,
+    "updatedReplicas": 0,
+    "readyReplicas": 2,
+    "availableReplicas": 2
+  }
+}

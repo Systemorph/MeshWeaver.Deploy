@@ -2112,6 +2112,149 @@ case "$_ie_out" in *"::hosting:: inline_env_retire=dry-run"*) ok "…and never c
 ie_no_value "…still printing no value"
 
 echo
+echo "── hosting-inline-env-retire --remove-despite-difference: a DECLARED removal onto the ConfigMap value ──"
+# The record may declare that one retired entry goes although its ConfigMap twin differs
+# (inlineEnv[].removeDespiteDifference + shadowedValue). The plan passes both values; the command
+# must find exactly those in the cluster, must fall through to a ConfigMap, and then removes the entry
+# in the same guarded patch. `--verify-reads` is the read-back after the rollout. Fixture values are
+# placeholders under git.example.invalid; the legacy one is what the pod carries inline.
+IE_RD_KEY="PluginCatalog__Sources__1__RepoPath"
+IE_RD_LEGACY="https://git.example.invalid/acme/legacy"
+IE_RD_CANON="https://git.example.invalid/acme/canonical"
+ierd() {  # ierd <scenario> <args…> — runs the command with explicit args; sets $_ie_out $_ie_rc $_ie_log $_ie_patch
+  local scenario="$1"
+  shift
+  _ie_state="$(mktemp -d)"
+  _ie_out="$(env ${IE_ENVX:-} PATH="$IE_STUBS:$PATH" HOSTING_IE_FIXTURE="$IE_FIXTURES/$scenario" HOSTING_IE_BASE="$IE_FIXTURES/base" \
+    HOSTING_IE_STATE="$_ie_state" hosting-inline-env-retire --namespace memex "$@" 2>&1)"; _ie_rc=$?
+  _ie_log="$(cat "$_ie_state/log" 2>/dev/null || true)"
+  _ie_patch="$(cat "$_ie_state/patch" 2>/dev/null || true)"
+  rm -rf "$_ie_state"
+}
+IE_RD=(--remove-despite-difference "$IE_RD_KEY=memex-portal-config" --expect-inline "$IE_RD_LEGACY" --expect-shadow "$IE_RD_CANON")
+IE_VR=(--verify-reads "$IE_RD_KEY=memex-portal-config" --expect-shadow "$IE_RD_CANON")
+
+# The argument refusals — none reaches kubectl.
+_ie_args_state="$(mktemp -d)"
+IE_ENV=(env "PATH=$IE_STUBS:$PATH" "HOSTING_IE_FIXTURE=$IE_FIXTURES/despite" "HOSTING_IE_BASE=$IE_FIXTURES/base" "HOSTING_IE_STATE=$_ie_args_state")
+refuses "despite: needs --expect-inline" "needs --expect-inline" \
+  "${IE_ENV[@]}" hosting-inline-env-retire --namespace memex --remove-despite-difference "$IE_RD_KEY=memex-portal-config" --expect-shadow "$IE_RD_CANON"
+refuses "despite: needs --expect-shadow" "needs --expect-shadow" \
+  "${IE_ENV[@]}" hosting-inline-env-retire --namespace memex --remove-despite-difference "$IE_RD_KEY=memex-portal-config" --expect-inline "$IE_RD_LEGACY"
+refuses "despite: never mixed with --retire" "never combined with --retire" \
+  "${IE_ENV[@]}" hosting-inline-env-retire --namespace memex "${IE_RD[@]}" --retire "$IE_TOKEN"
+refuses "despite: one key per run" "exactly one key" \
+  "${IE_ENV[@]}" hosting-inline-env-retire --namespace memex "${IE_RD[@]}" --remove-despite-difference "Other__Key=memex-portal-config"
+refuses "despite and the read-back are separate steps" "separate steps" \
+  "${IE_ENV[@]}" hosting-inline-env-retire --namespace memex "${IE_RD[@]}" --verify-reads "$IE_RD_KEY=memex-portal-config"
+refuses_hard "despite: a value that is not a plain token" "is not a plain token" \
+  "${IE_ENV[@]}" hosting-inline-env-retire --namespace memex --remove-despite-difference "$IE_RD_KEY=memex-portal-config" --expect-inline 'x;rm -rf /' --expect-shadow "$IE_RD_CANON"
+refuses "the expect flags never reach a plain --retire" "belong to --remove-despite-difference" \
+  "${IE_ENV[@]}" hosting-inline-env-retire --namespace memex --retire "$IE_TOKEN" --expect-shadow "$IE_RD_CANON"
+refuses "despite: --rollout-handed-off is refused on a removal (it belongs to the read-back)" "belongs to --verify-reads" \
+  "${IE_ENV[@]}" hosting-inline-env-retire --namespace memex "${IE_RD[@]}" --rollout-handed-off
+refuses "the read-back takes no --expect-inline" "takes no --expect-inline" \
+  "${IE_ENV[@]}" hosting-inline-env-retire --namespace memex "${IE_VR[@]}" --expect-inline "$IE_RD_LEGACY"
+case "$(cat "$_ie_args_state/log" 2>/dev/null)" in
+  "") ok "…and no argument refusal ever reached kubectl" ;;
+  *)  bad "no argument refusal reaches kubectl" "kubectl saw: $(cat "$_ie_args_state/log")" ;;
+esac
+rm -rf "$_ie_args_state"
+
+# NEGATIVE CONTROL: the same fixture through the ordinary --retire is refused as DIFFER — the
+# declaration is what makes the difference acceptable, nothing else.
+ie despite "$IE_RD_KEY=memex-portal-config"
+[ "$_ie_rc" -ne 0 ] && ok "control: without the declaration the same entry is refused as DIFFER" \
+  || bad "control: a plain --retire refuses the differing entry" "exited 0: ${_ie_out}"
+ie_no_patch "…and writes nothing"
+
+ierd despite "${IE_RD[@]}"
+[ "$_ie_rc" -eq 0 ] && ok "despite: a DECLARED differing entry is removed when both values match the plan" \
+  || bad "despite: the declared removal succeeds" "exited ${_ie_rc}: ${_ie_out}"
+case "$_ie_out" in *"DIFFER as DECLARED"*"configmap/memex-portal-config"*) ok "…saying the difference was declared, naming the ConfigMap" ;;
+  *) bad "despite: the verdict names the declaration" "said: ${_ie_out}" ;; esac
+case "$_ie_patch" in *"{\"op\":\"remove\",\"path\":\"/spec/template/spec/containers/0/env/1\"}"*) ok "…removing that one entry in a guarded patch" ;;
+  *) bad "despite: the entry is removed" "patch: ${_ie_patch}" ;; esac
+case "$_ie_patch" in '[{"op":"test","path":"/metadata/resourceVersion","value":"5150"}'*) ok "…guarded on the measured resourceVersion" ;;
+  *) bad "despite: the patch is guarded" "patch: ${_ie_patch}" ;; esac
+case "$_ie_out" in *"::hosting:: inline_env_retired=1"*"::hosting:: inline_env_removed_despite_difference=1"*) ok "…and reports it, after the read-back" ;;
+  *) bad "despite: the counts are reported" "said: ${_ie_out}" ;; esac
+case "$_ie_out" in *"$IE_RD_LEGACY"*|*"$IE_RD_CANON"*) bad "despite: no value is printed" "said: ${_ie_out}" ;;
+  *) ok "…printing lengths, never a value" ;; esac
+
+ierd despite --remove-despite-difference "$IE_RD_KEY=memex-portal-config" --expect-inline "https://git.example.invalid/acme/elsewhere" --expect-shadow "$IE_RD_CANON"
+[ "$_ie_rc" -ne 0 ] && ok "despite: a live inline value other than the plan's is refused" \
+  || bad "despite: an inline mismatch is refused" "exited 0: ${_ie_out}"
+case "$_ie_out" in *"not the one the plan removes"*) ok "…saying so" ;; *) bad "despite: the inline mismatch says so" "said: ${_ie_out}" ;; esac
+ie_no_patch "…and writes nothing"
+
+ierd despite --remove-despite-difference "$IE_RD_KEY=memex-portal-config" --expect-inline "$IE_RD_LEGACY" --expect-shadow "https://git.example.invalid/acme/elsewhere"
+[ "$_ie_rc" -ne 0 ] && ok "despite: a ConfigMap value other than the plan's is refused" \
+  || bad "despite: a ConfigMap mismatch is refused" "exited 0: ${_ie_out}"
+case "$_ie_out" in *"not the value the plan says then applies"*) ok "…saying so" ;; *) bad "despite: the ConfigMap mismatch says so" "said: ${_ie_out}" ;; esac
+ie_no_patch "…and writes nothing"
+
+ierd despite-no-twin "${IE_RD[@]}"
+[ "$_ie_rc" -ne 0 ] && ok "despite: an entry whose ConfigMap twin is ABSENT is refused — removing it would drop the value" \
+  || bad "despite: a missing twin is refused" "exited 0: ${_ie_out}"
+case "$_ie_out" in *"SOLE source"*) ok "…as the sole source of its key" ;; *) bad "despite: the missing twin is named" "said: ${_ie_out}" ;; esac
+ie_no_patch "…and writes nothing"
+
+ierd base --remove-despite-difference "$IE_TOKEN" --expect-inline "fake-inline-registry-token-0001" --expect-shadow "fake-rotated-registry-token-0001"
+[ "$_ie_rc" -ne 0 ] && ok "despite: an entry that falls through to a SECRET is refused — only a ConfigMap twin qualifies" \
+  || bad "despite: a Secret twin is refused" "exited 0: ${_ie_out}"
+case "$_ie_out" in *"not a ConfigMap"*) ok "…saying so" ;; *) bad "despite: the Secret refusal says so" "said: ${_ie_out}" ;; esac
+ie_no_patch "…and writes nothing"
+
+ierd rolling --remove-despite-difference "$IE_TOKEN" --expect-inline "x" --expect-shadow "y"
+[ "$_ie_rc" -ne 0 ] && ok "despite: still refused mid-rollout (no --fold-into-rollout)" \
+  || bad "despite: a mid-rollout Deployment is refused" "exited 0: ${_ie_out}"
+ie_no_patch "…and writes nothing"
+
+IE_ENVX=HOSTING_DRY_RUN=true ierd despite "${IE_RD[@]}"
+[ "$_ie_rc" -eq 0 ] && ok "despite: a dry run measures and succeeds" || bad "despite: a dry run succeeds" "exited ${_ie_rc}: ${_ie_out}"
+ie_no_patch "…writing nothing"
+case "$_ie_out" in *"::hosting:: inline_env_removed_despite_difference=0"*"::hosting:: inline_env_retire=dry-run"*) ok "…and claims no removal" ;;
+  *) bad "despite: a dry run claims no removal" "said: ${_ie_out}" ;; esac
+
+# The read-back.
+ierd despite-after "${IE_VR[@]}"
+[ "$_ie_rc" -eq 0 ] && ok "read-back: a settled Deployment whose pods all started without the entry reads the ConfigMap" \
+  || bad "read-back: the settled clean case passes" "exited ${_ie_rc}: ${_ie_out}"
+case "$_ie_out" in *"::hosting:: inline_env_reads_configmap=2"*"::hosting:: inline_env_pods_pending=0"*"::hosting:: inline_env_pods_terminating=1"*) ok "…counting the two live pods, and the terminating one apart, never hidden" ;;
+  *) bad "read-back: the counts are reported" "said: ${_ie_out}" ;; esac
+ie_no_patch "…and writes nothing"
+
+ierd despite-stale-pod "${IE_VR[@]}"
+[ "$_ie_rc" -ne 0 ] && ok "read-back: a live pod that still carries the entry fails the read-back" \
+  || bad "read-back: a stale pod fails" "exited 0: ${_ie_out}"
+case "$_ie_out" in *"memex-portal-old"*) ok "…naming the pod" ;; *) bad "read-back: the stale pod is named" "said: ${_ie_out}" ;; esac
+
+ierd despite-template-kept "${IE_VR[@]}"
+[ "$_ie_rc" -ne 0 ] && ok "read-back: a template that still carries the entry fails" \
+  || bad "read-back: a kept template entry fails" "exited 0: ${_ie_out}"
+
+ierd despite-cm-moved "${IE_VR[@]}"
+[ "$_ie_rc" -ne 0 ] && ok "read-back: a ConfigMap that no longer carries the declared value fails" \
+  || bad "read-back: a moved ConfigMap fails" "exited 0: ${_ie_out}"
+
+ierd despite-rolling "${IE_VR[@]}"
+[ "$_ie_rc" -ne 0 ] && ok "read-back: an unsettled Deployment fails when the plan waited for the rollout" \
+  || bad "read-back: an unsettled Deployment fails without the hand-off" "exited 0: ${_ie_out}"
+
+ierd despite-rolling "${IE_VR[@]}" --rollout-handed-off
+[ "$_ie_rc" -eq 0 ] && ok "read-back: under a hand-off the template and ConfigMap are proved, the rest counted" \
+  || bad "read-back: a handed-off rollout is accepted" "exited ${_ie_rc}: ${_ie_out}"
+case "$_ie_out" in *"::hosting:: inline_env_reads_configmap=1"*"::hosting:: inline_env_pods_pending=1"*) ok "…counting the pod still to be replaced, never claiming it" ;;
+  *) bad "read-back: the pending pod is counted" "said: ${_ie_out}" ;; esac
+
+IE_ENVX=HOSTING_DRY_RUN=true ierd despite "${IE_VR[@]}"
+[ "$_ie_rc" -eq 0 ] && ok "read-back: in a dry run there is nothing to read back" || bad "read-back: a dry run passes" "exited ${_ie_rc}: ${_ie_out}"
+case "$_ie_out" in *"::hosting:: inline_env_verify=dry-run"*) ok "…and it says so" ;;
+  *) bad "read-back: the dry run says so" "said: ${_ie_out}" ;; esac
+unset IE_ENVX
+
+echo
 echo "── hosting-volume-retire: a retired LIVE-ONLY volume leaves, once nothing renders it or reads its path ──"
 # The volume twin of hosting-inline-env-retire (memex stuck rolls, 2026-11-10: a live-only Secret volume
 # `hosting-jobrunner-token` that every roll copied forward after its Secret was deleted). The stub answers the

@@ -1,0 +1,128 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "metadata": {
+        "name": "memex-portal-a",
+        "labels": {
+          "app.kubernetes.io/name": "memex-portal"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "memex-portal",
+            "image": "cr.example.invalid/memex-portal-ai:test",
+            "env": [
+              {
+                "name": "DOTNET_DbgEnableMiniDump",
+                "value": "1"
+              }
+            ],
+            "envFrom": [
+              {
+                "configMapRef": {
+                  "name": "memex-portal-config"
+                }
+              },
+              {
+                "secretRef": {
+                  "name": "memex-portal-secrets"
+                }
+              },
+              {
+                "secretRef": {
+                  "name": "memex-portal-keyvault"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "metadata": {
+        "name": "memex-portal-b",
+        "labels": {
+          "app.kubernetes.io/name": "memex-portal"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "memex-portal",
+            "image": "cr.example.invalid/memex-portal-ai:test",
+            "env": [
+              {
+                "name": "DOTNET_DbgEnableMiniDump",
+                "value": "1"
+              }
+            ],
+            "envFrom": [
+              {
+                "configMapRef": {
+                  "name": "memex-portal-config"
+                }
+              },
+              {
+                "secretRef": {
+                  "name": "memex-portal-secrets"
+                }
+              },
+              {
+                "secretRef": {
+                  "name": "memex-portal-keyvault"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "metadata": {
+        "name": "memex-portal-old",
+        "labels": {
+          "app.kubernetes.io/name": "memex-portal"
+        },
+        "deletionTimestamp": "2026-11-14T10:00:00Z"
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "memex-portal",
+            "image": "cr.example.invalid/memex-portal-ai:test",
+            "env": [
+              {
+                "name": "DOTNET_DbgEnableMiniDump",
+                "value": "1"
+              },
+              {
+                "name": "PluginCatalog__Sources__1__RepoPath",
+                "value": "https://git.example.invalid/acme/legacy"
+              }
+            ],
+            "envFrom": [
+              {
+                "configMapRef": {
+                  "name": "memex-portal-config"
+                }
+              },
+              {
+                "secretRef": {
+                  "name": "memex-portal-secrets"
+                }
+              },
+              {
+                "secretRef": {
+                  "name": "memex-portal-keyvault"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
