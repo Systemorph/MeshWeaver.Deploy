@@ -2128,13 +2128,42 @@ fleet_accept_argv() {
   else FLEET_ACCEPT_ARGV+=(--no-accept-tokens); fi
 }
 
-# The v2 request (MachineEnrolment.Parse): the v1 facts, the owner and both answers, base64url.
+# A hardware fact as the control instance admits it (MacHardware.Text): letters, digits, space and , . ( ) + -, at most 40.
+fleet_hw_fact() { printf '%s' "$1" | LC_ALL=C tr -cd 'A-Za-z0-9 ,.()+-' | cut -c1-40; }
+
+# The Mac's hardware as the v2 request's "hw" object (MacHardware.OfWire on the control instance): model name, model
+# identifier, chip, CPU and GPU cores, memory in GB. Control derives the record's hardware class from it (Mac mini M5 Pro
+# vs Mac Studio M5 Max), the price-list class and the self-hosting plan — a Mac mini is never registered as a Studio.
+# Read-only; a value it cannot read is left out (control then says "Mac host" rather than guess). FLEET_HW_* override
+# each fact (tests).
+fleet_hw_json() {
+  local model id chip cpu gpu mem out=""
+  model="${FLEET_HW_MODEL-$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Model Name/ { print $2; exit }')}"
+  id="${FLEET_HW_ID-$(sysctl -n hw.model 2>/dev/null)}"
+  chip="${FLEET_HW_CHIP-$(sysctl -n machdep.cpu.brand_string 2>/dev/null)}"
+  cpu="${FLEET_HW_CPU-$(sysctl -n hw.ncpu 2>/dev/null)}"
+  gpu="${FLEET_HW_GPU-$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Total Number of Cores/ { print $2; exit }')}"
+  mem="${FLEET_HW_MEM_BYTES-$(sysctl -n hw.memsize 2>/dev/null)}"
+  model="$(fleet_hw_fact "$model")"; id="$(fleet_hw_fact "$id")"; chip="$(fleet_hw_fact "$chip")"
+  case "$cpu" in ''|*[!0-9]*) cpu="" ;; esac
+  case "$gpu" in ''|*[!0-9]*) gpu="" ;; esac
+  case "$mem" in ''|*[!0-9]*) mem="" ;; *) mem=$(( mem / 1073741824 )) ;; esac
+  [ -z "$model" ] || out="$out,\"model\":\"$model\""
+  [ -z "$id" ] || out="$out,\"id\":\"$id\""
+  [ -z "$chip" ] || out="$out,\"chip\":\"$chip\""
+  [ -z "$cpu" ] || out="$out,\"cpu\":$cpu"
+  [ -z "$gpu" ] || out="$out,\"gpu\":$gpu"
+  [ -z "$mem" ] || [ "$mem" = 0 ] || out="$out,\"memGb\":$mem"
+  printf '{%s}' "${out#,}"
+}
+
+# The v2 request (MachineEnrolment.Parse): the v1 facts, the owner, both answers and the hardware, base64url.
 fleet_request_v2() {
   local id="$1" host="$2" user="$3" machine="$4" spki="$5" owner_id="$6" owner_email="$7"
-  printf '{"v":2,"deployment":"%s","host":"%s","user":"%s","machine":"%s","key":"%s","owner":{"id":"%s","email":"%s"},"jobs":{"on":%s,"from":%s,"channels":%s,"repos":%s},"tokens":{"on":%s,"from":%s,"models":%s,"residency":"%s"}}' \
+  printf '{"v":2,"deployment":"%s","host":"%s","user":"%s","machine":"%s","key":"%s","owner":{"id":"%s","email":"%s"},"jobs":{"on":%s,"from":%s,"channels":%s,"repos":%s},"tokens":{"on":%s,"from":%s,"models":%s,"residency":"%s"},"hw":%s}' \
     "$id" "$host" "$user" "$machine" "$spki" "$owner_id" "$owner_email" \
     "$ACC_JOBS_ENABLED" "$(fleet_json_list "$ACC_JOBS_FROM")" "$(fleet_json_list "$ACC_JOBS_CHANNELS")" "$(fleet_json_list "$ACC_JOBS_REPOS")" \
-    "$ACC_TOK_ENABLED" "$(fleet_json_list "$ACC_TOK_FROM")" "$(fleet_json_list "$ACC_TOK_MODELS")" "$ACC_TOK_RES" | fleet_b64url
+    "$ACC_TOK_ENABLED" "$(fleet_json_list "$ACC_TOK_FROM")" "$(fleet_json_list "$ACC_TOK_MODELS")" "$ACC_TOK_RES" "$(fleet_hw_json)" | fleet_b64url
 }
 
 # The poll's key name: the full lower-hex SHA-256 of the public key's DER.

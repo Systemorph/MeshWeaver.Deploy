@@ -1761,10 +1761,15 @@ grep -q 'mode_args+=(-f "$FLEET_FILE")' "$CLI" && ok "helm_deploy layers the fle
 
 echo "── fleet join v2: both answers up front, the signed poll, the itemised code (enrolment v2) ──"
 # The v2 request: owner and both answers, base64url of the JSON MachineEnrolment.Parse reads.
-req="$(fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="control.example.test"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=false; ACC_TOK_RES=CH; fleet_request_v2 studio-5 host-a jroe C02X AAAA jroe jane.roe@example.com')"
+req="$(fj_lib 'FLEET_HW_MODEL="Mac mini"; FLEET_HW_ID="Mac17,16"; FLEET_HW_CHIP="Apple M5 Pro"; FLEET_HW_CPU=18; FLEET_HW_GPU=20; FLEET_HW_MEM_BYTES=68719476736; ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="control.example.test"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=false; ACC_TOK_RES=CH; fleet_request_v2 studio-5 host-a jroe C02X AAAA jroe jane.roe@example.com')"
 dec="$(printf '%s' "$req" | tr '_-' '/+' | awk '{ n = length($0) % 4; if (n) $0 = $0 substr("===", 1, 4 - n); print }' | base64 -d 2>/dev/null)"
-[ "$dec" = '{"v":2,"deployment":"studio-5","host":"host-a","user":"jroe","machine":"C02X","key":"AAAA","owner":{"id":"jroe","email":"jane.roe@example.com"},"jobs":{"on":true,"from":["control.example.test"],"channels":["mac"],"repos":[]},"tokens":{"on":false,"from":[],"models":[],"residency":"CH"}}' ] \
-  && ok "fleet_request_v2 carries the owner and both explicit answers" || bad "fleet_request_v2" "$dec"
+[ "$dec" = '{"v":2,"deployment":"studio-5","host":"host-a","user":"jroe","machine":"C02X","key":"AAAA","owner":{"id":"jroe","email":"jane.roe@example.com"},"jobs":{"on":true,"from":["control.example.test"],"channels":["mac"],"repos":[]},"tokens":{"on":false,"from":[],"models":[],"residency":"CH"},"hw":{"model":"Mac mini","id":"Mac17,16","chip":"Apple M5 Pro","cpu":18,"gpu":20,"memGb":64}}' ] \
+  && ok "fleet_request_v2 carries the owner, both explicit answers and the hardware" || bad "fleet_request_v2" "$dec"
+# The hardware: a fact it cannot read is LEFT OUT (control then says "Mac host", never a guess); a crafted one is filtered.
+HW="$(fj_lib 'FLEET_HW_MODEL="Mac Studio"; FLEET_HW_ID=""; FLEET_HW_CHIP="Apple M5 Max<script>"; FLEET_HW_CPU="18x"; FLEET_HW_GPU=""; FLEET_HW_MEM_BYTES=137438953472; fleet_hw_json')"
+[ "$HW" = '{"model":"Mac Studio","chip":"Apple M5 Maxscript","memGb":128}' ] && ok "fleet_hw_json leaves out what it cannot read and filters what it admits" || bad "fleet_hw_json partial" "$HW"
+HW="$(fj_lib 'FLEET_HW_MODEL=""; FLEET_HW_ID=""; FLEET_HW_CHIP=""; FLEET_HW_CPU=""; FLEET_HW_GPU=""; FLEET_HW_MEM_BYTES=""; fleet_hw_json')"
+[ "$HW" = '{}' ] && ok "fleet_hw_json with nothing readable is an empty object" || bad "fleet_hw_json empty" "$HW"
 # Managed preferences answer the two questions (an Intune profile): a plist array or a comma string.
 PREFS="$(fj_lib 'managed_pref() { case "$1" in AcceptJobs) echo 1 ;; AcceptJobsFrom) printf "(\n    \"control.example.test\",\n    \"*.example.test\"\n)" ;; AcceptTokens) echo false ;; esac; }; fleet_participation_from_prefs; echo "$ACC_JOBS_ANSWERED $ACC_JOBS_ENABLED [$ACC_JOBS_FROM] $ACC_TOK_ANSWERED $ACC_TOK_ENABLED"')"
 [ "$PREFS" = 'yes true [control.example.test *.example.test] yes false' ] && ok "the Intune profile's AcceptJobs/AcceptJobsFrom/AcceptTokens answer both questions" || bad "participation from managed prefs" "$PREFS"
