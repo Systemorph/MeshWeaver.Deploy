@@ -37,9 +37,9 @@ permissions:
 
 jobs:
   request:
-    uses: Systemorph/MeshWeaver/.github/workflows/node-repo-request-review.yml@main3
+    uses: Systemorph/MeshWeaver/.github/workflows/node-repo-request-review.yml@main
     permissions:
       contents: read
       pull-requests: write
     with:
-      scripts-ref: main3
+      scripts-ref: main

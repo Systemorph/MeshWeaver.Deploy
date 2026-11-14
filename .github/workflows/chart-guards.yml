@@ -42,7 +42,7 @@ env:
   # Which platform the guards compile against — DECLARED, never defaulted at the point of use
   # (MeshWeaver#3259). The chart is deployed against the platform's tip, so the guards track it.
   # The repo VARIABLE MW_PLATFORM_REF wins over it.
-  MW_CHART_GUARDS_PLATFORM_REF: main3
+  MW_CHART_GUARDS_PLATFORM_REF: main
   # Which MeshWeaver.Plugins the guards read the portal hosts' service defaults from — declared the
   # same way; the repo VARIABLE MW_PLUGINS_REF wins over it.
   MW_CHART_GUARDS_PLUGINS_REF: main

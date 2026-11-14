@@ -73,7 +73,7 @@ env:
   # at the point of use (MeshWeaver#3259). The publisher (`.github/scripts/push-bundle-publication.sh`)
   # is what main-cd.yml and every satellite's bake lane run against the fleet registry TODAY, i.e.
   # core's tip, so the harness tracks the tip. The repo VARIABLE MW_PLATFORM_REF wins over it.
-  MW_CHART_GATE_PLATFORM_REF: main3
+  MW_CHART_GATE_PLATFORM_REF: main
 
 # One live run per ref: a newer push to the same PR branch cancels the run it supersedes; main and
 # the merge queue never cancel (each main push is its own group, keyed on the commit).
