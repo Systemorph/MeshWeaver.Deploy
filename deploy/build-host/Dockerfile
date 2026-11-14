@@ -2,8 +2,9 @@
 #
 # What a stage needs and nothing it does not: bash, python3, git, jq (the workflow steps core's tests
 # execute call it, as the GitHub-hosted runner they were written for ships it), bubblewrap (every stage runs in a
-# `bwrap` sandbox — the host refuses to start without it), the .NET 10 SDK (the src/ half still
-# builds with it), PostgreSQL 17 with pgvector and a PREPARED test cluster built at image build
+# `bwrap` sandbox — the host refuses to start without it), the .NET 10 AND .NET 11 SDKs side by side, one
+# root each (/opt/dotnet/10, /opt/dotnet/11: a v3 set builds with 10, a v4 set with 11 — build-run.py
+# DOTNET_LINES, policy major-lines-run-separately), PostgreSQL 17 with pgvector and a PREPARED test cluster built at image build
 # (host-postgres.sh: UTF8, a pgvector template every suite database is cloned from — a stage starts a
 # copy of it inside its own sandbox; sandbox-postgres.sh still initialises a bare one on demand), core's
 # SOURCE at the set's commit and this repository's portal chart (the portal-host lane's test-support
@@ -29,7 +30,17 @@
 #     --build-arg PLATFORM_COMMIT=<platform sha> deploy/build-host
 # Handed to the hosts BY DIGEST with the rest of the set (`BuildHostChannel.RunnerDigest`). No moving
 # tag names it anywhere.
+#
+# 🧰 TWO SDKs, TWO ROOTS. The .NET 10 SDK is copied whole from its own SDK image into /opt/dotnet/10; the
+# .NET 11 SDK is the base image's /usr/share/dotnet, linked as /opt/dotnet/11. Each root carries ONE SDK
+# major, so the muxer in a root can only pick that line's SDK — the host puts its set's root first on
+# PATH and as DOTNET_ROOT (build-run.py select_platform_dotnet), never a global.json. Both bases float
+# on their band exactly as the single base did; the SDKs they carry are part of every tree's build
+# identity (build-run.py build_toolchain), so a moved base rebuilds rather than mixing compilers.
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS sdk10
+
 FROM mcr.microsoft.com/dotnet/sdk:11.0 AS sources
+COPY --from=sdk10 /usr/share/dotnet/ /opt/dotnet/10/
 
 # 40-hex commits only: a branch or tag would let one version's image be rebuilt from other bytes.
 ARG DEPLOY_COMMIT
@@ -59,7 +70,14 @@ RUN set -eu \
  && printf '%s\n' "$DEPLOY_COMMIT" > /out/deploy-src/.source-commit \
  && test -f /out/deploy-src/deploy/helm/Chart.yaml \
  && cd /src/platform \
- && dotnet publish src/MeshWeaver.Plugin.Build/MeshWeaver.Plugin.Build.csproj -c Release -o /out/plugin-build -nologo \
+ && major="$(sed -n 's/.*<PlatformVersion[^>]*>\([0-9][0-9]*\)\..*/\1/p' Directory.Build.props | head -n 1)" \
+ && case "$major" in \
+      3) dn=/opt/dotnet/10/dotnet ;; \
+      4) dn=/usr/share/dotnet/dotnet ;; \
+      *) echo "the platform at $PLATFORM_COMMIT declares platform major '$major' (Directory.Build.props <PlatformVersion>) — this image carries SDK 10 for 3.x and SDK 11 for 4.x only (build-run.py DOTNET_LINES)"; exit 1 ;; \
+    esac \
+ && echo "platform major $major: MeshWeaver.Plugin.Build is published with $("$dn" --version)" \
+ && "$dn" publish src/MeshWeaver.Plugin.Build/MeshWeaver.Plugin.Build.csproj -c Release -o /out/plugin-build -nologo \
  && test -f /out/plugin-build/MeshWeaver.Plugin.Build.dll \
  && test -d /out/platform-src/src && test -d /out/platform-src/tools
 
@@ -91,6 +109,13 @@ RUN set -eu; \
     [ -s /out/browser/chromium-fonts.list ] || { echo ".github/chromium-fonts.list at $PLATFORM_COMMIT names no package"; exit 1; }
 
 FROM mcr.microsoft.com/dotnet/sdk:11.0
+
+# The second line's SDK (see the header): .NET 10 in its own root, .NET 11 the base's own root under the
+# same parent. `--check-dotnet-roots` below fails the BUILD when either root is missing or carries the
+# other major's SDK too.
+COPY --from=sdk10 /usr/share/dotnet/ /opt/dotnet/10/
+RUN ln -s /usr/share/dotnet /opt/dotnet/11 \
+ && /opt/dotnet/10/dotnet --list-sdks && /opt/dotnet/11/dotnet --list-sdks
 
 # PostgreSQL 17 with pgvector from the PostgreSQL project's own apt repository — the SAME major and
 # extension line the CI runners' shared server and the developer container run (pgvector/pgvector:pg17);
@@ -181,6 +206,7 @@ COPY --from=sources /out/platform-src/ /opt/build-host/platform-src/
 COPY --from=sources /out/deploy-src/ /opt/build-host/deploy-src/
 RUN chmod 0555 /opt/build-host/*.py /opt/build-host/*.sh \
  && test -f /opt/build-host/plugin-build/MeshWeaver.Plugin.Build.dll \
+ && python3 /opt/build-host/build-run.py --check-dotnet-roots \
  && python3 /opt/build-host/module-build-key.py --self-test \
  && python3 /opt/build-host/compile-check.py --help > /dev/null \
  && bash /opt/build-host/sandbox-postgres.sh --self-test
