@@ -70,13 +70,16 @@ RUN set -eu \
  && printf '%s\n' "$DEPLOY_COMMIT" > /out/deploy-src/.source-commit \
  && test -f /out/deploy-src/deploy/helm/Chart.yaml \
  && cd /src/platform \
- && major="$(sed -n 's/.*<PlatformVersion[^>]*>\([0-9][0-9]*\)\..*/\1/p' Directory.Build.props | head -n 1)" \
+ && { pv="$(/usr/share/dotnet/dotnet msbuild src/MeshWeaver.Plugin.Build/MeshWeaver.Plugin.Build.csproj -getProperty:PlatformVersion -nologo 2>&1)" \
+      || { echo "the platform at $PLATFORM_COMMIT: evaluating MeshWeaver.Plugin.Build's PlatformVersion failed — $pv"; exit 1; }; } \
+ && pv="$(printf '%s\n' "$pv" | tail -n 1 | tr -d '[:space:]')" \
+ && major="$(printf '%s' "$pv" | sed -n 's/^\([0-9][0-9]*\)\.[0-9][0-9]*\.[0-9][0-9]*.*$/\1/p')" \
  && case "$major" in \
       3) dn=/opt/dotnet/10/dotnet ;; \
       4) dn=/usr/share/dotnet/dotnet ;; \
-      *) echo "the platform at $PLATFORM_COMMIT declares platform major '$major' (Directory.Build.props <PlatformVersion>) — this image carries SDK 10 for 3.x and SDK 11 for 4.x only (build-run.py DOTNET_LINES)"; exit 1 ;; \
+      *) echo "the platform at $PLATFORM_COMMIT evaluates PlatformVersion to '$pv' (major '$major') for MeshWeaver.Plugin.Build — this image carries SDK 10 for 3.x and SDK 11 for 4.x only (build-run.py DOTNET_LINES); an empty or unparsable value is refused, never guessed"; exit 1 ;; \
     esac \
- && echo "platform major $major: MeshWeaver.Plugin.Build is published with $("$dn" --version)" \
+ && echo "platform $pv (major $major): MeshWeaver.Plugin.Build is published with $("$dn" --version)" \
  && "$dn" publish src/MeshWeaver.Plugin.Build/MeshWeaver.Plugin.Build.csproj -c Release -o /out/plugin-build -nologo \
  && test -f /out/plugin-build/MeshWeaver.Plugin.Build.dll \
  && test -d /out/platform-src/src && test -d /out/platform-src/tools
@@ -114,7 +117,12 @@ FROM mcr.microsoft.com/dotnet/sdk:11.0
 # same parent. `--check-dotnet-roots` below fails the BUILD when either root is missing or carries the
 # other major's SDK too.
 COPY --from=sdk10 /usr/share/dotnet/ /opt/dotnet/10/
+# The base image's /usr/bin/dotnet link is REMOVED: it would expose the 11 SDK on every PATH, so a v3 host
+# could reach it by ordering alone — the runner refuses a PATH entry that exposes a dotnet outside its
+# line's root (select_platform_dotnet). A dotnet is reached only through the root the host selected.
 RUN ln -s /usr/share/dotnet /opt/dotnet/11 \
+ && rm /usr/bin/dotnet \
+ && if command -v dotnet; then echo "a dotnet is still on PATH outside the line roots"; exit 1; fi \
  && /opt/dotnet/10/dotnet --list-sdks && /opt/dotnet/11/dotnet --list-sdks
 
 # PostgreSQL 17 with pgvector from the PostgreSQL project's own apt repository — the SAME major and
@@ -145,7 +153,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && test -f "/usr/share/postgresql/${PG_MAJOR}/extension/vector.control" \
  && install -d -o 1654 -g 1654 -m 0700 /opt/build-host/pg-snapshot \
- && bwrap --version && python3 --version && git --version && jq --version && dotnet --version \
+ && bwrap --version && python3 --version && git --version && jq --version && /opt/dotnet/10/dotnet --version && /opt/dotnet/11/dotnet --version \
  && find /usr/lib/postgresql -maxdepth 3 -name initdb | grep -q initdb
 
 # The headless BROWSER and its FONT SET, as the portal image installs them (portal-ai's Dockerfile):

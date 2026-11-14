@@ -4261,19 +4261,36 @@ def dotnet_root_refusal(sdk: str, root: str) -> Optional[str]:
 
 def select_platform_dotnet(env: dict, lines: Optional[dict] = None) -> dict:
     """`env` with the dotnet root of its set's line FIRST on PATH, as DOTNET_ROOT, and named in MW_BUILD_DOTNET_SDK — the
-    environment the host, its own tools and (through ENV_ALLOW) every stage run with. Every root of the table is removed from
-    PATH first, so a re-exec (enter_run_namespace) applies it again to the same result. Refusal, naming why, on a version
-    whose line has no SDK or a root that is not that SDK's alone. Unset MW_BUILD_PLATFORM_VERSION is left to `preflight`."""
+    environment the host, its own tools and (through ENV_ALLOW) every stage run with.
+
+    The other line's SDK is UNREACHABLE, not merely shadowed by ordering, and every comparison is by RESOLVED path (a root
+    may be a symlink — /opt/dotnet/11 is the base image's /usr/share/dotnet): a PATH entry that IS a dotnet root under any
+    name is dropped (so a re-exec, enter_run_namespace, applies it again to the same result), and a PATH entry that only
+    EXPOSES a `dotnet` resolving anywhere but the line's root (the base image's /usr/bin/dotnet symlink) is REFUSED — that
+    directory carries other tools, so it cannot be dropped, and the image must not ship the link. Refusal, naming why, on a
+    version whose line has no SDK or a root that is not that SDK's alone. Unset MW_BUILD_PLATFORM_VERSION is left to
+    `preflight`, and a leftover MW_BUILD_DOTNET_SDK is dropped so no stage reads a major nobody selected."""
     lines = DOTNET_LINES if lines is None else lines
     version = (env.get("MW_BUILD_PLATFORM_VERSION") or "").strip()
     if not version:
-        return env
+        return {k: v for k, v in env.items() if k != DOTNET_SDK_ENV}
     sdk, root = platform_dotnet(version, lines)
     why = dotnet_root_refusal(sdk, root)
     if why:
         raise Refusal(f"the set {version} needs the .NET {sdk} SDK: {why}")
-    roots = {os.path.normpath(r) for _s, r in lines.values()}
-    rest = [p for p in (env.get("PATH") or "").split(os.pathsep) if p and os.path.normpath(p) not in roots]
+    real = os.path.realpath
+    line_root = real(root)
+    roots = {real(r) for _s, r in lines.values()}
+    rest = []
+    for p in (env.get("PATH") or "").split(os.pathsep):
+        if not p or real(p) in roots:
+            continue
+        exe = os.path.join(p, "dotnet")
+        if os.path.lexists(exe) and os.path.dirname(real(exe)) != line_root:
+            raise Refusal(f"the set {version} needs the .NET {sdk} SDK alone, but PATH entry {p} exposes {exe} → {real(exe)}, "
+                          f"a dotnet outside the line's root {root} ({line_root}) — the other line's SDK would stay reachable; "
+                          f"the runner image must not ship that dotnet")
+        rest.append(p)
     return dict(env, PATH=os.pathsep.join([root] + rest), DOTNET_ROOT=root, **{DOTNET_SDK_ENV: sdk})
 
 
@@ -7781,7 +7798,7 @@ def main(argv: list[str]) -> int:
         env = select_platform_dotnet(env)
         # and for what the host starts without an explicit environment (a subprocess inherits os.environ)
         os.environ.update({k: env[k] for k in ("PATH", "DOTNET_ROOT", DOTNET_SDK_ENV) if env.get(k)})
-        if env.get(DOTNET_SDK_ENV):
+        if (env.get("MW_BUILD_PLATFORM_VERSION") or "").strip():
             print(f"build-run: platform {env['MW_BUILD_PLATFORM_VERSION']} → .NET SDK {env[DOTNET_SDK_ENV]} ({env['DOTNET_ROOT']})", flush=True)
         host = Host(env, Api(env.get("BUILD_API", ""), read_worker_token(env)))
         if a.host:
@@ -7919,17 +7936,23 @@ def self_test() -> int:
             return r_
         r10, r11 = fake_root("d10", "10.0.100"), fake_root("d11", "11.0.100")
         lines_ = {"3": ("10", r10), "4": ("11", r11)}
-        base_ = {"PATH": "/usr/bin:/bin", "MW_BUILD_PLATFORM_VERSION": "3.1.12258"}
+        # the machine's own /usr/bin may carry a dotnet (a GitHub runner's does): the cases build their own tool dirs
+        ub, bn = os.path.join(dn_tmp, "usr-bin"), os.path.join(dn_tmp, "bin")
+        os.makedirs(ub)
+        os.makedirs(bn)
+        open(os.path.join(ub, "python3"), "w").close()
+        tools_ = f"{ub}:{bn}"
+        base_ = {"PATH": tools_, "MW_BUILD_PLATFORM_VERSION": "3.1.12258"}
         e3 = select_platform_dotnet(base_, lines_)
         check("dotnet/v3: the 10 root FIRST on PATH, as DOTNET_ROOT, named in MW_BUILD_DOTNET_SDK",
-              e3["PATH"] == f"{r10}:/usr/bin:/bin" and e3["DOTNET_ROOT"] == r10 and e3[DOTNET_SDK_ENV] == "10", e3)
+              e3["PATH"] == f"{r10}:{tools_}" and e3["DOTNET_ROOT"] == r10 and e3[DOTNET_SDK_ENV] == "10", e3)
         e4 = select_platform_dotnet(dict(base_, MW_BUILD_PLATFORM_VERSION="4.0.0"), lines_)
         check("dotnet/v4: the 11 root FIRST on PATH, as DOTNET_ROOT, named in MW_BUILD_DOTNET_SDK",
-              e4["PATH"] == f"{r11}:/usr/bin:/bin" and e4["DOTNET_ROOT"] == r11 and e4[DOTNET_SDK_ENV] == "11", e4)
-        check("dotnet/the input environment is not mutated", base_ == {"PATH": "/usr/bin:/bin", "MW_BUILD_PLATFORM_VERSION": "3.1.12258"}, base_)
+              e4["PATH"] == f"{r11}:{tools_}" and e4["DOTNET_ROOT"] == r11 and e4[DOTNET_SDK_ENV] == "11", e4)
+        check("dotnet/the input environment is not mutated", base_ == {"PATH": tools_, "MW_BUILD_PLATFORM_VERSION": "3.1.12258"}, base_)
         again_ = select_platform_dotnet(dict(e3, MW_BUILD_PLATFORM_VERSION="4.0.0"), lines_)
         check("dotnet/re-applied (a re-exec, or another line) it leaves ONE root on PATH — the other line's is removed",
-              again_["PATH"] == f"{r11}:/usr/bin:/bin" and select_platform_dotnet(e3, lines_)["PATH"] == e3["PATH"], again_)
+              again_["PATH"] == f"{r11}:{tools_}" and select_platform_dotnet(e3, lines_)["PATH"] == e3["PATH"], again_)
         check("dotnet/the dotnet the PATH resolves is the line's — the build identity names its SDK, not the other's",
               "sdk=10.0.100" in build_toolchain(lambda n: shutil.which(n, path=e3["PATH"]))
               and "sdk=11.0.100" in build_toolchain(lambda n: shutil.which(n, path=e4["PATH"])),
@@ -7939,6 +7962,32 @@ def self_test() -> int:
               se_.get("PATH") == e3["PATH"] and se_.get("DOTNET_ROOT") == r10 and se_.get(DOTNET_SDK_ENV) == "10", se_)
         check("dotnet/no platform version: the environment is left as it is (preflight names the missing variable)",
               select_platform_dotnet({"PATH": "/bin"}, lines_) == {"PATH": "/bin"})
+        check("dotnet/no platform version: a LEFTOVER MW_BUILD_DOTNET_SDK is dropped — no stage reads a major nobody selected",
+              select_platform_dotnet({"PATH": "/bin", DOTNET_SDK_ENV: "11"}, lines_) == {"PATH": "/bin"})
+        # THE SYMLINK SHAPE the image has: /opt/dotnet/11 → /usr/share/dotnet, and /usr/bin/dotnet → /usr/share/dotnet/dotnet
+        link11, alias11 = os.path.join(dn_tmp, "opt-dotnet-11"), os.path.join(dn_tmp, "alias-11")
+        os.symlink(r11, link11)
+        os.symlink(r11, alias11)
+        lines_s = {"3": ("10", r10), "4": ("11", link11)}
+        p_alias = f"{r11}:{alias11}:{tools_}"
+        es3 = select_platform_dotnet(dict(base_, PATH=p_alias), lines_s)
+        check("dotnet/v3: the 11 root is DROPPED from PATH under every name it resolves to (its real path, another link)",
+              es3["PATH"] == f"{r10}:{tools_}", es3["PATH"])
+        literal_ = [q for q in p_alias.split(":") if os.path.normpath(q) not in {os.path.normpath(r) for _s, r in lines_s.values()}]
+        check("dotnet/NEGATIVE CONTROL: a literal-path filter keeps both — the case discriminates the resolved filter from it",
+              r11 in literal_ and alias11 in literal_, literal_)
+        binl = os.path.join(dn_tmp, "usr-bin-link")
+        os.makedirs(binl)
+        os.symlink(os.path.join(link11, "dotnet"), os.path.join(binl, "dotnet"))
+        try:
+            got = select_platform_dotnet(dict(base_, PATH=f"{binl}:{tools_}"), lines_s)
+            check("dotnet/v3: a PATH dir exposing a dotnet that resolves into the 11 root is REFUSED, never shadowed", False, got)
+        except Refusal as e:
+            check("dotnet/v3: a PATH dir exposing a dotnet that resolves into the 11 root is REFUSED by name",
+                  binl in str(e) and "outside the line's root" in str(e) and "3.1.12258" in str(e), e)
+        es4 = select_platform_dotnet(dict(base_, PATH=f"{binl}:{tools_}", MW_BUILD_PLATFORM_VERSION="4.0.0"), lines_s)
+        check("dotnet/v4: the same dir is harmless — its dotnet resolves into the line's own root, so it is kept",
+              es4["PATH"] == f"{link11}:{binl}:{tools_}" and es4["DOTNET_ROOT"] == link11, es4["PATH"])
         check("dotnet/the image check passes when every line's root is there and its own", check_dotnet_roots(lines_) == [],
               check_dotnet_roots(lines_))
         for why_, lines_bad in (("no dotnet executable", {"3": ("10", os.path.join(dn_tmp, "absent")), "4": ("11", r11)}),
