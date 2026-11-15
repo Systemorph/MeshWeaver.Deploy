@@ -43,7 +43,9 @@
 #   3. creates two Secrets there from the values read in step 0, on stdin only — never a process argument, never printed:
 #      `build-worker-mac` (key `token`) and `build-pull` (kubernetes.io/dockerconfigjson: kubelet image pulls ONLY) and `build-registry-key-mac` (the READ-ONLY
 #      instance key the runner reads the plugin registry's bundle index with — a build host holds no registry credential);
-#   4. `helm upgrade --install build-host-mac` of THIS checkout's chart with build-host-mac.values.yaml and the set given;
+#   4. `helm upgrade --install build-host-mac` of THIS checkout's chart with build-host-mac.values.yaml, THIS Mac's sizing
+#      (<memex-local home>/buildhost-follow/<profile>/sizing.yaml, from `memex-local buildhost apply`; step 0 checks the fit
+#      with it too) and the set given;
 #   5. fleet jobs at the LOWEST priority on this Mac: loads the launchd governor (deploy/homebrew/share/buildhost-priority.sh
 #      --install) that puts the build VM's process in the background band while the owner, the portal VM or Ollama want
 #      the cores, and gives it every idle core otherwise (nice/renice do nothing on macOS — see the script's header).
@@ -221,8 +223,15 @@ alloc="$(k get nodes -o jsonpath='{.items[0].status.allocatable.cpu} {.items[0].
 # The declared FLOOR (every enabled channel's minReplicas) and the PEAK (their maxReplicas), each times one replica's
 # requests, must fit what the one node has left after the pods already on it (k3s, KEDA) — checking a single replica
 # passed a VM that left the second standing replica Pending for good.
-k get pods -A -o json | python3 "$here/host-fits-node.py" "$alloc" "$here/build-host-mac.values.yaml" --pods-json - \
-  || { echo "Nothing was changed." >&2; exit 1; }
+# THIS MAC'S SIZING (memex-local buildhost apply writes it from the Mac's plan, also before any release exists): the
+# release is installed with it and the fit is checked with it. Without it a Mac mini (one runner fits) was checked
+# against the values file's two standing 20 GiB runners and refused at 0/6 (2026-11-15). MEMEX_BUILDHOST_SIZING
+# names another file; an absent file = the values file's defaults, as before.
+sizing="${MEMEX_BUILDHOST_SIZING:-${MEMEX_LOCAL_HOME:-$HOME/.memex-local}/buildhost-follow/$profile/sizing.yaml}"
+sizing_args=(); fit_args=()
+if [ -f "$sizing" ]; then sizing_args=(-f "$sizing"); fit_args=(--overlay "$sizing"); echo "   this Mac's sizing: $sizing"; fi
+k get pods -A -o json | python3 "$here/host-fits-node.py" "$alloc" "$here/build-host-mac.values.yaml" ${fit_args[@]+"${fit_args[@]}"} --pods-json - \
+  || { echo "Nothing was changed. (A Mac whose plan differs: 'memex-local buildhost apply' writes its sizing, which this check and the release use.)" >&2; exit 1; }
 # The vault reads happen BEFORE any apply, so a failed read never replaces a working Secret with an empty one.
 key_value=
 if [ -n "$secrets_from" ]; then
@@ -302,7 +311,7 @@ echo "   build-worker-mac and build-pull (image pulls only) applied${instkey:+, 
 
 echo "== 4/6 helm upgrade --install build-host-mac ($version)"
 helm upgrade --install build-host-mac "$chart" --kube-context "$ctx" -n build-mac \
-  -f "$chart/values.yaml" -f "$here/build-host-mac.values.yaml" \
+  -f "$chart/values.yaml" -f "$here/build-host-mac.values.yaml" ${sizing_args[@]+"${sizing_args[@]}"} \
   --set-string buildHosts.apiUrl="$api" \
   --set-string buildHosts.testerRepository="$registry/mw-plugin-test" \
   --set-string buildHosts.portalRepository="$registry/memex-portal-ai" \
