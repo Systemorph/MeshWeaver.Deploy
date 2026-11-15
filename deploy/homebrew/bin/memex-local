@@ -6135,7 +6135,19 @@ instances_exec() {
   command -v python3 >/dev/null 2>&1 || die "instances: python3 is required (the Xcode command line tools carry it: xcode-select --install)"
   net="$(tailnet_name 2>/dev/null || true)"
   [ -n "$net" ] && ip="$(publish_tailscale ip -4 2>/dev/null | head -1 || true)"
-  env MEMEX_LOCAL_HOME="$LOCAL_HOME" MEMEX_LOCAL_SHARE="$share" MEMEX_INSTANCES_CHART="$(resolve_chart)" \
+  # MEMEX_LOCAL_BIN: this very memex-local — $0, made absolute — which the executor calls back for the build host's size
+  # (buildhost set / apply --resize / settings --json); never whichever memex-local PATH finds first (a dev checkout, an
+  # older keg). A test may point it at a stand-in.
+  local self="${MEMEX_LOCAL_BIN:-}"
+  if [ -z "$self" ]; then
+    case "$0" in
+      /*) self="$0" ;;
+      */*) self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+      *) self="$(command -v "$0" 2>/dev/null || command -v memex-local 2>/dev/null || printf '%s' "$0")" ;;
+    esac
+  fi
+  env MEMEX_LOCAL_HOME="$LOCAL_HOME" MEMEX_LOCAL_SHARE="$share" MEMEX_INSTANCES_CHART="$(resolve_chart)" MEMEX_LOCAL_BIN="$self" \
+      MEMEX_BUILD_PROFILE="$BUILD_PROFILE" \
       MEMEX_KUBE_CONTEXT="${MEMEX_KUBE_CONTEXT:-colima}" MEMEX_NAMESPACE="$NAMESPACE" \
       MEMEX_INSTANCES_MACHINE="$(instances_machine)" MEMEX_INSTANCES_NETWORK_NAME="$net" MEMEX_INSTANCES_NETWORK_IP="$ip" \
       MEMEX_INSTANCES_REGISTRY_URL="$(registry_url)" MEMEX_INSTANCES_LLM_AUTO_FILE="$LLM_AUTO_FILE" \
@@ -7363,7 +7375,25 @@ cmd_buildhost() {
   if [ "$sub" = idle ]; then cmd_buildhost_idle "$@"; return; fi
   case "$sub" in
     settings)
-      [ $# -eq 0 ] || die "buildhost settings: takes no arguments"
+      if [ "${1:-}" = --json ] && [ $# -eq 1 ]; then
+        # MACHINE-READABLE for the instances executor's inventory (Hosting/BuildHostSize §2): each setting's value, its
+        # source (environment | owner | fleet | auto), the full source text and whether it is applied (an invalid
+        # value is ignored = auto). Values are "auto" or digits, sources fixed words: nothing here needs escaping
+        # beyond the detail text, which names a file path or a profile key.
+        local n src v kind valid sep="{"
+        for n in vm-cpus max-runners; do
+          src="$(buildhost_cap_source "$n")"; v="${src%%$'\t'*}"; src="${src#*$'\t'}"
+          case "$src" in environment*) kind=environment ;; owner*) kind=owner ;; fleet*) kind=fleet ;; *) kind=auto ;; esac
+          if buildhost_cap_valid "$n" "$v"; then valid=true; else valid=false; fi
+          case "$v" in *[!A-Za-z0-9]*) v=invalid ;; esac
+          printf '%s"%s":{"value":"%s","source":"%s","detail":"%s","valid":%s}' "$sep" "$( [ "$n" = vm-cpus ] && echo vmCpus || echo maxRunners)" \
+            "$v" "$kind" "$(printf '%s' "$src" | sed 's/\\/\\\\/g; s/"/\\"/g')" "$valid"
+          sep=","
+        done
+        printf '}\n'
+        return 0
+      fi
+      [ $# -eq 0 ] || die "buildhost settings: takes no arguments (or --json)"
       local n src v
       for n in vm-cpus max-runners; do
         src="$(buildhost_cap_source "$n")"; v="${src%%$'\t'*}"
@@ -7838,7 +7868,7 @@ COMMANDS:
                   those constraints, installs both as mkcert's CA and re-issues the portal's
                   certificate under it. The key is never printed (fingerprints only).
   buildhost plan | apply [--resize] | attach | status | priority [install|off|status]
-  buildhost settings | set vm-cpus <n|auto> | set max-runners <n|auto>   (the owner's caps; the fleet default comes from the profile)
+  buildhost settings [--json] | set vm-cpus <n|auto> | set max-runners <n|auto>   (the owner's caps; the fleet default comes from the profile)
                   BUILD RUNNERS sized from this host: a build VM (Colima profile build, containerd)
                   of cores − 2 CPU and host − portal VM − model reserve − headroom GiB (the reserve:
                   the largest model this Mac answers with — the token models it OFFERS, not
