@@ -248,6 +248,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: deploy/aks/scripts/test-node-headroom.sh
 
+      # The portal's nodeSelector (portal.nodeSelector, Memex#148): the defaults render no selector (the
+      # negative control), a declared one renders on the portal pod spec as declared and nowhere else.
+      - name: Assert the portal nodeSelector renders only when declared
+        if: ${{ !cancelled() }}
+        run: deploy/aks/scripts/test-portal-node-selector.sh
+
       # The hosted registry's OWN workload identity (templates/registry/serviceaccount.yaml, Memex#922):
       # without a client id nothing new renders and both registry pods run as the portal's account (the
       # negative control); with one, ONE annotated, tokenless ServiceAccount renders and both pods run as

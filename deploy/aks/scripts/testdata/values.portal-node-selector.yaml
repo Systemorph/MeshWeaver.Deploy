@@ -1,0 +1,4 @@
+# test-portal-node-selector.sh: one declared portal node label.
+portal:
+  nodeSelector:
+    workload: silos
