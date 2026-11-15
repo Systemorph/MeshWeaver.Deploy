@@ -5,6 +5,9 @@
 #   $manifest[0]  the helm manifest + hooks as an ARRAY of Kubernetes objects (the truth)
 #   $live[0]      every live object in the namespace, every kind, as ONE array
 #   $namespace $release $deployment $container $revision $chart $auditedAt $skipped
+#   $owned[0]     objects COMMITTED ELSEWHERE that this namespace holds on purpose — each the object a
+#                 declared committed manifest names, carrying `.source` (the file). Empty when the
+#                 caller declares none (HOSTING_AUDIT_OWNED_MANIFESTS in hosting-audit).
 #   $persistence  the release's user-supplied `persistence` values — the Deployment record's
 #                 volumes[] as HelmValues rendered them (claimName + size per volume). The one
 #                 RECORD-vs-live comparison here: a claim's live capacity below what the record
@@ -32,10 +35,66 @@ def excluded:
     or (.kind == "ConfigMap" and .metadata.name == "kube-root-ca.crt")
     or (.kind == "ServiceAccount" and .metadata.name == "default");
 
-# A name that looks like it carries a secret. Name-based on purpose: the VALUE is what must not
-# be read, so the name is the only honest signal. A flag that merely ends in Key is a false
-# positive the record can rename; a token that slipped through would be an outage.
-def secretish: test("token|secret|key|password"; "i");
+# GENERATED objects: made by a controller or by a governed action's own run, never configuration
+# anyone put there (Systemorph/Memex#148 — 15 of memex-cloud's 66 findings were these):
+#   * a `memex-migration-roll-<version>` Job that COMPLETED — the Roll action's migration run, one
+#     per rolled version, kept as history. A running or failed one stays a finding: a migration that
+#     did not complete is exactly what an operator has to see;
+#   * a cert-manager TLS Secret (type kubernetes.io/tls, annotated cert-manager.io/certificate-name)
+#     that a live Ingress in the namespace names in spec.tls[].secretName. One NO Ingress names stays
+#     a finding: cert-manager leaves the Secret behind when its Certificate goes, and an orphaned
+#     certificate is the very thing to clean up;
+#   * the azurefile CSI driver's storage-account Secret: named `azure-storage-account-<account>-secret`
+#     AND carrying the driver's own keys (`azurestorageaccountname`, `azurestorageaccountkey` — key NAMES
+#     only; no value is read). A Secret that only borrows the name stays a finding. What this cannot
+#     tell is whether a live volume still uses the account: the reference sits on cluster-scoped
+#     PersistentVolumes, which this namespace audit does not list.
+def generated($ingressTls):
+    (.kind == "Job" and (.metadata.name | startswith("memex-migration-roll-"))
+       and ([.status.conditions[]? | select(.type == "Complete" and .status == "True")] | length > 0))
+    or (.kind == "Secret" and (.type // "") == "kubernetes.io/tls"
+       and (((.metadata.annotations // {})["cert-manager.io/certificate-name"] // "") != "")
+       and (.metadata.name as $n | ($ingressTls | index($n)) != null))
+    or (.kind == "Secret" and (.metadata.name | test("^azure-storage-account-[a-z0-9]+-secret$"))
+       and ((.data // {}) | has("azurestorageaccountname") and has("azurestorageaccountkey")));
+
+# The helm release another chart installed into this namespace (a ChartRelease record's own release,
+# e.g. a speech service beside the portal), or "" when the object names none or names THIS release.
+# Its objects are that release's to audit, not configuration living only on the cluster. An object
+# annotated with THIS release that the manifest does not render stays a finding: helm says it is
+# ours and the chart no longer renders it.
+def sibling_release: ((.metadata.annotations // {})["meta.helm.sh/release-name"] // "") as $r
+    | if $r == "" or $r == $release then "" else $r end;
+
+# A configuration NAME that looks like it carries a credential, judged on its LEAF — the last
+# `__`-separated segment that is not an array index — because the leaf is what the value IS; the
+# sections above it only say where it lives. Name-based on purpose: the VALUE is what must not be
+# read, so the name is the only honest signal (an EMPTY value is skipped by the caller — it carries
+# nothing). Measured false positives this rules out (Systemorph/Memex#148, every instance):
+#   * counts and limits — `…ContextWindowTokens__0__Tokens`, `…__Model`, `MaxOutputTokens`;
+#   * identifiers and references — `Apple__KeyId`, `SecretWriterClientId`, `SecretNamespace`,
+#     `TokenFile`, `SecretConfigKey` (the NAME of another config key), `SecretExecutor`;
+#   * flags — `RequireInstanceKey` (a verb-led leaf ending in a bare `key`; a verb-led leaf ending in a
+#     credential word — `UseApiKey`, `RequiredSecret`, `IsToken` — still matches);
+#   * the operator's own plumbing under `Hosting__Operator__`, whose entries name vault objects, files
+#     and service accounts (`Environment__AZ_POSTGRES_PASSWORD_SECRET` holds a vault object NAME).
+# What still matches (the negative control in run-tests.sh): a leaf ENDING in password, secret,
+# token, key, apikey, credential(s) or connectionstring, and every key under `ConnectionStrings__`;
+# under `Hosting__Operator__` only the strong endings (password, apikey, clientsecret, privatekey,
+# accesskey, connectionstring) still match.
+def leaf_of: (split("__") | map(select(test("^[0-9]+$") | not))) as $segs
+    | if ($segs | length) == 0 then "" else $segs[-1] end;
+def secretish:
+    . as $name
+    | ($name | leaf_of | ascii_downcase | gsub("[_.-]"; "")) as $leaf
+    | if ($name | test("(^|__)ConnectionStrings__"; "i")) then true
+      elif ($name | test("^Hosting__Operator__"; "i")) then
+        ($leaf | test("(password|apikey|clientsecret|privatekey|accesskey|connectionstring)$"))
+      elif ($leaf | test("^(require|enable|disable|use|allow|is|has|skip)"))
+           and ($leaf | test("(password|passwd|secret|token|apikey|credentials?|connectionstring)$") | not) then false
+      elif ($leaf | test("(configkey|keyname|secretname|tokenname)$")) then false
+      else ($leaf | test("(password|passwd|secret|token|key|credentials?|connectionstring)$"))
+      end;
 
 # a minus b, as sorted unique names
 def only(a; b): [a[] | select(. as $x | (b | index($x)) == null)] | unique;
@@ -70,7 +129,9 @@ def env_from: (.envFrom // []) | map(.secretRef.name // .configMapRef.name // em
 def mounts: (.volumeMounts // []) | map(.mountPath);
 def volumes: (.spec.template.spec.volumes // []) | map(.name);
 def containers: ((.spec.template.spec.containers // []) | map(.name)) + ((.spec.template.spec.initContainers // []) | map(.name));
-def annotations: (.spec.template.metadata.annotations // {}) | keys;
+# `kubectl.kubernetes.io/restartedAt` is what `kubectl rollout restart` (the Restart action) writes
+# into the template; it records WHEN a restart happened and configures nothing, so it is no finding.
+def annotations: (.spec.template.metadata.annotations // {}) | keys | map(select(. != "kubectl.kubernetes.io/restartedAt"));
 
 ($manifest[0]) as $m
 | ($live[0]) as $l
@@ -132,8 +193,23 @@ def annotations: (.spec.template.metadata.annotations // {}) | keys;
                      + (if .missingLive then 1 else 0 end)) | add // 0) as $configMapCount
 
 # ── objects the chart does not own ─────────────────────────────────────────────────────────────
+# Three classes leave the finding list: machinery (`excluded`), GENERATED objects, and objects OWNED
+# ELSEWHERE — by a sibling helm release, or by a declared committed manifest. The last two are
+# reported in `ownedElsewhere` with their owner, never silently dropped, so a reader can still see
+# what the namespace holds and who answers for it.
+| ([$l[] | select(.kind == "Ingress") | (.spec.tls // [])[] | .secretName // empty] | unique) as $ingressTls
+| (($owned[0] // []) | map({key: "\(.kind)/\(.metadata.name)", value: (.source // "a committed manifest")}) | from_entries) as $ownedBy
 | ($l | map(select(excluded | not))
       | map(select(oname as $n | ($managed | index($n)) == null))
+      | map(select(generated($ingressTls) | not))) as $notChart
+| ($notChart
+      | map(sibling_release as $r | (oname) as $n
+            | if $r != "" then {kind, name: .metadata.name, owner: ("helm release " + $r)}
+              elif $ownedBy[$n] != null then {kind, name: .metadata.name, owner: ("committed manifest " + $ownedBy[$n])}
+              else empty end)
+      | sort_by(.kind, .name)) as $ownedElsewhere
+| ($notChart
+      | map(select(sibling_release == "" and $ownedBy[oname] == null))
       | group_by(.kind)
       | map({kind: .[0].kind, names: (map(.metadata.name) | sort | unique)})) as $unmanagedObjects
 | ($unmanagedObjects | map(.names | length) | add // 0) as $unmanagedCount
@@ -148,9 +224,10 @@ def annotations: (.spec.template.metadata.annotations // {}) | keys;
 
 # ── secret-shaped names carried as plain values ────────────────────────────────────────────────
 | ([ ($ld.spec.template.spec.containers // [])[] | .name as $c
-     | (.env // [])[] | select(.value != null) | select(.name | secretish) | "env:\($c):\(.name)" ]
+     | (.env // [])[] | select(.value != null and .value != "") | select(.name | secretish) | "env:\($c):\(.name)" ]
    + [ $l[] | select(.kind == "ConfigMap") | select(oname as $n | ($managed | index($n)) != null)
-       | .metadata.name as $n | ((.data // {}) | keys[]) | select(secretish) | "configmap:\($n)/\(.)" ]
+       | .metadata.name as $n | ((.data // {}) | to_entries[]) | select(.value != null and .value != "")
+       | .key | select(secretish) | "configmap:\($n)/\(.)" ]
    | unique) as $plainSecretEntries
 
 # ── claims below the capacity the record declares ──────────────────────────────────────────────
@@ -200,6 +277,7 @@ def annotations: (.spec.template.metadata.annotations // {}) | keys;
     podSpecDiffs: $podSpecDiffs,
     configMaps: $configMaps,
     unmanagedObjects: $unmanagedObjects,
+    ownedElsewhere: $ownedElsewhere,
     unmanagedSecrets: $unmanagedSecrets,
     plainSecretEntries: $plainSecretEntries,
     volumeCapacityBelowRecord: $volumeCapacityBelowRecord,

@@ -1,0 +1,50 @@
+{
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "v1",
+      "kind": "ConfigMap",
+      "metadata": {
+        "name": "memex-portal-config",
+        "namespace": "memex"
+      },
+      "data": {
+        "Portal__Name": "memex",
+        "Email__Enabled": "false",
+        "OpenRouterEU__ContextWindowTokens__0__Model": "z-ai/glm",
+        "OpenRouterEU__ContextWindowTokens__0__Tokens": "200000",
+        "Hosting__Triage__PullRequestReview__Ensemble__Members__0__MaxOutputTokens": "8000",
+        "Authentication__Apple__KeyId": "ABC123",
+        "PluginCatalog__RequireInstanceKey": "true",
+        "WebhookInbox__Targets__0__SecretConfigKey": "WebhookInbox__Secret",
+        "Hosting__Operator__SecretExecutor": "Actions",
+        "Hosting__Operator__SecretNamespace": "memex-secrets",
+        "Hosting__Operator__SecretWriterClientId": "00000000-0000-0000-0000-000000000000",
+        "Hosting__Operator__SecretWriterServiceAccount": "hosting-secret-writer",
+        "Hosting__Operator__TokenFile": "/var/run/secrets/token",
+        "Hosting__Operator__Environment__AZ_POSTGRES_PASSWORD_SECRET": "pg-password",
+        "Fleet__Queue__Pools__M5__KeyClasses__bench__0": "bench",
+        "Bootstrap__Secret": "",
+        "OpenAICompatible__ApiKey": "must-never-print-1",
+        "Authentication__Microsoft__ClientSecret": "must-never-print-2",
+        "ConnectionStrings__memex": "must-never-print-3",
+        "PluginCatalog__RegistryToken": "must-never-print-4",
+        "Hosting__Operator__DatabasePassword": "must-never-print-5",
+        "Webhook__Secret": "must-never-print-6",
+        "Provider__UseApiKey": "must-never-print-7",
+        "Webhook__RequiredSecret": "must-never-print-8"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "ConfigMap",
+      "metadata": {
+        "name": "kube-root-ca.crt",
+        "namespace": "memex"
+      },
+      "data": {
+        "ca.crt": "..."
+      }
+    }
+  ]
+}
