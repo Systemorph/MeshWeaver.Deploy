@@ -691,6 +691,9 @@ portal:
   # is the mirror: the operator's `hosting-pull-secret` creates the Secret from the instance key in
   # Key Vault (deploy/aks/manifests/hosting-operator/README.md). MeshWeaver#3353.
   imagePullSecret: ""
+  # The node labels the portal pods must land on — the pod spec's `nodeSelector`. Declared on the
+  # record as `portalNodeSelector` (Systemorph/Memex#148). Empty (the default) renders no selector.
+  nodeSelector: {}
   # How long a rolled-out pod may keep serving the sessions it already has. The container's preStop
   # drains the ingress (15s) and then waits on /drain until its last Blazor circuit closes, so this
   # is the ceiling on "how long may someone keep working on the OLD build after a roll" — not a

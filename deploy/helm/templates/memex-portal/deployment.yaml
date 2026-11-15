@@ -107,6 +107,16 @@ spec:
                     app.kubernetes.io/name: "{{ .Chart.Name }}"
                     app.kubernetes.io/component: "memex-portal"
                     app.kubernetes.io/instance: "{{ .Release.Name }}"
+{{- /* The node labels the portal pods must land on (Systemorph/Memex#148). Declared on the record
+       as `portalNodeSelector` (core DeploymentContent.PortalNodeSelector) and rendered by the Plugins
+       HelmValues renderer as portal.nodeSelector. Empty (the default) renders no key at all, so a
+       release that does not declare one renders byte-identically to before. Before this key existed
+       a selector set by hand on the live Deployment was invisible to the record, reported live-only
+       by every chart-drift audit, and dropped by any render that replaced the pod spec. */}}
+{{- with (.Values.portal).nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
       terminationGracePeriodSeconds: {{ .Values.portal.drainSeconds | default 1800 }}
       initContainers:
         # 🩺 Crash-dump preparation, SYNCHRONOUSLY before the portal process exists: retention, the
