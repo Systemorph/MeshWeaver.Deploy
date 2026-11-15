@@ -6678,6 +6678,13 @@ class Host:
             pin = cap_schedule(stages, slots)[1] if fanout else None
             finished: set = set()
             pending = list(stages)
+            # How many NON-build stages can ever be in flight together: the slots, but never more than the run HAS. Sizing
+            # each test stage by the slots alone handed the two Plugins test stages (gate, portal-hosts) 15/8 = 1 CPU each
+            # on an 8-slot, 15-CPU cluster host while 13 CPUs idled, and the gate stage hit its 45-minute cap on 11 of 57
+            # pull-request heads (2026-11-12..15, MeshWeaver.Plugins scripts/build-parity-report.py) — host reds beside an
+            # Actions green, the gate leg's whole parity gap. The bound stays safe: no more than this many test stages can
+            # run at once, so the CPUs are never promised twice.
+            test_width = max(1, min(slots, sum(1 for s_ in stages if s_.get("kind") != "build")))
             inflight: dict = {}            # name → (thread, stage, nuget_before, art_before, artifacts dir)
             done: "queue.Queue[tuple[str, bool, Optional[BaseException]]]" = queue.Queue()
             cancel = threading.Event()
@@ -6734,7 +6741,7 @@ class Host:
                                             hand_over_failed=lambda: self.hand_over_failed_stage(
                                                 repo, sha, name, art, art_before, deadline=run_end, cancel=cancel),
                                             # a build stage runs ALONE (next_stages); any other shares the run's slots
-                                            concurrent=1 if st["kind"] == "build" else slots)
+                                            concurrent=1 if st["kind"] == "build" else test_width)
                         done.put((name, ok, None))
                     except BaseException as e:     # Lost, or a host defect: the scheduler decides, never a dead thread
                         # The run is abandoned the moment a worker KNOWS it — not when the scheduler reads this from the
@@ -12112,12 +12119,18 @@ def self_test() -> int:
                 d_["parallel"] = True
             return d_
         handed, saw, lines_ = cpu_run({"MW_BUILD_STAGE_SLOTS": "4"}, cpu_doc(True))
-        check("cpu/fan-out on 4 CPU / 4 slots: each test stage is HANDED DOTNET_PROCESSOR_COUNT=1, the lone build 4",
-              handed == {"build": "4", "t0": "1", "t1": "1"}, handed)
-        check("cpu/...and the stage process SEES it (survives --clearenv)", saw == {"build": "4", "t0": "1", "t1": "1"}, saw)
+        check("cpu/fan-out on 4 CPU / 4 slots with TWO test stages: each test stage is HANDED DOTNET_PROCESSOR_COUNT=2 (sized by "
+              "the test stages the run has, not the slots), the lone build 4",
+              handed == {"build": "4", "t0": "2", "t1": "2"}, handed)
+        check("cpu/...and the stage process SEES it (survives --clearenv)", saw == {"build": "4", "t0": "2", "t1": "2"}, saw)
         check("cpu/each stage's log names the count and where it came from, ONCE",
               sorted(lines_) == ["build", "t0", "t1"] and all(len(v) == 1 for v in lines_.values())
-              and "DOTNET_PROCESSOR_COUNT=1 — the cgroup's 4 CPU(s) / 4 stage(s) at once" in lines_["t0"][0], lines_)
+              and "DOTNET_PROCESSOR_COUNT=2 — the cgroup's 4 CPU(s) / 2 stage(s) at once" in lines_["t0"][0], lines_)
+        wide = cpu_doc(True)
+        wide["stages"] += [{"name": f"t{i}", "kind": "test", "after": ["build"], "command": ""} for i in (2, 3, 4, 5)]
+        handed, _, _ = cpu_run({"MW_BUILD_STAGE_SLOTS": "4"}, wide)
+        check("cpu/NEGATIVE CONTROL: six test stages on 4 slots are still bounded by the SLOTS — 4 CPU / 4 = 1 each, never 0",
+              handed.get("t0") == "1" and handed.get("t5") == "1" and handed.get("build") == "4", handed)
         handed, saw, _ = cpu_run({"MW_BUILD_STAGE_SLOTS": "4"}, cpu_doc(False))
         check("cpu/a serial run on 4 CPU: every stage gets 4", handed == {"build": "4", "t0": "4", "t1": "4"} and saw == handed, (handed, saw))
         handed, saw, lines_ = cpu_run({"MW_BUILD_STAGE_SLOTS": "4", STAGE_PROCESSOR_COUNT_ENV: "2"}, cpu_doc(True))
