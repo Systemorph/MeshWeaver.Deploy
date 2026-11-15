@@ -3743,7 +3743,7 @@ OUT="$(fja)"
 ! grep -q -- "--plugins-registry" "$JH/args" && ! grep -qx instance-key "$JH/files" && grep -q "bundle index stays off" <<<"$OUT" \
   && ok "fleet join's build-host attach leaves the registry bundle index OFF by default (an H8 host never claims on the assemblies-only AI bundle)" \
   || bad "join h8 default" "args=$(cat "$JH/args") files=$(tr '\n' ' ' < "$JH/files") $OUT"
-grep -q -- "--profile build " "$JH/args" && [ ! -e "$JH/home/enrol/buildhost" ] && ! ls "$JH/home/enrol" | grep -q '^attach\.' \
+grep -q -- "--profile build " "$JH/args" && [ ! -e "$JH/home/enrol/buildhost" ] && ! compgen -G "$JH/home/enrol/attach.*" >/dev/null \
   && ok "a SUCCESSFUL attach removes the kept build items and its secrets directory (the cluster's Secrets hold them now)" || bad "attach cleanup" "$(ls -la "$JH/home/enrol" 2>&1) $OUT"
 OUT="$(fja MEMEX_BUILDHOST_REGISTRY_BUNDLES=1)"
 grep -q -- "--plugins-registry https://reg.example.test" "$JH/args" && grep -qx instance-key "$JH/files" \
@@ -3760,6 +3760,10 @@ grep -q -- "--secrets-from" "$JH/args" && grep -qx worker "$JH/files" && grep -q
   && ok "buildhost_attach re-runs the attach from the KEPT items alone (no code, no key) and removes them on success" || bad "attach from kept" "$OUT"
 OUT="$(env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$JH/home" MEMEX_FIRST_ATTACH="$JH/fa.sh" bash -c '. "$0"; buildhost_attach' "$CLI" 2>&1)" && bad "an attach with nothing kept succeeded" "$OUT" \
   || { grep -q "memex-local fleet join" <<<"$OUT" && ok "with nothing kept the attach refuses and names the rejoin (control's Approve re-issues the items)" || bad "attach nothing kept" "$OUT"; }
+FA="$HERE/../../backlease/first-attach.sh"
+pl="$(grep -n -- '--profile) profile=' "$FA" | head -1 | cut -d: -f1)"; sl="$(grep -n '^sizing="' "$FA" | head -1 | cut -d: -f1)"
+[ -n "$pl" ] && [ -n "$sl" ] && [ "$pl" -lt "$sl" ] && grep -q 'host-fits-node.py" "$alloc" "$here/build-host-mac.values.yaml" ${fit_args' "$FA" && grep -q 'build-host-mac.values.yaml" ${sizing_args' "$FA" \
+  && ok "the real first-attach parses --profile before it reads <home>/buildhost-follow/<profile>/sizing.yaml, and both the fit check and the helm install layer it" || bad "first-attach sizing wiring" "profile@$pl sizing@$sl"
 rm -rf "$JH"
 
 echo "── the tap tarball carries every directory the formula installs (2026-11-10) ──────"

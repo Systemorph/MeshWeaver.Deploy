@@ -2406,7 +2406,8 @@ buildhost_attach() {
   api="$(cat "$k/api")"; reg="$(cat "$k/registry")"; puser="$(cat "$k/pull-user")"; preg="$(cat "$k/plugins-registry" 2>/dev/null || true)"
   fa="${MEMEX_FIRST_ATTACH:-$(resolve_share)/backlease/first-attach.sh}"
   [ -f "$fa" ] || { warn "build host: first-attach.sh is not installed ($fa) — skipped"; return 1; }
-  secrets="$(mktemp -d "$FLEET_DIR/attach.XXXXXX")"; chmod 700 "$secrets"
+  secrets="$(mktemp -d "$FLEET_DIR/attach.XXXXXX")" && [ -d "$secrets" ] || { warn "build host: could not create a secrets directory under $FLEET_DIR — the kept items stay"; return 1; }
+  chmod 700 "$secrets"
   # the registry key and the registry URL go TOGETHER (first-attach's pass-both-or-neither): a key without the URL is left
   # out, so the attach degrades to the plain contract instead of failing
   # 🚨 The registry bundle index (H8) stays OPT-IN (MEMEX_BUILDHOST_REGISTRY_BUNDLES=1): the registry serves the mixed
@@ -2416,7 +2417,8 @@ buildhost_attach() {
   # "NOT claiming this cycle". Without it the host takes its plugins layer as the cluster hosts do.
   local h8=""
   if [ "${MEMEX_BUILDHOST_REGISTRY_BUNDLES:-0}" = 1 ] && [ -s "$k/instance-key" ] && [ -n "$preg" ]; then h8=1; fi
-  ( umask 077; cp "$k/worker" "$secrets/worker"; cp "$k/pull" "$secrets/pull"; if [ -n "$h8" ]; then cp "$k/instance-key" "$secrets/instance-key"; fi )
+  ( umask 077; cp "$k/worker" "$secrets/worker" && cp "$k/pull" "$secrets/pull" && if [ -n "$h8" ]; then cp "$k/instance-key" "$secrets/instance-key"; fi ) \
+    || { rm -rf "$secrets"; warn "build host: could not stage the kept items for the attach — they stay ($k)"; return 1; }
   local args=(--profile "$BUILD_PROFILE" --api "$api" --registry "$reg" --pull-user "$puser" --secrets-from "$secrets" --set-from latest)
   if [ -n "$h8" ]; then args+=(--plugins-registry "$preg"); fi
   if [ -s "$k/instance-key" ] && [ -z "$h8" ]; then
