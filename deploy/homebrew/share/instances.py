@@ -34,7 +34,13 @@ import sys
 import time
 
 SCHEMA = 1
-OPERATIONS = ("create", "start", "stop", "update", "remove")
+OPERATIONS = ("create", "start", "stop", "update", "remove", "buildhost")
+# THE BUILD HOST'S SIZE (MeshWeaver.Plugins Hosting/BuildHostSize §2): the one operation that is about THIS Mac, not an
+# instance — it carries no name. Its spec is {vmCpus, maxRunners}, each "auto" or a whole number 1–99, and vmCpus at
+# least one runner's CPU (memex-local BUILD_CPU_PER_RUNNER) — the same range `memex-local buildhost set` accepts.
+MACHINE_OPERATIONS = ("buildhost",)
+BUILD_CPU_PER_RUNNER = 4
+BUILDHOST_SETTINGS = (("vmCpus", "vm-cpus"), ("maxRunners", "max-runners"))
 TERMINAL = ("Succeeded", "Failed", "Refused")
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,22}[a-z0-9]$")
 RESERVED = {"memex", "control", "build", "e2e", "www", "api", "default", "monitoring", "ingress-nginx", "kube-system"}
@@ -237,6 +243,28 @@ def check_spec(spec, operation, stored=None):
     return out
 
 
+def check_buildhost_value(key, value):
+    """One build-host setting, normalised to the string `memex-local buildhost set` takes: "auto" or "<n>"."""
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    if isinstance(value, str) and re.match(r"^[1-9][0-9]?$", value.strip()):
+        value = int(value.strip())
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 99:
+        raise Refused("%s %r is not auto or a whole number from 1 to 99" % (key, value))
+    if key == "vmCpus" and value < BUILD_CPU_PER_RUNNER:
+        raise Refused("vmCpus %d is below one runner's %d CPU" % (value, BUILD_CPU_PER_RUNNER))
+    return str(value)
+
+
+def check_buildhost_spec(spec):
+    if not isinstance(spec, dict):
+        raise Refused("buildhost needs a spec {vmCpus, maxRunners}")
+    extra = sorted(set(spec) - {k for k, _ in BUILDHOST_SETTINGS})
+    if extra:
+        raise Refused("buildhost spec has unknown fields %s (only vmCpus, maxRunners)" % ", ".join(extra))
+    return {k: check_buildhost_value(k, spec.get(k)) for k, _ in BUILDHOST_SETTINGS}
+
+
 def check_job(job, file_stem):
     if not isinstance(job, dict):
         raise Refused("the job is not a JSON object")
@@ -250,7 +278,12 @@ def check_job(job, file_stem):
     op = job.get("operation")
     if op not in OPERATIONS:
         raise Refused("operation %r is not one of %s" % (op, "|".join(OPERATIONS)))
-    check_name(job.get("name"))
+    if op in MACHINE_OPERATIONS:
+        if job.get("name") not in (None, ""):
+            raise Refused("%s is about this Mac, not an instance — it carries no name (got %r)" % (op, job.get("name")))
+        check_buildhost_spec(job.get("spec"))
+    else:
+        check_name(job.get("name"))
     rb = job.get("requestedBy")
     if not isinstance(rb, str) or not REQUESTED_BY_RE.match(rb):
         raise Refused("requestedBy %r is not a user id" % (rb,))
@@ -884,9 +917,55 @@ def op_remove(name, confirm, progress):
     return "removed %s (database and data deleted; registry claim kept)" % name
 
 
+def memex_local():
+    """The memex-local that started this program (instances_exec passes it), else the one on PATH."""
+    return env("MEMEX_LOCAL_BIN") or "memex-local"
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def op_buildhost(spec, progress):
+    """The owner's build-host size from the Settings page: validate again, write the owner's setting through
+    `memex-local buildhost set`, then `buildhost apply --resize` — which restarts the build VM at the new CPUs only
+    when they change, waits for k3s to come back healthy and ROLLS BACK to the previous profile when it does not."""
+    try:
+        want = check_buildhost_spec(spec)
+    except Refused as e:
+        progress.step("Validate", "Failed", str(e))
+        raise
+    progress.step("Validate", "Done", "vm-cpus %s, max-runners %s" % (want["vmCpus"], want["maxRunners"]))
+    progress.step("set", "Running")
+    for key, flag in BUILDHOST_SETTINGS:
+        run([memex_local(), "buildhost", "set", flag, want[key]], progress, timeout=60)
+    progress.step("set", "Done", "the owner's setting: vm-cpus=%s, max-runners=%s (wins over the fleet default)" % (want["vmCpus"], want["maxRunners"]))
+    progress.step("resize", "Running", "memex-local buildhost apply --resize")
+    p = run([memex_local(), "buildhost", "apply", "--resize"], progress, timeout=2400, check=False)
+    out = ANSI_RE.sub("", (p.stdout or "") + "\n" + (p.stderr or ""))
+    if "ROLLED BACK" in out or "rolled back" in out:
+        line = next((l.strip() for l in out.splitlines() if "rolled back" in l.lower()), "the resize was rolled back")
+        progress.step("resize", "Failed", "rolled back to the previous profile")
+        progress.step("k3s healthy", "Failed", line[:300])
+        raise Failed("the resize was ROLLED BACK — k3s did not stay up at the new size; the build VM runs on its previous profile (%s)" % line[:300])
+    if p.returncode != 0:
+        tail = [l.strip() for l in out.splitlines() if l.strip()][-1:] or ["exit %d" % p.returncode]
+        progress.step("resize", "Failed", tail[0][:300])
+        raise Failed("memex-local buildhost apply --resize failed: %s" % tail[0][:300])
+    resized = "Resizing the build VM" in out
+    progress.step("resize", "Done" if resized else "Skipped",
+                  "the build VM restarted at the new size" if resized else "the build VM already matches — no restart")
+    healthy = next((l.strip() for l in out.splitlines() if "k3s is healthy" in l), "")
+    progress.step("k3s healthy", "Done" if healthy else "Skipped", healthy[:300] if healthy else "no restart, nothing to check")
+    sized = next((l.strip() for l in out.splitlines() if "runners sized" in l or "sizing is written" in l), "")
+    progress.step("runners sized", "Done" if sized else "Skipped", sized[:300] if sized else "no build-host release to size")
+    return "build host set to vm-cpus %s, max-runners %s%s" % (want["vmCpus"], want["maxRunners"], " (build VM resized)" if resized else "")
+
+
 def execute(job, progress):
     """Run one validated operation; the terminal status is written by the caller."""
-    op, name = job["operation"], job["name"]
+    op, name = job["operation"], job.get("name")
+    if op == "buildhost":
+        return op_buildhost(job.get("spec"), progress)
     if op == "create":
         return op_create(name, job["spec"], progress)
     if op == "update":
@@ -965,9 +1044,75 @@ def describe(name):
     return item
 
 
+def build_vm():
+    """The build VM as Colima reports it: {cpu, memoryGi, diskGi}, each null when not read; null without a build VM."""
+    profile = env("MEMEX_BUILD_PROFILE", "build")
+    try:
+        p = run([env("MEMEX_COLIMA_BIN", "colima"), "list", "--json"], check=False, quiet=True, timeout=20)
+    except Failed:
+        return None
+    if p.returncode != 0:
+        return None
+    for line in (p.stdout or "").splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("name") == profile:
+            def gi(v):
+                return round(float(v) / 2 ** 30, 1) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else None
+            cpu = d.get("cpus")
+            return {"cpu": cpu if isinstance(cpu, int) and not isinstance(cpu, bool) and cpu > 0 else None,
+                    "memoryGi": gi(d.get("memory")), "diskGi": gi(d.get("disk"))}
+    return None
+
+
+def build_runners():
+    """What `buildhost apply` last sized the runners to (<home>/buildhost-follow/<profile>/sizing.yaml):
+    {min, max, cpu}, each null when not read; null when this Mac never sized any."""
+    path = os.path.join(LOCAL_HOME, "buildhost-follow", env("MEMEX_BUILD_PROFILE", "build"), "sizing.yaml")
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    def num(pattern):
+        m = re.search(pattern, text)
+        return int(m.group(1)) if m else None
+    return {"min": num(r"minReplicas:\s*([0-9]+)"), "max": num(r"maxReplicas:\s*([0-9]+)"),
+            "cpu": num(r"limits:\s*\{[^}]*cpu:\s*\"?([0-9]+)")}
+
+
+def build_settings():
+    """Each setting's value and where it came from, as memex-local resolves it (`buildhost settings --json`):
+    {vmCpus: {value, source, detail, valid}, maxRunners: {…}}; null when it cannot be read."""
+    try:
+        p = run([memex_local(), "buildhost", "settings", "--json"], check=False, quiet=True, timeout=30)
+    except Failed:
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        d = json.loads(p.stdout)
+    except ValueError:
+        return None
+    out = {}
+    for key, _ in BUILDHOST_SETTINGS:
+        v = d.get(key) if isinstance(d, dict) else None
+        out[key] = ({"value": str(v.get("value")), "source": v.get("source"), "detail": v.get("detail"), "valid": v.get("valid")}
+                    if isinstance(v, dict) and v.get("value") is not None else None)
+    return out
+
+
+def build_host():
+    """The inventory's buildHost block (Hosting/BuildHostSize §2): every figure null when it was not measured."""
+    return {"vm": build_vm(), "runners": build_runners(), "settings": build_settings()}
+
+
 def inventory():
     return {"schema": SCHEMA, "sampledAt": now(), "machine": machine(), "networkName": env("MEMEX_INSTANCES_NETWORK_NAME"),
             "agentVersion": env("MEMEX_INSTANCES_AGENT_VERSION", "0.3.0"), "capacity": capacity(),
+            "buildHost": build_host(),
             "instances": [describe(n) for n in instance_names()]}
 
 
@@ -1244,6 +1389,9 @@ def cli(argv):
             except Failed as e:
                 print("err  %s: %s" % (n, e), file=sys.stderr)
         return 0
+    if cmd in MACHINE_OPERATIONS:
+        print("%s runs from the portal's Settings; on the Mac: memex-local buildhost set vm-cpus|max-runners <n|auto>, then memex-local buildhost apply --resize" % cmd, file=sys.stderr)
+        return 2
     if cmd not in OPERATIONS:
         print(USAGE, file=sys.stderr)
         return 2

@@ -2899,7 +2899,96 @@ grep -q 'mode_args+=(-f "$INSTANCES_FILE")' <<<"$HD" && [ "$(grep -n 'mode_args+
 OUT="$(python3 -I "$HERE/../share/boot-progress.py" --self-test 2>&1)" && ok "boot-progress.py prints phases, landed modules, errors and the ETA heartbeat from the portal's own report" || bad "boot-progress.py self-test" "$OUT"
 grep -q 'instances-host' "$HERE/../share/instances.py" && bad "instances.py names the bridge layer" "" || ok "a created instance never gets the bridge layer (instances.py does not know it)"
 grep -c 'ensure_instances_agent  ' "$CLI" | grep -qx 2 && ok "up and update install the executor agent (registry mode)" || bad "agent install" "$(grep -n ensure_instances_agent "$CLI")"
-rm -rf "$IX"
+
+# THE BUILD HOST'S SIZE through the bridge (MeshWeaver.Plugins Hosting/BuildHostSize §2): the `buildhost` operation and the
+# inventory's buildHost block, against a stand-in memex-local (what it was asked, and the apply outcome FAKE_APPLY says).
+cat > "$IX/stubs/memex-local-stub" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$IX_LOG/memex-local.log"
+case "$*" in
+  "buildhost settings --json") printf '{"vmCpus":{"value":"8","source":"owner","detail":"owner setting (~/.memex-local/buildhost-settings)","valid":true},"maxRunners":{"value":"2","source":"fleet","detail":"fleet default (com.memex.local BuildMaxRunnersMacMini)","valid":true}}\n' ;;
+  "buildhost set "*) echo "ok build host setting $3 = $4" ;;
+  "buildhost apply --resize")
+    case "${FAKE_APPLY:-ok}" in
+      ok) echo "==> Resizing the build VM 16 CPU / 17 GiB / 120 GiB disk → 8 / 17 / 120"; echo " ok  the resized build VM's k3s is healthy: NRestarts=0"; echo " ok  runners sized: up to 4 stage containers at once" ;;
+      noop) echo " ok  build VM 8 CPU / 17 GiB covers the plan"; echo " ok  runners sized: up to 4 stage containers at once" ;;
+      rollback) echo "==> Resizing the build VM 16 CPU → 8"; echo "warn the resized build VM's k3s is NOT healthy (NRestarts=3)" >&2
+                echo "err  buildhost: the resize was ROLLED BACK — k3s did not stay up with the new profile; it runs again on the previous one (NRestarts=0)" >&2; exit 1 ;;
+      fail) echo "err  buildhost: helm could not size the release build-host" >&2; exit 1 ;;
+    esac ;;
+esac
+exit 0
+EOF
+cat > "$IX/stubs/colima" <<'EOF'
+#!/usr/bin/env bash
+if [ "$*" = "list --json" ]; then
+  echo '{"name":"default","cpus":8,"memory":17179869184,"disk":107374182400}'
+  echo '{"name":"build","cpus":8,"memory":18253611008,"disk":128849018880}'
+fi
+exit 0
+EOF
+chmod +x "$IX/stubs/memex-local-stub" "$IX/stubs/colima"
+mkdir -p "$IX/home/.memex-local/buildhost-follow/build"
+printf 'buildHosts:\n  mac: {minReplicas: 0, maxReplicas: 1}\n  resources:\n    requests: {cpu: "7500m", memory: "9Gi"}\n    limits: {cpu: "8", memory: "13Gi"}\n' > "$IX/home/.memex-local/buildhost-follow/build/sizing.yaml"
+# (MEMEX_COLIMA_BIN: memex-local's tool resolver puts its own colima ahead of PATH, so the stand-in is named explicitly)
+bh() { ix MEMEX_LOCAL_BIN="$IX/stubs/memex-local-stub" MEMEX_COLIMA_BIN="$IX/stubs/colima" "$@" "$CLI" instances agent run-once >"$IX/agent.out" 2>&1; }
+BJ() { printf '{"schema":1,"jobId":"%s","operation":"buildhost","name":null,"requestedBy":"owner1","requestedAt":"2026-11-15T12:00:00Z","spec":%s}' "$1" "$2"; }
+: > "$IX/memex-local.log"
+job buildhost-a "$(BJ buildhost-a '{"vmCpus":"3","maxRunners":"2"}')"
+job buildhost-b "$(BJ buildhost-b '{"vmCpus":"auto","maxRunners":"100"}')"
+job buildhost-c "$(BJ buildhost-c '{"vmCpus":"8","maxRunners":"2; rm -rf /"}')"
+job buildhost-d "$(printf '{"schema":1,"jobId":"buildhost-d","operation":"buildhost","name":"proof","requestedBy":"owner1","spec":{"vmCpus":"8","maxRunners":"2"}}')"
+job buildhost-e "$(BJ buildhost-e '{"vmCpus":"8","maxRunners":"2","disk":"999"}')"
+bh
+for c in "buildhost-a|below one runner's 4 CPU" "buildhost-b|not auto or a whole number from 1 to 99" "buildhost-c|not auto or a whole number" \
+         "buildhost-d|carries no name" "buildhost-e|unknown fields"; do
+  id="${c%%|*}"; want="${c#*|}"; r="$(res "$id")"
+  case "$r" in "Refused|"*"$want"*) ok "buildhost: a size the executor would not apply is Refused with its reason: $id ($want)" ;; *) bad "buildhost refusal $id" "got '$r' — $(cat "$IX/agent.out")" ;; esac
+done
+grep -q '^buildhost set \|^buildhost apply' "$IX/memex-local.log" && bad "a refused buildhost job reached memex-local" "$(cat "$IX/memex-local.log")" || ok "buildhost: a refused job runs nothing on the Mac"
+: > "$IX/memex-local.log"
+job buildhost-ok "$(BJ buildhost-ok '{"vmCpus":8,"maxRunners":"auto"}')"; bh
+python3 - "$IXB/results/buildhost-ok.json" "$IX/memex-local.log" <<'PY2' && ok "buildhost: Succeeded — set vm-cpus 8, set max-runners auto, then apply --resize; steps set, resize, k3s healthy, runners sized" || bad "buildhost ok" "$(cat "$IXB/results/buildhost-ok.json" "$IX/memex-local.log" "$IX/agent.out" 2>/dev/null)"
+import json, sys
+d = json.load(open(sys.argv[1])); calls = [l for l in open(sys.argv[2]).read().splitlines() if not l.startswith("buildhost settings")]
+assert d["status"] == "Succeeded" and d["operation"] == "buildhost" and d["name"] is None, d
+assert calls == ["buildhost set vm-cpus 8", "buildhost set max-runners auto", "buildhost apply --resize"], calls
+st = {s["name"]: s["status"] for s in d["steps"]}
+assert st == {"Validate": "Done", "set": "Done", "resize": "Done", "k3s healthy": "Done", "runners sized": "Done"}, st
+assert any("runners sized" in l for l in d["log"]), d["log"]
+assert "resized" in d["message"], d["message"]
+PY2
+job buildhost-noop "$(BJ buildhost-noop '{"vmCpus":"8","maxRunners":"2"}')"; bh FAKE_APPLY=noop
+python3 - "$IXB/results/buildhost-noop.json" <<'PY2' && ok "buildhost: a size the VM already has restarts nothing (resize Skipped) and still sizes the runners" || bad "buildhost noop" "$(cat "$IXB/results/buildhost-noop.json")"
+import json, sys
+d = json.load(open(sys.argv[1])); st = {s["name"]: s["status"] for s in d["steps"]}
+assert d["status"] == "Succeeded" and st["resize"] == "Skipped" and st["k3s healthy"] == "Skipped" and st["runners sized"] == "Done", (d["status"], st)
+PY2
+job buildhost-rb "$(BJ buildhost-rb '{"vmCpus":"8","maxRunners":"2"}')"; bh FAKE_APPLY=rollback
+case "$(res buildhost-rb)" in "Failed|"*"ROLLED BACK"*"previous profile"*) ok "buildhost: a resize k3s did not survive ends Failed, naming the rollback" ;; *) bad "buildhost rollback" "$(res buildhost-rb) — $(cat "$IXB/results/buildhost-rb.json")" ;; esac
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); st={s["name"]:s["status"] for s in d["steps"]}; assert st["resize"]=="Failed" and st["k3s healthy"]=="Failed", st' "$IXB/results/buildhost-rb.json" \
+  && ok "buildhost: the rolled-back run's steps say resize Failed, k3s healthy Failed" || bad "rollback steps" "$(cat "$IXB/results/buildhost-rb.json")"
+job buildhost-f "$(BJ buildhost-f '{"vmCpus":"8","maxRunners":"2"}')"; bh FAKE_APPLY=fail
+case "$(res buildhost-f)" in "Failed|"*"helm could not size"*) ok "buildhost: a failed apply ends Failed with its last line" ;; *) bad "buildhost fail" "$(res buildhost-f)" ;; esac
+python3 - "$IXB/inventory.json" <<'PY2' && ok "inventory.json: buildHost {vm {cpu, memoryGi, diskGi}, runners {min, max, cpu}, settings {vmCpus, maxRunners} with value and source}" || bad "inventory buildHost" "$(cat "$IXB/inventory.json")"
+import json, sys
+b = json.load(open(sys.argv[1]))["buildHost"]
+assert b["vm"] == {"cpu": 8, "memoryGi": 17.0, "diskGi": 120.0}, b["vm"]
+assert b["runners"] == {"min": 0, "max": 1, "cpu": 8}, b["runners"]
+assert b["settings"]["vmCpus"]["value"] == "8" and b["settings"]["vmCpus"]["source"] == "owner", b["settings"]
+assert b["settings"]["maxRunners"]["value"] == "2" and b["settings"]["maxRunners"]["source"] == "fleet", b["settings"]
+PY2
+rm -f "$IX/stubs/colima" "$IX/home/.memex-local/buildhost-follow/build/sizing.yaml"
+ix MEMEX_LOCAL_BIN="$IX/nowhere" MEMEX_COLIMA_BIN="$IX/stubs/colima" "$CLI" instances agent run-once >/dev/null 2>&1
+python3 -c 'import json,sys; b=json.load(open(sys.argv[1]))["buildHost"]; assert b == {"vm": None, "runners": None, "settings": None}, b' "$IXB/inventory.json" \
+  && ok "inventory.json: a build host nothing could read is null in each part, never 0 or false" || bad "inventory buildHost unmeasured" "$(cat "$IXB/inventory.json")"
+OUT="$(ix "$CLI" instances buildhost 2>&1)"; RC=$?
+[ "$RC" = 2 ] && grep -q 'memex-local buildhost set' <<<"$OUT" && ok "the CLI points 'instances buildhost' at 'memex-local buildhost set' (exit 2)" || bad "cli buildhost" "rc=$RC $OUT"
+S2="$(mktemp -d)"; printf 'vm-cpus=8\nmax-runners=2"x\n' > "$S2/buildhost-settings"
+OUT="$(env MEMEX_LOCAL_HOME="$S2" HOME="$S2" MEMEX_HOST_MODEL="Mac Studio" "$CLI" buildhost settings --json 2>&1)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["vmCpus"]=={"value":"8","source":"owner","detail":d["vmCpus"]["detail"],"valid":True} and d["maxRunners"]["valid"] is False and d["maxRunners"]["value"]=="invalid", d' "$OUT" \
+  && ok "buildhost settings --json: value, source and validity per setting, an unsafe value never echoed" || bad "settings --json" "$OUT"
+rm -rf "$S2" "$IX"
 
 echo "── back-lease sampler: host.ownerCpuPercent is the owner's CPU over the interval (Hosting/BackLease §14.5) ──"
 OC="$(mktemp -d)"; mkdir -p "$OC/stubs" "$OC/dir" "$OC/home/.colima/_lima/colima-build" "$OC/home/.colima/_lima/colima"
