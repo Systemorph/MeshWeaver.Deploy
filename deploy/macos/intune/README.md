@@ -50,6 +50,7 @@ placed on issuing CA"*. Re-measure on the first profile-trusted fleet Mac (Safar
 | `AcceptTokens` | boolean, **required** | the Mac serves local models to the fleet's token queue. NO ⇒ no token models beyond the portal's own chat model |
 | `AcceptTokensFrom`, `AcceptTokensModels` | list, both required on YES | whose token requests, which models |
 | `AcceptTokensResidency` | string, optional | where the Mac is (`CH`, `Eu`) — stamped on what it serves |
+| `BuildVmCpus<Class>`, `BuildMaxRunners<Class>` | integer, optional | the FLEET DEFAULT size of the build host for one model class — `<Class>` is the Mac's model name without spaces (`BuildVmCpusMacMini` = 8, `BuildMaxRunnersMacMini` = 2 for the Mac minis). A class with no key (the Mac Studios) keeps the automatic sizing; the class-less `BuildVmCpus` / `BuildMaxRunners` apply to every class. The Mac owner's own setting (`memex-local buildhost set vm-cpus …`) wins over both; `memex-local buildhost settings` names where each value came from |
 
 **Readings** — the run log is root-only, so the bootstrap also leaves one world-readable line per reading in
 `/Library/MeshWeaver/fleet-state/` (root-owned, 0644, `<verdict> <UTC time> <detail>`, nothing secret):
@@ -186,6 +187,15 @@ fetched its script policies only at enrolment and then every 8 h (10:11Z … 18:
 `syncDevice` said; four syncs in between fetched nothing. A bootstrap bump therefore reaches a Mac at its agent's next
 full sync, or sooner only when a person checks in through Company Portal ("Check status"). The reading
 `/Library/MeshWeaver/fleet-state/version` (1.11.1) names the bootstrap that actually ran.
+
+**The build host after a pre-setup join (1.12.0).** A fleet Mac joins BEFORE its first-run setup (its sign-in comes with
+the enrolment), and that join runs without the update: no build VM exists yet, so memex-local KEEPS the build items it
+opened (`~/.memex-local/enrol/buildhost`, 0700/0600). Every bootstrap run on a joined, finished Mac then runs
+`memex-local buildhost attach` (as the person) while those items exist: it creates the build VM, writes the Mac's sizing,
+attaches the release from them and removes them. Before 1.12.0 nothing finished it, and the first Mac mini said YES to
+jobs and had no runners until a person attached it by hand (2026-11-14). The `buildhost` and `heartbeat` readings are
+also readable again: 1.11.1 computed them with an inline `$(case …)`, which macOS's `/bin/bash` 3.2 cannot parse, and
+wrote `" echo ok ;; *) echo red ;; esac) …"` instead of the verdict.
 
 ### The console password that expired at enrolment (2026-11-09)
 

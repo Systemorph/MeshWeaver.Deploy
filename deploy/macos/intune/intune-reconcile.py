@@ -270,6 +270,11 @@ def validate(spec, spec_dir):
                          "would look for a certificate the profile never delivers)")
             if cas and not keys.get("FleetCaSha256"):
                 p.append(f"{w}: a fleet CA is declared but keys.FleetCaSha256 is absent (memex-local ca adopt reads it)")
+            # the build host's fleet default size per model class (BuildVmCpusMacMini …): a whole number above 0, never
+            # a bool or a string — memex-local ignores anything else and the Mac would fall back to auto in silence
+            for k, v in keys.items():
+                if (k.startswith("BuildVmCpus") or k.startswith("BuildMaxRunners")) and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
+                    p.append(f"{w}: keys.{k} must be a whole number above 0 (memex-local reads it as the build host's fleet default)")
             # the bootstrap's pin for the fleet loader (it travels in the profile: minutes, not the agent's 8 h)
             if ("BootstrapCommit" in keys) != ("BootstrapSha256" in keys):
                 p.append(f"{w}: keys.BootstrapCommit and keys.BootstrapSha256 go together (the loader verifies one by the other)")
@@ -1306,6 +1311,14 @@ def self_test():
     expect("validate: tokens on without models is refused, as the bootstrap refuses it", any("AcceptTokensModels" in x for x in v), v)
     tok_on["customProfiles"][0]["keys"]["AcceptTokensModels"] = ["model-a"]
     expect("validate: tokens on with models passes", not validate(tok_on, "."), validate(tok_on, "."))
+    size = copy.deepcopy(spec)
+    size["customProfiles"][0]["keys"].update(BuildVmCpusMacMini=8, BuildMaxRunnersMacMini=2)
+    expect("validate: the minis' build-host size keys (8 / 2) pass", not validate(size, "."), validate(size, "."))
+    expect("validate: …and travel as plist integers", build_plist(size["customProfiles"][0])["PayloadContent"][0].get("BuildVmCpusMacMini") == 8)
+    for badv in ("8", True, 0):
+        size["customProfiles"][0]["keys"]["BuildVmCpusMacMini"] = badv
+        v = validate(size, ".")
+        expect(f"validate: BuildVmCpusMacMini = {badv!r} is refused (a whole number above 0)", any("BuildVmCpusMacMini" in x for x in v), v)
     op = "ssh-ed25519 " + base64.b64encode(len(b"ssh-ed25519").to_bytes(4, "big") + b"ssh-ed25519" + (32).to_bytes(4, "big") + bytes(32)).decode() + " operator, laptop"
     ssh = copy.deepcopy(spec)
     ssh["customProfiles"][0]["keys"]["OperatorSshKeys"] = [op]

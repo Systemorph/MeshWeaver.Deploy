@@ -2480,6 +2480,41 @@ grep -q 'offer a smaller token model' <<<"$(lib buildhost_plan_remedy memory)" &
   && ok "a MEMORY refusal names memory remedies (a smaller token model), never 'free disk'; a disk refusal names disk" || bad "remedy by kind" "$(lib buildhost_plan_remedy memory)"
 P="$(env MEMEX_BUILD_MIN_WARM=9 MEMEX_LOCAL_LIB=1 bash -c '. "$0"; buildhost_plan 18 128 8 16 0' "$CLI")"
 grep -q '^runners_min=4$' <<<"$P" && ok "the warm floor never exceeds the ceiling" || bad "min clamp" "$P"
+echo "── buildhost: the owner's caps vm-cpus / max-runners, and the fleet default (2026-11-15) ──"
+P="$(env MEMEX_BUILD_VM_CPUS=8 MEMEX_BUILD_MAX_RUNNERS=2 MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c '. "$0"; buildhost_plan 18 64 8 16 23 200' "$CLI")"
+grep -q '^vm_cpu=8$' <<<"$P" && grep -q '^runners_max=1$' <<<"$P" && grep -q '^runner_cpu=8$' <<<"$P" && grep -q '^runner_cpu_request=7500m$' <<<"$P" \
+  && ok "the first Mac mini capped at 8 CPU / 2 runners: VM 8 CPU, memory leaves 1 runner, which takes the 8 cores" || bad "plan mini capped" "$P"
+P="$(env MEMEX_BUILD_VM_CPUS=8 MEMEX_BUILD_MAX_RUNNERS=2 MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c '. "$0"; buildhost_plan 18 64 8 16 0 200' "$CLI")"
+grep -q '^vm_cpu=8$' <<<"$P" && grep -q '^runners_max=2$' <<<"$P" && grep -q '^runner_cpu=4$' <<<"$P" \
+  && ok "the same caps with memory for more: 8 CPU, 2 runners × 4" || bad "plan mini capped roomy" "$P"
+P="$(env MEMEX_BUILD_MAX_RUNNERS=2 MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c '. "$0"; buildhost_plan 18 128 8 16 0' "$CLI")"
+grep -q '^vm_cpu=16$' <<<"$P" && grep -q '^runners_max=2$' <<<"$P" && grep -q '^runner_cpu=4$' <<<"$P" && grep -q '^limited_by=settings$' <<<"$P" \
+  && ok "max-runners alone caps the runners (limited_by=settings), not the VM" || bad "plan max runners" "$P"
+P="$(env MEMEX_BUILD_VM_CPUS=64 MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c '. "$0"; buildhost_plan 18 128 8 16 0' "$CLI")"
+grep -q '^vm_cpu=16$' <<<"$P" && grep -q '^runners_max=4$' <<<"$P" && ok "a cap above the plan never RAISES it (cores − 2 stays the ceiling)" || bad "plan cap above" "$P"
+P="$(env MEMEX_BUILD_VM_CPUS=abc MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c '. "$0"; buildhost_plan 18 128 8 16 0' "$CLI")"
+grep -q '^vm_cpu=16$' <<<"$P" && ok "a cap that is not a whole number is ignored (auto)" || bad "plan cap garbage" "$P"
+CS="$(mktemp -d)"
+csrc() { env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$CS" MEMEX_HOST_MODEL="${CS_MODEL:-Mac mini}" PATH="$STUBS:$PATH" "$@" bash -c '. "$0"; managed_pref() { [ "$1" = BuildVmCpusMacMini ] && printf 8; return 0; }; buildhost_cap_source vm-cpus' "$CLI"; }
+case "$(csrc)" in "8"$'\t'"fleet default (com.memex.local BuildVmCpusMacMini)") ok "a Mac mini with no owner setting takes the minis' fleet default (BuildVmCpusMacMini)" ;; *) bad "cap fleet default" "$(csrc)" ;; esac
+case "$(CS_MODEL='Mac Studio' csrc)" in "auto"$'\t'"auto") ok "…and a Mac Studio under the SAME profile keeps auto (no MacStudio key)" ;; *) bad "cap studio auto" "$(CS_MODEL='Mac Studio' csrc)" ;; esac
+env MEMEX_LOCAL_HOME="$CS" PATH="$STUBS:$PATH" "$CLI" buildhost set vm-cpus 6 >/dev/null 2>&1
+case "$(csrc)" in "6"$'\t'"owner setting"*) ok "'buildhost set vm-cpus 6' is the OWNER's setting and wins over the fleet default" ;; *) bad "cap owner wins" "$(csrc) / $(cat "$CS/buildhost-settings" 2>&1)" ;; esac
+env MEMEX_LOCAL_HOME="$CS" PATH="$STUBS:$PATH" "$CLI" buildhost set vm-cpus auto >/dev/null 2>&1
+case "$(csrc)" in "auto"$'\t'"owner setting"*) ok "an owner's explicit 'auto' wins over the fleet default too (the owner can lift a fleet cap)" ;; *) bad "cap owner auto" "$(csrc)" ;; esac
+case "$(csrc MEMEX_BUILD_VM_CPUS=10)" in "10"$'\t'"environment") ok "the environment wins over both (a one-off run)" ;; *) bad "cap env" "$(csrc MEMEX_BUILD_VM_CPUS=10)" ;; esac
+OUT="$(env MEMEX_LOCAL_HOME="$CS" PATH="$STUBS:$PATH" "$CLI" buildhost set vm-cpus 2 2>&1)" && bad "vm-cpus 2 was accepted" "$OUT" || ok "'buildhost set vm-cpus' below one runner's CPU is refused"
+OUT="$(env MEMEX_LOCAL_HOME="$CS" PATH="$STUBS:$PATH" "$CLI" buildhost set max-runners lots 2>&1)" && bad "max-runners lots was accepted" "$OUT" || ok "'buildhost set' refuses a value that is not a number or auto"
+for bad in 2 123; do
+  P="$(env MEMEX_BUILD_VM_CPUS=$bad MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c '. "$0"; buildhost_plan 18 128 8 16 0' "$CLI")"
+  grep -q '^vm_cpu=16$' <<<"$P" && ok "a vm-cpus cap of $bad (below one runner, or above 99) is ignored — the same range 'settings' and 'set' use, never a misattributed 'host has too few cores'" || bad "cap $bad" "$P"
+done
+OUT="$(env MEMEX_LOCAL_HOME="$CS" MEMEX_BUILD_VM_CPUS=123 PATH="$STUBS:$PATH" "$CLI" buildhost settings 2>&1)"
+case "$OUT" in *"vm-cpus: 123"*"ignored (auto)"*) ok "'buildhost settings' says a value outside the range is ignored — and it is" ;; *) bad "settings ignored" "$OUT" ;; esac
+OUT="$(env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$CS" MEMEX_HOST_CORES=18 PATH="$STUBS:$PATH" bash -c '. "$0"; buildhost_cap_source vm-cpus | awk -F"\t" "{ print \$1 \" — \" \$2 }"' "$CLI")"
+case "$OUT" in "auto — owner setting ("*) true ;; *) false ;; esac && ok "the plan's settings line splits on the TAB (no BSD-sed \\t that eats every 't')" || bad "settings line" "$OUT"
+! grep -q "sed 's/\\\\t/" "$CLI" && ok "no sed 's/\\t/…' in memex-local (BSD sed reads it as the letter t)" || bad "bsd sed tab" "$(grep -n "sed 's/\\\\t/" "$CLI")"
+rm -rf "$CS"
 # THE MODEL RESERVE (2026-11-15): the largest model this Mac ANSWERS with — the offered token models (idle-only ones not
 # reserved) and its own chat model — never a pulled model nobody serves.
 MR="$(mktemp -d)"
@@ -2523,6 +2558,17 @@ grep -q 'colima start -p build --cpu 16 --memory 104 --disk 300 --runtime contai
   && ok "apply creates the build VM at the plan (containerd, k3s), checks KEDA in colima-build, writes the sizing the first attach layers, and names 'buildhost attach' for a missing release" || bad "apply create" "$OUT / $(cat "$BH/log")"
 grep -q 'colima ssh -p build -- sudo systemctl restart mw-netshape.service' "$BH/log" && [ -f "$BH/.memex-local/netshape-build.env" ] \
   && ok "apply also shapes the build VM's network (mw-netshape.service in the VM) and records the rates" || bad "apply netshape" "$(grep netshape "$BH/log")"
+# an owner-capped VM bigger than the cap: named without --resize, shrunk with it; an uncapped one is never shrunk
+: > "$BH/log"
+OUT="$(bh MEMEX_BUILD_VM_CPUS=8 FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":111669149696}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
+! grep -q 'colima stop' "$BH/log" && case "$OUT" in *"caps it at 8"*"apply --resize"*) true ;; *) false ;; esac && grep -q 'maxReplicas: 2}' "$BH/.memex-local/buildhost-follow/build/sizing.yaml" \
+  && ok "a VM above the owner's CPU cap is NOT restarted without --resize; the runners are sized to the cap and the resize is named" || bad "cap no resize" "$OUT / $(cat "$BH/log")"
+: > "$BH/log"
+bh MEMEX_BUILD_VM_CPUS=8 FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":111669149696}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize >/dev/null 2>&1
+grep -q 'colima stop -p build' "$BH/log" && grep -q 'colima start -p build --cpu 8 ' "$BH/log" && ok "--resize SHRINKS a VM above the owner's CPU cap to the cap" || bad "cap resize" "$(cat "$BH/log")"
+: > "$BH/log"
+bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":17,"memory":111669149696,"disk":322122547200}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply --resize >/dev/null 2>&1
+! grep -q 'colima stop' "$BH/log" && ok "an UNCAPPED VM above the plan is never shrunk (the Mac Studios keep their sizing)" || bad "uncapped no shrink" "$(cat "$BH/log")"
 : > "$BH/log"
 OUT="$(bh FAKE_COLIMA_LIST='{"name":"build","status":"Running","cpus":16,"memory":107374182400}' FAKE_RELEASE_RC=0 "$CLI" buildhost apply 2>&1)"
 SZ="$BH/.memex-local/buildhost-follow/build/sizing.yaml"
