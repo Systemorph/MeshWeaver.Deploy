@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Do the build host's standing replicas AND its peak fit the Mac's one node? (first-attach.sh, step 0)
 
-    host-fits-node.py "<allocatable cpu> <allocatable memory>" <values file> [--pods-json <file>|-]
+    host-fits-node.py "<allocatable cpu> <allocatable memory>" <values file> [--overlay <values file>]… [--pods-json <file>|-]
     host-fits-node.py --self-test
 
 A Mac is ONE node, so every replica the chart can run has to fit on it beside what the node already runs.
@@ -19,6 +19,11 @@ re-run does not count the replicas it is about to replace):
 The channels are the chart's own (deploy/helm/templates/build-host/_build-hosts.tpl): `latest`, `stable` and each
 of `buildHosts.extraChannels`, DE-DUPLICATED as the chart's `uniq` does — `extraChannels: [mac, mac]` renders one
 Deployment, so its floor counts once — and only the enabled ones.
+
+Each --overlay is merged over the values file the way helm merges a later -f (maps deep, everything else replaced):
+first-attach.sh passes THIS Mac's sizing (`memex-local buildhost apply` writes <home>/buildhost-follow/<profile>/
+sizing.yaml), which the release is installed with — checking the values file's defaults alone refused a Mac mini whose
+plan is one 13 GiB runner against the defaults' two standing 20 GiB ones (2026-11-15).
 
 Exits 1 naming the shortfall; prints the reading on success. Needs PyYAML.
 """
@@ -39,6 +44,19 @@ def gib(v):
     if not m:
         raise ValueError(f"unreadable memory quantity {v!r}")
     return float(m.group(1)) * (units[m.group(2)] if m.group(2) else 1 / 1073741824)
+
+
+def merge(base, over):
+    """helm's -f merge: maps merge key by key, a later scalar or list replaces; a null deletes the key."""
+    if not isinstance(base, dict) or not isinstance(over, dict):
+        return over
+    out = dict(base)
+    for k, v in over.items():
+        if v is None:
+            out.pop(k, None)
+        else:
+            out[k] = merge(out.get(k), v)
+    return out
 
 
 def channels(b):
@@ -177,8 +195,22 @@ def self_test():
          {**one({"cpu": "4", "memory": "20Gi"}, minReplicas=1), "latest": {"enabled": False, "minReplicas": 3, "maxReplicas": 3}}, (0, 0), True),
         ("every enabled channel is counted", "8 40Gi",
          {**one({"cpu": "4", "memory": "20Gi"}, minReplicas=2, maxReplicas=2), "latest": {"enabled": True, "minReplicas": 1}}, (0, 0), False),
+        # 2026-11-15, the first Mac mini: a 16 CPU / 17 GiB build VM refuses the shipped defaults, and fits once THIS
+        # Mac's sizing (one runner, 15.5 CPU / 9 GiB requested) is layered over them, as the release is installed.
+        ("a Mac mini's build VM refuses the shipped defaults", "16 17Gi", shipped, (0, 0), False),
+        ("a Mac mini's build VM fits with its own sizing layered over the defaults", "16 17Gi",
+         merge({"buildHosts": shipped}, {"buildHosts": {"mac": {"minReplicas": 1, "maxReplicas": 1},
+                                                       "resources": {"requests": {"cpu": "15500m", "memory": "9Gi"},
+                                                                     "limits": {"cpu": "16", "memory": "13Gi"}}}})["buildHosts"],
+         (0, 0), True),
     ]
-    bad = 0
+    m = merge({"a": {"b": 1, "c": [1, 2]}, "d": 1}, {"a": {"c": [3], "e": 2}, "d": None})
+    if m != {"a": {"b": 1, "c": [3], "e": 2}}:
+        bad_merge = True
+        print(f"FAIL: merge is not helm's -f merge: {m}", file=sys.stderr)
+    else:
+        bad_merge = False
+    bad = 1 if bad_merge else 0
     if abs(sys_used[0] - 0.9) > 1e-9 or abs(sys_used[1] - 250 / 1024) > 1e-9:
         bad += 1
         print(f"FAIL: the system pods' requests read {sys_used}, expected 0.9 CPU / 250 MiB (finished pods, the host's "
@@ -197,7 +229,7 @@ def self_test():
             print(f"ok: {name}")
     if bad:
         sys.exit(1)
-    print(f"host-fits-node self-test: {len(cases) + 2} of {len(cases) + 2} checks hold")
+    print(f"host-fits-node self-test: {len(cases) + 3} of {len(cases) + 3} checks hold")
 
 
 def main(argv):
@@ -211,10 +243,18 @@ def main(argv):
         src = args[i + 1]
         pods = json.load(sys.stdin if src == "-" else open(src))
         del args[i:i + 2]
+    overlays = []
+    while "--overlay" in args:
+        i = args.index("--overlay")
+        overlays.append(args[i + 1])
+        del args[i:i + 2]
     if len(args) != 2:
         sys.exit(__doc__)
     import yaml
-    ok, msg = verdict(args[0], yaml.safe_load(open(args[1]))["buildHosts"], used_by_others(pods))
+    values = yaml.safe_load(open(args[1])) or {}
+    for o in overlays:
+        values = merge(values, yaml.safe_load(open(o)) or {})
+    ok, msg = verdict(args[0], values["buildHosts"], used_by_others(pods))
     print(msg, file=sys.stdout if ok else sys.stderr)
     sys.exit(0 if ok else 1)
 

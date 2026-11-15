@@ -284,6 +284,11 @@ readonly PUBLISH_FILE="$LOCAL_HOME/publish.yaml"
 # tailscale serve hand network traffic to a forward WITHOUT the mark; publish refuses one (below).
 readonly ENTRY_PORT="${MEMEX_ENTRY_PORT:-8446}"
 readonly FLEET_DIR="$LOCAL_HOME/enrol"
+# The build items a join opened (worker token, pull password, optional registry key + the facts they go with), KEPT
+# until the build host is attached: a join whose build VM step failed used to remove them with the rest, and finishing
+# the build host later then needed a fresh join and a second Approve (2026-11-15, the first Mac mini). 0700, files 0600;
+# removed by `memex-local buildhost attach` once the attach succeeds.
+readonly BUILD_KEEP_DIR="$FLEET_DIR/buildhost"
 readonly FLEET_CODE_PREFIX="mwenrol1."
 # The host's Ollama under launchd (survives a reboot), bound to every interface so the Colima VM reaches
 # it by the gateway IP — the nohup'd `ollama serve` did not survive a reboot (MacStudioFleet §2b gap 9).
@@ -1261,8 +1266,16 @@ cmd_backlease() {
           if launchctl print "gui/$(id -u)/${IDLE_PLIST_LABEL}" >/dev/null 2>&1; then ok "idle governor '$IDLE_PLIST_LABEL' loaded (log: $IDLE_LOG)"
           else warn "idle governor '$IDLE_PLIST_LABEL' NOT loaded — the idle-only models are never served ('memex-local buildhost idle apply')"; fi
         fi
-        if grep -q 'Hosting__ModuleReportSecret' "$OVERLAY" 2>/dev/null; then ok "pairing secret present in the overlay (never printed)"; else warn "pairing secret MISSING — the portal does not beat until secrets.memex_portal.Hosting__ModuleReportSecret is in $OVERLAY"; fi
-        backlease_declarations "$(backlease_control)" "$(backlease_deployment)"
+        # A JOINED Mac carries the pairing secret in fleet.yaml (the join writes it from its enrolment code, and
+        # helm_deploy layers that file): reading only the overlay called a joined Mac's secret MISSING and printed
+        # an operator procedure it does not need (2026-11-15, the first Mac mini). The overlay is the hand path.
+        if grep -q 'Hosting__ModuleReportSecret: "[^"]' "$FLEET_FILE" 2>/dev/null; then
+          ok "pairing secret present — written by the fleet join ($FLEET_FILE, heartbeat key $(fleet_value_fingerprint "$(awk '$1 == "Hosting__ModuleReportSecret:" { gsub(/"/, "", $2); print $2; exit }' "$FLEET_FILE")"); never printed)"
+        elif grep -q 'Hosting__ModuleReportSecret' "$OVERLAY" 2>/dev/null; then ok "pairing secret present in the overlay (never printed)"
+        else
+          warn "pairing secret MISSING — the portal does not beat until it is set: 'memex-local fleet join' writes it from control's enrolment (the supported way), or by hand secrets.memex_portal.Hosting__ModuleReportSecret in $OVERLAY"
+          backlease_declarations "$(backlease_control)" "$(backlease_deployment)"
+        fi
       else
         info "back-lease is OFF — offer this Mac with:"
         info "  memex-local backlease enroll --control https://<control> --deployment <id> [--interval 30] [--repo github.com/OWNER/REPO]"
@@ -2359,15 +2372,41 @@ fleet_apply_ca() {
 }
 
 # The build host: first-attach with the sealed worker/pull/registry values from FILES (no vault, no az) — jobs opt-in only.
+# The items are KEPT first ($BUILD_KEEP_DIR), then attached from there; a failed attach leaves them for
+# `memex-local buildhost attach`.
 fleet_apply_buildhost() {
-  local dir="$1" fa api reg puser preg secrets
+  local dir="$1"
   [ "$ACC_JOBS_ENABLED" = true ] || { info "build host: jobs are OFF — nothing installed"; return 0; }
-  [ -s "$dir/w" ] && [ -s "$dir/p" ] || { warn "build host: jobs are on but the code carries no worker/pull token — skipped"; return 0; }
+  fleet_keep_buildhost_items "$dir" || return 0
+  buildhost_attach || warn "build host: the attach did not finish — the items stay kept ($BUILD_KEEP_DIR); finish it with 'memex-local buildhost attach' (no rejoin)"
+}
+
+# Keeps the build items of an opened code in $BUILD_KEEP_DIR: worker, pull, instance-key (each 0600) and the facts
+# api, registry, pull-user, plugins-registry (one value per file). 1 (said) when the code carries none.
+fleet_keep_buildhost_items() {
+  local dir="$1" api reg puser preg
+  [ -s "$dir/w" ] && [ -s "$dir/p" ] || { warn "build host: jobs are on but the code carries no worker/pull token — skipped"; return 1; }
   api="$(fleet_fact_of "$dir" buildApi)"; reg="$(fleet_fact_of "$dir" buildRegistry)"; puser="$(fleet_fact_of "$dir" pullUser)"; preg="$(fleet_fact_of "$dir" pluginsRegistry)"
-  [ -n "$api" ] && [ -n "$reg" ] && [ -n "$puser" ] || { warn "build host: the code lacks buildApi/buildRegistry/pullUser — skipped"; return 0; }
+  [ -n "$api" ] && [ -n "$reg" ] && [ -n "$puser" ] || { warn "build host: the code lacks buildApi/buildRegistry/pullUser — skipped"; return 1; }
+  rm -rf "$BUILD_KEEP_DIR"; mkdir -p "$BUILD_KEEP_DIR"; chmod 700 "$BUILD_KEEP_DIR"
+  ( umask 077
+    cp "$dir/w" "$BUILD_KEEP_DIR/worker"; cp "$dir/p" "$BUILD_KEEP_DIR/pull"
+    if [ -s "$dir/k" ]; then cp "$dir/k" "$BUILD_KEEP_DIR/instance-key"; fi
+    printf '%s' "$api" > "$BUILD_KEEP_DIR/api"; printf '%s' "$reg" > "$BUILD_KEEP_DIR/registry"
+    printf '%s' "$puser" > "$BUILD_KEEP_DIR/pull-user"; printf '%s' "$preg" > "$BUILD_KEEP_DIR/plugins-registry" )
+  ok "build host: the build items are kept until the attach succeeds ($BUILD_KEEP_DIR, 0600)"
+}
+
+# Attaches the build host from $BUILD_KEEP_DIR (first-attach.sh --secrets-from, the set from control's channel). On
+# success the kept items are removed (the cluster's Secrets hold them now). Returns first-attach's status.
+buildhost_attach() {
+  local k="$BUILD_KEEP_DIR" fa api reg puser preg secrets
+  [ -s "$k/worker" ] && [ -s "$k/pull" ] && [ -s "$k/api" ] && [ -s "$k/registry" ] && [ -s "$k/pull-user" ] \
+    || { warn "build host: no kept build items ($k) — a fleet join keeps them; re-run 'memex-local fleet join' (control's Approve re-issues them)"; return 1; }
+  api="$(cat "$k/api")"; reg="$(cat "$k/registry")"; puser="$(cat "$k/pull-user")"; preg="$(cat "$k/plugins-registry" 2>/dev/null || true)"
   fa="${MEMEX_FIRST_ATTACH:-$(resolve_share)/backlease/first-attach.sh}"
-  [ -f "$fa" ] || { warn "build host: first-attach.sh is not installed ($fa) — skipped"; return 0; }
-  secrets="$dir/build"; mkdir -p "$secrets"; chmod 700 "$secrets"
+  [ -f "$fa" ] || { warn "build host: first-attach.sh is not installed ($fa) — skipped"; return 1; }
+  secrets="$(mktemp -d "$FLEET_DIR/attach.XXXXXX")"; chmod 700 "$secrets"
   # the registry key and the registry URL go TOGETHER (first-attach's pass-both-or-neither): a key without the URL is left
   # out, so the attach degrades to the plain contract instead of failing
   # 🚨 The registry bundle index (H8) stays OPT-IN (MEMEX_BUILDHOST_REGISTRY_BUNDLES=1): the registry serves the mixed
@@ -2376,19 +2415,25 @@ fleet_apply_buildhost() {
   # again on the second (2026-11-10), whose join passed the key by default and left it polling forever on
   # "NOT claiming this cycle". Without it the host takes its plugins layer as the cluster hosts do.
   local h8=""
-  if [ "${MEMEX_BUILDHOST_REGISTRY_BUNDLES:-0}" = 1 ] && [ -s "$dir/k" ] && [ -n "$preg" ]; then h8=1; fi
-  ( umask 077; cp "$dir/w" "$secrets/worker"; cp "$dir/p" "$secrets/pull"; if [ -n "$h8" ]; then cp "$dir/k" "$secrets/instance-key"; fi )
-  local args=(--api "$api" --registry "$reg" --pull-user "$puser" --secrets-from "$secrets" --set-from latest)
+  if [ "${MEMEX_BUILDHOST_REGISTRY_BUNDLES:-0}" = 1 ] && [ -s "$k/instance-key" ] && [ -n "$preg" ]; then h8=1; fi
+  ( umask 077; cp "$k/worker" "$secrets/worker"; cp "$k/pull" "$secrets/pull"; if [ -n "$h8" ]; then cp "$k/instance-key" "$secrets/instance-key"; fi )
+  local args=(--profile "$BUILD_PROFILE" --api "$api" --registry "$reg" --pull-user "$puser" --secrets-from "$secrets" --set-from latest)
   if [ -n "$h8" ]; then args+=(--plugins-registry "$preg"); fi
-  if [ -s "$dir/k" ] && [ -z "$h8" ]; then
+  if [ -s "$k/instance-key" ] && [ -z "$h8" ]; then
     info "build host: the registry bundle index stays off (assemblies-only AI bundle; MEMEX_BUILDHOST_REGISTRY_BUNDLES=1 opts in) — plugins layer as the cluster hosts take it"
   fi
-  if [ -s "$dir/k" ] && [ -z "$preg" ]; then
+  if [ -s "$k/instance-key" ] && [ -z "$preg" ]; then
     warn "build host: the code carries a registry key but no pluginsRegistry fact — the key is left out and the host attaches with the plain plugins contract (declare Hosting:Enrolment:Facts:pluginsRegistry on control)"
   fi
   fleet_accept_argv first-attach
-  ( bash "$fa" ${args[@]+"${args[@]}"} ${FLEET_ACCEPT_ARGV[@]+"${FLEET_ACCEPT_ARGV[@]}"} ) && ok "build host attached (first-attach, values from the code)" \
-    || warn "build host: first-attach failed — re-run 'memex-local fleet join' or first-attach.sh by hand"
+  local rc=0
+  ( bash "$fa" ${args[@]+"${args[@]}"} ${FLEET_ACCEPT_ARGV[@]+"${FLEET_ACCEPT_ARGV[@]}"} ) || rc=$?
+  rm -rf "$secrets"
+  if [ "$rc" = 0 ]; then
+    rm -rf "$k"
+    ok "build host attached (first-attach, values from the enrolment) — the kept items are removed"
+  fi
+  return "$rc"
 }
 
 # THE HEARTBEAT, WAITED FOR (2026-11-10, the second Mac Studio). The back-lease heartbeat runs in the Hosting
@@ -2826,17 +2871,26 @@ cmd_fleet() {
         fi
         if participation_build_host "$with_build"; then
           step "Build runners (a build VM sized from this host, KEDA; the release on its first attach)"
-          ( cmd_buildhost apply ) || warn "the build host did not finish — re-run 'memex-local buildhost apply'"
+          local vm_ok=yes
+          ( cmd_buildhost apply ) || { vm_ok=no; warn "the build VM did not finish (above)"; }
           if [ -d "$items" ]; then
-            fleet_apply_buildhost "$items"
-            # the release exists only now: size its runners to the plan (the apply above found no release to size)
-            ( cmd_buildhost apply ) >/dev/null 2>&1 && ok "build runners sized to the plan" || warn "the runners keep the chart's sizes — 'memex-local buildhost apply'"
+            if [ "$vm_ok" = yes ]; then
+              fleet_apply_buildhost "$items"
+              # the release exists only now: size its runners to the plan (the apply above found no release to size)
+              ( cmd_buildhost apply ) >/dev/null 2>&1 && ok "build runners sized to the plan" || warn "the runners keep the chart's sizes — 'memex-local buildhost apply'"
+            elif [ "$ACC_JOBS_ENABLED" = true ] && fleet_keep_buildhost_items "$items"; then
+              warn "the build host is NOT attached — fix the build VM (above), then 'memex-local buildhost attach' finishes it from the kept items (no rejoin)"
+            fi
           fi
         elif [ "$with_build" = "yes" ]; then
           info "No build host: the owner has not said YES to fleet jobs ($(participation_said Jobs)) — no build VM, runners or priority agent"
         fi
       else
         info "Apply it: memex-local update"
+        # the build items would leave with the join's temp files: keep them for 'buildhost attach'
+        if [ -d "$items" ] && participation_build_host "$with_build" && [ "$ACC_JOBS_ENABLED" = true ] && fleet_keep_buildhost_items "$items"; then
+          info "then the build host: memex-local buildhost attach (from the kept items — no rejoin)"
+        fi
       fi
       case "$hb_min" in ''|*[!0-9]*) die "--heartbeat-wait: minutes, a whole number (got '$hb_min')" ;; esac
       if [ "$do_update" = "yes" ] && [ "$hb_min" -gt 0 ] && registry_mode && colima_running; then
@@ -6943,44 +6997,100 @@ host_mem_gib() {
   local b; b="$(sysctl -n hw.memsize 2>/dev/null || awk '/^MemTotal:/ { print $2 * 1024 }' /proc/meminfo)"
   printf '%s' "$(( b / 1073741824 ))"
 }
-# The largest local model's size in whole GiB (rounded up) — it is resident in unified memory when it answers.
+# THE MODEL RESERVE (GiB, rounded up): the largest model this Mac ANSWERS with while the build VM runs — the token
+# models the owner OFFERS (backlease accept tokens … --token-models, when tokens are on; an idle-only model runs only
+# while the build VM is stopped for it, so it is not reserved) and this Mac's own chat model ($OLLAMA_MODEL), which
+# answers its portal whatever the token answer is. NOT every model `ollama list` holds: on the first Mac mini
+# (2026-11-15, 64 GiB) a pulled 23 GiB model nobody served any more refused the build VM outright. A model whose size
+# is unknown (not pulled, not in model_size_gib's table) reserves nothing and is said by `buildhost plan`.
+model_reserve_models() {
+  local m out="" idle=""
+  if [ "$(backlease_value Hosting__BackLease__Accept__Tokens__Enabled)" = true ]; then
+    idle=" $(accept_list Hosting__BackLease__Accept__Tokens__IdleOnlyModels) "
+    set -f
+    for m in $(accept_list Hosting__BackLease__Accept__Tokens__Models); do
+      case "$idle" in *" $m "*) continue ;; esac
+      case " $out " in *" $m "*) ;; *) out="${out:+$out }$m" ;; esac
+    done
+    set +f
+  fi
+  case "$OLLAMA_MODEL" in ''|none) ;; *) case " $out " in *" $OLLAMA_MODEL "*) ;; *) out="${out:+$out }$OLLAMA_MODEL" ;; esac ;; esac
+  printf '%s' "$out"
+}
 largest_model_gib() {
   [ -n "${MEMEX_MODEL_GIB:-}" ] && { printf '%s' "$MEMEX_MODEL_GIB"; return; }
-  command -v ollama >/dev/null 2>&1 || { printf 0; return; }
-  ollama list 2>/dev/null | awk 'NR > 1 { for (i = 1; i < NF; i++) if ($(i+1) ~ /^(GB|MB)$/) { v = ($(i+1) == "GB") ? $i : $i / 1024; if (v > m) m = v } }
-    END { printf "%d", (m == int(m)) ? m : int(m) + 1 }'
+  local m sz max=0
+  set -f
+  for m in $(model_reserve_models); do
+    sz="$(model_size_gib "$m")"
+    case "$sz" in ''|*[!0-9]*) continue ;; esac
+    [ "$sz" -le "$max" ] || max="$sz"
+  done
+  set +f
+  printf '%s' "$max"
 }
 
 # The plan, as key=value lines, from the host and the portal VM. Pure arithmetic over its inputs:
 #   build VM CPU   = cores − 2 (macOS and Ollama keep two)
-#   build VM GiB   = host − portal VM − largest model − headroom
-#   runners (max)  = VM CPU / CPU per runner, each with stage slots = CPU per runner, so the stage containers
-#                    of all runners together ≈ the VM's CPUs; KEDA keeps BUILD_MIN_WARM warm and scales to max
-#   runner memory  = (VM GiB − the VM's own system share) / max runners, capped; request = limit − 4 GiB
+#   build VM GiB   = host − portal VM − model reserve − headroom
+#   runners (max)  = the FEWEST of: VM CPU / CPU per runner, (VM GiB − the VM's system share) / 8 GiB (a runner's
+#                    least memory), and the runs the build disk holds — so a Mac mini plans fewer runners rather
+#                    than none (2026-11-15: 64 GiB, 18 cores → 4 by CPU, 1 by memory). Only when not even ONE runner
+#                    fits is the plan refused, and the error says which resource (kind=cores|memory|disk)
+#   runner CPU     = CPU per runner; when MEMORY cut the runners below what the CPU allows, the VM's CPU is shared
+#                    out over the runners that remain (each runner's stage slots = its CPU), so the cores the build
+#                    VM was given are not left idle
+#   runner memory  = (VM GiB − the VM's own system share) / runners, capped; request = limit − 4 GiB
 #   (host − portal VM: every OTHER Colima profile's memory is subtracted, see other_vms_gib)
+readonly BUILD_RUNNER_MIN_GIB=8                                     # one runner's memory limit, at least
 buildhost_plan() {
   # $3 (the portal VM's CPU) is not subtracted: the two VMs share the host's cores, and macOS schedules
   # whichever is busy; memory is not shared, so the portal VM's memory is.
   local cores="$1" mem="$2" pmem="$4" model="$5" per="$BUILD_CPU_PER_RUNNER"
   local cpu=$(( cores - 2 )) vmem=$(( mem - pmem - model - BUILD_HEADROOM_GIB ))
-  [ "$cpu" -ge "$per" ] || { echo "error=the host has $cores cores; a build VM needs at least $(( per + 2 )) (cores − 2 ≥ one runner's $per CPU)"; return 1; }
-  local runners=$(( cpu / per )) lim req
-  lim=$(( (vmem - BUILD_SYSTEM_GIB) / runners )); [ "$lim" -le "$BUILD_RUNNER_MAX_GIB" ] || lim="$BUILD_RUNNER_MAX_GIB"
-  [ "$lim" -ge 8 ] || { echo "error=only ${vmem} GiB left for the build VM (host ${mem} − portal VM ${pmem} − model ${model} − headroom ${BUILD_HEADROOM_GIB}); a runner needs at least 8 GiB"; return 1; }
-  req=$(( lim - 4 ))
+  [ "$cpu" -ge "$per" ] || { printf 'kind=cores\nerror=the host has %s cores; a build VM needs at least %s (cores − 2 ≥ one runner'"'"'s %s CPU)\n' "$cores" "$(( per + 2 ))" "$per"; return 1; }
+  local by_cpu=$(( cpu / per )) by_mem=0 runners lim req
+  [ "$vmem" -le "$BUILD_SYSTEM_GIB" ] || by_mem=$(( (vmem - BUILD_SYSTEM_GIB) / BUILD_RUNNER_MIN_GIB ))
+  [ "$by_mem" -ge 1 ] || { printf 'kind=memory\nerror=only %s GiB left for the build VM (host %s − portal VM %s − model %s − headroom %s); one runner needs %s GiB (%s for the runner, %s for the VM'"'"'s system)\n' "$vmem" "$mem" "$pmem" "$model" "$BUILD_HEADROOM_GIB" "$(( BUILD_RUNNER_MIN_GIB + BUILD_SYSTEM_GIB ))" "$BUILD_RUNNER_MIN_GIB" "$BUILD_SYSTEM_GIB"; return 1; }
+  runners="$by_cpu"; [ "$by_mem" -ge "$runners" ] || runners="$by_mem"
   local disk="${6:-}" disk_runs=""
   if [ -n "$disk" ]; then
     disk_runs="$(buildhost_disk_runs "$disk")"
-    [ "$disk_runs" -ge 1 ] || { echo "error=the build VM's disk of ${disk} GiB holds no run: ${disk} × $(( 100 - BUILD_DISK_HEADROOM_PCT )) % − cache $(buildhost_cache_gib "$disk") − images ${BUILD_IMAGES_GIB} − system ${BUILD_VM_SYSTEM_DISK_GIB} leaves less than one run's ${BUILD_RUN_DISK_GIB} GiB (it needs at least $(buildhost_disk_min) GiB)"; return 1; }
+    [ "$disk_runs" -ge 1 ] || { echo "kind=disk"; echo "error=the build VM's disk of ${disk} GiB holds no run: ${disk} × $(( 100 - BUILD_DISK_HEADROOM_PCT )) % − cache $(buildhost_cache_gib "$disk") − images ${BUILD_IMAGES_GIB} − system ${BUILD_VM_SYSTEM_DISK_GIB} leaves less than one run's ${BUILD_RUN_DISK_GIB} GiB (it needs at least $(buildhost_disk_min) GiB)"; return 1; }
     [ "$disk_runs" -ge "$runners" ] || runners="$disk_runs"
-    lim=$(( (vmem - BUILD_SYSTEM_GIB) / runners )); [ "$lim" -le "$BUILD_RUNNER_MAX_GIB" ] || lim="$BUILD_RUNNER_MAX_GIB"; req=$(( lim - 4 ))
   fi
+  # memory cut the runners: share the VM's CPU out over the ones that remain (never above what the VM has)
+  local rcpu="$per"
+  if [ "$by_mem" -lt "$by_cpu" ] && [ "$runners" -eq "$by_mem" ]; then rcpu=$(( cpu / runners )); fi
+  lim=$(( (vmem - BUILD_SYSTEM_GIB) / runners )); [ "$lim" -le "$BUILD_RUNNER_MAX_GIB" ] || lim="$BUILD_RUNNER_MAX_GIB"
+  req=$(( lim - 4 ))
   local minw="$BUILD_MIN_WARM"; [ "$minw" -le "$runners" ] || minw="$runners"
   # The CPU REQUEST sits half a core under the limit: k3s, KEDA and the kubelet request CPU too, and N runners
-  # requesting the VM's every core would leave the last one Pending. The limit still lets each use its 4.
+  # requesting the VM's every core would leave the last one Pending. The limit still lets each use its share.
   printf 'vm_cpu=%s\nvm_mem=%s\nrunners_min=%s\nrunners_max=%s\nrunner_cpu=%s\nrunner_cpu_request=%sm\nrunner_mem_request=%s\nrunner_mem_limit=%s\nstage_slots=%s\nstage_total=%s\n' \
-    "$cpu" "$vmem" "$minw" "$runners" "$per" "$(( per * 1000 - 500 ))" "$req" "$lim" "$per" "$(( runners * per ))"
+    "$cpu" "$vmem" "$minw" "$runners" "$rcpu" "$(( rcpu * 1000 - 500 ))" "$req" "$lim" "$rcpu" "$(( runners * rcpu ))"
   [ -z "$disk" ] || printf 'vm_disk=%s\ndisk_runs=%s\n' "$disk" "$disk_runs"
+  [ "$runners" -ge "$by_cpu" ] || printf 'limited_by=%s\n' "$( [ "$runners" -eq "$by_mem" ] && echo memory || echo disk)"
+}
+# The readings behind a refused plan, by its kind: $1 kind, $2 other VMs GiB, $3 free disk GiB, $4 other VMs' disk growth,
+# $5 the build VM's disk (empty when none). (A function, not a `case` inside $( ): bash 3.2 cannot parse that.)
+buildhost_plan_context() {
+  if [ "$1" = memory ]; then
+    printf "host: %s GiB; other VMs %s GiB (the portal's included); model reserve %s GiB — the largest of: %s" \
+      "$(host_mem_gib)" "$2" "$(largest_model_gib)" "$(model_reserve_models | sed 's/ /, /g')"
+  else
+    printf 'host: %s GiB free on the Colima volume, %s GiB kept for macOS and models, other VMs may still grow by %s GiB' "$3" "$BUILD_HOST_DISK_RESERVE_GIB" "$4"
+    [ -z "$5" ] || printf ' — the build VM has %s GiB' "$5"
+    printf '.'
+  fi
+}
+# The remedy for a refused plan, by the resource that refused it ($1 = the plan's kind).
+buildhost_plan_remedy() {
+  case "$1" in
+    memory) printf '%s' "Remedy: this Mac's MEMORY — offer a smaller token model ('memex-local backlease accept tokens --token-models <smaller model>', or --idle-only-models <the large one> to serve it only while the build VM is idle), stop another Colima VM, or answer NO to jobs ('memex-local backlease accept jobs --off')." ;;
+    cores) printf '%s' "Remedy: none on this Mac — it has too few cores for a build VM; answer NO to jobs ('memex-local backlease accept jobs --off')." ;;
+    *) printf '%s' "Remedy: free disk on this Mac (then 'memex-local buildhost apply --resize'), or answer NO to jobs ('memex-local backlease accept jobs --off')." ;;
+  esac
 }
 # How many runs at once the build VM's disk holds (whole runs; pure).
 # The cache budget a build disk of $1 GiB gets (GiB; pure): what is left once images, the VM's system and ONE run are
@@ -7130,7 +7240,7 @@ buildHosts:
   mac: {minReplicas: $(plan_value runners_min "$plan"), maxReplicas: $(plan_value runners_max "$plan")}
   resources:
     requests: {cpu: "$(plan_value runner_cpu_request "$plan")", memory: "$(plan_value runner_mem_request "$plan")Gi"}
-    limits: {cpu: "${BUILD_CPU_PER_RUNNER}", memory: "$(plan_value runner_mem_limit "$plan")Gi"}
+    limits: {cpu: "$(plan_value runner_cpu "$plan")", memory: "$(plan_value runner_mem_limit "$plan")Gi"}
   stageSlots: $(plan_value stage_slots "$plan")
   cache: {sizeEnforced: false, maxGi: $c, shares: {treeGi: $t, slicesGi: $sl, nugetGi: $n, refsetsGi: $r, preparedGi: $p}}
 YAML
@@ -7186,6 +7296,21 @@ buildhost_disk_report() {
 cmd_buildhost() {
   local sub="${1:-status}"; shift || true
   if [ "$sub" = idle ]; then cmd_buildhost_idle "$@"; return; fi
+  if [ "$sub" = attach ]; then
+    # FINISH A BUILD HOST WITHOUT A REJOIN (2026-11-15): the build VM, then the release from the items the join kept,
+    # then the runners sized to the plan. Idempotent — an attached host is re-attached onto the current set.
+    [ $# -eq 0 ] || die "buildhost attach: takes no arguments"
+    [ "$(participation_answer Jobs)" = true ] \
+      || die "buildhost attach: the owner has not said YES to fleet jobs on this Mac ($(participation_said Jobs)) — 'memex-local backlease accept jobs --from <instances>' first"
+    accept_load
+    [ -d "$BUILD_KEEP_DIR" ] || die "buildhost attach: this Mac kept no build items ($BUILD_KEEP_DIR) — they come with a fleet join: re-run 'memex-local fleet join' (one Approve on control re-issues them)"
+    step "The build VM (sized from this Mac)"
+    ( cmd_buildhost apply ) || die "buildhost attach: the build VM is not ready (above) — fix that first; the kept items stay for the next 'memex-local buildhost attach'"
+    step "The build-host release (first-attach, values from the items the join kept)"
+    buildhost_attach || die "buildhost attach: first-attach did not finish (above) — the kept items stay ($BUILD_KEEP_DIR); re-run 'memex-local buildhost attach'"
+    ( cmd_buildhost apply ) >/dev/null 2>&1 && ok "build runners sized to the plan" || warn "the runners keep the attach's sizes — 'memex-local buildhost apply'"
+    return 0
+  fi
   [ "$sub" = apply ] && [ "$(participation_answer Jobs)" = false ] \
     && die "buildhost apply: the owner said NO to fleet jobs on this Mac ($BACKLEASE_FILE) — no build host is installed. To opt in: memex-local backlease accept jobs --from <instances>"
   buildhost_tools
@@ -7209,17 +7334,18 @@ cmd_buildhost() {
   case " $* " in *" --resize "*) [ -z "$have_disk" ] || [ "$want_disk" -le "$have_disk" ] || disk="$want_disk" ;; esac
   plan="$(buildhost_plan "$(host_cores)" "$(host_mem_gib)" "$COLIMA_CPU" "$others" "$(largest_model_gib)" "$disk")" \
     || die "buildhost: $(plan_value error "$plan")
-     host: ${free} GiB free on the Colima volume, ${BUILD_HOST_DISK_RESERVE_GIB} GiB kept for macOS and models, other VMs may still grow by ${growth:-0} GiB$( [ -n "$have_disk" ] && printf ' — the build VM has %s GiB' "$have_disk").
-     Remedy: free disk on this Mac (then 'memex-local buildhost apply --resize'), or answer NO to jobs ('memex-local backlease accept jobs --off')."
+     $(buildhost_plan_context "$(plan_value kind "$plan")" "$others" "$free" "${growth:-0}" "$have_disk")
+     $(buildhost_plan_remedy "$(plan_value kind "$plan")")"
   local cpu vmem
   cpu="$(plan_value vm_cpu "$plan")"; vmem="$(plan_value vm_mem "$plan")"
   case "$sub" in
     plan)
       [ $# -eq 0 ] || die "buildhost plan: takes no arguments"
-      info "host: $(host_cores) cores, $(host_mem_gib) GiB; other VMs ${others} GiB (the portal's included); largest model $(largest_model_gib) GiB"
+      info "host: $(host_cores) cores, $(host_mem_gib) GiB; other VMs ${others} GiB (the portal's included); model reserve $(largest_model_gib) GiB (the largest this Mac answers with: $(model_reserve_models | sed 's/ /, /g'))"
       info "build VM (profile $BUILD_PROFILE): ${cpu} CPU / ${vmem} GiB / disk ${disk} GiB$( [ -n "$have_disk" ] && [ "$want_disk" -gt "$have_disk" ] && printf ' (this Mac could back %s — apply --resize grows it)' "$want_disk")"
       info "disk: ${free} GiB free on this Mac; the disk holds $(plan_value disk_runs "$plan") run(s) of ${BUILD_RUN_DISK_GIB} GiB at once beside a cache budget of $(buildhost_cache_gib "$disk") GiB (shares tree/slices/nuget/refsets/prepared: $(buildhost_cache_shares "$(buildhost_cache_gib "$disk")" | tr ' ' '/')), images ${BUILD_IMAGES_GIB}, ${BUILD_DISK_HEADROOM_PCT} % kept free"
-      info "runners: $(plan_value runners_min "$plan") warm … $(plan_value runners_max "$plan") (KEDA), each ${BUILD_CPU_PER_RUNNER} CPU / $(plan_value runner_mem_request "$plan")–$(plan_value runner_mem_limit "$plan") GiB, $(plan_value stage_slots "$plan") stage slots → up to $(plan_value stage_total "$plan") stage containers at once"
+      info "runners: $(plan_value runners_min "$plan") warm … $(plan_value runners_max "$plan") (KEDA), each $(plan_value runner_cpu "$plan") CPU / $(plan_value runner_mem_request "$plan")–$(plan_value runner_mem_limit "$plan") GiB, $(plan_value stage_slots "$plan") stage slots → up to $(plan_value stage_total "$plan") stage containers at once"
+      [ "$(plan_value limited_by "$plan")" != memory ] || info "fewer runners than the cores allow: MEMORY limits them (each needs at least ${BUILD_RUNNER_MIN_GIB} GiB) — a smaller token model frees more"
       ;;
     apply)
       local resize="no"
@@ -7286,14 +7412,23 @@ cmd_buildhost() {
       buildhost_gc_args_check
       buildhost_gc || true
       if helm --kube-context "$(build_ctx)" -n "$BUILD_NS" status "$BUILD_RELEASE" >/dev/null 2>&1; then
-        step "Sizing the runners: $(plan_value runners_min "$plan")…$(plan_value runners_max "$plan") × ${BUILD_CPU_PER_RUNNER} CPU, $(plan_value stage_slots "$plan") stage slots"
+        step "Sizing the runners: $(plan_value runners_min "$plan")…$(plan_value runners_max "$plan") × $(plan_value runner_cpu "$plan") CPU, $(plan_value stage_slots "$plan") stage slots"
         local sizing; sizing="$(buildhost_write_sizing "$plan" "$disk")"
         helm --kube-context "$(build_ctx)" -n "$BUILD_NS" upgrade "$BUILD_RELEASE" "$(resolve_chart)" --reuse-values -f "$sizing" >/dev/null \
           || die "buildhost: helm could not size the release $BUILD_RELEASE"
         ok "cache budget $(buildhost_cache_gib "$disk") GiB on the ${disk} GiB build disk (one run of ${BUILD_RUN_DISK_GIB} GiB + ${BUILD_DISK_HEADROOM_PCT} % still fits) — $sizing, which the release follower layers over the Mac values"
         ok "runners sized: up to $(plan_value stage_total "$plan") stage containers at once"
       else
-        warn "no build-host release yet: the first attach installs it with this Mac's worker token (MeshWeaver.Deploy deploy/backlease/first-attach.sh --profile $BUILD_PROFILE …); then re-run 'memex-local buildhost apply' to size it. Target: the token arrives through the enrolment channel (Hosting/MacStudioFleet §2b.5)"
+        # The sizing is written NOW, before any release exists: the first attach layers it (first-attach.sh reads
+        # <home>/buildhost-follow/<profile>/sizing.yaml) — without it the attach checked the values file's defaults
+        # (two standing 20 GiB runners) against a Mac mini's build VM and refused at 0/6 (2026-11-15).
+        local sizing0; sizing0="$(buildhost_write_sizing "$plan" "$disk")"
+        ok "this Mac's runner sizing is written for the first attach ($sizing0)"
+        if [ -d "$BUILD_KEEP_DIR" ]; then
+          info "no build-host release yet — the build items this Mac's join kept are here: 'memex-local buildhost attach' installs it"
+        else
+          warn "no build-host release yet: 'memex-local buildhost attach' installs it from the items a fleet join keeps (none kept here: re-run 'memex-local fleet join', whose Approve on control re-issues them — Hosting/MacStudioFleet §2b.5)"
+        fi
       fi
       ;;
     status)
@@ -7320,7 +7455,7 @@ print("  runners %s…%s, %s stage slots, requests %s, limits %s" % (m.get("minR
     net) shift_net_cmd "$BUILD_PROFILE" "$@" ;;
     gc) [ $# -eq 0 ] || die "buildhost gc: takes no arguments"; buildhost_gc ;;
     disk) [ $# -eq 0 ] || die "buildhost disk: takes no arguments"; buildhost_disk_report ;;
-    *) die "usage: memex-local buildhost {plan | apply [--resize] | status | gc | disk | priority [install|off|status] | net [apply|measure|off|status] | idle [status|apply|off]}" ;;
+    *) die "usage: memex-local buildhost {plan | apply [--resize] | attach | status | gc | disk | priority [install|off|status] | net [apply|measure|off|status] | idle [status|apply|off]}" ;;
   esac
 }
 
@@ -7610,12 +7745,18 @@ COMMANDS:
                   (--sha256 or the managed preference FleetCaSha256) and that the certificate carries
                   those constraints, installs both as mkcert's CA and re-issues the portal's
                   certificate under it. The key is never printed (fingerprints only).
-  buildhost plan | apply [--resize] | status | priority [install|off|status]
+  buildhost plan | apply [--resize] | attach | status | priority [install|off|status]
                   BUILD RUNNERS sized from this host: a build VM (Colima profile build, containerd)
-                  of cores − 2 CPU and host − portal VM − largest model − headroom GiB; runners of
-                  4 CPU with 4 stage slots each, 1 warm … VM CPU / 4 under KEDA, so the stage
-                  containers together fill the VM. 'apply' creates the VM and KEDA and sizes an
-                  installed release; --resize restarts a smaller VM at the planned size.
+                  of cores − 2 CPU and host − portal VM − model reserve − headroom GiB (the reserve:
+                  the largest model this Mac answers with — the token models it OFFERS, not
+                  idle-only ones, and its own chat model; not every pulled model); runners of
+                  4 CPU with 4 stage slots each, 1 warm … VM CPU / 4 under KEDA — FEWER when the
+                  memory holds fewer (each at least 8 GiB), each then given a larger CPU share;
+                  refused only when not even one fits, naming the resource and its remedy.
+                  'apply' creates the VM and KEDA and sizes an installed release (or writes the
+                  sizing the first attach uses); --resize restarts a smaller VM at the planned size.
+                  'attach' installs the release from the build items a fleet join KEPT (a join
+                  whose build step failed needs no rejoin) and sizes it.
                   Fleet jobs run at the LOWEST priority: 'apply' also loads a launchd governor that
                   puts the build VM in the background band while the owner, the portal VM or Ollama
                   want the cores, and gives it every idle core otherwise ('priority off' removes it).

@@ -7,11 +7,33 @@ portal that `memex-local` runs stays in its own profile (`default`), and Ollama 
 | What | Where |
 |---|---|
 | Size the build VM and the runners from the host | `memex-local buildhost plan \| apply [--resize] \| status` (`deploy/homebrew/bin/memex-local`) |
-| First attach: AppArmor profile, Secrets, the `build-host-mac` release | `first-attach.sh` (this directory), header for the steps |
+| First attach: AppArmor profile, Secrets, the `build-host-mac` release | `first-attach.sh` (this directory), header for the steps; `memex-local buildhost attach` runs it from the items a join kept |
 | Following the sealed set from then on (no hand re-attach to move a set) | `follow-set.py` (this directory), installed by `first-attach.sh` step 6 |
 | The runners' values | `build-host-mac.values.yaml` |
 | Fleet jobs at the lowest priority | `deploy/homebrew/share/buildhost-priority.sh` (below) |
 | Fleet traffic yields to the owner's network | `deploy/homebrew/share/vm-netshape.sh` (below) |
+
+## Sizing: fewer runners before none, and the reserve is what the Mac SERVES (2026-11-15)
+
+Measured on the first Mac mini (18 cores, 64 GiB, portal VM 16 GiB): `buildhost plan` refused it outright — 4 runners
+by CPU, `(17 − 4) / 4` GiB each, under the 8 GiB a runner needs — and blamed the disk. The plan now:
+
+- **fits the runner COUNT to every resource**: runners = the fewest of `VM CPU / 4`, `(VM GiB − 4) / 8` and the runs
+  the build disk holds. When memory is the limit, the VM's CPU is shared out over the runners that remain (that mini:
+  one runner of 16 CPU / 13 GiB, 16 stage slots). It refuses only when not even one runner fits, and the error names
+  the resource (`kind=memory|cores|disk`) with that resource's remedy — for memory, a smaller token model, an
+  idle-only model, or NO to jobs; never "free disk".
+- **reserves the largest model the Mac ANSWERS with**: the token models the owner offers (`backlease accept tokens
+  --token-models`, idle-only ones excluded — they run only while the build VM is stopped) and its own chat model. A
+  pulled model nobody serves reserves nothing; the mini's refusal came from a 23 GiB model still in `ollama list`.
+- **writes the sizing before the release exists** (`~/.memex-local/buildhost-follow/<profile>/sizing.yaml`).
+  `first-attach.sh` checks the fit with it and installs the release with it, as the follower already upgrades with it.
+  Without it the attach checked the values file's two standing 20 GiB runners against a 17 GiB VM and stopped at 0/6.
+
+**A join whose build step failed needs no rejoin.** The worker token, the pull password, the optional registry key and
+their facts are kept in `~/.memex-local/enrol/buildhost/` (0700, files 0600) until an attach succeeds; `memex-local
+buildhost attach` finishes it (build VM → release → sizing) and removes them. Before, the join removed them with its
+other temp files, and the only way back was a fresh join with a second Approve on control.
 
 ## The host follows the sealed set — never re-run first-attach to move it
 

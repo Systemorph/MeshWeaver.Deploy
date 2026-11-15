@@ -1819,7 +1819,7 @@ ARGV="$(cd "$FJ/globdir" && fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="contro
 ARGV="$(fj_lib 'ACC_JOBS_ENABLED=true; ACC_JOBS_FROM="a.example b.example"; ACC_JOBS_CHANNELS="mac"; ACC_TOK_ENABLED=true; ACC_TOK_FROM="*.example.test"; ACC_TOK_MODELS="qwen3.6 qwen3.8:27b-mlx"; ACC_TOK_RES=CH; fleet_accept_argv; printf "[%s]\n" "${FLEET_ACCEPT_ARGV[@]}"')"
 [ "$(printf '%s\n' "$ARGV" | wc -l | tr -d ' ')" = 5 ] && printf '%s' "$ARGV" | grep -qx '\[--token-models=qwen3.6 qwen3.8:27b-mlx\]' \
   && ok "backlease enroll gets every answer as one word per flag" || bad "accept argv for backlease" "$ARGV"
-grep -q 'if \[ "${MEMEX_BUILDHOST_REGISTRY_BUNDLES:-0}" = 1 \] && \[ -s "$dir/k" \] && \[ -n "$preg" \]; then h8=1' "$CLI" && ok "the registry bundle index (H8) is opt-in: the key goes to first-attach only with MEMEX_BUILDHOST_REGISTRY_BUNDLES=1 AND the registry URL" || bad "H8 opt-in gate" "missing"
+grep -q 'if \[ "${MEMEX_BUILDHOST_REGISTRY_BUNDLES:-0}" = 1 \] && \[ -s "$k/instance-key" \] && \[ -n "$preg" \]; then h8=1' "$CLI" && ok "the registry bundle index (H8) is opt-in: the key goes to first-attach only with MEMEX_BUILDHOST_REGISTRY_BUNDLES=1 AND the registry URL" || bad "H8 opt-in gate" "missing"
 ! grep -q 'SC2046' "$CLI" || bad "no unquoted accept substitution remains" "$(grep -n SC2046 "$CLI")"
 grep -q -- '--auth-key="file:$dir/t"' "$CLI" && ok "as root the pre-auth key goes to tailscale by FILE reference on the root daemon's socket" || bad "tailscale auth by file" "missing"
 grep -q 'cmd_internal on --tenant "$tenant" --client-id "$cid" < "$dir/e"' "$CLI" && grep -q '< "$dir/n" )' "$CLI" \
@@ -2464,11 +2464,35 @@ grep -q '^vm_mem=81$' <<<"$P" && grep -q '^runner_mem_limit=19$' <<<"$P" && grep
 P="$(lib buildhost_plan 12 36 4 8 0)"
 grep -q '^runners_max=2$' <<<"$P" && grep -q '^runner_mem_limit=8$' <<<"$P" && ok "a smaller Mac gets fewer runners (12 cores → 2), never an over-committed one" || bad "plan small" "$P"
 P="$(lib buildhost_plan 5 64 4 8 0 2>&1)" && bad "a 5-core host is refused" "$P" || { grep -q 'at least 6' <<<"$P" && ok "a host without room for one runner is refused, with the reason" || bad "few cores reason" "$P"; }
-P="$(lib buildhost_plan 18 32 8 16 0 2>&1)" && bad "a memory-starved host is refused" "$P" || { grep -q 'needs at least 8 GiB' <<<"$P" && ok "a host without memory for one runner is refused, with the arithmetic" || bad "low memory reason" "$P"; }
+P="$(lib buildhost_plan 18 32 8 16 0 2>&1)" && bad "a memory-starved host is refused" "$P" || { grep -q 'one runner needs 12 GiB' <<<"$P" && grep -q '^kind=memory$' <<<"$P" && ok "a host without memory for ONE runner is refused, with the arithmetic and kind=memory" || bad "low memory reason" "$P"; }
+# THE MAC MINI (2026-11-15: wildberg, 18 cores / 64 GiB, portal VM 16, a 23 GiB token model): 4 runners by CPU, 1 by
+# memory — planned as ONE runner with the VM's 16 CPU, never refused.
+P="$(lib buildhost_plan 18 64 8 16 23)"
+grep -q '^vm_mem=17$' <<<"$P" && grep -q '^runners_max=1$' <<<"$P" && grep -q '^runner_cpu=16$' <<<"$P" && grep -q '^stage_slots=16$' <<<"$P" \
+  && grep -q '^runner_mem_limit=13$' <<<"$P" && grep -q '^runner_cpu_request=15500m$' <<<"$P" && grep -q '^limited_by=memory$' <<<"$P" \
+  && ok "a 64 GiB Mac mini with a 23 GiB token model gets ONE runner (16 CPU / 13 GiB, 16 stage slots), limited_by=memory — not a refusal" || bad "plan mini" "$P"
+P="$(lib buildhost_plan 18 64 8 16 18)"
+grep -q '^runners_max=2$' <<<"$P" && grep -q '^runner_cpu=8$' <<<"$P" && grep -q '^runner_mem_limit=9$' <<<"$P" \
+  && ok "…and with an 18 GiB token model TWO runners of 8 CPU / 9 GiB (each at least 8 GiB)" || bad "plan mini 18" "$P"
+P="$(lib buildhost_plan 18 64 8 16 30 2>&1)" && bad "a mini with a 30 GiB model planned a runner" "$P" \
+  || { grep -q '^kind=memory$' <<<"$P" && ok "…and only when not even one runner fits is it refused (kind=memory)" || bad "plan mini refuse" "$P"; }
+grep -q 'offer a smaller token model' <<<"$(lib buildhost_plan_remedy memory)" && ! grep -q 'free disk' <<<"$(lib buildhost_plan_remedy memory)" && grep -q 'free disk' <<<"$(lib buildhost_plan_remedy disk)" \
+  && ok "a MEMORY refusal names memory remedies (a smaller token model), never 'free disk'; a disk refusal names disk" || bad "remedy by kind" "$(lib buildhost_plan_remedy memory)"
 P="$(env MEMEX_BUILD_MIN_WARM=9 MEMEX_LOCAL_LIB=1 bash -c '. "$0"; buildhost_plan 18 128 8 16 0' "$CLI")"
 grep -q '^runners_min=4$' <<<"$P" && ok "the warm floor never exceeds the ceiling" || bad "min clamp" "$P"
-M="$(env MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c '. "$0"; ollama() { printf "%s\n" "NAME ID SIZE MODIFIED" "qwen3.6:latest abc 23.4 GB 2 days ago" "qwen2.5:0.5b def 397 MB 3 days ago"; }; largest_model_gib' "$CLI")"
-[ "$M" = 24 ] && ok "the largest model's size is read from 'ollama list' and rounded UP (23.4 GB → 24)" || bad "largest model" "$M"
+# THE MODEL RESERVE (2026-11-15): the largest model this Mac ANSWERS with — the offered token models (idle-only ones not
+# reserved) and its own chat model — never a pulled model nobody serves.
+MR="$(mktemp -d)"
+mr() { env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$MR" MEMEX_OLLAMA_MODEL="${MR_OWN:-qwen2.5:0.5b}" PATH="$STUBS:$PATH" bash -c '. "$0"; ollama() { printf "%s\n" "NAME ID SIZE MODIFIED" "qwen3.6:latest abc 23.4 GB 2 days ago" "qwen3.8:27b-mlx ghi 17.2 GB 1 day ago" "qwen2.5:0.5b def 397 MB 3 days ago"; }; '"$1" "$CLI"; }
+printf 'config:\n  memex_portal:\n    Hosting__BackLease__Accept__Tokens__Enabled: "true"\n    Hosting__BackLease__Accept__Tokens__Models__0: "qwen3.8:27b-mlx"\n    Hosting__BackLease__Accept__Tokens__Models__1: "qwen3.6"\n' > "$MR/backlease.yaml"
+[ "$(mr largest_model_gib)" = 24 ] && ok "the reserve is the largest OFFERED token model, sized from 'ollama list' and rounded UP (qwen3.6 23.4 GB → 24)" || bad "reserve offered" "$(mr largest_model_gib)"
+printf '    Hosting__BackLease__Accept__Tokens__IdleOnlyModels__0: "qwen3.6"\n' >> "$MR/backlease.yaml"
+[ "$(mr largest_model_gib)" = 18 ] && ok "an IDLE-ONLY model is not reserved (it runs only while the build VM is stopped): qwen3.8:27b-mlx → 18" || bad "reserve idle-only" "$(mr largest_model_gib)"
+printf 'config:\n  memex_portal:\n    Hosting__BackLease__Accept__Tokens__Enabled: "false"\n    Hosting__BackLease__Accept__Tokens__Models__0: "qwen3.6"\n' > "$MR/backlease.yaml"
+[ "$(mr largest_model_gib)" = 1 ] && ok "tokens OFF: only this Mac's own chat model is reserved — a pulled 23 GB model nobody serves reserves nothing" || bad "reserve tokens off" "$(mr largest_model_gib)"
+[ "$(MR_OWN=qwen3.8:27b-mlx mr largest_model_gib)" = 18 ] && ok "…and the Mac's own chat model counts whatever the token answer (qwen3.8:27b-mlx → 18)" || bad "reserve own model" "$(MR_OWN=qwen3.8:27b-mlx mr largest_model_gib)"
+[ "$(MR_OWN=none mr largest_model_gib)" = 0 ] && ok "…and with no chat model and no tokens nothing is reserved" || bad "reserve none" "$(MR_OWN=none mr largest_model_gib)"
+rm -rf "$MR"
 # apply against recording stubs: a missing VM is created at the plan; an installed release is sized; never the portal's context.
 BH="$(mktemp -d)"; mkdir -p "$BH/stubs"
 # launchctl, taskpolicy and lsof are stubbed too: apply loads the priority governor, and a test on a developer's
@@ -2494,8 +2518,9 @@ mkdir -p "$BH/prefix"
 bh() { env PATH="$BH/stubs:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" MEMEX_PREFIX="$BH/prefix" HOME="$BH" MEMEX_LOCAL_HOME="$BH/.memex-local" MEMEX_NET_NO_MEASURE=1 MEMEX_K3S_STABLE_S=0 MEMEX_K3S_POLL_S=0 MEMEX_K3S_HEALTH_S=2 MEMEX_BUILD_DISK_MAX_GIB=300 MEMEX_HOST_DISK_FREE_GIB="${BH_FREE:-400}" MEMEX_HOST_CORES=18 MEMEX_HOST_MEM_GIB=128 MEMEX_MODEL_GIB=0 MEMEX_COLIMA_CPU=8 MEMEX_COLIMA_MEM=16 MEMEX_CHART_DIR="$HERE/../../helm" "$@"; }
 OUT="$(bh "$CLI" buildhost apply 2>&1)"
 grep -q 'colima start -p build --cpu 16 --memory 104 --disk 300 --runtime containerd --kubernetes' "$BH/log" && grep -q 'kubectl --context colima-build get crd scaledobjects.keda.sh' "$BH/log" \
-  && case "$OUT" in *"first attach installs it"*) true ;; *) false ;; esac \
-  && ok "apply creates the build VM at the plan (containerd, k3s), checks KEDA in colima-build, and names the first attach for a missing release" || bad "apply create" "$OUT / $(cat "$BH/log")"
+  && case "$OUT" in *"buildhost attach"*) true ;; *) false ;; esac \
+  && grep -q 'mac: {minReplicas: 1, maxReplicas: 4}' "$BH/.memex-local/buildhost-follow/build/sizing.yaml" \
+  && ok "apply creates the build VM at the plan (containerd, k3s), checks KEDA in colima-build, writes the sizing the first attach layers, and names 'buildhost attach' for a missing release" || bad "apply create" "$OUT / $(cat "$BH/log")"
 grep -q 'colima ssh -p build -- sudo systemctl restart mw-netshape.service' "$BH/log" && [ -f "$BH/.memex-local/netshape-build.env" ] \
   && ok "apply also shapes the build VM's network (mw-netshape.service in the VM) and records the rates" || bad "apply netshape" "$(grep netshape "$BH/log")"
 : > "$BH/log"
@@ -2523,6 +2548,8 @@ grep -q '^launchctl bootstrap gui/[0-9]* .*/Library/LaunchAgents/com.memex.local
   && [ -x "$BH/.memex-local/buildhost-priority.sh" ] \
   && ok "apply loads the priority governor (launchd agent for profile build, script copied to ~/.memex-local)" || bad "apply priority governor" "$(cat "$BH/log")"
 OUT="$(bh MEMEX_HOST_MEM_GIB=abc "$CLI" buildhost plan 2>&1)" && bad "a non-numeric probe was used" "$OUT" || { case "$OUT" in *"instead of a whole number"*) ok "a host probe that is not a whole number stops the plan (never sized from 0)" ;; *) bad "probe validation" "$OUT" ;; esac; }
+OUT="$(bh MEMEX_HOST_MEM_GIB=64 MEMEX_MODEL_GIB=30 "$CLI" buildhost plan 2>&1)" && bad "a mini with a 30 GiB model planned" "$OUT" \
+  || { case "$OUT" in *"MEMORY"*"smaller token model"*) case "$OUT" in *"free disk"*) bad "memory refusal names disk" "$OUT" ;; *) ok "buildhost plan's memory refusal names the model reserve and the memory remedy (not disk)" ;; esac ;; *) bad "plan memory refusal" "$OUT" ;; esac; }
 echo "── buildhost: the build VM's disk is sized from this Mac, the runners from the disk (2026-11-11) ──"
 : > "$BH/log"; bh "$CLI" buildhost apply >/dev/null 2>&1
 grep -q -- '--k3s-arg=--kubelet-arg=image-gc-high-threshold=60 --k3s-arg=--kubelet-arg=image-gc-low-threshold=45 --k3s-arg=--kube-controller-manager-arg=terminated-pod-gc-threshold=5' "$BH/log" \
@@ -2638,8 +2665,8 @@ grep -q 'MEMEX_HEADLESS=1 .*buildhost-priority.sh" --install' "$HERE/../../macos
   && ok "the unattended daemon starts the governor headless after every boot, once installed" || bad "daemon starts governor" ""
 
 FJB="$(awk '/^cmd_fleet\(\) \{/,/^}$/' "$CLI")"
-grep -q '( cmd_buildhost apply ) || warn' <<<"$FJB" && grep -q -- '--no-buildhost) with_build="no"' <<<"$FJB" \
-  && ok "fleet join runs buildhost apply by default (--no-buildhost skips it), and a failure there never ends the join" || bad "fleet join buildhost" ""
+grep -q '( cmd_buildhost apply ) || { vm_ok=no; warn' <<<"$FJB" && grep -qF 'fleet_keep_buildhost_items "$items"' <<<"$FJB" && grep -q -- '--no-buildhost) with_build="no"' <<<"$FJB" \
+  && ok "fleet join runs buildhost apply by default (--no-buildhost skips it); a failure there never ends the join and KEEPS the build items for 'buildhost attach'" || bad "fleet join buildhost" ""
 # back-lease: the owner DECLARES how full a leased Mac may get.
 [ "$(lib percent_arg 85 --x)" = 85 ] && [ "$(lib percent_arg 85% --x)" = 85 ] && ok "a threshold is a whole percentage (85 or 85%)" || bad "percent ok" ""
 lib percent_arg 5 --x >/dev/null 2>&1 && bad "5% accepted" "" || ok "a threshold below 10% is refused"
@@ -3663,19 +3690,39 @@ OUT2="$(PATH="$PY/bin:$FAO/bin:$PATH" MEMEX_ATTACH_VENV="$PY/venv" MEMEX_HEADLES
 rm -rf "$PY"
 
 echo "── fleet join attaches the build host WITHOUT the registry bundle index by default (2026-11-10) ──────"
-JH="$(mktemp -d)"; mkdir -p "$JH/code"
+JH="$(mktemp -d)"; mkdir -p "$JH/code" "$JH/home"
 printf '{"f":{"buildApi":"https://ops.example.test/api/builds","buildRegistry":"r.example.test","pullUser":"u","pluginsRegistry":"https://reg.example.test"}}' > "$JH/code/code.json"
 printf 'w' > "$JH/code/w"; printf 'p' > "$JH/code/p"; printf 'mwi_k' > "$JH/code/k"
-printf '#!/bin/bash\necho "$*" > "%s/args"\nls "%s/code/build" > "%s/files"\n' "$JH" "$JH" "$JH" > "$JH/fa.sh"
-fja() { env MEMEX_LOCAL_LIB=1 MEMEX_FIRST_ATTACH="$JH/fa.sh" "$@" bash -c '. "$0"; ACC_JOBS_ENABLED=true; ACC_TOK_ENABLED=false; fleet_apply_buildhost "$1"' "$CLI" "$JH/code" 2>&1; }
+# the stub first-attach records its argv and the files of the --secrets-from directory, and exits FA_RC
+cat > "$JH/fa.sh" <<FASTUB
+#!/bin/bash
+echo "\$*" > "$JH/args"
+d="\$(printf '%s' "\$*" | sed -n 's/.*--secrets-from \([^ ]*\).*/\1/p')"
+ls "\$d" > "$JH/files"
+exit "\${FA_RC:-0}"
+FASTUB
+fja() { env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$JH/home" MEMEX_FIRST_ATTACH="$JH/fa.sh" "$@" bash -c '. "$0"; ACC_JOBS_ENABLED=true; ACC_TOK_ENABLED=false; fleet_apply_buildhost "$1"' "$CLI" "$JH/code" 2>&1; }
 OUT="$(fja)"
 ! grep -q -- "--plugins-registry" "$JH/args" && ! grep -qx instance-key "$JH/files" && grep -q "bundle index stays off" <<<"$OUT" \
   && ok "fleet join's build-host attach leaves the registry bundle index OFF by default (an H8 host never claims on the assemblies-only AI bundle)" \
   || bad "join h8 default" "args=$(cat "$JH/args") files=$(tr '\n' ' ' < "$JH/files") $OUT"
-rm -rf "$JH/code/build"
+grep -q -- "--profile build " "$JH/args" && [ ! -e "$JH/home/enrol/buildhost" ] && ! ls "$JH/home/enrol" | grep -q '^attach\.' \
+  && ok "a SUCCESSFUL attach removes the kept build items and its secrets directory (the cluster's Secrets hold them now)" || bad "attach cleanup" "$(ls -la "$JH/home/enrol" 2>&1) $OUT"
 OUT="$(fja MEMEX_BUILDHOST_REGISTRY_BUNDLES=1)"
 grep -q -- "--plugins-registry https://reg.example.test" "$JH/args" && grep -qx instance-key "$JH/files" \
   && ok "…and MEMEX_BUILDHOST_REGISTRY_BUNDLES=1 opts in (key file + --plugins-registry)" || bad "join h8 opt-in" "args=$(cat "$JH/args") $OUT"
+echo "── a join whose build step failed KEEPS the build items; 'buildhost attach' finishes it, no rejoin (2026-11-15) ──"
+OUT="$(fja FA_RC=1)"
+K="$JH/home/enrol/buildhost"
+[ "$(cat "$K/worker" 2>/dev/null)" = w ] && [ "$(cat "$K/pull")" = p ] && [ "$(cat "$K/api")" = https://ops.example.test/api/builds ] && [ "$(cat "$K/pull-user")" = u ] \
+  && [ "$(stat -f%Lp "$K/worker" 2>/dev/null || stat -c%a "$K/worker")" = 600 ] && [ "$(stat -f%Lp "$K" 2>/dev/null || stat -c%a "$K")" = 700 ] \
+  && grep -q "memex-local buildhost attach" <<<"$OUT" \
+  && ok "a FAILED attach keeps the worker/pull tokens and the facts (0600 in a 0700 dir) and names 'buildhost attach'" || bad "attach keep on failure" "$(ls -la "$K" 2>&1) $OUT"
+OUT="$(env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$JH/home" MEMEX_FIRST_ATTACH="$JH/fa.sh" bash -c '. "$0"; ACC_JOBS_ENABLED=true; ACC_TOK_ENABLED=false; buildhost_attach' "$CLI" 2>&1)"
+grep -q -- "--secrets-from" "$JH/args" && grep -qx worker "$JH/files" && grep -qx pull "$JH/files" && [ ! -e "$K" ] \
+  && ok "buildhost_attach re-runs the attach from the KEPT items alone (no code, no key) and removes them on success" || bad "attach from kept" "$OUT"
+OUT="$(env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$JH/home" MEMEX_FIRST_ATTACH="$JH/fa.sh" bash -c '. "$0"; buildhost_attach' "$CLI" 2>&1)" && bad "an attach with nothing kept succeeded" "$OUT" \
+  || { grep -q "memex-local fleet join" <<<"$OUT" && ok "with nothing kept the attach refuses and names the rejoin (control's Approve re-issues the items)" || bad "attach nothing kept" "$OUT"; }
 rm -rf "$JH"
 
 echo "── the tap tarball carries every directory the formula installs (2026-11-10) ──────"
