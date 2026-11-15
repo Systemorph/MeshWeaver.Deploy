@@ -20,7 +20,7 @@ by CPU, `(17 − 4) / 4` GiB each, under the 8 GiB a runner needs — and blamed
 
 - **fits the runner COUNT to every resource**: runners = the fewest of `VM CPU / 4`, `(VM GiB − 4) / 8` and the runs
   the build disk holds. When memory is the limit, the VM's CPU is shared out over the runners that remain (that mini:
-  one runner of 16 CPU / 13 GiB, 16 stage slots). It refuses only when not even one runner fits, and the error names
+  one runner of 16 CPU / 13 GiB). Stage slots follow the CPU but never exceed the memory limit at 2 GiB per concurrent stage (the runner refuses to start otherwise: `MW_BUILD_STAGE_SLOTS 8 in 13.0 GiB`), so that runner gets 6. The plan refuses only when not even one runner fits, and the error names
   the resource (`kind=memory|cores|disk`) with that resource's remedy — for memory, a smaller token model, an
   idle-only model, or NO to jobs; never "free disk".
 - **reserves the largest model the Mac ANSWERS with**: the token models the owner offers (`backlease accept tokens
