@@ -2982,6 +2982,14 @@ rm -f "$IX/stubs/colima" "$IX/home/.memex-local/buildhost-follow/build/sizing.ya
 ix MEMEX_LOCAL_BIN="$IX/nowhere" MEMEX_COLIMA_BIN="$IX/stubs/colima" "$CLI" instances agent run-once >/dev/null 2>&1
 python3 -c 'import json,sys; b=json.load(open(sys.argv[1]))["buildHost"]; assert b == {"vm": None, "runners": None, "settings": None}, b' "$IXB/inventory.json" \
   && ok "inventory.json: a build host nothing could read is null in each part, never 0 or false" || bad "inventory buildHost unmeasured" "$(cat "$IXB/inventory.json")"
+# THE MARKERS op_buildhost reads from `buildhost apply` are pinned here against memex-local's own wording: if apply's
+# text drifts, this goes red instead of a completed resize being reported as Skipped or a rollback losing its reason.
+for m in "Resizing the build VM" "k3s is healthy" "the resize was ROLLED BACK" "runners sized" "sizing is written"; do
+  grep -qF "$m" "$CLI" && grep -qF "$m" "$HERE/../share/instances.py" || bad "buildhost marker '$m' is in both memex-local's apply and instances.py" "$(grep -cF "$m" "$CLI") in memex-local"
+done
+ok "buildhost: every marker the executor reads from 'buildhost apply' is memex-local's own wording (pinned)"
+# instances_exec calls THIS memex-local back ($0 made absolute), never whichever one PATH finds first.
+grep -q 'case "\$0" in' <<<"$(sed -n '/^instances_exec() {/,/^}/p' "$CLI")" && ok "instances_exec hands the executor this memex-local (\$0), not PATH's" || bad "MEMEX_LOCAL_BIN from \$0" ""
 OUT="$(ix "$CLI" instances buildhost 2>&1)"; RC=$?
 [ "$RC" = 2 ] && grep -q 'memex-local buildhost set' <<<"$OUT" && ok "the CLI points 'instances buildhost' at 'memex-local buildhost set' (exit 2)" || bad "cli buildhost" "rc=$RC $OUT"
 S2="$(mktemp -d)"; printf 'vm-cpus=8\nmax-runners=2"x\n' > "$S2/buildhost-settings"

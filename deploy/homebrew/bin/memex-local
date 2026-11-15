@@ -6135,9 +6135,17 @@ instances_exec() {
   command -v python3 >/dev/null 2>&1 || die "instances: python3 is required (the Xcode command line tools carry it: xcode-select --install)"
   net="$(tailnet_name 2>/dev/null || true)"
   [ -n "$net" ] && ip="$(publish_tailscale ip -4 2>/dev/null | head -1 || true)"
-  # MEMEX_LOCAL_BIN: this very memex-local, which the executor calls back for the build host's size (buildhost set /
-  # apply --resize / settings --json) — a test may point it at a stand-in.
-  local self; self="${MEMEX_LOCAL_BIN:-$(command -v memex-local 2>/dev/null || printf '%s' "$0")}"
+  # MEMEX_LOCAL_BIN: this very memex-local — $0, made absolute — which the executor calls back for the build host's size
+  # (buildhost set / apply --resize / settings --json); never whichever memex-local PATH finds first (a dev checkout, an
+  # older keg). A test may point it at a stand-in.
+  local self="${MEMEX_LOCAL_BIN:-}"
+  if [ -z "$self" ]; then
+    case "$0" in
+      /*) self="$0" ;;
+      */*) self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+      *) self="$(command -v "$0" 2>/dev/null || command -v memex-local 2>/dev/null || printf '%s' "$0")" ;;
+    esac
+  fi
   env MEMEX_LOCAL_HOME="$LOCAL_HOME" MEMEX_LOCAL_SHARE="$share" MEMEX_INSTANCES_CHART="$(resolve_chart)" MEMEX_LOCAL_BIN="$self" \
       MEMEX_BUILD_PROFILE="$BUILD_PROFILE" \
       MEMEX_KUBE_CONTEXT="${MEMEX_KUBE_CONTEXT:-colima}" MEMEX_NAMESPACE="$NAMESPACE" \
