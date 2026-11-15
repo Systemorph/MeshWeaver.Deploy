@@ -1110,6 +1110,27 @@ unset LSCRIPT
 grep -q '^return 0 2>/dev/null || exit 0$' "$FL" && [ "$(tail -1 "$FL")" = 'return 0 2>/dev/null || exit 0' ] && ok "the loader ends in an exit: the embedded bytes appended after it are never executed inline" || bad "loader end" "$(tail -1 "$FL")"
 rm -rf "$LD"
 
+echo "── the doctor readings and the build host's attach from the kept items (1.12.0, the first Mac mini) ──"
+FB="$HERE/../intune/fleet-bootstrap.sh"
+# executed under macOS's /bin/bash 3.2 when it is there: `$(case … in ✓*) …)` inline broke there
+BASH32=/bin/bash
+V="$(env FLEET_BOOTSTRAP_LIB=1 "$BASH32" -c '. "$0"; printf "%s %s %s %s" "$(doctor_verdict "✓ joined")" "$(doctor_verdict "· none" strict)" "$(doctor_verdict "· none")" "$(doctor_verdict "✗ no VM")"' "$FB")"
+[ "$V" = "ok red ok red" ] && ok "doctor_verdict reads ✓ ok, · ok (red when strict), ✗ red — under $("$BASH32" -c 'echo $BASH_VERSION')" || bad "doctor_verdict" "$V"
+! grep -q 'write_reading [a-z]* "$(case ' "$FB" && ok "no reading is computed by an inline \$(case …) (bash 3.2 ends the substitution at the pattern's paren)" || bad "inline case reading" "$(grep -n 'write_reading [a-z]* "$(case ' "$FB")"
+BA="$(mktemp -d)"; mkdir -p "$BA/home/.memex-local/enrol/buildhost"
+printf '#!/bin/bash\necho "$*" >> "%s/calls"\n[ "$1 $2" = "buildhost attach" ] && rm -rf "%s/home/.memex-local/enrol/buildhost"\nexit 0\n' "$BA" "$BA" > "$BA/ml"; chmod +x "$BA/ml"
+env FLEET_BOOTSTRAP_LIB=1 FLEET_USER_HOME="$BA/home" FLEET_LOG_DIR="$BA/log" bash -c '. "$0"; as_user() { shift; "$@"; }; PART_JOBS=true; step_buildhost_attach jroe "$1"' "$FB" "$BA/ml" >/dev/null 2>&1
+grep -qx 'buildhost attach' "$BA/calls" 2>/dev/null && grep -q 'build host attached from the kept items' "$BA/log/fleet-bootstrap.log" \
+  && ok "kept build items: the run calls 'memex-local buildhost attach' (as the person), which attaches from them" || bad "attach from kept items" "$(cat "$BA/calls" "$BA/log/"* 2>&1)"
+: > "$BA/calls"
+env FLEET_BOOTSTRAP_LIB=1 FLEET_USER_HOME="$BA/home" FLEET_LOG_DIR="$BA/log" bash -c '. "$0"; as_user() { shift; "$@"; }; PART_JOBS=true; step_buildhost_attach jroe "$1"' "$FB" "$BA/ml" >/dev/null 2>&1
+[ ! -s "$BA/calls" ] && ok "no kept items (attached, or never kept): nothing is called" || bad "no items" "$(cat "$BA/calls")"
+mkdir -p "$BA/home/.memex-local/enrol/buildhost"
+env FLEET_BOOTSTRAP_LIB=1 FLEET_USER_HOME="$BA/home" FLEET_LOG_DIR="$BA/log" bash -c '. "$0"; as_user() { shift; "$@"; }; PART_JOBS=false; step_buildhost_attach jroe "$1"' "$FB" "$BA/ml" >/dev/null 2>&1
+[ ! -s "$BA/calls" ] && ok "the owner said NO to jobs: no build host is attached, items or not" || bad "jobs no" "$(cat "$BA/calls")"
+grep -q 'step_buildhost_attach "$user" "$mlocal"' "$FB" && ok "a joined, finished Mac runs the attach step on every run (until the items are gone)" || bad "attach step wired" ""
+rm -rf "$BA"
+
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

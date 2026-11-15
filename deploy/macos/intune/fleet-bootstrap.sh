@@ -61,7 +61,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.11.1"
+readonly FLEET_BOOTSTRAP_VERSION="1.12.0"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -532,8 +532,20 @@ record_doctor() {
   hb="$(printf '%s\n' "$out" | grep -E "heartbeat" | head -1 | sed -E 's/^[[:space:]]*//' | cut -c1-300)"
   bh="$(printf '%s\n' "$out" | grep -E "build host|build VM" | head -1 | sed -E 's/^[[:space:]]*//' | cut -c1-300)"
   write_reading doctor "$( [ "$rc" = 0 ] && echo ok || echo red )" "$(printf '%s\n' "$out" | grep 'fleet doctor:' | tail -1 | sed -E 's/^[[:space:]]*//')"
-  [ -z "$hb" ] || write_reading heartbeat "$(case "$hb" in ✓*) echo ok ;; *) echo red ;; esac)" "$hb"
-  [ -z "$bh" ] || write_reading buildhost "$(case "$bh" in ✓*|·*) echo ok ;; *) echo red ;; esac)" "$bh"
+  [ -z "$hb" ] || write_reading heartbeat "$(doctor_verdict "$hb" strict)" "$hb"
+  [ -z "$bh" ] || write_reading buildhost "$(doctor_verdict "$bh")" "$bh"
+}
+
+# ok | red from a doctor line's mark: ✓ is ok, and · (a reading that is not an error) too unless $2 = strict. Pure.
+# 🚨 A FUNCTION, never `$(case … in ✓*) …)` inline: macOS's /bin/bash 3.2 ends the command substitution at the
+# pattern's `)`, and every buildhost/heartbeat reading was written as " echo ok ;; *) echo red ;; esac) …" (1.11.1,
+# the first Mac mini, 2026-11-15).
+doctor_verdict() {
+  case "$1" in
+    ✓*) echo ok ;;
+    ·*) if [ "${2:-}" = strict ]; then echo red; else echo ok; fi ;;
+    *) echo red ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1075,9 +1087,32 @@ step_memex() {
       as_user "$user" /usr/bin/touch "$home/.memex-local/fleet.finalized" || return 1
     fi
     log "memex: joined as $machine, finished"; write_reading join ok "joined as $machine, finished"
+    step_buildhost_attach "$user" "$mlocal"
     record_doctor "$user" "$mlocal"; return 0
   fi
   run_join "$user" "$machine" "$control" "$mlocal" full
+}
+
+# THE BUILD HOST'S FIRST ATTACH, from the items the join kept (1.12.0). A fleet Mac joins BEFORE the setup, with
+# --no-update and no build VM: the join keeps its build items (memex-local's enrol/buildhost, 0700/0600) and this step
+# runs `memex-local buildhost attach` (as the person) on every run until they are gone — it creates the build VM, writes
+# the sizing, attaches from them and removes them. Before, nothing ever finished it: the first Mac mini said YES to jobs
+# and had no runners until a person attached it by hand (2026-11-14). Owner said NO to jobs: nothing. A failed attach
+# is said and retried next run.
+step_buildhost_attach() {
+  local user="$1" mlocal="$2" home out rc
+  home="$(user_home "$user")"
+  [ "${PART_JOBS:-}" = true ] || return 0
+  [ -d "$home/.memex-local/enrol/buildhost" ] || return 0
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then printf 'DRY-RUN: (as %s) memex-local buildhost attach — from the kept items\n' "$user"; return 0; fi
+  log "memex: the join kept this Mac's build items — 'memex-local buildhost attach' attaches the build host"
+  out="$(as_user "$user" "$mlocal" buildhost attach 2>&1)"; rc=$?
+  if [ "$rc" = 0 ] && [ ! -d "$home/.memex-local/enrol/buildhost" ]; then
+    log "memex: build host attached from the kept items"
+  else
+    log "memex: build host NOT attached yet (exit $rc) — $(last_said "$out") — retried next run"
+  fi
+  return 0
 }
 
 # `memex-local fleet join`, polling control for this Mac's code. Mode `full` (a configured portal): the join's whole

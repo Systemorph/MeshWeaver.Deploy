@@ -7048,11 +7048,17 @@ buildhost_plan() {
   # whichever is busy; memory is not shared, so the portal VM's memory is.
   local cores="$1" mem="$2" pmem="$4" model="$5" per="$BUILD_CPU_PER_RUNNER"
   local cpu=$(( cores - 2 )) vmem=$(( mem - pmem - model - BUILD_HEADROOM_GIB ))
+  # THE OWNER'S CAPS (2026-11-15, the first Mac mini): the build VM's CPUs and the most runners, each "auto" (the
+  # arithmetic) unless set — the owner's own setting first, then the fleet default the device profile carries
+  # (buildhost_cap). A cap only ever LOWERS the plan: a Mac Studio with no cap keeps its full sizing.
+  local cap_cpu cap_run; cap_cpu="$(buildhost_cap vm-cpus)"; cap_run="$(buildhost_cap max-runners)"
+  [ -z "$cap_cpu" ] || [ "$cap_cpu" -ge "$cpu" ] || cpu="$cap_cpu"
   [ "$cpu" -ge "$per" ] || { printf 'kind=cores\nerror=the host has %s cores; a build VM needs at least %s (cores − 2 ≥ one runner'"'"'s %s CPU)\n' "$cores" "$(( per + 2 ))" "$per"; return 1; }
   local by_cpu=$(( cpu / per )) by_mem=0 runners lim req
   [ "$vmem" -le "$BUILD_SYSTEM_GIB" ] || by_mem=$(( (vmem - BUILD_SYSTEM_GIB) / BUILD_RUNNER_MIN_GIB ))
   [ "$by_mem" -ge 1 ] || { printf 'kind=memory\nerror=only %s GiB left for the build VM (host %s − portal VM %s − model %s − headroom %s); one runner needs %s GiB (%s for the runner, %s for the VM'"'"'s system)\n' "$vmem" "$mem" "$pmem" "$model" "$BUILD_HEADROOM_GIB" "$(( BUILD_RUNNER_MIN_GIB + BUILD_SYSTEM_GIB ))" "$BUILD_RUNNER_MIN_GIB" "$BUILD_SYSTEM_GIB"; return 1; }
   runners="$by_cpu"; [ "$by_mem" -ge "$runners" ] || runners="$by_mem"
+  [ -z "$cap_run" ] || [ "$cap_run" -ge "$runners" ] || runners="$cap_run"
   local disk="${6:-}" disk_runs=""
   if [ -n "$disk" ]; then
     disk_runs="$(buildhost_disk_runs "$disk")"
@@ -7070,7 +7076,50 @@ buildhost_plan() {
   printf 'vm_cpu=%s\nvm_mem=%s\nrunners_min=%s\nrunners_max=%s\nrunner_cpu=%s\nrunner_cpu_request=%sm\nrunner_mem_request=%s\nrunner_mem_limit=%s\nstage_slots=%s\nstage_total=%s\n' \
     "$cpu" "$vmem" "$minw" "$runners" "$rcpu" "$(( rcpu * 1000 - 500 ))" "$req" "$lim" "$rcpu" "$(( runners * rcpu ))"
   [ -z "$disk" ] || printf 'vm_disk=%s\ndisk_runs=%s\n' "$disk" "$disk_runs"
-  [ "$runners" -ge "$by_cpu" ] || printf 'limited_by=%s\n' "$( [ "$runners" -eq "$by_mem" ] && echo memory || echo disk)"
+  [ "$runners" -ge "$by_cpu" ] || printf 'limited_by=%s\n' "$( if [ "$runners" -eq "$by_mem" ]; then echo memory; elif [ -n "$cap_run" ] && [ "$runners" -eq "$cap_run" ]; then echo settings; else echo disk; fi)"
+}
+
+# THE BUILD HOST'S SIZE SETTINGS (2026-11-15): `vm-cpus` (the build VM's CPUs) and `max-runners` (the most runners at
+# once). Each is "auto" — the plan's arithmetic — unless set. Where a value comes from, first that answers:
+#   1. MEMEX_BUILD_VM_CPUS / MEMEX_BUILD_MAX_RUNNERS (a test, or a one-off run)
+#   2. the OWNER'S setting: ~/.memex-local/buildhost-settings (`memex-local buildhost set vm-cpus 8`); an explicit
+#      `auto` there wins over the fleet default too, so a Mac's owner can lift a fleet cap
+#   3. the FLEET DEFAULT the device profile carries, per MODEL CLASS first: com.memex.local BuildVmCpus<Class> /
+#      BuildMaxRunners<Class>, <Class> the Mac's model name without spaces (BuildVmCpusMacMini = 8,
+#      BuildMaxRunnersMacMini = 2 — the Mac minis), then the class-less BuildVmCpus / BuildMaxRunners. ONE profile serves
+#      the whole fleet group, and a Mac Studio (no MacStudio key) keeps its full sizing.
+# A value that is not a whole number above 0 is ignored (auto), and `buildhost settings` says so.
+readonly BUILD_SETTINGS_FILE="$LOCAL_HOME/buildhost-settings"
+buildhost_cap_source() {
+  local name="$1" env pref v
+  case "$name" in vm-cpus) env="${MEMEX_BUILD_VM_CPUS:-}"; pref=BuildVmCpus ;; max-runners) env="${MEMEX_BUILD_MAX_RUNNERS:-}"; pref=BuildMaxRunners ;; *) return 1 ;; esac
+  if [ -n "$env" ]; then printf '%s\tenvironment' "$env"; return 0; fi
+  if [ -f "$BUILD_SETTINGS_FILE" ]; then
+    v="$(awk -F= -v k="$name" '$1 == k { gsub(/[[:space:]]/, "", $2); print $2; exit }' "$BUILD_SETTINGS_FILE")"
+    if [ -n "$v" ]; then printf '%s\towner setting (%s)' "$v" "$BUILD_SETTINGS_FILE"; return 0; fi
+  fi
+  local cls; cls="$(host_model_class)"
+  if [ -n "$cls" ]; then
+    v="$(managed_pref "$pref$cls")"
+    if [ -n "$v" ]; then printf '%s\tfleet default (com.memex.local %s)' "$v" "$pref$cls"; return 0; fi
+  fi
+  v="$(managed_pref "$pref")"
+  if [ -n "$v" ]; then printf '%s\tfleet default (com.memex.local %s)' "$v" "$pref"; return 0; fi
+  printf 'auto\tauto'
+}
+# This Mac's model class for the per-class fleet defaults: its model name, each word capitalised, spaces removed
+# ("Mac mini" → MacMini, "Mac Studio" → MacStudio). MEMEX_HOST_MODEL overrides (tests). Empty when unreadable.
+host_model_class() {
+  local n="${MEMEX_HOST_MODEL:-}"
+  if [ -z "$n" ] && command -v system_profiler >/dev/null 2>&1; then
+    n="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Model Name/ { print $2; exit }')"
+  fi
+  printf '%s' "$n" | awk '{ for (i = 1; i <= NF; i++) printf "%s%s", toupper(substr($i, 1, 1)), substr($i, 2) }' | tr -cd 'A-Za-z0-9'
+}
+buildhost_cap() {
+  local v; v="$(buildhost_cap_source "$1" | cut -f1)"
+  case "$v" in ''|auto|0|*[!0-9]*) return 0 ;; esac
+  printf '%s' "$v"
 }
 # The readings behind a refused plan, by its kind: $1 kind, $2 other VMs GiB, $3 free disk GiB, $4 other VMs' disk growth,
 # $5 the build VM's disk (empty when none). (A function, not a `case` inside $( ): bash 3.2 cannot parse that.)
@@ -7296,6 +7345,28 @@ buildhost_disk_report() {
 cmd_buildhost() {
   local sub="${1:-status}"; shift || true
   if [ "$sub" = idle ]; then cmd_buildhost_idle "$@"; return; fi
+  case "$sub" in
+    settings)
+      [ $# -eq 0 ] || die "buildhost settings: takes no arguments"
+      local n src v
+      for n in vm-cpus max-runners; do
+        src="$(buildhost_cap_source "$n")"; v="${src%%$'\t'*}"
+        info "$n: $v — ${src#*$'\t'}"
+        case "$v" in auto|[1-9]|[1-9][0-9]) ;; *) warn "$n: '$v' is not a whole number above 0 — ignored (auto)" ;; esac
+      done
+      info "change: memex-local buildhost set vm-cpus <n|auto>, set max-runners <n|auto> — then 'memex-local buildhost apply --resize' (a VM restart when the CPUs change)"
+      return 0 ;;
+    set)
+      local n="${1:-}" v="${2:-}"
+      case "$n" in vm-cpus|max-runners) ;; *) die "buildhost set: vm-cpus <n|auto> or max-runners <n|auto> (got '${n}')" ;; esac
+      case "$v" in auto|[1-9]|[1-9][0-9]) ;; *) die "buildhost set $n: a whole number from 1 to 99, or auto (got '${v}')" ;; esac
+      [ "$n" != vm-cpus ] || [ "$v" = auto ] || [ "$v" -ge "$BUILD_CPU_PER_RUNNER" ] || die "buildhost set vm-cpus: at least one runner's $BUILD_CPU_PER_RUNNER CPU (got $v)"
+      mkdir -p "$LOCAL_HOME"
+      { if [ -f "$BUILD_SETTINGS_FILE" ]; then grep -v "^$n=" "$BUILD_SETTINGS_FILE" || true; fi; printf '%s=%s\n' "$n" "$v"; } > "$BUILD_SETTINGS_FILE.tmp"
+      mv -f "$BUILD_SETTINGS_FILE.tmp" "$BUILD_SETTINGS_FILE"
+      ok "build host setting $n = $v (the owner's setting: wins over the fleet default) — apply it: memex-local buildhost apply --resize"
+      return 0 ;;
+  esac
   if [ "$sub" = attach ]; then
     # FINISH A BUILD HOST WITHOUT A REJOIN (2026-11-15): the build VM, then the release from the items the join kept,
     # then the runners sized to the plan. Idempotent — an attached host is re-attached onto the current set.
@@ -7342,6 +7413,7 @@ cmd_buildhost() {
     plan)
       [ $# -eq 0 ] || die "buildhost plan: takes no arguments"
       info "host: $(host_cores) cores, $(host_mem_gib) GiB; other VMs ${others} GiB (the portal's included); model reserve $(largest_model_gib) GiB (the largest this Mac answers with: $(model_reserve_models | sed 's/ /, /g'))"
+      info "settings: vm-cpus $(buildhost_cap_source vm-cpus | sed 's/\t/ — /'); max-runners $(buildhost_cap_source max-runners | sed 's/\t/ — /')"
       info "build VM (profile $BUILD_PROFILE): ${cpu} CPU / ${vmem} GiB / disk ${disk} GiB$( [ -n "$have_disk" ] && [ "$want_disk" -gt "$have_disk" ] && printf ' (this Mac could back %s — apply --resize grows it)' "$want_disk")"
       info "disk: ${free} GiB free on this Mac; the disk holds $(plan_value disk_runs "$plan") run(s) of ${BUILD_RUN_DISK_GIB} GiB at once beside a cache budget of $(buildhost_cache_gib "$disk") GiB (shares tree/slices/nuget/refsets/prepared: $(buildhost_cache_shares "$(buildhost_cache_gib "$disk")" | tr ' ' '/')), images ${BUILD_IMAGES_GIB}, ${BUILD_DISK_HEADROOM_PCT} % kept free"
       info "runners: $(plan_value runners_min "$plan") warm … $(plan_value runners_max "$plan") (KEDA), each $(plan_value runner_cpu "$plan") CPU / $(plan_value runner_mem_request "$plan")–$(plan_value runner_mem_limit "$plan") GiB, $(plan_value stage_slots "$plan") stage slots → up to $(plan_value stage_total "$plan") stage containers at once"
@@ -7373,7 +7445,10 @@ cmd_buildhost() {
           step "Starting the build VM (profile $BUILD_PROFILE is ${have_status:-not running})"
           colima_keep_context colima start -p "$BUILD_PROFILE" || die "buildhost: could not start the build VM (colima start -p $BUILD_PROFILE)"
         fi
-        if [ "${have_cpu:-0}" -lt "$cpu" ] || [ "${have_mem:-0}" -lt "$vmem" ] || { [ "$resize" = yes ] && [ "$disk" -gt "${have_disk:-0}" ]; }; then
+        # an OWNER-CAPPED VM bigger than the cap shrinks on --resize — only then: an uncapped VM is never shrunk
+        local shrink=no
+        if [ -n "$(buildhost_cap vm-cpus)" ] && [ "${have_cpu:-0}" -gt "$cpu" ]; then shrink=yes; fi
+        if [ "${have_cpu:-0}" -lt "$cpu" ] || [ "${have_mem:-0}" -lt "$vmem" ] || { [ "$resize" = yes ] && { [ "$disk" -gt "${have_disk:-0}" ] || [ "$shrink" = yes ]; }; }; then
           if [ "$resize" = "yes" ]; then
             step "Resizing the build VM ${have_cpu} CPU / ${have_mem} GiB / ${have_disk:-?} GiB disk → ${cpu} / ${vmem} / ${disk} (a restart: running builds are re-queued by the build API; the disk only grows, its data is kept; the GC args are added)"
             colima stop -p "$BUILD_PROFILE" || die "buildhost: could not stop the build VM for the resize"
@@ -7401,6 +7476,8 @@ cmd_buildhost() {
             plan="$(buildhost_plan $(( cpu + 2 )) $(( vmem + others + $(largest_model_gib) + BUILD_HEADROOM_GIB )) "$COLIMA_CPU" "$others" "$(largest_model_gib)" "$disk")" \
               || die "buildhost: the current build VM is too small for one runner — 'memex-local buildhost apply --resize'"
           fi
+        elif [ "$shrink" = yes ]; then
+          warn "the build VM has ${have_cpu} CPU, the setting caps it at ${cpu} — 'memex-local buildhost apply --resize' restarts it at that size (the runners are sized to the cap now)"
         else
           ok "build VM ${have_cpu} CPU / ${have_mem} GiB covers the plan"
         fi
@@ -7746,6 +7823,7 @@ COMMANDS:
                   those constraints, installs both as mkcert's CA and re-issues the portal's
                   certificate under it. The key is never printed (fingerprints only).
   buildhost plan | apply [--resize] | attach | status | priority [install|off|status]
+  buildhost settings | set vm-cpus <n|auto> | set max-runners <n|auto>   (the owner's caps; the fleet default comes from the profile)
                   BUILD RUNNERS sized from this host: a build VM (Colima profile build, containerd)
                   of cores − 2 CPU and host − portal VM − model reserve − headroom GiB (the reserve:
                   the largest model this Mac answers with — the token models it OFFERS, not
