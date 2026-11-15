@@ -2814,6 +2814,57 @@ else
   bad "a claim at its declared size is not a finding" "report: $(printf '%s' "$report" | jq -c .volumeCapacityBelowRecord 2>/dev/null)"
 fi
 
+# The NOISE namespace (Systemorph/Memex#148): what is generated, what another release or a committed
+# manifest owns, and which config-key NAMES are credentials. Every rule is held from BOTH sides — the
+# noise is gone, and its look-alike that is a real finding is still there.
+NOISE="$FIXTURES/noise"
+OWNED="$NOISE/committed/assembly-cache-prune.json $NOISE/committed/portal-pvcs.json"
+out="$(env PATH="$STUBS:$PATH" HOSTING_AUDIT_FIXTURE="$NOISE" HOSTING_AUDIT_OWNED_MANIFESTS="$OWNED" \
+  hosting-audit --namespace memex --release memex 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "the noise audit exits 0" || bad "the noise audit exits 0" "exited ${rc}: ${out}"
+report="$(printf '%s\n' "$out" | sed -n 's/^::hosting:: audit=//p' | tail -1 | base64 -d 2>/dev/null)"
+if [ -z "$report" ]; then
+  bad "the noise report rides an ::hosting:: audit= line" "no decodable audit= line in: ${out}"
+else
+  noise_report() {  # noise_report <what> <jq predicate over the report>
+    if printf '%s' "$report" | jq -e "$2" >/dev/null 2>&1; then ok "$1"; else
+      bad "$1" "predicate '$2' false for: $(printf '%s' "$report" | jq -c . 2>/dev/null)"; fi
+  }
+  noise_names='[.unmanagedObjects[].names[]]'
+  noise_report "a kubectl restartedAt annotation is no finding" '.podAnnotationsLiveOnly == []'
+  noise_report "a COMPLETED memex-migration-roll Job is generated, not a finding" "$noise_names | index(\"memex-migration-roll-3-1-100\") | not"
+  noise_report "…a FAILED or RUNNING one still is" "$noise_names | index(\"memex-migration-roll-3-1-101\") and index(\"memex-migration-roll-3-1-102\")"
+  noise_report "a cert-manager TLS Secret a live Ingress names is generated" "$noise_names | index(\"memex-tls\") | not"
+  noise_report "…an ORPHANED cert-manager Secret and a hand-made TLS Secret still are" "$noise_names | index(\"orphan-tls\") and index(\"hand-tls\")"
+  noise_report "the azurefile CSI storage-account Secret is generated" "$noise_names | index(\"azure-storage-account-f45d8e671caa74b96a6c37f-secret\") | not"
+  noise_report "…an opaque Secret nobody declares still is" "$noise_names | index(\"hosting-jobrunner-token\")"
+  noise_report "a sibling helm release's object is owned elsewhere, by name" '.ownedElsewhere | index({"kind":"Deployment","name":"whisper","owner":"helm release memex-whisper"})'
+  noise_report "…an object annotated with THIS release the chart no longer renders is still a finding" "$noise_names | index(\"stale-own\")"
+  noise_report "a declared committed manifest's objects are owned elsewhere, with the file" '(.ownedElsewhere | index({"kind":"CronJob","name":"assembly-cache-prune","owner":"committed manifest assembly-cache-prune.json"})) and (.ownedElsewhere | index({"kind":"PersistentVolumeClaim","name":"memex-users","owner":"committed manifest portal-pvcs.json"}))'
+  noise_report "…an object a declared file names in ANOTHER namespace owns nothing here" "$noise_names | index(\"memex-undeclared\")"
+  noise_report "owned-elsewhere objects are not counted as findings" '.findingCount == ([.unmanagedObjects[].names | length] | add) + (.plainSecretEntries | length)'
+  noise_report "config keys that only LOOK secret are not flagged (counts, ids, references, flags, operator plumbing, an empty value)" \
+    '[.plainSecretEntries[] | select(test("ContextWindowTokens|MaxOutputTokens|Apple__KeyId|RequireInstanceKey|SecretConfigKey|Hosting__Operator__Secret|Hosting__Operator__TokenFile|AZ_POSTGRES_PASSWORD_SECRET|KeyClasses|Bootstrap__Secret"))] == []'
+  # 🚨 THE NEGATIVE CONTROL: tightening the name check must not let a real credential through.
+  noise_report "…while every REAL credential name still is (api key, client secret, connection string, token, a password under Hosting__Operator__, a bare Secret)" \
+    '.plainSecretEntries == ["configmap:memex-portal-config/Authentication__Microsoft__ClientSecret","configmap:memex-portal-config/ConnectionStrings__memex","configmap:memex-portal-config/Hosting__Operator__DatabasePassword","configmap:memex-portal-config/OpenAICompatible__ApiKey","configmap:memex-portal-config/PluginCatalog__RegistryToken","configmap:memex-portal-config/Webhook__Secret"]'
+fi
+case "$out" in *"owned elsewhere         CronJob/assembly-cache-prune — committed manifest assembly-cache-prune.json"*) ok "the human summary names what is owned elsewhere and by whom" ;;
+  *) bad "the human summary names what is owned elsewhere" "said: ${out}" ;; esac
+case "$out" in *"must-never-print"*) bad "the noise audit never prints a value" "a fixture VALUE leaked: ${out}" ;;
+  *) ok "the noise audit never prints a value" ;; esac
+# Without the declaration the same objects are findings again: ownership is DECLARED, never inferred.
+out="$(env PATH="$STUBS:$PATH" HOSTING_AUDIT_FIXTURE="$NOISE" hosting-audit --namespace memex --release memex 2>&1)"
+report="$(printf '%s\n' "$out" | sed -n 's/^::hosting:: audit=//p' | tail -1 | base64 -d 2>/dev/null)"
+if printf '%s' "$report" | jq -e '([.unmanagedObjects[].names[]] | index("assembly-cache-prune") and index("memex-users")) and (.ownedElsewhere | map(.owner | startswith("committed")) | any | not)' >/dev/null 2>&1; then
+  ok "with no declared manifest, the committed CronJob and PVC are findings (nothing is guessed)"
+else
+  bad "with no declared manifest, the committed objects are findings" "report: $(printf '%s' "$report" | jq -c '{unmanagedObjects,ownedElsewhere}' 2>/dev/null)"
+fi
+refuses "a declared manifest that is not a file fails the audit (never silently a finding, never clean)" "not a file" \
+  env PATH="$STUBS:$PATH" HOSTING_AUDIT_FIXTURE="$NOISE" HOSTING_AUDIT_OWNED_MANIFESTS="$NOISE/committed/absent.json" \
+  hosting-audit --namespace memex --release memex
+
 # Read-only: a dry run audits for real — same report, same verdict.
 emits "a dry run still audits (read-only)" "::hosting:: audit_verdict=clean" \
   env HOSTING_DRY_RUN=true PATH="$STUBS:$PATH" HOSTING_AUDIT_FIXTURE="$FIXTURES/clean" \

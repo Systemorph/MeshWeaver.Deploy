@@ -1,0 +1,9 @@
+{
+  "apiVersion": "batch/v1",
+  "kind": "CronJob",
+  "metadata": {
+    "name": "assembly-cache-prune",
+    "namespace": "memex"
+  },
+  "spec": {}
+}

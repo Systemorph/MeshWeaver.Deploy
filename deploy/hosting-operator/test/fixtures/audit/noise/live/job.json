@@ -1,0 +1,58 @@
+{
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "batch/v1",
+      "kind": "Job",
+      "metadata": {
+        "name": "memex-migration",
+        "namespace": "memex"
+      },
+      "spec": {}
+    },
+    {
+      "apiVersion": "batch/v1",
+      "kind": "Job",
+      "metadata": {
+        "name": "memex-migration-roll-3-1-100",
+        "namespace": "memex"
+      },
+      "spec": {},
+      "status": {
+        "conditions": [
+          {
+            "type": "Complete",
+            "status": "True"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "batch/v1",
+      "kind": "Job",
+      "metadata": {
+        "name": "memex-migration-roll-3-1-101",
+        "namespace": "memex"
+      },
+      "spec": {},
+      "status": {
+        "conditions": [
+          {
+            "type": "Failed",
+            "status": "True"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "batch/v1",
+      "kind": "Job",
+      "metadata": {
+        "name": "memex-migration-roll-3-1-102",
+        "namespace": "memex"
+      },
+      "spec": {},
+      "status": {}
+    }
+  ]
+}

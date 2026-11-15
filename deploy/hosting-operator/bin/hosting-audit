@@ -44,6 +44,19 @@
 #     hosting-pv-resize applies it — capacity is a record property, and this is what says when the
 #     cluster has not caught up (measured 2026-09-08: memex-data declared 16Gi, full at 3 MiB free).
 #
+# WHAT IS NOT A FINDING (Systemorph/Memex#148 — 15 of one instance's 66 findings were generated objects, 34
+# were config keys that only looked secret, and 15 belonged to something else that is declared):
+#   * GENERATED objects: the `kubectl.kubernetes.io/restartedAt` pod annotation; a COMPLETED
+#     `memex-migration-roll-*` Job; a cert-manager TLS Secret a live Ingress names; the azurefile CSI
+#     storage-account Secret. A failed or running migration Job, an orphaned or hand-made TLS Secret stay;
+#   * objects OWNED ELSEWHERE, reported under `ownedElsewhere` with their owner and never counted: those a
+#     SIBLING helm release annotates (meta.helm.sh/release-name naming another release), and those a
+#     declared committed manifest names (HOSTING_AUDIT_OWNED_MANIFESTS, step 3b — declared by the caller,
+#     never searched for);
+#   * a config key whose LEAF only looks secret (counts, ids, references to other keys, flags, the
+#     operator's own plumbing) or whose value is EMPTY — see `secretish` in _audit.jq, and its negative
+#     control in test/run-tests.sh, which holds that every real credential name is still flagged.
+#
 # THE OUTPUT is the human summary plus the machine lines the mesh's Hosting plugin parses:
 #   ::hosting:: audit_verdict=clean|drift   ::hosting:: audit_findings=N   ::hosting:: audit=<base64 JSON>
 # The JSON is the LiveOnlyConfigReport the Hosting/InstanceAction `Audit` verb records on the
@@ -153,10 +166,39 @@ jq -s 'add // []' "$work/live.jsonl" > "$work/live.json" \
   || hosting::die "could not combine the live listings"
 skipped="${skipped# }"
 
+# ── 3b. what is committed ELSEWHERE — declared, never guessed ─────────────────────────────────
+# HOSTING_AUDIT_OWNED_MANIFESTS: whitespace-separated paths of committed manifests whose objects this
+# namespace holds ON PURPOSE without the chart rendering them (Systemorph/Memex#148: the per-instance
+# assembly-cache-prune CronJob and the portal PVCs under the config repository's deployments/aks/<env>/).
+# The caller (the estate's aks-ops lane) passes the files its instance folder DECLARES; nothing here
+# searches for them, so an object no declared file names stays a finding. Each file is turned into
+# objects by kubectl's own parser, like the helm manifest above; an object it names in ANOTHER namespace
+# owns nothing here. A declared file that is missing or does not parse FAILS the audit: a declaration
+# the audit could not read must not silently turn back into findings, nor into a clean bill.
+owned_parts=()
+for f in ${HOSTING_AUDIT_OWNED_MANIFESTS:-}; do
+  [ -f "$f" ] || hosting::die "HOSTING_AUDIT_OWNED_MANIFESTS names '${f}', which is not a file — the declaration names a committed manifest that is not in this checkout"
+  part="$work/owned-${#owned_parts[@]}.json"
+  if ! kubectl apply --dry-run=client -o json -f - < "$f" 2>"$work/err" \
+       | jq -s --arg source "$(basename "$f")" --arg ns "$namespace" \
+           '[.[] | if .kind == "List" then (.items // [])[] else . end
+                 | select((.metadata.namespace // $ns) == $ns) | . + {source: $source}]' > "$part"; then
+    hosting::die "could not turn the declared manifest ${f} into objects ($(tr -d '\n' < "$work/err"))"
+  fi
+  owned_parts+=("$part")
+  hosting::log "owned     $(jq 'length' "$part") object(s) committed in $(basename "$f")"
+done
+if [ "${#owned_parts[@]}" -gt 0 ]; then
+  jq -s 'add' "${owned_parts[@]}" > "$work/owned.json" || hosting::die "could not combine the declared manifests"
+else
+  echo '[]' > "$work/owned.json"
+fi
+
 # ── 4. the detection ────────────────────────────────────────────────────────────────────────────
 if ! jq -n \
       --slurpfile manifest "$work/manifest.json" \
       --slurpfile live "$work/live.json" \
+      --slurpfile owned "$work/owned.json" \
       --arg namespace "$namespace" --arg release "$release" \
       --arg deployment "$deployment" --arg container "$container" \
       --argjson revision "$revision" --arg chart "$chart" \
@@ -191,6 +233,7 @@ jq -r '.podSpecDiffs[] | "  pod spec differs        \(.field): live=\(.live) man
 jq -r '.configMaps[] | select(.missingLive or ((.liveOnlyKeys|length) + (.manifestOnlyKeys|length) + (.differingKeys|length)) > 0)
   | "  ConfigMap \(.name): " + (if .missingLive then "MISSING live" else "live-only keys [\(.liveOnlyKeys|join(" "))] manifest-only keys [\(.manifestOnlyKeys|join(" "))] value-differs [\(.differingKeys|join(" "))]" end)' "$work/report.json"
 jq -r '.unmanagedObjects[] | "  unmanaged \(.kind) (\(.names|length)): \(.names|join(" "))"' "$work/report.json"
+jq -r '.ownedElsewhere[] | "  owned elsewhere         \(.kind)/\(.name) — \(.owner)"' "$work/report.json"
 jq -r '.volumeCapacityBelowRecord[] | "  volume below record     \(.volume) (\(.claimName)): live=\(.live) record=\(.declared)"' "$work/report.json"
 say_list "🚨 unmanaged secrets the pod reads" '.unmanagedSecrets'
 say_list "🚨 secret-shaped entries carried as PLAIN values" '.plainSecretEntries'

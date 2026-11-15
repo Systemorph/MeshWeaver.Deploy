@@ -1,0 +1,23 @@
+{
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolumeClaim",
+      "metadata": {
+        "name": "memex-users",
+        "namespace": "memex"
+      },
+      "spec": {}
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolumeClaim",
+      "metadata": {
+        "name": "memex-undeclared",
+        "namespace": "other-ns"
+      },
+      "spec": {}
+    }
+  ]
+}

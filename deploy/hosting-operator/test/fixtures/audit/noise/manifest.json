@@ -1,0 +1,181 @@
+{
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "name": "memex-portal-deployment",
+        "namespace": "memex"
+      },
+      "spec": {
+        "replicas": 1,
+        "template": {
+          "metadata": {
+            "annotations": {
+              "checksum/config": "abc"
+            }
+          },
+          "spec": {
+            "serviceAccountName": "memex-portal-sa",
+            "terminationGracePeriodSeconds": 1800,
+            "containers": [
+              {
+                "name": "memex-portal",
+                "image": "cr.example.test/memex-portal-ai:3.0.0-rc8.ci.5000",
+                "env": [
+                  {
+                    "name": "ASPNETCORE_ENVIRONMENT",
+                    "value": "Production"
+                  },
+                  {
+                    "name": "MEMEX_DATABASENAME",
+                    "value": "memex"
+                  },
+                  {
+                    "name": "RENDERED_ONLY",
+                    "value": "1"
+                  }
+                ],
+                "envFrom": [
+                  {
+                    "configMapRef": {
+                      "name": "memex-portal-config"
+                    }
+                  },
+                  {
+                    "secretRef": {
+                      "name": "memex-kv-secrets"
+                    }
+                  }
+                ],
+                "resources": {
+                  "limits": {
+                    "cpu": 4,
+                    "memory": "8Gi"
+                  },
+                  "requests": {
+                    "cpu": 1,
+                    "memory": "4Gi"
+                  }
+                },
+                "startupProbe": {
+                  "httpGet": {
+                    "path": "/health",
+                    "port": 8080
+                  },
+                  "periodSeconds": 5,
+                  "failureThreshold": 60
+                },
+                "volumeMounts": [
+                  {
+                    "name": "data",
+                    "mountPath": "/data"
+                  }
+                ]
+              }
+            ],
+            "volumes": [
+              {
+                "name": "data",
+                "persistentVolumeClaim": {
+                  "claimName": "memex-data"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "ConfigMap",
+      "metadata": {
+        "name": "memex-portal-config",
+        "namespace": "memex"
+      },
+      "data": {
+        "Portal__Name": "memex",
+        "Email__Enabled": "false",
+        "OpenRouterEU__ContextWindowTokens__0__Model": "z-ai/glm",
+        "OpenRouterEU__ContextWindowTokens__0__Tokens": "200000",
+        "Hosting__Triage__PullRequestReview__Ensemble__Members__0__MaxOutputTokens": "8000",
+        "Authentication__Apple__KeyId": "ABC123",
+        "PluginCatalog__RequireInstanceKey": "true",
+        "WebhookInbox__Targets__0__SecretConfigKey": "WebhookInbox__Secret",
+        "Hosting__Operator__SecretExecutor": "Actions",
+        "Hosting__Operator__SecretNamespace": "memex-secrets",
+        "Hosting__Operator__SecretWriterClientId": "00000000-0000-0000-0000-000000000000",
+        "Hosting__Operator__SecretWriterServiceAccount": "hosting-secret-writer",
+        "Hosting__Operator__TokenFile": "/var/run/secrets/token",
+        "Hosting__Operator__Environment__AZ_POSTGRES_PASSWORD_SECRET": "pg-password",
+        "Fleet__Queue__Pools__M5__KeyClasses__bench__0": "bench",
+        "Bootstrap__Secret": "",
+        "OpenAICompatible__ApiKey": "must-never-print-1",
+        "Authentication__Microsoft__ClientSecret": "must-never-print-2",
+        "ConnectionStrings__memex": "must-never-print-3",
+        "PluginCatalog__RegistryToken": "must-never-print-4",
+        "Hosting__Operator__DatabasePassword": "must-never-print-5",
+        "Webhook__Secret": "must-never-print-6"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Secret",
+      "metadata": {
+        "name": "memex-chart-secret",
+        "namespace": "memex"
+      },
+      "type": "Opaque",
+      "data": {
+        "x": "eA=="
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "name": "memex-portal-service",
+        "namespace": "memex"
+      },
+      "spec": {
+        "ports": [
+          {
+            "port": 80
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "memex-ingress",
+        "namespace": "memex"
+      },
+      "spec": {}
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolumeClaim",
+      "metadata": {
+        "name": "memex-data",
+        "namespace": "memex",
+        "annotations": {
+          "helm.sh/resource-policy": "keep"
+        }
+      },
+      "spec": {
+        "accessModes": [
+          "ReadWriteMany"
+        ],
+        "storageClassName": "azurefile-memex",
+        "resources": {
+          "requests": {
+            "storage": "16Gi"
+          }
+        }
+      }
+    }
+  ]
+}
