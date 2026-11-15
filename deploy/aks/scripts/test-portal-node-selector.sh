@@ -23,16 +23,19 @@ ok() { echo "✅ $1"; }
 command -v helm >/dev/null 2>&1 || { echo "::error::helm is not on PATH"; exit 1; }
 python3 -c "import yaml" >/dev/null 2>&1 || { echo "::error::python3 with PyYAML is required (pip install pyyaml)"; exit 1; }
 
-render() { helm template t "$CHART" "$@" 2>&1; }
+# stdout only is parsed; helm's stderr goes to a file and is quoted only when the render FAILS, so a warning
+# on a successful render can never corrupt the YAML the inspection reads.
+ERR="$(mktemp)"; trap 'rm -f "$ERR"' EXIT
+render() { helm template t "$CHART" "$@" 2>"$ERR" || { cat "$ERR"; return 1; }; }
 
 # Prints one JSON object: {"portal": <nodeSelector or "ABSENT">, "others": [names of other workloads carrying the portal's selector]}
-# or the word NOPORTAL when the render holds no portal Deployment.
+# or NOPORTAL / DUPLICATE-PORTAL when the render holds no portal Deployment, or more than one.
 INSPECT='
 import json, sys, yaml
 docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if isinstance(d, dict)]
 portal = [d for d in docs if d.get("kind") == "Deployment" and (d.get("metadata") or {}).get("name") == "memex-portal-deployment"]
 if len(portal) != 1:
-    print("NOPORTAL"); sys.exit(0)
+    print("NOPORTAL" if not portal else "DUPLICATE-PORTAL x%d" % len(portal)); sys.exit(0)
 spec = portal[0]["spec"]["template"]["spec"]
 sel = spec["nodeSelector"] if "nodeSelector" in spec else "ABSENT"
 others = []
