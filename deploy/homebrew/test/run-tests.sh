@@ -2505,6 +2505,15 @@ case "$(csrc)" in "auto"$'\t'"owner setting"*) ok "an owner's explicit 'auto' wi
 case "$(csrc MEMEX_BUILD_VM_CPUS=10)" in "10"$'\t'"environment") ok "the environment wins over both (a one-off run)" ;; *) bad "cap env" "$(csrc MEMEX_BUILD_VM_CPUS=10)" ;; esac
 OUT="$(env MEMEX_LOCAL_HOME="$CS" PATH="$STUBS:$PATH" "$CLI" buildhost set vm-cpus 2 2>&1)" && bad "vm-cpus 2 was accepted" "$OUT" || ok "'buildhost set vm-cpus' below one runner's CPU is refused"
 OUT="$(env MEMEX_LOCAL_HOME="$CS" PATH="$STUBS:$PATH" "$CLI" buildhost set max-runners lots 2>&1)" && bad "max-runners lots was accepted" "$OUT" || ok "'buildhost set' refuses a value that is not a number or auto"
+for bad in 2 123; do
+  P="$(env MEMEX_BUILD_VM_CPUS=$bad MEMEX_LOCAL_LIB=1 PATH="$STUBS:$PATH" bash -c '. "$0"; buildhost_plan 18 128 8 16 0' "$CLI")"
+  grep -q '^vm_cpu=16$' <<<"$P" && ok "a vm-cpus cap of $bad (below one runner, or above 99) is ignored — the same range 'settings' and 'set' use, never a misattributed 'host has too few cores'" || bad "cap $bad" "$P"
+done
+OUT="$(env MEMEX_LOCAL_HOME="$CS" MEMEX_BUILD_VM_CPUS=123 PATH="$STUBS:$PATH" "$CLI" buildhost settings 2>&1)"
+case "$OUT" in *"vm-cpus: 123"*"ignored (auto)"*) ok "'buildhost settings' says a value outside the range is ignored — and it is" ;; *) bad "settings ignored" "$OUT" ;; esac
+OUT="$(env MEMEX_LOCAL_LIB=1 MEMEX_LOCAL_HOME="$CS" MEMEX_HOST_CORES=18 PATH="$STUBS:$PATH" bash -c '. "$0"; buildhost_cap_source vm-cpus | awk -F"\t" "{ print \$1 \" — \" \$2 }"' "$CLI")"
+case "$OUT" in "auto — owner setting ("*) true ;; *) false ;; esac && ok "the plan's settings line splits on the TAB (no BSD-sed \\t that eats every 't')" || bad "settings line" "$OUT"
+! grep -q "sed 's/\\\\t/" "$CLI" && ok "no sed 's/\\t/…' in memex-local (BSD sed reads it as the letter t)" || bad "bsd sed tab" "$(grep -n "sed 's/\\\\t/" "$CLI")"
 rm -rf "$CS"
 # THE MODEL RESERVE (2026-11-15): the largest model this Mac ANSWERS with — the offered token models (idle-only ones not
 # reserved) and its own chat model — never a pulled model nobody serves.

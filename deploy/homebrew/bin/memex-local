@@ -7118,10 +7118,17 @@ host_model_class() {
   fi
   printf '%s' "$n" | awk '{ for (i = 1; i <= NF; i++) printf "%s%s", toupper(substr($i, 1, 1)), substr($i, 2) }' | tr -cd 'A-Za-z0-9'
 }
+# The cap in force, or nothing (auto). ONE range for what is applied and what `buildhost settings` / `set` accept:
+# 1–99, and vm-cpus at least one runner's CPU — anything else is ignored (auto), never applied, and `settings` says so.
 buildhost_cap() {
   local v; v="$(buildhost_cap_source "$1" | cut -f1)"
-  case "$v" in ''|auto|0|*[!0-9]*) return 0 ;; esac
+  buildhost_cap_valid "$1" "$v" || return 0
+  case "$v" in auto) return 0 ;; esac
   printf '%s' "$v"
+}
+buildhost_cap_valid() {
+  case "$2" in auto) return 0 ;; [1-9]|[1-9][0-9]) ;; *) return 1 ;; esac
+  [ "$1" != vm-cpus ] || [ "$2" -ge "$BUILD_CPU_PER_RUNNER" ]
 }
 # The readings behind a refused plan, by its kind: $1 kind, $2 other VMs GiB, $3 free disk GiB, $4 other VMs' disk growth,
 # $5 the build VM's disk (empty when none). (A function, not a `case` inside $( ): bash 3.2 cannot parse that.)
@@ -7354,15 +7361,14 @@ cmd_buildhost() {
       for n in vm-cpus max-runners; do
         src="$(buildhost_cap_source "$n")"; v="${src%%$'\t'*}"
         info "$n: $v — ${src#*$'\t'}"
-        case "$v" in auto|[1-9]|[1-9][0-9]) ;; *) warn "$n: '$v' is not a whole number above 0 — ignored (auto)" ;; esac
+        buildhost_cap_valid "$n" "$v" || warn "$n: '$v' is ignored (auto) — a setting is auto or 1–99$( [ "$n" = vm-cpus ] && printf ', and at least one runner'"'"'s %s CPU' "$BUILD_CPU_PER_RUNNER")"
       done
       info "change: memex-local buildhost set vm-cpus <n|auto>, set max-runners <n|auto> — then 'memex-local buildhost apply --resize' (a VM restart when the CPUs change)"
       return 0 ;;
     set)
       local n="${1:-}" v="${2:-}"
       case "$n" in vm-cpus|max-runners) ;; *) die "buildhost set: vm-cpus <n|auto> or max-runners <n|auto> (got '${n}')" ;; esac
-      case "$v" in auto|[1-9]|[1-9][0-9]) ;; *) die "buildhost set $n: a whole number from 1 to 99, or auto (got '${v}')" ;; esac
-      [ "$n" != vm-cpus ] || [ "$v" = auto ] || [ "$v" -ge "$BUILD_CPU_PER_RUNNER" ] || die "buildhost set vm-cpus: at least one runner's $BUILD_CPU_PER_RUNNER CPU (got $v)"
+      buildhost_cap_valid "$n" "$v" || die "buildhost set $n: auto, or a whole number from 1 to 99$( [ "$n" = vm-cpus ] && printf ' and at least one runner'"'"'s %s CPU' "$BUILD_CPU_PER_RUNNER") (got '${v}')"
       mkdir -p "$LOCAL_HOME"
       { if [ -f "$BUILD_SETTINGS_FILE" ]; then grep -v "^$n=" "$BUILD_SETTINGS_FILE" || true; fi; printf '%s=%s\n' "$n" "$v"; } > "$BUILD_SETTINGS_FILE.tmp"
       mv -f "$BUILD_SETTINGS_FILE.tmp" "$BUILD_SETTINGS_FILE"
@@ -7415,7 +7421,7 @@ cmd_buildhost() {
     plan)
       [ $# -eq 0 ] || die "buildhost plan: takes no arguments"
       info "host: $(host_cores) cores, $(host_mem_gib) GiB; other VMs ${others} GiB (the portal's included); model reserve $(largest_model_gib) GiB (the largest this Mac answers with: $(model_reserve_models | sed 's/ /, /g'))"
-      info "settings: vm-cpus $(buildhost_cap_source vm-cpus | sed 's/\t/ — /'); max-runners $(buildhost_cap_source max-runners | sed 's/\t/ — /')"
+      info "settings: vm-cpus $(buildhost_cap_source vm-cpus | awk -F'\t' '{ print $1 " — " $2 }'); max-runners $(buildhost_cap_source max-runners | awk -F'\t' '{ print $1 " — " $2 }')"
       info "build VM (profile $BUILD_PROFILE): ${cpu} CPU / ${vmem} GiB / disk ${disk} GiB$( [ -n "$have_disk" ] && [ "$want_disk" -gt "$have_disk" ] && printf ' (this Mac could back %s — apply --resize grows it)' "$want_disk")"
       info "disk: ${free} GiB free on this Mac; the disk holds $(plan_value disk_runs "$plan") run(s) of ${BUILD_RUN_DISK_GIB} GiB at once beside a cache budget of $(buildhost_cache_gib "$disk") GiB (shares tree/slices/nuget/refsets/prepared: $(buildhost_cache_shares "$(buildhost_cache_gib "$disk")" | tr ' ' '/')), images ${BUILD_IMAGES_GIB}, ${BUILD_DISK_HEADROOM_PCT} % kept free"
       info "runners: $(plan_value runners_min "$plan") warm … $(plan_value runners_max "$plan") (KEDA), each $(plan_value runner_cpu "$plan") CPU / $(plan_value runner_mem_request "$plan")–$(plan_value runner_mem_limit "$plan") GiB, $(plan_value stage_slots "$plan") stage slots → up to $(plan_value stage_total "$plan") stage containers at once"
