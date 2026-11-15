@@ -44,15 +44,19 @@ def excluded:
 #     that a live Ingress in the namespace names in spec.tls[].secretName. One NO Ingress names stays
 #     a finding: cert-manager leaves the Secret behind when its Certificate goes, and an orphaned
 #     certificate is the very thing to clean up;
-#   * the azurefile CSI driver's storage-account Secret (`azure-storage-account-<account>-secret`),
-#     which the driver writes for a dynamically provisioned file share.
+#   * the azurefile CSI driver's storage-account Secret: named `azure-storage-account-<account>-secret`
+#     AND carrying the driver's own keys (`azurestorageaccountname`, `azurestorageaccountkey` — key NAMES
+#     only; no value is read). A Secret that only borrows the name stays a finding. What this cannot
+#     tell is whether a live volume still uses the account: the reference sits on cluster-scoped
+#     PersistentVolumes, which this namespace audit does not list.
 def generated($ingressTls):
     (.kind == "Job" and (.metadata.name | startswith("memex-migration-roll-"))
        and ([.status.conditions[]? | select(.type == "Complete" and .status == "True")] | length > 0))
     or (.kind == "Secret" and (.type // "") == "kubernetes.io/tls"
        and (((.metadata.annotations // {})["cert-manager.io/certificate-name"] // "") != "")
        and (.metadata.name as $n | ($ingressTls | index($n)) != null))
-    or (.kind == "Secret" and (.metadata.name | test("^azure-storage-account-[a-z0-9]+-secret$")));
+    or (.kind == "Secret" and (.metadata.name | test("^azure-storage-account-[a-z0-9]+-secret$"))
+       and ((.data // {}) | has("azurestorageaccountname") and has("azurestorageaccountkey")));
 
 # The helm release another chart installed into this namespace (a ChartRelease record's own release,
 # e.g. a speech service beside the portal), or "" when the object names none or names THIS release.
@@ -70,7 +74,8 @@ def sibling_release: ((.metadata.annotations // {})["meta.helm.sh/release-name"]
 #   * counts and limits — `…ContextWindowTokens__0__Tokens`, `…__Model`, `MaxOutputTokens`;
 #   * identifiers and references — `Apple__KeyId`, `SecretWriterClientId`, `SecretNamespace`,
 #     `TokenFile`, `SecretConfigKey` (the NAME of another config key), `SecretExecutor`;
-#   * flags — `RequireInstanceKey`;
+#   * flags — `RequireInstanceKey` (a verb-led leaf ending in a bare `key`; a verb-led leaf ending in a
+#     credential word — `UseApiKey`, `RequiredSecret`, `IsToken` — still matches);
 #   * the operator's own plumbing under `Hosting__Operator__`, whose entries name vault objects, files
 #     and service accounts (`Environment__AZ_POSTGRES_PASSWORD_SECRET` holds a vault object NAME).
 # What still matches (the negative control in run-tests.sh): a leaf ENDING in password, secret,
@@ -85,7 +90,8 @@ def secretish:
     | if ($name | test("(^|__)ConnectionStrings__"; "i")) then true
       elif ($name | test("^Hosting__Operator__"; "i")) then
         ($leaf | test("(password|apikey|clientsecret|privatekey|accesskey|connectionstring)$"))
-      elif ($leaf | test("^(require|enable|disable|use|allow|is|has|skip)")) then false
+      elif ($leaf | test("^(require|enable|disable|use|allow|is|has|skip)"))
+           and ($leaf | test("(password|passwd|secret|token|apikey|credentials?|connectionstring)$") | not) then false
       elif ($leaf | test("(configkey|keyname|secretname|tokenname)$")) then false
       else ($leaf | test("(password|passwd|secret|token|key|credentials?|connectionstring)$"))
       end;

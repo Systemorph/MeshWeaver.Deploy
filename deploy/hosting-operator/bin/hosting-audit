@@ -176,7 +176,9 @@ skipped="${skipped# }"
 # owns nothing here. A declared file that is missing or does not parse FAILS the audit: a declaration
 # the audit could not read must not silently turn back into findings, nor into a clean bill.
 owned_parts=()
-for f in ${HOSTING_AUDIT_OWNED_MANIFESTS:-}; do
+# Split on whitespace only — `read -a` never glob-expands, so a path is used exactly as declared.
+read -r -a owned_files <<< "${HOSTING_AUDIT_OWNED_MANIFESTS:-}"
+for f in "${owned_files[@]}"; do
   [ -f "$f" ] || hosting::die "HOSTING_AUDIT_OWNED_MANIFESTS names '${f}', which is not a file — the declaration names a committed manifest that is not in this checkout"
   part="$work/owned-${#owned_parts[@]}.json"
   if ! kubectl apply --dry-run=client -o json -f - < "$f" 2>"$work/err" \

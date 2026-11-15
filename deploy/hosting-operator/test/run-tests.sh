@@ -2838,6 +2838,7 @@ else
   noise_report "…an ORPHANED cert-manager Secret and a hand-made TLS Secret still are" "$noise_names | index(\"orphan-tls\") and index(\"hand-tls\")"
   noise_report "the azurefile CSI storage-account Secret is generated" "$noise_names | index(\"azure-storage-account-f45d8e671caa74b96a6c37f-secret\") | not"
   noise_report "…an opaque Secret nobody declares still is" "$noise_names | index(\"hosting-jobrunner-token\")"
+  noise_report "…and so is a Secret that only BORROWS the storage-account name (no driver keys)" "$noise_names | index(\"azure-storage-account-lookalike-secret\")"
   noise_report "a sibling helm release's object is owned elsewhere, by name" '.ownedElsewhere | index({"kind":"Deployment","name":"whisper","owner":"helm release memex-whisper"})'
   noise_report "…an object annotated with THIS release the chart no longer renders is still a finding" "$noise_names | index(\"stale-own\")"
   noise_report "a declared committed manifest's objects are owned elsewhere, with the file" '(.ownedElsewhere | index({"kind":"CronJob","name":"assembly-cache-prune","owner":"committed manifest assembly-cache-prune.json"})) and (.ownedElsewhere | index({"kind":"PersistentVolumeClaim","name":"memex-users","owner":"committed manifest portal-pvcs.json"}))'
@@ -2846,8 +2847,8 @@ else
   noise_report "config keys that only LOOK secret are not flagged (counts, ids, references, flags, operator plumbing, an empty value)" \
     '[.plainSecretEntries[] | select(test("ContextWindowTokens|MaxOutputTokens|Apple__KeyId|RequireInstanceKey|SecretConfigKey|Hosting__Operator__Secret|Hosting__Operator__TokenFile|AZ_POSTGRES_PASSWORD_SECRET|KeyClasses|Bootstrap__Secret"))] == []'
   # 🚨 THE NEGATIVE CONTROL: tightening the name check must not let a real credential through.
-  noise_report "…while every REAL credential name still is (api key, client secret, connection string, token, a password under Hosting__Operator__, a bare Secret)" \
-    '.plainSecretEntries == ["configmap:memex-portal-config/Authentication__Microsoft__ClientSecret","configmap:memex-portal-config/ConnectionStrings__memex","configmap:memex-portal-config/Hosting__Operator__DatabasePassword","configmap:memex-portal-config/OpenAICompatible__ApiKey","configmap:memex-portal-config/PluginCatalog__RegistryToken","configmap:memex-portal-config/Webhook__Secret"]'
+  noise_report "…while every REAL credential name still is (api key, client secret, connection string, token, a password under Hosting__Operator__, a bare Secret, a verb-led credential like UseApiKey)" \
+    '.plainSecretEntries == ["configmap:memex-portal-config/Authentication__Microsoft__ClientSecret","configmap:memex-portal-config/ConnectionStrings__memex","configmap:memex-portal-config/Hosting__Operator__DatabasePassword","configmap:memex-portal-config/OpenAICompatible__ApiKey","configmap:memex-portal-config/PluginCatalog__RegistryToken","configmap:memex-portal-config/Provider__UseApiKey","configmap:memex-portal-config/Webhook__RequiredSecret","configmap:memex-portal-config/Webhook__Secret"]'
 fi
 case "$out" in *"owned elsewhere         CronJob/assembly-cache-prune — committed manifest assembly-cache-prune.json"*) ok "the human summary names what is owned elsewhere and by whom" ;;
   *) bad "the human summary names what is owned elsewhere" "said: ${out}" ;; esac

@@ -116,7 +116,9 @@
         "ConnectionStrings__memex": "must-never-print-3",
         "PluginCatalog__RegistryToken": "must-never-print-4",
         "Hosting__Operator__DatabasePassword": "must-never-print-5",
-        "Webhook__Secret": "must-never-print-6"
+        "Webhook__Secret": "must-never-print-6",
+        "Provider__UseApiKey": "must-never-print-7",
+        "Webhook__RequiredSecret": "must-never-print-8"
       }
     },
     {
