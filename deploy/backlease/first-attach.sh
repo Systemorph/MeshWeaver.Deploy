@@ -335,8 +335,11 @@ bash "$prio" --install --profile "$profile" \
   || echo "WARN: the priority governor did not load — the build VM competes at the default band; re-run: bash deploy/homebrew/share/buildhost-priority.sh --install --profile $profile" >&2
 # The network too (maintainer, 2026-11-08): the build VM's internet traffic is capped at a share of the measured link
 # and marked DSCP CS1, so an artefact upload never fills the owner's uplink (mw-netshape.service in the VM).
-bash "$here/../homebrew/share/vm-netshape.sh" --apply --profile "$profile" \
-  || echo "WARN: the build VM's network is NOT shaped — its uploads compete with the owner's traffic; re-run: bash deploy/homebrew/share/vm-netshape.sh --apply --profile $profile" >&2
+# from a checkout: deploy/homebrew/share; from the brew install (libexec/share/backlease): the share beside it — as the
+# governor above. Without the fallback every brew-installed attach warned "NOT shaped" (2026-11-15, the first Mac mini).
+netshape="$here/../homebrew/share/vm-netshape.sh"; [ -f "$netshape" ] || netshape="$here/../vm-netshape.sh"
+bash "$netshape" --apply --profile "$profile" \
+  || echo "WARN: the build VM's network is NOT shaped — its uploads compete with the owner's traffic; re-run: bash $netshape --apply --profile $profile" >&2
 
 echo "== 6/6 follow the sealed set of channel ${follow}"
 # Installed AFTER the runners exist; a follower that cannot load is reported, never a failed attach (the host still runs
