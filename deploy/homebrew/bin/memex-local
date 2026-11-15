@@ -7049,6 +7049,7 @@ largest_model_gib() {
 #   runner memory  = (VM GiB − the VM's own system share) / runners, capped; request = limit − 4 GiB
 #   (host − portal VM: every OTHER Colima profile's memory is subtracted, see other_vms_gib)
 readonly BUILD_RUNNER_MIN_GIB=8                                     # one runner's memory limit, at least
+readonly BUILD_STAGE_MIN_GIB=2                                      # one concurrent stage's memory (build-run.py MIN_MEMORY_PER_SLOT)
 buildhost_plan() {
   # $3 (the portal VM's CPU) is not subtracted: the two VMs share the host's cores, and macOS schedules
   # whichever is busy; memory is not shared, so the portal VM's memory is.
@@ -7076,11 +7077,17 @@ buildhost_plan() {
   if [ "$by_mem" -lt "$by_cpu" ] && [ "$runners" -eq "$by_mem" ]; then rcpu=$(( cpu / runners )); fi
   lim=$(( (vmem - BUILD_SYSTEM_GIB) / runners )); [ "$lim" -le "$BUILD_RUNNER_MAX_GIB" ] || lim="$BUILD_RUNNER_MAX_GIB"
   req=$(( lim - 4 ))
+  # STAGE SLOTS = the runner's CPU, but never more than its memory LIMIT holds at the runner's own floor of 2 GiB per
+  # concurrent stage (build-run.py MIN_MEMORY_PER_SLOT): the first Mac mini's runner of 8 CPU / 13 GiB was planned 8
+  # slots and refused to start — "MW_BUILD_STAGE_SLOTS 8 in 13.0 GiB — each concurrent stage needs at least 2 GiB"
+  # (2026-11-15, CrashLoopBackOff).
+  local slots="$rcpu"; [ "$slots" -le $(( lim / BUILD_STAGE_MIN_GIB )) ] || slots=$(( lim / BUILD_STAGE_MIN_GIB ))
+  [ "$slots" -ge 1 ] || slots=1
   local minw="$BUILD_MIN_WARM"; [ "$minw" -le "$runners" ] || minw="$runners"
   # The CPU REQUEST sits half a core under the limit: k3s, KEDA and the kubelet request CPU too, and N runners
   # requesting the VM's every core would leave the last one Pending. The limit still lets each use its share.
   printf 'vm_cpu=%s\nvm_mem=%s\nrunners_min=%s\nrunners_max=%s\nrunner_cpu=%s\nrunner_cpu_request=%sm\nrunner_mem_request=%s\nrunner_mem_limit=%s\nstage_slots=%s\nstage_total=%s\n' \
-    "$cpu" "$vmem" "$minw" "$runners" "$rcpu" "$(( rcpu * 1000 - 500 ))" "$req" "$lim" "$rcpu" "$(( runners * rcpu ))"
+    "$cpu" "$vmem" "$minw" "$runners" "$rcpu" "$(( rcpu * 1000 - 500 ))" "$req" "$lim" "$slots" "$(( runners * slots ))"
   [ -z "$disk" ] || printf 'vm_disk=%s\ndisk_runs=%s\n' "$disk" "$disk_runs"
   [ "$runners" -ge "$by_cpu" ] || printf 'limited_by=%s\n' "$( if [ "$runners" -eq "$by_mem" ]; then echo memory; elif [ -n "$cap_run" ] && [ "$runners" -eq "$cap_run" ]; then echo settings; else echo disk; fi)"
 }

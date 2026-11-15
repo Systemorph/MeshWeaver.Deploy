@@ -2468,12 +2468,12 @@ P="$(lib buildhost_plan 18 32 8 16 0 2>&1)" && bad "a memory-starved host is ref
 # THE MAC MINI (2026-11-15: wildberg, 18 cores / 64 GiB, portal VM 16, a 23 GiB token model): 4 runners by CPU, 1 by
 # memory — planned as ONE runner with the VM's 16 CPU, never refused.
 P="$(lib buildhost_plan 18 64 8 16 23)"
-grep -q '^vm_mem=17$' <<<"$P" && grep -q '^runners_max=1$' <<<"$P" && grep -q '^runner_cpu=16$' <<<"$P" && grep -q '^stage_slots=16$' <<<"$P" \
+grep -q '^vm_mem=17$' <<<"$P" && grep -q '^runners_max=1$' <<<"$P" && grep -q '^runner_cpu=16$' <<<"$P" && grep -q '^stage_slots=6$' <<<"$P" && grep -q '^stage_total=6$' <<<"$P" \
   && grep -q '^runner_mem_limit=13$' <<<"$P" && grep -q '^runner_cpu_request=15500m$' <<<"$P" && grep -q '^limited_by=memory$' <<<"$P" \
-  && ok "a 64 GiB Mac mini with a 23 GiB token model gets ONE runner (16 CPU / 13 GiB, 16 stage slots), limited_by=memory — not a refusal" || bad "plan mini" "$P"
+  && ok "a 64 GiB Mac mini with a 23 GiB token model gets ONE runner (16 CPU / 13 GiB; 6 stage slots — 2 GiB each, the runner's own floor), limited_by=memory — not a refusal" || bad "plan mini" "$P"
 P="$(lib buildhost_plan 18 64 8 16 18)"
-grep -q '^runners_max=2$' <<<"$P" && grep -q '^runner_cpu=8$' <<<"$P" && grep -q '^runner_mem_limit=9$' <<<"$P" \
-  && ok "…and with an 18 GiB token model TWO runners of 8 CPU / 9 GiB (each at least 8 GiB)" || bad "plan mini 18" "$P"
+grep -q '^runners_max=2$' <<<"$P" && grep -q '^runner_cpu=8$' <<<"$P" && grep -q '^runner_mem_limit=9$' <<<"$P" && grep -q '^stage_slots=4$' <<<"$P" \
+  && ok "…and with an 18 GiB token model TWO runners of 8 CPU / 9 GiB (each at least 8 GiB), 4 stage slots each (9 GiB / 2)" || bad "plan mini 18" "$P"
 P="$(lib buildhost_plan 18 64 8 16 30 2>&1)" && bad "a mini with a 30 GiB model planned a runner" "$P" \
   || { grep -q '^kind=memory$' <<<"$P" && ok "…and only when not even one runner fits is it refused (kind=memory)" || bad "plan mini refuse" "$P"; }
 grep -q 'offer a smaller token model' <<<"$(lib buildhost_plan_remedy memory)" && ! grep -q 'free disk' <<<"$(lib buildhost_plan_remedy memory)" && grep -q 'free disk' <<<"$(lib buildhost_plan_remedy disk)" \
