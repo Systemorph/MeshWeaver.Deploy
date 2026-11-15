@@ -3277,7 +3277,7 @@ rm -f "$NSV/colima.log" "$NSV/home/netshape-build.env"
 OUT="$(nsapply env MEMEX_NET_SHAPE=off)"; RC=$?
 { [ "$RC" = 0 ] && [ ! -e "$NSV/colima.log" ] && [ ! -e "$NSV/home/netshape-build.env" ]; } && case "$OUT" in *"MEMEX_NET_SHAPE=off"*) true ;; *) false ;; esac \
   && ok "MEMEX_NET_SHAPE=off is honoured by the shaper itself: no VM call, no record, exit 0" || bad "MEMEX_NET_SHAPE=off in vm-netshape.sh" "rc=$RC $OUT"
-case "$(cat "$HERE/../../backlease/first-attach.sh")" in *'homebrew/share/vm-netshape.sh" --apply'*) ok "first-attach.sh shapes through vm-netshape.sh --apply (so the switch above covers it)" ;; *) bad "first-attach shaper call" "" ;; esac
+case "$(cat "$HERE/../../backlease/first-attach.sh")" in *'netshape="$here/../homebrew/share/vm-netshape.sh"; [ -f "$netshape" ] || netshape="$here/../vm-netshape.sh"'*'bash "$netshape" --apply'*) ok "first-attach.sh shapes through vm-netshape.sh --apply from a checkout AND from the brew layout (so the switch above covers it)" ;; *) bad "first-attach shaper call" "" ;; esac
 rm -rf "$NSV"
 # `memex-local net --profile build` (no subcommand) is `status` for that profile, as vm-netshape.sh defaults a bare flag
 NSS="$(mktemp -d)"; printf '#!/bin/bash\nprintf "%%s" "$*"\n' > "$NSS/vm-netshape.sh"
