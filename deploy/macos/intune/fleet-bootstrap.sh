@@ -27,11 +27,13 @@
 #      (sign out and back in first; a later run names `sudo profiles install -type bootstraptoken`). Never a password.
 #   0c. Energy enabler (1.8.0): until the Intune Energy Saver profile is installed, only `pmset -c sleep 0`, so the
 #      Mac is awake to receive it (a sleeping Mac answers MDM commands NotNow during DarkWake).
+#   0d. GPU wired-memory limit (1.13.0): when GpuWiredReserveMb[<Class>] is configured, iogpu.wired_limit_mb = RAM − reserve,
+#      set now and at every boot by a root LaunchDaemon (com.meshweaver.fleet.gpu-wired-limit). Not configured: nothing set.
 #   5b. Once the join is filed (1.9.0): the approval page is opened for the person at the console and a notification
 #      posted, and a root LaunchDaemon (com.meshweaver.fleet.join-poller) polls control every 30 s for at most 24 h — the
 #      Approve is collected within half a minute and the run continues at once. It removes itself when done.
 #   Readings the person can read without root: /Library/MeshWeaver/fleet-state/ — one file per step (operator-ssh,
-#      version, bootstrap-token, energy, join-poller, participation, homebrew, devtools, tools, tailscale, tailscaled, network, up, setup, join, doctor,
+#      version, bootstrap-token, energy, gpu-wired-limit, join-poller, participation, homebrew, devtools, tools, tailscale, tailscaled, network, up, setup, join, doctor,
 #      heartbeat, buildhost) and `stage`: the step the onboarding is stuck on, since when and why (1.7.0). A join that
 #      failed or was skipped for a missing prerequisite also reaches the person as a notification, naming it.
 #
@@ -61,7 +63,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.12.0"
+readonly FLEET_BOOTSTRAP_VERSION="1.13.0"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -424,6 +426,133 @@ step_energy_enabler() {
     write_reading energy failed "pmset -c sleep 0 failed (AC sleep ${ac:-unreadable})"; return 1
   fi
   write_reading energy enabler "AC system sleep ${ac:-unreadable} → 0 until the Energy Saver profile arrives"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# GPU WIRED-MEMORY LIMIT (1.13.0; owner, 2026-11-16: "it should be done when onboarding"). On Apple silicon the GPU may
+# wire at most `iogpu.wired_limit_mb` of the unified memory; at 0 macOS applies its own default (about three quarters
+# of the RAM above 36 GB, two thirds below), so a 128 GB Mac Studio cannot load a model of ~100 GB. Raising it takes
+# root and does not survive a reboot — measured on the second Mac Studio (2026-11-16), where a person had to type
+# `sudo sysctl` for a 102 GB model. The bootstrap runs as root, so it does it, from the profile:
+#   GpuWiredReserveMb<Class> (the Mac's model name without spaces, as the build host's per-class keys: MacStudio,
+#   MacMini), else the class-less GpuWiredReserveMb — the MiB kept OUT of the GPU's reach for macOS and everything
+#   else. limit = RAM MiB − reserve. A RESERVE rather than a limit, so one key is right on every RAM size of a class
+#   and can never name more memory than the Mac has.
+# Configured ⇒ a root LaunchDaemon (com.meshweaver.fleet.gpu-wired-limit, RunAtLoad) sets it at every boot and the run
+# sets it now. Not configured ⇒ nothing is set, and a daemon an earlier declaration installed is removed (the live
+# value stays until the next reboot; nothing is lowered under a running model). Refused, never applied: a reserve that
+# is not a whole number, below GPU_RESERVE_MIN_MB, or that leaves the GPU no more than macOS's own default.
+readonly GPU_LIMIT_LABEL="com.meshweaver.fleet.gpu-wired-limit"
+readonly GPU_LIMIT_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${GPU_LIMIT_LABEL}.plist"
+readonly GPU_RESERVE_MIN_MB=4096
+
+# The LaunchDaemon that sets the limit at boot. Pure: prints the plist for limit $1 (MiB).
+gpu_limit_plist() {
+  cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${GPU_LIMIT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/sbin/sysctl</string>
+    <string>iogpu.wired_limit_mb=$1</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>${LOG_DIR}/gpu-wired-limit.log</string>
+  <key>StandardErrorPath</key><string>${LOG_DIR}/gpu-wired-limit.log</string>
+</dict>
+</plist>
+PLIST
+}
+
+# This Mac's model class ("Mac Studio" → MacStudio, "Mac mini" → MacMini) — the same rule as memex-local's
+# host_model_class. FLEET_HOST_MODEL overrides (tests). Empty when unreadable.
+host_model_class() {
+  local n="${FLEET_HOST_MODEL:-}"
+  [ -n "$n" ] || n="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Model Name/ { print $2; exit }')"
+  printf '%s' "$n" | awk '{ for (i = 1; i <= NF; i++) printf "%s%s", toupper(substr($i, 1, 1)), substr($i, 2) }' | tr -cd 'A-Za-z0-9'
+}
+
+# The declared reserve and the key it came from ("<value>\t<key>"), or nothing when neither key is configured.
+gpu_reserve_setting() {
+  local cls v; cls="$(host_model_class)"
+  if [ -n "${FLEET_GPU_WIRED_RESERVE_MB:-}" ]; then printf '%s\tFLEET_GPU_WIRED_RESERVE_MB' "$FLEET_GPU_WIRED_RESERVE_MB"; return 0; fi
+  if [ -n "$cls" ]; then
+    v="$(setting __FLEET_NO_ENV GpuWiredReserveMb"$cls")"
+    [ -z "$v" ] || { printf '%s\tGpuWiredReserveMb%s' "$v" "$cls"; return 0; }
+  fi
+  v="$(setting __FLEET_NO_ENV GpuWiredReserveMb)"
+  [ -z "$v" ] || printf '%s\tGpuWiredReserveMb' "$v"
+}
+
+# macOS's own default GPU wired limit in MiB for RAM $1 MiB (what the GPU gets with iogpu.wired_limit_mb = 0). Pure.
+gpu_default_limit_mb() {
+  if [ "$1" -gt 36864 ]; then printf '%s' $(( $1 * 3 / 4 )); else printf '%s' $(( $1 * 2 / 3 )); fi
+}
+
+# The limit for RAM $1 MiB and reserve $2, or a refusal on stderr (return 1). Pure.
+gpu_limit_for() {
+  local mem="$1" reserve="$2" limit def
+  case "$reserve" in ''|*[!0-9]*) echo "the reserve '$reserve' is not a whole number of MiB" >&2; return 1 ;; esac
+  case "$mem" in ''|*[!0-9]*|0) echo "the RAM size is unreadable" >&2; return 1 ;; esac
+  reserve=$((10#$reserve))
+  [ "$reserve" -ge "$GPU_RESERVE_MIN_MB" ] || { echo "a reserve of $reserve MiB leaves macOS less than $GPU_RESERVE_MIN_MB MiB" >&2; return 1; }
+  limit=$(( mem - reserve )); def="$(gpu_default_limit_mb "$mem")"
+  [ "$limit" -gt "$def" ] || { echo "RAM $mem MiB − reserve $reserve MiB = $limit MiB is not above macOS's default of $def MiB (it would lower the GPU's share)" >&2; return 1; }
+  printf '%s' "$limit"
+}
+
+remove_gpu_limit_daemon() {
+  [ -f "$GPU_LIMIT_PLIST" ] || return 0
+  log "gpu: removing $GPU_LIMIT_LABEL ($1) — the live limit stays until the next reboot, then macOS's default applies"
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then printf 'DRY-RUN: launchctl bootout system/%s; rm %s\n' "$GPU_LIMIT_LABEL" "$GPU_LIMIT_PLIST"; return 0; fi
+  launchctl bootout "system/$GPU_LIMIT_LABEL" >/dev/null 2>&1 || true
+  rm -f "$GPU_LIMIT_PLIST"
+}
+
+step_gpu_wired_limit() {
+  local decl reserve key mem cur limit want why
+  decl="$(gpu_reserve_setting)"
+  if [ -z "$decl" ]; then
+    remove_gpu_limit_daemon "not configured any more"
+    log "gpu: wired-memory limit not configured (no GpuWiredReserveMb in the com.memex.local profile) — left as it is"
+    write_reading gpu-wired-limit not-configured; return 0
+  fi
+  reserve="${decl%%$'\t'*}"; key="${decl#*$'\t'}"
+  if ! cur="$(sysctl -n iogpu.wired_limit_mb 2>/dev/null)" || [ -z "$cur" ]; then
+    log "gpu: this Mac has no iogpu.wired_limit_mb (not Apple silicon) — $key ignored"
+    write_reading gpu-wired-limit unsupported "$key"; return 0
+  fi
+  mem="${FLEET_HW_MEMSIZE:-$(sysctl -n hw.memsize 2>/dev/null)}"
+  case "$mem" in ''|*[!0-9]*) mem="" ;; *) mem=$(( mem / 1048576 )) ;; esac
+  if ! limit="$(gpu_limit_for "$mem" "$reserve" 2>&1)"; then
+    why="$limit"
+    log "gpu: REFUSED $key = $reserve — $why; nothing set"
+    write_reading gpu-wired-limit refused "$key=$reserve: $why"; return 1
+  fi
+  want="$(gpu_limit_plist "$limit")"
+  if [ ! -f "$GPU_LIMIT_PLIST" ] || [ "$(cat "$GPU_LIMIT_PLIST")" != "$want" ]; then
+    log "gpu: installing $GPU_LIMIT_LABEL (iogpu.wired_limit_mb=$limit at every boot; $key = $reserve MiB kept from RAM $mem MiB)"
+    if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then printf 'DRY-RUN: write %s; launchctl bootstrap system\n' "$GPU_LIMIT_PLIST"
+    else
+      { mkdir -p "$(dirname "$GPU_LIMIT_PLIST")" && printf '%s\n' "$want" > "$GPU_LIMIT_PLIST" && chmod 644 "$GPU_LIMIT_PLIST" && { chown root:wheel "$GPU_LIMIT_PLIST" 2>/dev/null || true; }; } \
+        || { log "gpu: FAILED to write $GPU_LIMIT_PLIST — the limit would not survive a reboot (retried next run)"; write_reading gpu-wired-limit failed "could not write the LaunchDaemon"; return 1; }
+      launchctl bootout "system/$GPU_LIMIT_LABEL" >/dev/null 2>&1 || true
+      launchctl bootstrap system "$GPU_LIMIT_PLIST" 2>/dev/null || log "gpu: could not load $GPU_LIMIT_LABEL now (it loads at the next boot; the limit is set directly below)"
+    fi
+  fi
+  if [ "$cur" = "$limit" ]; then
+    log "gpu: iogpu.wired_limit_mb is $limit ($key = $reserve MiB of RAM $mem MiB kept for macOS)"
+    write_reading gpu-wired-limit ok "$limit MiB ($key=$reserve)"; return 0
+  fi
+  log "gpu: setting iogpu.wired_limit_mb $cur → $limit ($key = $reserve MiB of RAM $mem MiB kept for macOS)"
+  if ! run sysctl -w "iogpu.wired_limit_mb=$limit"; then
+    log "gpu: FAILED to set iogpu.wired_limit_mb=$limit (retried next run)"
+    write_reading gpu-wired-limit failed "sysctl iogpu.wired_limit_mb=$limit failed (was $cur)"; return 1
+  fi
+  write_reading gpu-wired-limit ok "$limit MiB ($key=$reserve; was $cur)"
 }
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1321,6 +1450,8 @@ main() {
   step_bootstrap_token "$user"
   # before anything that can fail or wait: a sleeping Mac receives no profile at all
   step_energy_enabler || deferred_failed=1
+  # needs nothing of the person or the network: a model that does not fit waits on no other step
+  step_gpu_wired_limit || deferred_failed=1
   # the owner's answers are required BEFORE anything is installed — an unanswered one fails the run, loudly
   if ! track participation read_participation; then
     log "a step FAILED — the profile must carry the owner's answers (AcceptJobs, AcceptTokens); the next run retries"

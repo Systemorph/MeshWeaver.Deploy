@@ -119,6 +119,7 @@
         "AcceptTokensResidency": "CH",
         "BuildVmCpusMacMini": 8,
         "BuildMaxRunnersMacMini": 2,
+        "GpuWiredReserveMbMacStudio": 8192,
         "OperatorSshKeys": [
           "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDH5AD0ellP162c2ThMr3M79UFF5xWm4cAqHv5xf2coD operator@example.com"
         ],

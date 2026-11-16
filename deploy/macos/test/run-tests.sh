@@ -1131,6 +1131,75 @@ env FLEET_BOOTSTRAP_LIB=1 FLEET_USER_HOME="$BA/home" FLEET_LOG_DIR="$BA/log" bas
 grep -q 'step_buildhost_attach "$user" "$mlocal"' "$FB" && ok "a joined, finished Mac runs the attach step on every run (until the items are gone)" || bad "attach step wired" ""
 rm -rf "$BA"
 
+echo "── GPU wired-memory limit: RAM − the declared reserve, now and at every boot, never below macOS's default (1.13.0) ──"
+FB="$HERE/../intune/fleet-bootstrap.sh"
+GP="$(mktemp -d)"; mkdir -p "$GP/bin" "$GP/ld"
+cat > "$GP/bin/sysctl" <<STUB
+#!/bin/bash
+case "\$*" in
+  "-n iogpu.wired_limit_mb") [ -n "\${GP_CUR:-}" ] || exit 1; cat "$GP/cur" 2>/dev/null || echo "\$GP_CUR" ;;
+  "-n hw.memsize") echo 137438953472 ;;
+  -w*) echo "sysctl \$*" >> "$GP/calls"; [ "\${GP_SYSCTL_RC:-0}" = 0 ] || exit 1; echo "\${2#*=}" > "$GP/cur" ;;
+  *) exit 1 ;;
+esac
+STUB
+cat > "$GP/bin/launchctl" <<STUB
+#!/bin/bash
+echo "launchctl \$*" >> "$GP/lcalls"
+STUB
+chmod +x "$GP/bin/sysctl" "$GP/bin/launchctl"
+# a com.memex.local profile carrying the given keys (a BINARY plist, as Managed Preferences holds it)
+gprefs() { python3 -c 'import plistlib,sys; plistlib.dump({k: int(v) if v.isdigit() else v for k, v in (a.split("=", 1) for a in sys.argv[2:])}, open(sys.argv[1], "wb"), fmt=plistlib.FMT_BINARY)' "$GP/prefs.plist" "$@"; }
+gps() { rm -f "$GP/calls" "$GP/lcalls" "$GP/cur"; env FLEET_BOOTSTRAP_LIB=1 PATH="$GP/bin:$PATH" FLEET_STATE_DIR="$GP/st" FLEET_LOG_DIR="$GP/log" FLEET_LAUNCHDAEMONS_DIR="$GP/ld" \
+  FLEET_MANAGED_PREFS="$GP/prefs" FLEET_HOST_MODEL="${GP_MODEL:-Mac Studio}" "$@" bash -c '. "$0"; step_gpu_wired_limit; echo "RC=$?"' "$FB" 2>&1; }
+GPL="$GP/ld/com.meshweaver.fleet.gpu-wired-limit.plist"
+V="$(env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; printf "%s %s %s" "$(gpu_limit_for 131072 8192)" "$(gpu_default_limit_mb 131072)" "$(gpu_default_limit_mb 32768)"' "$FB")"
+[ "$V" = "122880 98304 21845" ] && ok "128 GiB with an 8 GiB reserve → 122880 MiB; macOS's default is 3/4 above 36 GiB (98304), 2/3 below" || bad "limit arithmetic" "$V"
+for r in abc -1 4095 40000 32768 ""; do
+  env FLEET_BOOTSTRAP_LIB=1 bash -c '. "$0"; gpu_limit_for 131072 "$1"' "$FB" "$r" >/dev/null 2>&1 && bad "reserve '$r' accepted" "" || ok "reserve '$r' is refused (not a number, under 4096 MiB, or not above macOS's default)"
+done
+[ "$(env FLEET_BOOTSTRAP_LIB=1 FLEET_HOST_MODEL="Mac mini" bash -c '. "$0"; host_model_class' "$FB")" = MacMini ] && ok "the model class is the model name without spaces (Mac mini → MacMini, as memex-local's)" || bad "model class" ""
+# not configured: nothing set, nothing installed
+rm -f "$GP/prefs.plist"
+OUT="$(gps GP_CUR=0)"
+case "$OUT" in *"not configured"*"RC=0"*) [ ! -e "$GP/calls" ] && [ ! -e "$GPL" ] && grep -q '^not-configured ' "$GP/st/gpu-wired-limit" && ok "not configured: no sysctl, no LaunchDaemon, reading gpu-wired-limit = not-configured" || bad "unconfigured changed something" "$(cat "$GP/calls" 2>/dev/null)" ;; *) bad "unconfigured" "$OUT" ;; esac
+# the class key on a Mac Studio: set now, daemon installed with the limit, loaded
+gprefs GpuWiredReserveMbMacStudio=8192 GpuWiredReserveMb=20000
+OUT="$(gps GP_CUR=0)"
+case "$OUT" in *"setting iogpu.wired_limit_mb 0 → 122880"*"RC=0"*)
+  [ "$(cat "$GP/calls")" = "sysctl -w iogpu.wired_limit_mb=122880" ] && grep -q '<string>iogpu.wired_limit_mb=122880</string>' "$GPL" && grep -q '<string>/usr/sbin/sysctl</string>' "$GPL" \
+    && grep -q 'RunAtLoad' "$GPL" && plutil -lint "$GPL" >/dev/null && grep -q "bootstrap system $GPL" "$GP/lcalls" && grep -q '^ok .*122880 MiB (GpuWiredReserveMbMacStudio=8192; was 0)' "$GP/st/gpu-wired-limit" \
+    && ok "GpuWiredReserveMbMacStudio=8192 on a 128 GiB Studio: set to 122880 now, a RunAtLoad LaunchDaemon (lints) sets it at boot, the class key wins over the class-less one" \
+    || bad "configured calls" "$(cat "$GP/calls" "$GP/lcalls" "$GPL" "$GP/st/gpu-wired-limit" 2>&1)" ;; *) bad "configured" "$OUT" ;; esac
+# a re-run with the value in force: nothing changed (idempotent)
+OUT="$(gps GP_CUR=122880)"
+case "$OUT" in *"iogpu.wired_limit_mb is 122880"*"RC=0"*) [ ! -e "$GP/calls" ] && [ ! -e "$GP/lcalls" ] && ok "a re-run with the limit in force and the daemon current changes nothing" || bad "rerun changed" "$(cat "$GP/calls" "$GP/lcalls" 2>&1)" ;; *) bad "rerun" "$OUT" ;; esac
+# the class-less key applies to a class with no key of its own
+OUT="$(GP_MODEL="Mac mini" gps GP_CUR=0 FLEET_HW_MEMSIZE=137438953472)"
+case "$OUT" in *"0 → 111072"*"GpuWiredReserveMb ="*"RC=0"*) ok "a class without its own key takes the class-less GpuWiredReserveMb" ;; *) bad "class-less" "$OUT" ;; esac
+# refused: a reserve that would lower the GPU's share — nothing set, the daemon left as it was, FAILED in the reading
+gprefs GpuWiredReserveMbMacStudio=40000
+cp "$GPL" "$GP/before"
+OUT="$(gps GP_CUR=0)"
+case "$OUT" in *"REFUSED GpuWiredReserveMbMacStudio = 40000"*"not above macOS's default"*"RC=1"*) [ ! -e "$GP/calls" ] && cmp -s "$GPL" "$GP/before" && grep -q '^refused ' "$GP/st/gpu-wired-limit" && ok "a reserve leaving the GPU no more than macOS's default is REFUSED: nothing set, exit 1, reading refused" || bad "refused changed" "$(cat "$GP/calls" 2>&1)" ;; *) bad "refused" "$OUT" ;; esac
+# no iogpu (not Apple silicon): said, nothing done, not a failure
+gprefs GpuWiredReserveMbMacStudio=8192
+OUT="$(gps GP_CUR=)"
+case "$OUT" in *"not Apple silicon"*"RC=0"*) [ ! -e "$GP/calls" ] && ok "no iogpu.wired_limit_mb: said, nothing set, not a failure" || bad "no iogpu set" "" ;; *) bad "no iogpu" "$OUT" ;; esac
+# a failing sysctl is FAILED
+OUT="$(gps GP_CUR=0 GP_SYSCTL_RC=1)"
+case "$OUT" in *"FAILED to set iogpu.wired_limit_mb=122880"*"RC=1"*) grep -q '^failed ' "$GP/st/gpu-wired-limit" && ok "a failed sysctl is FAILED in the log and the reading" || bad "sysctl failed reading" "" ;; *) bad "sysctl failed" "$OUT" ;; esac
+# dry run: prints, changes nothing
+rm -f "$GPL"
+OUT="$(gps GP_CUR=0 FLEET_BOOTSTRAP_DRY_RUN=1)"
+case "$OUT" in *"DRY-RUN: write $GPL"*"DRY-RUN: sysctl -w iogpu.wired_limit_mb=122880"*"RC=0"*) [ ! -e "$GP/calls" ] && [ ! -e "$GPL" ] && ok "a dry run prints the daemon and the sysctl and changes nothing" || bad "dry run changed" "" ;; *) bad "dry run gpu" "$OUT" ;; esac
+# the declaration withdrawn: the daemon an earlier run installed is removed, the live value is not touched
+gps GP_CUR=0 >/dev/null; rm -f "$GP/prefs.plist"
+OUT="$(gps GP_CUR=122880)"
+case "$OUT" in *"removing com.meshweaver.fleet.gpu-wired-limit"*"RC=0"*) [ ! -e "$GPL" ] && [ ! -e "$GP/calls" ] && grep -q 'bootout system/com.meshweaver.fleet.gpu-wired-limit' "$GP/lcalls" && ok "a withdrawn declaration removes the LaunchDaemon and leaves the live value alone" || bad "withdrawn" "$(cat "$GP/calls" "$GP/lcalls" 2>&1)" ;; *) bad "withdrawn" "$OUT" ;; esac
+awk '/^main\(\) \{/{on=1} on' "$FB" | grep -n 'step_gpu_wired_limit\|read_participation' | head -1 | grep -q step_gpu_wired_limit && ok "main sets the GPU limit before the participation answers (a Mac failing later still gets it)" || bad "gpu order" ""
+rm -rf "$GP"
+
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
