@@ -4335,6 +4335,94 @@ rm -rf "$_mg_dir"
 refuses_hard "hosting-migrate --current refuses a typed --tag beside it" "takes neither --image nor --tag" \
   env HOSTING_DRY_RUN=true hosting-migrate --namespace fabrikam --current --tag 3.0.0-ci.9101
 
+# ── hosting-migrate: a FAILED Job says WHY, even when `kubectl logs job/<job>` gives nothing ──────
+# 🚨 MeshWeaver.Deploy#315. On one estate every Roll stopped at the migration with
+# "Last lines: (no log: Found 7 pods, using pod/…)" — kubectl's own pod-selection notice, quoted as
+# the reason. The Job is now DESCRIBED from what the operator may read without a secret: the Job's
+# Failed condition, each pod (selected by the Job's label, never by kubectl's pick) with its
+# containers' reasons and exit codes, the pods' last events, and the newest failed pod's own log.
+# The fixture plants an env VALUE in the pods' spec, an event on an UNRELATED pod and a current log
+# that cannot be read (only --previous answers), and answers pods only on the LEGACY label.
+MGF_FIXTURES="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/fixtures/migrate-failed" && pwd)"
+_mgf_new() { _mg_new; cp -R "$MGF_FIXTURES/." "$_mg_dir/"; echo 1 > "$_mg_dir/polls"; echo failed > "$_mg_dir/outcome"; }
+_mgf_new; echo unreadable > "$_mg_dir/job-log"; echo job-name > "$_mg_dir/pods-label"
+_mg_out="$(_mg_run env)"; _mg_rc=$?
+_mgf_err="$(grep -m1 '^hosting-migrate: ERROR:' <<< "$_mg_out")"
+if [ "$_mg_rc" -ne 0 ] \
+   && grep_in "$_mgf_err" -q 'Cause: Job Failed: BackoffLimitExceeded — Job has reached the specified backoff limit' \
+   && grep_in "$_mgf_err" -q "pod ${_mg_job}-m4ph4: container memex-migration terminated Error (exit 1): Npgsql.PostgresException: 42501: permission denied"; then
+  ok "a failed Job's ERROR line names its Failed condition and the newest failed pod's reason and exit code"
+else
+  bad "a failed Job's ERROR line carries the cause" "rc=${_mg_rc} error line: ${_mgf_err} out: ${_mg_out}"
+fi
+if grep_in "$_mg_out" -Fq "  pod ${_mg_job}-zzzz9: phase Pending" \
+   && grep_in "$_mg_out" -Fq '    PodScheduled: Unschedulable — 0/3 nodes are available: 3 Insufficient memory.' \
+   && grep_in "$_mg_out" -Fq "  pod ${_mg_job}-aaaa1: phase Failed" \
+   && grep_in "$_mg_out" -Fq '    init container wait-for-postgres: terminated Completed (exit 0)' \
+   && grep_in "$_mg_out" -Fq '  job condition Failed: BackoffLimitExceeded — Job has reached the specified backoff limit' \
+   && grep_in "$_mg_out" -Fq "pod/${_mg_job}-m4ph4 Warning BackOff: Back-off restarting failed container memex-migration (×3)" \
+   && grep_in "$_mg_out" -Fq "job/${_mg_job} Warning BackoffLimitExceeded" \
+   && grep_in "$_mg_out" -Fq "  last lines of pod/${_mg_job}-m4ph4:" \
+   && grep_in "$_mg_out" -Fq 'Unhandled exception: permission denied for schema public'; then
+  ok "…and describes every pod, the pods' events and the newest failed pod's own (previous) log"
+else
+  bad "a failed Job is described: pods, events, the newest failed pod's log" "out: ${_mg_out}"
+fi
+if ! grep_in "$_mg_out" -q 'PLANTED-ENV-VALUE' && ! grep_in "$_mg_out" -q 'UnrelatedEvent' \
+   && ! grep_in "$_mg_out" -q 'Found 7 pods' \
+   && grep -q "get pods -l job-name=${_mg_job} -o json" "$_mg_log" \
+   && grep -q "logs ${_mg_job}-m4ph4 --all-containers --previous --tail=20" "$_mg_log"; then
+  ok "…from status alone: no env value, no other pod's event, no kubectl pod-pick notice; pods by the Job's label"
+else
+  bad "the description reads status only, by the Job's label" "out: ${_mg_out} log: $(cat "$_mg_log")"
+fi
+# the CONTROL: the verdict is the same as before — non-zero, FAILED, never completed — and no
+# description read decides it: with every diagnostic read REFUSED the step fails exactly the same way.
+if [ "$_mg_rc" -eq 1 ] && grep_in "$_mg_out" -q "${_mg_job} FAILED" && grep_in "$_mg_out" -q 'must not either' \
+   && ! grep_in "$_mg_out" -q 'migration=completed'; then
+  ok "…the control: the described failure is still exit 1, FAILED, never completed"
+else
+  bad "the description does not change the verdict" "rc=${_mg_rc} out: ${_mg_out}"
+fi
+rm -rf "$_mg_dir"
+_mgf_new; echo unreadable > "$_mg_dir/job-log"; echo forbidden > "$_mg_dir/pods.json"; echo forbidden > "$_mg_dir/events.json"
+_mg_out="$(_mg_run env)"; _mg_rc=$?
+if [ "$_mg_rc" -eq 1 ] && grep_in "$_mg_out" -q "${_mg_job} FAILED" && ! grep_in "$_mg_out" -q 'migration=completed' \
+   && grep_in "$_mg_out" -q '  pods: not readable by this operator' && grep_in "$_mg_out" -q '  events: not readable by this operator' \
+   && [ "$(grep -c '^hosting-migrate: ERROR:' <<< "$_mg_out")" = "1" ]; then
+  ok "…the control: every description read REFUSED — still exit 1, one ERROR line, the refusals named"
+else
+  bad "refused description reads leave the verdict alone" "rc=${_mg_rc} out: ${_mg_out}"
+fi
+rm -rf "$_mg_dir"
+# …and a Job that SUCCEEDS is not touched by any of it: no pod or event read, still completed.
+_mgf_new; echo succeeded > "$_mg_dir/outcome"
+_mg_out="$(_mg_run env)"; _mg_rc=$?
+if [ "$_mg_rc" -eq 0 ] && grep_in "$_mg_out" -q '::hosting:: migration=completed' \
+   && ! grep -q ' get pods ' "$_mg_log" && ! grep -q ' get events ' "$_mg_log"; then
+  ok "…the control: a succeeded Job reads no pod and no event and is still completed"
+else
+  bad "a succeeded Job is untouched by the failure description" "rc=${_mg_rc} out: ${_mg_out} log: $(cat "$_mg_log")"
+fi
+rm -rf "$_mg_dir"
+# BOUNDED: a Job that retried 30 times still yields at most 8 pods and 8 events.
+_mgf_new; echo unreadable > "$_mg_dir/job-log"
+jq --arg job "$_mg_job" '.items = [range(0; 30) as $i | .items[1]
+    | .metadata.name = "\($job)-p\($i)" | .metadata.creationTimestamp = "2026-11-15T10:\(10 + $i):00Z"]' \
+  "$MGF_FIXTURES/pods.json" > "$_mg_dir/pods.json"
+jq --arg job "$_mg_job" '.items = [range(0; 30) as $i | .items[0]
+    | .involvedObject.name = "\($job)-p\($i)" | .lastTimestamp = "2026-11-15T10:\(10 + $i):30Z"]' \
+  "$MGF_FIXTURES/events.json" > "$_mg_dir/events.json"
+_mg_out="$(_mg_run env)"; _mg_rc=$?
+if [ "$_mg_rc" -eq 1 ] && grep_in "$_mg_out" -Fq '  (30 pods; the newest 8 shown)' \
+   && [ "$(grep -c '^  pod ' <<< "$_mg_out")" = "8" ] && [ "$(grep -c '^  event ' <<< "$_mg_out")" = "8" ] \
+   && grep_in "$_mg_out" -Fq "  pod ${_mg_job}-p29: phase Failed" && ! grep_in "$_mg_out" -Fq "  pod ${_mg_job}-p21:"; then
+  ok "…bounded: 30 retried pods print the newest 8 pods and the last 8 events"
+else
+  bad "the description is bounded" "rc=${_mg_rc} out: ${_mg_out}"
+fi
+rm -rf "$_mg_dir"
+
 # ── run.sh's migrate-first interlock (policy roll-migrates-first) ────────────────────────────────
 # 🚨 memex, 2026-09-24/25: the control instance's Hosting generation predated the migrate-first
 # Roll plan (Plugins #2219, held behind a seal), so it planned 2-step `set image` + hand-off rolls

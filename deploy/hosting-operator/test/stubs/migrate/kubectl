@@ -7,6 +7,14 @@
 #   job-state       absent | succeeded | failed | active | forbidden   (the Job as `get job` sees it)
 #   outcome         what a CREATED Job becomes after `polls` more reads: succeeded | failed | hang
 #   polls           how many reads a created Job stays active before it reaches its outcome
+# and, for the description of a FAILED Job (MeshWeaver.Deploy#315):
+#   failed-job.json what `get job` answers once the Job has failed (default: a bare Failed condition)
+#   job-log         "unreadable" plays the estate's answer to `logs job/<job>`: kubectl's pod-selection
+#                   notice on stderr and a non-zero exit, nothing on stdout
+#   pods.json       what `get pods -l <selector>` answers (default: no pods); pods-label, when present,
+#                   names the ONE selector key the pods answer to (the other gets no pods)
+#   events.json     what `get events` answers (default: none)
+#   pod-log, pod-log-previous   what `logs <pod>` / `logs <pod> --previous` answer (default: an error)
 set -uo pipefail
 log="${HOSTING_MIGRATE_STUB_LOG:?the kubectl stub needs HOSTING_MIGRATE_STUB_LOG}"
 fixture="${HOSTING_MIGRATE_FIXTURE:?the kubectl stub needs HOSTING_MIGRATE_FIXTURE}"
@@ -16,7 +24,9 @@ state() { cat "$fixture/job-state" 2>/dev/null || echo absent; }
 job_json() {
   case "$1" in
     succeeded) echo '{"kind":"Job","status":{"succeeded":1}}' ;;
-    failed)    echo '{"kind":"Job","status":{"failed":7,"conditions":[{"type":"Failed","status":"True"}]}}' ;;
+    failed)
+      if [ -f "$fixture/failed-job.json" ]; then cat "$fixture/failed-job.json"
+      else echo '{"kind":"Job","status":{"failed":7,"conditions":[{"type":"Failed","status":"True"}]}}'; fi ;;
     *)         echo '{"kind":"Job","status":{"active":1}}' ;;
   esac
 }
@@ -27,6 +37,22 @@ case "${1:-}" in
     echo active > "$fixture/job-state"
     echo "job.batch/created" ;;
   get)
+    if [ "${2:-}" = "pods" ] || [ "${2:-}" = "events" ]; then
+      # "forbidden" in pods.json / events.json plays a refused list.
+      [ "$(cat "$fixture/${2}.json" 2>/dev/null || true)" = "forbidden" ] \
+        && { echo "Error from server (Forbidden): ${2} is forbidden: User cannot list resource" >&2; exit 1; }
+    fi
+    if [ "${2:-}" = "pods" ]; then
+      # `get pods -l <key>=<job> -o json`
+      sel="${4:-}"; want="$(cat "$fixture/pods-label" 2>/dev/null || true)"
+      if [ -f "$fixture/pods.json" ] && { [ -z "$want" ] || [ "${sel%%=*}" = "$want" ]; }; then cat "$fixture/pods.json"
+      else echo '{"kind":"List","items":[]}'; fi
+      exit 0
+    fi
+    if [ "${2:-}" = "events" ]; then
+      if [ -f "$fixture/events.json" ]; then cat "$fixture/events.json"; else echo '{"kind":"List","items":[]}'; fi
+      exit 0
+    fi
     if [ "${2:-}" = "deployment" ] && [[ "$*" == *"containers[0].image"* ]]; then
       # `get deployment memex-portal-deployment -o jsonpath=…containers[0].image` (--current's tag
       # read): $FIXTURE/portal-image, else NotFound; "forbidden" in it plays a refused read.
@@ -56,6 +82,16 @@ case "${1:-}" in
       *) job_json "$s" ;;
     esac ;;
   delete) echo absent > "$fixture/job-state"; echo "job.batch deleted" ;;
-  logs)   printf 'Rehearsal: 2 pending migrations\nDatabase migration completed. Version: 57\n' ;;
+  logs)
+    if [[ "${2:-}" == job/* ]]; then
+      if [ "$(cat "$fixture/job-log" 2>/dev/null || true)" = "unreadable" ]; then
+        echo "Found 7 pods, using pod/${2#job/}-m4ph4" >&2; exit 1
+      fi
+      printf 'Rehearsal: 2 pending migrations\nDatabase migration completed. Version: 57\n'; exit 0
+    fi
+    # `logs <pod> --all-containers [--previous] --tail=N`
+    if [[ "$*" == *--previous* ]]; then f="$fixture/pod-log-previous"; else f="$fixture/pod-log"; fi
+    [ -f "$f" ] || { echo "Error from server (BadRequest): container \"memex-migration\" in pod \"${2:-}\" is not available" >&2; exit 1; }
+    cat "$f" ;;
   *) echo "kubectl stub: unexpected invocation: $*" >&2; exit 1 ;;
 esac

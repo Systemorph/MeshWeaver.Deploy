@@ -1,0 +1,11 @@
+{
+  "kind": "Job",
+  "metadata": {"name": "memex-migration-roll-3-0-0-ci-9101"},
+  "status": {
+    "failed": 7,
+    "conditions": [
+      {"type": "FailureTarget", "status": "True", "reason": "BackoffLimitExceeded", "message": "Job has reached the specified backoff limit"},
+      {"type": "Failed", "status": "True", "reason": "BackoffLimitExceeded", "message": "Job has reached the specified backoff limit"}
+    ]
+  }
+}

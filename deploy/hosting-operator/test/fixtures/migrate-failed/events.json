@@ -1,0 +1,11 @@
+{
+  "kind": "List",
+  "items": [
+    {"involvedObject": {"kind": "Pod", "name": "memex-migration-roll-3-0-0-ci-9101-m4ph4"}, "type": "Warning",
+     "reason": "BackOff", "message": "Back-off restarting failed container memex-migration", "lastTimestamp": "2026-11-15T10:06:30Z", "count": 3},
+    {"involvedObject": {"kind": "Job", "name": "memex-migration-roll-3-0-0-ci-9101"}, "type": "Warning",
+     "reason": "BackoffLimitExceeded", "message": "Job has reached the specified backoff limit", "lastTimestamp": "2026-11-15T10:08:00Z"},
+    {"involvedObject": {"kind": "Pod", "name": "some-other-pod-unrelated"}, "type": "Warning",
+     "reason": "UnrelatedEvent", "message": "not this Job's", "lastTimestamp": "2026-11-15T10:09:00Z"}
+  ]
+}
