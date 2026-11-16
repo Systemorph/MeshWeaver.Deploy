@@ -252,11 +252,38 @@ diag_jq_defs='def clip: if length > $chars then .[0:$chars] + "…" else . end;
   def failed_container: (.state.terminated.exitCode // 0) != 0 or (.lastState.terminated.exitCode // 0) != 0;
   def failed_pod: .status.phase == "Failed" or any(statuses[]; failed_container);'
 
+# diag_jq <what> <answer> <jq args…> — jq over a kubectl answer. An answer that is empty or not the JSON
+# expected is a NAMED note (status 1), never jq's own error text: in the very case this description
+# exists for — kubectl saying something unexpected — a tool notice must not stand in for a cause.
+diag_jq() {
+  local what="$1" answer="$2" res=""
+  shift 2
+  if [ -n "$answer" ] && res="$(jq "$@" <<< "$answer" 2>/dev/null)"; then
+    printf '%s' "$res"; return 0
+  fi
+  if [ -n "$answer" ]; then
+    printf '  %s: kubectl answered something other than the JSON this description reads' "$what"
+  else
+    printf '  %s: kubectl answered nothing' "$what"
+  fi
+  return 1
+}
+
+# diag_clip <text> — every line clipped to diag_chars: --tail bounds a log's LINES, not its bytes, and one
+# crash dump without newlines would otherwise make the ERROR message unbounded.
+diag_clip() {
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "${#line}" -gt "$diag_chars" ]; then printf '%s…\n' "${line:0:$diag_chars}"; else printf '%s\n' "$line"; fi
+  done <<< "$1"
+}
+
 # The Job's pods by the Job's OWN label: `batch.kubernetes.io/job-name` (Kubernetes ≥ 1.27), then the
-# legacy `job-name` every version sets. Sets diag_pods_json, or diag_pods_note saying why there is none.
+# legacy `job-name` every version sets. Sets diag_pods_json, or diag_pods_note saying why there is none —
+# exactly one of the two, always.
 diag_pods_json="" diag_pods_note=""
 diag_read_pods() {
-  local sel
+  local sel n
   diag_pods_json="" diag_pods_note=""
   for sel in "batch.kubernetes.io/job-name=${job}" "job-name=${job}"; do
     hosting::probe any kubectl -n "$namespace" get pods -l "$sel" -o json
@@ -264,7 +291,8 @@ diag_read_pods() {
       2) diag_pods_note="  pods: not readable by this operator (${HOSTING_PROBE_ERR:-no reason given})"; return 0 ;;
       1) diag_pods_note="  pods: could not be listed (${HOSTING_PROBE_ERR:-no reason given})"; return 0 ;;
     esac
-    if [ "$(jq '.items | length' <<< "$HOSTING_PROBE_OUT" 2>&1)" != "0" ]; then
+    n="$(diag_jq pods "$HOSTING_PROBE_OUT" '.items | length')" || { diag_pods_note="$n"; return 0; }
+    if [ "$n" != "0" ]; then
       diag_pods_json="$HOSTING_PROBE_OUT"; return 0
     fi
   done
@@ -277,18 +305,18 @@ failure_report() {
   local cause="" pod_cause="" newest="" names="[]" log="" out=""
   # 1. the Job: its condition and its counts (job_json is the last read_job_state's answer).
   if [ -n "$job_json" ]; then
-    cause="$(jq -r --argjson chars "$diag_chars" "${diag_jq_defs}"'
+    cause="$(diag_jq job "$job_json" -r --argjson chars "$diag_chars" "${diag_jq_defs}"'
       [.status.conditions[]? | select(.status == "True" and (.type == "Failed" or .type == "FailureTarget"))]
-      | sort_by(.type != "Failed") | map("Job \(.type): \(.reason // "no reason") — \(.message // "no message" | oneline)") | first // empty' <<< "$job_json" 2>&1)"
-    out+="$(jq -r --argjson chars "$diag_chars" "${diag_jq_defs}"'
+      | sort_by(.type != "Failed") | map("Job \(.type): \(.reason // "no reason") — \(.message // "no message" | oneline)") | first // empty')" || cause=""
+    out+="$(diag_jq job "$job_json" -r --argjson chars "$diag_chars" "${diag_jq_defs}"'
       "  job/\(.metadata.name // "?"): active \(.status.active // 0), failed \(.status.failed // 0), succeeded \(.status.succeeded // 0)",
       (.status.conditions[]? | select(.status == "True")
-       | "  job condition \(.type): \(.reason // "no reason") — \(.message // "no message" | oneline)")' <<< "$job_json" 2>&1)"$'\n'
+       | "  job condition \(.type): \(.reason // "no reason") — \(.message // "no message" | oneline)")')"$'\n'
   fi
   # 2. the pods, newest first, capped.
   diag_read_pods
   if [ -n "$diag_pods_json" ]; then
-    out+="$(jq -r --argjson chars "$diag_chars" --argjson cap "$diag_pods" "${diag_jq_defs}"'
+    out+="$(diag_jq pods "$diag_pods_json" -r --argjson chars "$diag_chars" --argjson cap "$diag_pods" "${diag_jq_defs}"'
       .items | sort_by(.metadata.creationTimestamp // "") | reverse
       | (if length > $cap then "  (\(length) pods; the newest \($cap) shown)" else empty end),
         (.[0:$cap][]
@@ -296,47 +324,47 @@ failure_report() {
              + (if .status.reason then " (\(.status.reason)" + (if .status.message then ": \(.status.message | oneline)" else "" end) + ")" else "" end),
            (.status.conditions[]? | select(.status == "False" and .reason != null and .type == "PodScheduled")
             | "    \(.type): \(.reason) — \(.message // "" | oneline)"),
-           (statuses[] | "    \(.kind) \(.name): \(cstate)"))' <<< "$diag_pods_json" 2>&1)"$'\n'
-    newest="$(jq -r --argjson chars "$diag_chars" "${diag_jq_defs}"'
-      [.items[] | select(failed_pod)] | sort_by(.metadata.creationTimestamp // "") | last | .metadata.name // empty' <<< "$diag_pods_json" 2>&1)"
-    pod_cause="$(jq -r --argjson chars "$diag_chars" "${diag_jq_defs}"'
+           (statuses[] | "    \(.kind) \(.name): \(cstate)"))')"$'\n'
+    newest="$(diag_jq pods "$diag_pods_json" -r --argjson chars "$diag_chars" "${diag_jq_defs}"'
+      [.items[] | select(failed_pod)] | sort_by(.metadata.creationTimestamp // "") | last | .metadata.name // empty')" || newest=""
+    pod_cause="$(diag_jq pods "$diag_pods_json" -r --argjson chars "$diag_chars" "${diag_jq_defs}"'
       [.items[] | select(failed_pod)] | sort_by(.metadata.creationTimestamp // "") | last
       | if . == null then empty else
           .metadata.name as $pod | [statuses[] | select(failed_container or .state.waiting)] | first
-          | if . == null then empty else "pod \($pod): \(.kind) \(.name) \(cstate)" end end' <<< "$diag_pods_json" 2>&1)"
-    names="$(jq -c '[.items[].metadata.name]' <<< "$diag_pods_json" 2>&1)"
+          | if . == null then empty else "pod \($pod): \(.kind) \(.name) \(cstate)" end end')" || pod_cause=""
+    names="$(diag_jq pods "$diag_pods_json" -c '[.items[].metadata.name]')" || names="[]"
   else
     out+="${diag_pods_note}"$'\n'
   fi
   # 3. the last events on those pods and on the Job.
   hosting::probe any kubectl -n "$namespace" get events -o json
   case $? in
-    0) out+="$(jq -r --argjson chars "$diag_chars" --argjson cap "$diag_events" --argjson pods "$names" --arg job "$job" "${diag_jq_defs}"'
+    0) out+="$(diag_jq events "$HOSTING_PROBE_OUT" -r --argjson chars "$diag_chars" --argjson cap "$diag_events" --argjson pods "$names" --arg job "$job" "${diag_jq_defs}"'
          [.items[] | .involvedObject as $o
           | select(($o.kind == "Job" and $o.name == $job) or ($o.kind == "Pod" and ($pods | index([$o.name]) != null)))]
          | sort_by(.lastTimestamp // .eventTime // .metadata.creationTimestamp // "")
          | if length == 0 then "  events: none recorded for the Job or its pods (events expire after about an hour)"
            else (.[-$cap:][]
              | "  event \(.lastTimestamp // .eventTime // "?") \(.involvedObject.kind | ascii_downcase)/\(.involvedObject.name) \(.type // "") \(.reason // "?"): \(.message // "" | oneline)"
-               + (if (.count // 1) > 1 then " (×\(.count))" else "" end)) end' <<< "$HOSTING_PROBE_OUT" 2>&1)"$'\n' ;;
+               + (if (.count // 1) > 1 then " (×\(.count))" else "" end)) end')"$'\n' ;;
     2) out+="  events: not readable by this operator (${HOSTING_PROBE_ERR:-no reason given})"$'\n' ;;
     *) out+="  events: could not be listed (${HOSTING_PROBE_ERR:-no reason given})"$'\n' ;;
   esac
-  # 4. the newest failed pod's OWN log — its current container, else the previous one.
+  # 4. the newest failed pod's OWN log — its current container, else the previous one. Every line clipped.
   if [ -n "$newest" ]; then
     hosting::probe output kubectl -n "$namespace" logs "$newest" --all-containers --tail="$diag_lines"
     case $? in
-      0) log="$HOSTING_PROBE_OUT" ;;
+      0) log="$(diag_clip "$HOSTING_PROBE_OUT")" ;;
       2) log="  (the log of pod/${newest} is not readable by this operator: ${HOSTING_PROBE_ERR})" ;;
       *) hosting::probe output kubectl -n "$namespace" logs "$newest" --all-containers --previous --tail="$diag_lines"
          case $? in
-           0) log="$HOSTING_PROBE_OUT" ;;
+           0) log="$(diag_clip "$HOSTING_PROBE_OUT")" ;;
            *) log="  (pod/${newest} has no readable log, current or previous: ${HOSTING_PROBE_ERR:-empty})" ;;
          esac ;;
     esac
     out+="  last lines of pod/${newest}:"$'\n'"${log}"
   else
-    out+="  last lines (kubectl logs job/${job}):"$'\n'"$(log_tail)"
+    out+="  last lines (kubectl logs job/${job}):"$'\n'"$(diag_clip "$(log_tail)")"
   fi
   # A newline inside the cause would push the rest of it off the quoted ERROR line.
   cause="${cause:-the Job carries no Failed condition}${pod_cause:+; ${pod_cause}}"

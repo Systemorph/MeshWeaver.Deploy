@@ -4423,6 +4423,44 @@ else
 fi
 rm -rf "$_mg_dir"
 
+# …and an answer kubectl gives that is not the JSON expected — a proxy's HTML page, or nothing at all —
+# is a NAMED note, never jq's own error text and never a blank line where a reason belongs (review on #316).
+_mgf_new; echo unreadable > "$_mg_dir/job-log"
+printf '<html><body>502 Bad Gateway</body></html>\n' > "$_mg_dir/pods.json"
+printf '<html><body>502 Bad Gateway</body></html>\n' > "$_mg_dir/events.json"
+_mg_out="$(_mg_run env)"; _mg_rc=$?
+if [ "$_mg_rc" -eq 1 ] && grep_in "$_mg_out" -Fq '  pods: kubectl answered something other than the JSON this description reads' \
+   && grep_in "$_mg_out" -Fq '  events: kubectl answered something other than the JSON this description reads' \
+   && ! grep_in "$_mg_out" -q 'jq: error' && grep_in "$_mg_out" -q "${_mg_job} FAILED"; then
+  ok "…a non-JSON pods/events answer is a named note, never jq's error text"
+else
+  bad "a non-JSON answer is a named note" "rc=${_mg_rc} out: ${_mg_out}"
+fi
+rm -rf "$_mg_dir"
+_mgf_new; echo unreadable > "$_mg_dir/job-log"; : > "$_mg_dir/pods.json"
+_mg_out="$(_mg_run env)"; _mg_rc=$?
+if [ "$_mg_rc" -eq 1 ] && grep_in "$_mg_out" -Fq '  pods: kubectl answered nothing' \
+   && ! grep_in "$_mg_out" -q 'jq: error'; then
+  ok "…an EMPTY pods answer is named, not a blank line"
+else
+  bad "an empty pods answer is named" "rc=${_mg_rc} out: ${_mg_out}"
+fi
+rm -rf "$_mg_dir"
+# …and the log's BYTES are bounded too: --tail caps lines, so one 5000-character line is clipped.
+_mgf_new; echo unreadable > "$_mg_dir/job-log"
+{ echo 'before the dump'; printf 'x%.0s' $(seq 1 5000); echo; } > "$_mg_dir/pod-log-previous"
+_mg_out="$(_mg_run env)"; _mg_rc=$?
+# Compared as strings, never as `x{300}`: BSD grep refuses a repetition count above 255.
+_mgf_x300="$(printf 'x%.0s' $(seq 1 300))"
+_mgf_xline="$(grep -m1 '^xxxx' <<< "$_mg_out")"
+if [ "$_mg_rc" -eq 1 ] && grep_in "$_mg_out" -Fq 'before the dump' \
+   && [ "$_mgf_xline" = "${_mgf_x300}…" ] && [ "$(grep -c '^xxxx' <<< "$_mg_out")" = "1" ]; then
+  ok "…bounded in bytes: a 5000-character log line is clipped to 300 characters"
+else
+  bad "a long log line is clipped" "rc=${_mg_rc} out: ${_mg_out:0:2000}"
+fi
+rm -rf "$_mg_dir"
+
 # ── run.sh's migrate-first interlock (policy roll-migrates-first) ────────────────────────────────
 # 🚨 memex, 2026-09-24/25: the control instance's Hosting generation predated the migrate-first
 # Roll plan (Plugins #2219, held behind a seal), so it planned 2-step `set image` + hand-off rolls
