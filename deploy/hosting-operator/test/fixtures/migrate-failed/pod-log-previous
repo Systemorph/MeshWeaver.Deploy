@@ -1,0 +1,3 @@
+Rehearsal: 2 pending migrations
+Applying migration 58 …
+Unhandled exception: permission denied for schema public

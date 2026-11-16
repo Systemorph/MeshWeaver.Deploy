@@ -1,0 +1,33 @@
+{
+  "kind": "List",
+  "items": [
+    {
+      "metadata": {"name": "memex-migration-roll-3-0-0-ci-9101-aaaa1", "creationTimestamp": "2026-11-15T10:00:00Z",
+                   "labels": {"job-name": "memex-migration-roll-3-0-0-ci-9101"}},
+      "spec": {"containers": [{"name": "memex-migration", "image": "cr.example.test/memex-migration:3.0.0-ci.9101",
+                               "env": [{"name": "ConnectionStrings__memex", "value": "Host=db;Password=PLANTED-ENV-VALUE"}]}]},
+      "status": {"phase": "Failed",
+                 "initContainerStatuses": [{"name": "wait-for-postgres", "state": {"terminated": {"reason": "Completed", "exitCode": 0}}}],
+                 "containerStatuses": [{"name": "memex-migration", "restartCount": 0,
+                                        "state": {"terminated": {"reason": "Error", "exitCode": 1, "message": "older attempt"}}}]}
+    },
+    {
+      "metadata": {"name": "memex-migration-roll-3-0-0-ci-9101-m4ph4", "creationTimestamp": "2026-11-15T10:06:00Z",
+                   "labels": {"job-name": "memex-migration-roll-3-0-0-ci-9101"}},
+      "spec": {"containers": [{"name": "memex-migration", "image": "cr.example.test/memex-migration:3.0.0-ci.9101",
+                               "env": [{"name": "ConnectionStrings__memex", "value": "Host=db;Password=PLANTED-ENV-VALUE"}]}]},
+      "status": {"phase": "Failed",
+                 "initContainerStatuses": [{"name": "wait-for-postgres", "state": {"terminated": {"reason": "Completed", "exitCode": 0}}}],
+                 "containerStatuses": [{"name": "memex-migration", "restartCount": 0,
+                                        "state": {"terminated": {"reason": "Error", "exitCode": 1,
+                                                                 "message": "Npgsql.PostgresException: 42501: permission denied for schema public\nat Migrator.Run()"}}}]}
+    },
+    {
+      "metadata": {"name": "memex-migration-roll-3-0-0-ci-9101-zzzz9", "creationTimestamp": "2026-11-15T10:07:00Z",
+                   "labels": {"job-name": "memex-migration-roll-3-0-0-ci-9101"}},
+      "status": {"phase": "Pending",
+                 "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                                 "message": "0/3 nodes are available: 3 Insufficient memory."}]}
+    }
+  ]
+}
