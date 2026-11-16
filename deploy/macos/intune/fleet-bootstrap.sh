@@ -440,7 +440,8 @@ step_energy_enabler() {
 #   and can never name more memory than the Mac has.
 # Configured ⇒ a root LaunchDaemon (com.meshweaver.fleet.gpu-wired-limit, RunAtLoad) sets it at every boot and the run
 # sets it now. Not configured ⇒ nothing is set, and a daemon an earlier declaration installed is removed (the live
-# value stays until the next reboot; nothing is lowered under a running model). Refused, never applied: a reserve that
+# value stays until the next reboot; nothing is lowered under a running model — a live value above the declared one is
+# left until the next boot, too). Refused, never applied: a reserve that
 # is not a whole number, below GPU_RESERVE_MIN_MB, or that leaves the GPU no more than macOS's own default.
 readonly GPU_LIMIT_LABEL="com.meshweaver.fleet.gpu-wired-limit"
 readonly GPU_LIMIT_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${GPU_LIMIT_LABEL}.plist"
@@ -529,6 +530,8 @@ step_gpu_wired_limit() {
   case "$mem" in ''|*[!0-9]*) mem="" ;; *) mem=$(( mem / 1048576 )) ;; esac
   if ! limit="$(gpu_limit_for "$mem" "$reserve" 2>&1)"; then
     why="$limit"
+    # an earlier declaration's daemon stays (it still sets ITS limit at boot) — said, so the reading is not read as "nothing in force"
+    if [ -f "$GPU_LIMIT_PLIST" ]; then why="$why; the earlier $GPU_LIMIT_LABEL stays in force"; fi
     log "gpu: REFUSED $key = $reserve — $why; nothing set"
     write_reading gpu-wired-limit refused "$key=$reserve: $why"; return 1
   fi
@@ -547,6 +550,11 @@ step_gpu_wired_limit() {
     log "gpu: iogpu.wired_limit_mb is $limit ($key = $reserve MiB of RAM $mem MiB kept for macOS)"
     write_reading gpu-wired-limit ok "$limit MiB ($key=$reserve)"; return 0
   fi
+  # never LOWERED under a running model (a person may have raised it by hand): the daemon applies the lower value at the next boot
+  case "$cur" in *[!0-9]*) ;; *) if [ "$cur" -gt "$limit" ]; then
+    log "gpu: iogpu.wired_limit_mb is $cur, above the declared $limit — not lowered under a running model; $GPU_LIMIT_LABEL sets $limit at the next boot"
+    write_reading gpu-wired-limit deferred "$cur MiB now, $limit MiB from the next boot ($key=$reserve)"; return 0
+  fi ;; esac
   log "gpu: setting iogpu.wired_limit_mb $cur → $limit ($key = $reserve MiB of RAM $mem MiB kept for macOS)"
   if ! run sysctl -w "iogpu.wired_limit_mb=$limit"; then
     log "gpu: FAILED to set iogpu.wired_limit_mb=$limit (retried next run)"

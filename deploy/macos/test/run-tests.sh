@@ -1181,7 +1181,12 @@ case "$OUT" in *"0 → 111072"*"GpuWiredReserveMb ="*"RC=0"*) ok "a class withou
 gprefs GpuWiredReserveMbMacStudio=40000
 cp "$GPL" "$GP/before"
 OUT="$(gps GP_CUR=0)"
-case "$OUT" in *"REFUSED GpuWiredReserveMbMacStudio = 40000"*"not above macOS's default"*"RC=1"*) [ ! -e "$GP/calls" ] && cmp -s "$GPL" "$GP/before" && grep -q '^refused ' "$GP/st/gpu-wired-limit" && ok "a reserve leaving the GPU no more than macOS's default is REFUSED: nothing set, exit 1, reading refused" || bad "refused changed" "$(cat "$GP/calls" 2>&1)" ;; *) bad "refused" "$OUT" ;; esac
+case "$OUT" in *"REFUSED GpuWiredReserveMbMacStudio = 40000"*"not above macOS's default"*"earlier com.meshweaver.fleet.gpu-wired-limit stays in force"*"RC=1"*) [ ! -e "$GP/calls" ] && cmp -s "$GPL" "$GP/before" && grep -q '^refused ' "$GP/st/gpu-wired-limit" && ok "a reserve leaving the GPU no more than macOS's default is REFUSED: nothing set, exit 1, reading refused" || bad "refused changed" "$(cat "$GP/calls" 2>&1)" ;; *) bad "refused" "$OUT" ;; esac
+# a live value ABOVE the declared one (raised by hand): never lowered under a running model — the daemon does it at boot
+gprefs GpuWiredReserveMbMacStudio=8192
+OUT="$(gps GP_CUR=126000)"
+case "$OUT" in *"is 126000, above the declared 122880 — not lowered"*"RC=0"*) [ ! -e "$GP/calls" ] && grep -q '<string>iogpu.wired_limit_mb=122880</string>' "$GPL" && grep -q '^deferred ' "$GP/st/gpu-wired-limit" \
+  && ok "a live limit above the declared one is NOT lowered now (reading deferred); the daemon sets the declared one at the next boot" || bad "lowered live" "$(cat "$GP/calls" 2>&1)" ;; *) bad "deferred" "$OUT" ;; esac
 # no iogpu (not Apple silicon): said, nothing done, not a failure
 gprefs GpuWiredReserveMbMacStudio=8192
 OUT="$(gps GP_CUR=)"
