@@ -275,6 +275,11 @@ def validate(spec, spec_dir):
             for k, v in keys.items():
                 if (k.startswith("BuildVmCpus") or k.startswith("BuildMaxRunners")) and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
                     p.append(f"{w}: keys.{k} must be a whole number above 0 (memex-local reads it as the build host's fleet default)")
+            # the GPU wired-memory reserve per model class (GpuWiredReserveMbMacStudio …, bootstrap 1.13.0): a whole number of
+            # MiB of at least 4096 — the bootstrap refuses anything else, so the Mac would keep macOS's default in silence
+            for k, v in keys.items():
+                if k.startswith("GpuWiredReserveMb") and (isinstance(v, bool) or not isinstance(v, int) or v < 4096):
+                    p.append(f"{w}: keys.{k} must be a whole number of MiB of at least 4096 (the bootstrap keeps it from the GPU)")
             # the bootstrap's pin for the fleet loader (it travels in the profile: minutes, not the agent's 8 h)
             if ("BootstrapCommit" in keys) != ("BootstrapSha256" in keys):
                 p.append(f"{w}: keys.BootstrapCommit and keys.BootstrapSha256 go together (the loader verifies one by the other)")
@@ -1319,6 +1324,14 @@ def self_test():
         size["customProfiles"][0]["keys"]["BuildVmCpusMacMini"] = badv
         v = validate(size, ".")
         expect(f"validate: BuildVmCpusMacMini = {badv!r} is refused (a whole number above 0)", any("BuildVmCpusMacMini" in x for x in v), v)
+    gpu = copy.deepcopy(spec)
+    gpu["customProfiles"][0]["keys"]["GpuWiredReserveMbMacStudio"] = 8192
+    expect("validate: GpuWiredReserveMbMacStudio = 8192 passes", not validate(gpu, "."), validate(gpu, "."))
+    expect("validate: …and travels as a plist integer", build_plist(gpu["customProfiles"][0])["PayloadContent"][0].get("GpuWiredReserveMbMacStudio") == 8192)
+    for badv in ("8192", True, 4095):
+        gpu["customProfiles"][0]["keys"]["GpuWiredReserveMbMacStudio"] = badv
+        v = validate(gpu, ".")
+        expect(f"validate: GpuWiredReserveMbMacStudio = {badv!r} is refused (whole MiB, at least 4096)", any("GpuWiredReserveMbMacStudio" in x for x in v), v)
     op = "ssh-ed25519 " + base64.b64encode(len(b"ssh-ed25519").to_bytes(4, "big") + b"ssh-ed25519" + (32).to_bytes(4, "big") + bytes(32)).decode() + " operator, laptop"
     ssh = copy.deepcopy(spec)
     ssh["customProfiles"][0]["keys"]["OperatorSshKeys"] = [op]
