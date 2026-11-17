@@ -37,10 +37,40 @@ loki:
   # 3. DURABLE STORE. With the default emptyDir, ANY reschedule — eviction, node upgrade, a chart
   #    upgrade — silently wipes every log the cluster has. This is the single change that would have
   #    preserved the 2026-08-12 window.
+  #
+  #    THE STORE IS THE NAMED CLAIM `storage-loki-0`, mounted through `existingClaim` — declared, not
+  #    derived (MeshWeaver#8144). The control cluster's live release records exactly this value:
+  #    the governed ApplyObservabilityRelease dry run (Memex run 43974096662) refused because the
+  #    live release carries `loki.persistence.existingClaim` and this file did not, so an upgrade
+  #    from here would have DROPPED it. The live StatefulSet has no volumeClaimTemplates (the
+  #    QuarantineObservabilityStore dry run, Memex run 43971187021: "templates: none") and its pod
+  #    loki-0 mounts the one claim `storage-loki-0` (NodeEvents read of `monitoring`, 2026-11-15).
+  #    In this chart a persistent store with no template is rendered from `existingClaim` alone
+  #    (`claimName: {{ .Values.persistence.existingClaim }}`), so the recorded value is that claim.
+  #    The dry run prints value PATHS, not values: the value is read off the mount, not printed.
+  #
+  #    Why a NAMED claim rather than a volumeClaimTemplate: the name is the one a template would
+  #    have minted (template `storage`, pod `loki-0`), so a cluster still on the template keeps its
+  #    data when it moves — the claim outlives the StatefulSet. But a template is IMMUTABLE on a
+  #    StatefulSet, so that move is the one-time `delete sts loki --cascade=orphan` described in
+  #    install-observability.sh, and a named claim survives every later StatefulSet replacement
+  #    with no such step. With `existingClaim` set the chart creates NO claim: the installer
+  #    creates `storage-loki-0` from `size` and `storageClassName` below when it is absent (a
+  #    fresh cluster), and never touches one that exists.
   persistence:
     enabled: true
+    existingClaim: storage-loki-0
     size: 30Gi
     storageClassName: default
+
+  # THE UPDATE STRATEGY IS THE CHART DEFAULT, declared so the live release has nothing undeclared to
+  # drop. The same dry run named `loki.updateStrategy.type` as a second live value this file did not
+  # carry. The live value was set by hand and never recorded, and the dry run prints value PATHS,
+  # not values, so it is not known here. RollingUpdate is the chart default and the declared
+  # intent. If the live value differs, the release dry run lists this path among the values the
+  # apply CHANGES, and the owner sees that before approving the real re-apply.
+  updateStrategy:
+    type: RollingUpdate
 
   # Retention is age-based: the compactor deletes logs older than 30 days. The
   # 24-hour index period from this chart is required by boltdb-shipper retention.

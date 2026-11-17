@@ -498,6 +498,72 @@ ensure_no_leftover_cleaner
 recover_full_tsdb
 recover_pending_release
 
+# ── 1b. Loki's named claim, when the values declare one ─────────────────────────────────────────
+# With `loki.persistence.existingClaim` the chart renders NO volumeClaimTemplate and creates no
+# claim: it mounts the named one, and on a fresh cluster a missing claim leaves loki-0 Pending
+# forever behind a helm `deployed`. So the claim the values NAME is created here, from the values'
+# own `size` and `storageClassName`, when — and only when — it does not exist. An existing claim
+# (the live store, or the one a former template minted under the same name) is never touched.
+# Read with awk because the invoke pod has no YAML tooling: the scalars directly under
+# `loki:` → `persistence:`, as "key value" lines.
+# THE PARSER'S CONTRACT: single-token scalars, optionally quoted, optionally followed by a `#`
+# comment. A value of more than one token is printed as `!unparsed`, and the claim step refuses
+# it, so the installer can never create a different claim than the chart renders from the same
+# file (a claim name is a DNS-1123 name and never contains whitespace anyway).
+loki_persistence() {
+  awk '
+    /^[^[:space:]#]/ { top = $1; sec = "" }
+    top == "loki:" && /^  [^[:space:]#]/ { sec = $1 }
+    top == "loki:" && sec == "persistence:" && /^    [A-Za-z]/ {
+      k = $1; sub(/:$/, "", k); v = $2; gsub(/^["\047]|["\047]$/, "", v)
+      if (NF > 2 && substr($3, 1, 1) != "#") v = "!unparsed"
+      print k, v
+    }' "$VALUES"
+}
+ensure_loki_claim() {
+  local declared claim size class enabled present
+  declared=$(loki_persistence)
+  claim=$(awk '$1 == "existingClaim" { print $2 }' <<<"$declared")
+  [ -n "$claim" ] || return 0
+  size=$(awk '$1 == "size" { print $2 }' <<<"$declared")
+  class=$(awk '$1 == "storageClassName" { print $2 }' <<<"$declared")
+  enabled=$(awk '$1 == "enabled" { print $2 }' <<<"$declared")
+  # The chart mounts `existingClaim` only under `persistence.enabled: true` (otherwise it renders
+  # an emptyDir): a claim named without it would be a stray PVC nothing mounts, and the values
+  # contradict themselves. Refused, never guessed either way.
+  if [ "$enabled" != true ]; then
+    echo "FATAL: the values name Loki's claim $claim but persistence.enabled is '${enabled:-absent}', not true —" >&2
+    echo "       the chart would not mount it. Fix the values; nothing was upgraded." >&2
+    exit 1
+  fi
+  case "$claim $size $class" in
+    *'!unparsed'*)
+      echo "FATAL: loki.persistence carries a value of more than one token (existingClaim/size/storageClassName) —" >&2
+      echo "       this reader takes single-token scalars only. Nothing was upgraded." >&2
+      exit 1 ;;
+  esac
+  if ! present=$(kc get pvc "$claim" --ignore-not-found -o name); then
+    echo "FATAL: could not read whether Loki's declared claim $NS/$claim exists — nothing was upgraded." >&2
+    exit 1
+  fi
+  if [ -n "$present" ]; then
+    echo "Loki's declared claim $NS/$claim exists — mounted as is."
+    return 0
+  fi
+  if [ -z "$size" ] || [ -z "$class" ]; then
+    echo "FATAL: the values name Loki's claim $claim but not its size and storageClassName, and it does not exist —" >&2
+    echo "       it cannot be created, and the chart will not create it. Nothing was upgraded." >&2
+    exit 1
+  fi
+  if ! printf 'apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: %s\n  namespace: %s\nspec:\n  accessModes: [ReadWriteOnce]\n  storageClassName: %s\n  resources:\n    requests:\n      storage: %s\n' \
+      "$claim" "$NS" "$class" "$size" | kc create -f - >/dev/null; then
+    echo "FATAL: could not create Loki's declared claim $NS/$claim ($size, $class) — nothing was upgraded." >&2
+    exit 1
+  fi
+  echo "Created Loki's declared claim $NS/$claim ($size, $class): the values name it and it did not exist."
+}
+ensure_loki_claim
+
 # 🚨 FIRST TIME ONLY, on a cluster that already runs the emptyDir Loki: enabling persistence adds a
 # volumeClaimTemplate, and a StatefulSet's volumeClaimTemplates are IMMUTABLE — `helm upgrade` fails
 # with "Forbidden: updates to statefulset spec for fields other than …". Delete the StatefulSet
@@ -509,6 +575,12 @@ recover_pending_release
 #
 # Accept before doing it: whatever the old emptyDir held is discarded. That is the one-time cost of
 # never losing a window again.
+#
+# The SAME step moves a cluster from the volumeClaimTemplate to the declared named claim
+# (`loki.persistence.existingClaim`, see the values file): removing the template is the same
+# immutable-field change. Here NOTHING is discarded — the template's claim is `storage-loki-0`, the
+# very name the values declare, and a StatefulSet's claims outlive it, so step 1b finds it present
+# and the new StatefulSet mounts the same store.
 # 🚨 Check helm's exit EXPLICITLY. This script runs without `set -e` (the `helm repo add` above is
 # allowed to fail when the repo already exists), so without this a failed install would be followed
 # by the verification echoes below and the script would still exit 0 — an install failure that reads
@@ -537,7 +609,8 @@ if ! bounded $(( UPGRADE_SECONDS + 15 )) helm upgrade --install "$RELEASE" grafa
   --timeout "${UPGRADE_SECONDS}s"
 then
   echo "FATAL: helm upgrade failed — the stack was NOT installed/updated." >&2
-  echo "If it complains about immutable StatefulSet fields, that is the persistence change:" >&2
+  echo "If it complains about immutable StatefulSet fields, that is the persistence change (emptyDir or" >&2
+  echo "volumeClaimTemplate -> the declared claim; the claim and its data are kept):" >&2
   echo "  kubectl -n monitoring delete sts loki --cascade=orphan   # then re-run, then delete pod loki-0" >&2
   exit 1
 fi
