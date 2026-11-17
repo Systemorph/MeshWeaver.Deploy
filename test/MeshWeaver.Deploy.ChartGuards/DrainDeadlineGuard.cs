@@ -104,6 +104,55 @@ public class DrainDeadlineGuard
     }
 
     /// <summary>
+    /// 🚨 <b>The margin must be reserved in fact, not only in the values file.</b> The arithmetic
+    /// above compares two numbers in <c>values.yaml</c>; it cannot see how long the HOOK actually
+    /// runs. The hook used to take its clock AFTER the 15 s ingress sleep and compare only the
+    /// elapsed time, so it could run the sleep + the deadline + one more poll iteration (curl's
+    /// <c>-m</c> plus the loop's <c>sleep</c>) — 1705 s of the default 1800 s grace, leaving 95 s for
+    /// a host whose <c>ShutdownTimeout</c> alone is 90 s. This reads the hook's own numbers and
+    /// requires that its WORST-CASE end leaves the whole margin.
+    /// </summary>
+    [Fact]
+    public void ThePreStopHook_EndsByTheDeadline_SoTheWholeMarginIsLeftToShutDownIn()
+    {
+        var preStop = ExecutableLinesOf(File.ReadAllText(ChartRoots.ChartFile(Deployment)));
+        var values = File.ReadAllText(ChartRoots.ChartFile(Values));
+        var drain = ScalarUnder(values, "portal", "drainSeconds");
+        var margin = ScalarUnder(values, "portal", "shutdownMarginSeconds");
+
+        var start = preStop.IndexOf("START=", StringComparison.Ordinal);
+        Assert.True(start >= 0, $"{Deployment}'s preStop must take its clock (START=) — see the guard above.");
+
+        // Every sleep the hook does BEFORE it takes its clock is time the deadline does not see.
+        var hook = preStop[..start];
+        var preStopBegins = hook.LastIndexOf("preStop:", StringComparison.Ordinal);
+        var beforeClock = preStopBegins >= 0 ? hook[preStopBegins..] : hook;
+        var uncounted = Regex.Matches(beforeClock, @"\bsleep\s+(?<s>\d+)")
+            .Sum(m => int.Parse(m.Groups["s"].Value));
+
+        var probeTimeout = Regex.Match(preStop, @"curl[^\n]*?-m\s+(?<m>\d+)");
+        Assert.True(probeTimeout.Success, $"{Deployment}'s preStop probe must bound each curl with -m.");
+        var loop = preStop[preStop.IndexOf("while ", start, StringComparison.Ordinal)..];
+        var pollSleep = Regex.Match(loop, @"\bsleep\s+(?<s>\d+)");
+        Assert.True(pollSleep.Success, $"{Deployment}'s preStop loop must sleep between probes.");
+        var iteration = int.Parse(probeTimeout.Groups["m"].Value) + int.Parse(pollSleep.Groups["s"].Value);
+
+        // What the deadline check adds for the iteration it is about to start (`NOW - START + n`).
+        var lookahead = Regex.Match(loop, @"NOW\s*-\s*START\s*\+\s*(?<n>\d+)");
+        var covered = lookahead.Success ? int.Parse(lookahead.Groups["n"].Value) : 0;
+
+        var deadline = drain - margin;
+        var worstCaseEnd = uncounted + deadline + Math.Max(0, iteration - covered);
+        Assert.True(worstCaseEnd <= deadline,
+            $"{Deployment}'s preStop can run {worstCaseEnd}s ({uncounted}s slept before START + the "
+            + $"{deadline}s deadline + {Math.Max(0, iteration - covered)}s of an iteration the check "
+            + $"does not look ahead to) — past drainSeconds − shutdownMarginSeconds. That leaves "
+            + $"{drain - worstCaseEnd}s of the {drain}s grace for a host whose ShutdownTimeout is "
+            + $"{HostShutdownTimeoutSeconds}s, so a drain that runs to its deadline is SIGKILLed while "
+            + "the silo is still leaving membership. Take START first and add one iteration to the check.");
+    }
+
+    /// <summary>
     /// The grace ceiling must still BE drainSeconds. If they ever diverge, the deadline computed
     /// from drainSeconds stops relating to the ceiling it is supposed to stay inside.
     /// </summary>
