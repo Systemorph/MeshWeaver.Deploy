@@ -176,3 +176,23 @@ jobs:
             -e HOSTING_CHART_TEMPLATES=/opt/hosting/chart/templates \
             --entrypoint /bin/bash hosting-operator:ci -c 'cd /opt/hosting && bash test/run-tests.sh' | tee "$RUNNER_TEMP/suite.log"
           grep -Eq '^[0-9]+ passed, 0 failed' "$RUNNER_TEMP/suite.log" || { echo "::error::the suite printed no '<n> passed, 0 failed' line — an exit code is not a verdict"; exit 1; }
+
+      # The behaviour suite drives hosting-db-reset against a psql STUB (which statements, in which
+      # order, what a failure does). This step runs the image's OWN hosting-db-reset and psql against
+      # a REAL PostgreSQL that exists only for this job (MeshWeaver.Plugins#4336): keep renames and
+      # keeps, the new database is empty with the old owner, `show` reads the kept copy back, `purge`
+      # drops only a marked copy past its retention. Major 16, the fleet's flexible-server major
+      # (Dockerfile). It cannot prove the Key Vault read, the plan's quiesce/migrate steps, or the
+      # mesh reading the result back — those stay owed to the one run on a throwaway instance.
+      - name: hosting-db-reset against a real, throwaway PostgreSQL (inside the image)
+        run: |
+          set -euo pipefail
+          net="dbr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker network create "$net" >/dev/null
+          trap 'docker rm -f "$net-pg" >/dev/null 2>&1 || true; docker network rm "$net" >/dev/null 2>&1 || true' EXIT
+          docker run -d --rm --name "$net-pg" --network "$net" -e POSTGRES_PASSWORD=throwaway postgres:16 >/dev/null
+          docker run --rm --network "$net" -v "$PWD/$OPERATOR_DIR/test:/opt/hosting/test:ro" \
+            -e PGHOST="$net-pg" -e PGUSER=postgres -e PGPASSWORD=throwaway -e HOSTING_DBR_REAL_DISPOSABLE=yes \
+            --entrypoint /bin/bash hosting-operator:ci /opt/hosting/test/db-reset-real-postgres.sh | tee "$RUNNER_TEMP/db-reset.log"
+          grep -Eq '^[1-9][0-9]* passed, 0 failed \(hosting-db-reset against a real PostgreSQL\)$' "$RUNNER_TEMP/db-reset.log" \
+            || { echo "::error::the real-PostgreSQL proof printed no '<n> passed, 0 failed' line — an exit code is not a verdict"; exit 1; }
