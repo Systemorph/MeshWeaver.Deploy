@@ -311,6 +311,17 @@ spec:
           # Bounded by terminationGracePeriodSeconds above as well: a forgotten open tab delays the
           # pod's exit, it cannot block the rollout for ever.
           #
+          # 🚨 The clock covers the WHOLE hook, and the deadline check covers the iteration it is about
+          # to start. START used to be taken AFTER the 15 s ingress sleep and the check compared only
+          # the elapsed time, so the hook could run 15 s (the sleep) + the deadline + one more iteration
+          # (curl -m 5 + sleep 5) = drainSeconds − shutdownMarginSeconds + 25 s. At the defaults that
+          # is 1705 s of an 1800 s grace: 95 s left for a host whose ShutdownTimeout alone is 90 s, so
+          # a drain that ran to its deadline handed the process 5 s to dispose its container and exit
+          # before the SIGKILL — the abrupt departure the margin exists to prevent. Now START is taken
+          # first and the check adds the 10 s one more iteration costs (the 5 in `-m 5` plus the
+          # `sleep 5`), so the hook ends by (drainSeconds − shutdownMarginSeconds) and the WHOLE margin
+          # is left to shut down in. DrainDeadlineGuard pins both.
+          #
           # 🚨 The probe tool is `curl`, and that is MEASURED, not assumed. This block previously
           # used `wget` on the reasoning "curl is not in the base image; wget is (Debian aspnet)" —
           # which is false for the image this chart actually deploys (`memex-portal-ai-base`).
@@ -345,13 +356,13 @@ spec:
                   - "sh"
                   - "-c"
                   - >-
+                    START=$(date +%s 2>/dev/null || echo 0);
                     sleep 15;
                     command -v curl >/dev/null 2>&1 || exit 0;
                     DEADLINE={{ sub (.Values.portal.drainSeconds | default 1800) (.Values.portal.shutdownMarginSeconds | default 120) }};
-                    START=$(date +%s 2>/dev/null || echo 0);
                     while ! curl -sf -m 5 -o /dev/null http://127.0.0.1:8080/drain; do
                       NOW=$(date +%s 2>/dev/null || echo 0);
-                      if [ "$START" -gt 0 ] && [ $((NOW - START)) -ge "$DEADLINE" ]; then
+                      if [ "$START" -gt 0 ] && [ $((NOW - START + 10)) -ge "$DEADLINE" ]; then
                         exit 0;
                       fi;
                       sleep 5;
