@@ -506,21 +506,42 @@ recover_pending_release
 # (the live store, or the one a former template minted under the same name) is never touched.
 # Read with awk because the invoke pod has no YAML tooling: the scalars directly under
 # `loki:` → `persistence:`, as "key value" lines.
+# THE PARSER'S CONTRACT: single-token scalars, optionally quoted, optionally followed by a `#`
+# comment. A value of more than one token is printed as `!unparsed`, and the claim step refuses
+# it, so the installer can never create a different claim than the chart renders from the same
+# file (a claim name is a DNS-1123 name and never contains whitespace anyway).
 loki_persistence() {
   awk '
     /^[^[:space:]#]/ { top = $1; sec = "" }
     top == "loki:" && /^  [^[:space:]#]/ { sec = $1 }
     top == "loki:" && sec == "persistence:" && /^    [A-Za-z]/ {
-      k = $1; sub(/:$/, "", k); v = $2; gsub(/^["\047]|["\047]$/, "", v); print k, v
+      k = $1; sub(/:$/, "", k); v = $2; gsub(/^["\047]|["\047]$/, "", v)
+      if (NF > 2 && substr($3, 1, 1) != "#") v = "!unparsed"
+      print k, v
     }' "$VALUES"
 }
 ensure_loki_claim() {
-  local declared claim size class present
+  local declared claim size class enabled present
   declared=$(loki_persistence)
   claim=$(awk '$1 == "existingClaim" { print $2 }' <<<"$declared")
   [ -n "$claim" ] || return 0
   size=$(awk '$1 == "size" { print $2 }' <<<"$declared")
   class=$(awk '$1 == "storageClassName" { print $2 }' <<<"$declared")
+  enabled=$(awk '$1 == "enabled" { print $2 }' <<<"$declared")
+  # The chart mounts `existingClaim` only under `persistence.enabled: true` (otherwise it renders
+  # an emptyDir): a claim named without it would be a stray PVC nothing mounts, and the values
+  # contradict themselves. Refused, never guessed either way.
+  if [ "$enabled" != true ]; then
+    echo "FATAL: the values name Loki's claim $claim but persistence.enabled is '${enabled:-absent}', not true —" >&2
+    echo "       the chart would not mount it. Fix the values; nothing was upgraded." >&2
+    exit 1
+  fi
+  case "$claim $size $class" in
+    *'!unparsed'*)
+      echo "FATAL: loki.persistence carries a value of more than one token (existingClaim/size/storageClassName) —" >&2
+      echo "       this reader takes single-token scalars only. Nothing was upgraded." >&2
+      exit 1 ;;
+  esac
   if ! present=$(kc get pvc "$claim" --ignore-not-found -o name); then
     echo "FATAL: could not read whether Loki's declared claim $NS/$claim exists — nothing was upgraded." >&2
     exit 1

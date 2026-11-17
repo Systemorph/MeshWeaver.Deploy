@@ -167,6 +167,36 @@ class DeclaredClaimTest(unittest.TestCase):
                 self.assertIn('FATAL:', result.stderr)
                 self.assertNotIn('upgrade', seen['helm'])
 
+    def test_named_claim_without_persistence_enabled_is_refused(self):
+        # The chart mounts existingClaim only when persistence is enabled: creating it otherwise is a stray PVC.
+        for enabled in ('    enabled: false\n', ''):
+            with self.subTest(enabled=enabled.strip() or 'absent'):
+                values = ('loki:\n  persistence:\n' + enabled
+                          + '    existingClaim: storage-loki-0\n    size: 30Gi\n    storageClassName: default\n')
+                seen = {}
+                result = self.run_installer('claim_absent', values,
+                                            lambda root, _: seen.update(created=(root / 'created.yaml').exists(),
+                                                                        helm=read(root / 'helm-calls')))
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn('persistence.enabled is', result.stderr)
+                self.assertFalse(seen['created'])
+                self.assertNotIn('upgrade', seen['helm'])
+
+    def test_multi_token_value_is_refused_not_truncated(self):
+        # "my claim" must never become a claim named "my" while the chart renders "my claim".
+        values = ('loki:\n  persistence:\n    enabled: true\n    existingClaim: "my claim"\n'
+                  '    size: 30Gi\n    storageClassName: default\n')
+        seen = {}
+        result = self.run_installer('claim_absent', values,
+                                    lambda root, _: seen.update(created=(root / 'created.yaml').exists(),
+                                                                asked=read(root / 'pvc-calls'),
+                                                                helm=read(root / 'helm-calls')))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('single-token scalars only', result.stderr)
+        self.assertFalse(seen['created'])
+        self.assertEqual(seen['asked'], '')
+        self.assertNotIn('upgrade', seen['helm'])
+
     def test_named_claim_without_size_is_refused_not_guessed(self):
         values = 'loki:\n  persistence:\n    enabled: true\n    existingClaim: storage-loki-0\n'
         seen = {}

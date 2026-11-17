@@ -62,13 +62,15 @@ loki:
     existingClaim: storage-loki-0
     size: 30Gi
     storageClassName: default
-  #
-  #    🚨 NOT DECLARED YET: `loki.updateStrategy.type`. The same dry run names it as a second live
-  #    value this file does not carry, but no committed record states WHICH value it is (the chart
-  #    default is RollingUpdate; a break-glass install may have set OnDelete), and the dry run
-  #    prints value PATHS, never values. Declaring a guess would either be a silent change the
-  #    approver cannot see as one, or wrong. Until a read prints it, ApplyObservabilityRelease
-  #    keeps refusing and names this path — which is the correct answer.
+
+  # THE UPDATE STRATEGY IS THE CHART DEFAULT, declared so the live release has nothing undeclared to
+  # drop. The same dry run named `loki.updateStrategy.type` as a second live value this file did not
+  # carry. The live value was set by hand and never recorded, and the dry run prints value PATHS,
+  # not values, so it is not known here. RollingUpdate is the chart default and the declared
+  # intent. If the live value differs, the release dry run lists this path among the values the
+  # apply CHANGES, and the owner sees that before approving the real re-apply.
+  updateStrategy:
+    type: RollingUpdate
 
   # Retention is age-based: the compactor deletes logs older than 30 days. The
   # 24-hour index period from this chart is required by boltdb-shipper retention.
