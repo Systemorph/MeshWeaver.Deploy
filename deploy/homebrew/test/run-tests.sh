@@ -4064,6 +4064,105 @@ grep -q 'memex-local" settle' <<<"$A" && [ "$(grep -n 'memex-local" settle' <<<"
   && ok "the autoupdate agent runs 'settle' after EVERY upgrade, before the assets-unchanged skip — a script-only repair (HSTS) reaches existing Macs" || bad "autoupdate settle" ""
 rm -rf "$HS"
 
+echo "── fleet steer: control's record steers this Mac's update line, every tick, from the first boot (2026-11-18) ──────"
+# The regression: Memex#1084 set Continuous + 4.* on three mac-host records and no Mac moved — the record only SEEDED the
+# portal's Admin/UpdatePolicy on first boot. Now the Mac asks control (the signed /api/fleet/self-status) for the line its
+# record declares, renders it after the overlay, and re-applies the chart when it changed. The fake control answers what
+# "$FS/record" holds, so one test = one record state; the re-apply is observed through a cmd_update stand-in.
+FS="$(mktemp -d)"; mkdir -p "$FS/home/.memex-local"
+printf 'config:\n  memex_portal:\n    Hosting__Deployment: "mini-1"\nsecrets:\n  memex_portal:\n    Hosting__ModuleReportSecret: "s3cr3t-heartbeat-key-value"\n' > "$FS/home/.memex-local/fleet.yaml"
+cat > "$FS/srv.py" <<'PY'
+import hashlib, hmac, http.server, json, os, sys, time
+rec = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0)); body = self.rfile.read(n)
+        want = "sha256=" + hmac.new(b"s3cr3t-heartbeat-key-value", body, hashlib.sha256).hexdigest()
+        d = json.loads(body)
+        mode = open(rec).read().strip()
+        if mode == "401" or self.path != "/api/fleet/self-status" or self.headers.get("X-Hub-Signature-256") != want or d.get("deployment") != "mini-1" or abs(d["ts"] - time.time()) > 300:
+            self.send_response(401); self.end_headers(); return
+        out = {"deployment": "mini-1", "record": {"present": True, "path": "Deployments/mini-1", "kind": "mac-host"}}
+        if mode != "old-control":
+            out["desired"] = json.loads(mode)
+        b = json.dumps(out).encode(); self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(b)
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+with open(sys.argv[2] + ".tmp", "w") as f: f.write(str(s.server_address[1]))
+os.replace(sys.argv[2] + ".tmp", sys.argv[2])
+s.serve_forever()
+PY
+printf 'old-control' > "$FS/record"
+python3 "$FS/srv.py" "$FS/record" "$FS/port" 2>"$FS/srv.err" & FS_PID=$!
+for _ in $(seq 1 150); do [ -s "$FS/port" ] && break; sleep 0.2; done
+FS_PORT="$(cat "$FS/port" 2>/dev/null)"
+printf 'config:\n  memex_portal:\n    Hosting__ReportTo: "http://127.0.0.1:%s"\n    Hosting__Deployment: "mini-1"\n' "$FS_PORT" > "$FS/home/.memex-local/backlease.yaml"
+LINE="$FS/home/.memex-local/update-line.yaml"
+# one pass; `colima_running` and `cmd_update` are stood in so a re-apply is RECORDED (with its flags and env), never run
+steer() { env MEMEX_LOCAL_LIB=1 HOME="$FS/home" MEMEX_LOCAL_HOME="$FS/home/.memex-local" PATH="$STUBS:$PATH" \
+  bash -c '. "$0"; colima_running() { return 0; }; cmd_update() { echo "UPDATE $* image=${MEMEX_AUTOUPDATE_IMAGE:-} in=${MEMEX_IN_AUTOUPDATE:-}" >> "'"$FS"'/updates"; }; fleet_steer "$@"' "$CLI" "$@" 2>&1; }
+record() { printf '%s' "$1" > "$FS/record"; }
+if [ -z "$FS_PORT" ]; then bad "fleet steer: the fake control did not start" "$(tail -c 400 "$FS/srv.err")"; else
+: > "$FS/updates"
+OUT="$(steer yes)"; RC=$?
+[ "$RC" = 3 ] && [ ! -f "$LINE" ] && [ ! -s "$FS/updates" ] && grep -q 'UNREAD — control answers no desired update line' <<<"$OUT" \
+  && ok "a control whose image predates the desired block is UNREAD: nothing written, nothing re-applied (exit 3)" || bad "steer old control" "rc=$RC $OUT"
+record '{"declared": true, "updatePolicy": "Continuous", "updatePattern": "4.*", "reason": null}'
+OUT="$(steer yes)"; RC=$?
+[ "$RC" = 0 ] && grep -q 'SelfUpdate__DefaultPolicy: "Continuous"' "$LINE" && grep -q 'SelfUpdate__DefaultPattern: "4.\*"' "$LINE" \
+  && grep -q "changed this Mac's update line: none -> Continuous 4.\*" <<<"$OUT" \
+  && [ "$(cat "$FS/updates")" = "UPDATE --skip-image image=0 in=" ] \
+  && ok "REGRESSION: the record declares Continuous 4.* → the Mac renders both keys and re-applies the chart ONCE (update --skip-image, no image pull)" || bad "steer declare" "rc=$RC $OUT / $(cat "$FS/updates")"
+[ "$(stat -f '%Lp' "$LINE")" = 600 ] && ok "the update-line layer is written 0600, like every other layer" || bad "steer mode" "$(stat -f '%Lp' "$LINE")"
+: > "$FS/updates"; cp "$LINE" "$FS/line.before"
+OUT="$(steer yes)"; RC=$?
+[ "$RC" = 0 ] && [ ! -s "$FS/updates" ] && cmp -s "$LINE" "$FS/line.before" && grep -q 'in step with Deployments/mini-1' <<<"$OUT" \
+  && ok "NEGATIVE CONTROL: an unchanged record re-applies NOTHING (the tick is a no-op; no restart every 15 min)" || bad "steer idempotent" "rc=$RC $OUT / $(cat "$FS/updates")"
+record '{"declared": true, "updatePolicy": "Stable", "updatePattern": null, "reason": null}'
+OUT="$(steer yes)"; RC=$?
+[ "$RC" = 0 ] && grep -q 'SelfUpdate__DefaultPolicy: "Stable"' "$LINE" && ! grep -q 'SelfUpdate__DefaultPattern' "$LINE" && [ "$(wc -l < "$FS/updates" | tr -d ' ')" = 1 ] \
+  && ok "a record CHANGE is followed: Stable with no pattern drops the pattern key and re-applies again" || bad "steer change" "rc=$RC $OUT"
+: > "$FS/updates"; cp "$LINE" "$FS/line.before"
+for bad_desired in '{"declared": true, "updatePolicy": "Continous", "updatePattern": "4.*"}' \
+                   '{"declared": true, "updatePolicy": "Continuous", "updatePattern": "4.*\"\n    X: y"}' \
+                   '401'; do
+  record "$bad_desired"; OUT="$(steer yes)"; RC=$?
+  [ "$RC" = 3 ] && cmp -s "$LINE" "$FS/line.before" && [ ! -s "$FS/updates" ] \
+    && ok "fails closed — UNREAD, the rendered line untouched: $(printf '%s' "$bad_desired" | head -c 60)" || bad "steer fail closed $bad_desired" "rc=$RC $OUT"
+done
+record '{"declared": false, "updatePolicy": null, "updatePattern": null, "reason": "the record declares no updatePolicy"}'
+OUT="$(steer yes)"; RC=$?
+[ "$RC" = 0 ] && [ ! -f "$LINE" ] && [ -s "$FS/updates" ] && grep -q 'withdrawn: the record declares no updatePolicy' <<<"$OUT" \
+  && ok "a record that STOPS declaring a line withdraws it (the layer is removed and the chart re-applied — the node is then the admin's)" || bad "steer withdraw" "rc=$RC $OUT"
+: > "$FS/updates"
+OUT="$(steer yes)"; RC=$?
+[ "$RC" = 0 ] && [ ! -s "$FS/updates" ] && ok "…and withdrawing nothing re-applies nothing" || bad "steer withdraw idempotent" "rc=$RC $OUT"
+record '{"declared": true, "updatePolicy": "Continuous", "updatePattern": "4.*", "reason": null}'
+OUT="$(steer no)"; RC=$?
+[ "$RC" = 0 ] && [ -f "$LINE" ] && [ ! -s "$FS/updates" ] && grep -q 'not re-applied (--no-apply)' <<<"$OUT" \
+  && ok "--no-apply writes the line and leaves the re-apply to the next up/update (what a join does before its own update)" || bad "steer no-apply" "rc=$RC $OUT"
+case "$OUT" in *s3cr3t*) bad "fleet steer printed the heartbeat key" "" ;; *) ok "fleet steer never prints the heartbeat key" ;; esac
+# a Mac enrolled by `backlease enroll` before the one-command join keeps its key in the OVERLAY, not fleet.yaml
+mv "$FS/home/.memex-local/fleet.yaml" "$FS/fleet.kept"
+printf 'secrets:\n  memex_portal:\n    Hosting__ModuleReportSecret: "s3cr3t-heartbeat-key-value"\n' > "$FS/home/.memex-local/values.local.yaml"
+rm -f "$LINE"; OUT="$(steer no)"; RC=$?
+[ "$RC" = 0 ] && [ -f "$LINE" ] && ok "a back-lease-enrolled Mac (key in the overlay, no fleet.yaml) is steered too — moench's shape" || bad "steer overlay key" "rc=$RC $OUT"
+mv "$FS/fleet.kept" "$FS/home/.memex-local/fleet.yaml"
+fi
+kill "$FS_PID" 2>/dev/null; wait "$FS_PID" 2>/dev/null
+# the wiring: the layer comes AFTER the overlay (the record wins on a fleet Mac), every autoupdate tick runs a pass BEFORE the
+# brew throttle (so a record change is not held for 6 h), inside the agent (no re-arm), and the join steers once it has a beat
+HD="$(fn_body helm_deploy)"
+[ "$(grep -n -- '-f "$OVERLAY"' <<<"$HD" | cut -d: -f1)" -lt "$(grep -n 'steer_args\[@\]' <<<"$HD" | cut -d: -f1)" ] \
+  && ok "helm_deploy layers the update line AFTER the overlay" || bad "steer layer order" ""
+A="$(sed -n '/^cmd_autoupdate() {/,/^}/p' "$CLI")"
+[ "$(grep -n 'fleet_steer yes' <<<"$A" | cut -d: -f1)" -lt "$(grep -n 'AUTOUPDATE_CHECKED" -mmin' <<<"$A" | cut -d: -f1)" ] \
+  && grep -q 'export MEMEX_IN_AUTOUPDATE=1; fleet_steer yes' <<<"$A" \
+  && ok "every autoupdate tick steers, before the 6-hour brew throttle, inside the agent" || bad "tick steers" ""
+grep -q 'fleet_steer yes ||' <<<"$(sed -n '/^cmd_fleet() {/,/^}/p' "$CLI")" && ok "fleet join steers once the first heartbeat landed (a new enrolment follows its record from first boot)" || bad "join steers" ""
+grep -q 'MEMEX_AUTOUPDATE_IMAGE=0 cmd_update --skip-image' <<<"$(fn_body fleet_steer)" && ok "the steer re-apply pulls no image (the portal's own self-updater moves it, on the declared line)" || bad "steer skip image" ""
+rm -rf "$FS"
+
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

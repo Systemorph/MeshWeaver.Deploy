@@ -269,6 +269,13 @@ readonly CERT_PLIST_DST="$HOME/Library/LaunchAgents/${CERT_PLIST_LABEL}.plist"
 # One values layer after back-lease and before the overlay (an overlay value still wins). The throw-away
 # RSA key the code is sealed to lives under $FLEET_DIR only until the code is opened.
 readonly FLEET_FILE="$LOCAL_HOME/fleet.yaml"
+# ── FLEET STEER — the update line control's record declares for this Mac (MeshWeaver.Plugins Hosting/BackLease §5.1) ──
+# Written ONLY by `memex-local fleet steer` from control's signed /api/fleet/self-status answer (its `desired` block — the
+# record's updatePolicy/updatePattern, derived as the AKS render derives a cluster record's): SelfUpdate__DefaultPolicy and
+# SelfUpdate__DefaultPattern, which the portal's self-updater converges its Admin/UpdatePolicy to at every start (policy
+# self-update-record-authoritative). Layered AFTER the overlay: on a fleet Mac the record is the source of truth
+# (declared-not-derived), so a hand-set overlay value cannot outlive it. Removed when the record stops declaring a line.
+readonly STEER_FILE="$LOCAL_HOME/update-line.yaml"
 # ── PUBLISHED — this Mac answers at its tailnet name (and optionally a public name) on the private network ──
 # Written by `memex-local publish on`, read by helm_deploy as one more values layer after the fleet layer
 # and before the overlay (an overlay value still wins): the published names as ADDITIONAL ingress hosts (the
@@ -2574,14 +2581,19 @@ doc_info(){ printf '  · %s\n' "$*"; }
 # (read from fleet.yaml by python, never on an argv or in the output). Prints the JSON, or "HTTP <code>" / "ERR <why>".
 fleet_self_status() {
   local control="$1" id="$2"
-  MEMEX_FLEET_FILE="$FLEET_FILE" python3 - "$control" "$id" <<'PY' 2>/dev/null || printf 'ERR python3'
+  MEMEX_FLEET_FILE="$FLEET_FILE" MEMEX_OVERLAY_FILE="$OVERLAY" python3 - "$control" "$id" <<'PY' 2>/dev/null || printf 'ERR python3'
 import hashlib, hmac, json, os, re, sys, time, urllib.request, urllib.error
 control, dep = sys.argv[1].rstrip("/"), sys.argv[2]
 key = None
-for line in open(os.environ["MEMEX_FLEET_FILE"]):
-    m = re.match(r'\s*Hosting__ModuleReportSecret:\s*"?([^"\s]+)"?', line)
-    if m: key = m.group(1); break
-if not key: print("ERR no heartbeat key in fleet.yaml"); sys.exit(0)
+# a joined Mac holds its key in fleet.yaml; a Mac enrolled by `backlease enroll` before the one-command join holds it in the
+# overlay's secrets (memex_portal) — the same value the portal signs its heartbeat with
+for path in (os.environ.get("MEMEX_FLEET_FILE"), os.environ.get("MEMEX_OVERLAY_FILE")):
+    if not path or not os.path.isfile(path): continue
+    for line in open(path):
+        m = re.match(r'\s*Hosting__ModuleReportSecret:\s*"?([^"\s]+)"?', line)
+        if m: key = m.group(1); break
+    if key: break
+if not key: print("ERR no heartbeat key in fleet.yaml or the overlay"); sys.exit(0)
 body = json.dumps({"deployment": dep, "ts": int(time.time())}, separators=(",", ":")).encode()
 sig = "sha256=" + hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
 req = urllib.request.Request(control + "/api/fleet/self-status", data=body, method="POST",
@@ -2637,6 +2649,13 @@ fleet_doctor() {
       hs="$(printf '%s' "$st" | json_field hostStatus.present)"
       [ "$hs" = true ] && doc_ok "host status on the board (Ops/Status/$id, $(printf '%s' "$st" | json_field hostStatus.at))" \
         || doc_red "no host status on control's board yet" "it is written by the first verified heartbeat once Deployments/$id exists"
+      local line; line="$(printf '%s' "$st" | fleet_steer_verdict)"
+      case "$line" in
+        declare*) if [ "$(steer_summary)" = "${line#declare }" ]; then doc_ok "update line ${line#declare }: declared by Deployments/$id and rendered on this Mac"
+                  else doc_red "update line: Deployments/$id declares ${line#declare }, this Mac renders $(steer_summary)" "memex-local fleet steer (the autoupdate agent runs it every tick)"; fi ;;
+        withdraw*) doc_info "update line: the record declares none — ${line#withdraw }" ;;
+        *) doc_info "update line: ${line#unread }" ;;
+      esac
       ;;
   esac
 
@@ -2734,6 +2753,115 @@ fleet_doctor() {
   printf '\n'
   if [ "$DOC_RED" -eq 0 ]; then ok "fleet doctor: every reading is green"; return 0; fi
   warn "fleet doctor: ${DOC_RED} reading(s) red — each names its remedy above"; return 1
+}
+
+# ── FLEET STEER (MeshWeaver.Plugins Hosting/BackLease §5.1) ────────────────────────────────────────────────────────────────
+# Control steers a fleet Mac's update line from the machine's Deployments record — no SSH, no hand login. The Mac ASKS (control
+# never connects to a Mac): the same signed /api/fleet/self-status the doctor reads answers a `desired` block, and the line it
+# declares is rendered into STEER_FILE; a changed file is re-applied (`update --skip-image`: chart only, no image pull), and
+# the restarted portal converges Admin/UpdatePolicy to it (policy self-update-record-authoritative). The autoupdate agent runs
+# one pass every tick, so a record change reaches the Mac within one tick of reaching control.
+
+# The one-line summary of what STEER_FILE declares ("Continuous 4.*"), or "none".
+steer_summary() {
+  [ -f "$STEER_FILE" ] || { printf 'none'; return; }
+  local p t
+  p="$(awk '$1 == "SelfUpdate__DefaultPolicy:" { gsub(/"/, "", $2); print $2; exit }' "$STEER_FILE")"
+  t="$(awk '$1 == "SelfUpdate__DefaultPattern:" { gsub(/"/, "", $2); print $2; exit }' "$STEER_FILE")"
+  printf '%s%s' "${p:-?}" "${t:+ $t}"
+}
+
+# Control's answer (stdin) → one verdict line: "declare <policy> [<pattern>]", "withdraw <reason>" or "unread <why>". Pure.
+# Re-checks what it is handed: a policy outside the platform's three names, or a pattern of another shape, is UNREAD — a value
+# the pod binds to an enum must never reach the chart from a malformed answer.
+fleet_steer_verdict() {
+  python3 -c '
+import json, re, sys
+try: d = json.loads(sys.stdin.read())
+except Exception: print("unread control answered no JSON"); sys.exit(0)
+des = d.get("desired") if isinstance(d, dict) else None
+if not isinstance(des, dict):
+    print("unread control answers no desired update line (its image predates fleet steer)"); sys.exit(0)
+if des.get("declared") is not True:
+    why = re.sub(r"\s+", " ", str(des.get("reason") or "the record declares no update line")).strip()[:300]
+    print("withdraw " + why); sys.exit(0)
+p, t = des.get("updatePolicy"), des.get("updatePattern")
+if p not in ("Continuous", "Stable", "None"):
+    print("unread the declared policy %r is not a platform update policy" % (p,)); sys.exit(0)
+if t is not None and (not isinstance(t, str) or not re.fullmatch(r"[0-9A-Za-z.*+-]{1,64}", t)):
+    print("unread the declared pattern %r is not a version pattern" % (t,)); sys.exit(0)
+print("declare %s%s" % (p, (" " + t) if t else ""))
+' 2>/dev/null || printf 'unread python3 failed\n'
+}
+
+# STEER_FILE's text for a declared line.
+steer_file_text() {
+  local policy="$1" pattern="${2:-}"
+  printf '# memex-local FLEET STEER — managed by `memex-local fleet steer`; NEVER edit by hand: the next pass rewrites it from\n'
+  printf "# control's record (Deployments/<this Mac>: updatePolicy / updatePattern). Change the line THERE. Layered after the overlay.\n"
+  printf 'config:\n  memex_portal:\n    SelfUpdate__DefaultPolicy: "%s"\n' "$policy"
+  [ -z "$pattern" ] || printf '    SelfUpdate__DefaultPattern: "%s"\n' "$pattern"
+}
+
+# Applies one verdict to STEER_FILE. Exit 0 = unchanged, 10 = changed (written or withdrawn), 3 = unread (nothing touched).
+fleet_steer_apply() {
+  local verdict="$1" kind rest policy pattern want
+  kind="${verdict%% *}"; rest="${verdict#* }"; [ "$rest" != "$verdict" ] || rest=""
+  case "$kind" in
+    declare)
+      policy="${rest%% *}"; pattern="${rest#* }"; [ "$pattern" != "$rest" ] || pattern=""
+      want="$(steer_file_text "$policy" "$pattern")"
+      if [ -f "$STEER_FILE" ] && [ "$(cat "$STEER_FILE")" = "$want" ]; then return 0; fi
+      mkdir -p "$LOCAL_HOME"
+      ( umask 077; printf '%s\n' "$want" > "$STEER_FILE.tmp" ) && mv -f "$STEER_FILE.tmp" "$STEER_FILE"
+      return 10 ;;
+    withdraw)
+      [ -f "$STEER_FILE" ] || return 0
+      rm -f "$STEER_FILE"
+      return 10 ;;
+    *) return 3 ;;
+  esac
+}
+
+# One steer pass: ask control, apply, re-apply the chart when the line changed. Prints one dated line per pass (the autoupdate
+# log is its audit trail). Exit 0 = in step, 1 = the re-apply failed, 3 = unread (nothing changed; the next tick asks again).
+fleet_steer() {
+  local apply="${1:-yes}" id control st verdict rc=0 before after
+  id="$(fleet_value Hosting__Deployment)"; [ -n "$id" ] || id="$(backlease_deployment)"
+  control="$(backlease_control)"
+  [ -n "$control" ] || control="$(fleet_value Hosting__ControlInbox__Url | sed -E 's|^(https?://[^/]+).*|\1|')"
+  if [ -z "$id" ] || [ -z "$control" ]; then
+    printf '%s steer: not a fleet Mac (no deployment id or control in fleet.yaml/backlease.yaml) — nothing to steer\n' "$(date -u +%FT%TZ)"
+    return 3
+  fi
+  before="$(steer_summary)"
+  st="$(fleet_self_status "$control" "$id")"
+  case "$st" in
+    HTTP*|ERR*) verdict="unread control's answer: $st" ;;
+    *) verdict="$(printf '%s' "$st" | fleet_steer_verdict)" ;;
+  esac
+  fleet_steer_apply "$verdict" || rc=$?
+  after="$(steer_summary)"
+  case "$rc" in
+    0)  printf '%s steer: in step with Deployments/%s on %s — update line %s\n' "$(date -u +%FT%TZ)" "$id" "$control" "$after"; return 0 ;;
+    3)  printf '%s steer: UNREAD — %s; nothing changed (update line stays %s)\n' "$(date -u +%FT%TZ)" "${verdict#unread }" "$before"; return 3 ;;
+  esac
+  printf '%s steer: Deployments/%s changed this Mac'"'"'s update line: %s -> %s%s\n' "$(date -u +%FT%TZ)" "$id" "$before" "$after" \
+    "$([ "${verdict%% *}" = withdraw ] && printf ' (withdrawn: %s)' "${verdict#withdraw }")"
+  if [ "$apply" != yes ]; then
+    printf '%s steer: not re-applied (--no-apply) — the next up/update renders it\n' "$(date -u +%FT%TZ)"; return 0
+  fi
+  if ! colima_running; then
+    printf '%s steer: Colima is not running — the next up/update renders it\n' "$(date -u +%FT%TZ)"; return 0
+  fi
+  # chart only (no image pull: the portal's own self-updater moves the image, on the line just declared); the restart it
+  # forces is what makes the portal converge Admin/UpdatePolicy — and loads any module set that landed waiting for one.
+  # A subshell: a die inside `update` fails THIS pass, loudly, and never the caller.
+  if ( MEMEX_SKIP_OLLAMA=1 MEMEX_AUTOUPDATE_IMAGE=0 cmd_update --skip-image ); then
+    printf '%s steer: re-applied — the portal restarted on update line %s\n' "$(date -u +%FT%TZ)" "$after"; return 0
+  fi
+  printf '%s steer: the re-apply FAILED (above) — the line is written; the next up/update renders it\n' "$(date -u +%FT%TZ)"
+  return 1
 }
 
 cmd_fleet() {
@@ -2897,6 +3025,9 @@ cmd_fleet() {
       case "$hb_min" in ''|*[!0-9]*) die "--heartbeat-wait: minutes, a whole number (got '$hb_min')" ;; esac
       if [ "$do_update" = "yes" ] && [ "$hb_min" -gt 0 ] && registry_mode && colima_running; then
         fleet_wait_heartbeat "$hb_min"
+        # the update line control's record declares for this Mac, from the first boot on: once the record exists (its pull
+        # request merged), this pass and every autoupdate tick after it keep the portal's Admin/UpdatePolicy on it
+        fleet_steer yes || info "update line: not steered yet (above) — the autoupdate agent asks control again every tick"
         # the readings that say the join is done; a red one is named with its remedy, and never undoes the join
         fleet_doctor || warn "the join finished with red readings — 'memex-local fleet doctor' re-reads them"
       else
@@ -2910,6 +3041,11 @@ cmd_fleet() {
     doctor)
       [ $# -eq 0 ] || die "fleet doctor: takes no arguments"
       fleet_doctor
+      ;;
+    steer)
+      local steer_apply=yes
+      while [ $# -gt 0 ]; do case "$1" in --no-apply) steer_apply=no ;; *) die "fleet steer: unknown flag '$1'" ;; esac; shift; done
+      fleet_steer "$steer_apply"
       ;;
     heartbeat)
       local hb_wait="${MEMEX_HEARTBEAT_WAIT_MIN:-20}"
@@ -2933,7 +3069,7 @@ cmd_fleet() {
         info "not joined — memex-local fleet join --control https://<control-instance> --id <id>"
       fi
       ;;
-    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--wait <min>] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] [--accept-jobs=<patterns> | --no-accept-jobs] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--residency <X>] [--heartbeat-wait <min>] | heartbeat [--wait <min>] | doctor | status}" ;;
+    *) die "usage: memex-local fleet {join --control <https url> --id <id> [--no-open] [--wait <min>] [--code-file <f>] [--no-update] [--no-observability] [--no-buildhost] [--accept-jobs=<patterns> | --no-accept-jobs] [--accept-tokens=<patterns> | --no-accept-tokens] [--token-models <m>] [--residency <X>] [--heartbeat-wait <min>] | heartbeat [--wait <min>] | doctor | steer [--no-apply] | status}" ;;
   esac
 }
 
@@ -4695,6 +4831,12 @@ helm_deploy() {
   # default chat tier and the VM's gateway — right after the tracked defaults, so every later layer wins.
   migrate_overlay_llm
   write_llm_auto_layer
+  # FLEET STEER layer (`memex-local fleet steer`): the record's update line, AFTER the overlay — the record wins on a fleet Mac.
+  local steer_args=()
+  if [ -f "$STEER_FILE" ]; then
+    steer_args=(-f "$STEER_FILE")
+    info "UPDATE LINE: $(steer_summary) — declared by control's record for this Mac (memex-local fleet steer)"
+  fi
   helm upgrade --install "$RELEASE" "$chart" \
     -f "$chart/values.yaml" \
     -f "$share_dir/values.local.defaults.yaml" \
@@ -4702,6 +4844,7 @@ helm_deploy() {
     ${mode_args[@]+"${mode_args[@]}"} \
     -f "$OVERLAY" \
     ${internal_args[@]+"${internal_args[@]}"} \
+    ${steer_args[@]+"${steer_args[@]}"} \
     --set persistDataVolume=true \
     --set "config.memex_portal.Bootstrap__Secret=$LOCAL_BOOTSTRAP_SECRET" \
     ${plugin_args[@]+"${plugin_args[@]}"} \
@@ -8475,6 +8618,12 @@ PLIST
       info "last:      $(tail -1 "$AUTOUPDATE_LOG" 2>/dev/null || echo none)"
       ;;
     _tick)
+      # 🍎 FLEET STEER on EVERY tick, before the brew throttle (Hosting/BackLease §5.1): a fleet Mac asks control for the update
+      # line its record declares and re-applies the chart when it changed, so a record change reaches the Mac within one tick.
+      # Inside the agent (MEMEX_IN_AUTOUPDATE: the re-apply must not re-arm — that would unload this very job); chart only.
+      if [ -f "$FLEET_FILE" ] || [ -f "$BACKLEASE_FILE" ]; then
+        ( export MEMEX_IN_AUTOUPDATE=1; fleet_steer yes ) || true
+      fi
       [ -z "$(find "$AUTOUPDATE_CHECKED" -mmin "-$AUTOUPDATE_INTERVAL_MIN" 2>/dev/null)" ] || exit 0
       mkdir -p "$LOCAL_HOME"; touch "$AUTOUPDATE_CHECKED"
       local keg before after abefore aafter out
