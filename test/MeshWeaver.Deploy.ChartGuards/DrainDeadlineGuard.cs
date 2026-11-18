@@ -202,9 +202,40 @@ public class DrainDeadlineGuard
         var path = probe.Groups["path"].Value.TrimEnd(';');
         var port = probe.Groups["port"].Value;
 
-        var serviceDefaults = File.ReadAllText(ChartRoots.PluginsFile(ServiceDefaults));
+        var serviceDefaultsPath = ChartRoots.PluginsFile(ServiceDefaults);
+        var serviceDefaults = File.ReadAllText(serviceDefaultsPath);
+        var projectDirectory = Path.GetDirectoryName(serviceDefaultsPath);
+        Assert.False(string.IsNullOrEmpty(projectDirectory), $"{ServiceDefaults} has no containing directory.");
+        // The route is mapped either by its literal or by a constant of the ServiceDefaults project whose value IS the
+        // probed path (MeshWeaver.Plugins#5626 moved it to `DrainInFlightWork.DrainRoute = "/drain"`). The constant is
+        // bound to its DECLARING TYPE, so the call must name that type (`DrainInFlightWork.DrainRoute`, with any
+        // namespace qualifier in front) — a same-named member of another type does not count. A bare name counts only
+        // when the constant is declared in ServiceDefaults.cs itself. Generated output (bin/, obj/) is not scanned.
+        var mapsTheRoute = serviceDefaults.Contains($"MapGet(\"{path}\"", StringComparison.Ordinal);
+        foreach (var file in Directory.EnumerateFiles(projectDirectory, "*.cs", SearchOption.AllDirectories)
+                     .Where(f => !Path.GetRelativePath(projectDirectory, f).Split(Path.DirectorySeparatorChar)
+                         .Any(part => part is "bin" or "obj")))
+        {
+            var source = File.ReadAllText(file);
+            foreach (Match constant in Regex.Matches(source,
+                         @"const\s+string\s+(?<name>\w+)\s*=\s*""" + Regex.Escape(path) + @"""\s*;"))
+            {
+                var name = constant.Groups["name"].Value;
+                var declaringType = Regex.Matches(source[..constant.Index], @"\b(?:class|struct|record)\s+(?<type>\w+)")
+                    .Cast<Match>().LastOrDefault()?.Groups["type"].Value;
+                var qualified = declaringType is null
+                    ? null
+                    : @"MapGet\(\s*(?:\w+\.)*" + Regex.Escape(declaringType) + @"\." + Regex.Escape(name) + @"\s*,";
+                var bare = Path.GetFullPath(file) == Path.GetFullPath(serviceDefaultsPath)
+                    ? @"MapGet\(\s*" + Regex.Escape(name) + @"\s*,"
+                    : null;
+                if ((qualified is not null && Regex.IsMatch(serviceDefaults, qualified))
+                    || (bare is not null && Regex.IsMatch(serviceDefaults, bare)))
+                    mapsTheRoute = true;
+            }
+        }
         Assert.True(
-            serviceDefaults.Contains($"MapGet(\"{path}\"", StringComparison.Ordinal),
+            mapsTheRoute,
             $"{Deployment}'s preStop probes '{path}', but {ServiceDefaults} does not map that "
             + "route. curl -sf reads the resulting 404 as 'still draining', so the drain would "
             + "silently run to its deadline on every roll and cut every open session (#1971).");
