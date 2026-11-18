@@ -351,6 +351,25 @@ heartbeat and the self-update patcher both ship in Hosting. `MEMEX_FLEET_HOST=0`
 autoupdate agent, a registry-mode re-apply also pulls the public GHCR image (`MEMEX_AUTOUPDATE_IMAGE=0`
 opts out). A template that needs a newer platform, such as a package's `minMeshVersion`, therefore lands
 with no hand on the machine. What the registry serves the instance is still its plan's decision.
+
+**Control's record steers a fleet Mac's update line (`memex-local fleet steer`).** The record on control
+(`Deployments/<mac>`: `updatePolicy` / `updatePattern`) is the source of truth, not the Mac's own Settings → Updates.
+Every autoupdate tick (before the 6-hour brew throttle) and once at the end of `fleet join`, the Mac posts its signed
+`/api/fleet/self-status` and reads the answer's `desired` block. It writes the declared line to
+`~/.memex-local/update-line.yaml` (managed, 0600, layered AFTER the overlay) and, when it changed, re-applies the
+chart with `update --skip-image`. The restarted portal converges `Admin/UpdatePolicy` to it at start. An unchanged
+line re-applies nothing. A record that stops declaring removes the file. An unreadable answer changes nothing.
+`fleet doctor` shows the declared and rendered lines side by side. Full account: MeshWeaver.Plugins
+`Hosting/BackLease.md` §5.1.
+
+**Control can also run a governed Restart or Roll ON this Mac, with no SSH** (BackLease §5.2). The same pass reads the
+answer's `commands`, the Restart or Roll InstanceActions control filed on this Mac's record:
+- A Restart is unattended under `hosting.restart`; a Roll needs one approval under `hosting.roll`.
+- The pass runs each command once: `restart` restarts the portal, `update` runs `memex-local update --tag <tag>`.
+- It keeps the outcome in `~/.memex-local/host-commands/` and posts it signed with this Mac's own key to control's
+  heartbeat inbox, and the action finishes on it.
+- An unknown operation or a malformed tag runs nothing and is reported Failed.
+- `--no-apply` runs no command.
  On the control instance,
 `Hosting/Heartbeats/Enrolments` lists every join with the first step not yet measured done.
 
