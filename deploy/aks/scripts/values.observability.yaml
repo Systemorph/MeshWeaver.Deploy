@@ -18,6 +18,13 @@
 # raising the portal's memory limit or the node size — that only moves the ceiling.
 
 loki:
+  # 0. RE-OWN THE STORE ONLY ON A ROOT MISMATCH. The chart's pod securityContext sets fsGroup 10001; with no change
+  #    policy the kubelet re-owns EVERY file on the volume at each start. The store holds ~650,000 files, re-owned at
+  #    ~60,000 a minute (measured 2026-11-18, `VolumePermissionChangeInProgress … processed 652182 files`), so every
+  #    restart sat ~11 minutes in ContainerCreating and outlasted the quarantine action's 600 s rollout wait. Helm merges
+  #    this key into the chart's securityContext; the chart's runAsUser/fsGroup stay.
+  securityContext:
+    fsGroupChangePolicy: OnRootMismatch
   # 1. OUT OF BestEffort. Requests are what the eviction ranking reads: a pod inside its requests is
   #    protected relative to any BestEffort pod on the node. Sized from observed steady state
   #    (~150-300Mi), with headroom for query bursts rather than for retained data (that is the PVC).
