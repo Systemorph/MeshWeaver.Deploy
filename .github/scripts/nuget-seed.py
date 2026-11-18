@@ -4,6 +4,8 @@ THE PACKAGE SEED — the NuGet closure of a core version, published to the contr
 (MeshWeaver.Plugins Hosting/OneBuildTree §6.3; the routes: MeshWeaver.Plugins src/MeshWeaver.Fleet.Control/
 BuildSeedEndpoints.cs). Run by .github/workflows/nuget-seed.yml.
 
+  nuget-seed.py lines   [--repo Systemorph/MeshWeaver]                every delivery line the platform declares, as the
+                        seed's matrix: `lines=[{"line","channel","pluginsRef"}, …]` (GitHub output line)
   nuget-seed.py plan    --api <…/api/builds> [--channel latest]       which version, and whether its seed is published
   nuget-seed.py publish --api <…/api/builds> --version V --packages DIR [--source URL]
                         every complete package in the global-packages folder DIR: its `.nupkg` uploaded as a blob
@@ -14,6 +16,13 @@ BuildSeedEndpoints.cs). Run by .github/workflows/nuget-seed.yml.
   nuget-seed.py --self-test
 
 `plan` prints GitHub output lines: version=…, build=true|false, why=….
+
+ONE SEED PER DELIVERY LINE (policy `major-lines-run-separately`). Each platform major is its own line: core's
+`.github/delivery-lines.json` declares, per line, the build host CHANNEL its runs are queued on (`buildHostChannel`:
+latest4 = v4 = SDK 11, latest3 = v3 = SDK 10) and the MeshWeaver.Plugins branch built against it (`pluginsRef`). A seed
+restores THAT branch inside THAT channel's runner image with THAT line's SDK; restoring Plugins' default branch (v4,
+net11.0) against the v3 channel with the v3 SDK cannot succeed (NETSDK1045). The pairs are read from the declaration,
+never spelled here.
 """
 from __future__ import annotations
 
@@ -89,6 +98,41 @@ def exchange(call: Http, method: str, url: str, body: Optional[bytes], headers: 
 def signature(secret: str, kind: str, name: str, sha256: str, size: int) -> str:
     msg = f"seed-{kind}:{name}:{sha256}:{size}".encode()
     return "sha256=" + hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
+
+
+def seed_lines(doc: object) -> list:
+    """The seed's matrix from core's `.github/delivery-lines.json`: one entry per declared line, with its branch, the build
+    host channel it runs on and the MeshWeaver.Plugins branch it builds. Raises SystemExit naming what is missing or
+    doubled; a line the declaration does not complete is never guessed. Pure."""
+    lines = doc.get("lines") if isinstance(doc, dict) else None
+    if not isinstance(lines, list) or not lines:
+        raise SystemExit("::error::core's delivery-lines.json declares no `lines`")
+    out, seen = [], set()
+    for ln in lines:
+        entry = {k: (ln.get(src) if isinstance(ln, dict) else None)
+                 for k, src in (("line", "branch"), ("channel", "buildHostChannel"), ("pluginsRef", "pluginsRef"))}
+        bad = [k for k, v in entry.items() if not (isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9._/-]+", v))]
+        if bad:
+            raise SystemExit(f"::error::delivery line {ln!r} declares no usable {', '.join(bad)}; the seed cannot place it")
+        if entry["channel"] in seen:
+            raise SystemExit(f"::error::two delivery lines name build host channel {entry['channel']}; one seed per channel")
+        seen.add(entry["channel"])
+        out.append(entry)
+    return out
+
+
+def read_delivery_lines(repo: str) -> object:
+    """core's `.github/delivery-lines.json` on its default branch, through `gh api` (the platform repository is public).
+    Raises SystemExit when it cannot be read: a failed read is red, never "no lines"."""
+    import subprocess
+    r = subprocess.run(["gh", "api", f"repos/{repo}/contents/.github/delivery-lines.json",
+                        "-H", "Accept: application/vnd.github.raw"], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"::error::{repo}'s .github/delivery-lines.json cannot be read: {r.stderr.strip()[:300]}")
+    try:
+        return json.loads(r.stdout)
+    except ValueError as e:
+        raise SystemExit(f"::error::{repo}'s .github/delivery-lines.json is not JSON: {e}")
 
 
 def plan(api: str, channel: str, call: Http, digests: Optional[dict] = None) -> "tuple[str, bool, str]":
@@ -227,6 +271,22 @@ def self_test() -> int:
             return (200 if existed else 201), json.dumps({"existed": existed}).encode()
         return 404, b""
 
+    decl = {"lines": [{"branch": "main", "pluginsRef": "main", "buildHostChannel": "latest4"},
+                      {"branch": "main3", "pluginsRef": "main3", "buildHostChannel": "latest3"}]}
+    check("lines: every declared line, its channel and its Plugins branch, in declaration order",
+          seed_lines(decl) == [{"line": "main", "channel": "latest4", "pluginsRef": "main"},
+                               {"line": "main3", "channel": "latest3", "pluginsRef": "main3"}], seed_lines(decl))
+    for name, bad in (("no lines", {}), ("an empty list", {"lines": []}),
+                      ("a line without its channel", {"lines": [{"branch": "main", "pluginsRef": "main"}]}),
+                      ("a line without its Plugins branch", {"lines": [{"branch": "main", "buildHostChannel": "latest4"}]}),
+                      ("two lines on one channel",
+                       {"lines": [decl["lines"][0], dict(decl["lines"][1], buildHostChannel="latest4")]})):
+        try:
+            seed_lines(bad)
+            check(f"lines: {name} is refused", False, "accepted")
+        except SystemExit as e:
+            check(f"lines: {name} is refused, naming it", str(e).startswith("::error::"), e)
+
     dg: dict = {}
     v, build, why = plan("https://ops.example/api/builds", "latest", fake, dg)
     check("plan: the version latest runs, not published → build, with its runner and portal digests",
@@ -348,14 +408,15 @@ def self_test() -> int:
         for f in fails:
             print(f"SELF-TEST FAILED: {f}")
         return 1
-    print("nuget-seed self-test: all cases passed (plan; complete packages only; manifest fields; idempotent re-run; "
+    print("nuget-seed self-test: all cases passed (lines; plan; complete packages only; manifest fields; idempotent re-run; "
           "write-once manifest; signature)")
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["plan", "publish"], nargs="?")
+    ap.add_argument("command", choices=["lines", "plan", "publish"], nargs="?")
+    ap.add_argument("--repo", default="Systemorph/MeshWeaver")
     ap.add_argument("--api", default="")
     ap.add_argument("--channel", default="latest")
     ap.add_argument("--version", default="")
@@ -364,6 +425,9 @@ def main() -> int:
     a = ap.parse_args()
     if a.self_test:
         return self_test()
+    if a.command == "lines":
+        print("lines=" + json.dumps(seed_lines(read_delivery_lines(a.repo)), separators=(",", ":")))
+        return 0
     if not a.api.startswith("https://"):
         raise SystemExit("::error::--api must be the control instance's https …/api/builds")
     if a.command == "plan":
