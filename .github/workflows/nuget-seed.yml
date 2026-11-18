@@ -132,7 +132,7 @@ jobs:
           id=$(docker create --platform linux/amd64 "$ACR/memex-portal-ai@$PORTAL")
           docker cp "$id:/app" "$w/portal/app"
           docker rm "$id" >/dev/null
-          # the declared restore of the default branch, run exactly as a host's warm restore runs it: core at the version's
+          # the declared restore of the line's Plugins branch (pluginsRef), run exactly as a host's warm restore runs it: core at the version's
           # commit (the image's platform source, copied writable — restore writes core's obj/), the reference set as
           # MeshWeaverRefs, and a FRESH package folder that becomes the seed. The line's SDK first: the image's own
           # runner selects it from the set's version (PATH, DOTNET_ROOT), refusing by name a major it carries no SDK for
@@ -141,9 +141,9 @@ jobs:
             "$ACR/mw-build-host@$RUNNER" -c '
               set -euo pipefail
               : "${MW_BUILD_PLATFORM_VERSION:?the set version is not handed in; the line SDK cannot be selected}"
-              sel=$(python3 -c "import os, runpy, shlex; m = runpy.run_path(\"/opt/build-host/build-run.py\", run_name=\"build_run\"); e = m[\"select_platform_dotnet\"](dict(os.environ)); print(\" \".join(\"export %s=%s;\" % (k, shlex.quote(e[k])) for k in (\"PATH\", \"DOTNET_ROOT\", m[\"DOTNET_SDK_ENV\"])))")
+              sel=$(python3 -c "import os, runpy, shlex; m = runpy.run_path(\"/opt/build-host/build-run.py\", run_name=\"build_run\"); e = m[\"select_platform_dotnet\"](dict(os.environ)); print(\" \".join(\"export %s=%s;\" % (k, shlex.quote(e[k])) for k in (\"PATH\", \"DOTNET_ROOT\", m[\"DOTNET_SDK_ENV\"])) + \" export SEED_DOTNET_SDK=%s;\" % shlex.quote(e[m[\"DOTNET_SDK_ENV\"]]))")
               eval "$sel"
-              echo "package seed: platform $MW_BUILD_PLATFORM_VERSION → .NET SDK $MW_BUILD_DOTNET_SDK ($DOTNET_ROOT); $(dotnet --version)"
+              echo "package seed: platform $MW_BUILD_PLATFORM_VERSION → .NET SDK $SEED_DOTNET_SDK ($DOTNET_ROOT); $(dotnet --version)"
               cp -a /opt/build-host/platform-src /tmp/core
               cd /src
               cmd=$(python3 -c "import json; print(json.load(open(\".github/build-stages.json\"))[\"restore\"][\"command\"])")
