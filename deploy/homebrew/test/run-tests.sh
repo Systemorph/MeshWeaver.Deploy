@@ -4121,7 +4121,8 @@ OUT="$(steer yes)"; RC=$?
   && grep -q "changed this Mac's update line: none -> Continuous 4.\*" <<<"$OUT" \
   && [ "$(cat "$FS/updates")" = "UPDATE --skip-image image=0 in=" ] \
   && ok "REGRESSION: the record declares Continuous 4.* → the Mac renders both keys and re-applies the chart ONCE (update --skip-image, no image pull)" || bad "steer declare" "rc=$RC $OUT / $(cat "$FS/updates")"
-[ "$(stat -f '%Lp' "$LINE")" = 600 ] && ok "the update-line layer is written 0600, like every other layer" || bad "steer mode" "$(stat -f '%Lp' "$LINE")"
+# GNU first: GNU `stat -f` is the FILESYSTEM report and exits 0, so a BSD-first read never reaches `-c` on Linux
+[ "$(stat -c '%a' "$LINE" 2>/dev/null || stat -f '%Lp' "$LINE")" = 600 ] && ok "the update-line layer is written 0600, like every other layer" || bad "steer mode" "$(ls -l "$LINE")"
 : > "$FS/updates"; cp "$LINE" "$FS/line.before"
 OUT="$(steer yes)"; RC=$?
 [ "$RC" = 0 ] && [ ! -s "$FS/updates" ] && cmp -s "$LINE" "$FS/line.before" && grep -q 'in step with Deployments/mini-1' <<<"$OUT" \
