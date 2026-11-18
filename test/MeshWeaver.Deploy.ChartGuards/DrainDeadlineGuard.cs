@@ -202,9 +202,22 @@ public class DrainDeadlineGuard
         var path = probe.Groups["path"].Value.TrimEnd(';');
         var port = probe.Groups["port"].Value;
 
-        var serviceDefaults = File.ReadAllText(ChartRoots.PluginsFile(ServiceDefaults));
+        var serviceDefaultsPath = ChartRoots.PluginsFile(ServiceDefaults);
+        var serviceDefaults = File.ReadAllText(serviceDefaultsPath);
+        // The route is mapped either by its literal or by a constant of the ServiceDefaults project whose value IS the
+        // probed path (MeshWeaver.Plugins#5626 moved it to `DrainInFlightWork.DrainRoute = "/drain"`). Both are read
+        // from the project's own sources, so a constant renamed or re-valued fails here exactly as a renamed literal does.
+        var projectSources = Directory.GetFiles(Path.GetDirectoryName(serviceDefaultsPath)!, "*.cs", SearchOption.AllDirectories)
+            .Select(File.ReadAllText).ToArray();
+        var routeConstants = projectSources
+            .SelectMany(source => Regex.Matches(source,
+                @"const\s+string\s+(?<name>\w+)\s*=\s*""" + Regex.Escape(path) + @"""\s*;").Cast<Match>())
+            .Select(m => m.Groups["name"].Value)
+            .ToArray();
+        var mapsTheRoute = serviceDefaults.Contains($"MapGet(\"{path}\"", StringComparison.Ordinal)
+            || routeConstants.Any(name => Regex.IsMatch(serviceDefaults, @"MapGet\(\s*(\w+\.)?" + Regex.Escape(name) + @"\s*,"));
         Assert.True(
-            serviceDefaults.Contains($"MapGet(\"{path}\"", StringComparison.Ordinal),
+            mapsTheRoute,
             $"{Deployment}'s preStop probes '{path}', but {ServiceDefaults} does not map that "
             + "route. curl -sf reads the resulting 404 as 'still draining', so the drain would "
             + "silently run to its deadline on every roll and cut every open session (#1971).");
