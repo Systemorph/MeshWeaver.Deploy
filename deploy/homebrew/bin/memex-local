@@ -2823,6 +2823,103 @@ fleet_steer_apply() {
   esac
 }
 
+# ── HOST COMMANDS (MeshWeaver.Plugins Hosting/BackLease §5.2) — a governed Restart or Roll control hands THIS Mac ─────────────
+# Control files a Hosting/InstanceAction (Restart: hosting.restart, unattended; Roll: hosting.roll, one signature) on this Mac's
+# record; its run hands the Mac a command, which the self-status answer lists (`commands`). The Mac runs each ONCE (a ledger
+# under HOST_CMD_DIR), then posts its outcome to control's heartbeat inbox signed with its OWN heartbeat key — control lands it
+# on the action and the action finishes on it. Only the operations named here run; anything else is REPORTED Failed by name.
+readonly HOST_CMD_DIR="$LOCAL_HOME/host-commands"
+
+# Control's answer (stdin) → one line per pending command: "<id>\t<operation>\t<imageTag>\t<action>". Pure. Malformed rows are
+# dropped here (a value outside its shape never reaches a shell): ids/tags are tokens, the action a mesh path.
+host_commands_of() {
+  python3 -c '
+import json, re, sys
+try: d = json.loads(sys.stdin.read())
+except Exception: sys.exit(0)
+tok = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}")
+pth = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}")
+for c in (d.get("commands") or []) if isinstance(d, dict) else []:
+    if not isinstance(c, dict): continue
+    i, o, t, a = c.get("id"), c.get("operation"), c.get("imageTag") or "", c.get("action")
+    if not (isinstance(i, str) and tok.fullmatch(i) and isinstance(o, str) and tok.fullmatch(o)
+            and isinstance(a, str) and pth.fullmatch(a) and ".." not in a and isinstance(t, str)): continue
+    # never an EMPTY field: IFS=tab is whitespace to `read`, so an empty one would collapse and shift the action into the tag
+    print("\t".join((i, o, "-" if t == "" else (t if tok.fullmatch(t) else "!invalid"), a)))
+' 2>/dev/null || true
+}
+
+# Runs one operation on this Mac. Prints the detail line; exit 0 = Done. Never dies (each step in a subshell).
+host_command_run() {
+  local op="$1" tag="$2"
+  case "$op" in
+    restart)
+      if ( kubectl rollout restart deploy/memex-portal-deployment -n "$NAMESPACE" >/dev/null \
+           && kubectl rollout status deploy/memex-portal-deployment -n "$NAMESPACE" --timeout=600s >/dev/null ); then
+        printf 'portal restarted (deploy/memex-portal-deployment rolled out)'; return 0
+      fi
+      printf 'the portal restart did not complete (kubectl rollout restart/status failed)'; return 1 ;;
+    update)
+      if [ -z "$tag" ] || [ "$tag" = "!invalid" ]; then printf 'no valid image tag in the command — nothing was run'; return 1; fi
+      if ( MEMEX_SKIP_OLLAMA=1 MEMEX_AUTOUPDATE_IMAGE=0 cmd_update --tag "$tag" ) >/dev/null 2>&1; then
+        printf 'memex-local update --tag %s completed (the portal verified usable)' "$tag"; return 0
+      fi
+      printf 'memex-local update --tag %s FAILED — the Mac'"'"'s autoupdate.log carries its output' "$tag"; return 1 ;;
+    *) printf 'unknown operation %s — this memex-local runs restart and update only; nothing was run' "$op"; return 1 ;;
+  esac
+}
+
+# Posts one outcome to control's heartbeat inbox, signed with this Mac's own key (the same key and scheme as self-status).
+host_command_report() {
+  local control="$1" id="$2" action="$3" cmd="$4" outcome="$5" detail="$6"
+  MEMEX_FLEET_FILE="$FLEET_FILE" MEMEX_OVERLAY_FILE="$OVERLAY" python3 - "$control" "$id" "$action" "$cmd" "$outcome" "$detail" <<'PY' 2>/dev/null || printf 'ERR python3'
+import hashlib, hmac, json, os, re, sys, time, urllib.request, urllib.error
+control, dep, action, cmd, outcome, detail = sys.argv[1].rstrip("/"), *sys.argv[2:7]
+key = None
+for path in (os.environ.get("MEMEX_FLEET_FILE"), os.environ.get("MEMEX_OVERLAY_FILE")):
+    if not path or not os.path.isfile(path): continue
+    for line in open(path):
+        m = re.match(r'\s*Hosting__ModuleReportSecret:\s*"?([^"\s]+)"?', line)
+        if m: key = m.group(1); break
+    if key: break
+if not key: print("ERR no heartbeat key"); sys.exit(0)
+body = json.dumps({"event": "host-action-result", "deployment": dep, "action": action, "commandId": cmd,
+                   "outcome": outcome, "detail": detail[:600], "ts": int(time.time())}, separators=(",", ":")).encode()
+sig = "sha256=" + hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
+req = urllib.request.Request(control + "/api/hooks/Hosting/Heartbeats", data=body, method="POST",
+      headers={"Content-Type": "application/json", "X-Hub-Signature-256": sig, "User-Agent": "memex-local-host-command"})
+try:
+    with urllib.request.urlopen(req, timeout=20) as r: print("HTTP %d" % r.status)
+except urllib.error.HTTPError as e: print("HTTP %d" % e.code)
+except Exception as e: print("ERR %s" % (str(e)[:160]))
+PY
+}
+
+# Runs every command control's answer lists for this Mac — each at most ONCE (its outcome is kept in the ledger, and a command
+# whose outcome is already kept is only REPORTED again: the report may not have landed). One dated line per command.
+host_commands_pass() {
+  local control="$1" mac="$2" answer="$3" id op tag action detail outcome rc sent
+  mkdir -p "$HOST_CMD_DIR"; chmod 700 "$HOST_CMD_DIR" 2>/dev/null || true
+  while IFS="$(printf '\t')" read -r id op tag action; do
+    [ -n "$id" ] || continue
+    [ "$tag" != "-" ] || tag=""
+    if [ -f "$HOST_CMD_DIR/$id.outcome" ]; then
+      outcome="$(sed -n 1p "$HOST_CMD_DIR/$id.outcome")"; detail="$(sed -n 2p "$HOST_CMD_DIR/$id.outcome")"
+      printf '%s host command %s (%s on %s): already ran — %s; reporting again\n' "$(date -u +%FT%TZ)" "$id" "$op" "$action" "$outcome"
+    else
+      printf '%s host command %s: running %s%s for %s\n' "$(date -u +%FT%TZ)" "$id" "$op" "${tag:+ $tag}" "$action"
+      rc=0; detail="$(host_command_run "$op" "$tag")" || rc=$?
+      [ "$rc" = 0 ] && outcome=Done || outcome=Failed
+      printf '%s\n%s\n' "$outcome" "$detail" > "$HOST_CMD_DIR/$id.outcome"
+      printf '%s host command %s: %s — %s\n' "$(date -u +%FT%TZ)" "$id" "$outcome" "$detail"
+    fi
+    sent="$(host_command_report "$control" "$mac" "$action" "$id" "$outcome" "$detail")"
+    printf '%s host command %s: report to control: %s\n' "$(date -u +%FT%TZ)" "$id" "$sent"
+  done <<EOF
+$(printf '%s' "$answer" | host_commands_of)
+EOF
+}
+
 # One steer pass: ask control, apply, re-apply the chart when the line changed. Prints one dated line per pass (the autoupdate
 # log is its audit trail). Exit 0 = in step, 1 = the re-apply failed, 3 = unread (nothing changed; the next tick asks again).
 fleet_steer() {
@@ -2838,7 +2935,10 @@ fleet_steer() {
   st="$(fleet_self_status "$control" "$id")"
   case "$st" in
     HTTP*|ERR*) verdict="unread control's answer: $st" ;;
-    *) verdict="$(printf '%s' "$st" | fleet_steer_verdict)" ;;
+    *) verdict="$(printf '%s' "$st" | fleet_steer_verdict)"
+       # the governed commands control handed THIS Mac (Hosting/BackLease §5.2) — from the same signed answer, before the
+       # line is applied (a roll then runs on the line it was approved for, and the re-apply below sees its result)
+       if [ "$apply" = yes ]; then host_commands_pass "$control" "$id" "$st"; fi ;;
   esac
   fleet_steer_apply "$verdict" || rc=$?
   after="$(steer_summary)"

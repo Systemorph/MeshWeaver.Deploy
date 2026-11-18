@@ -361,6 +361,15 @@ chart with `update --skip-image`. The restarted portal converges `Admin/UpdatePo
 line re-applies nothing. A record that stops declaring removes the file. An unreadable answer changes nothing.
 `fleet doctor` shows the declared and rendered lines side by side. Full account: MeshWeaver.Plugins
 `Hosting/BackLease.md` §5.1.
+
+**Control can also run a governed Restart or Roll ON this Mac, with no SSH** (BackLease §5.2). The same pass reads the
+answer's `commands`, the Restart or Roll InstanceActions control filed on this Mac's record:
+- A Restart is unattended under `hosting.restart`; a Roll needs one approval under `hosting.roll`.
+- The pass runs each command once: `restart` restarts the portal, `update` runs `memex-local update --tag <tag>`.
+- It keeps the outcome in `~/.memex-local/host-commands/` and posts it signed with this Mac's own key to control's
+  heartbeat inbox, and the action finishes on it.
+- An unknown operation or a malformed tag runs nothing and is reported Failed.
+- `--no-apply` runs no command.
  On the control instance,
 `Hosting/Heartbeats/Enrolments` lists every join with the first step not yet measured done.
 
