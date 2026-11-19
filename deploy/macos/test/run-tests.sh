@@ -1310,6 +1310,14 @@ jin
 OUT="$(jrc FLEET_BOOTSTRAP_DRY_RUN=1)"
 case "$OUT" in *"DRY-RUN: $JR/bin/memex-local backlease accept jobs --off"*"DRY-RUN: launchctl bootout gui/$JUID/com.memex.local.buildhost-follow.build"*"DRY-RUN: /bin/rm -f $JR/home/Library/LaunchAgents/com.memex.local.buildhost-follow.build.plist"*"buildhost priority off"*"DRY-RUN: colima stop -p build"*"DRY-RUN: $JR/bin/memex-local update"*"buildhost idle off"*"RC=0"*)
   [ ! -e "$JR/calls" ] && [ -e "$JR/vm-running" ] && grep -q '__Jobs__Enabled: "true"' "$JR/home/.memex-local/backlease.yaml" && ok "a dry run prints every take-out action and changes nothing" || bad "dry run changed" "$(cat "$JR/calls")" ;; *) bad "dry run jobs" "$OUT" ;; esac
+OUT="$(JR_JOBS=maybe jrc)"
+case "$OUT" in *"no jobs answer was read"*"RC=1"*) [ ! -e "$JR/calls" ] && ok "an absent jobs answer is never read as NO: the reconcile changes nothing and FAILS" || bad "absent answer acted" "$(cat "$JR/calls")" ;; *) bad "absent answer" "$OUT" ;; esac
+# the labels and the layer key are memex-local's (this repository): pinned against its sources, so a rename reds here
+ML="$HERE/../../homebrew/bin/memex-local"; FS="$HERE/../../backlease/follow-set.py"; PS="$HERE/../../homebrew/share/buildhost-priority.sh"
+grep -q 'readonly IDLE_PLIST_LABEL="com.memex.local.buildhost-idle"' "$ML" && grep -q 'LABEL = "com.memex.local.buildhost-follow"' "$FS" \
+  && grep -q 'LABEL="com.memex.local.buildhost-priority"' "$PS" && grep -q 'f"{LABEL}.{a.profile}.plist"' "$FS" \
+  && grep -q '__Accept__Jobs__Enabled' "$ML" && grep -q 'readonly BUILD_PROFILE="${MEMEX_BUILD_PROFILE:-build}"' "$ML" \
+  && ok "the agent labels, the follow plist's name, the build profile and the layer key match memex-local's own sources" || bad "memex-local names drifted" ""
 grep -q 'step_jobs_reconcile "$user" "$mlocal" || jobs_rc=1' "$FB" && ok "a joined, finished Mac runs the jobs reconcile on every run" || bad "reconcile wired" ""
 rm -rf "$JR"
 

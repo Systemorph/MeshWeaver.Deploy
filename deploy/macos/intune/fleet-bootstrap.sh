@@ -1326,8 +1326,11 @@ jobs_bootout() {
 }
 
 step_jobs_reconcile() {
-  local user="$1" mlocal="$2" home rec vm=no follow=no idle=no prio=no did="" failed=0 optin pending
+  local user="$1" mlocal="$2" home rec vm=no follow=no idle=no prio=no did="" failed=0 optin pending owed
   home="$(user_home "$user")"
+  # never read an absent answer as a NO (read_participation fails the run before this, but the invariant holds here too)
+  case "${PART_JOBS:-}" in true|false) ;; *)
+    log "jobs: FAILED — no jobs answer was read ($PART_JOBS_KEY); nothing changed"; write_reading jobs failed "no jobs answer"; return 1 ;; esac
   rec="$(jobs_recorded "$user")"
   if [ "${PART_JOBS:-}" = true ]; then
     if [ "$rec" = false ]; then
@@ -1356,7 +1359,9 @@ step_jobs_reconcile() {
     if jobs_as_user "$user" "$mlocal" backlease accept jobs --off; then
       did="$did accept-off"
       # the update is owed from here on, whatever fails below — the next run's layer already reads NO and forgets it
-      [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] || { mkdir -p "$STATE_DIR" && date -u +%Y-%m-%dT%H:%M:%SZ > "$pending"; } 2>/dev/null
+      if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" != "1" ] && ! { mkdir -p "$STATE_DIR" && date -u +%Y-%m-%dT%H:%M:%SZ > "$pending"; } 2>/dev/null; then
+        log "jobs: could not write $pending — the update runs in this run, but a failed one would not be remembered"
+      fi
     else log "jobs: 'backlease accept jobs --off' FAILED — $(last_said "$JOBS_OUT")"; failed=1; fi
   fi
   if [ "$follow" = yes ]; then
@@ -1375,10 +1380,13 @@ step_jobs_reconcile() {
     if jobs_as_user "$user" colima stop -p "$BUILD_VM_PROFILE"; then did="$did vm-stopped"
     else log "jobs: 'colima stop -p $BUILD_VM_PROFILE' FAILED — $(last_said "$JOBS_OUT")"; failed=1; fi
   fi
-  if [ -f "$pending" ] || { [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] && [ "$rec" = true ]; }; then
+  # this run flipped the layer (in memory), or an earlier run's update is still owed (the marker)
+  case "$did" in *accept-off*) owed=yes ;; *) owed=no; [ -f "$pending" ] && owed=yes ;; esac
+  [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] && [ "$rec" = true ] && owed=yes
+  if [ "$owed" = yes ]; then
     log "jobs: the recorded answer changed — 'memex-local update' re-renders the portal, so the heartbeat carries 'accepts NO jobs'"
     if jobs_as_user "$user" "$mlocal" update; then did="$did updated"; [ -f "$pending" ] && rm -f "$pending"
-    else log "jobs: 'memex-local update' FAILED — $(last_said "$JOBS_OUT") — the layer says NO; the next run retries the update"; failed=1; fi
+    else log "jobs: 'memex-local update' FAILED — $(last_said "$JOBS_OUT") — the layer says NO; the next run retries the update$( [ -f "$pending" ] || printf ' only if %s could be written (it could not)' "$pending")"; failed=1; fi
   fi
   # LAST, and looked at again: a memex-local before 1.14.0's companion change re-installs this governor on every
   # `backlease accept` and `update` while idle-only models are declared — whatever those left behind goes now
