@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# A stand-in `kubectl` for hosting-probe-run. Not a YAML parser: the "parse" answers the JSON fixture beside the
+# manifest (<file>.json). The cluster is a directory of marker files, so what is tested is the validation, the digest
+# binding, the never-adopt rule, the wait, the bounded log, and that EVERYTHING created is deleted and read back.
+#
+#   HOSTING_PR_STATE   directory: kubectl.log (every argv) and cluster/<kind>-<name> markers
+#   MW_LIVE_NS         namespaces that already exist (words)
+#   MW_PROBE_PHASE     the pod phase / job condition the probe reaches (Succeeded|Failed|Running; default Succeeded)
+#   MW_PROBE_LOG       the probe's log text
+#   MW_DELETE_STUCK    set → a delete answers OK but leaves the object behind (the read-back must catch it)
+#   MW_CREATE_FAILS    set → `create -f` creates the namespace, then fails (a partial create must still be cleaned)
+set -uo pipefail
+state="${HOSTING_PR_STATE:?the kubectl stub needs HOSTING_PR_STATE}"
+mkdir -p "$state/cluster"
+printf 'kubectl %s\n' "$*" >> "$state/kubectl.log"
+file=""; prev=""
+for a in "$@"; do [ "$prev" = "-f" ] && file="$a"; prev="$a"; done
+ns=""
+if [ "${1:-}" = "-n" ]; then ns="$2"; shift 2; fi
+has() { [ -e "$state/cluster/$1-$2" ]; }
+case "$*" in
+  "create --dry-run=client -f "*) cat "${file}.json" ;;
+  "create --dry-run=server -f "*) echo "pod/probe created (server dry run)" ;;
+  "get namespace "*)
+    for n in ${MW_LIVE_NS:-}; do [ "$n" = "$3" ] && { echo "namespace/$n"; exit 0; }; done
+    has namespace "$3" && echo "namespace/$3"; true ;;
+  "get pods -l "*) ls "$state/cluster" | sed -n 's/^jobpod-/pod\//p' ;;
+  "get pod "*" -o jsonpath="*) echo "${MW_PROBE_PHASE:-Succeeded}" ;;
+  "get job "*" -o jsonpath="*)
+    case "${MW_PROBE_PHASE:-Succeeded}" in Succeeded) echo "Complete " ;; Failed) echo "Failed " ;; *) echo "" ;; esac ;;
+  "get "*" --ignore-not-found -o name") has "$2" "$3" && echo "$2/$3"; true ;;
+  "create -f "*)
+    jq -r '.kind as $k | if $k == "List" then .items[] else . end | "\(.kind | ascii_downcase) \(.metadata.name)"' "${file}.json" \
+      | while read -r k n; do
+          if [ -n "${MW_CREATE_FAILS:-}" ] && [ "$k" != namespace ]; then echo "error: create failed" >&2; exit 1; fi
+          touch "$state/cluster/$k-$n"; [ "$k" = job ] && touch "$state/cluster/jobpod-$n-abcde"; echo "$k/$n created"
+        done ;;
+  "logs "*) printf '%s\n' "${MW_PROBE_LOG:-probe ok}" ;;
+  "delete namespace "*)
+    [ -n "${MW_DELETE_STUCK:-}" ] || rm -f "$state/cluster/"*; echo "namespace \"$3\" deleted" ;;
+  "delete "*)
+    [ -n "${MW_DELETE_STUCK:-}" ] || rm -f "$state/cluster/$2-$3" "$state/cluster/jobpod-$3-"*; echo "$2 \"$3\" deleted" ;;
+  *) echo "kubectl stub: unexpected invocation: ${ns:+-n $ns }$*" >&2; exit 1 ;;
+esac

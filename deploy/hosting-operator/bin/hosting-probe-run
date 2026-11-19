@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# hosting-probe-run (check | run) --manifest probes/<name>.yaml [--sha256 <hex>]
+#
+# The ONE way a short-lived PROBE pod reaches the cluster: the `RunProbe` InstanceAction on the control instance
+# (MeshWeaver.Plugins#5630), run by the config repository's aks-ops lane (Systemorph/Memex aks-ops.yml). A feasibility
+# probe — does bubblewrap work on this node pool, does an NFS mount succeed — used to be `kubectl apply -f pod.yaml`, a
+# wait, `kubectl logs` and a delete from a laptop through `az aks command invoke`: a cluster write by a person, with no
+# approval, nothing recorded, and nobody checking that the delete happened. Here:
+#
+#   check  — prints the file's digest (`::hosting:: probe_digest=sha256:<hex>`, the value the real request must carry),
+#            validates it (below) and asks the API server what creating it WOULD do (`kubectl create --dry-run=server`).
+#            Persists nothing. The dry run of the action; unattended.
+#   run    — REQUIRES --sha256 and refuses a mismatch, validates again, refuses if ANY object of the file already
+#            exists (it deletes only what it created), creates the objects, waits for the pod or Job to finish within
+#            the bound, prints its log (bounded and masked), then DELETES EVERYTHING IT CREATED and READS EACH ONE BACK
+#            as gone — on every exit path, a failure or a timeout included. Reports
+#            `::hosting:: probe_result=succeeded|failed|timeout` and `::hosting:: probe_cleaned=<n>`; a cleanup it
+#            cannot confirm fails the run and names what is left. Only on the lane's approved leg, with a mesh approval
+#            that binds the file's sha256.
+#
+# 🚨 WHAT THE VALIDATION REFUSES, before anything is sent to the API server — a backstop under the approval:
+#   * a path outside deploy/aks/manifests/probes/, a symlink, a `<placeholder>`;
+#   * any kind but ONE Pod or ONE Job, plus at most one Namespace named `probe-…` the file creates for it (the
+#     throwaway namespace, deleted last). Without one the probe runs in the fixed namespace `hosting-probes`;
+#   * a pod that can authenticate to the API server: automountServiceAccountToken must be `false`, the service account
+#     the namespace's `default`, and no projected serviceAccountToken volume;
+#   * a pod that can READ a Secret: a secret or projected-secret volume, an envFrom secretRef, a secretKeyRef — its log
+#     lands on the action node, so nothing it could print may come from a Secret;
+#   * anything beyond the Pod Security BASELINE level, BY NAME: privileged, hostNetwork/hostPID/hostIPC, a hostPath
+#     volume, a hostPort, a capability outside baseline's set, a procMount, an Unconfined seccomp or AppArmor profile,
+#     an unsafe sysctl, a Windows hostProcess;
+#   * a pod that would outlive the bound on its own: restartPolicy must be Never and activeDeadlineSeconds at most
+#     HOSTING_PROBE_MAX_SECONDS (900); a Job must also carry backoffLimit 0.
+#
+# The path is relative to deploy/aks/manifests and must start with probes/.
+# shellcheck source=_common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
+# shellcheck disable=SC2034  # read by hosting::die in _common.sh
+HOSTING_CMD="hosting-probe-run"
+
+PROBE_NAMESPACE="hosting-probes"
+MAX_SECONDS="${HOSTING_PROBE_MAX_SECONDS:-900}"
+LOG_LINES="${HOSTING_PROBE_LOG_LINES:-200}"
+LOG_BYTES="${HOSTING_PROBE_LOG_BYTES:-16000}"
+DELETE_TIMEOUT="${HOSTING_PROBE_DELETE_TIMEOUT:-180}"
+POLL_SECONDS="${HOSTING_PROBE_POLL_SECONDS:-5}"
+# The wait is the probe's OWN activeDeadlineSeconds plus this grace (the kubelet's time to mark it Failed).
+GRACE_SECONDS="${HOSTING_PROBE_GRACE_SECONDS:-60}"
+
+mode="${1:-}"
+[ $# -gt 0 ] && shift
+case "$mode" in
+  check|run) ;;
+  *) hosting::die "the first argument is check or run, not '${mode}'" ;;
+esac
+manifest="" sha=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --manifest) manifest="${2:-}"; shift 2 ;;
+    --sha256)   sha="${2:-}";      shift 2 ;;
+    *) hosting::die "unknown argument '$1'" ;;
+  esac
+done
+hosting::need_flag manifest "$manifest"
+[[ "$manifest" =~ ^probes/[a-z0-9][a-z0-9-]*\.yaml$ ]] \
+  || hosting::die "--manifest '${manifest}' is not a probe under deploy/aks/manifests/probes/ (probes/<lowercase-name>.yaml, no '..')"
+sha="${sha#sha256:}"
+[ -z "$sha" ] || [[ "$sha" =~ ^[0-9a-f]{64}$ ]] \
+  || hosting::die "--sha256 must be 64 lowercase hex characters (optionally prefixed sha256:)"
+[ "$mode" = check ] || [ -n "$sha" ] \
+  || hosting::die "run needs --sha256: the approval binds the file's bytes, and a run that names none would create whatever the checkout holds"
+[[ "$MAX_SECONDS" =~ ^[0-9]+$ ]] && [ "$MAX_SECONDS" -le 900 ] || hosting::die "HOSTING_PROBE_MAX_SECONDS must be a number of seconds, at most 900"
+
+command -v jq >/dev/null 2>&1 || hosting::die "jq is not installed here"
+command -v kubectl >/dev/null 2>&1 || hosting::die "kubectl is not installed here"
+
+root="${HOSTING_MANIFESTS_ROOT:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../manifests}"
+[ -d "$root" ] \
+  || hosting::die "no manifests directory at ${root}: this command runs from a MeshWeaver.Deploy checkout (the aks-ops lane checks out deploy/aks/manifests beside the scripts), never in the operator image"
+root_real="$(readlink -f "$root")"
+file="${root_real}/${manifest}"
+[ -f "$file" ] || hosting::die "no probe at deploy/aks/manifests/${manifest} in this checkout"
+[ ! -L "$file" ] || hosting::die "deploy/aks/manifests/${manifest} is a symlink — refused; a probe runs committed files only"
+file_real="$(readlink -f "$file")"
+case "$file_real" in
+  "${root_real}"/probes/*) ;;
+  *) hosting::die "deploy/aks/manifests/${manifest} resolves outside deploy/aks/manifests/probes" ;;
+esac
+
+if command -v sha256sum >/dev/null 2>&1; then
+  digest="$(sha256sum "$file_real" | cut -d' ' -f1)"
+else
+  digest="$(shasum -a 256 "$file_real" | cut -d' ' -f1)"
+fi
+[[ "$digest" =~ ^[0-9a-f]{64}$ ]] || hosting::die "could not hash deploy/aks/manifests/${manifest}"
+hosting::log "probe     deploy/aks/manifests/${manifest} (sha256:${digest})"
+hosting::say probe_digest "sha256:${digest}"
+if [ -n "$sha" ] && [ "$sha" != "$digest" ]; then
+  hosting::die "deploy/aks/manifests/${manifest} at this checkout is sha256:${digest}, and the request names sha256:${sha} — these are not the bytes that were approved. Nothing was created. Re-run the dry run, read the file at the commit it names, and request the probe with that digest."
+fi
+if placeholders="$(grep -nE '<[A-Za-z][A-Za-z0-9_-]*>' "$file_real" | grep -vE '^[0-9]+:[[:space:]]*#')" && [ -n "$placeholders" ]; then
+  hosting::die "deploy/aks/manifests/${manifest} still carries a placeholder (line $(printf '%s' "$placeholders" | head -1 | cut -d: -f1)) — a probe runs a committed file verbatim"
+fi
+
+work="$(mktemp -d)" || hosting::die "could not create a working directory"
+created=""   # set once the run has created anything; the EXIT trap then cleans up
+cleanup_done=""
+
+# The objects, as kubectl's own parser reads THE FILE — nothing is sent to the server.
+kubectl create --dry-run=client -f "$file_real" -o json > "$work/parsed.json" 2>"$work/err" \
+  || hosting::die "kubectl could not parse deploy/aks/manifests/${manifest}: $(head -1 "$work/err")"
+jq -s '{kind: "List", items: [.[] | if .kind == "List" then .items[] else . end]}' "$work/parsed.json" > "$work/objects.json" 2>"$work/err" \
+  || hosting::die "could not read the parsed objects of deploy/aks/manifests/${manifest}: $(head -1 "$work/err")"
+
+# 🚨 THE VALIDATION — one jq program, one problem per line, each naming the object and the rule.
+problems="$(jq -r --arg fixed "$PROBE_NAMESPACE" --argjson max "$MAX_SECONDS" '
+  .items as $objs
+  | ([$objs[] | select(.kind == "Namespace")]) as $nss
+  | ([$objs[] | select(.kind == "Pod" or .kind == "Job")]) as $runs
+  | (if ($nss | length) == 1 then $nss[0].metadata.name else $fixed end) as $ns
+  | ["AUDIT_WRITE","CHOWN","DAC_OVERRIDE","FOWNER","FSETID","KILL","MKNOD","NET_BIND_SERVICE","SETFCAP","SETGID",
+     "SETPCAP","SETUID","SYS_CHROOT"] as $baselineCaps
+  | ["kernel.shm_rmid_forced","net.ipv4.ip_local_port_range","net.ipv4.ip_unprivileged_port_start","net.ipv4.tcp_syncookies",
+     "net.ipv4.ping_group_range","net.ipv4.ip_local_reserved_ports","net.ipv4.tcp_keepalive_time","net.ipv4.tcp_fin_timeout",
+     "net.ipv4.tcp_keepalive_intvl","net.ipv4.tcp_keepalive_probes"] as $safeSysctls
+  | (
+      ($objs[] | select(.kind != "Pod" and .kind != "Job" and .kind != "Namespace")
+        | "\(.kind) \(.metadata.name // "?"): kind \(.kind) is not one a probe creates (one Pod or one Job, and at most one probe-… Namespace)"),
+      (if ($runs | length) != 1 then "the file holds \($runs | length) Pod/Job object(s) — a probe is exactly ONE Pod or ONE Job" else empty end),
+      (if ($nss | length) > 1 then "the file holds \($nss | length) Namespaces — at most one, the probe'"'"'s throwaway namespace" else empty end),
+      ($nss[] | select((.metadata.name // "") | test("^probe-[a-z0-9]([-a-z0-9]{0,50}[a-z0-9])?$") | not)
+        | "Namespace \(.metadata.name // "?"): a throwaway namespace is named probe-<name>"),
+      ($runs[] | (.metadata.namespace // "") as $on
+        | select($on != $ns)
+        | "\(.kind) \(.metadata.name // "?"): runs in namespace \($on | if . == "" then "(unset)" else . end), not \($ns) (the file'"'"'s probe-… namespace, or the fixed \($fixed))"),
+      ($runs[] | (.kind + " " + (.metadata.name // "?")) as $id
+        | (if .kind == "Job" then .spec.template.spec else .spec end) as $p
+        | ((($p.initContainers // []) + ($p.containers // []) + ($p.ephemeralContainers // []))) as $cs
+        | (
+            (if $p.automountServiceAccountToken != false then "\($id): automountServiceAccountToken must be false — a probe never holds an API token" else empty end),
+            (if (($p.serviceAccountName // $p.serviceAccount // "default") != "default") then "\($id): serviceAccountName \($p.serviceAccountName // $p.serviceAccount) — a probe runs as its namespace'"'"'s default account" else empty end),
+            (if ($p.restartPolicy // "") != "Never" then "\($id): restartPolicy must be Never" else empty end),
+            (if (($p.activeDeadlineSeconds // 0) < 1 or ($p.activeDeadlineSeconds // 0) > $max) then "\($id): activeDeadlineSeconds must be set, at most \($max) — a probe ends on its own" else empty end),
+            (if .kind == "Job" and (.spec.backoffLimit // 6) != 0 then "\($id): a probe Job carries backoffLimit 0" else empty end),
+            (if $p.hostNetwork == true then "\($id): hostNetwork is beyond Pod Security baseline" else empty end),
+            (if $p.hostPID == true then "\($id): hostPID is beyond Pod Security baseline" else empty end),
+            (if $p.hostIPC == true then "\($id): hostIPC is beyond Pod Security baseline" else empty end),
+            (if ($p.securityContext.windowsOptions.hostProcess // false) then "\($id): a Windows hostProcess is beyond Pod Security baseline" else empty end),
+            (($p.securityContext.sysctls // [])[] | select(.name as $n | ($safeSysctls | index($n)) == null) | "\($id): sysctl \(.name) is beyond Pod Security baseline"),
+            (if ($p.securityContext.seccompProfile.type // "") == "Unconfined" then "\($id): an Unconfined seccomp profile is beyond Pod Security baseline" else empty end),
+            (if ($p.securityContext.appArmorProfile.type // "") == "Unconfined" then "\($id): an Unconfined AppArmor profile is beyond Pod Security baseline" else empty end),
+            (($p.volumes // [])[] | select(.hostPath != null) | "\($id): hostPath volume \(.name) is beyond Pod Security baseline"),
+            (($p.volumes // [])[] | select(.secret != null) | "\($id): volume \(.name) mounts a Secret — a probe reads no Secret"),
+            (($p.volumes // [])[] | .name as $v | (.projected.sources // [])[]
+               | (if .secret != null then "\($id): volume \($v) projects a Secret — a probe reads no Secret" else empty end),
+                 (if .serviceAccountToken != null then "\($id): volume \($v) projects a service-account token — a probe never holds an API token" else empty end)),
+            ($cs[] | .name as $c
+               | (if (.securityContext.privileged // false) then "\($id): container \($c) is privileged — beyond Pod Security baseline" else empty end),
+                 (if (.securityContext.windowsOptions.hostProcess // false) then "\($id): container \($c) is a Windows hostProcess — beyond Pod Security baseline" else empty end),
+                 ((.securityContext.capabilities.add // [])[] | select(. as $cap | ($baselineCaps | index($cap)) == null)
+                   | "\($id): container \($c) adds capability \(.) — beyond Pod Security baseline"),
+                 (if ((.securityContext.procMount // "Default") != "Default") then "\($id): container \($c) sets procMount \(.securityContext.procMount) — beyond Pod Security baseline" else empty end),
+                 (if (.securityContext.seccompProfile.type // "") == "Unconfined" then "\($id): container \($c) runs seccomp Unconfined — beyond Pod Security baseline" else empty end),
+                 (if (.securityContext.appArmorProfile.type // "") == "Unconfined" then "\($id): container \($c) runs AppArmor Unconfined — beyond Pod Security baseline" else empty end),
+                 ((.ports // [])[] | select((.hostPort // 0) != 0) | "\($id): container \($c) binds hostPort \(.hostPort) — beyond Pod Security baseline"),
+                 ((.envFrom // [])[] | select(.secretRef != null) | "\($id): container \($c) reads Secret \(.secretRef.name) through envFrom — a probe reads no Secret"),
+                 ((.env // [])[] | select(.valueFrom.secretKeyRef != null) | "\($id): container \($c) reads Secret \(.valueFrom.secretKeyRef.name) through secretKeyRef — a probe reads no Secret"))
+          ))
+    )
+' "$work/objects.json" 2>"$work/err")" \
+  || hosting::die "could not validate deploy/aks/manifests/${manifest}: $(head -1 "$work/err")"
+if [ -n "$problems" ]; then
+  printf '%s\n' "$problems" | while IFS= read -r p; do hosting::log "refused   ${p}"; done
+  rm -rf "$work"
+  hosting::die "deploy/aks/manifests/${manifest} holds $(printf '%s\n' "$problems" | wc -l | tr -d ' ') thing(s) a probe may not do (listed above). Nothing was sent to the API server."
+fi
+
+kind="$(jq -r '[.items[] | select(.kind == "Pod" or .kind == "Job")][0].kind' "$work/objects.json")"
+name="$(jq -r '[.items[] | select(.kind == "Pod" or .kind == "Job")][0].metadata.name' "$work/objects.json")"
+own_ns="$(jq -r '[.items[] | select(.kind == "Namespace")][0].metadata.name // empty' "$work/objects.json")"
+ns="${own_ns:-$PROBE_NAMESPACE}"
+run_deadline="$(jq -r '[.items[] | select(.kind == "Pod" or .kind == "Job")][0] | (if .kind == "Job" then .spec.template.spec else .spec end).activeDeadlineSeconds' "$work/objects.json")"
+[[ "$name" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]] || hosting::die "the probe's name '${name}' is not a DNS label"
+lower_kind="$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')"
+hosting::log "object    ${kind} ${ns}/${name}${own_ns:+ (in its own throwaway namespace ${own_ns})}"
+
+# exists <kind> <name> [<ns>] — prints the object's name when it is on the cluster, nothing when it is not; FAILS when
+# the API server cannot say (an unknown is never read as "gone").
+exists() {
+  if [ -n "${3:-}" ]; then kubectl -n "$3" get "$1" "$2" --ignore-not-found -o name 2>"$work/err"
+  else kubectl get "$1" "$2" --ignore-not-found -o name 2>"$work/err"; fi
+}
+
+if [ "$mode" = check ]; then
+  hosting::step "Ask the API server what creating deploy/aks/manifests/${manifest} would do"
+  # A throwaway namespace does not exist yet and a server dry run persists nothing, so the Pod/Job inside it cannot be
+  # dry-run; it is validated above and NAMED as deferred, never silently dropped (the same rule as hosting-manifest-apply).
+  if [ -n "$own_ns" ]; then
+    live="$(exists namespace "$own_ns")" || hosting::die "could not read namespace ${own_ns}: $(head -1 "$work/err")"
+    [ -z "$live" ] || hosting::die "namespace ${own_ns} already exists — a probe's throwaway namespace is one the run creates and deletes; refused before anything ran"
+    hosting::log "deferred  ${lower_kind}/${name} in namespace ${own_ns} — the namespace does not exist yet; validated above, created by the run"
+  else
+    live="$(exists namespace "$PROBE_NAMESPACE")" || hosting::die "could not read namespace ${PROBE_NAMESPACE}: $(head -1 "$work/err")"
+    [ -n "$live" ] || hosting::die "namespace ${PROBE_NAMESPACE} does not exist — a probe without its own probe-… namespace runs there; create it with a governed ApplyClusterManifest first"
+    kubectl create --dry-run=server -f "$file_real" > "$work/out" 2>"$work/err" \
+      || hosting::die "the API server refused a dry run of deploy/aks/manifests/${manifest}: $(head -1 "$work/err")"
+    while IFS= read -r line; do hosting::log "would     ${line% (server dry run)}"; done < "$work/out"
+  fi
+  rm -rf "$work"
+  hosting::say probe_check "sha256:${digest}"
+  exit 0
+fi
+
+# ── run ───────────────────────────────────────────────────────────────────────────────────────────
+# cleanup — delete everything this run created, then read each one back. Runs on EVERY exit once anything was
+# created; a cleanup it cannot confirm FAILS the run, naming what is left. The pod's own activeDeadlineSeconds is the
+# backstop for a lane that dies before this runs.
+cleanup() {
+  [ -n "$created" ] && [ -z "$cleanup_done" ] || return 0
+  cleanup_done=1
+  local left="" cleaned=0
+  hosting::step "Delete the probe and read it back as gone"
+  kubectl -n "$ns" delete "$lower_kind" "$name" --ignore-not-found --cascade=foreground --wait=true \
+    --timeout="${DELETE_TIMEOUT}s" > "$work/del.out" 2>"$work/del.err" \
+    || hosting::log "delete    ${lower_kind}/${name}: $(head -1 "$work/del.err")"
+  if [ -n "$own_ns" ]; then
+    kubectl delete namespace "$own_ns" --ignore-not-found --wait=true --timeout="${DELETE_TIMEOUT}s" > "$work/del.out" 2>"$work/del.err" \
+      || hosting::log "delete    namespace/${own_ns}: $(head -1 "$work/del.err")"
+  fi
+  # The read-back: the Pod/Job, the pods a Job made, and the throwaway namespace.
+  if ! live="$(exists "$lower_kind" "$name" "$ns")"; then left+=" ${lower_kind}/${name} (unreadable: $(head -1 "$work/err"))"
+  elif [ -n "$live" ]; then left+=" ${lower_kind}/${name}"; else cleaned=$((cleaned + 1)); fi
+  if [ "$kind" = Job ]; then
+    if ! pods="$(kubectl -n "$ns" get pods -l "job-name=${name}" -o name 2>"$work/err")"; then left+=" the Job's pods (unreadable: $(head -1 "$work/err"))"
+    elif [ -n "$pods" ] && [ -z "$own_ns" ]; then left+=" $(printf '%s' "$pods" | tr '\n' ' ')"; fi
+  fi
+  if [ -n "$own_ns" ]; then
+    if ! live="$(exists namespace "$own_ns")"; then left+=" namespace/${own_ns} (unreadable: $(head -1 "$work/err"))"
+    elif [ -n "$live" ]; then left+=" namespace/${own_ns}"; else cleaned=$((cleaned + 1)); fi
+  fi
+  if [ -n "$left" ]; then
+    # shellcheck disable=SC2034  # read by hosting::on_exit in _common.sh: this failure has spoken
+    HOSTING_DIED=1
+    printf '%s: ERROR: the probe was NOT cleaned up — still on the cluster:%s. Delete it through a governed DeleteClusterManifest or re-run; its activeDeadlineSeconds stops the pod meanwhile.\n' "$HOSTING_CMD" "$left" >&2
+    return 1
+  fi
+  hosting::log "deleted   ${cleaned} object(s), each read back as gone"
+  hosting::say probe_cleaned "$cleaned"
+}
+# The EXIT trap: hosting::on_exit FIRST (it reads $? and the line bash was on), then the cleanup. A cleanup it cannot
+# confirm turns the exit red; otherwise the script's own exit status stands.
+finish() {
+  if ! cleanup; then rm -rf "$work"; exit 1; fi
+  rm -rf "$work"
+}
+trap 'hosting::on_exit; finish' EXIT
+
+if hosting::dry; then
+  hosting::log "(dry run) would create ${kind} ${ns}/${name} from deploy/aks/manifests/${manifest} (sha256:${digest}), wait at most $((run_deadline + GRACE_SECONDS))s, read its log and delete it"
+  exit 0
+fi
+
+# It deletes only what it created: an object of the file that is already there is refused, untouched.
+if [ -n "$own_ns" ]; then
+  live="$(exists namespace "$own_ns")" || hosting::die "could not read namespace ${own_ns}: $(head -1 "$work/err"). Nothing was created."
+  [ -z "$live" ] || hosting::die "namespace ${own_ns} already exists — refused: this run deletes only what it creates. Nothing was created."
+else
+  live="$(exists "$lower_kind" "$name" "$ns")" || hosting::die "could not read ${lower_kind} ${ns}/${name}: $(head -1 "$work/err"). Nothing was created."
+  [ -z "$live" ] || hosting::die "${lower_kind} ${ns}/${name} already exists — refused: this run deletes only what it creates. Nothing was created."
+fi
+
+hosting::step "Create the probe"
+created=1
+kubectl create -f "$file_real" > "$work/out" 2>"$work/err" \
+  || hosting::die "creating deploy/aks/manifests/${manifest} failed: $(head -1 "$work/err")"
+while IFS= read -r line; do hosting::log "created   ${line}"; done < "$work/out"
+
+hosting::step "Wait for the probe to finish"
+result=timeout
+deadline=$(( $(date +%s) + run_deadline + GRACE_SECONDS ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  if [ "$kind" = Pod ]; then
+    phase="$(kubectl -n "$ns" get pod "$name" -o 'jsonpath={.status.phase}' 2>"$work/err")" \
+      || hosting::die "could not read pod ${ns}/${name}: $(head -1 "$work/err")"
+    case "$phase" in Succeeded) result=succeeded; break ;; Failed) result=failed; break ;; esac
+  else
+    state="$(kubectl -n "$ns" get job "$name" -o 'jsonpath={range .status.conditions[?(@.status=="True")]}{.type}{" "}{end}' 2>"$work/err")" \
+      || hosting::die "could not read job ${ns}/${name}: $(head -1 "$work/err")"
+    case " $state " in *" Complete "*) result=succeeded; break ;; *" Failed "*) result=failed; break ;; esac
+  fi
+  sleep "$POLL_SECONDS"
+done
+hosting::log "result    ${result}"
+
+hosting::step "Read the probe's log"
+# Bounded on the server (--tail, --limit-bytes) and masked here: a probe reads no Secret, so this is a backstop.
+if kubectl -n "$ns" logs "${lower_kind}/${name}" --all-containers --tail="$LOG_LINES" --limit-bytes="$LOG_BYTES" > "$work/log" 2>"$work/err"; then
+  masked=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    clean="$(printf '%s' "$line" | sed -E \
+      -e 's/((password|passwd|pwd|secret|token|accountkey|sharedaccesskey|client_secret|apikey|api_key)["]?[=:]["]?)[^[:space:];&,"]+/\1<redacted>/Ig' \
+      -e 's/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/<redacted-jwt>/g' \
+      -e 's/-----BEGIN [A-Z ]*PRIVATE KEY-----.*/<redacted-pem>/')"
+    [ "$clean" = "$line" ] || masked=$((masked + 1))
+    printf '  probe | %s\n' "${clean:0:400}"
+  done < "$work/log"
+  hosting::say probe_log_lines "$(wc -l < "$work/log" | tr -d ' ')"
+  hosting::say probe_log_masked "$masked"
+else
+  hosting::log "log       NOT READ — $(head -1 "$work/err")"
+  hosting::say probe_log_lines "unread"
+fi
+hosting::say probe_result "$result"
+# The EXIT trap deletes the probe and reads it back; a cleanup it cannot confirm turns this run red.
+exit 0
