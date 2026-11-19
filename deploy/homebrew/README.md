@@ -467,6 +467,12 @@ a model the opt-in does not list), and loads the launchd agent `com.memex.local.
 (`memex-local buildhost idle run` → `share/buildhost-idle.py`). It is not asked interactively, like the token slots.
 `backlease status`, `buildhost idle status` and `fleet doctor` show the declaration and the current state.
 
+**Only on a Mac that takes fleet jobs.** When the back-lease layer records NO to jobs, there is no CI to yield to and the
+governor would START the build VM for CI demand (unloading the models to do it), so `accept`, `enroll` and `update`
+install none and remove one that is there, with its state file — the worker then serves no idle-only model; offer the
+model in `--models` to serve it outright on such a Mac. The fleet bootstrap (1.14.0) keeps a NO from the Intune profile
+(`AcceptJobs<Class>` / `AcceptJobs`) on every run and removes the governor too.
+
 **The state file** — the ONLY thing the portal's token worker reads: `~/.memex-local/backlease/buildhost.json`,
 mounted read-only as `/host-readings/buildhost.json`, written atomically (a temp file in the same directory, then a
 rename): `{"state":"running|draining|stopped","since":"<ISO-8601 UTC>","reason":"<short text>"}`. The worker lists an

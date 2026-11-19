@@ -29,6 +29,12 @@
 #      Mac is awake to receive it (a sleeping Mac answers MDM commands NotNow during DarkWake).
 #   0d. GPU wired-memory limit (1.13.0): when GpuWiredReserveMb[<Class>] is configured, iogpu.wired_limit_mb = RAM − reserve,
 #      set now and at every boot by a root LaunchDaemon (com.meshweaver.fleet.gpu-wired-limit). Not configured: nothing set.
+#   5c. Jobs participation, kept (1.14.0): on EVERY run once the Mac is joined and finished, the owner's effective
+#      AcceptJobs answer (AcceptJobs<Class> over AcceptJobs) is compared with what the Mac does. NO while it still
+#      accepts jobs, runs its build VM or has a build-host agent ⇒ taken out (as the person: backlease accept jobs --off,
+#      the follow / idle / priority agents removed, `colima stop -p build`, then `memex-local update` when the recorded
+#      answer changed). YES while the Mac is out ⇒ said with the opt-in commands, never re-attached by the run.
+#      Only the build VM is ever stopped — never Ollama, a model server or any other process.
 #   5b. Once the join is filed (1.9.0): the approval page is opened for the person at the console and a notification
 #      posted, and a root LaunchDaemon (com.meshweaver.fleet.join-poller) polls control every 30 s for at most 24 h — the
 #      Approve is collected within half a minute and the run continues at once. It removes itself when done.
@@ -44,7 +50,8 @@
 # FLEET_REGISTRY_URL, FLEET_CA_SHA256. Nothing secret is configured here.
 #
 # PARTICIPATION (the owner's answers — Mac onboarding contract §5), REQUIRED, never defaulted: AcceptJobs (bool —
-# does this Mac take the fleet's build-queue work), AcceptJobsFrom / AcceptJobsChannels / AcceptJobsRepos, and
+# does this Mac take the fleet's build-queue work; AcceptJobs<Class>, e.g. AcceptJobsMacStudio, overrides it for one
+# model class, as GpuWiredReserveMb<Class> does — 1.14.0), AcceptJobsFrom / AcceptJobsChannels / AcceptJobsRepos, and
 # AcceptTokens (bool — does it serve local models to the token queue), AcceptTokensFrom / AcceptTokensModels /
 # AcceptTokensResidency (lists: a profile array or a comma-separated string). Environment: FLEET_ACCEPT_JOBS,
 # FLEET_ACCEPT_JOBS_FROM, FLEET_ACCEPT_JOBS_CHANNELS, FLEET_ACCEPT_JOBS_REPOS, FLEET_ACCEPT_TOKENS,
@@ -63,7 +70,7 @@
 # every command that would change the machine instead of running it.
 set -uo pipefail
 
-readonly FLEET_BOOTSTRAP_VERSION="1.13.0"
+readonly FLEET_BOOTSTRAP_VERSION="1.14.0"
 readonly BREW_PREFIX="${FLEET_BREW_PREFIX:-/opt/homebrew}"
 readonly TAILSCALED_LABEL="com.meshweaver.fleet.tailscaled"
 readonly TAILSCALED_PLIST="${FLEET_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${TAILSCALED_LABEL}.plist"
@@ -701,13 +708,27 @@ pref_bool() {
 # Sets PART_JOBS / PART_TOKENS (true|false) and PART_ARGS (the `fleet join` flags). Returns 1 — after saying
 # exactly which key is missing or wrong — when an answer is absent or incomplete: an unanswered question is
 # never read as a no (or a yes).
-PART_JOBS=""; PART_TOKENS=""; PART_ARGS=()
+# The jobs answer and the key it came from ("<value>\t<key>"), the same resolution as gpu_reserve_setting (1.14.0): the
+# environment (FLEET_ACCEPT_JOBS), else AcceptJobs<Class> (the Mac's model name without spaces: AcceptJobsMacStudio,
+# AcceptJobsMacMini), else the class-less AcceptJobs. Nothing configured: an empty value under the class-less key.
+accept_jobs_setting() {
+  local cls v; cls="$(host_model_class)"
+  if [ -n "${FLEET_ACCEPT_JOBS:-}" ]; then printf '%s\tFLEET_ACCEPT_JOBS' "$FLEET_ACCEPT_JOBS"; return 0; fi
+  if [ -n "$cls" ]; then
+    v="$(setting __FLEET_NO_ENV AcceptJobs"$cls")"
+    [ -z "$v" ] || { printf '%s\tAcceptJobs%s' "$v" "$cls"; return 0; }
+  fi
+  printf '%s\tAcceptJobs' "$(setting __FLEET_NO_ENV AcceptJobs)"
+}
+PART_JOBS=""; PART_JOBS_KEY="AcceptJobs"; PART_JOBS_FROM=""; PART_JOBS_CHANNELS=""; PART_JOBS_REPOS=""; PART_TOKENS=""; PART_ARGS=()
 read_participation() {
-  local jobs_raw tok_raw jfrom jch jrepo tfrom tmodels tres bad=0
-  jobs_raw="$(setting FLEET_ACCEPT_JOBS AcceptJobs)"; tok_raw="$(setting FLEET_ACCEPT_TOKENS AcceptTokens)"
+  local jobs_decl jobs_raw tok_raw jfrom jch jrepo tfrom tmodels tres bad=0
+  jobs_decl="$(accept_jobs_setting)"; jobs_raw="${jobs_decl%%$'\t'*}"; PART_JOBS_KEY="${jobs_decl#*$'\t'}"
+  tok_raw="$(setting FLEET_ACCEPT_TOKENS AcceptTokens)"
   PART_JOBS="$(pref_bool "$jobs_raw")"; PART_TOKENS="$(pref_bool "$tok_raw")"
   if [ -z "$PART_JOBS" ]; then
-    log "participation: FAILED — AcceptJobs is ${jobs_raw:+not a boolean ('$jobs_raw')}${jobs_raw:-absent}: the owner's answer to 'does this Mac take the fleet's build-queue jobs' is required, never defaulted. Set AcceptJobs (true/false) in the com.memex.local profile"
+    if [ -n "$jobs_raw" ]; then jobs_raw="not a boolean ('$jobs_raw')"; else jobs_raw="absent"; fi
+    log "participation: FAILED — $PART_JOBS_KEY is $jobs_raw: the owner's answer to 'does this Mac take the fleet's build-queue jobs' is required, never defaulted. Set AcceptJobs (true/false) in the com.memex.local profile"
     bad=1
   fi
   if [ -z "$PART_TOKENS" ]; then
@@ -721,6 +742,7 @@ read_participation() {
     jch="$(pref_list "$(setting FLEET_ACCEPT_JOBS_CHANNELS AcceptJobsChannels)")"
     jrepo="$(pref_list "$(setting FLEET_ACCEPT_JOBS_REPOS AcceptJobsRepos)")"
     [ -n "$jfrom" ] || { log "participation: FAILED — AcceptJobs is true but AcceptJobsFrom is empty: name the instances whose jobs this Mac takes"; return 1; }
+    PART_JOBS_FROM="$jfrom"; PART_JOBS_CHANNELS="$jch"; PART_JOBS_REPOS="$jrepo"
     PART_ARGS+=("--accept-jobs=$jfrom")
     [ -z "$jch" ] || PART_ARGS+=(--job-channels "$jch")
     [ -z "$jrepo" ] || PART_ARGS+=(--job-repos "$jrepo")
@@ -738,7 +760,7 @@ read_participation() {
   else
     PART_ARGS+=(--no-accept-tokens)
   fi
-  log "participation: jobs ${PART_JOBS}${jfrom:+ (from $jfrom)}$( [ "$PART_JOBS" = true ] || printf ' — no build host'), tokens ${PART_TOKENS}${tfrom:+ (from $tfrom; models $tmodels)}$( [ "$PART_TOKENS" = true ] || printf ' — no token models beyond the chat model')"
+  log "participation: jobs ${PART_JOBS} (decided by $PART_JOBS_KEY)${jfrom:+ (from $jfrom)}$( [ "$PART_JOBS" = true ] || printf ' — no build host'), tokens ${PART_TOKENS}${tfrom:+ (from $tfrom; models $tmodels)}$( [ "$PART_TOKENS" = true ] || printf ' — no token models beyond the chat model')"
 }
 
 # The person's login shell finds Homebrew: the documented `brew shellenv` line in ~/.zprofile, written ONCE
@@ -1225,7 +1247,8 @@ step_memex() {
     fi
     log "memex: joined as $machine, finished"; write_reading join ok "joined as $machine, finished"
     step_buildhost_attach "$user" "$mlocal"
-    record_doctor "$user" "$mlocal"; return 0
+    local jobs_rc=0; step_jobs_reconcile "$user" "$mlocal" || jobs_rc=1
+    record_doctor "$user" "$mlocal"; return "$jobs_rc"
   fi
   run_join "$user" "$machine" "$control" "$mlocal" full
 }
@@ -1249,6 +1272,133 @@ step_buildhost_attach() {
   else
     log "memex: build host NOT attached yet (exit $rc) — $(last_said "$out") — retried next run"
   fi
+  return 0
+}
+
+# JOBS PARTICIPATION, KEPT (1.14.0; owner, 2026-11-19: the Mac Studios leave the build queue and become a model
+# cluster). The answer reached the Mac only AT JOIN (`fleet join --accept-jobs=… | --no-accept-jobs --no-buildhost`):
+# once fleet.finalized exists the join never reruns, so a later NO reached nothing — three Macs were taken out by hand.
+# This step runs on every run of a joined, finished Mac and compares the effective answer (read_participation:
+# AcceptJobs<Class> over AcceptJobs) with what the Mac DOES:
+#   NO  and the Mac still accepts jobs (back-lease layer), runs its build VM, or has a build-host agent (follow, idle,
+#       priority) ⇒ taken out, each step only when needed and logged, all as the person: `backlease accept jobs --off`;
+#       the follow agent booted out and its plist removed (what follow-set.py --uninstall does — a plist left behind is
+#       loaded again at the next login); `buildhost priority off`; `colima stop -p build`; `memex-local update` ONLY when
+#       the recorded answer changed (the portal re-renders; the heartbeat then carries "accepts NO jobs"); and LAST
+#       `buildhost idle off` — the idle governor starts the build VM for CI and unloads models to do it, and an older
+#       memex-local re-installs it on `accept`/`update`. Nothing else is stopped: never the portal VM, Ollama, a model
+#       server or any other process.
+#   YES and the Mac is out (the layer records NO) ⇒ said, with the commands that opt in, and NOT re-attached: a build
+#       host needs the build items a fleet join issues (one Approve on control), which no unattended run can supply —
+#       memex-local has no idempotent opt-in that brings the build host back (`buildhost attach` needs the kept items).
+# Reading `jobs`: in | out | taken-out | differs | failed.
+readonly FOLLOW_LABEL="com.memex.local.buildhost-follow"
+readonly IDLE_LABEL="com.memex.local.buildhost-idle"
+readonly PRIORITY_LABEL="com.memex.local.buildhost-priority"
+readonly BUILD_VM_PROFILE="${FLEET_BUILD_PROFILE:-build}"
+
+# What the back-lease layer records for jobs: true | false | nothing (no layer). Read-only (root reads the person's file).
+jobs_recorded() {
+  local f; f="$(user_home "$1")/.memex-local/backlease.yaml"
+  [ -f "$f" ] || return 0
+  awk '$1 == "Hosting__BackLease__Accept__Jobs__Enabled:" { gsub(/"/, "", $2); print $2; exit }' "$f" 2>/dev/null || true
+}
+# Is the person's launchd agent $2 present — its plist in ~/Library/LaunchAgents, or loaded? Read-only.
+user_agent_present() {
+  local user="$1" label="$2" uid
+  [ -f "$(user_home "$user")/Library/LaunchAgents/$label.plist" ] && return 0
+  uid="$(id -u "$user" 2>/dev/null)" || return 1
+  launchctl print "gui/$uid/$label" >/dev/null 2>&1
+}
+# Is the build VM (Colima profile $BUILD_VM_PROFILE, never the portal's) running? A read-only probe as the person.
+build_vm_running() { probe_as_user "$1" colima status -p "$BUILD_VM_PROFILE"; }
+# A changing command as the person, its output kept in JOBS_OUT for the log — printed instead under a dry run.
+JOBS_OUT=""
+jobs_as_user() {
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then as_user "$@"; return 0; fi
+  JOBS_OUT="$(as_user "$@" 2>&1)"
+}
+# Boots the person's agent $2 out of their launchd session (as root) — printed instead under a dry run.
+jobs_bootout() {
+  local uid; uid="$(id -u "$1" 2>/dev/null)" || return 0
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ]; then run launchctl bootout "gui/$uid/$2"; return 0; fi
+  launchctl bootout "gui/$uid/$2" >/dev/null 2>&1 || true
+}
+
+step_jobs_reconcile() {
+  local user="$1" mlocal="$2" home rec vm=no follow=no idle=no prio=no did="" failed=0 optin pending
+  home="$(user_home "$user")"
+  rec="$(jobs_recorded "$user")"
+  if [ "${PART_JOBS:-}" = true ]; then
+    if [ "$rec" = false ]; then
+      optin="memex-local backlease accept jobs --from ${PART_JOBS_FROM}${PART_JOBS_CHANNELS:+ --channels $PART_JOBS_CHANNELS}${PART_JOBS_REPOS:+ --repos $PART_JOBS_REPOS} && memex-local update"
+      log "jobs: $PART_JOBS_KEY says YES but this Mac accepts NO jobs (its back-lease layer) — NOT re-attached by the bootstrap (a build host needs the items a fleet join issues). To opt in, as $user: '$optin', then 'memex-local fleet join --control <ControlUrl> --id <machine> --accept-jobs=${PART_JOBS_FROM}' (one Approve on control) and 'memex-local buildhost attach'"
+      write_reading jobs differs "$PART_JOBS_KEY=true but the Mac accepts NO jobs — opt in: $optin, then a fleet join + buildhost attach"
+    else
+      log "jobs: $PART_JOBS_KEY says YES — this Mac ${rec:+accepts jobs}${rec:-has no recorded jobs answer}; nothing to change"
+      write_reading jobs in "$PART_JOBS_KEY=true"
+    fi
+    return 0
+  fi
+  # an update an earlier take-out could not finish: the layer already says NO, so only this marker remembers it
+  pending="$STATE_DIR/jobs.update-pending"
+  build_vm_running "$user" && vm=yes
+  user_agent_present "$user" "$FOLLOW_LABEL.$BUILD_VM_PROFILE" && follow=yes
+  user_agent_present "$user" "$IDLE_LABEL" && idle=yes
+  user_agent_present "$user" "$PRIORITY_LABEL" && prio=yes
+  if [ "$rec" != true ] && [ "$vm$follow$idle$prio" = nononono ] && [ ! -f "$pending" ]; then
+    log "jobs: $PART_JOBS_KEY says NO — this Mac is out of the build queue (accepts ${rec:+NO jobs}${rec:-no recorded answer}, no build VM running, no build-host agent)"
+    write_reading jobs out "$PART_JOBS_KEY=false"; return 0
+  fi
+  log "jobs: $PART_JOBS_KEY says NO but this Mac is still in the build queue (accepts jobs: ${rec:-unrecorded}; build VM running: $vm; follow agent: $follow; idle agent: $idle; priority agent: $prio) — taking it out"
+  if [ "$rec" = true ]; then
+    log "jobs: recording NO in the back-lease layer (memex-local backlease accept jobs --off)"
+    if jobs_as_user "$user" "$mlocal" backlease accept jobs --off; then
+      did="$did accept-off"
+      # the update is owed from here on, whatever fails below — the next run's layer already reads NO and forgets it
+      [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] || { mkdir -p "$STATE_DIR" && date -u +%Y-%m-%dT%H:%M:%SZ > "$pending"; } 2>/dev/null
+    else log "jobs: 'backlease accept jobs --off' FAILED — $(last_said "$JOBS_OUT")"; failed=1; fi
+  fi
+  if [ "$follow" = yes ]; then
+    log "jobs: removing the follow agent $FOLLOW_LABEL.$BUILD_VM_PROFILE (it upgrades the build host's release — gone, and not loaded again at the next login)"
+    jobs_bootout "$user" "$FOLLOW_LABEL.$BUILD_VM_PROFILE"
+    as_user "$user" /bin/rm -f "$home/Library/LaunchAgents/$FOLLOW_LABEL.$BUILD_VM_PROFILE.plist" && did="$did follow-off" \
+      || { log "jobs: FAILED to remove the follow agent's plist"; failed=1; }
+  fi
+  if [ "$prio" = yes ]; then
+    log "jobs: removing the priority governor $PRIORITY_LABEL (memex-local buildhost priority off)"
+    if jobs_as_user "$user" "$mlocal" buildhost priority off; then did="$did priority-off"
+    else log "jobs: 'buildhost priority off' FAILED — $(last_said "$JOBS_OUT")"; failed=1; fi
+  fi
+  if [ "$vm" = yes ]; then
+    log "jobs: stopping the build VM (colima stop -p $BUILD_VM_PROFILE — only that VM; the portal, Ollama and every model server keep running)"
+    if jobs_as_user "$user" colima stop -p "$BUILD_VM_PROFILE"; then did="$did vm-stopped"
+    else log "jobs: 'colima stop -p $BUILD_VM_PROFILE' FAILED — $(last_said "$JOBS_OUT")"; failed=1; fi
+  fi
+  if [ -f "$pending" ] || { [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" = "1" ] && [ "$rec" = true ]; }; then
+    log "jobs: the recorded answer changed — 'memex-local update' re-renders the portal, so the heartbeat carries 'accepts NO jobs'"
+    if jobs_as_user "$user" "$mlocal" update; then did="$did updated"; [ -f "$pending" ] && rm -f "$pending"
+    else log "jobs: 'memex-local update' FAILED — $(last_said "$JOBS_OUT") — the layer says NO; the next run retries the update"; failed=1; fi
+  fi
+  # LAST, and looked at again: a memex-local before 1.14.0's companion change re-installs this governor on every
+  # `backlease accept` and `update` while idle-only models are declared — whatever those left behind goes now
+  if [ "${FLEET_BOOTSTRAP_DRY_RUN:-}" != "1" ]; then idle=no; user_agent_present "$user" "$IDLE_LABEL" && idle=yes; fi
+  if [ "$idle" = yes ]; then
+    log "jobs: removing the idle governor $IDLE_LABEL (memex-local buildhost idle off) — it would start the build VM again for CI"
+    if jobs_as_user "$user" "$mlocal" buildhost idle off; then did="$did idle-off"
+    else
+      # it refuses while the VM is stopped FOR an idle-only model — with jobs NO the VM stays stopped: the governor goes anyway
+      log "jobs: 'buildhost idle off' refused ($(last_said "$JOBS_OUT")) — booting the governor out directly; the build VM stays stopped"
+      jobs_bootout "$user" "$IDLE_LABEL"
+      as_user "$user" /bin/rm -f "$home/Library/LaunchAgents/$IDLE_LABEL.plist" && did="$did idle-off" || { log "jobs: FAILED to remove the idle governor"; failed=1; }
+    fi
+  fi
+  if [ "$failed" != 0 ]; then
+    log "jobs: taking this Mac out of the build queue FAILED in part (done:${did:- nothing}) — retried next run"
+    write_reading jobs failed "$PART_JOBS_KEY=false; done:${did:- nothing}"; return 1
+  fi
+  log "jobs: this Mac is out of the build queue ($PART_JOBS_KEY=false; done:$did)"
+  write_reading jobs taken-out "$PART_JOBS_KEY=false; done:$did"
   return 0
 }
 
