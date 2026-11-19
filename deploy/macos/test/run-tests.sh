@@ -522,7 +522,7 @@ rp() { env FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$T/plog" FLEET_MANAGED_PREFS="$T
 OUT="$(rp)"
 case "$OUT" in *"AcceptJobs is absent"*"AcceptTokens is absent"*"rc=1"*) ok "no AcceptJobs and no AcceptTokens → FAILS, naming both" ;; *) bad "participation absent" "$OUT" ;; esac
 OUT="$(rp FLEET_ACCEPT_JOBS=maybe FLEET_ACCEPT_TOKENS=false)"
-case "$OUT" in *"AcceptJobs is not a boolean ('maybe')"*"rc=1"*) ok "an answer that is not a boolean FAILS (never read as no)" ;; *) bad "participation maybe" "$OUT" ;; esac
+case "$OUT" in *"FLEET_ACCEPT_JOBS is not a boolean ('maybe'):"*"rc=1"*) ok "an answer that is not a boolean FAILS (never read as no), naming where it came from" ;; *) bad "participation maybe" "$OUT" ;; esac
 OUT="$(rp FLEET_ACCEPT_JOBS=true FLEET_ACCEPT_TOKENS=false)"
 case "$OUT" in *"AcceptJobsFrom is empty"*"rc=1"*) ok "jobs YES without AcceptJobsFrom FAILS" ;; *) bad "jobs without from" "$OUT" ;; esac
 OUT="$(rp FLEET_ACCEPT_JOBS=false FLEET_ACCEPT_TOKENS=true FLEET_ACCEPT_TOKENS_FROM='*.meshweaver.cloud')"
@@ -1204,6 +1204,122 @@ OUT="$(gps GP_CUR=122880)"
 case "$OUT" in *"removing com.meshweaver.fleet.gpu-wired-limit"*"RC=0"*) [ ! -e "$GPL" ] && [ ! -e "$GP/calls" ] && grep -q 'bootout system/com.meshweaver.fleet.gpu-wired-limit' "$GP/lcalls" && ok "a withdrawn declaration removes the LaunchDaemon and leaves the live value alone" || bad "withdrawn" "$(cat "$GP/calls" "$GP/lcalls" 2>&1)" ;; *) bad "withdrawn" "$OUT" ;; esac
 awk '/^main\(\) \{/{on=1} on' "$FB" | grep -n 'step_gpu_wired_limit\|read_participation' | head -1 | grep -q step_gpu_wired_limit && ok "main sets the GPU limit before the participation answers (a Mac failing later still gets it)" || bad "gpu order" ""
 rm -rf "$GP"
+
+echo "── Jobs participation per model class, kept on every run: AcceptJobs<Class> over AcceptJobs; NO ⇒ taken out (1.14.0) ──"
+FB="$HERE/../intune/fleet-bootstrap.sh"
+JR="$(mktemp -d)"; mkdir -p "$JR/bin" "$JR/home/.memex-local" "$JR/home/Library/LaunchAgents"
+JPREFS() { python3 -c 'import plistlib,sys
+d = {}
+for a in sys.argv[2:]:
+    k, v = a.split("=", 1)
+    d[k] = True if v == "true" else False if v == "false" else v
+plistlib.dump(d, open(sys.argv[1], "wb"), fmt=plistlib.FMT_BINARY)' "$JR/prefs.plist" "$@"; }
+jrp() { env FLEET_BOOTSTRAP_LIB=1 FLEET_LOG_DIR="$JR/log" FLEET_MANAGED_PREFS="$JR/prefs" FLEET_HOST_MODEL="${JR_MODEL:-Mac Studio}" "$@" \
+  bash -c '. "$0"; read_participation; rc=$?; printf "rc=%s jobs=%s key=%s args=%s\n" "$rc" "$PART_JOBS" "$PART_JOBS_KEY" "${PART_ARGS[*]-}"' "$FB" 2>&1; }
+JPREFS AcceptJobs=true AcceptJobsMacStudio=false AcceptJobsFrom=control.example.test AcceptTokens=false
+OUT="$(jrp)"
+case "$OUT" in *"jobs false (decided by AcceptJobsMacStudio)"*"rc=0 jobs=false key=AcceptJobsMacStudio args=--no-accept-jobs --no-buildhost --no-accept-tokens"*) ok "AcceptJobsMacStudio=false overrides AcceptJobs=true on a Mac Studio: a join says --no-accept-jobs --no-buildhost, and the log names the deciding key" ;; *) bad "class key NO" "$OUT" ;; esac
+OUT="$(JR_MODEL="Mac mini" jrp)"
+case "$OUT" in *"jobs true (decided by AcceptJobs)"*"rc=0 jobs=true key=AcceptJobs args=--accept-jobs=control.example.test"*) ok "a class without its own key (Mac mini) keeps the class-less AcceptJobs" ;; *) bad "class-less fallback" "$OUT" ;; esac
+JPREFS AcceptJobs=false AcceptJobsMacStudio=true AcceptJobsFrom=control.example.test AcceptTokens=false
+OUT="$(jrp)"
+case "$OUT" in *"rc=0 jobs=true key=AcceptJobsMacStudio"*) ok "the class key wins in the YES direction too" ;; *) bad "class key YES" "$OUT" ;; esac
+OUT="$(jrp FLEET_ACCEPT_JOBS=false)"
+case "$OUT" in *"rc=0 jobs=false key=FLEET_ACCEPT_JOBS"*) ok "the environment (FLEET_ACCEPT_JOBS) wins over both keys" ;; *) bad "env wins" "$OUT" ;; esac
+JPREFS AcceptJobsMacStudio=maybe AcceptTokens=false
+OUT="$(jrp)"
+case "$OUT" in *"AcceptJobsMacStudio is not a boolean ('maybe')"*"rc=1"*) ok "a class key that is not a boolean FAILS, naming that key (never read as no)" ;; *) bad "class key maybe" "$OUT" ;; esac
+
+# the reconcile, against stubs: memex-local, colima, launchctl record every call; nothing else is reachable
+cat > "$JR/bin/memex-local" <<STUB
+#!/bin/bash
+echo "memex-local \$*" >> "$JR/calls"
+case "\$*" in
+  "backlease accept jobs --off") sed -i '' 's/Jobs__Enabled: "true"/Jobs__Enabled: "false"/' "$JR/home/.memex-local/backlease.yaml" ;;
+  "buildhost idle off") [ "\${JR_IDLE_RC:-0}" = 0 ] || { echo "the build VM is stopped for an idle-only model"; exit 1; }; rm -f "$JR/home/Library/LaunchAgents/com.memex.local.buildhost-idle.plist" ;;
+  "buildhost priority off") rm -f "$JR/home/Library/LaunchAgents/com.memex.local.buildhost-priority.plist" ;;
+  update) [ "\${JR_UPDATE_RC:-0}" = 0 ] || { echo "the portal did not come back"; exit 1; } ;;
+esac
+STUB
+cat > "$JR/bin/colima" <<STUB
+#!/bin/bash
+case "\$*" in
+  "status -p build") [ -f "$JR/vm-running" ] ;;
+  "stop -p build") echo "colima \$*" >> "$JR/calls"; rm -f "$JR/vm-running" ;;
+  *) echo "colima \$*" >> "$JR/calls"; exit 1 ;;
+esac
+STUB
+cat > "$JR/bin/launchctl" <<STUB
+#!/bin/bash
+case "\$1" in print) exit 1 ;; esac
+echo "launchctl \$*" >> "$JR/calls"
+STUB
+chmod +x "$JR/bin/memex-local" "$JR/bin/colima" "$JR/bin/launchctl"
+JUSER="$(id -un)"; JUID="$(id -u)"
+jin() {   # a Mac still in the build queue: accepts jobs, build VM up, the three agents' plists
+  printf '    Hosting__BackLease__Accept__Jobs__Enabled: "true"\n    Hosting__BackLease__Accept__Tokens__Enabled: "true"\n' > "$JR/home/.memex-local/backlease.yaml"
+  touch "$JR/vm-running" "$JR/home/Library/LaunchAgents/com.memex.local.buildhost-follow.build.plist" \
+        "$JR/home/Library/LaunchAgents/com.memex.local.buildhost-idle.plist" "$JR/home/Library/LaunchAgents/com.memex.local.buildhost-priority.plist"
+}
+jrc() { rm -f "$JR/calls"; env FLEET_BOOTSTRAP_LIB=1 PATH="$JR/bin:$PATH" FLEET_USER_HOME="$JR/home" FLEET_STATE_DIR="$JR/st" FLEET_LOG_DIR="$JR/log" "$@" \
+  bash -c '. "$0"; as_user() { shift; run "$@"; }; probe_as_user() { shift; "$@" >/dev/null 2>&1; }
+    PART_JOBS="${JR_JOBS:-false}"; PART_JOBS_KEY=AcceptJobsMacStudio; PART_JOBS_FROM=control.example.test; PART_JOBS_CHANNELS=mac
+    step_jobs_reconcile "$1" "$2"; echo "RC=$?"' "$FB" "$JUSER" "$JR/bin/memex-local" 2>&1; }
+jin
+OUT="$(jrc)"
+WANT="memex-local backlease accept jobs --off
+launchctl bootout gui/$JUID/com.memex.local.buildhost-follow.build
+memex-local buildhost priority off
+colima stop -p build
+memex-local update
+memex-local buildhost idle off"
+case "$OUT" in *"says NO but this Mac is still in the build queue"*"RC=0"*)
+  [ "$(cat "$JR/calls")" = "$WANT" ] && [ ! -e "$JR/vm-running" ] && [ ! -e "$JR/home/Library/LaunchAgents/com.memex.local.buildhost-follow.build.plist" ] \
+    && grep -q '__Jobs__Enabled: "false"' "$JR/home/.memex-local/backlease.yaml" && grep -q '^taken-out .*AcceptJobsMacStudio=false; done: accept-off follow-off priority-off vm-stopped updated idle-off' "$JR/st/jobs" \
+    && [ ! -e "$JR/st/jobs.update-pending" ] \
+    && ok "NO on a Mac still in the queue: accept --off, follow agent booted out and its plist removed, priority off, ONLY the build VM stopped, update, then the idle governor last — reading taken-out" \
+    || bad "take-out calls" "$(cat "$JR/calls" "$JR/st/jobs" 2>&1)" ;; *) bad "take-out" "$OUT" ;; esac
+! grep -qiE 'ollama|llama|kill|colima stop( |$)[^-]|colima stop -p default|colima delete' "$JR/calls" && ok "the take-out touches no other process: no Ollama, no model server, no kill, no other Colima profile" || bad "other process touched" "$(cat "$JR/calls")"
+OUT="$(jrc)"
+case "$OUT" in *"is out of the build queue (accepts NO jobs"*"RC=0"*) [ ! -e "$JR/calls" ] && grep -q '^out ' "$JR/st/jobs" && ok "a re-run on a Mac that is out changes nothing (idempotent) — reading out" || bad "rerun changed" "$(cat "$JR/calls")" ;; *) bad "rerun out" "$OUT" ;; esac
+touch "$JR/vm-running"
+OUT="$(jrc)"
+case "$OUT" in *"RC=0"*) [ "$(cat "$JR/calls")" = "colima stop -p build" ] && ok "NO, the answer already recorded, but the build VM was started again: only the VM is stopped, no update" || bad "vm only" "$(cat "$JR/calls")" ;; *) bad "vm only" "$OUT" ;; esac
+# an update that fails is owed: the layer reads NO from now on, so a marker remembers it and the next run retries it
+jin
+OUT="$(jrc JR_UPDATE_RC=1)"
+case "$OUT" in *"'memex-local update' FAILED"*"RC=1"*) [ -f "$JR/st/jobs.update-pending" ] && grep -q '^failed ' "$JR/st/jobs" && ok "a failed update FAILS the step (reading failed) and leaves the update owed" || bad "update failed marker" "" ;; *) bad "update failed" "$OUT" ;; esac
+OUT="$(jrc)"
+case "$OUT" in *"RC=0"*) [ "$(cat "$JR/calls")" = "memex-local update" ] && [ ! -e "$JR/st/jobs.update-pending" ] && ok "the next run retries only the owed update, then forgets it" || bad "owed update" "$(cat "$JR/calls")" ;; *) bad "owed update" "$OUT" ;; esac
+# an older memex-local re-installs the idle governor on `update`: the take-out looks again AFTER the update and removes it
+jin; rm -f "$JR/home/Library/LaunchAgents/com.memex.local.buildhost-idle.plist"
+sed -i '' 's|^  update) |  update) touch "'"$JR"'/home/Library/LaunchAgents/com.memex.local.buildhost-idle.plist"; |' "$JR/bin/memex-local"
+OUT="$(jrc)"
+case "$OUT" in *"RC=0"*) [ "$(tail -2 "$JR/calls")" = "memex-local update
+memex-local buildhost idle off" ] && [ ! -e "$JR/home/Library/LaunchAgents/com.memex.local.buildhost-idle.plist" ] && ok "an idle governor re-installed by the update itself is removed in the same run" || bad "reinstalled governor" "$(cat "$JR/calls")" ;; *) bad "reinstalled governor" "$OUT" ;; esac
+sed -i '' 's|^  update) touch "[^"]*"; |  update) |' "$JR/bin/memex-local"
+# idle off refused (VM stopped for an idle-only model): the governor goes anyway
+jin; rm -f "$JR/vm-running"
+OUT="$(jrc JR_IDLE_RC=1)"
+case "$OUT" in *"booting the governor out directly"*"RC=0"*) grep -q "launchctl bootout gui/$JUID/com.memex.local.buildhost-idle" "$JR/calls" && [ ! -e "$JR/home/Library/LaunchAgents/com.memex.local.buildhost-idle.plist" ] && ! grep -q 'colima' "$JR/calls" && ok "a refused 'buildhost idle off' still removes the governor; a stopped VM is not touched" || bad "idle refused" "$(cat "$JR/calls")" ;; *) bad "idle refused" "$OUT" ;; esac
+# YES while the Mac is out: said, with the opt-in commands — nothing is re-attached
+OUT="$(JR_JOBS=true jrc)"
+case "$OUT" in *"says YES but this Mac accepts NO jobs"*"NOT re-attached"*"memex-local backlease accept jobs --from control.example.test --channels mac && memex-local update"*"RC=0"*) [ ! -e "$JR/calls" ] && grep -q '^differs ' "$JR/st/jobs" && ok "YES on a Mac that is out: the difference and the opt-in commands are logged (reading differs); no build VM is started, nothing changed" || bad "yes out changed" "$(cat "$JR/calls")" ;; *) bad "yes out" "$OUT" ;; esac
+# dry run: every action printed, nothing run
+jin
+OUT="$(jrc FLEET_BOOTSTRAP_DRY_RUN=1)"
+case "$OUT" in *"DRY-RUN: $JR/bin/memex-local backlease accept jobs --off"*"DRY-RUN: launchctl bootout gui/$JUID/com.memex.local.buildhost-follow.build"*"DRY-RUN: /bin/rm -f $JR/home/Library/LaunchAgents/com.memex.local.buildhost-follow.build.plist"*"buildhost priority off"*"DRY-RUN: colima stop -p build"*"DRY-RUN: $JR/bin/memex-local update"*"buildhost idle off"*"RC=0"*)
+  [ ! -e "$JR/calls" ] && [ -e "$JR/vm-running" ] && grep -q '__Jobs__Enabled: "true"' "$JR/home/.memex-local/backlease.yaml" && ok "a dry run prints every take-out action and changes nothing" || bad "dry run changed" "$(cat "$JR/calls")" ;; *) bad "dry run jobs" "$OUT" ;; esac
+OUT="$(JR_JOBS=maybe jrc)"
+case "$OUT" in *"no jobs answer was read"*"RC=1"*) [ ! -e "$JR/calls" ] && ok "an absent jobs answer is never read as NO: the reconcile changes nothing and FAILS" || bad "absent answer acted" "$(cat "$JR/calls")" ;; *) bad "absent answer" "$OUT" ;; esac
+# the labels and the layer key are memex-local's (this repository): pinned against its sources, so a rename reds here
+ML="$HERE/../../homebrew/bin/memex-local"; FS="$HERE/../../backlease/follow-set.py"; PS="$HERE/../../homebrew/share/buildhost-priority.sh"
+grep -q 'readonly IDLE_PLIST_LABEL="com.memex.local.buildhost-idle"' "$ML" && grep -q 'LABEL = "com.memex.local.buildhost-follow"' "$FS" \
+  && grep -q 'LABEL="com.memex.local.buildhost-priority"' "$PS" && grep -q 'f"{LABEL}.{a.profile}.plist"' "$FS" \
+  && grep -q '__Accept__Jobs__Enabled' "$ML" && grep -q 'readonly BUILD_PROFILE="${MEMEX_BUILD_PROFILE:-build}"' "$ML" \
+  && ok "the agent labels, the follow plist's name, the build profile and the layer key match memex-local's own sources" || bad "memex-local names drifted" ""
+grep -q 'step_jobs_reconcile "$user" "$mlocal" || jobs_rc=1' "$FB" && ok "a joined, finished Mac runs the jobs reconcile on every run" || bad "reconcile wired" ""
+rm -rf "$JR"
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"

@@ -7886,6 +7886,17 @@ uninstall_buildhost_idle_agent() {
 # next tick: a stopped host with nothing declared drains). No build profile: nothing to govern.
 ensure_buildhost_idle_agent() {
   accept_load
+  # The owner said NO to fleet jobs (MeshWeaver.Deploy fleet bootstrap 1.14.0 keeps that answer): there is no CI to yield
+  # to, and the governor would START the build VM for CI demand and unload models from Ollama to do it — so none runs,
+  # and an installed one goes. No state file then: the worker serves no idle-only model (declare it in --models to serve
+  # it outright on a Mac without jobs).
+  if [ "$(participation_answer Jobs)" = false ]; then
+    if [ -f "$IDLE_PLIST_DST" ] || [ -f "$IDLE_STATE_FILE" ]; then
+      uninstall_buildhost_idle_agent; rm -f "$IDLE_STATE_FILE"
+      info "idle-only models: this Mac takes NO fleet jobs — no build host to yield, so no governor '$IDLE_PLIST_LABEL'${ACC_TOK_IDLE:+ (the idle-only models $ACC_TOK_IDLE are not served; offer them with --models to serve them outright)}"
+    fi
+    return 0
+  fi
   if [ -n "$ACC_TOK_IDLE" ] && [ "$ACC_TOK_ENABLED" = true ]; then
     if ! has_build_profile; then info "idle-only models: no build VM (Colima profile $BUILD_PROFILE) on this Mac — nothing yields, they are served whenever the worker can"; return 0; fi
     if [ "$HEADLESS" = "1" ]; then warn "idle-only models: a headless host has no login session for '$IDLE_PLIST_LABEL' — not installed; the worker serves no idle-only model"; return 0; fi
