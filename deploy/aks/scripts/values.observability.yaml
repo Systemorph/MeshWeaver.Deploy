@@ -67,7 +67,11 @@ loki:
   persistence:
     enabled: true
     existingClaim: storage-loki-0
-    size: 30Gi
+    # 200Gi: at 30Gi with 30-day retention the volume filled (ingestion outgrew it), a full disk
+    # left truncated boltdb index files, and Loki could not start for days (Nov 2026). An
+    # EXISTING claim is never resized by the installer: it takes effect when the claim is
+    # re-created (ResetObservabilityStore re-creates it at this size).
+    size: 200Gi
     storageClassName: default
 
   # THE UPDATE STRATEGY IS THE CHART DEFAULT, declared so the live release has nothing undeclared to
@@ -79,7 +83,9 @@ loki:
   updateStrategy:
     type: RollingUpdate
 
-  # Retention is age-based: the compactor deletes logs older than 30 days. The
+  # Retention is age-based: the compactor deletes logs older than 14 days (336h). Age is the
+  # ONLY bound Loki enforces — there is no size cap — so the volume above must hold 14 days of
+  # the fleet's ingestion with headroom; at 30 days on 30Gi it filled and corrupted the index. The
   # 24-hour index period from this chart is required by boltdb-shipper retention.
   # Its working directory and WAL are both below the persistent /data mount.
   #
@@ -115,7 +121,7 @@ loki:
     compactor:
       retention_enabled: true
     limits_config:
-      retention_period: 720h
+      retention_period: 336h
     ingester:
       wal:
         enabled: true

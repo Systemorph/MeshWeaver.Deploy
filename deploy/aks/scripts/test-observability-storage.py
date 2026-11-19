@@ -139,7 +139,7 @@ class DeclaredClaimTest(unittest.TestCase):
         shipped = Path(__file__).with_name('values.observability.yaml').read_text()
         result = self.run_installer('claim_absent', shipped)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Created Loki's declared claim monitoring/storage-loki-0 (30Gi, default)", result.stdout)
+        self.assertIn("Created Loki's declared claim monitoring/storage-loki-0 (200Gi, default)", result.stdout)
 
     def test_existing_claim_is_never_touched(self):
         seen = {}
