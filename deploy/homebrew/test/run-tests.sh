@@ -3105,7 +3105,8 @@ printf '#!/bin/bash\necho "launchctl $*" >> "%s/launchctl.log"\nexit 0\n' "$IO" 
 io() { env PATH="$IO/stubs:$STUBS:$PATH" HOME="$IO/home" MEMEX_LOCAL_HOME="$IO/home/.memex-local" COLIMA_HOME="$IO/home/.colima" "$@"; }
 IOF="$IO/home/.memex-local/backlease.yaml"; ioh() { grep -qF "$1" "$IOF" 2>/dev/null; }
 io "$CLI" registry https://memex.example.test --id ci-io >/dev/null 2>&1
-io "$CLI" backlease enroll --control https://control.example.test --deployment studio-9 --accept-tokens='*.meshweaver.cloud' --token-models qwen3.8:27b-mlx --residency CH </dev/null >/dev/null 2>&1
+# the governor exists for a Mac that takes fleet jobs (CI first): enrolled with a YES to jobs
+io "$CLI" backlease enroll --control https://control.example.test --deployment studio-9 --accept-jobs=control.example.test --accept-tokens='*.meshweaver.cloud' --token-models qwen3.8:27b-mlx --residency CH </dev/null >/dev/null 2>&1
 OUT="$(io "$CLI" backlease accept tokens --idle-only-models gpt-oss:120b </dev/null 2>&1)"; RC=$?
 [ "$RC" = 0 ] && ioh 'Hosting__BackLease__Accept__Tokens__IdleOnlyModels__0: "gpt-oss:120b"' && ioh 'Hosting__BackLease__Accept__Tokens__Models__0: "qwen3.8:27b-mlx"' \
   && ioh 'Hosting__BackLease__Accept__Tokens__Models__1: "gpt-oss:120b"' \
@@ -3134,7 +3135,7 @@ OUT="$(io "$CLI" buildhost idle off </dev/null 2>&1)" && bad "idle off while sto
 printf '{"state":"running","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$IO/home/.memex-local/backlease/buildhost.json"
 io "$CLI" backlease accept tokens --idle-only-models none </dev/null >/dev/null 2>&1
 [ ! -e "$PL" ] && [ ! -e "$IO/home/.memex-local/backlease/buildhost.json" ] && ok "--idle-only-models none with the VM back: governor removed, no state file (the worker serves none)" || bad "withdraw while running" "$(ls "$IO/home/.memex-local/backlease")"
-io "$CLI" backlease enroll --control https://control.example.test --deployment studio-9 --accept-tokens='*.meshweaver.cloud' --token-models qwen3.8:27b-mlx \
+io "$CLI" backlease enroll --control https://control.example.test --deployment studio-9 --accept-jobs=control.example.test --accept-tokens='*.meshweaver.cloud' --token-models qwen3.8:27b-mlx \
   --token-idle-only-models gpt-oss:120b --residency CH </dev/null >/dev/null 2>&1
 ioh 'IdleOnlyModels__0: "gpt-oss:120b"' && ioh 'Tokens__Models__1: "gpt-oss:120b"' && [ -e "$PL" ] \
   && ok "backlease enroll --token-idle-only-models declares it and loads the governor (the same path as accept)" || bad "enroll idle flag" "$(grep Tokens "$IOF")"
@@ -3142,6 +3143,14 @@ printf '{"state":"stopped","since":"2026-11-13T10:00:00Z","reason":"t"}\n' > "$I
 OUT="$(io "$CLI" backlease off </dev/null 2>&1)"
 [ ! -e "$IOF" ] && [ -e "$PL" ] && [ -e "$IO/home/.memex-local/backlease/buildhost.json" ] && grep -q "gives it back to CI first" <<<"$OUT" \
   && ok "backlease off while the VM is stopped for a model: the layer goes, the governor stays to restart the VM (it drains with nothing declared)" || bad "off while stopped" "$OUT"
+# the owner said NO to jobs (fleet bootstrap 1.14.0 keeps it): no CI to yield to — the governor would START the build VM
+# for CI and unload models, so it is removed (even while it holds the VM stopped) and never installed again
+OUT="$(io "$CLI" backlease enroll --control https://control.example.test --deployment studio-9 --no-accept-jobs --accept-tokens='*.meshweaver.cloud' \
+  --token-models qwen3.8:27b-mlx --token-idle-only-models gpt-oss:120b --residency CH </dev/null 2>&1)"
+ioh 'Accept__Jobs__Enabled: "false"' && [ ! -e "$PL" ] && [ ! -e "$IO/home/.memex-local/backlease/buildhost.json" ] && grep -q "takes NO fleet jobs" <<<"$OUT" \
+  && ok "jobs NO: the idle governor is removed (state file too, the worker serves no idle-only model) — it would start the build VM for CI" || bad "jobs no keeps governor" "$OUT $(ls "$IO/home/Library/LaunchAgents" 2>&1)"
+io "$CLI" backlease accept tokens --idle-only-models gpt-oss:120b </dev/null >/dev/null 2>&1
+[ ! -e "$PL" ] && ok "jobs NO: re-declaring idle-only models installs no governor" || bad "jobs no reinstalls governor" "$(cat "$IO/launchctl.log" | tail -2)"
 
 # ── the governor itself: share/buildhost-idle.py against a stub control + Ollama, a stub colima and kubectl ──
 IDLE="$HERE/../share/buildhost-idle.py"

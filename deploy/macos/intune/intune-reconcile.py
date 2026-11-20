@@ -260,6 +260,14 @@ def validate(spec, spec_dir):
                     p.append(f"{w}: keys.{k} must be a list of non-empty strings without commas")
             if keys.get("AcceptJobs") is True and not keys.get("AcceptJobsFrom"):
                 p.append(f"{w}: AcceptJobs is true but AcceptJobsFrom names no instance")
+            # the jobs answer per model class (AcceptJobsMacStudio …, bootstrap 1.14.0): overrides AcceptJobs for that class,
+            # and the bootstrap keeps it on every run (NO takes a joined Mac out of the build queue). An explicit bool only.
+            for k, v in keys.items():
+                if k.startswith("AcceptJobs") and k != "AcceptJobs" and k not in PARTICIPATION_LIST:
+                    if not isinstance(v, bool):
+                        p.append(f"{w}: keys.{k} must be an explicit true/false (the jobs answer for one model class)")
+                    elif v is True and not keys.get("AcceptJobsFrom"):
+                        p.append(f"{w}: {k} is true but AcceptJobsFrom names no instance")
             if keys.get("AcceptTokens") is True and not keys.get("AcceptTokensFrom"):
                 p.append(f"{w}: AcceptTokens is true but AcceptTokensFrom names no instance")
             if keys.get("AcceptTokens") is True and not keys.get("AcceptTokensModels"):
@@ -1332,6 +1340,18 @@ def self_test():
         gpu["customProfiles"][0]["keys"]["GpuWiredReserveMbMacStudio"] = badv
         v = validate(gpu, ".")
         expect(f"validate: GpuWiredReserveMbMacStudio = {badv!r} is refused (whole MiB, at least 4096)", any("GpuWiredReserveMbMacStudio" in x for x in v), v)
+    cls = copy.deepcopy(spec)
+    cls["customProfiles"][0]["keys"]["AcceptJobsMacStudio"] = False
+    expect("validate: AcceptJobsMacStudio = false passes", not validate(cls, "."), validate(cls, "."))
+    expect("validate: …and travels as a plist boolean", build_plist(cls["customProfiles"][0])["PayloadContent"][0].get("AcceptJobsMacStudio") is False)
+    for badv in ("false", 0, None):
+        cls["customProfiles"][0]["keys"]["AcceptJobsMacStudio"] = badv
+        v = validate(cls, ".")
+        expect(f"validate: AcceptJobsMacStudio = {badv!r} is refused (an explicit true/false)", any("AcceptJobsMacStudio" in x for x in v), v)
+    cls["customProfiles"][0]["keys"]["AcceptJobsMacStudio"] = True
+    cls["customProfiles"][0]["keys"].pop("AcceptJobsFrom", None)
+    cls["customProfiles"][0]["keys"]["AcceptJobs"] = False
+    expect("validate: AcceptJobsMacStudio = true without AcceptJobsFrom is refused", any("AcceptJobsMacStudio is true" in x for x in validate(cls, ".")), validate(cls, "."))
     op = "ssh-ed25519 " + base64.b64encode(len(b"ssh-ed25519").to_bytes(4, "big") + b"ssh-ed25519" + (32).to_bytes(4, "big") + bytes(32)).decode() + " operator, laptop"
     ssh = copy.deepcopy(spec)
     ssh["customProfiles"][0]["keys"]["OperatorSshKeys"] = [op]
