@@ -11,7 +11,9 @@ What the spec declares (deploy/macos/intune/README.md → "Intune objects as cod
 Macs in them (by serial number), the bootstrap shell script (content pinned to a commit + sha256), the
 `com.memex.local` custom profile and its keys, the trusted-root certificate of the fleet's local CA, the
 night-window DDM update policy, the compliance policies the Studios must be excluded from / given, every
-include and exclude assignment, the Apple Business Manager enrollment program (the ADE token by name, the fleet's
+include and exclude assignment, the people in a group of users (the Mac admins Platform SSO names), any other custom
+profile payload written verbatim (Platform SSO's com.apple.extensiblesso and PPPC validated by shape), the macOS apps
+(read and assigned, a post-install template rendered per client — the package itself is uploaded by a person), the Apple Business Manager enrollment program (the ADE token by name, the fleet's
 macOS enrollment profile, its default flag and the serials assigned to it), and the application permissions the app
 identity must hold (verified only).
 
@@ -95,6 +97,25 @@ PARTICIPATION_STR = ("AcceptTokensResidency",)
 # Keys kept as a real plist ARRAY (never comma-joined: an SSH key's comment may hold a comma). The bootstrap reads
 # OperatorSshKeys element by element (fleet-bootstrap.sh operator_ssh_keys).
 ARRAY_KEYS = ("OperatorSshKeys",)
+# A custom profile whose payload is NOT com.memex.local is written VERBATIM from `keys` (lists stay arrays, dicts stay
+# dicts): the comma-joining above is com.memex.local's contract with memex-local, not a plist rule. Two Apple payloads
+# are validated by shape because a mistake in them is silent on the Mac:
+#   com.apple.extensiblesso (with PlatformSSO) — Apple, Device Management "ExtensibleSingleSignOn" + "PlatformSSO";
+#   com.apple.TCC.configuration-profile-policy (PPPC) — Apple, "Privacy Preferences Policy Control payload".
+SSO_T = "com.apple.extensiblesso"
+TCC_T = "com.apple.TCC.configuration-profile-policy"
+PSSO_AUTH = ("Password", "UserSecureEnclaveKey", "SmartCard")
+PSSO_MODES = ("Standard", "Admin", "Groups", "Temporary")
+# Services an MDM can only DENY (or, for these two, let a standard user approve): Apple's PPPC payload. A profile that
+# claims to ALLOW them installs and grants nothing — the approval is still a person's click at the Mac.
+TCC_DENY_ONLY = ("ScreenCapture", "ListenEvent")
+TCC_AUTH = ("Allow", "Deny", "AllowStandardUserToSetSystemService")
+# apps[]: the Intune macOS app types the reconcile reads and assigns (it never uploads app CONTENT — the package is
+# uploaded by a person in the admin center; see README "Apps").
+APP_TYPES = ("macOSPkgApp", "macOSLobApp", "macOSDmgApp")
+APP_INTENTS = ("required", "available", "uninstall")
+ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+PARAM_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 # One OpenSSH public key line, as the bootstrap accepts it (fleet-bootstrap.sh ssh_key_core): an accepted type, the
 # base64 blob, an optional comment — no options prefix, no private key material.
 SSH_PUBKEY = re.compile(r"^(ssh-ed25519|ecdsa-sha2-nistp(?:256|384|521)|ssh-rsa) ([A-Za-z0-9+/]+={0,3})( [^\x00-\x1f\x7f]*)?\Z")
@@ -233,6 +254,13 @@ def validate(spec, spec_dir):
         for d in g.get("devices", []):
             if not d.get("serial") or not d.get("name"):
                 p.append(f"groups.{k}.devices: every device names serial and name")
+        for u in g.get("users", []):
+            if "@" not in str(u.get("upn", "")):
+                p.append(f"groups.{k}.users: every user names its upn (user@domain)")
+            if u.get("id") and not GUID.match(u["id"]):
+                p.append(f"groups.{k}.users: {u.get('upn')} id is not a GUID (the user's directory object id)")
+        if g.get("users") and g.get("devices"):
+            p.append(f"groups.{k}: declare users OR devices — a group that grants admin rights never also carries Macs")
 
     def targets(where, a):
         for kind in ("include", "exclude"):
@@ -335,6 +363,10 @@ def validate(spec, spec_dir):
                         why = ssh_pubkey_problem(k)
                         if why:
                             p.append(f"{w}: keys.OperatorSshKeys[{i}] is refused — {why} (the bootstrap refuses it too)")
+        if pl.get("payloadType") == SSO_T:
+            p.extend(f"{w}: {x}" for x in validate_sso(keys))
+        if pl.get("payloadType") == TCC_T:
+            p.extend(f"{w}: {x}" for x in validate_tcc(keys))
         targets(w, c.get("assign"))
     for t in spec.get("trustedRootCertificates", []):
         w = f"trustedRootCertificates.{t.get('key')}"
@@ -364,11 +396,150 @@ def validate(spec, spec_dir):
         if not c.get("id") and not c.get("properties"):
             p.append(f"{w}: an undeclared-id policy needs properties to create it from")
         targets(w, c.get("assign"))
+    for a in spec.get("apps", []):
+        w = f"apps.{a.get('key')}"
+        p.extend(f"{w}: {x}" for x in validate_app(a, groups))
+        targets(w, a.get("assign"))
     p.extend(validate_enrollment_program(spec.get("enrollmentProgram"), groups))
     app = spec.get("appIdentity") or {}
     if not isinstance(app.get("requiredRoles"), list) or not app.get("requiredRoles"):
         p.append("appIdentity.requiredRoles: declare the Graph application permissions the reconcile needs")
     return p
+
+
+def validate_sso(keys):
+    """com.apple.extensiblesso: the extension, and — when it carries PlatformSSO — the values macOS accepts. A wrong
+    value is not an install error on the Mac: the profile installs and the setting is ignored, so it is refused here."""
+    p = []
+    for k in ("ExtensionIdentifier", "TeamIdentifier", "Type"):
+        if not keys.get(k):
+            p.append(f"keys.{k} is required for {SSO_T}")
+    if keys.get("Type") not in (None, "Redirect", "Credential"):
+        p.append("keys.Type must be Redirect or Credential")
+    if keys.get("Type") == "Redirect" and not (isinstance(keys.get("URLs"), list) and keys["URLs"]):
+        p.append("keys.URLs must be a non-empty list for a Redirect extension")
+    ps = keys.get("PlatformSSO")
+    if ps is None:
+        return p
+    if not isinstance(ps, dict):
+        return p + ["keys.PlatformSSO must be a dictionary"]
+    if ps.get("AuthenticationMethod") not in PSSO_AUTH:
+        p.append("keys.PlatformSSO.AuthenticationMethod must be one of " + ", ".join(PSSO_AUTH))
+    groups_used = False
+    for k in ("NewUserAuthorizationMode", "UserAuthorizationMode"):
+        if k in ps and ps[k] not in PSSO_MODES:
+            p.append(f"keys.PlatformSSO.{k} must be one of " + ", ".join(PSSO_MODES))
+        groups_used |= ps.get(k) == "Groups"
+    for k in ("AdministratorGroups", "AdditionalGroups"):
+        if k in ps and not (isinstance(ps[k], list) and ps[k] and all(isinstance(x, str) and x for x in ps[k])):
+            p.append(f"keys.PlatformSSO.{k} must be a non-empty list of group names")
+    if groups_used and not (ps.get("AdministratorGroups") or ps.get("AuthorizationGroups")):
+        p.append("keys.PlatformSSO: an authorization mode of Groups needs AdministratorGroups (or AuthorizationGroups) — "
+                 "without one every Platform SSO user is a standard user")
+    if ps.get("EnableCreateUserAtLogin") is True and ps.get("AuthenticationMethod") == "UserSecureEnclaveKey":
+        p.append("keys.PlatformSSO.EnableCreateUserAtLogin needs AuthenticationMethod Password (or SmartCard): the login "
+                 "window can only create an account from a credential it can verify")
+    if ps.get("EnableCreateUserAtLogin") is True and ps.get("UseSharedDeviceKeys") is not True:
+        p.append("keys.PlatformSSO.EnableCreateUserAtLogin needs UseSharedDeviceKeys true (Apple's com.apple.extensiblesso schema)")
+    for k in ("NonPlatformSSOAccounts",):
+        if k in ps and not (isinstance(ps[k], list) and all(isinstance(x, str) and x for x in ps[k])):
+            p.append(f"keys.PlatformSSO.{k} must be a list of local account short names")
+    if not isinstance(keys.get("RegistrationToken", ""), str):
+        p.append("keys.RegistrationToken must be a string")
+    return p
+
+
+def validate_tcc(keys):
+    """PPPC: every entry names its code (identifier, type, designated requirement) and one authorization; a service an
+    MDM can only deny is refused when the spec ALLOWS it (Apple ignores the grant; the approval stays a person's)."""
+    p = []
+    svc = keys.get("Services")
+    if not isinstance(svc, dict) or not svc:
+        return ["keys.Services must map each TCC service to its entries"]
+    for name, entries in svc.items():
+        if not isinstance(entries, list) or not entries:
+            p.append(f"keys.Services.{name} must be a non-empty list")
+            continue
+        for i, e in enumerate(entries):
+            where = f"keys.Services.{name}[{i}]"
+            if not isinstance(e, dict):
+                p.append(f"{where} must be a dictionary")
+                continue
+            for k in ("Identifier", "IdentifierType", "CodeRequirement"):
+                if not e.get(k):
+                    p.append(f"{where}.{k} is required (an entry without the designated requirement is ignored by macOS)")
+            if e.get("IdentifierType") not in (None, "bundleID", "path"):
+                p.append(f"{where}.IdentifierType must be bundleID or path")
+            auth = e.get("Authorization")
+            if auth is not None and auth not in TCC_AUTH:
+                p.append(f"{where}.Authorization must be one of " + ", ".join(TCC_AUTH))
+            if auth is None and not isinstance(e.get("Allowed"), bool):
+                p.append(f"{where}: declare Authorization (or the older boolean Allowed)")
+            if name in TCC_DENY_ONLY and (auth == "Allow" or e.get("Allowed") is True):
+                p.append(f"{where}: {name} cannot be pre-granted by MDM — Apple honours only Deny or "
+                         "AllowStandardUserToSetSystemService; the approval is a person's click at the Mac")
+    return p
+
+
+def validate_app(a, groups):
+    p = []
+    for f in ("key", "displayName", "type", "intent"):
+        if not a.get(f):
+            p.append(f"{f} is required")
+    if a.get("type") and a["type"] not in APP_TYPES:
+        p.append("type must be one of " + ", ".join(APP_TYPES))
+    if a.get("intent") and a["intent"] not in APP_INTENTS:
+        p.append("intent must be one of " + ", ".join(APP_INTENTS))
+    if a.get("id") and not GUID.match(a["id"]):
+        p.append("id is not a GUID")
+    props = a.get("properties", {})
+    if not isinstance(props, dict) or any(k in props for k in ("postInstallScript", "preInstallScript", "@odata.type")):
+        p.append("properties is a map of the app's simple properties (scripts are declared under postInstallScript)")
+    sc = a.get("postInstallScript")
+    if sc is not None:
+        if a.get("type") != "macOSPkgApp":
+            p.append("postInstallScript is only carried by a macOSPkgApp")
+        src = (sc or {}).get("source") or {}
+        if not HEX40.match(src.get("commit", "")) or not HEX64.match(src.get("sha256", "")) or not src.get("repo") or not src.get("path"):
+            p.append("postInstallScript.source needs repo, path, a 40-hex commit and a 64-hex sha256 (a pin, never a branch)")
+        for k, v in (sc.get("params") or {}).items():
+            if not PARAM_NAME.match(k) or not isinstance(v, str):
+                p.append(f"postInstallScript.params.{k}: an UPPER_CASE name and a string value")
+        for k, v in (sc.get("secrets") or {}).items():
+            if not PARAM_NAME.match(k) or not isinstance(v, str) or not ENV_NAME.match(v):
+                p.append(f"postInstallScript.secrets.{k} must name an ENVIRONMENT VARIABLE (the secret itself never lives in the spec)")
+        af = sc.get("aliasesFrom")
+        if af is not None and af not in groups:
+            p.append(f"postInstallScript.aliasesFrom names an undeclared group '{af}'")
+    return p
+
+
+def render_script(template, sc, spec, secret_values):
+    """A post-install script from its pinned TEMPLATE: `@@NAME@@` → params[NAME]; `@@DEVICE_ALIASES@@` → one
+    `<serial> <name>` line per Mac of the aliasesFrom group (each Mac names itself by its own serial); a secret's line
+    `NAME='@@NAME@@'` → its value from the environment — or, when `secret_values` is None, the placeholder is KEPT, which
+    is the form a live script is compared in (normalise_script), so the drift check needs no secret."""
+    out = template.decode()
+    for k, v in (sc.get("params") or {}).items():
+        out = out.replace(f"@@{k}@@", v)
+    if sc.get("aliasesFrom"):
+        devs = spec["groups"][sc["aliasesFrom"]].get("devices", [])
+        out = out.replace("@@DEVICE_ALIASES@@", "\n".join(f"{d['serial']} {d['name']}" for d in devs))
+    for k in (sc.get("secrets") or {}):
+        if secret_values is not None:
+            v = secret_values[k]
+            if "'" in v or "\n" in v:
+                raise GraphError(0, "SECRET", k, "a secret value may not contain a quote or a newline")
+            out = out.replace(f"{k}='@@{k}@@'", f"{k}='{v}'")
+    return out.encode()
+
+
+def normalise_script(content, sc):
+    """A live script with every secret's VALUE put back to its placeholder: what the drift check compares."""
+    out = content.decode(errors="replace")
+    for k in (sc.get("secrets") or {}):
+        out = re.sub(rf"^{k}='[^'\n]*'$", f"{k}='@@{k}@@'", out, flags=re.M)
+    return out.encode()
 
 
 def validate_enrollment_program(ep, groups):
@@ -450,8 +621,9 @@ def build_plist(c):
     pl = c["plist"]
     inner = {"PayloadType": pl["payloadType"], "PayloadVersion": 1, "PayloadIdentifier": pl["innerIdentifier"],
              "PayloadUUID": pl["innerUuid"], "PayloadDisplayName": pl["displayName"]}
+    joined = pl["payloadType"] == "com.memex.local"
     for k, v in c.get("keys", {}).items():
-        inner[k] = ",".join(v) if isinstance(v, list) and k not in ARRAY_KEYS else v
+        inner[k] = ",".join(v) if joined and isinstance(v, list) and k not in ARRAY_KEYS else v
     return {"PayloadContent": [inner], "PayloadDisplayName": pl["displayName"], "PayloadIdentifier": pl["identifier"],
             "PayloadOrganization": pl.get("organization", ""), "PayloadRemovalDisallowed": False,
             "PayloadScope": "System", "PayloadType": "Configuration", "PayloadUUID": pl["uuid"], "PayloadVersion": 1}
@@ -569,10 +741,12 @@ class Reconcile:
             out.add((SPECIAL_TARGETS[t], None) if t in SPECIAL_TARGETS else (INCLUDE_T, self.gid.get(t)))
         return out
 
-    def reconcile_assignments(self, obj, what, live, assign_path, body_key, odata_item=None):
+    def reconcile_assignments(self, obj, what, live, assign_path, body_key, odata_item=None, extra=None):
         """Writes the UNION of live and declared targets. The only target ever dropped is one the spec names under
         `assign.remove` (a declared removal, reviewed like any other line). A kept live target is written back
-        verbatim, assignment filter included."""
+        verbatim, assignment filter included. `extra` (an app's {"intent": …}) is carried by every declared item: a
+        declared target live with a different value is rewritten with the declared one; a kept item keeps its own."""
+        extra = extra or {}
         want = self.desired_targets(obj.get("assign"))
         drop = self.removal_targets(obj.get("assign"))
         if any(g is None and k in (INCLUDE_T, EXCLUDE_T) for k, g in want):
@@ -580,17 +754,21 @@ class Reconcile:
             self.pending += 1
             return
         have = self.live_targets(live)
-        missing, extra, removing = want - have, have - want - drop, have & drop
-        if extra:
-            self.line("INFO", what, "assignment not in the spec, kept: " + ", ".join(sorted(self.label(t) for t in extra)))
+        wrong = {(a["target"]["@odata.type"], a["target"].get("groupId")) for a in live
+                 if (a["target"]["@odata.type"], a["target"].get("groupId")) in want and any(a.get(k) != v for k, v in extra.items())}
+        missing, kept, removing = (want - have) | wrong, have - want - drop, have & drop
+        if kept:
+            self.line("INFO", what, "assignment not in the spec, kept: " + ", ".join(sorted(self.label(t) for t in kept)))
         if not missing and not removing:
             self.line("OK", what, "assignments " + ", ".join(sorted(self.label(t) for t in want)))
             return
         items = []
         for a in live:
-            if (a["target"]["@odata.type"], a["target"].get("groupId")) in drop:
+            if (a["target"]["@odata.type"], a["target"].get("groupId")) in drop | wrong:
                 continue
             item = {"target": {k: v for k, v in a["target"].items() if v is not None}}
+            item.update({k: a[k] for k in extra if k in a})
+            item.update({k: a[k] for k in ("settings",) if extra and a.get(k) is not None})
             if odata_item:
                 item["@odata.type"] = odata_item
             items.append(item)
@@ -598,12 +776,14 @@ class Reconcile:
             target = {"@odata.type": kind}
             if gid:
                 target["groupId"] = gid
-            item = {"target": target}
+            item = dict({"target": target}, **extra)
             if odata_item:
                 item["@odata.type"] = odata_item
             items.append(item)
         detail = "; ".join(x for x in (
-            ("missing assignment " + ", ".join(sorted(self.label(t) for t in missing))) if missing else "",
+            ("missing assignment " + ", ".join(sorted(self.label(t) for t in missing - wrong))) if missing - wrong else "",
+            (", ".join(sorted(self.label(t) for t in wrong)) + " live with another " + "/".join(extra)
+             + " (spec: " + ", ".join(f"{k}={v}" for k, v in extra.items()) + ")") if wrong else "",
             ("declared removal of " + ", ".join(sorted(self.label(t) for t in removing))) if removing else "") if x)
         self.finding(obj, what, detail,
                      f"POST {assign_path} with the live targets" + (" minus the declared removal" if removing else "")
@@ -647,7 +827,7 @@ class Reconcile:
 
     def devices(self):
         for key, g in self.spec["groups"].items():
-            if not g.get("devices") and not g.get("reportMembers"):
+            if not g.get("devices") and not g.get("users") and not g.get("reportMembers"):
                 continue
             gid = self.gid.get(key)
             what_g = f"members of {key}"
@@ -693,6 +873,21 @@ class Reconcile:
                     self.new_members.append((name, mid))
                 self.finding(g, what, "not a member",
                              f"POST v1.0/groups/{short(gid)}/members/$ref directory object {short(oid)}", add)
+            for u in g.get("users", []):
+                what = f"user {u['upn']} in {key}"
+                if not u.get("id"):
+                    # resolving a UPN app-only needs User.ReadBasic.All, which the app identity does not hold: the id is declared
+                    self.pending += 1
+                    self.line("PENDING", what, "its directory object id is not declared — read it with "
+                              f"`az ad user show --id {u['upn']} --query id -o tsv` and record it as users[].id")
+                    continue
+                declared.add(u["id"])
+                if u["id"] in members:
+                    self.line("OK", what, f"member (directory {short(u['id'])})")
+                    continue
+                self.finding(g, what, "not a member", f"POST v1.0/groups/{short(gid)}/members/$ref directory object {short(u['id'])}",
+                             lambda oid=u["id"]: self.g.post(f"v1.0/groups/{gid}/members/$ref",
+                                                             {"@odata.id": f"{GRAPH}/v1.0/directoryObjects/{oid}"}))
             for mid, m in members.items():
                 if mid not in declared:
                     self.line("INFO", what_g, f"member {m.get('displayName') or short(mid)} is not declared, kept")
@@ -834,6 +1029,67 @@ class Reconcile:
             self.reconcile_assignments(c, what, self.g.list(f"beta/deviceManagement/deviceConfigurations/{live['id']}/assignments"),
                                        f"beta/deviceManagement/deviceConfigurations/{live['id']}/assign", "assignments",
                                        "#microsoft.graph.deviceConfigurationAssignment")
+
+    # apps (an Intune macOS app: read, its declared properties, its post-install script, its assignments) ──
+    def apps(self):
+        for a in self.spec.get("apps", []):
+            what = f"app {a['key']} \"{a['displayName']}\""
+            t = "#microsoft.graph." + a["type"]
+            live = None
+            if a.get("id"):
+                try:
+                    live = self.g.get(f"beta/deviceAppManagement/mobileApps/{a['id']}")
+                except GraphError as e:
+                    if e.status != 404:
+                        raise
+            if live is None:
+                found = [x for x in self.g.list("beta/deviceAppManagement/mobileApps?$filter="
+                                                + urllib.parse.quote(f"displayName eq '{a['displayName']}'"))
+                         if x.get("@odata.type") == t]
+                if found:
+                    self.name_match(what, a, found)
+                    live = found[0]
+            if live is None:
+                # the CONTENT of an app (the package) is never uploaded here: it is the licensed vendor's or the client's
+                # file, uploaded by a person — AWAITING (counted as pending), never red, like a missing ADE token
+                self.pending += 1
+                self.line("AWAITING", what, f"no {a['type']} of this name — a person uploads the package in the Intune "
+                          "admin center (Apps → macOS → Add → " + {"macOSPkgApp": "macOS app (PKG)", "macOSLobApp":
+                          "Line-of-business app", "macOSDmgApp": "macOS app (DMG)"}[a["type"]]
+                          + f") named exactly \"{a['displayName']}\"", "nothing — app content is never uploaded by the reconcile")
+                continue
+            if live.get("@odata.type") not in (None, t):
+                self.errors += 1
+                self.line("ERROR", what, f"is a {live.get('@odata.type')}, the spec declares {a['type']}")
+                continue
+            diffs = [f"{k}: live={live.get(k)!r} spec={v!r}" for k, v in (a.get("properties") or {}).items() if live.get(k) != v]
+            body = {"@odata.type": t, **(a.get("properties") or {})}
+            sc = a.get("postInstallScript")
+            if sc:
+                tmpl = self.pinned(sc["source"])
+                want = render_script(tmpl, sc, self.spec, None)
+                have = base64.b64decode(((live.get("postInstallScript") or {}).get("scriptContent")) or "")
+                if normalise_script(have, sc) != want:
+                    diffs.append("post-install script differs from " + f"{sc['source']['path']}@{sc['source']['commit'][:12]}"
+                                 + " rendered from the spec" + (" (live: none)" if not have else ""))
+                    env = {k: os.environ.get(v) for k, v in (sc.get("secrets") or {}).items()}
+                    if self.apply and not a.get("hold") and any(v is None for v in env.values()):
+                        self.errors += 1
+                        self.line("ERROR", what, "; ".join(diffs) + "; the script needs its secret(s) from the environment: "
+                                  + ", ".join(sc["secrets"][k] for k, v in env.items() if v is None) + " — nothing written")
+                        diffs = None
+                    elif self.apply:
+                        body["postInstallScript"] = {"@odata.type": "#microsoft.graph.macOSAppScript", "scriptContent":
+                                                     base64.b64encode(render_script(tmpl, sc, self.spec, env)).decode()}
+            if diffs:
+                self.finding(a, what, "; ".join(diffs), f"PATCH mobileApps/{short(live['id'])} ("
+                             + ", ".join(k for k in body if k != "@odata.type") + " — the script with its secret from the environment)",
+                             lambda live=live, body=body: self.g.patch(f"beta/deviceAppManagement/mobileApps/{live['id']}", body))
+            elif diffs is not None:
+                self.line("OK", what, f"{short(live['id'])}" + (f", post-install script = {sc['source']['path']}@{sc['source']['commit'][:12]}" if sc else ""))
+            self.reconcile_assignments(a, what, self.g.list(f"beta/deviceAppManagement/mobileApps/{live['id']}/assignments"),
+                                       f"beta/deviceAppManagement/mobileApps/{live['id']}/assign", "mobileAppAssignments",
+                                       "#microsoft.graph.mobileAppAssignment", extra={"intent": a["intent"]})
 
     # trusted root certificate ────────────────────────────────────────────────────────────────────────────
     def trusted_roots(self):
@@ -1143,7 +1399,7 @@ class Reconcile:
     # device sync ──────────────────────────────────────────────────────────────────────────────────────────
     def delivered(self, obj):
         """An object Intune DELIVERS to the Macs (whose change a Mac sees only at its next sync)."""
-        return any(obj is x for k in ("scripts", "customProfiles", "trustedRootCertificates", "settingsPolicies")
+        return any(obj is x for k in ("scripts", "customProfiles", "trustedRootCertificates", "settingsPolicies", "apps")
                    for x in self.spec.get(k, []))
 
     def group_devices(self, key):
@@ -1218,7 +1474,7 @@ class Reconcile:
     def run(self):
         steps = [("app identity", self.app_identity), ("groups", self.groups), ("devices", self.devices),
                  ("scripts", self.scripts), ("profiles", self.custom_profiles), ("certificates", self.trusted_roots),
-                 ("settings policies", self.settings_policies), ("compliance", self.compliance),
+                 ("settings policies", self.settings_policies), ("apps", self.apps), ("compliance", self.compliance),
                  ("enrollment program", self.enrollment_program)]
         if self.sync_only:
             steps = [("groups", self.groups)]
@@ -1232,7 +1488,7 @@ class Reconcile:
         try:
             if self.sync_only:
                 # a HELD object is not touched at all — not even by a device action on its behalf (review on #278)
-                self.sync_devices([x for k in ("scripts", "customProfiles", "trustedRootCertificates", "settingsPolicies")
+                self.sync_devices([x for k in ("scripts", "customProfiles", "trustedRootCertificates", "settingsPolicies", "apps")
                                    for x in self.spec.get(k, []) if not x.get("hold")], "--sync")
             elif self.apply and self.changed:
                 self.sync_devices(self.changed, "changed by this apply: " + ", ".join(o.get("key", "?") for o in self.changed))
@@ -1328,7 +1584,8 @@ class FakeGraph:
                             ("beta/deviceManagement/deviceConfigurations", "configs"),
                             ("beta/deviceManagement/configurationPolicies", "policies"),
                             ("beta/deviceManagement/configurationSettings", "settingDefs"),
-                            ("beta/deviceManagement/deviceCompliancePolicies", "compliance")):
+                            ("beta/deviceManagement/deviceCompliancePolicies", "compliance"),
+                            ("beta/deviceAppManagement/mobileApps", "apps")):
             if p == prefix or p.startswith(prefix + "/"):
                 return key, p[len(prefix):].strip("/").split("/") if p != prefix else []
         raise GraphError(400, "?", p, "route not faked")
@@ -1372,7 +1629,7 @@ class FakeGraph:
         obj = self.s[key][rest[0]]
         if rest[1] == "assign":
             items = next(iter(body.values()))
-            obj["_assign"] = [{"target": it["target"]} for it in items]
+            obj["_assign"] = [{k: v for k, v in it.items() if k != "@odata.type"} for it in items]
             return {}
         if rest[1:] == ["members", "$ref"]:
             obj.setdefault("_members", []).append(body["@odata.id"].rsplit("/", 1)[1])
@@ -1929,6 +2186,141 @@ def self_test():
         v = validate(b, ".")
         expect(f"validate: an enrollment program with {label} is refused", any(needle in x for x in v), v)
 
+    # ── Platform SSO / PPPC payloads, user members, apps (MeshWeaver.Deploy README "Mac admins through an Entra group",
+    #    "Apps") ────────────────────────────────────────────────────────────────────────────────────────────────────
+    def prof(ptype, keys):
+        return {"key": "p", "displayName": "P", "deploymentChannel": "deviceChannel",
+                "plist": {"payloadType": ptype, "identifier": "i", "uuid": "U", "innerIdentifier": "ii", "innerUuid": "IU",
+                          "displayName": "P"}, "keys": keys, "assign": {"include": ["studios"]}}
+    psso = {"ExtensionIdentifier": "com.microsoft.CompanyPortalMac.ssoextension", "TeamIdentifier": "UBF8T346G9",
+            "Type": "Redirect", "URLs": ["https://login.microsoftonline.com", "https://login.microsoft.com"],
+            "RegistrationToken": "{{DEVICEREGISTRATION}}",
+            "PlatformSSO": {"AuthenticationMethod": "Password", "UseSharedDeviceKeys": True, "EnableCreateUserAtLogin": True,
+                            "NewUserAuthorizationMode": "Groups", "UserAuthorizationMode": "Groups",
+                            "AdministratorGroups": ["Fleet — Mac Admins"]}}
+    ok_sp = {**spec, "customProfiles": [prof(SSO_T, psso)]}
+    expect("validate: a Platform SSO payload with Groups authorization and its administrator group is accepted",
+           not validate(ok_sp, "."), validate(ok_sp, "."))
+    bad = copy.deepcopy(psso); del bad["PlatformSSO"]["AdministratorGroups"]
+    expect("validate: Groups authorization with no AdministratorGroups is refused (every user would be standard)",
+           any("needs AdministratorGroups" in x for x in validate({**spec, "customProfiles": [prof(SSO_T, bad)]}, ".")))
+    bad = copy.deepcopy(psso); bad["PlatformSSO"]["AuthenticationMethod"] = "UserSecureEnclaveKey"
+    expect("validate: creating the account at the login window with the Secure Enclave key method is refused",
+           any("EnableCreateUserAtLogin" in x for x in validate({**spec, "customProfiles": [prof(SSO_T, bad)]}, ".")))
+    bad = copy.deepcopy(psso); bad["PlatformSSO"]["UseSharedDeviceKeys"] = False
+    expect("validate: creating the account at the login window without shared device keys is refused",
+           any("UseSharedDeviceKeys" in x for x in validate({**spec, "customProfiles": [prof(SSO_T, bad)]}, ".")))
+    bad = copy.deepcopy(psso); bad["PlatformSSO"]["UserAuthorizationMode"] = "Administrator"
+    expect("validate: an authorization mode macOS does not know is refused",
+           any("UserAuthorizationMode must be one of" in x for x in validate({**spec, "customProfiles": [prof(SSO_T, bad)]}, ".")))
+    built = build_plist(prof(SSO_T, psso))["PayloadContent"][0]
+    expect("a non-com.memex.local payload is written VERBATIM: URLs stay an array, PlatformSSO a dictionary",
+           built["URLs"] == psso["URLs"] and built["PlatformSSO"]["AdministratorGroups"] == ["Fleet — Mac Admins"], [repr(built)])
+    pppc = {"Services": {"Accessibility": [{"Identifier": "com.example.host", "IdentifierType": "bundleID",
+                                             "CodeRequirement": "identifier \"com.example.host\"", "Authorization": "Allow"}],
+                         "ScreenCapture": [{"Identifier": "com.example.host", "IdentifierType": "bundleID",
+                                            "CodeRequirement": "identifier \"com.example.host\"",
+                                            "Authorization": "AllowStandardUserToSetSystemService"}]}}
+    expect("validate: a PPPC payload granting Accessibility and letting a standard user approve Screen Recording is accepted",
+           not validate({**spec, "customProfiles": [prof(TCC_T, pppc)]}, "."))
+    bad = copy.deepcopy(pppc); bad["Services"]["ScreenCapture"][0]["Authorization"] = "Allow"
+    expect("validate: a PPPC payload that claims to ALLOW Screen Recording is refused (MDM cannot pre-grant it)",
+           any("ScreenCapture cannot be pre-granted" in x for x in validate({**spec, "customProfiles": [prof(TCC_T, bad)]}, ".")))
+    bad = copy.deepcopy(pppc); del bad["Services"]["Accessibility"][0]["CodeRequirement"]
+    expect("validate: a PPPC entry without its designated requirement is refused",
+           any("CodeRequirement is required" in x for x in validate({**spec, "customProfiles": [prof(TCC_T, bad)]}, ".")))
+
+    GA = "55555555-5555-4555-8555-555555555555"
+    U1, U2 = "66666666-6666-4666-8666-666666666661", "66666666-6666-4666-8666-666666666662"
+    usp = {**spec, "groups": {**spec["groups"], "admins": {"id": GA, "displayName": "Fleet — Mac Admins", "users": [
+        {"upn": "jane.roe@example.com", "id": U1}, {"upn": "john.doe@example.com"}]}}}
+    expect("validate: a group of users is accepted", not validate(usp, "."), validate(usp, "."))
+    bad = copy.deepcopy(usp); bad["groups"]["admins"]["devices"] = [{"serial": "S", "name": "n"}]
+    expect("validate: a group that declares users AND devices is refused", any("users OR devices" in x for x in validate(bad, ".")))
+    stu = tenant(); stu["apps"] = {}
+    stu["groups"][GA] = {"id": GA, "displayName": "Fleet — Mac Admins", "groupTypes": [], "_members": []}
+    stu["devices"][U1] = {"id": U1, "displayName": "Jane Roe"}
+    rc, lines, g = run(stu, False, usp)
+    expect("user members: a declared user not in the group is DRIFT; one without a declared id is PENDING (no UPN lookup)",
+           any(ln.startswith("DRIFT") and "user jane.roe@example.com in admins" in ln for ln in lines)
+           and any(ln.startswith("PENDING") and "john.doe@example.com" in ln and "az ad user show" in ln for ln in lines), lines)
+    rc, lines, g = run(stu, True, usp)
+    expect("user members: apply adds the user by its directory object id", U1 in stu["groups"][GA]["_members"], lines)
+    rc, lines, g = run(stu, False, usp)
+    expect("user members: then OK", any(ln.startswith("OK") and "user jane.roe@example.com in admins" in ln for ln in lines), lines)
+
+    tmpl = (b"#!/bin/bash\nASSIGNMENT_ID='@@ASSIGNMENT_ID@@'\nPREFIX='@@ALIAS_PREFIX@@'\n"
+            b"while read -r s n; do :; done <<'EOF'\n@@DEVICE_ALIASES@@\nEOF\n")
+    tsha = hashlib.sha256(tmpl).hexdigest()
+    app = {"key": "remoteHost", "displayName": "Remote Host — Example", "type": "macOSPkgApp", "intent": "required",
+           "properties": {"primaryBundleId": "com.example.host"},
+           "postInstallScript": {"source": {"repo": "acme/deploy", "path": "host-postinstall.sh", "commit": "b" * 40, "sha256": tsha},
+                                 "params": {"ALIAS_PREFIX": "example-"}, "aliasesFrom": "studios",
+                                 "secrets": {"ASSIGNMENT_ID": "EXAMPLE_ASSIGNMENT_ID"}},
+           "assign": {"include": ["studios"]}}
+    asp = {**spec, "apps": [app]}
+    expect("validate: an app with a pinned post-install template and an environment secret is accepted", not validate(asp, "."), validate(asp, "."))
+    bad = copy.deepcopy(asp); bad["apps"][0]["postInstallScript"]["secrets"]["ASSIGNMENT_ID"] = "0001CoABChBkZXZpY2U"
+    expect("validate: a secret written INTO the spec (not an environment variable name) is refused",
+           any("ENVIRONMENT VARIABLE" in x for x in validate(bad, ".")))
+    def run_app(state, apply, env=None):
+        g, lines = FakeGraph(state), []
+        old = {k: os.environ.get(k) for k in ("EXAMPLE_ASSIGNMENT_ID",)}
+        if env is None:
+            os.environ.pop("EXAMPLE_ASSIGNMENT_ID", None)
+        else:
+            os.environ["EXAMPLE_ASSIGNMENT_ID"] = env
+        try:
+            rc = Reconcile(copy.deepcopy(asp), tempfile.gettempdir(), g, apply=apply, fetch=lambda s: tmpl, token=tok, out=lines.append).run()
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return rc, [ln for ln in lines if "app remoteHost" in ln], g
+    sta = tenant(); sta["apps"] = {}
+    rc, lines, g = run_app(sta, True, "SECRET-1")
+    expect("apps: an app not uploaded yet is AWAITING (a person uploads the package), and nothing is written for it",
+           any(ln.startswith("AWAITING") and "macOS app (PKG)" in ln for ln in lines)
+           and not any("mobileApps" in w[1] for w in g.writes), lines)
+    sta["apps"]["a1"] = {"id": "a1", "@odata.type": "#microsoft.graph.macOSPkgApp", "displayName": "Remote Host — Example",
+                         "primaryBundleId": "com.example.host",
+                         "_assign": [{"target": {"@odata.type": INCLUDE_T, "groupId": G1}, "intent": "available"}]}
+    rc, lines, g = run_app(sta, False)
+    expect("apps: --check names the missing post-install script and the wrong intent, needs no secret, writes nothing",
+           any(ln.startswith("DRIFT") and "post-install script differs" in ln for ln in lines)
+           and any(ln.startswith("DRIFT") and "another intent" in ln for ln in lines) and not g.writes, lines)
+    rc, lines, g = run_app(sta, True)
+    expect("apps: --apply without the secret in the environment is an ERROR naming the variable, and writes no script",
+           any(ln.startswith("ERROR") and "EXAMPLE_ASSIGNMENT_ID" in ln for ln in lines)
+           and not any(w[0] == "PATCH" and "mobileApps" in w[1] for w in g.writes), lines)
+    rc, lines, g = run_app(sta, True, "SECRET-1")
+    got = base64.b64decode(sta["apps"]["a1"]["postInstallScript"]["scriptContent"]).decode()
+    expect("apps: --apply writes the rendered script — the secret from the environment, the prefix, one alias line per Mac — "
+           "and never prints the secret",
+           "ASSIGNMENT_ID='SECRET-1'" in got and "PREFIX='example-'" in got and "SERIAL0001 studio-1\nSERIAL0009 studio-9" in got
+           and not any("SECRET-1" in ln for ln in lines), lines + [got])
+    expect("apps: --apply rewrites the declared target's intent to required",
+           sta["apps"]["a1"]["_assign"] == [{"target": {"@odata.type": INCLUDE_T, "groupId": G1}, "intent": "required"}], lines)
+    rc, lines, g = run_app(sta, False)
+    expect("apps: then --check is OK without the secret (the live value is compared as its placeholder)",
+           any(ln.startswith("OK") and "post-install script" in ln for ln in lines)
+           and not any(ln.startswith(("DRIFT", "ERROR")) for ln in lines), lines)
+    sta["apps"]["a1"]["_assign"].append({"target": {"@odata.type": INCLUDE_T, "groupId": G2}, "intent": "available"})
+    sta["apps"]["a1"]["postInstallScript"]["scriptContent"] = base64.b64encode(got.replace("PREFIX='example-'", "PREFIX='x'").encode()).decode()
+    rc, lines, g = run_app(sta, True, "SECRET-1")
+    expect("apps: an edited live script is drift and rewritten; an undeclared assignment is kept with ITS intent",
+           {"target": {"@odata.type": INCLUDE_T, "groupId": G2}, "intent": "available"} in sta["apps"]["a1"]["_assign"]
+           and "PREFIX='example-'" in base64.b64decode(sta["apps"]["a1"]["postInstallScript"]["scriptContent"]).decode(), lines)
+
+    real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "teamviewer", "teamviewer-host-postinstall.sh")
+    if os.path.exists(real):
+        rt = open(real, "rb").read()
+        rsc = {"params": {"ALIAS_PREFIX": "ACME-"}, "aliasesFrom": "studios", "secrets": {"ASSIGNMENT_ID": "X"}}
+        filled = render_script(rt, rsc, spec, {"ASSIGNMENT_ID": "0001-secret"})
+        syn = subprocess.run(["bash", "-n"], input=filled, capture_output=True)
+        expect("the committed TeamViewer template renders to valid bash with no placeholder left, and its secret line "
+               "normalises back to the placeholder",
+               syn.returncode == 0 and b"@@" not in filled.replace(b"''|@@*)", b"")
+               and normalise_script(filled, rsc) == render_script(rt, rsc, spec, None), [syn.stderr.decode()])
     print(f"self-test: {'FAILED ' + str(len(fails)) if fails else 'passed'}")
     return 1 if fails else 0
 
