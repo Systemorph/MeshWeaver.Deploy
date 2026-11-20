@@ -5429,6 +5429,16 @@ _dbrc hosting-db-reclaim reclaim "${DBRC_ARGS[@]}"
   || bad "unknown live size sized as whole table" "rc=${_dbrc_rc} out: ${_dbrc_out}"
 rm -rf "$_dbrc_state"
 
+# …and a table whose WHOLE size is below the threshold is skipped even with an unknown estimate
+_dbrc_new; printf 'hosting\t5000000\t3000000\t1000000\t1000000\t10\t20\tpg_stat\t-1\t0\n' > "$_dbrc_state/tables"
+_dbrc hosting-db-reclaim reclaim "${DBRC_ARGS[@]}"
+[ "$_dbrc_rc" -eq 0 ] && grep_in "$_dbrc_out" -q '::hosting:: reclaim_skipped=hosting.mesh_node_history' \
+  && grep_in "$_dbrc_out" -q 'the whole table is 5000000 bytes' && ! grep_in "$_dbrc_log" -q 'VACUUM' \
+  && grep_in "$_dbrc_out" -q '::hosting:: reclaimed_total=0' \
+  && ok "…and a table smaller than the threshold is never locked, whatever its estimate" \
+  || bad "small table skipped" "rc=${_dbrc_rc} out: ${_dbrc_out}"
+rm -rf "$_dbrc_state"
+
 # reclaim: a table that no longer fits the budget is not started
 _dbrc_new; _dbrc hosting-db-reclaim reclaim "${DBRC_ARGS[@]}" --budget-seconds 60
 [ "$_dbrc_rc" -ne 0 ] && grep_in "$_dbrc_out" -q 'STOPPED before hosting.mesh_node_history' && ! grep_in "$_dbrc_log" -q 'VACUUM' \
@@ -5484,6 +5494,14 @@ refuses_hard "hosting-db-reclaim refuses a login given empty" "was given EMPTY" 
   env HOSTING_DRY_RUN=true hosting-db-reclaim measure --database acmedb --server pg.test --user ''
 refuses_hard "hosting-db-reclaim refuses a non-numeric --top" "is not a whole number" \
   env HOSTING_DRY_RUN=true hosting-db-reclaim measure --database acmedb --server pg.test --user u --top 'x;y'
+refuses_hard "a rewrite rate that would wrap the arithmetic is refused" "is outside 1..100000" \
+  env HOSTING_DRY_RUN=true hosting-db-reclaim measure --database acmedb --server pg.test --user u --rate-mib-per-second 999999999999999
+refuses_hard "a budget beyond a day is refused" "is outside 0..86400" \
+  env HOSTING_DRY_RUN=true hosting-db-reclaim reclaim --database acmedb --server pg.test --user u --budget-seconds 999999999999999
+refuses_hard "a headroom beyond 1000% is refused" "is outside 0..1000" \
+  env HOSTING_DRY_RUN=true hosting-db-reclaim reclaim --database acmedb --server pg.test --user u --headroom-percent 999999999999999
+refuses_hard "a lock wait beyond an hour is refused" "is outside 1..3600" \
+  env HOSTING_DRY_RUN=true hosting-db-reclaim reclaim --database acmedb --server pg.test --user u --lock-timeout-seconds 7200
 refuses_hard "measure takes no reclaim-only flag" "ride reclaim only" \
   env HOSTING_DRY_RUN=true hosting-db-reclaim measure --database acmedb --server pg.test --user u --budget-seconds 60
 unset _dbrc_out _dbrc_rc _dbrc_log _dbrc_az _dbrc_state _c1 _c2 _vac _sizes _s1 _s2 _sysdb

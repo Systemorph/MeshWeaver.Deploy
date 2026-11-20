@@ -130,8 +130,13 @@ for _n in top:"$top" min-reclaim-bytes:"$min_reclaim" headroom-percent:"$headroo
   [[ "${_n#*:}" =~ ^[0-9]{1,15}$ ]] || hosting::die "--${_n%%:*} '${_n#*:}' is not a whole number"
 done
 [ "$top" -ge 1 ] && [ "$top" -le 100 ] || hosting::die "--top ${top} is outside 1..100"
-[ "$rate_mib" -ge 1 ] || hosting::die "--rate-mib-per-second must be at least 1"
-[ "$lock_timeout" -ge 1 ] || hosting::die "--lock-timeout-seconds must be at least 1"
+# Realistic bounds, so no value can wrap the 64-bit arithmetic below and turn a guard into a pass (a negative
+# estimate would fit any budget): a rewrite faster than 100 000 MiB/s, a day-long budget, or an hour-long lock wait
+# is a mistyped plan, refused here.
+[ "$rate_mib" -ge 1 ] && [ "$rate_mib" -le 100000 ] || hosting::die "--rate-mib-per-second ${rate_mib} is outside 1..100000"
+[ "$lock_timeout" -ge 1 ] && [ "$lock_timeout" -le 3600 ] || hosting::die "--lock-timeout-seconds ${lock_timeout} is outside 1..3600"
+[ "$budget" -le 86400 ] || hosting::die "--budget-seconds ${budget} is outside 0..86400"
+[ "$headroom" -le 1000 ] || hosting::die "--headroom-percent ${headroom} is outside 0..1000"
 [ "$verb" = reclaim ] || [ "${reclaim_only:-0}" = 0 ] \
   || hosting::die "--min-reclaim-bytes, --headroom-percent, --budget-seconds and --lock-timeout-seconds ride reclaim only — measure changes nothing"
 
@@ -223,8 +228,10 @@ WITH stattuple AS (
   FROM measured m
 )
 SELECT 'T', schema, total, total - idx - toast, toast, idx, live, dead, live_source,
-       CASE WHEN live = 0 THEN 0
-            WHEN sampled = 0 THEN -1
+       -- 0 only when the statistics AND the sample agree the table is empty: pg_stat reads 0 until the first
+       -- ANALYZE (a restored database), and a confident 0 would size the reclaim's room check at nothing.
+       CASE WHEN live = 0 AND sampled = 0 THEN 0
+            WHEN live = 0 OR sampled = 0 THEN -1
             ELSE (live::numeric * avg_row
                   + CASE WHEN live + dead = 0 THEN idx ELSE idx::numeric * live / (live + dead) END)::bigint END,
        sampled
@@ -330,7 +337,7 @@ report_measurement() {
     hosting::say reclaimable_bytes "$r"
     hosting::say estimate_method "$method"
     hosting::say estimated_seconds "$est"
-    hosting::log "${t_schema[$i]}.mesh_node_history: ${t_total[$i]} bytes (heap ${t_heap[$i]}, toast ${t_toast[$i]}, index ${t_idx[$i]}), ${t_live[$i]} live / ${t_dead[$i]} dead tuples, ~${r} reclaimable, ~${est}s to rewrite at ${rate_mib} MiB/s"
+    hosting::log "${t_schema[$i]}.mesh_node_history: ${t_total[$i]} bytes (heap ${t_heap[$i]}, toast ${t_toast[$i]}, index ${t_idx[$i]}), ${t_live[$i]} live / ${t_dead[$i]} dead tuples, reclaimable ${r}, rewrite estimate ${est} s at ${rate_mib} MiB/s"
     [ "$r" = unknown ] || sum=$((sum + r))
   done
   hosting::say candidate_tables "$n"
@@ -373,6 +380,12 @@ for ((i = 0; i < n; i++)); do
   if [ "$r" != unknown ] && [ "$r" -lt "$min_reclaim" ]; then
     hosting::say reclaim_skipped "$table"
     hosting::say skip_reason "estimate ${r} bytes is below --min-reclaim-bytes ${min_reclaim}"
+    continue
+  fi
+  # A table smaller than the threshold cannot give back more than its whole size — known estimate or not.
+  if [ "${t_total[$i]}" -lt "$min_reclaim" ]; then
+    hosting::say reclaim_skipped "$table"
+    hosting::say skip_reason "the whole table is ${t_total[$i]} bytes, below --min-reclaim-bytes ${min_reclaim}"
     continue
   fi
   # An unknown live size is sized as the whole table: the worst case, never a guess in the safe direction.
