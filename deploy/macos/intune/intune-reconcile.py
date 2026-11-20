@@ -1032,7 +1032,10 @@ class Reconcile:
                 diffs = []
                 for k, v in sorted(dict(pr["settings"], description=pr.get("description", "")).items()):
                     lv = prof.get(k)
-                    same = sorted(lv or []) == sorted(v) if isinstance(v, list) else (lv or "") == v if isinstance(v, str) else lv == v
+                    # an unset value may read back as null: null is "" for a string, [] for a list and false for a
+                    # boolean (Graph's default) — else a declared false would read as drift forever (review on #332)
+                    same = sorted(lv or []) == sorted(v) if isinstance(v, list) else (lv or "") == v if isinstance(v, str) \
+                        else (False if lv is None else lv) == v
                     if not same:
                         diffs.append(f"{k} live={lv!r} spec={v!r}")
                 if diffs:
@@ -1865,6 +1868,12 @@ def self_test():
            and any(ln.startswith("OK") and "enrollment assignment studio-1" in ln for ln in lines)
            and any(ln.startswith("PENDING") and "studio-9" in ln and "Apple Business Manager" in ln for ln in lines), lines)
     pid = made[0]["id"]
+    tk["_profiles"][pid]["registrationDisabled"] = None
+    tk["_profiles"][pid].pop("enableAuthenticationViaCompanyPortal", None)
+    nl = run(st13, False, {**ade, "enrollmentProgram": {**ep, "profiles": [dict(ep["profiles"][0], settings=dict(
+        ep["profiles"][0]["settings"], registrationDisabled=False, enableAuthenticationViaCompanyPortal=False))]}})[1]
+    expect("ADE: a boolean Graph reads back as null (or omits) matches a declared false — never drift forever",
+           not any(ln.startswith("DRIFT") and ("registrationDisabled" in ln or "enableAuthenticationViaCompanyPortal" in ln) for ln in nl), nl)
     tk["_profiles"][pid]["requiresUserAuthentication"] = True
     tk["_profiles"]["other"] = {"id": "other", "@odata.type": DEP_MACOS_T, "displayName": "Someone's", "isDefault": True}
     tk["_profiles"][pid]["isDefault"] = False

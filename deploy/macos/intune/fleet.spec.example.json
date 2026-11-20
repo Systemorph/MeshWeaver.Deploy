@@ -272,7 +272,7 @@
           "profileRemovalDisabled": "true — the local admin cannot remove the MDM profile; leaving the fleet is a retire in Intune",
           "skipPrimarySetupAccountCreation / setPrimarySetupAccountAsRegularUser / autoAdvanceSetupEnabled": "false — a person creates the console account at Setup Assistant (the fleet bootstrap runs as the console user, and an admin one); auto-advance would leave a Mac with no console user, so it is off; no local admin account is declared (its password would be a secret in this spec)",
           "locationDisabled": "false — Location Services stays so the time zone sets itself: the update policy's night window is in LOCAL time",
-          "fileVaultDisabled": "true — the Studios run without FileVault on the startup volume (group unattendedBoot); FileVault for any other fleet Mac comes from the declared FileVault policy, not from Setup Assistant",
+          "fileVaultDisabled": "true — skips Setup Assistant's FileVault pane ONLY; it neither turns FileVault on nor off. Whether a fleet Mac is encrypted stays the declared FileVault policy's decision after enrolment, never a person's choice at the console",
           "restoreBlocked": "true — no Migration Assistant / restore: a fleet Mac starts clean and is built by the bootstrap",
           "appleIdDisabled / iCloudStorageDisabled / iCloudDiagnosticsDisabled": "true — no Apple Account and no iCloud on a fleet host",
           "termsAndConditionsDisabled": "true — the organisation accepts Apple's terms through Apple Business Manager",

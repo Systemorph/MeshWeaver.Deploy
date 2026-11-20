@@ -204,8 +204,11 @@ wrote `" echo ok ;; *) echo red ;; esac) …"` instead of the verdict.
 ### The enrollment program (Apple Business Manager → Automated Device Enrollment)
 
 With the `enrollmentProgram` section a fleet Mac enrols **zero-touch**: assigned to the fleet's MDM server in Apple
-Business Manager, it enrols at Setup Assistant, comes up **supervised**, and — supervised and enrolled through ADE —
-escrows its **bootstrap token** to Intune when the first secure-token account signs in. Graph **beta** only (the v1.0
+Business Manager, it enrols at Setup Assistant and comes up **supervised**. Its **bootstrap token**: Apple documents
+that on macOS 26 or later the Mac creates one during device-management enrolment, and otherwise tries to generate and
+store one whenever a secure-token user logs in, where the MDM supports it (Apple Platform Deployment, *Use secure token,
+bootstrap token, and volume ownership in deployments*); that Intune receives it so on the fleet's Macs is NOT
+established, so the bootstrap's `bootstrap-token` reading (above) stays the check. Graph **beta** only (the v1.0
 endpoint carries none of these routes), read against the Microsoft Graph beta reference:
 
 | What | Graph | `--check` | `--apply` |
@@ -232,7 +235,7 @@ line starts 30 days before.
 **A Mac already enrolled through Company Portal** (user enrolment) had no escrowed bootstrap token — measured on all
 three fleet Macs on 2026-11-12 (MeshWeaver.Plugins `Hosting/MacStudioOnboarding` row 0b). Once ABM lists its serial under this MDM server and the profile is assigned (`OK enrollment assignment …`),
 `sudo profiles renew -type enrollment` on the Mac re-runs the enrolment through ADE. NOT established: whether that
-converts a user-enrolled Mac to an ADE enrolment (the fleet profile, the token's bootstrap-token escrow) WITHOUT an
+converts a user-enrolled Mac to an ADE enrolment (the fleet profile, supervision) WITHOUT an
 erase on the fleet's macOS versions; the fallback is an erase and a fresh Setup Assistant. Also NOT established: whether
 Intune honours the per-pane booleans (`appleIdDisabled`, …) alone or expects `enabledSkipKeys` too — read the created
 profile back in the admin center after the first `--apply`.
