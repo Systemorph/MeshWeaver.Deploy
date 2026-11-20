@@ -24,13 +24,16 @@
 #     throwaway namespace, deleted last). Without one the probe runs in the fixed namespace `hosting-probes`;
 #   * a pod that can authenticate to the API server: automountServiceAccountToken must be `false`, the service account
 #     the namespace's `default`, and no projected serviceAccountToken volume;
-#   * a pod that can READ a Secret: a secret or projected-secret volume, an envFrom secretRef, a secretKeyRef — its log
+#   * a pod that can READ a Secret: a secret or projected-secret volume, an inline CSI volume (the secrets-store driver
+#     mounts Secret contents, and baseline allows csi), an envFrom secretRef, a secretKeyRef — its log
 #     lands on the action node, so nothing it could print may come from a Secret;
 #   * anything beyond the Pod Security BASELINE level, BY NAME: privileged, hostNetwork/hostPID/hostIPC, a hostPath
 #     volume, a hostPort, a capability outside baseline's set, a procMount, an Unconfined seccomp or AppArmor profile,
 #     an unsafe sysctl, a Windows hostProcess;
 #   * a pod that would outlive the bound on its own: restartPolicy must be Never and activeDeadlineSeconds at most
-#     HOSTING_PROBE_MAX_SECONDS (900); a Job must also carry backoffLimit 0.
+#     HOSTING_PROBE_MAX_SECONDS (900) on the pod (a Job's pod TEMPLATE — inherited by its one pod, enforced by the
+#     kubelet); a Job must also carry backoffLimit 0, and a Job-level activeDeadlineSeconds, when set, is held to the
+#     same bound.
 #
 # The path is relative to deploy/aks/manifests and must start with probes/.
 # shellcheck source=_common.sh
@@ -142,6 +145,7 @@ problems="$(jq -r --arg fixed "$PROBE_NAMESPACE" --argjson max "$MAX_SECONDS" '
             (if ($p.restartPolicy // "") != "Never" then "\($id): restartPolicy must be Never" else empty end),
             (if (($p.activeDeadlineSeconds // 0) < 1 or ($p.activeDeadlineSeconds // 0) > $max) then "\($id): activeDeadlineSeconds must be set, at most \($max) — a probe ends on its own" else empty end),
             (if .kind == "Job" and (.spec.backoffLimit // 6) != 0 then "\($id): a probe Job carries backoffLimit 0" else empty end),
+            (if .kind == "Job" and .spec.activeDeadlineSeconds != null and (.spec.activeDeadlineSeconds < 1 or .spec.activeDeadlineSeconds > $max) then "\($id): the Job'"'"'s own activeDeadlineSeconds must be at most \($max) when it is set — the pod template'"'"'s bound is the one enforced, and a Job-level value may only tighten it" else empty end),
             (if $p.hostNetwork == true then "\($id): hostNetwork is beyond Pod Security baseline" else empty end),
             (if $p.hostPID == true then "\($id): hostPID is beyond Pod Security baseline" else empty end),
             (if $p.hostIPC == true then "\($id): hostIPC is beyond Pod Security baseline" else empty end),
@@ -151,6 +155,7 @@ problems="$(jq -r --arg fixed "$PROBE_NAMESPACE" --argjson max "$MAX_SECONDS" '
             (if ($p.securityContext.appArmorProfile.type // "") == "Unconfined" then "\($id): an Unconfined AppArmor profile is beyond Pod Security baseline" else empty end),
             (($p.volumes // [])[] | select(.hostPath != null) | "\($id): hostPath volume \(.name) is beyond Pod Security baseline"),
             (($p.volumes // [])[] | select(.secret != null) | "\($id): volume \(.name) mounts a Secret — a probe reads no Secret"),
+            (($p.volumes // [])[] | select(.csi != null) | "\($id): volume \(.name) is an inline CSI volume (driver \(.csi.driver // "?")) — a CSI driver such as the secrets store mounts Secret contents, so a probe mounts none"),
             (($p.volumes // [])[] | .name as $v | (.projected.sources // [])[]
                | (if .secret != null then "\($id): volume \($v) projects a Secret — a probe reads no Secret" else empty end),
                  (if .serviceAccountToken != null then "\($id): volume \($v) projects a service-account token — a probe never holds an API token" else empty end)),

@@ -6752,8 +6752,8 @@ pr MW_LIVE_NS=hosting-probes MW_PROBE_PHASE=Failed -- run --manifest probes/good
 [ "$_pr_rc" -eq 0 ] && [ -z "$_pr_left" ] && case "$_pr_out" in *"probe_result=failed"*"probe_cleaned=1"*) true ;; *) false ;; esac \
   && ok "a probe that FAILS is an answer — reported, and still cleaned up" || bad "failed probe" "rc ${_pr_rc}; left: ${_pr_left}; ${_pr_out}"
 pr MW_LIVE_NS=hosting-probes MW_PROBE_PHASE=Running -- run --manifest probes/good.yaml --sha256 "$_pr_good"
-[ -z "$_pr_left" ] && case "$_pr_out" in *"probe_result=timeout"*"probe_cleaned=1"*) true ;; *) false ;; esac \
-  && ok "a probe that outlives its bound is a timeout — reported, and still cleaned up" || bad "timeout probe" "rc ${_pr_rc}; left: ${_pr_left}; ${_pr_out}"
+[ "$_pr_rc" -eq 0 ] && [ -z "$_pr_left" ] && case "$_pr_out" in *"probe_result=timeout"*"probe_cleaned=1"*) true ;; *) false ;; esac \
+  && ok "a probe that outlives its bound is a timeout — an answer like a failure (exit 0), reported, and still cleaned up" || bad "timeout probe" "rc ${_pr_rc}; left: ${_pr_left}; ${_pr_out}"
 
 pr MW_LIVE_NS=hosting-probes MW_DELETE_STUCK=1 -- run --manifest probes/good.yaml --sha256 "$_pr_good"
 [ "$_pr_rc" -ne 0 ] && case "$_pr_out" in *"NOT cleaned up"*"pod/userns"*) true ;; *) false ;; esac \
@@ -6798,6 +6798,7 @@ pr_refuses "an API token (automount not false)" "automountServiceAccountToken mu
 pr_refuses "another service account" "serviceAccountName operator" "$(pr_mut '.spec.serviceAccountName = "operator"')"
 pr_refuses "a projected token" "projects a service-account token" "$(pr_mut '.spec.volumes = [{"name":"t","projected":{"sources":[{"serviceAccountToken":{"path":"t"}}]}}]')"
 pr_refuses "a Secret volume" "mounts a Secret — a probe reads no Secret" "$(pr_mut '.spec.volumes = [{"name":"s","secret":{"secretName":"x"}}]')"
+pr_refuses "an inline CSI volume (the secrets-store driver)" "is an inline CSI volume (driver secrets-store.csi.k8s.io)" "$(pr_mut '.spec.volumes = [{"name":"c","csi":{"driver":"secrets-store.csi.k8s.io","readOnly":true}}]')"
 pr_refuses "an envFrom Secret" "reads Secret x through envFrom" "$(pr_mut '.spec.containers[0].envFrom = [{"secretRef":{"name":"x"}}]')"
 pr_refuses "a secretKeyRef" "reads Secret x through secretKeyRef" "$(pr_mut '.spec.containers[0].env = [{"name":"E","valueFrom":{"secretKeyRef":{"name":"x","key":"k"}}}]')"
 pr_refuses "restartPolicy other than Never" "restartPolicy must be Never" "$(pr_mut '.spec.restartPolicy = "Always"')"
@@ -6811,6 +6812,7 @@ $(pr_mut '.metadata.name = "second"')"
 pr_refuses "a throwaway namespace not named probe-…" "a throwaway namespace is named probe-<name>" '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"scratch"}}
 '"$(pr_mut '.metadata.namespace = "scratch"')"
 pr_refuses "a Job that retries" "carries backoffLimit 0" '{"apiVersion":"batch/v1","kind":"Job","metadata":{"name":"j","namespace":"hosting-probes"},"spec":{"template":{"spec":{"restartPolicy":"Never","activeDeadlineSeconds":5,"automountServiceAccountToken":false,"containers":[{"name":"p","image":"busybox"}]}}}}'
+pr_refuses "a Job-level activeDeadlineSeconds beyond the bound" "the Job's own activeDeadlineSeconds must be at most 900" '{"apiVersion":"batch/v1","kind":"Job","metadata":{"name":"j","namespace":"hosting-probes"},"spec":{"backoffLimit":0,"activeDeadlineSeconds":3600,"template":{"spec":{"restartPolicy":"Never","activeDeadlineSeconds":5,"automountServiceAccountToken":false,"containers":[{"name":"p","image":"busybox"}]}}}}'
 # NEGATIVE CONTROL: what baseline allows (NET_BIND_SERVICE, a safe sysctl) passes.
 pr_fixture bad "$(pr_mut '.spec.containers[0].securityContext.capabilities.add = ["NET_BIND_SERVICE"] | .spec.securityContext.sysctls = [{"name":"net.ipv4.ping_group_range","value":"0 0"}]')"
 pr MW_LIVE_NS=hosting-probes -- check --manifest probes/bad.yaml

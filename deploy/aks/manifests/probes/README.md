@@ -26,12 +26,13 @@ repository's aks-ops lane. Never `kubectl apply` it by hand.
   must already exist (applied through `ApplyClusterManifest`).
 - `automountServiceAccountToken: false`. The namespace's `default` account, and no projected token. **A probe never
   holds an API token.**
-- **No Secret**: no secret or projected-secret volume, no `envFrom` secretRef, no `secretKeyRef`. Its log lands on the
-  action node.
+- **No Secret**: no secret or projected-secret volume, no inline `csi` volume (the secrets-store driver mounts Secret
+  contents, and baseline allows `csi`), no `envFrom` secretRef, no `secretKeyRef`. Its log lands on the action node.
 - **Pod Security baseline at most**. No `privileged`, no `hostNetwork`/`hostPID`/`hostIPC`, no `hostPath`, no
   `hostPort`, no capability outside baseline's set, no `procMount`, no Unconfined seccomp or AppArmor profile, no unsafe
   sysctl. A probe that needs more (for example bubblewrap with `SYS_ADMIN`) is refused by name: that question needs an
   owner's decision, not a probe.
 - `restartPolicy: Never` and `activeDeadlineSeconds` ≤ 900, so the pod ends on its own even if the lane dies before its
-  cleanup. A Job also carries `backoffLimit: 0`.
+  cleanup. For a Job that bound is the pod template's (the one pod inherits it and the kubelet enforces it); the Job
+  also carries `backoffLimit: 0`, and a Job-level `activeDeadlineSeconds`, when set, is held to the same ≤ 900.
 - Committed verbatim: no `<placeholder>`.
