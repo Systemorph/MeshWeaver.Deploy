@@ -6702,6 +6702,125 @@ else
 fi
 
 echo
+echo "── hosting-probe-run: a committed probe pod, bound to its digest, always deleted and read back ──"
+# The RunProbe action's one command (MeshWeaver.Plugins#5630; the config repo's aks-ops lane runs it). What is tested:
+# the path and digest refusals, the validation (one Pod/Job, no API token, no Secret, Pod Security baseline, a bound),
+# that `check` creates nothing, that `run` never adopts an object it did not create, and that EVERYTHING it created is
+# deleted and read back as gone on every exit path — a cleanup it cannot confirm is red.
+PR_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/probe-run" && pwd)"
+_pr_root="$(mktemp -d)"; mkdir -p "$_pr_root/probes" "$_pr_root/demo"
+pr_fixture() {  # pr_fixture <name> <parsed json>
+  printf 'kind: Pod # fixture %s\n' "$1" > "$_pr_root/probes/$1.yaml"; printf '%s\n' "$2" > "$_pr_root/probes/$1.yaml.json"
+}
+pr_sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$_pr_root/probes/$1.yaml" | cut -d' ' -f1; else shasum -a 256 "$_pr_root/probes/$1.yaml" | cut -d' ' -f1; fi; }
+pr() {  # pr [VAR=value…] -- <args…>; sets $_pr_out $_pr_rc $_pr_log $_pr_left
+  local envs=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  shift
+  _pr_state="$(mktemp -d)"
+  _pr_out="$(env "${envs[@]+"${envs[@]}"}" PATH="$PR_STUBS:$PATH" HOSTING_PR_STATE="$_pr_state" HOSTING_MANIFESTS_ROOT="$_pr_root" \
+             HOSTING_PROBE_POLL_SECONDS=0 HOSTING_PROBE_GRACE_SECONDS=0 hosting-probe-run "$@" 2>&1)"; _pr_rc=$?
+  _pr_log="$(cat "$_pr_state/kubectl.log" 2>/dev/null || true)"
+  _pr_left="$(ls "$_pr_state/cluster" 2>/dev/null | tr '\n' ' ')"; rm -rf "$_pr_state"
+}
+PR_POD='{"apiVersion":"v1","kind":"Pod","metadata":{"name":"userns","namespace":"hosting-probes"},"spec":{"restartPolicy":"Never","activeDeadlineSeconds":1,"automountServiceAccountToken":false,"containers":[{"name":"p","image":"busybox","command":["unshare","-U","true"]}]}}'
+pr_fixture good "$PR_POD"
+pr_fixture ownns '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"probe-nfs"}}
+{"apiVersion":"batch/v1","kind":"Job","metadata":{"name":"nfs","namespace":"probe-nfs"},"spec":{"backoffLimit":0,"template":{"spec":{"restartPolicy":"Never","activeDeadlineSeconds":1,"automountServiceAccountToken":false,"containers":[{"name":"p","image":"busybox"}]}}}}'
+pr_mut() { jq -c "$1" <<< "$PR_POD"; }
+_pr_good="$(pr_sha good)"; _pr_own="$(pr_sha ownns)"
+
+pr MW_LIVE_NS=hosting-probes -- check --manifest probes/good.yaml
+[ "$_pr_rc" -eq 0 ] && case "$_pr_out" in *"::hosting:: probe_digest=sha256:${_pr_good}"*"::hosting:: probe_check=sha256:${_pr_good}"*) true ;; *) false ;; esac \
+  && ok "probe check prints the digest and the server's dry-run answer" || bad "probe check" "rc ${_pr_rc}: ${_pr_out}"
+if grep_in "$_pr_log" -qE '^kubectl (-n [^ ]+ )?create -f'; then bad "probe check creates nothing" "kubectl saw: ${_pr_log}"; else ok "probe check creates nothing (a server dry run only)"; fi
+pr -- check --manifest probes/good.yaml
+[ "$_pr_rc" -ne 0 ] && case "$_pr_out" in *"namespace hosting-probes does not exist"*) true ;; *) false ;; esac \
+  && ok "probe check refuses when the fixed probe namespace is not there" || bad "fixed namespace absent" "rc ${_pr_rc}: ${_pr_out}"
+
+pr MW_LIVE_NS=hosting-probes MW_PROBE_LOG='hello token=abc123 bye' -- run --manifest probes/good.yaml --sha256 "$_pr_good"
+[ "$_pr_rc" -eq 0 ] && [ -z "$_pr_left" ] \
+  && case "$_pr_out" in *"probe | hello token=<redacted> bye"*"::hosting:: probe_result=succeeded"*"::hosting:: probe_cleaned=1"*) true ;; *) false ;; esac \
+  && ok "probe run creates, waits, prints the masked log, deletes the pod and reads it back as gone" || bad "probe run" "rc ${_pr_rc}; left: ${_pr_left}; ${_pr_out}"
+case "$_pr_out" in *abc123*) bad "the probe log is masked" "the planted value survived: ${_pr_out}" ;; *) ok "a secret-shaped value in the probe log is masked" ;; esac
+
+pr -- run --manifest probes/ownns.yaml --sha256 "$_pr_own"
+[ "$_pr_rc" -eq 0 ] && [ -z "$_pr_left" ] && case "$_pr_out" in *"probe_result=succeeded"*"probe_cleaned=2"*) true ;; *) false ;; esac \
+  && ok "a probe Job in its own throwaway namespace: both deleted, both read back" || bad "own-namespace job" "rc ${_pr_rc}; left: ${_pr_left}; ${_pr_out}"
+
+pr MW_LIVE_NS=hosting-probes MW_PROBE_PHASE=Failed -- run --manifest probes/good.yaml --sha256 "$_pr_good"
+[ "$_pr_rc" -eq 0 ] && [ -z "$_pr_left" ] && case "$_pr_out" in *"probe_result=failed"*"probe_cleaned=1"*) true ;; *) false ;; esac \
+  && ok "a probe that FAILS is an answer — reported, and still cleaned up" || bad "failed probe" "rc ${_pr_rc}; left: ${_pr_left}; ${_pr_out}"
+pr MW_LIVE_NS=hosting-probes MW_PROBE_PHASE=Running -- run --manifest probes/good.yaml --sha256 "$_pr_good"
+[ "$_pr_rc" -eq 0 ] && [ -z "$_pr_left" ] && case "$_pr_out" in *"probe_result=timeout"*"probe_cleaned=1"*) true ;; *) false ;; esac \
+  && ok "a probe that outlives its bound is a timeout — an answer like a failure (exit 0), reported, and still cleaned up" || bad "timeout probe" "rc ${_pr_rc}; left: ${_pr_left}; ${_pr_out}"
+
+pr MW_LIVE_NS=hosting-probes MW_DELETE_STUCK=1 -- run --manifest probes/good.yaml --sha256 "$_pr_good"
+[ "$_pr_rc" -ne 0 ] && case "$_pr_out" in *"NOT cleaned up"*"pod/userns"*) true ;; *) false ;; esac \
+  && case "$_pr_out" in *"probe_cleaned="*) false ;; *) true ;; esac \
+  && ok "a delete that leaves the probe behind is RED, naming what is left — the read-back decides, not the delete's answer" || bad "stuck delete" "rc ${_pr_rc}; ${_pr_out}"
+
+pr MW_CREATE_FAILS=1 -- run --manifest probes/ownns.yaml --sha256 "$_pr_own"
+[ "$_pr_rc" -ne 0 ] && [ -z "$_pr_left" ] && case "$_pr_out" in *"creating deploy/aks/manifests/probes/ownns.yaml failed"*"probe_cleaned="*) true ;; *) false ;; esac \
+  && ok "a probe create that fails half-way is red AND what it did create is deleted and read back" || bad "partial create" "rc ${_pr_rc}; left: ${_pr_left}; ${_pr_out}"
+
+pr MW_LIVE_NS="hosting-probes probe-nfs" -- run --manifest probes/ownns.yaml --sha256 "$_pr_own"
+if [ "$_pr_rc" -ne 0 ] && case "$_pr_out" in *"already exists"*"Nothing was created"*) true ;; *) false ;; esac \
+   && ! grep_in "$_pr_log" -qE '(create -f|delete )'; then
+  ok "an object of the probe that already exists is refused untouched — the run deletes only what it creates"
+else bad "never adopt" "rc ${_pr_rc}; kubectl: ${_pr_log}; ${_pr_out}"; fi
+
+pr MW_LIVE_NS=hosting-probes -- run --manifest probes/good.yaml
+[ "$_pr_rc" -ne 0 ] && [ -z "$_pr_log" ] && case "$_pr_out" in *"run needs --sha256"*) true ;; *) false ;; esac \
+  && ok "a probe run without a digest is refused before kubectl is asked anything" || bad "probe run without digest" "rc ${_pr_rc}; ${_pr_out}"
+pr MW_LIVE_NS=hosting-probes -- run --manifest probes/good.yaml --sha256 "$(printf '0%.0s' $(seq 1 64))"
+[ "$_pr_rc" -ne 0 ] && [ -z "$_pr_log" ] && case "$_pr_out" in *"not the bytes that were approved"*) true ;; *) false ;; esac \
+  && ok "a probe run with another digest is refused, nothing sent" || bad "probe digest mismatch" "rc ${_pr_rc}; ${_pr_log}; ${_pr_out}"
+refuses_hard "a probe outside deploy/aks/manifests/probes/ is refused" "is not a probe under deploy/aks/manifests/probes/" hosting-probe-run check --manifest demo/x.yaml
+refuses_hard "a probe path out of the probes directory is refused" "is not a probe under" hosting-probe-run check --manifest probes/../demo/x.yaml
+refuses_hard "the probe mode is check or run" "check or run" hosting-probe-run apply --manifest probes/good.yaml
+
+# Every rule refuses BY NAME, and nothing reaches the API server.
+pr_refuses() {  # pr_refuses <what> <phrase> <parsed json>
+  pr_fixture bad "$3"
+  pr MW_LIVE_NS=hosting-probes -- check --manifest probes/bad.yaml
+  if [ "$_pr_rc" -ne 0 ] && case "$_pr_out" in *"$2"*) true ;; *) false ;; esac \
+     && ! grep_in "$_pr_log" -qE 'dry-run=server|create -f|get namespace'; then ok "probe refused: $1"; else bad "probe refused: $1" "rc ${_pr_rc}; kubectl: ${_pr_log}; ${_pr_out}"; fi
+}
+pr_refuses "a privileged container" "is privileged — beyond Pod Security baseline" "$(pr_mut '.spec.containers[0].securityContext.privileged = true')"
+pr_refuses "hostNetwork" "hostNetwork is beyond Pod Security baseline" "$(pr_mut '.spec.hostNetwork = true')"
+pr_refuses "a hostPath volume" "hostPath volume h is beyond Pod Security baseline" "$(pr_mut '.spec.volumes = [{"name":"h","hostPath":{"path":"/"}}]')"
+pr_refuses "a capability outside baseline (the bubblewrap case)" "adds capability SYS_ADMIN" "$(pr_mut '.spec.containers[0].securityContext.capabilities.add = ["SYS_ADMIN"]')"
+pr_refuses "a hostPort" "binds hostPort 80" "$(pr_mut '.spec.containers[0].ports = [{"containerPort":80,"hostPort":80}]')"
+pr_refuses "an Unconfined seccomp profile" "seccomp profile is beyond Pod Security baseline" "$(pr_mut '.spec.securityContext.seccompProfile.type = "Unconfined"')"
+pr_refuses "an unsafe sysctl" "sysctl kernel.msgmax is beyond Pod Security baseline" "$(pr_mut '.spec.securityContext.sysctls = [{"name":"kernel.msgmax","value":"1"}]')"
+pr_refuses "an API token (automount not false)" "automountServiceAccountToken must be false" "$(pr_mut 'del(.spec.automountServiceAccountToken)')"
+pr_refuses "another service account" "serviceAccountName operator" "$(pr_mut '.spec.serviceAccountName = "operator"')"
+pr_refuses "a projected token" "projects a service-account token" "$(pr_mut '.spec.volumes = [{"name":"t","projected":{"sources":[{"serviceAccountToken":{"path":"t"}}]}}]')"
+pr_refuses "a Secret volume" "mounts a Secret — a probe reads no Secret" "$(pr_mut '.spec.volumes = [{"name":"s","secret":{"secretName":"x"}}]')"
+pr_refuses "an inline CSI volume (the secrets-store driver)" "is an inline CSI volume (driver secrets-store.csi.k8s.io)" "$(pr_mut '.spec.volumes = [{"name":"c","csi":{"driver":"secrets-store.csi.k8s.io","readOnly":true}}]')"
+pr_refuses "an envFrom Secret" "reads Secret x through envFrom" "$(pr_mut '.spec.containers[0].envFrom = [{"secretRef":{"name":"x"}}]')"
+pr_refuses "a secretKeyRef" "reads Secret x through secretKeyRef" "$(pr_mut '.spec.containers[0].env = [{"name":"E","valueFrom":{"secretKeyRef":{"name":"x","key":"k"}}}]')"
+pr_refuses "restartPolicy other than Never" "restartPolicy must be Never" "$(pr_mut '.spec.restartPolicy = "Always"')"
+pr_refuses "no activeDeadlineSeconds" "activeDeadlineSeconds must be set" "$(pr_mut 'del(.spec.activeDeadlineSeconds)')"
+pr_refuses "an activeDeadlineSeconds beyond the bound" "at most 900" "$(pr_mut '.spec.activeDeadlineSeconds = 3600')"
+pr_refuses "another namespace" "runs in namespace monitoring, not hosting-probes" "$(pr_mut '.metadata.namespace = "monitoring"')"
+pr_refuses "a kind a probe does not create" "kind Deployment is not one a probe creates" "$PR_POD
+{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"d\",\"namespace\":\"hosting-probes\"}}"
+pr_refuses "two pods" "a probe is exactly ONE Pod or ONE Job" "$PR_POD
+$(pr_mut '.metadata.name = "second"')"
+pr_refuses "a throwaway namespace not named probe-…" "a throwaway namespace is named probe-<name>" '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"scratch"}}
+'"$(pr_mut '.metadata.namespace = "scratch"')"
+pr_refuses "a Job that retries" "carries backoffLimit 0" '{"apiVersion":"batch/v1","kind":"Job","metadata":{"name":"j","namespace":"hosting-probes"},"spec":{"template":{"spec":{"restartPolicy":"Never","activeDeadlineSeconds":5,"automountServiceAccountToken":false,"containers":[{"name":"p","image":"busybox"}]}}}}'
+pr_refuses "a Job-level activeDeadlineSeconds beyond the bound" "the Job's own activeDeadlineSeconds must be at most 900" '{"apiVersion":"batch/v1","kind":"Job","metadata":{"name":"j","namespace":"hosting-probes"},"spec":{"backoffLimit":0,"activeDeadlineSeconds":3600,"template":{"spec":{"restartPolicy":"Never","activeDeadlineSeconds":5,"automountServiceAccountToken":false,"containers":[{"name":"p","image":"busybox"}]}}}}'
+# NEGATIVE CONTROL: what baseline allows (NET_BIND_SERVICE, a safe sysctl) passes.
+pr_fixture bad "$(pr_mut '.spec.containers[0].securityContext.capabilities.add = ["NET_BIND_SERVICE"] | .spec.securityContext.sysctls = [{"name":"net.ipv4.ping_group_range","value":"0 0"}]')"
+pr MW_LIVE_NS=hosting-probes -- check --manifest probes/bad.yaml
+[ "$_pr_rc" -eq 0 ] && ok "…and what baseline allows (NET_BIND_SERVICE, a safe sysctl) is not refused (negative control)" || bad "probe baseline negative control" "rc ${_pr_rc}: ${_pr_out}"
+rm -rf "$_pr_root"
+unset _pr_root _pr_out _pr_rc _pr_log _pr_left _pr_state _pr_good _pr_own PR_POD PR_STUBS
+
+echo
 echo "── no grep -q behind a pipe (SIGPIPE under pipefail reads a match as FALSE) ──"
 # Every script here runs under pipefail. `producer | grep -q` is then a race: grep exits on its
 # match, a producer still writing dies of SIGPIPE (141), and the condition reads FALSE — a present
