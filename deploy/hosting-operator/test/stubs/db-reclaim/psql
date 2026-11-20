@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# A stand-in psql for hosting-db-reclaim's tests. It plays ONE database from files in
+# $HOSTING_DBRC_STATE and records every invocation (PGPASSWORD set/unset, never the value; PGOPTIONS;
+# the statement, or `measure` for the read-only measurement read from stdin) in $HOSTING_DBRC_STATE/pg.log:
+#   tables       one measured table per line, TAB-separated, largest first:
+#                schema total heap toast index live dead live_source live_bytes sampled
+#   size.<schema>  the table's current size (default: its total from `tables`)
+#   after.<schema> what a VACUUM FULL leaves the table at (default: its live_bytes)
+#   repack       `<installed extversion>\t<available default_version>` (absent: neither)
+#   no-end       present: the measurement stops before its end marker (a truncated answer)
+#   fail-on      a substring: the first statement containing it fails (exit 1), nothing changes
+# Not a mock of Postgres: it asserts nothing about SQL semantics — only which statements the script
+# issues, in which order, under which session options, and what it does when one of them fails.
+set -uo pipefail
+state="${HOSTING_DBRC_STATE:?the psql stub needs HOSTING_DBRC_STATE}"
+sqltext="" db="" from_stdin=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    -tAc|-c) sqltext="${args[$((i + 1))]}" ;;
+    -d)      db="${args[$((i + 1))]}" ;;
+    -f)      [ "${args[$((i + 1))]}" = - ] && from_stdin=1 ;;
+  esac
+done
+[ -z "$from_stdin" ] || sqltext="$(cat)"
+shown="$sqltext"; case "$sqltext" in *"BEGIN TRANSACTION READ ONLY"*mesh_node_history*) shown="measure" ;; esac
+printf 'psql PGPASSWORD=%s PGOPTIONS=%s db=%s sql=%s\n' "$([ -n "${PGPASSWORD:-}" ] && echo set || echo unset)" \
+  "${PGOPTIONS:-}" "$db" "$shown" >> "$state/pg.log"
+fail_on="$(cat "$state/fail-on" 2>/dev/null || true)"
+if [ -n "$fail_on" ] && [[ "$sqltext" == *"$fail_on"* ]]; then
+  : > "$state/fail-on"
+  echo "ERROR:  stub refused: ${fail_on}" >&2; exit 1
+fi
+touch "$state/tables"
+field() { cut -f "$2" <<< "$1"; }
+row_of() { grep "^$1"$'\t' "$state/tables" | head -1; }
+case "$shown" in
+  measure)
+    case "${PGOPTIONS:-}" in *default_transaction_read_only=on*) ;; *) echo "psql stub: the measurement must run read-only" >&2; exit 1 ;; esac
+    # psql -F answers in the unit separator the script asks for; the fixture files stay TAB-separated.
+    {
+      while IFS= read -r t; do [ -n "$t" ] && printf 'T\t%s\n' "$t"; done < "$state/tables"
+      if [ -f "$state/repack" ]; then printf 'R\t%s\t\t\t\t\t\t\t%s\t\t\n' "$(cut -f1 "$state/repack")" "$(cut -f2 "$state/repack")"
+      else printf 'R\t\t\t\t\t\t\t\t\t\t\n'; fi
+      [ -e "$state/no-end" ] || printf 'E\t%s\t\t\t\t\t\t\t\t\t\n' "$db"
+    } | tr '\t' '\037' ;;
+  "SELECT pg_total_relation_size("*)
+    schema="$(printf '%s' "$sqltext" | sed -n "s/.*('\"\\([^\"]*\\)\"\\.mesh_node_history'::regclass).*/\\1/p")"
+    if [ -f "$state/size.$schema" ]; then cat "$state/size.$schema"; else field "$(row_of "$schema")" 2; fi ;;
+  "VACUUM (FULL, ANALYZE) "*)
+    schema="$(printf '%s' "$sqltext" | sed -n 's/^VACUUM (FULL, ANALYZE) "\([^"]*\)"\.mesh_node_history$/\1/p')"
+    [ -n "$schema" ] || { echo "psql stub: unexpected VACUUM: ${sqltext}" >&2; exit 1; }
+    if [ -f "$state/after.$schema" ]; then cp "$state/after.$schema" "$state/size.$schema"
+    else field "$(row_of "$schema")" 9 > "$state/size.$schema"; fi
+    echo "VACUUM" ;;
+  *) echo "psql stub: unexpected statement: ${sqltext}" >&2; exit 1 ;;
+esac
+exit 0

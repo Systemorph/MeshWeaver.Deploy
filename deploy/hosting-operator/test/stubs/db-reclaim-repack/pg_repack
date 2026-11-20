@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# A stand-in pg_repack client for hosting-db-reclaim's tests — on PATH only when a test puts this
+# directory there, so the default is an image WITHOUT the client. `--version` answers
+# `pg_repack <version>` from $HOSTING_DBRC_STATE/client-version (default 1.5.0); a run records its
+# argv (PGPASSWORD set/unset, never the value) in $HOSTING_DBRC_STATE/pg.log and leaves the table at
+# after.<schema> (default: its live_bytes), exactly as the psql stub's VACUUM FULL does.
+set -uo pipefail
+state="${HOSTING_DBRC_STATE:?the pg_repack stub needs HOSTING_DBRC_STATE}"
+if [ "${1:-}" = --version ]; then echo "pg_repack $(cat "$state/client-version" 2>/dev/null || echo 1.5.0)"; exit 0; fi
+printf 'pg_repack PGPASSWORD=%s %s\n' "$([ -n "${PGPASSWORD:-}" ] && echo set || echo unset)" "$*" >> "$state/pg.log"
+table=""
+while [ $# -gt 0 ]; do case "$1" in --table) table="${2:-}"; shift 2 ;; *) shift ;; esac; done
+schema="$(printf '%s' "$table" | sed -n 's/^"\([^"]*\)"\.mesh_node_history$/\1/p')"
+[ -n "$schema" ] || { echo "pg_repack stub: unexpected --table '${table}'" >&2; exit 1; }
+[ -e "$state/repack-fails" ] && { echo "ERROR: pg_repack stub refused" >&2; exit 1; }
+if [ -f "$state/after.$schema" ]; then cp "$state/after.$schema" "$state/size.$schema"
+else grep "^${schema}"$'\t' "$state/tables" | head -1 | cut -f9 > "$state/size.$schema"; fi
+echo "INFO: repacking table \"${schema}.mesh_node_history\""
