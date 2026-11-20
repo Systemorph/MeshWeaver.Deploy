@@ -12,7 +12,8 @@
       "Group.Read.All",
       "Device.Read.All",
       "GroupMember.ReadWrite.All",
-      "DeviceManagementManagedDevices.PrivilegedOperations.All"
+      "DeviceManagementManagedDevices.PrivilegedOperations.All",
+      "DeviceManagementServiceConfig.ReadWrite.All"
     ]
   },
   "groups": {
@@ -248,5 +249,76 @@
         ]
       }
     }
-  ]
+  ],
+  "enrollmentProgram": {
+    "_comment": "Apple Business Manager Automated Device Enrollment (ADE) for the fleet's Macs. The TOKEN is a person's act in two portals (Intune's public key → an ABM MDM server; the ABM server token back to Intune, named exactly as token.tokenName; renewed yearly) — the reconcile only reads it: until a token of this name exists its lines read AWAITING, never red. The profile is created / patched, made the token's DEFAULT macOS profile, and assigned to the serials of assign.devicesOf; a serial ABM has not assigned to this MDM server is PENDING. Graph beta: deviceManagement/depOnboardingSettings, …/enrollmentProfiles (depMacOSEnrollmentProfile), …/setDefaultProfile, …/updateDeviceProfileAssignment, …/importedAppleDeviceIdentities. Needs DeviceManagementServiceConfig.ReadWrite.All (apply) / .Read.All (check). Field reference: MeshWeaver.Deploy deploy/macos/intune/README.md → 'The enrollment program'.",
+    "token": {
+      "tokenName": "Fleet — Apple Business Manager",
+      "renewWarnDays": 30
+    },
+    "profiles": [
+      {
+        "key": "fleetMacs",
+        "platform": "macOS",
+        "default": true,
+        "displayName": "Fleet — Macs, unattended (ADE)",
+        "description": "Fleet Macs: no user affinity (they run unattended), supervised, locked enrolment, await final configuration; Setup Assistant shows only what a person must answer at the console (language/region, network, the console account, location for the time zone). Declared in the estate's Intune spec; reconciled by intune-reconcile.py.",
+        "_choices": {
+          "requiresUserAuthentication": "false — no user affinity: the Mac belongs to the fleet, not to a person, and enrols with nobody signing in to Entra (a Mac Studio runs unattended)",
+          "enableAuthenticationViaCompanyPortal / requireCompanyPortalOnSetupAssistantEnrolledDevices / usePlatformSSODuringSetupAssistant": "false — all three only make sense with user affinity",
+          "supervisedModeEnabled": "true — supervision is what lets MDM manage the bootstrap token, the software-update deferral and the restrictions without a person approving each",
+          "waitForDeviceConfiguredConfirmation": "true — await final configuration: Setup Assistant holds at its end until Intune has delivered the device-channel profiles (com.memex.local, energy, the fleet CA), so the console account is created on a Mac that already carries them",
+          "isMandatory": "true — locked enrolment: the person at Setup Assistant cannot skip MDM",
+          "profileRemovalDisabled": "true — the local admin cannot remove the MDM profile; leaving the fleet is a retire in Intune",
+          "skipPrimarySetupAccountCreation / setPrimarySetupAccountAsRegularUser / autoAdvanceSetupEnabled": "false — a person creates the console account at Setup Assistant (the fleet bootstrap runs as the console user, and an admin one); auto-advance would leave a Mac with no console user, so it is off; no local admin account is declared (its password would be a secret in this spec)",
+          "locationDisabled": "false — Location Services stays so the time zone sets itself: the update policy's night window is in LOCAL time",
+          "fileVaultDisabled": "true — skips Setup Assistant's FileVault pane ONLY; it neither turns FileVault on nor off. Whether a fleet Mac is encrypted stays the declared FileVault policy's decision after enrolment, never a person's choice at the console",
+          "restoreBlocked": "true — no Migration Assistant / restore: a fleet Mac starts clean and is built by the bootstrap",
+          "appleIdDisabled / iCloudStorageDisabled / iCloudDiagnosticsDisabled": "true — no Apple Account and no iCloud on a fleet host",
+          "termsAndConditionsDisabled": "true — the organisation accepts Apple's terms through Apple Business Manager",
+          "registrationDisabled / diagnosticsDisabled / privacyPaneDisabled / screenTimeScreenDisabled / siriDisabled / touchIdDisabled / applePayDisabled / displayToneSetupDisabled / zoomDisabled / accessibilityScreenDisabled / chooseYourLockScreenDisabled / autoUnlockWithWatchDisabled": "true — personal-device panes with no meaning on a headless host",
+          "enabledSkipKeys / deviceNameTemplate / supportPhoneNumber": "not declared — the panes are declared by the documented booleans above; the Mac's name is chosen by the person who sets it up (eiger, moench, …); no support phone is published"
+        },
+        "settings": {
+          "requiresUserAuthentication": false,
+          "enableAuthenticationViaCompanyPortal": false,
+          "requireCompanyPortalOnSetupAssistantEnrolledDevices": false,
+          "usePlatformSSODuringSetupAssistant": false,
+          "configurationWebUrl": false,
+          "supervisedModeEnabled": true,
+          "waitForDeviceConfiguredConfirmation": true,
+          "isMandatory": true,
+          "profileRemovalDisabled": true,
+          "skipPrimarySetupAccountCreation": false,
+          "setPrimarySetupAccountAsRegularUser": false,
+          "autoAdvanceSetupEnabled": false,
+          "locationDisabled": false,
+          "fileVaultDisabled": true,
+          "restoreBlocked": true,
+          "appleIdDisabled": true,
+          "iCloudStorageDisabled": true,
+          "iCloudDiagnosticsDisabled": true,
+          "termsAndConditionsDisabled": true,
+          "registrationDisabled": true,
+          "diagnosticsDisabled": true,
+          "privacyPaneDisabled": true,
+          "screenTimeScreenDisabled": true,
+          "siriDisabled": true,
+          "touchIdDisabled": true,
+          "applePayDisabled": true,
+          "displayToneSetupDisabled": true,
+          "zoomDisabled": true,
+          "accessibilityScreenDisabled": true,
+          "chooseYourLockScreenDisabled": true,
+          "autoUnlockWithWatchDisabled": true,
+          "supportDepartment": "Fleet operations"
+        },
+        "assign": {
+          "devicesOf": [
+            "studios"
+          ]
+        }
+      }
+    ]
+  }
 }

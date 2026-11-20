@@ -11,7 +11,9 @@ What the spec declares (deploy/macos/intune/README.md → "Intune objects as cod
 Macs in them (by serial number), the bootstrap shell script (content pinned to a commit + sha256), the
 `com.memex.local` custom profile and its keys, the trusted-root certificate of the fleet's local CA, the
 night-window DDM update policy, the compliance policies the Studios must be excluded from / given, every
-include and exclude assignment, and the application permissions the app identity must hold (verified only).
+include and exclude assignment, the Apple Business Manager enrollment program (the ADE token by name, the fleet's
+macOS enrollment profile, its default flag and the serials assigned to it), and the application permissions the app
+identity must hold (verified only).
 
 The rules the reconcile keeps:
   * --check never writes. Every line says what --apply WOULD do for it.
@@ -20,6 +22,9 @@ The rules the reconcile keeps:
   * An object marked "hold" is reported as drift and never written, not even by --apply: the owner's go
     lifts the hold in the spec (a reviewed change), not a flag on the command line.
   * A secret is never printed: the token is used, never echoed; ids are shortened to 8 characters.
+  * The enrollment program's token is uploaded by a PERSON (Intune's public key → Apple Business Manager, the server
+    token back to Intune — two portals, renewed yearly). Until a token of the declared name exists, its lines read
+    AWAITING (counted as pending, exit 0): a missing token never turns the rest of the spec red.
   * After an --apply that CHANGED a script, profile, certificate or settings policy, every Mac that object
     reaches (its include groups' members, minus its exclude groups') is asked to sync (managedDevices/{id}/
     syncDevice, one line per Mac): the Intune agent otherwise re-runs a CACHED script until its next full sync,
@@ -32,6 +37,7 @@ Python standard library only.
 import argparse
 import base64
 import copy
+import datetime
 import hashlib
 import json
 import os
@@ -52,6 +58,29 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 EMBED_MARK = b"__FLEET_EMBEDDED_BOOTSTRAP__"
 # The loader's last line: what makes the bytes appended after it inert. Only a host that ends in it may embed (#288).
 EMBED_GUARD = b"return 0 2>/dev/null || exit 0"
+# The Apple Business Manager enrollment program (Automated Device Enrollment). Graph beta only (measured against the
+# Microsoft Graph beta reference: depOnboardingSetting, depMacOSEnrollmentProfile, setDefaultProfile,
+# updateDeviceProfileAssignment, importedAppleDeviceIdentity). Read: DeviceManagementServiceConfig.Read.All;
+# write: DeviceManagementServiceConfig.ReadWrite.All.
+DEP = "beta/deviceManagement/depOnboardingSettings"
+DEP_MACOS_T = "#microsoft.graph.depMacOSEnrollmentProfile"
+# The depMacOSEnrollmentProfile properties a spec may declare, by JSON type. A name outside this set is refused by
+# validation (a typo would otherwise be drift forever, or a 400 at apply). adminAccountPassword is deliberately absent:
+# a secret never lives in the spec; isDefault is absent because `default` declares it (setDefaultProfile writes it).
+DEP_MACOS_BOOL = frozenset((
+    "requiresUserAuthentication", "enableAuthenticationViaCompanyPortal", "requireCompanyPortalOnSetupAssistantEnrolledDevices",
+    "supervisedModeEnabled", "isMandatory", "locationDisabled", "profileRemovalDisabled", "restoreBlocked", "appleIdDisabled",
+    "termsAndConditionsDisabled", "touchIdDisabled", "applePayDisabled", "siriDisabled", "diagnosticsDisabled",
+    "displayToneSetupDisabled", "privacyPaneDisabled", "screenTimeScreenDisabled", "configurationWebUrl",
+    "waitForDeviceConfiguredConfirmation", "registrationDisabled", "fileVaultDisabled", "iCloudDiagnosticsDisabled",
+    "passCodeDisabled", "zoomDisabled", "iCloudStorageDisabled", "chooseYourLockScreenDisabled", "accessibilityScreenDisabled",
+    "autoUnlockWithWatchDisabled", "skipPrimarySetupAccountCreation", "setPrimarySetupAccountAsRegularUser",
+    "dontAutoPopulatePrimaryAccountInfo", "enableRestrictEditing", "hideAdminAccount", "requestRequiresNetworkTether",
+    "autoAdvanceSetupEnabled", "usePlatformSSODuringSetupAssistant"))
+DEP_MACOS_STR = frozenset(("supportDepartment", "supportPhoneNumber", "deviceNameTemplate", "primaryAccountFullName",
+                           "primaryAccountUserName", "adminAccountUserName", "adminAccountFullName", "configurationEndpointUrl"))
+DEP_MACOS_LIST = frozenset(("enabledSkipKeys",))
+DEP_SECRET = frozenset(("adminAccountPassword",))
 SPECIAL_TARGETS = {
     "allDevices": "#microsoft.graph.allDevicesAssignmentTarget",
     "allLicensedUsers": "#microsoft.graph.allLicensedUsersAssignmentTarget",
@@ -335,9 +364,83 @@ def validate(spec, spec_dir):
         if not c.get("id") and not c.get("properties"):
             p.append(f"{w}: an undeclared-id policy needs properties to create it from")
         targets(w, c.get("assign"))
+    p.extend(validate_enrollment_program(spec.get("enrollmentProgram"), groups))
     app = spec.get("appIdentity") or {}
     if not isinstance(app.get("requiredRoles"), list) or not app.get("requiredRoles"):
         p.append("appIdentity.requiredRoles: declare the Graph application permissions the reconcile needs")
+    return p
+
+
+def validate_enrollment_program(ep, groups):
+    """The `enrollmentProgram` section's shape (absent = no enrollment program declared, valid)."""
+    p = []
+    if ep is None:
+        return p
+    if not isinstance(ep, dict):
+        return ["enrollmentProgram: must be an object"]
+    tok = ep.get("token") or {}
+    if not isinstance(tok.get("tokenName"), str) or not tok.get("tokenName").strip():
+        p.append("enrollmentProgram.token.tokenName: required — the token's display name, as the owner names it when "
+                 "uploading the Apple Business Manager server token to Intune")
+    if tok.get("id") and not GUID.match(str(tok["id"])):
+        p.append("enrollmentProgram.token.id: is not a GUID")
+    rd = tok.get("renewWarnDays", 30)
+    if isinstance(rd, bool) or not isinstance(rd, int) or rd < 1:
+        p.append("enrollmentProgram.token.renewWarnDays: a whole number of days above 0")
+    profiles = ep.get("profiles")
+    if not isinstance(profiles, list) or not profiles:
+        p.append("enrollmentProgram.profiles: declare at least one enrollment profile")
+        return p
+    defaults = 0
+    for pr in profiles:
+        w = f"enrollmentProgram.profiles.{pr.get('key') if isinstance(pr, dict) else '?'}"
+        if not isinstance(pr, dict):
+            p.append(f"{w}: must be an object")
+            continue
+        for f in ("key", "displayName"):
+            if not pr.get(f):
+                p.append(f"{w}: {f} is required")
+        if pr.get("id") and not GUID.match(str(pr["id"])):
+            p.append(f"{w}: id is not a GUID")
+        if pr.get("platform") != "macOS":
+            p.append(f"{w}: platform must be \"macOS\" (the only enrollment profile this reconcile builds)")
+        if not isinstance(pr.get("default", False), bool):
+            p.append(f"{w}: default must be true/false")
+        defaults += pr.get("default") is True
+        st = pr.get("settings")
+        if not isinstance(st, dict) or not st:
+            p.append(f"{w}: settings must map depMacOSEnrollmentProfile properties to their values")
+            st = {}
+        for k, v in st.items():
+            if k in DEP_SECRET:
+                p.append(f"{w}: settings.{k} is refused — a secret never lives in the spec (leave the local admin account undeclared)")
+            elif k == "isDefault":
+                p.append(f"{w}: settings.isDefault is refused — declare `default: true` (setDefaultProfile writes it)")
+            elif k in DEP_MACOS_BOOL:
+                if not isinstance(v, bool):
+                    p.append(f"{w}: settings.{k} must be true/false")
+            elif k in DEP_MACOS_STR:
+                if not isinstance(v, str):
+                    p.append(f"{w}: settings.{k} must be a string")
+            elif k in DEP_MACOS_LIST:
+                if not (isinstance(v, list) and all(isinstance(x, str) and x for x in v)):
+                    p.append(f"{w}: settings.{k} must be a list of non-empty strings")
+            else:
+                p.append(f"{w}: settings.{k} is not a depMacOSEnrollmentProfile property this reconcile knows")
+        a = pr.get("assign") or {}
+        dof = a.get("devicesOf", [])
+        if not isinstance(dof, list) or not all(isinstance(x, str) for x in dof):
+            p.append(f"{w}: assign.devicesOf must be a list of declared group keys")
+            dof = []
+        for gk in dof:
+            if gk not in groups:
+                p.append(f"{w}: assign.devicesOf names an undeclared group '{gk}'")
+            elif not (groups[gk] or {}).get("devices"):
+                p.append(f"{w}: assign.devicesOf names group '{gk}', which declares no devices")
+        if not dof:
+            p.append(f"{w}: assign.devicesOf is empty — name the declared group(s) whose serials this profile enrols")
+    if defaults > 1:
+        p.append("enrollmentProgram.profiles: more than one macOS profile declares default: true")
     return p
 
 
@@ -878,6 +981,141 @@ class Reconcile:
             self.reconcile_assignments(c, what, self.g.list(f"beta/deviceManagement/deviceCompliancePolicies/{live['id']}/assignments"),
                                        f"beta/deviceManagement/deviceCompliancePolicies/{live['id']}/assign", "assignments")
 
+    # the Apple Business Manager enrollment program (Automated Device Enrollment) ───────────────────────────
+    def enrollment_program(self):
+        """The ADE token (verify only: a person uploads and renews it), the declared macOS enrollment profile(s), the
+        default flag, and each declared serial's profile assignment. No token of the declared name yet = AWAITING."""
+        ep = self.spec.get("enrollmentProgram")
+        if not ep:
+            return
+        tok = ep["token"]
+        what = f"enrollment token \"{tok['tokenName']}\""
+        try:
+            live = self.find(DEP, tok, "tokenName")
+        except GraphError as e:
+            if e.status in (401, 403):
+                raise GraphError(e.status, "GET", DEP, "the credential cannot read the enrollment program (needs "
+                                 "DeviceManagementServiceConfig.Read.All to check, .ReadWrite.All to apply)") from None
+            raise
+        if live is None:
+            self.pending += 1
+            self.line("AWAITING", what, "awaiting the ABM token — no enrollment program token of this name in Intune "
+                      "(the owner exchanges it in two portals: Intune's public key → an ABM MDM server, its server token "
+                      "back to Intune, named exactly as declared)", "nothing")
+            for pr in ep["profiles"]:
+                self.pending += 1
+                self.line("AWAITING", f"enrollment profile {pr['key']} \"{pr['displayName']}\"", "waits for the ABM token",
+                          "nothing until the token exists")
+            return
+        tid = live["id"]
+        self.token_health(what, tok, live)
+        idents = None
+        for pr in ep["profiles"]:
+            pwhat = f"enrollment profile {pr['key']} \"{pr['displayName']}\""
+            coll = f"{DEP}/{tid}/enrollmentProfiles"
+            body = dict(pr["settings"], **{"@odata.type": DEP_MACOS_T, "displayName": pr["displayName"],
+                                           "description": pr.get("description", "")})
+            prof = self.find(coll, pr, "displayName")
+            if prof is not None and prof.get("@odata.type") not in (None, DEP_MACOS_T):
+                self.errors += 1
+                self.line("ERROR", pwhat, f"the profile of this name is a {prof.get('@odata.type')}, not a macOS ADE profile")
+                continue
+            if prof is None:
+                self.finding(pr, pwhat, "absent", f"POST {coll.split('/', 2)[2].replace(tid, short(tid))} "
+                             "(depMacOSEnrollmentProfile, settings as declared)",
+                             lambda pr=pr, coll=coll, body=body: pr.__setitem__("_live", self.g.post(coll, body)))
+                prof = pr.get("_live")
+                if prof is None:
+                    self.line("INFO", pwhat, "its default flag and serial assignments are checked once it exists")
+                    continue
+            else:
+                diffs = []
+                for k, v in sorted(dict(pr["settings"], description=pr.get("description", "")).items()):
+                    lv = prof.get(k)
+                    # an unset value may read back as null: null is "" for a string, [] for a list and false for a
+                    # boolean (Graph's default) — else a declared false would read as drift forever (review on #332)
+                    same = sorted(lv or []) == sorted(v) if isinstance(v, list) else (lv or "") == v if isinstance(v, str) \
+                        else (False if lv is None else lv) == v
+                    if not same:
+                        diffs.append(f"{k} live={lv!r} spec={v!r}")
+                if diffs:
+                    self.finding(pr, pwhat, "; ".join(diffs), f"PATCH enrollmentProfiles/{short(prof['id'])} with the declared settings",
+                                 lambda prof=prof, coll=coll, body=body: self.g.patch(f"{coll}/{prof['id']}", body))
+                else:
+                    self.line("OK", pwhat, f"{short(prof['id'])}, {len(pr['settings'])} settings as declared")
+            if pr.get("default"):
+                if prof.get("isDefault") is True:
+                    self.line("OK", pwhat, "the token's default macOS profile")
+                else:
+                    self.finding(pr, pwhat, "not the token's default macOS profile",
+                                 f"POST enrollmentProfiles/{short(prof['id'])}/setDefaultProfile",
+                                 lambda prof=prof, coll=coll: self.g.post(f"{coll}/{prof['id']}/setDefaultProfile", None))
+            if idents is None:
+                idents = {}
+                for d in self.g.list(f"{DEP}/{tid}/importedAppleDeviceIdentities"):
+                    if not d.get("isDeleted"):
+                        idents.setdefault((d.get("serialNumber") or "").upper(), d)
+            self.profile_assignment(pr, pwhat, prof, coll, idents)
+
+    def token_health(self, what, tok, live):
+        """Expiry, last sync and Apple's last sync error. Nothing here is --apply's to repair: the token is renewed by a
+        person in Apple Business Manager and Intune, so a problem is drift with no write (as a missing grant is)."""
+        now = getattr(self, "now", None) or datetime.datetime.now(datetime.timezone.utc)
+        def when(k):
+            v = live.get(k)
+            try:
+                return datetime.datetime.fromisoformat(v.replace("Z", "+00:00")) if v else None
+            except ValueError:
+                return None
+        exp, synced = when("tokenExpirationDateTime"), when("lastSuccessfulSyncDateTime")
+        detail = (f"{short(live['id'])}, expires {exp.date() if exp else '?'}, last sync "
+                  f"{synced.strftime('%Y-%m-%dT%H:%MZ') if synced else 'never'}, {live.get('syncedDeviceCount', '?')} devices synced")
+        if exp is None or exp <= now:
+            self.drift += 1
+            self.line("DRIFT", what, detail + ("; EXPIRED" if exp else "; no expiry readable"),
+                      "nothing — renew the server token in Apple Business Manager and upload it to the SAME token in Intune (the owner's act)")
+            return
+        if live.get("lastSyncErrorCode"):
+            self.drift += 1
+            self.line("DRIFT", what, f"{detail}; Apple reported sync error {live['lastSyncErrorCode']}",
+                      "nothing — read the token's sync status in the Intune admin center (the owner's act)")
+            return
+        left = (exp - now).days
+        if left < tok.get("renewWarnDays", 30):
+            self.pending += 1
+            self.line("PENDING", what, f"{detail}; renew within {left} days (yearly, in Apple Business Manager + Intune)", "nothing")
+            return
+        self.line("OK", what, detail)
+
+    def profile_assignment(self, pr, pwhat, prof, coll, idents):
+        """Each declared serial (the devices of `assign.devicesOf`) assigned to this profile. A serial Apple Business
+        Manager has not assigned to this MDM server is PENDING (that is done in ABM, not here); a serial assigned to no
+        or another profile is drift, and --apply assigns every such serial in ONE updateDeviceProfileAssignment call."""
+        serials = {}
+        for gk in pr["assign"]["devicesOf"]:
+            for d in self.spec["groups"][gk].get("devices", []):
+                serials.setdefault(d["serial"].upper(), d.get("name") or d["serial"])
+        move = []
+        for serial, name in serials.items():
+            w = f"enrollment assignment {name} → {pr['key']}"
+            d = idents.get(serial)
+            if d is None:
+                self.pending += 1
+                self.line("PENDING", w, "not in this token's devices — assign the serial to this MDM server in Apple Business Manager", "nothing")
+                continue
+            state = f"enrollment {d.get('enrollmentState') or '?'}, supervised {d.get('isSupervised')}"
+            if d.get("requestedEnrollmentProfileId") == prof["id"]:
+                self.line("OK", w, f"assigned ({state})")
+                continue
+            have = d.get("requestedEnrollmentProfileId")
+            move.append((serial, name, f"profile live={short(have) if have else 'none'} ({state})"))
+        if move:
+            names = ", ".join(n for _s, n, _d in move)
+            self.finding(pr, f"enrollment assignment {pr['key']}", "; ".join(f"{n}: {d}" for _s, n, d in move),
+                         f"POST enrollmentProfiles/{short(prof['id'])}/updateDeviceProfileAssignment for {names}",
+                         lambda: self.g.post(f"{coll}/{prof['id']}/updateDeviceProfileAssignment",
+                                             {"deviceIds": [s_ for s_, _n, _d in move]}))
+
     # the app identity (verify only) ──────────────────────────────────────────────────────────────────────
     def app_identity(self):
         app = self.spec.get("appIdentity") or {}
@@ -980,7 +1218,8 @@ class Reconcile:
     def run(self):
         steps = [("app identity", self.app_identity), ("groups", self.groups), ("devices", self.devices),
                  ("scripts", self.scripts), ("profiles", self.custom_profiles), ("certificates", self.trusted_roots),
-                 ("settings policies", self.settings_policies), ("compliance", self.compliance)]
+                 ("settings policies", self.settings_policies), ("compliance", self.compliance),
+                 ("enrollment program", self.enrollment_program)]
         if self.sync_only:
             steps = [("groups", self.groups)]
         for name, step in steps:
@@ -1028,6 +1267,59 @@ class FakeGraph:
         m = re.match(r"(\w+) eq '([^']*)'", q)
         return [x for x in items if x.get(m.group(1)) == m.group(2)] if m else items
 
+    def _dep(self, method, path, body=None):
+        """The enrollment program's nested routes: the token, its profiles, its imported device identities, and the two
+        profile actions — answered as Graph beta documents them (setDefaultProfile: no body; a 204 = {})."""
+        rest = path.split("?")[0][len(DEP):].strip("/")
+        parts = rest.split("/") if rest else []
+        toks = self.s.setdefault("dep", {})
+        if not parts:
+            if method == "LIST":
+                return self._filter([{k: copy.deepcopy(v) for k, v in t.items() if not k.startswith("_")} for t in toks.values()], path)
+            raise GraphError(400, method, path, "route not faked")
+        t = toks.get(parts[0])
+        if t is None:
+            raise GraphError(404, method, path, "not found")
+        if len(parts) == 1 and method == "GET":
+            return {k: copy.deepcopy(v) for k, v in t.items() if not k.startswith("_")}
+        profs = t.setdefault("_profiles", {})
+        if parts[1:] == ["importedAppleDeviceIdentities"] and method == "LIST":
+            return copy.deepcopy(t.get("_identities", []))
+        if parts[1:] == ["enrollmentProfiles"]:
+            if method == "LIST":
+                return copy.deepcopy(list(profs.values()))
+            if method == "POST":
+                i = self._new()
+                profs[i] = dict(body, id=i, isDefault=False)
+                return copy.deepcopy(profs[i])
+        if len(parts) >= 3 and parts[1] == "enrollmentProfiles":
+            pr = profs.get(parts[2])
+            if pr is None:
+                raise GraphError(404, method, path, "not found")
+            if len(parts) == 3 and method == "GET":
+                return copy.deepcopy(pr)
+            if len(parts) == 3 and method == "PATCH":
+                pr.update({k: v for k, v in body.items() if k != "@odata.type"})
+                return {}
+            if parts[3:] == ["setDefaultProfile"] and method == "POST":
+                if body is not None:
+                    raise GraphError(400, method, path, "setDefaultProfile takes no body")
+                for o in profs.values():
+                    if o.get("@odata.type") == pr.get("@odata.type"):
+                        o["isDefault"] = o is pr
+                return {}
+            if parts[3:] == ["updateDeviceProfileAssignment"] and method == "POST":
+                ids = (body or {}).get("deviceIds")
+                if not isinstance(ids, list) or not ids:
+                    raise GraphError(400, method, path, "deviceIds required")
+                known = {d["serialNumber"]: d for d in t.get("_identities", [])}
+                if any(x not in known for x in ids):
+                    raise GraphError(400, method, path, "a serial this token does not hold")
+                for x in ids:
+                    known[x]["requestedEnrollmentProfileId"] = pr["id"]
+                return {}
+        raise GraphError(400, method, path, "route not faked")
+
     def _coll(self, path):
         p = path.split("?")[0]
         for prefix, key in (("v1.0/groups", "groups"), ("v1.0/devices", "devices"),
@@ -1042,6 +1334,8 @@ class FakeGraph:
         raise GraphError(400, "?", p, "route not faked")
 
     def get(self, path):
+        if path.startswith(DEP):
+            return self._dep("GET", path)
         key, rest = self._coll(path)
         obj = self.s[key].get(rest[0])
         if obj is None:
@@ -1052,6 +1346,8 @@ class FakeGraph:
         return out
 
     def list(self, path):
+        if path.startswith(DEP):
+            return self._dep("LIST", path)
         key, rest = self._coll(path)
         if not rest:
             return self._filter(copy.deepcopy(list(self.s[key].values())), path)
@@ -1066,6 +1362,8 @@ class FakeGraph:
 
     def post(self, path, body):
         self.writes.append(("POST", path.split("?")[0], body))
+        if path.startswith(DEP):
+            return self._dep("POST", path, body)
         key, rest = self._coll(path)
         if not rest:
             i = self._new()
@@ -1088,6 +1386,8 @@ class FakeGraph:
 
     def patch(self, path, body):
         self.writes.append(("PATCH", path, body))
+        if path.startswith(DEP):
+            return self._dep("PATCH", path, body)
         key, rest = self._coll(path)
         self.s[key][rest[0]].update({k: v for k, v in body.items() if k != "@odata.type"})
         return {}
@@ -1510,6 +1810,124 @@ def self_test():
     synced12 = [w[1].split("/")[3] for w in g12.writes if w[1].endswith("/syncDevice")]
     expect("device sync: one Mac's lookup failing (503) is an ERROR for THAT Mac and the others are still synced",
            synced12 == ["mx"] and any(ln.startswith("ERROR") and "lookup failed" in ln for ln in lines12), lines12)
+
+    # the Apple Business Manager enrollment program (ADE): AWAITING without the token, then create / default / assign
+    ep = {"token": {"tokenName": "Fleet — Apple Business Manager"},
+          "profiles": [{"key": "fleetMacs", "platform": "macOS", "default": True, "displayName": "Fleet — Macs (ADE)",
+                        "description": "d", "settings": {"requiresUserAuthentication": False, "supervisedModeEnabled": True,
+                                                         "waitForDeviceConfiguredConfirmation": True, "isMandatory": True,
+                                                         "profileRemovalDisabled": True, "appleIdDisabled": True,
+                                                         "supportDepartment": "Fleet operations"},
+                        "assign": {"devicesOf": ["studios"]}}]}
+    ade = {**spec, "compliancePolicies": [], "enrollmentProgram": ep}
+    expect("validate: a declared enrollment program passes", not validate(ade, "."), validate(ade, "."))
+    base = copy.deepcopy(st)
+    rc, lines, g = run(copy.deepcopy(base), False, ade)
+    expect("ADE: no token of the declared name → AWAITING lines (token and profile), exit 0, nothing red, nothing written",
+           rc == 0 and not g.writes and any(ln.startswith("AWAITING") and "awaiting the ABM token" in ln for ln in lines)
+           and any(ln.startswith("AWAITING") and "enrollment profile fleetMacs" in ln for ln in lines)
+           and not any(ln.startswith(("ERROR", "DRIFT")) for ln in lines), lines)
+    rc, lines, g = run(copy.deepcopy(base), True, ade)
+    expect("ADE: --apply without the token writes nothing to the enrollment program and stays green",
+           rc == 0 and not any(DEP in w[1] for w in g.writes), lines)
+    wrong_name = copy.deepcopy(base)
+    wrong_name["dep"] = {"t0": {"id": "t0", "tokenName": "Some other token", "tokenExpirationDateTime": "2099-01-01T00:00:00Z"}}
+    rc, lines, g = run(wrong_name, False, ade)
+    expect("ADE (negative control): a token of ANOTHER name is not taken for the declared one — still AWAITING",
+           rc == 0 and any(ln.startswith("AWAITING") for ln in lines), lines)
+
+    def with_token(**over):
+        t = copy.deepcopy(base)
+        tokn = {"id": "aaaaaaaa-0000-4000-8000-000000000001", "tokenName": "Fleet — Apple Business Manager", "tokenType": "dep",
+                "tokenExpirationDateTime": "2099-01-01T00:00:00Z", "lastSuccessfulSyncDateTime": "2026-11-20T06:00:00Z",
+                "syncedDeviceCount": 1, "lastSyncErrorCode": 0,
+                "_identities": [{"id": "i1", "serialNumber": "SERIAL0001", "platform": "macOS", "enrollmentState": "notContacted",
+                                 "isSupervised": False, "requestedEnrollmentProfileId": None}]}
+        tokn.update(over)
+        t["dep"] = {tokn["id"]: tokn}
+        return t
+    st13 = with_token()
+    rc, lines, g = run(st13, False, ade)
+    expect("ADE: --check with the token reports it (expiry, last sync), the absent profile as drift, the serial ABM has not "
+           "assigned as PENDING, and writes nothing",
+           rc == 2 and not g.writes and any(ln.startswith("OK") and "expires 2099-01-01" in ln and "last sync 2026-11-20" in ln for ln in lines)
+           and any(ln.startswith("DRIFT") and "enrollment profile fleetMacs" in ln and "absent" in ln for ln in lines), lines)
+    rc, lines, g = run(st13, True, ade)
+    tk = st13["dep"]["aaaaaaaa-0000-4000-8000-000000000001"]
+    made = list(tk["_profiles"].values())
+    expect("ADE: --apply creates the macOS profile with the declared settings, makes it the default, and assigns the serial",
+           len(made) == 1 and made[0]["@odata.type"] == DEP_MACOS_T and made[0]["requiresUserAuthentication"] is False
+           and made[0]["waitForDeviceConfiguredConfirmation"] is True and made[0]["isDefault"] is True
+           and tk["_identities"][0]["requestedEnrollmentProfileId"] == made[0]["id"]
+           and any(w[1].endswith("/setDefaultProfile") and w[2] is None for w in g.writes)
+           and any(w[1].endswith("/updateDeviceProfileAssignment") and w[2] == {"deviceIds": ["SERIAL0001"]} for w in g.writes), lines)
+    rc, lines, g = run(st13, False, ade)
+    expect("ADE: the next --check is clean apart from the serial ABM has not assigned (PENDING), exit 0",
+           rc == 0 and not g.writes and not any(ln.startswith("DRIFT") for ln in lines)
+           and any(ln.startswith("OK") and "the token's default macOS profile" in ln for ln in lines)
+           and any(ln.startswith("OK") and "enrollment assignment studio-1" in ln for ln in lines)
+           and any(ln.startswith("PENDING") and "studio-9" in ln and "Apple Business Manager" in ln for ln in lines), lines)
+    pid = made[0]["id"]
+    tk["_profiles"][pid]["registrationDisabled"] = None
+    tk["_profiles"][pid].pop("enableAuthenticationViaCompanyPortal", None)
+    nl = run(st13, False, {**ade, "enrollmentProgram": {**ep, "profiles": [dict(ep["profiles"][0], settings=dict(
+        ep["profiles"][0]["settings"], registrationDisabled=False, enableAuthenticationViaCompanyPortal=False))]}})[1]
+    expect("ADE: a boolean Graph reads back as null (or omits) matches a declared false — never drift forever",
+           not any(ln.startswith("DRIFT") and ("registrationDisabled" in ln or "enableAuthenticationViaCompanyPortal" in ln) for ln in nl), nl)
+    tk["_profiles"][pid]["requiresUserAuthentication"] = True
+    tk["_profiles"]["other"] = {"id": "other", "@odata.type": DEP_MACOS_T, "displayName": "Someone's", "isDefault": True}
+    tk["_profiles"][pid]["isDefault"] = False
+    tk["_identities"][0]["requestedEnrollmentProfileId"] = "other"
+    rc, lines, g = run(st13, False, ade)
+    expect("ADE drift: a changed setting, a lost default and a serial moved to another profile are each named",
+           rc == 2 and any("requiresUserAuthentication live=True spec=False" in ln for ln in lines)
+           and any("not the token's default" in ln for ln in lines) and any("studio-1: profile live=other" in ln for ln in lines), lines)
+    class LyingAssign(FakeGraph):
+        def post(self, path, body):
+            if path.endswith("/updateDeviceProfileAssignment"):
+                self.writes.append(("POST", path, body))
+                return {}   # Graph answers 204, nothing changes
+            return super().post(path, body)
+    lg, ll = LyingAssign(st13), []
+    Reconcile(copy.deepcopy(ade), tempfile.gettempdir(), lg, apply=True, fetch=lambda s_: script, token=tok, out=ll.append).run()
+    rc, lines, g = run(st13, False, ade)
+    expect("ADE (negative control): an assignment Graph accepted but did not record is STILL drift at the next --check "
+           "(the check reads the live assignment, never trusts the apply)",
+           rc == 2 and any(ln.startswith("DRIFT") and "studio-1: profile live=other" in ln for ln in lines)
+           and not any("requiresUserAuthentication" in ln and ln.startswith("DRIFT") for ln in lines), lines + ll)
+    run(st13, True, ade)
+    rc, lines, g = run(st13, False, ade)
+    expect("ADE drift: --apply restores all three, and the next check is clean", rc == 0
+           and tk["_profiles"]["other"]["isDefault"] is False and tk["_identities"][0]["requestedEnrollmentProfileId"] == pid, lines)
+    rc, lines, g = run(with_token(tokenExpirationDateTime="2020-01-01T00:00:00Z"), False, ade)
+    expect("ADE: an EXPIRED token is drift no --apply repairs (renewal is the owner's act)",
+           rc == 2 and any(ln.startswith("DRIFT") and "EXPIRED" in ln and "renew" in ln for ln in lines), lines)
+    soon = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rc, lines, g = run(with_token(tokenExpirationDateTime=soon), False, ade)
+    expect("ADE: a token expiring within renewWarnDays is PENDING with the days left, never red on its own",
+           any(ln.startswith("PENDING") and "renew within" in ln for ln in lines), lines)
+    class Denied(FakeGraph):
+        def list(self, path):
+            if path.startswith(DEP):
+                raise GraphError(403, "GET", path, "forbidden")
+            return super().list(path)
+    dl = []
+    rc = Reconcile(copy.deepcopy(ade), tempfile.gettempdir(), Denied(copy.deepcopy(base)), token=tok, out=dl.append).run()
+    expect("ADE: a credential that cannot read the enrollment program is an ERROR naming the permission, never AWAITING",
+           rc == 1 and any(ln.startswith("ERROR") and "DeviceManagementServiceConfig.Read.All" in ln for ln in dl)
+           and not any(ln.startswith("AWAITING") for ln in dl), dl)
+    for label, mut, needle in (
+            ("a local admin password (a secret)", lambda e: e["profiles"][0]["settings"].__setitem__("adminAccountPassword", "x"), "secret"),
+            ("an unknown setting", lambda e: e["profiles"][0]["settings"].__setitem__("supervisedModeEnabledd", True), "knows"),
+            ("a non-boolean boolean", lambda e: e["profiles"][0]["settings"].__setitem__("isMandatory", "yes"), "true/false"),
+            ("isDefault in settings", lambda e: e["profiles"][0]["settings"].__setitem__("isDefault", True), "default: true"),
+            ("an undeclared group", lambda e: e["profiles"][0]["assign"].__setitem__("devicesOf", ["nowhere"]), "nowhere"),
+            ("two default profiles", lambda e: e["profiles"].append(dict(copy.deepcopy(e["profiles"][0]), key="second")), "more than one"),
+            ("no token name", lambda e: e["token"].pop("tokenName"), "tokenName")):
+        b = copy.deepcopy(ade)
+        mut(b["enrollmentProgram"])
+        v = validate(b, ".")
+        expect(f"validate: an enrollment program with {label} is refused", any(needle in x for x in v), v)
 
     print(f"self-test: {'FAILED ' + str(len(fails)) if fails else 'passed'}")
     return 1 if fails else 0

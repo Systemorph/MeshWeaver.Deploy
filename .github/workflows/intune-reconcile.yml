@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - name: The reconcile against a fake Graph (create, no-op, drift, exclusion, removal, device membership)
+      - name: The reconcile against a fake Graph (create, no-op, drift, exclusion, removal, device membership, enrollment program)
         run: python3 deploy/macos/intune/intune-reconcile.py --self-test
       - name: The example spec passes the reconcile's own validation
         run: python3 deploy/macos/intune/intune-reconcile.py --validate --spec deploy/macos/intune/fleet.spec.example.json

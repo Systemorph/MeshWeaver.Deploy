@@ -85,7 +85,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$INTUNE_CLIENT_ID" ]; then
-            msg="no credential configured: the Intune drift check did NOT read the tenant. Owner action: a READ-ONLY Intune app identity (DeviceManagementConfiguration.Read.All, DeviceManagementScripts.Read.All, DeviceManagementManagedDevices.Read.All, Group.Read.All, Device.Read.All) with federated credentials for issuer https://token.actions.githubusercontent.com, subjects repo:${GITHUB_REPOSITORY}:ref:refs/heads/main and repo:${GITHUB_REPOSITORY}:pull_request; then the repository variables INTUNE_CLIENT_ID and INTUNE_TENANT_ID."
+            msg="no credential configured: the Intune drift check did NOT read the tenant. Owner action: a READ-ONLY Intune app identity (DeviceManagementConfiguration.Read.All, DeviceManagementScripts.Read.All, DeviceManagementManagedDevices.Read.All, Group.Read.All, Device.Read.All, and DeviceManagementServiceConfig.Read.All when the spec declares an enrollmentProgram) with federated credentials for issuer https://token.actions.githubusercontent.com, subjects repo:${GITHUB_REPOSITORY}:ref:refs/heads/main and repo:${GITHUB_REPOSITORY}:pull_request; then the repository variables INTUNE_CLIENT_ID and INTUNE_TENANT_ID."
             { echo "### Intune drift check — not run"; echo; echo "$msg"; } >> "$GITHUB_STEP_SUMMARY"
             # A scheduled caller sets require-credential: a credential that was removed, renamed or expired must
             # turn the standing check RED, not leave it green on a notice nobody reads.

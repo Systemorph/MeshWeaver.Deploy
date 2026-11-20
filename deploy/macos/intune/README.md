@@ -125,7 +125,7 @@ DECLARED spec reconciled by `intune-reconcile.py` (Python standard library only)
 
 | Command | What it does |
 |---|---|
-| `--check --spec <f>` | Read-only. One line per object: `OK`, `DRIFT`, `HELD`, `PENDING`, `INFO` or `ERROR`, and every non-OK line says what `--apply` WOULD do. Exit 0 in sync (PENDING allowed), 2 drift, 1 error |
+| `--check --spec <f>` | Read-only. One line per object: `OK`, `DRIFT`, `HELD`, `PENDING`, `AWAITING`, `INFO` or `ERROR`, and every non-OK line says what `--apply` WOULD do. Exit 0 in sync (PENDING allowed), 2 drift, 1 error |
 | `--apply --spec <f>` | Creates and patches to match. **Never deletes**: an assignment, group member or object the spec does not name is reported as kept. Assignments are written as the union of live and declared; the only target ever dropped is one the spec lists under `assign.remove`. An object with `hold` is never written |
 | `--validate --spec <f>` | The spec's shape, no Graph call (CI) |
 | `--self-test` | Against an in-memory Graph: create, no-op, drift, exclusion assignment, declared removal, held objects, device membership, a pinned source that does not match its sha256 |
@@ -141,7 +141,8 @@ uses); otherwise `az account get-access-token --resource https://graph.microsoft
 🔐 The scheduled drift check must NOT sign in as the apply identity: its federated credential would have to trust the
 private repository's pull-request subject, and every pull-request branch could then mint a token that WRITES device
 management. It signs in as a separate READ-ONLY identity (`DeviceManagementConfiguration.Read.All`,
-`DeviceManagementScripts.Read.All`, `DeviceManagementManagedDevices.Read.All`, `Group.Read.All`, `Device.Read.All`),
+`DeviceManagementScripts.Read.All`, `DeviceManagementManagedDevices.Read.All`, `Group.Read.All`, `Device.Read.All`, and
+`DeviceManagementServiceConfig.Read.All` once the spec declares an `enrollmentProgram`),
 whose federated credentials name that repository's `main` and `pull_request` subjects; the `appIdentity` line then
 reads INFO (a different application), and the apply identity's grants are verified when a person runs `--apply`.
 ⚠️ The Azure CLI's own sign-in carries NO Intune scopes (measured 2026-11-09: every `deviceManagement` read →
@@ -159,6 +160,7 @@ reads INFO (a different application), and the apply identity's grants are verifi
 | `trustedRootCertificates[]` | `macOSTrustedRootCertificate` | the fleet local CA's PUBLIC certificate (`certFile`, PEM or DER, next to the spec) and its DER sha256. Until the CA is minted, `sha256` is empty and the line is `PENDING — CA not minted yet`. Once declared, the `com.memex.local` keys must carry the same value as `FleetCaSha256` (what `memex-local ca adopt` reads); validation refuses either without the other |
 | `settingsPolicies[]` | settings-catalog policy (the DDM night-window software-update policy) | `settings` maps `settingDefinitionId` → value; `--apply` rewrites those values in the LIVE tree and PUTs it back (the tree itself is created in the admin center, then its id is recorded). Each Apple release bumps `enforcement_targetosversion` + `enforcement_targetlocaldatetime` here |
 | `compliancePolicies[]` | `deviceCompliancePolicy` | existing policies by id (assignments, declared `properties`), new ones created from `properties` |
+| `enrollmentProgram` | the Apple Business Manager ADE token (`depOnboardingSetting`), a `depMacOSEnrollmentProfile`, its default flag, and each declared serial's profile assignment | section below. Needs `DeviceManagementServiceConfig.ReadWrite.All` on the apply identity and `.Read.All` on the drift identity |
 
 **A Mac newly added to a group is synced at once.** When an `--apply` adds a declared Mac to a group, it asks that Mac
 to sync right after (one `SYNCED … newly added to a group` line): its first bootstrap and its profiles come at the next
@@ -199,6 +201,45 @@ jobs and had no runners until a person attached it by hand (2026-11-14). The `bu
 also readable again: 1.11.1 computed them with an inline `$(case …)`, which macOS's `/bin/bash` 3.2 cannot parse, and
 wrote `" echo ok ;; *) echo red ;; esac) …"` instead of the verdict.
 
+### The enrollment program (Apple Business Manager → Automated Device Enrollment)
+
+With the `enrollmentProgram` section a fleet Mac enrols **zero-touch**: assigned to the fleet's MDM server in Apple
+Business Manager, it enrols at Setup Assistant and comes up **supervised**. Its **bootstrap token**: Apple documents
+that on macOS 26 or later the Mac creates one during device-management enrolment, and otherwise tries to generate and
+store one whenever a secure-token user logs in, where the MDM supports it (Apple Platform Deployment, *Use secure token,
+bootstrap token, and volume ownership in deployments*); that Intune receives it so on the fleet's Macs is NOT
+established, so the bootstrap's `bootstrap-token` reading (above) stays the check. Graph **beta** only (the v1.0
+endpoint carries none of these routes), read against the Microsoft Graph beta reference:
+
+| What | Graph | `--check` | `--apply` |
+|---|---|---|---|
+| the token, by `token.tokenName` (or `token.id`) | `GET beta/deviceManagement/depOnboardingSettings` | `OK` with its expiry, last successful sync and synced device count; **`AWAITING`** when no token of that name exists; `PENDING` inside `renewWarnDays` (default 30) of expiry; `DRIFT` when expired or Apple reported a sync error | **never written**: the token is uploaded and renewed by a person (below) |
+| the profile `profiles[]` (`platform: macOS`) | `GET/POST/PATCH …/depOnboardingSettings/{id}/enrollmentProfiles` (`#microsoft.graph.depMacOSEnrollmentProfile`) | each declared `settings` property compared with the live value | creates it, or PATCHes the declared settings |
+| `default: true` | `POST …/enrollmentProfiles/{id}/setDefaultProfile` (no body) | drift while the profile's `isDefault` is not true | makes it the token's default macOS profile (a Mac ABM assigns later enrols with it even before the next run) |
+| `assign.devicesOf` (declared group keys; their `devices[].serial`) | `GET …/importedAppleDeviceIdentities`, `POST …/enrollmentProfiles/{id}/updateDeviceProfileAssignment` `{"deviceIds": [serials]}` | per serial: `OK` (with its `enrollmentState` and `isSupervised`), `DRIFT` (no or another profile), `PENDING` (ABM has not assigned the serial to this MDM server) | ONE call for every drifting serial |
+
+**A missing token is never red.** Until the owner has exchanged the token, every enrollment-program line is `AWAITING`
+(counted as pending, exit 0) and nothing else in the spec changes its verdict. A credential that cannot READ the
+enrollment program is different and IS red (`ERROR … needs DeviceManagementServiceConfig.Read.All`): a check that read
+nothing never reads as one that found nothing. Validation refuses a setting that is not a `depMacOSEnrollmentProfile`
+property, a non-boolean boolean, `isDefault` in `settings` (declare `default`), more than one default, and
+`adminAccountPassword` (a secret never lives in the spec).
+
+**What stays manual (the owner, in two portals):** Intune admin center → Devices → Enrollment → Apple → Enrollment
+program tokens → Add: download Intune's public key; Apple Business Manager → Preferences → Your MDM Servers → Add: upload
+it, download the server token; back in Intune, upload it **named exactly as `token.tokenName`**. Then, in ABM, assign the
+fleet's serials to that MDM server. The token **expires after a year**: renew it in ABM and upload it to the SAME token
+in Intune (a new token would orphan the profile and its assignments); the reconcile's `PENDING … renew within N days`
+line starts 30 days before.
+
+**A Mac already enrolled through Company Portal** (user enrolment) had no escrowed bootstrap token — measured on all
+three fleet Macs on 2026-11-12 (MeshWeaver.Plugins `Hosting/MacStudioOnboarding` row 0b). Once ABM lists its serial under this MDM server and the profile is assigned (`OK enrollment assignment …`),
+`sudo profiles renew -type enrollment` on the Mac re-runs the enrolment through ADE. NOT established: whether that
+converts a user-enrolled Mac to an ADE enrolment (the fleet profile, supervision) WITHOUT an
+erase on the fleet's macOS versions; the fallback is an erase and a fresh Setup Assistant. Also NOT established: whether
+Intune honours the per-pane booleans (`appleIdDisabled`, …) alone or expects `enabledSkipKeys` too — read the created
+profile back in the admin center after the first `--apply`.
+
 ### The console password that expired at enrolment (2026-11-09)
 
 Read-only Graph on 2026-11-09: no macOS configuration profile and no macOS settings-catalog policy in the tenant
@@ -228,7 +269,9 @@ Macs (read 2026-11-09): `deviceOSType = MacMDM`, `deviceModel = Mac17,14`, `manu
 - `device.enrollmentProfileName -eq "<ADE profile>"` is the right rule once the Studios enrol through Apple
   Business Manager (automated device enrolment with a fleet-only enrolment profile): membership then follows the
   purchase, nothing is named, nothing is mis-captured. Without ABM it matches nothing.
-Until ABM exists, the declared serial list is the safer choice: a Mac joins the fleet because someone named it.
+Until ABM exists, the declared serial list is the safer choice: a Mac joins the fleet because someone named it. With the
+enrollment program declared (section above), the same serial list also decides which Macs ABM's token enrols with the
+fleet profile; the dynamic rule remains possible later, and is not adopted here.
 
 ## Microsoft sign-in: the device's work account, silently
 
