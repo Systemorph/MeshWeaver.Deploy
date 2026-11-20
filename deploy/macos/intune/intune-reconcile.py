@@ -116,6 +116,7 @@ APP_TYPES = ("macOSPkgApp", "macOSLobApp", "macOSDmgApp")
 APP_INTENTS = ("required", "available", "uninstall")
 ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 PARAM_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+PLACEHOLDER = re.compile(r"@@([A-Z][A-Z0-9_]*)@@")
 # One OpenSSH public key line, as the bootstrap accepts it (fleet-bootstrap.sh ssh_key_core): an accepted type, the
 # base64 blob, an optional comment — no options prefix, no private key material.
 SSH_PUBKEY = re.compile(r"^(ssh-ed25519|ecdsa-sha2-nistp(?:256|384|521)|ssh-rsa) ([A-Za-z0-9+/]+={0,3})( [^\x00-\x1f\x7f]*)?\Z")
@@ -505,12 +506,19 @@ def validate_app(a, groups):
         for k, v in (sc.get("params") or {}).items():
             if not PARAM_NAME.match(k) or not isinstance(v, str):
                 p.append(f"postInstallScript.params.{k}: an UPPER_CASE name and a string value")
+            elif "'" in v or "\n" in v or "@@" in v:
+                # the template carries a param inside a single-quoted assignment: a quote would end it and run the rest as root
+                p.append(f"postInstallScript.params.{k}: a value may not contain a quote, a newline or '@@'")
         for k, v in (sc.get("secrets") or {}).items():
             if not PARAM_NAME.match(k) or not isinstance(v, str) or not ENV_NAME.match(v):
                 p.append(f"postInstallScript.secrets.{k} must name an ENVIRONMENT VARIABLE (the secret itself never lives in the spec)")
         af = sc.get("aliasesFrom")
         if af is not None and af not in groups:
             p.append(f"postInstallScript.aliasesFrom names an undeclared group '{af}'")
+        elif af is not None and (not isinstance((groups.get(af) or {}).get("devices"), list) or (groups.get(af) or {}).get("users")):
+            # a users group renders an empty alias block, and every Mac silently falls back to its LocalHostName. A DEVICE
+            # group that is still empty is fine: the Macs it will hold are the ones the alias lines are rendered for.
+            p.append(f"postInstallScript.aliasesFrom names group '{af}', which is not a device group (a devices list and no users)")
     return p
 
 
@@ -531,6 +539,12 @@ def render_script(template, sc, spec, secret_values):
             if "'" in v or "\n" in v:
                 raise GraphError(0, "SECRET", k, "a secret value may not contain a quote or a newline")
             out = out.replace(f"{k}='@@{k}@@'", f"{k}='{v}'")
+    kept = set() if secret_values is not None else set(sc.get("secrets") or {})
+    left = sorted(set(PLACEHOLDER.findall(out)) - kept)
+    if left:
+        # a placeholder left in place would be installed verbatim, and the drift check would then match it forever
+        raise GraphError(0, "RENDER", (sc.get("source") or {}).get("path", "post-install script"),
+                         "the template carries placeholder(s) the spec does not fill: " + ", ".join(f"@@{x}@@" for x in left))
     return out.encode()
 
 
@@ -777,6 +791,9 @@ class Reconcile:
             if gid:
                 target["groupId"] = gid
             item = dict({"target": target}, **extra)
+            # a target rewritten for its intent keeps its live settings, exactly as a kept target does
+            item.update({k: lv[k] for lv in live for k in ("settings",)
+                         if extra and (lv["target"]["@odata.type"], lv["target"].get("groupId")) == (kind, gid) and lv.get(k) is not None})
             if odata_item:
                 item["@odata.type"] = odata_item
             items.append(item)
@@ -876,7 +893,7 @@ class Reconcile:
             for u in g.get("users", []):
                 what = f"user {u['upn']} in {key}"
                 if not u.get("id"):
-                    # resolving a UPN app-only needs User.ReadBasic.All, which the app identity does not hold: the id is declared
+                    # resolving a UPN app-only needs User.Read.All (application), which the app identity does not hold: the id is declared
                     self.pending += 1
                     self.line("PENDING", what, "its directory object id is not declared — read it with "
                               f"`az ad user show --id {u['upn']} --query id -o tsv` and record it as users[].id")
@@ -2263,6 +2280,25 @@ def self_test():
     bad = copy.deepcopy(asp); bad["apps"][0]["postInstallScript"]["secrets"]["ASSIGNMENT_ID"] = "0001CoABChBkZXZpY2U"
     expect("validate: a secret written INTO the spec (not an environment variable name) is refused",
            any("ENVIRONMENT VARIABLE" in x for x in validate(bad, ".")))
+    bad = copy.deepcopy(asp); bad["apps"][0]["postInstallScript"]["params"]["ALIAS_PREFIX"] = "x'; touch /tmp/pwned; '"
+    expect("validate: a param value with a quote is refused (it would break out of the single-quoted assignment)",
+           any("may not contain a quote" in x for x in validate(bad, ".")), validate(bad, "."))
+    bad = copy.deepcopy(asp); bad["groups"]["nodevices"] = {"displayName": "Users only", "users": [{"upn": "a@example.com"}]}
+    bad["apps"][0]["postInstallScript"]["aliasesFrom"] = "nodevices"
+    expect("validate: aliasesFrom naming a users group (no devices list) is refused",
+           any("not a device group" in x for x in validate(bad, ".")), validate(bad, "."))
+    ok = copy.deepcopy(asp); ok["groups"]["emptyclient"] = {"displayName": "Macs at a client", "devices": []}
+    ok["apps"][0]["postInstallScript"]["aliasesFrom"] = "emptyclient"
+    expect("validate: aliasesFrom naming a device group that is still empty is accepted", not validate(ok, "."), validate(ok, "."))
+    nop = copy.deepcopy(app["postInstallScript"]); nop["params"] = {}
+    try:
+        render_script(tmpl, nop, asp, None); left = None
+    except GraphError as e:
+        left = str(e)
+    expect("render: a placeholder the spec does not fill is refused, never installed verbatim",
+           left is not None and "@@ALIAS_PREFIX@@" in left, [str(left)])
+    expect("render: in the drift form a secret's placeholder is kept and is no refusal",
+           b"ASSIGNMENT_ID='@@ASSIGNMENT_ID@@'" in render_script(tmpl, app["postInstallScript"], asp, None))
     def run_app(state, apply, env=None):
         g, lines = FakeGraph(state), []
         old = {k: os.environ.get(k) for k in ("EXAMPLE_ASSIGNMENT_ID",)}
@@ -2310,6 +2346,13 @@ def self_test():
     expect("apps: an edited live script is drift and rewritten; an undeclared assignment is kept with ITS intent",
            {"target": {"@odata.type": INCLUDE_T, "groupId": G2}, "intent": "available"} in sta["apps"]["a1"]["_assign"]
            and "PREFIX='example-'" in base64.b64decode(sta["apps"]["a1"]["postInstallScript"]["scriptContent"]).decode(), lines)
+    sta["apps"]["a1"]["_assign"] = [{"target": {"@odata.type": INCLUDE_T, "groupId": G1}, "intent": "available",
+                                     "settings": {"@odata.type": "#microsoft.graph.macOsLobAppAssignmentSettings", "uninstallOnDeviceRemoval": True}}]
+    rc, lines, g = run_app(sta, True, "SECRET-1")
+    expect("apps: a target rewritten for its intent keeps its live settings, as a kept target does",
+           sta["apps"]["a1"]["_assign"] == [{"target": {"@odata.type": INCLUDE_T, "groupId": G1}, "intent": "required",
+                                             "settings": {"@odata.type": "#microsoft.graph.macOsLobAppAssignmentSettings", "uninstallOnDeviceRemoval": True}}],
+           lines + [json.dumps(sta["apps"]["a1"]["_assign"])])
 
     real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "teamviewer", "teamviewer-host-postinstall.sh")
     if os.path.exists(real):

@@ -324,7 +324,11 @@ profile (`customProfiles[]`, `com.apple.TCC.configuration-profile-policy`). Per 
 
 - the post-install script is the pinned TEMPLATE `teamviewer/teamviewer-host-postinstall.sh`, rendered by the reconcile:
   `@@NAME@@` ← `postInstallScript.params`; `@@DEVICE_ALIASES@@` ← one `<serial> <name>` line per Mac of the
-  `aliasesFrom` group (each Mac finds its own alias by serial; the device alias is `ALIAS_PREFIX` + name);
+  `aliasesFrom` group (each Mac finds its own alias by serial; the device alias is `ALIAS_PREFIX` + name). Refused
+  before anything is written: a param value with a quote, a newline or `@@` (it sits inside a single-quoted assignment
+  run as root); an `aliasesFrom` that is not a DEVICE group (a `devices` list, possibly still empty, and no users); and a
+  rendered script that still carries a `@@NAME@@` the spec does not fill (it would be installed verbatim and then match
+  the drift check forever);
 - the client's **assignment id** is a SECRET: the spec names only the environment variable (`secrets.ASSIGNMENT_ID`)
   that carries it when a person runs `--apply`. `--check` puts the live script's `ASSIGNMENT_ID='…'` line back to its
   placeholder before comparing, so the drift check never needs the secret and never prints it; an `--apply` that would
