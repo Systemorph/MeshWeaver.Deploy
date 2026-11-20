@@ -13,7 +13,8 @@
       "Device.Read.All",
       "GroupMember.ReadWrite.All",
       "DeviceManagementManagedDevices.PrivilegedOperations.All",
-      "DeviceManagementServiceConfig.ReadWrite.All"
+      "DeviceManagementServiceConfig.ReadWrite.All",
+      "DeviceManagementApps.ReadWrite.All"
     ]
   },
   "groups": {
@@ -38,6 +39,31 @@
         {
           "serial": "<serial-1>",
           "name": "studio-1"
+        }
+      ]
+    },
+    "macAdmins": {
+      "id": "00000000-0000-4000-8000-0000000000a3",
+      "displayName": "Fleet — Mac Admins",
+      "description": "The people who are local administrators on the fleet Macs through Platform SSO (customProfiles.platformSso names it in AdministratorGroups). Users only; created by a person (the app identity holds no Group.Create).",
+      "users": [
+        {
+          "upn": "jane.roe@example.com",
+          "id": "00000000-0000-4000-8000-0000000000b1"
+        },
+        {
+          "upn": "john.doe@example.com"
+        }
+      ]
+    },
+    "clientAcme": {
+      "id": "00000000-0000-4000-8000-0000000000a4",
+      "displayName": "Fleet — Macs at Acme",
+      "description": "The fleet Macs placed at the client Acme: they get Acme's TeamViewer Host and its PPPC profile. Each Mac's name is also its TeamViewer device alias.",
+      "devices": [
+        {
+          "serial": "<serial-2>",
+          "name": "studio-2"
         }
       ]
     }
@@ -133,6 +159,117 @@
         ],
         "exclude": [
           "noBootstrap"
+        ]
+      }
+    },
+    {
+      "key": "platformSso",
+      "displayName": "Fleet — Platform SSO, Entra sign-in, admins by group (Mac Studios)",
+      "description": "Platform SSO through the Microsoft Enterprise SSO plug-in (Company Portal): Entra sign-in at the login window, admin rights by the admins' group, the owner account exempt. README 'Mac admins through an Entra group'. URLs: the real spec lists the Microsoft Entra sign-in hosts of section 'Microsoft sign-in' (this public example names example.com only).",
+      "payloadName": "Fleet — Platform SSO (Entra ID)",
+      "payloadFileName": "fleet-platform-sso.mobileconfig",
+      "deploymentChannel": "deviceChannel",
+      "plist": {
+        "payloadType": "com.apple.extensiblesso",
+        "identifier": "com.example.intune.macos.fleet-platform-sso",
+        "uuid": "9B1B0B0E-0000-4000-8000-000000000001",
+        "innerIdentifier": "com.example.intune.macos.fleet-platform-sso.extensiblesso",
+        "innerUuid": "9B1B0B0E-0000-4000-8000-000000000002",
+        "displayName": "Fleet — Platform SSO (Entra ID)",
+        "organization": "Example"
+      },
+      "keys": {
+        "ExtensionIdentifier": "com.microsoft.CompanyPortalMac.ssoextension",
+        "TeamIdentifier": "UBF8T346G9",
+        "Type": "Redirect",
+        "URLs": [
+          "https://login.example.com"
+        ],
+        "ScreenLockedBehavior": "DoNotHandle",
+        "ExtensionData": {
+          "browser_sso_interaction_enabled": 1,
+          "disable_explicit_app_prompt": 1,
+          "AppPrefixAllowList": "com.apple.,com.microsoft.,cloud.meshweaver."
+        },
+        "PlatformSSO": {
+          "AuthenticationMethod": "Password",
+          "UseSharedDeviceKeys": true,
+          "AccountDisplayName": "Example (Entra ID)",
+          "EnableCreateUserAtLogin": true,
+          "NewUserAuthorizationMode": "Groups",
+          "UserAuthorizationMode": "Groups",
+          "AdministratorGroups": [
+            "Fleet — Mac Admins"
+          ],
+          "TokenToUserMapping": {
+            "AccountName": "preferred_username",
+            "FullName": "name"
+          },
+          "LoginPolicy": [
+            "AttemptAuthentication"
+          ],
+          "NonPlatformSSOAccounts": [
+            "<local owner account>"
+          ]
+        }
+      },
+      "assign": {
+        "include": [
+          "studios"
+        ],
+        "exclude": [
+          "noBootstrap"
+        ]
+      }
+    },
+    {
+      "key": "teamViewerPppc",
+      "displayName": "Fleet — TeamViewer Host privacy (Accessibility) (Acme)",
+      "description": "TeamViewer Host's Accessibility for one client's Macs. Screen Recording cannot be granted by MDM: approved once per Mac by a person at the console before it ships. README 'Apps: TeamViewer Host per client'.",
+      "payloadName": "Fleet — TeamViewer Host privacy",
+      "payloadFileName": "fleet-teamviewer-pppc.mobileconfig",
+      "deploymentChannel": "deviceChannel",
+      "plist": {
+        "payloadType": "com.apple.TCC.configuration-profile-policy",
+        "identifier": "com.example.intune.macos.fleet-teamviewer-pppc",
+        "uuid": "9B1B0B0E-0000-4000-8000-000000000003",
+        "innerIdentifier": "com.example.intune.macos.fleet-teamviewer-pppc.tcc",
+        "innerUuid": "9B1B0B0E-0000-4000-8000-000000000004",
+        "displayName": "Fleet — TeamViewer Host privacy",
+        "organization": "Example"
+      },
+      "keys": {
+        "Services": {
+          "Accessibility": [
+            {
+              "Identifier": "com.teamviewer.TeamViewerHost",
+              "IdentifierType": "bundleID",
+              "CodeRequirement": "identifier \"com.teamviewer.TeamViewerHost\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = H7UGFBUGV6",
+              "Authorization": "Allow",
+              "Comment": "TeamViewer Host"
+            },
+            {
+              "Identifier": "com.teamviewer.desktop",
+              "IdentifierType": "bundleID",
+              "CodeRequirement": "identifier \"com.teamviewer.desktop\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = H7UGFBUGV6",
+              "Authorization": "Allow",
+              "Comment": "TeamViewer Host's desktop helper"
+            }
+          ],
+          "ScreenCapture": [
+            {
+              "Identifier": "com.teamviewer.TeamViewerHost",
+              "IdentifierType": "bundleID",
+              "CodeRequirement": "identifier \"com.teamviewer.TeamViewerHost\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = H7UGFBUGV6",
+              "Authorization": "AllowStandardUserToSetSystemService",
+              "Comment": "NOT a grant: Apple lets an MDM only deny Screen Recording or let a standard user approve it. The approval is a person's click at the Mac (pre-shipping)."
+            }
+          ]
+        }
+      },
+      "assign": {
+        "include": [
+          "clientAcme"
         ]
       }
     }
@@ -320,5 +457,34 @@
         }
       }
     ]
-  }
+  },
+  "apps": [
+    {
+      "key": "teamViewerHostAcme",
+      "displayName": "TeamViewer Host — Acme",
+      "description": "The client's TeamViewer Host package (uploaded by a person), assigned required to the client's Macs; the post-install script assigns each Mac to the client's TeamViewer account with its alias. README 'Apps'.",
+      "type": "macOSPkgApp",
+      "intent": "required",
+      "postInstallScript": {
+        "source": {
+          "repo": "Systemorph/MeshWeaver.Deploy",
+          "path": "deploy/macos/intune/teamviewer/teamviewer-host-postinstall.sh",
+          "commit": "fc17c20654e1309a4f664ed2c83302461a289c58",
+          "sha256": "116365c11ea41245ec6855be9e687899ad73a528878ec11e25ba32c3fa7ac52b"
+        },
+        "params": {
+          "ALIAS_PREFIX": "ACME-"
+        },
+        "aliasesFrom": "clientAcme",
+        "secrets": {
+          "ASSIGNMENT_ID": "TEAMVIEWER_ASSIGNMENT_ID_ACME"
+        }
+      },
+      "assign": {
+        "include": [
+          "clientAcme"
+        ]
+      }
+    }
+  ]
 }

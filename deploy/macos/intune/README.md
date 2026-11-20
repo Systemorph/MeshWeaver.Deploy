@@ -142,7 +142,8 @@ uses); otherwise `az account get-access-token --resource https://graph.microsoft
 private repository's pull-request subject, and every pull-request branch could then mint a token that WRITES device
 management. It signs in as a separate READ-ONLY identity (`DeviceManagementConfiguration.Read.All`,
 `DeviceManagementScripts.Read.All`, `DeviceManagementManagedDevices.Read.All`, `Group.Read.All`, `Device.Read.All`, and
-`DeviceManagementServiceConfig.Read.All` once the spec declares an `enrollmentProgram`),
+`DeviceManagementServiceConfig.Read.All` once the spec declares an `enrollmentProgram`, `DeviceManagementApps.Read.All`
+once it declares `apps`),
 whose federated credentials name that repository's `main` and `pull_request` subjects; the `appIdentity` line then
 reads INFO (a different application), and the apply identity's grants are verified when a person runs `--apply`.
 ⚠️ The Azure CLI's own sign-in carries NO Intune scopes (measured 2026-11-09: every `deviceManagement` read →
@@ -154,11 +155,13 @@ reads INFO (a different application), and the apply identity's grants are verifi
 |---|---|---|
 | `appIdentity.requiredRoles` | the app identity's Graph application permissions | **verified only** (from the token's `roles` claim): `DeviceManagementConfiguration.ReadWrite.All`, `DeviceManagementScripts.ReadWrite.All`, `DeviceManagementManagedDevices.Read.All`, `Group.Read.All`, `Device.Read.All`, `GroupMember.ReadWrite.All`. A missing one is drift no `--apply` repairs: an admin-consented grant is the owner's act |
 | `groups.studios` / `groups.noBootstrap` | two ASSIGNED security groups: the Studios, and the hand-attached Studios the bootstrap must not touch | the app identity cannot create a group (no `Group.Create`); an absent group is reported with the body a person creates |
+| `groups.*.users` `[{upn, id}]` | group membership of PEOPLE (e.g. the Mac admins group Platform SSO names) | by the user's directory object `id` → `POST /groups/{id}/members/$ref` (`GroupMember.ReadWrite.All`). The id is DECLARED: resolving a UPN app-only needs `User.Read.All`, which the app identity does not hold, so a user without one is `PENDING` with the `az ad user show` that reads it. A group declares users OR devices, never both |
 | `groups.*.devices` `[{serial, name}]` | group membership | serial → `managedDevices` (macOS) → `azureADDeviceId` → the directory `device` object → `POST /groups/{id}/members/$ref`. A Mac not yet enrolled is `PENDING`; a member the spec does not declare is reported and kept |
 | `scripts[]` | `deviceShellScript` | content = `source.path` at `source.commit` (a full sha) with `source.sha256`; `runAsAccount`, `executionFrequency`, `retryCount`, `blockExecutionNotifications`, include + exclude |
-| `customProfiles[]` | `macOSCustomConfiguration`, device channel, domain `com.memex.local` | the payload is BUILT from `plist` + `keys` and compared by parsed value, not bytes. Keys: `ControlUrl`, `RegistryUrl`, `LoginServer`, `OwnerId`, `OwnerEmail`, the unattended first-run answers `Organisation`, `OwnerName`, `AcceptTerms`, `FleetCaSha256`, and the participation answers `AcceptJobs`, `AcceptJobsFrom`, `AcceptJobsChannels`, `AcceptJobsRepos`, `AcceptTokens`, `AcceptTokensFrom`, `AcceptTokensModels`, `AcceptTokensResidency`. `AcceptJobs` / `AcceptTokens` must be explicit booleans (validation refuses a spec without them), and `AcceptTokens: true` needs `AcceptTokensModels` (the bootstrap refuses tokens on without models, so validation does too); a list is written as ONE comma-separated string, the form `memex-local --accept-jobs=…` / `--token-models` take, so the bootstrap passes `defaults read` output through unchanged |
+| `customProfiles[]` | `macOSCustomConfiguration`, device channel, domain `com.memex.local` | the payload is BUILT from `plist` + `keys` and compared by parsed value, not bytes. Keys: `ControlUrl`, `RegistryUrl`, `LoginServer`, `OwnerId`, `OwnerEmail`, the unattended first-run answers `Organisation`, `OwnerName`, `AcceptTerms`, `FleetCaSha256`, and the participation answers `AcceptJobs`, `AcceptJobsFrom`, `AcceptJobsChannels`, `AcceptJobsRepos`, `AcceptTokens`, `AcceptTokensFrom`, `AcceptTokensModels`, `AcceptTokensResidency`. `AcceptJobs` / `AcceptTokens` must be explicit booleans (validation refuses a spec without them), and `AcceptTokens: true` needs `AcceptTokensModels` (the bootstrap refuses tokens on without models, so validation does too); a list is written as ONE comma-separated string, the form `memex-local --accept-jobs=…` / `--token-models` take, so the bootstrap passes `defaults read` output through unchanged. **Any other `payloadType` is written VERBATIM** from `keys` (lists stay arrays, dictionaries stay dictionaries); two are validated by shape because a mistake in them installs and does nothing: `com.apple.extensiblesso` (Platform SSO, section "Mac admins through an Entra group") and `com.apple.TCC.configuration-profile-policy` (PPPC — validation refuses a profile that claims to ALLOW `ScreenCapture` or `ListenEvent`, which Apple lets an MDM only deny or leave to a standard user) |
 | `trustedRootCertificates[]` | `macOSTrustedRootCertificate` | the fleet local CA's PUBLIC certificate (`certFile`, PEM or DER, next to the spec) and its DER sha256. Until the CA is minted, `sha256` is empty and the line is `PENDING — CA not minted yet`. Once declared, the `com.memex.local` keys must carry the same value as `FleetCaSha256` (what `memex-local ca adopt` reads); validation refuses either without the other |
 | `settingsPolicies[]` | settings-catalog policy (the DDM night-window software-update policy) | `settings` maps `settingDefinitionId` → value; `--apply` rewrites those values in the LIVE tree and PUTs it back (the tree itself is created in the admin center, then its id is recorded). Each Apple release bumps `enforcement_targetosversion` + `enforcement_targetlocaldatetime` here |
+| `apps[]` | an Intune macOS app (`macOSPkgApp`, `macOSLobApp`, `macOSDmgApp`), Graph beta `deviceAppManagement/mobileApps` | section "Apps" below: read by id or exact name (absent = `AWAITING`: the package is uploaded by a person, never by the reconcile), declared `properties` compared, a pinned post-install TEMPLATE rendered per client (secrets from the environment, one alias line per Mac of a group), assignments with their `intent`. Needs `DeviceManagementApps.ReadWrite.All` (apply) / `.Read.All` (check) |
 | `compliancePolicies[]` | `deviceCompliancePolicy` | existing policies by id (assignments, declared `properties`), new ones created from `properties` |
 | `enrollmentProgram` | the Apple Business Manager ADE token (`depOnboardingSetting`), a `depMacOSEnrollmentProfile`, its default flag, and each declared serial's profile assignment | section below. Needs `DeviceManagementServiceConfig.ReadWrite.All` on the apply identity and `.Read.All` on the drift identity |
 
@@ -257,6 +260,106 @@ The fix, declared and **held** (it changes the tenant-wide policy, so it waits f
 2. a Studios compliance policy without a password rule (`storageRequireEncryption`, Gatekeeper), assigned to the
    Studios, so they keep a compliance verdict.
 Lifting the hold is a reviewed change to the spec (delete `hold`), never a command-line flag.
+
+### Mac admins through an Entra group (Platform SSO)
+
+**What is declared** (`customProfiles[]`, `payloadType: com.apple.extensiblesso`): macOS **Platform SSO** through the
+Microsoft Enterprise SSO plug-in that Company Portal carries — extension `com.microsoft.CompanyPortalMac.ssoextension`,
+team `UBF8T346G9`, `Type: Redirect`, the Entra URLs, `ScreenLockedBehavior: DoNotHandle`, and a `PlatformSSO`
+dictionary: `AuthenticationMethod: Password`, `UseSharedDeviceKeys: true`, `EnableCreateUserAtLogin: true` (an Entra
+user signs in at the login window and gets a local account), `NewUserAuthorizationMode` / `UserAuthorizationMode:
+Groups` with `AdministratorGroups` naming the admins' Entra group, `TokenToUserMapping` (`preferred_username`, `name`),
+`LoginPolicy: [AttemptAuthentication]`, and `NonPlatformSSOAccounts` — the local accounts Platform SSO must leave alone.
+The admins' group is a `groups.*.users` group (above). It also carries the Redirect plug-in's `ExtensionData`
+(`browser_sso_interaction_enabled`, `disable_explicit_app_prompt`, `AppPrefixAllowList`), so on a Mac it reaches it
+REPLACES the hand-registered Redirect profile of section "Microsoft sign-in" — which must then no longer reach that Mac:
+two `com.apple.extensiblesso` payloads for the same extension on one Mac conflict.
+
+**Facts it rests on** (read 2026-11-20):
+
+| Fact | Source |
+|---|---|
+| Intune's documented route is the settings catalog (Authentication → Extensible Single Sign On), with Registration Token `{{DEVICEREGISTRATION}}`; "any undocumented Platform SSO settings aren't supported"; Company Portal 5.2404.0+, macOS 13+ (14+ recommended) | [Configure Platform SSO for macOS](https://learn.microsoft.com/en-us/intune/intune-service/configuration/platform-sso-macos), [scenarios](https://learn.microsoft.com/en-us/intune/device-configuration/settings-catalog/configure-platform-sso-scenarios-macos) |
+| 🚨 **Microsoft supports only `Standard` and `Admin`** for the two authorization modes — `Groups` is Apple's, NOT supported by Microsoft today | [scenarios](https://learn.microsoft.com/en-us/intune/device-configuration/settings-catalog/configure-platform-sso-scenarios-macos) |
+| Apple: `AdministratorGroups` is an array of "the group name"; "the system requests membership during authentication"; `UserAuthorizationMode` applies "each time the user authenticates"; the keys arrived in macOS 14, `NonPlatformSSOAccounts` / `LoginPolicy` in 15 | [Apple com.apple.extensiblesso schema](https://github.com/apple/device-management/blob/release/mdm/profiles/com.apple.extensiblesso.yaml), [Apple Platform Deployment: Platform SSO](https://support.apple.com/guide/deployment/dep7bbb05313/web) |
+| Creating the account at the login window works only with `Password` or `SmartCard`, needs `UseSharedDeviceKeys`, and a network connection (the validation refuses the other combinations) | the Apple schema and guide above |
+| With `Password` the Entra password REPLACES the local one and they stay in sync; `NonPlatformSSOAccounts` (macOS 15+) exempts an account from the registration prompt and the login policies | [scenarios](https://learn.microsoft.com/en-us/intune/device-configuration/settings-catalog/configure-platform-sso-scenarios-macos) |
+| Microsoft's other-MDM guide lists no registration token among its required settings; Apple marks `RegistrationToken` optional (silent registration only) | [macOS Platform SSO integration guide](https://learn.microsoft.com/en-us/entra/identity/devices/macos-psso-integration-guide) |
+| An app identity cannot create a group without `Group.Create` (or higher); `GroupMember.ReadWrite.All` adds members; resolving a UPN needs `User.Read.All` | [Create group](https://learn.microsoft.com/en-us/graph/api/group-post-groups?view=graph-rest-1.0), [Add members](https://learn.microsoft.com/en-us/graph/api/group-post-members?view=graph-rest-1.0), [Get user](https://learn.microsoft.com/en-us/graph/api/user-get?view=graph-rest-1.0) |
+
+**Why a custom profile and not the settings catalog.** The reconcile can build a settings-catalog tree only from flat
+group → simple/choice children; Platform SSO is a nested tree with string collections (`URLs`,
+`AdministratorGroups`), and its setting definition ids were not readable here (the person's `az login` carries no Intune
+scope). A custom profile is the same Apple payload, fully declared and compared by value. What it gives up: Intune's
+`{{DEVICEREGISTRATION}}` is not a documented custom-profile variable, so the payload carries NO `RegistrationToken` and
+each account registers interactively (the "Registration required" notification → sign-in and MFA). If the pre-shipping
+test below fails, the fallback is the settings-catalog policy Microsoft documents, created in the admin center with the
+same values, its id recorded under `settingsPolicies[]`.
+
+**Not established** (each is read on the first Mac, at our desk, before any Mac ships):
+- whether Entra delivers group membership the Platform SSO extension matches against `AdministratorGroups` — by display
+  name, by object id, or not at all (Microsoft documents nothing; declare BOTH the name and the group's object id once it
+  exists). The failure mode is safe — an Entra user gets a STANDARD account, nobody gets admin by mistake — and the
+  test is: sign in at the login window as a member, then `dseditgroup -o checkmember -m <short name> admin`;
+- whether registration can be completed over Screen Sharing (no source says either way);
+- whether the extension registers the device with no `RegistrationToken` in an Intune custom profile.
+
+**Unattended boot and the owner account.** FileVault is off on the fleet's startup volumes, so the login window is
+reached with no unlock and `FileVaultPolicy` is not declared. The Mac's local OWNER account (the one its memex runs as)
+must be listed in `NonPlatformSSOAccounts`: with `Password`, a registered account's local password would become the
+Entra password — breaking anything that relies on the local one. Members of the admins' group then sign in with their
+OWN Entra accounts, created at the login window (over Screen Sharing, with Remote Management on).
+
+### Apps: TeamViewer Host per client
+
+`apps[]` declares an Intune macOS app the reconcile READS and ASSIGNS; it never uploads app content (the package is a
+vendor's or a client's licensed file). A missing app is `AWAITING` — counted as pending, never red — with the admin
+center path to upload it, named exactly as `displayName`. Present, it compares the declared `properties`, the
+post-install script and the assignments (each with the declared `intent`, `required` / `available` / `uninstall`; a
+declared target live with another intent is rewritten, an undeclared one is kept with its own).
+
+**TeamViewer Host for a client's remote support** (alongside Screen Sharing over the tailnet; the licence is the
+CLIENT's): one `macOSPkgApp` per client, assigned `required` to that client's group of Macs, plus that client's PPPC
+profile (`customProfiles[]`, `com.apple.TCC.configuration-profile-policy`). Per client and per machine:
+
+- the post-install script is the pinned TEMPLATE `teamviewer/teamviewer-host-postinstall.sh`, rendered by the reconcile:
+  `@@NAME@@` ← `postInstallScript.params`; `@@DEVICE_ALIASES@@` ← one `<serial> <name>` line per Mac of the
+  `aliasesFrom` group (each Mac finds its own alias by serial; the device alias is `ALIAS_PREFIX` + name). Refused
+  before anything is written: a param value with a quote, a newline or `@@` (it sits inside a single-quoted assignment
+  run as root); an `aliasesFrom` that is not a DEVICE group (a `devices` list, possibly still empty, and no users); and a
+  rendered script that still carries a `@@NAME@@` the spec does not fill (it would be installed verbatim and then match
+  the drift check forever);
+- the client's **assignment id** is a SECRET: the spec names only the environment variable (`secrets.ASSIGNMENT_ID`)
+  that carries it when a person runs `--apply`. `--check` puts the live script's `ASSIGNMENT_ID='…'` line back to its
+  placeholder before comparing, so the drift check never needs the secret and never prints it; an `--apply` that would
+  rewrite the script without the variable set is an `ERROR` naming it, and writes nothing;
+- the script runs `/Applications/TeamViewerHost.app/Contents/Helpers/TeamViewer_Assignment -assignment_id <id>
+  -device_alias <alias> --reassign` (TeamViewer Corporate / Tensor, 15+:
+  [Assign a device via command line](https://www.teamviewer.com/en/global/support/knowledge-base/teamviewer-remote/deployment/mass-deployment-user-guide/assign-a-device-via-command-line-8-10/)),
+  three attempts, logging to `/Library/Logs/MeshWeaver/teamviewer-assignment.log` — Intune does not report a failed
+  post-install script ([unmanaged PKG apps](https://learn.microsoft.com/en-us/intune/intune-service/apps/macos-unmanaged-pkg):
+  agent 2309.007+ for scripts, each under 15,360 characters). A changed assignment id reaches a Mac only with a
+  reinstall: the script runs after an install, not on its own schedule.
+
+**What a person does, per client:** download the client's TeamViewer HOST package for macOS from the client's
+Management Console (the rollout configuration's installer ZIP holds separate Host and full-client packages:
+[mass deployment on macOS](https://www.teamviewer.com/hk/global/support/knowledge-base/teamviewer-classic/deployment/mass-deployment-on-macos/));
+upload the Host `.pkg` in the admin center as a macOS app (PKG) named exactly as `displayName`, leaving the scripts
+empty; then `--apply` with the assignment-id variable set, which writes the rendered script and the assignment.
+
+🚨 **Screen Recording cannot be pre-granted by MDM.** Apple: for `ScreenCapture` "a profile can't grant access … it
+can only deny it", and `AllowStandardUserToSetSystemService` (valid only for `ScreenCapture` and `ListenEvent`) merely
+lets a non-admin flip the switch ([Apple PPPC schema](https://github.com/apple/device-management/blob/release/mdm/profiles/com.apple.TCC.configuration-profile-policy.yaml)).
+TeamViewer says the same: "users must still grant Screen Recording"
+([remote control a Mac](https://www.teamviewer.com/pl/global/support/knowledge-base/teamviewer-remote/remote-control/remote-control-a-mac/)).
+So the PPPC profile grants **Accessibility** and leaves Screen Recording to ONE approval per Mac by a person at the
+console — at our desk, before the Mac ships. **Not established:** TeamViewer Host's bundle ids and designated
+requirements (TeamViewer publishes no PPPC file); the declared ones (`com.teamviewer.TeamViewerHost`,
+`com.teamviewer.desktop`, team `H7UGFBUGV6`) are verified with `codesign -dr - /Applications/TeamViewerHost.app` on the
+first installed copy before the first Mac ships — a wrong requirement installs and grants nothing. Also not
+established: whether TeamViewer Host connects at the login window with nobody signed in, and whether macOS's periodic
+screen-recording re-confirmation (macOS 15+) reaches it; `forceBypassScreenCaptureAlert`
+(`com.apple.applicationaccess`, 15.1+) is not declared.
 
 ### Device membership without a spec line: the dynamic-group alternative (evaluated, not created)
 
