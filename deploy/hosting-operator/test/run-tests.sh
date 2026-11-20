@@ -5274,6 +5274,220 @@ refuses_hard "hosting-db-retire refuses a login given empty" "was given EMPTY" \
   env HOSTING_DRY_RUN=true hosting-db-retire check --database oldcopy --server pg.test --user ''
 unset _dbrt_out _dbrt_rc _dbrt_log _dbrt_az _dbrt_state _drop_line _last_exists _sysdb
 
+# ── hosting-db-reclaim: give the disk back after a retention drain — measure, then reclaim ──────
+# MeshWeaver.Plugins kind ReclaimDatabaseSpace. `measure` READS (in a dry run too — it is the what-if) in
+# a read-only session; `reclaim` rewrites each history table, largest first, only with room for a copy
+# of its live data, only inside its time budget, and reads every size back. Pinned: the read-only
+# session, the estimate and its method, the free-storage reading in all three answers, every refusal
+# that protects the server, pg_repack only when extension AND client agree, VACUUM FULL under
+# lock_timeout + statement_timeout, and the control that a table with room IS rewritten and reported.
+echo
+echo "── hosting-db-reclaim: measure reads read-only, reclaim rewrites only with room and inside its budget ──"
+DBRC_STUBS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/db-reclaim" && pwd)"
+DBRC_REPACK="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/stubs/db-reclaim-repack" && pwd)"
+DBRC_ARGS=(--database acmedb --server pg-example.postgres.database.azure.com --user acmeowner --vault kv-example --password-secret memex-postgres-password)
+_dbrc_new() {
+  _dbrc_state="$(mktemp -d)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    hosting 445000000000 5000000000 437200000000 2800000000 1000000 90000000 pg_stat 10000000000 500 \
+    admin_versions 10000000000 400000000 9400000000 200000000 50000 60000 pg_stat 9500000000 80 > "$_dbrc_state/tables"
+  printf '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example/providers/Microsoft.DBforPostgreSQL/flexibleServers/pg-example\t512\n' > "$_dbrc_state/server"
+  echo 480000000000.0 > "$_dbrc_state/used"
+}
+_dbrc() { _dbrc_out="$(env -u PGPASSWORD -u HOSTING_DRY_RUN -u PGOPTIONS PATH="$DBRC_STUBS:$PATH" HOSTING_DBRC_STATE="$_dbrc_state" "$@" 2>&1)"; _dbrc_rc=$?
+  _dbrc_log="$(cat "$_dbrc_state/pg.log" 2>/dev/null || true)"; _dbrc_az="$(cat "$_dbrc_state/az.log" 2>/dev/null || true)"; }
+_dbrc_repack() { _dbrc_out="$(env -u PGPASSWORD -u HOSTING_DRY_RUN -u PGOPTIONS PATH="$DBRC_REPACK:$DBRC_STUBS:$PATH" HOSTING_DBRC_STATE="$_dbrc_state" "$@" 2>&1)"; _dbrc_rc=$?
+  _dbrc_log="$(cat "$_dbrc_state/pg.log" 2>/dev/null || true)"; }
+
+# measure: per-table sizes, tuples, the estimate and its method, pg_repack's verdict, free storage — read-only
+_dbrc_new; _dbrc hosting-db-reclaim measure "${DBRC_ARGS[@]}"
+if [ "$_dbrc_rc" -eq 0 ] \
+   && grep_in "$_dbrc_out" -q '::hosting:: candidate_table=hosting.mesh_node_history' \
+   && grep_in "$_dbrc_out" -q '::hosting:: total_bytes=445000000000' \
+   && grep_in "$_dbrc_out" -q '::hosting:: toast_bytes=437200000000' \
+   && grep_in "$_dbrc_out" -q '::hosting:: dead_tuples=90000000' \
+   && grep_in "$_dbrc_out" -q '::hosting:: reclaimable_bytes=435000000000' \
+   && grep_in "$_dbrc_out" -q '::hosting:: estimate_method=row_sample' \
+   && grep_in "$_dbrc_out" -q '::hosting:: live_tuples_source=pg_stat' \
+   && grep_in "$_dbrc_out" -q '::hosting:: candidate_tables=2' \
+   && grep_in "$_dbrc_out" -q '::hosting:: reclaimable_total=435500000000' \
+   && grep_in "$_dbrc_out" -q '::hosting:: free_bytes=69755813888' \
+   && grep_in "$_dbrc_out" -q '::hosting:: free_storage_verify=true'; then
+  ok "measure reports each history table's sizes, tuples, estimate (and its method), the total and the free storage"
+else
+  bad "measure reports the per-table reading" "rc=${_dbrc_rc} out: ${_dbrc_out}"
+fi
+_c1="$(grep_in "$_dbrc_out" -n 'candidate_table=hosting\.' | head -1 | cut -d: -f1)"; _c2="$(grep_in "$_dbrc_out" -n 'candidate_table=admin_versions\.' | head -1 | cut -d: -f1)"
+[ -n "$_c1" ] && [ -n "$_c2" ] && [ "$_c1" -lt "$_c2" ] && ok "…largest table first" || bad "largest table first" "out: ${_dbrc_out}"
+if grep_in "$_dbrc_log" -q 'PGOPTIONS=-c default_transaction_read_only=on db=acmedb sql=measure' && ! grep_in "$_dbrc_log" -q 'VACUUM'; then
+  ok "…in a read-only session on the instance's database, and nothing is rewritten"
+else
+  bad "measure is read-only and rewrites nothing" "log: ${_dbrc_log}"
+fi
+grep_in "$_dbrc_out" -q '::hosting:: repack_usable=false' && grep_in "$_dbrc_out" -q 'not available on the server' \
+  && grep_in "$_dbrc_out" -q '::hosting:: reclaim_method=vacuum_full' \
+  && ok "…with no pg_repack extension it says so and names VACUUM FULL as the method" \
+  || bad "pg_repack verdict without the extension" "out: ${_dbrc_out}"
+case "$_dbrc_az" in *"monitor metrics list --resource /subscriptions/"*"--metric storage_used"*) ok "…free storage is the provisioned size minus the storage_used metric" ;; *) bad "free storage read from Azure" "az: ${_dbrc_az}" ;; esac
+case "$_dbrc_out$_dbrc_log" in *NEVER-PRINTED*) bad "the password is never printed nor on an argv" "seen: ${_dbrc_out}" ;; *) ok "the password is never printed nor on an argv" ;; esac
+rm -rf "$_dbrc_state"
+
+# measure in a DRY RUN still reads (it IS the what-if)
+_dbrc_new; _dbrc env HOSTING_DRY_RUN=true hosting-db-reclaim measure "${DBRC_ARGS[@]}"
+if [ "$_dbrc_rc" -eq 0 ] && grep_in "$_dbrc_log" -q 'sql=measure' && grep_in "$_dbrc_out" -q '::hosting:: reclaimable_bytes=435000000000'; then
+  ok "a dry-run measure reads the server for real — the approver reads the per-table estimate"
+else
+  bad "dry-run measure reads" "rc=${_dbrc_rc} out: ${_dbrc_out}"
+fi
+rm -rf "$_dbrc_state"
+
+# measure: free storage unreadable / refused — said, never guessed, and the read still succeeds
+_dbrc_new; rm -f "$_dbrc_state/server"; _dbrc hosting-db-reclaim measure "${DBRC_ARGS[@]}"
+if [ "$_dbrc_rc" -eq 0 ] && grep_in "$_dbrc_out" -q '::hosting:: free_bytes=unknown' && grep_in "$_dbrc_out" -q '::hosting:: free_storage_verify=unknown' \
+   && grep_in "$_dbrc_out" -q 'a real reclaim REFUSES without it'; then
+  ok "an unreadable free storage is reported unknown (free_storage_verify=unknown), never a number"
+else
+  bad "unknown free storage" "rc=${_dbrc_rc} out: ${_dbrc_out}"
+fi
+rm -rf "$_dbrc_state"
+_dbrc_new; touch "$_dbrc_state/server-refused"; _dbrc hosting-db-reclaim measure "${DBRC_ARGS[@]}"
+grep_in "$_dbrc_out" -q 'REFUSED, not absent' && grep_in "$_dbrc_out" -q 'free_bytes=unknown' \
+  && ok "…and a REFUSED listing says REFUSED, not absent" || bad "refused free storage" "out: ${_dbrc_out}"
+rm -rf "$_dbrc_state"
+
+# measure: a truncated answer is a failure, never a smaller database
+_dbrc_new; touch "$_dbrc_state/no-end"; _dbrc hosting-db-reclaim measure "${DBRC_ARGS[@]}"
+[ "$_dbrc_rc" -ne 0 ] && grep_in "$_dbrc_out" -q 'did not reach its end marker' \
+  && ok "a measurement without its end marker fails — a partial reading is never reported as a whole one" \
+  || bad "a truncated measurement fails" "rc=${_dbrc_rc} out: ${_dbrc_out}"
+rm -rf "$_dbrc_state"
+
+# measure: an unknown live size, and a schema name it would have to escape
+_dbrc_new; printf 'hosting\t100\t60\t20\t20\t5\t9\tpg_stat\t-1\t0\nwe"ird\t50\t30\t10\t10\t1\t1\tpg_stat\t10\t1\n' > "$_dbrc_state/tables"
+_dbrc hosting-db-reclaim measure "${DBRC_ARGS[@]}"
+if [ "$_dbrc_rc" -eq 0 ] && grep_in "$_dbrc_out" -q '::hosting:: reclaimable_bytes=unknown' && grep_in "$_dbrc_out" -q '::hosting:: estimate_method=none' \
+   && ! grep_in "$_dbrc_out" -q 'candidate_table=we' && grep_in "$_dbrc_out" -q 'is not interpolated into SQL'; then
+  ok "a table with no live sample is 'unknown', never 0; a schema name outside the plain set is named and left alone"
+else
+  bad "unknown estimate and odd schema" "rc=${_dbrc_rc} out: ${_dbrc_out}"
+fi
+rm -rf "$_dbrc_state"
+
+# reclaim dry run: narrates, reads no secret, issues no statement
+_dbrc_new; _dbrc env HOSTING_DRY_RUN=true hosting-db-reclaim reclaim "${DBRC_ARGS[@]}"
+if [ "$_dbrc_rc" -eq 0 ] && [ ! -s "$_dbrc_state/pg.log" ] && [ ! -s "$_dbrc_state/az.log" ] && grep_in "$_dbrc_out" -q '::hosting:: reclaimed_total=dry-run'; then
+  ok "a dry-run reclaim reads no secret, issues no statement and rewrites nothing"
+else
+  bad "a dry-run reclaim touches nothing" "rc=${_dbrc_rc} out: ${_dbrc_out}"
+fi
+rm -rf "$_dbrc_state"
+
+# reclaim: the control — the big table is rewritten (VACUUM FULL, bounded), the small one skipped, sizes read back
+_dbrc_new; _dbrc hosting-db-reclaim reclaim "${DBRC_ARGS[@]}"
+if [ "$_dbrc_rc" -eq 0 ] \
+   && grep_in "$_dbrc_out" -q '::hosting:: reclaim_table=hosting.mesh_node_history' \
+   && grep_in "$_dbrc_out" -q '::hosting:: method=vacuum_full' \
+   && grep_in "$_dbrc_out" -q '::hosting:: before_bytes=445000000000' \
+   && grep_in "$_dbrc_out" -q '::hosting:: after_bytes=10000000000' \
+   && grep_in "$_dbrc_out" -q '::hosting:: freed_bytes=435000000000' \
+   && grep_in "$_dbrc_out" -q '::hosting:: reclaim_skipped=admin_versions.mesh_node_history' \
+   && grep_in "$_dbrc_out" -q '::hosting:: reclaimed_total=435000000000'; then
+  ok "reclaim rewrites the table worth it, skips the one below the threshold, and reports before/after/freed and the total"
+else
+  bad "reclaim rewrites and reports" "rc=${_dbrc_rc} out: ${_dbrc_out}"
+fi
+grep_in "$_dbrc_log" -q 'PGOPTIONS=-c lock_timeout=10000 -c statement_timeout=[0-9]*000 db=acmedb sql=VACUUM (FULL, ANALYZE) "hosting".mesh_node_history' \
+  && ok "…VACUUM FULL runs under lock_timeout and a statement_timeout of the remaining budget" \
+  || bad "VACUUM FULL is bounded" "log: ${_dbrc_log}"
+! grep_in "$_dbrc_log" -q 'VACUUM (FULL, ANALYZE) "admin_versions"' && ok "…and the skipped table is never locked" || bad "skipped table untouched" "log: ${_dbrc_log}"
+_vac="$(grep_in "$_dbrc_log" -n 'VACUUM' | head -1 | cut -d: -f1)"; _sizes="$(grep_in "$_dbrc_log" -n 'pg_total_relation_size' | cut -d: -f1 | tr '\n' ' ')"
+read -r _s1 _s2 _ <<< "$_sizes"
+[ -n "$_vac" ] && [ -n "${_s2:-}" ] && [ "$_s1" -lt "$_vac" ] && [ "$_s2" -gt "$_vac" ] \
+  && ok "…the size is read before the rewrite and AGAIN after it — freed is a reading, not an assumption" \
+  || bad "size read before and after" "log: ${_dbrc_log}"
+case "$_dbrc_log" in *"PGPASSWORD=unset"*) bad "every psql got the password through the environment" "log: ${_dbrc_log}" ;; *) ok "every psql got the password through the environment" ;; esac
+rm -rf "$_dbrc_state"
+
+# reclaim: unknown free storage → refused, nothing rewritten
+_dbrc_new; rm -f "$_dbrc_state/used"; _dbrc hosting-db-reclaim reclaim "${DBRC_ARGS[@]}"
+[ "$_dbrc_rc" -ne 0 ] && grep_in "$_dbrc_out" -q 'free storage is UNKNOWN' && ! grep_in "$_dbrc_log" -q 'VACUUM' \
+  && ok "reclaim refuses when the free storage cannot be read — room nobody read is no room" \
+  || bad "reclaim refuses unknown free storage" "rc=${_dbrc_rc} out: ${_dbrc_out}"
+rm -rf "$_dbrc_state"
+
+# reclaim: no room for a copy of the live data (+ headroom) → refused before the table, nothing rewritten
+_dbrc_new; echo 540000000000 > "$_dbrc_state/used"; _dbrc hosting-db-reclaim reclaim "${DBRC_ARGS[@]}"
+[ "$_dbrc_rc" -ne 0 ] && grep_in "$_dbrc_out" -q 'REFUSED before hosting.mesh_node_history: it needs 15000000000 bytes free' && ! grep_in "$_dbrc_log" -q 'VACUUM' \
+  && ok "reclaim refuses a table the free storage cannot hold a copy of (live data + headroom)" \
+  || bad "reclaim refuses without room" "rc=${_dbrc_rc} out: ${_dbrc_out}"
+rm -rf "$_dbrc_state"
+# …and an UNKNOWN live size is sized as the whole table
+_dbrc_new; printf 'hosting\t445000000000\t5000000000\t437200000000\t2800000000\t1000000\t90000000\tpg_stat\t-1\t0\n' > "$_dbrc_state/tables"
+_dbrc hosting-db-reclaim reclaim "${DBRC_ARGS[@]}"
+[ "$_dbrc_rc" -ne 0 ] && grep_in "$_dbrc_out" -q 'needs 667500000000 bytes free' && ! grep_in "$_dbrc_log" -q 'VACUUM' \
+  && ok "…and a table whose live size is unknown is sized as the WHOLE table, never as small" \
+  || bad "unknown live size sized as whole table" "rc=${_dbrc_rc} out: ${_dbrc_out}"
+rm -rf "$_dbrc_state"
+
+# reclaim: a table that no longer fits the budget is not started
+_dbrc_new; _dbrc hosting-db-reclaim reclaim "${DBRC_ARGS[@]}" --budget-seconds 60
+[ "$_dbrc_rc" -ne 0 ] && grep_in "$_dbrc_out" -q 'STOPPED before hosting.mesh_node_history' && ! grep_in "$_dbrc_log" -q 'VACUUM' \
+  && ok "reclaim does not start a rewrite estimated past its remaining budget, and says how to continue" \
+  || bad "reclaim respects its budget" "rc=${_dbrc_rc} out: ${_dbrc_out}"
+rm -rf "$_dbrc_state"
+
+# reclaim: VACUUM FULL fails (lock not taken, or cancelled) → a failed step naming what Postgres kept
+_dbrc_new; echo 'VACUUM' > "$_dbrc_state/fail-on"; _dbrc hosting-db-reclaim reclaim "${DBRC_ARGS[@]}"
+[ "$_dbrc_rc" -ne 0 ] && grep_in "$_dbrc_out" -q 'rolled the rewrite back' && ! grep_in "$_dbrc_out" -q 'reclaimed_total=' \
+  && ok "a VACUUM FULL that fails is a failed step, never reclaimed_total=" \
+  || bad "a failed VACUUM fails" "rc=${_dbrc_rc} out: ${_dbrc_out}"
+rm -rf "$_dbrc_state"
+
+# pg_repack: used only when the extension is installed AND the client matches it
+_dbrc_new; printf '1.5.0\t1.5.0\n' > "$_dbrc_state/repack"; _dbrc_repack hosting-db-reclaim reclaim "${DBRC_ARGS[@]}"
+if [ "$_dbrc_rc" -eq 0 ] && grep_in "$_dbrc_out" -q '::hosting:: repack_usable=true' && grep_in "$_dbrc_out" -q '::hosting:: method=pg_repack' \
+   && grep_in "$_dbrc_log" -q 'pg_repack PGPASSWORD=set -h pg-example.postgres.database.azure.com -U acmeowner -d acmedb --table "hosting".mesh_node_history --no-superuser-check --no-kill-backend --wait-timeout 10' \
+   && ! grep_in "$_dbrc_log" -q 'VACUUM' && grep_in "$_dbrc_out" -q '::hosting:: freed_bytes=435000000000'; then
+  ok "with the extension installed and a matching client, reclaim uses pg_repack (never killing a backend) and no VACUUM FULL"
+else
+  bad "pg_repack when usable" "rc=${_dbrc_rc} out: ${_dbrc_out} log: ${_dbrc_log}"
+fi
+rm -rf "$_dbrc_state"
+_dbrc_new; printf '1.4.8\t1.4.8\n' > "$_dbrc_state/repack"; _dbrc_repack hosting-db-reclaim measure "${DBRC_ARGS[@]}"
+grep_in "$_dbrc_out" -q '::hosting:: repack_usable=false' && grep_in "$_dbrc_out" -q 'refuses a version mismatch' && grep_in "$_dbrc_out" -q 'reclaim_method=vacuum_full' \
+  && ok "…a client/extension version mismatch is not usable, and the method falls back to VACUUM FULL" \
+  || bad "pg_repack version mismatch" "out: ${_dbrc_out}"
+rm -rf "$_dbrc_state"
+_dbrc_new; printf '1.5.0\t1.5.0\n' > "$_dbrc_state/repack"; _dbrc hosting-db-reclaim measure "${DBRC_ARGS[@]}"
+if command -v pg_repack >/dev/null 2>&1; then
+  ok "…(an image without the client: skipped — this host carries a real pg_repack)"
+else
+  grep_in "$_dbrc_out" -q 'carries no pg_repack client' && grep_in "$_dbrc_out" -q 'repack_usable=false' \
+    && ok "…an installed extension with no client on the image is not usable" || bad "pg_repack without a client" "out: ${_dbrc_out}"
+fi
+rm -rf "$_dbrc_state"
+_dbrc_new; printf '\t1.5.0\n' > "$_dbrc_state/repack"; _dbrc_repack hosting-db-reclaim measure "${DBRC_ARGS[@]}"
+grep_in "$_dbrc_out" -q 'available on the server (1.5.0) but not installed in acmedb' && grep_in "$_dbrc_out" -q 'repack_usable=false' \
+  && ok "…an extension that is only AVAILABLE is not installed by this verb" || bad "pg_repack available only" "out: ${_dbrc_out}"
+rm -rf "$_dbrc_state"
+
+# refusals before anything is read or reported
+for _sysdb in postgres template0 template1 azure_maintenance azure_sys; do
+  refuses_hard "hosting-db-reclaim refuses the server's own database ${_sysdb}" "one of the server's own databases" \
+    env HOSTING_DRY_RUN=true hosting-db-reclaim measure --database "$_sysdb" --server pg.test --user u
+done
+refuses_hard "hosting-db-reclaim refuses a database name it would have to quote" "not a plain lower-case Postgres name" \
+  env HOSTING_DRY_RUN=true hosting-db-reclaim measure --database 'acme";drop' --server pg.test --user u
+refuses_hard "hosting-db-reclaim needs a verb" "missing verb" hosting-db-reclaim
+refuses_hard "hosting-db-reclaim refuses an unknown verb" "unknown verb" hosting-db-reclaim shrink --database acmedb --server pg.test --user u
+refuses_hard "hosting-db-reclaim refuses a login given empty" "was given EMPTY" \
+  env HOSTING_DRY_RUN=true hosting-db-reclaim measure --database acmedb --server pg.test --user ''
+refuses_hard "hosting-db-reclaim refuses a non-numeric --top" "is not a whole number" \
+  env HOSTING_DRY_RUN=true hosting-db-reclaim measure --database acmedb --server pg.test --user u --top 'x;y'
+refuses_hard "measure takes no reclaim-only flag" "ride reclaim only" \
+  env HOSTING_DRY_RUN=true hosting-db-reclaim measure --database acmedb --server pg.test --user u --budget-seconds 60
+unset _dbrc_out _dbrc_rc _dbrc_log _dbrc_az _dbrc_state _c1 _c2 _vac _sizes _s1 _s2 _sysdb
+
 echo
 echo "── hosting-inventory: node counts per partition schema, READ-ONLY by the server's own rule ──"
 # The Inventory action's one step (MeshWeaver.Plugins Hosting/InstanceAction, kind Inventory). It may run

@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# hosting-db-reclaim measure --database <db> --server <pg host> --user <login>
+#                            [--vault <key vault> --password-secret <vault object>] [--top <n>]
+# hosting-db-reclaim reclaim --database <db> --server <pg host> --user <login>
+#                            [--vault <key vault> --password-secret <vault object>] [--top <n>]
+#                            [--min-reclaim-bytes <n>] [--headroom-percent <n>] [--budget-seconds <n>]
+#                            [--lock-timeout-seconds <n>] [--rate-mib-per-second <n>]
+#
+# GIVE THE DISK BACK AFTER A RETENTION DRAIN (MeshWeaver.Plugins Hosting/InstanceAction, kind
+# `ReclaimDatabaseSpace`). A retention sweep DELETEs version-history rows; Postgres marks them dead,
+# autovacuum makes the space reusable, and the files never shrink. The only ways to hand the space
+# back to the server are to REWRITE the table: `VACUUM FULL` (an ACCESS EXCLUSIVE lock on the table
+# for the whole rewrite) or `pg_repack` (an online rebuild that holds an exclusive lock only briefly,
+# at the start and at the swap). The governed plan is two steps, in this order:
+#
+#   1. hosting-db-reclaim measure   — what a rewrite would give back, per table (a READ)
+#   2. hosting-db-reclaim reclaim   — rewrite each table, largest first, and read its size back
+#
+# WHICH TABLES. Every `mesh_node_history` of the database, in any schema — a partition keeps its
+# history either beside its nodes (`<schema>.mesh_node_history`) or in a sibling `<schema>_versions`
+# schema, so the catalog is read rather than a naming rule assumed. The largest --top (default 10).
+#
+# measure  is a READ and runs for real in a dry run too — like hosting-db-retire's check, and for the
+#          same reason: the dry run IS the what-if the approver reads, and "how much would this give
+#          back, and is there room to do it" is a fact about the server no narration can state. The
+#          session is opened read-only (default_transaction_read_only=on) and the one statement runs
+#          inside BEGIN TRANSACTION READ ONLY, so the SERVER refuses any write. It reports, per table:
+#          total, heap, TOAST and index bytes; live and dead tuples; and an ESTIMATE of the reclaimable
+#          bytes: total − (live tuples × average live row size including TOAST, from a 1% TABLESAMPLE)
+#          − the live share of the indexes. Live tuples come from pgstattuple_approx when that
+#          extension is installed in the database, else from pg_stat (the statistics collector's
+#          figure); `live_tuples_source` says which. It also reports whether pg_repack can be used
+#          (the extension installed in the database, the client binary on this image, the same
+#          version on both) and the server's FREE storage, read from Azure (the Flexible Server's
+#          provisioned size minus its `storage_used` metric) — or `free_storage_verify=unknown` with
+#          the reason when it cannot be read.
+# reclaim  in a dry run narrates and reads nothing (the measure step already read). On a real run it
+#          measures again and then goes table by table, largest first:
+#            • a table whose estimate is below --min-reclaim-bytes (default 1 GiB) is SKIPPED —
+#              locking a table for a rewrite that gives nothing back is pure cost;
+#            • it REFUSES (exit 1) unless the free storage holds a full copy of the table's LIVE data
+#              plus --headroom-percent (default 50: the WAL the rewrite writes before a checkpoint can
+#              recycle it). Both VACUUM FULL and pg_repack build the new files before dropping the
+#              old ones. Unknown free storage is a refusal, never a pass;
+#            • it REFUSES to START a table whose estimated rewrite time (live bytes ÷
+#              --rate-mib-per-second, default 40) no longer fits the remaining --budget-seconds
+#              (default 2400 — the operations lane cuts a job at 45 minutes). The run then fails
+#              naming what it did and what is left; a second run continues where this one stopped;
+#            • pg_repack --table when usable, else VACUUM (FULL, ANALYZE). VACUUM FULL runs with
+#              lock_timeout (default 10 s: it never queues in front of every writer waiting for a long
+#              reader) and statement_timeout = the remaining budget (an overrun is aborted by Postgres
+#              itself, which rolls the rewrite back and keeps the old files — never a lock left held
+#              by a backend whose client the lane killed). pg_repack runs with --no-kill-backend and
+#              --wait-timeout = the lock timeout;
+#            • after each table it reads the table's size back and reports what it freed.
+#
+# WHAT THIS DOES NOT DO. It never CREATEs an extension (installing pg_repack on a server is a server
+# change with its own allow-list, `azure.extensions` on an Azure Flexible Server); it never touches a
+# table other than mesh_node_history; and it cannot shrink the PROVISIONED storage of an Azure
+# Flexible Server, which only ever grows — a reclaim lowers what is USED, not what is billed.
+#
+# Output contract (the ::hosting:: lines the mesh reads):
+#   reclaim_database=<db>                     the database the step is about
+#   candidate_table=<schema>.mesh_node_history   (measure, once per table, largest first) followed by:
+#     total_bytes= heap_bytes= toast_bytes= index_bytes= live_tuples= dead_tuples=
+#     live_tuples_source=pgstattuple_approx|pg_stat  live_bytes=<estimate>|unknown
+#     reclaimable_bytes=<estimate>|unknown  estimate_method=row_sample|none  estimated_seconds=<n>|unknown
+#   candidate_tables=<n>                      how many tables were measured
+#   reclaimable_total=<bytes>                 the sum of the known estimates
+#   repack_usable=true|false   repack_reason=<why>   reclaim_method=pg_repack|vacuum_full
+#   free_bytes=<n>|unknown     storage_bytes=<n>|unknown   free_storage_verify=true|unknown
+#   reclaim_table=<schema>.mesh_node_history  (reclaim, once per rewritten table) followed by:
+#     method=pg_repack|vacuum_full  before_bytes= after_bytes= freed_bytes=
+#   reclaim_skipped=<schema>.mesh_node_history (reclaim) followed by skip_reason=<why>
+#   reclaimed_total=<bytes>                   the sum of freed_bytes — the ONLY success line of reclaim
+#   reclaimed_total=dry-run                   a rehearsal of reclaim
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_common.sh"
+# shellcheck disable=SC2034  # read by hosting::die in _common.sh, which shellcheck does not follow here
+HOSTING_CMD="hosting-db-reclaim"
+
+# The server's own databases. Never this action's target: their history tables are not the mesh's.
+SYSTEM_DATABASES=" postgres template0 template1 azure_maintenance azure_sys "
+
+verb="${1:-}"
+[ $# -gt 0 ] && shift
+case "$verb" in
+  measure|reclaim) ;;
+  "") hosting::die "missing verb — measure (read what a rewrite would give back) or reclaim (rewrite the history tables)" ;;
+  *)  hosting::die "unknown verb '${verb}' — measure or reclaim" ;;
+esac
+
+database="" server="" user="" vault="" password_secret=""
+top=10 min_reclaim=1073741824 headroom=50 budget=2400 lock_timeout=10 rate_mib=40
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --database)             database="${2:-}";        shift 2 ;;
+    --server)               server="${2:-}";          shift 2 ;;
+    --user)                 user="${2:-}"; user_given=1; shift 2 ;;
+    --vault)                vault="${2:-}";           shift 2 ;;
+    --password-secret)      password_secret="${2:-}"; shift 2 ;;
+    --top)                  top="${2:-}";             shift 2 ;;
+    --min-reclaim-bytes)    min_reclaim="${2:-}";     reclaim_only=1; shift 2 ;;
+    --headroom-percent)     headroom="${2:-}";        reclaim_only=1; shift 2 ;;
+    --budget-seconds)       budget="${2:-}";          reclaim_only=1; shift 2 ;;
+    --lock-timeout-seconds) lock_timeout="${2:-}";    reclaim_only=1; shift 2 ;;
+    --rate-mib-per-second)  rate_mib="${2:-}";        shift 2 ;;
+    *) hosting::die "unknown argument '$1'" ;;
+  esac
+done
+
+hosting::need_flag database "$database"
+hosting::need_flag server "$server"
+# A Postgres identifier: lower-case letters, digits and underscore only, so nothing in it can close a
+# quote; at most Postgres' 63 bytes.
+[[ "$database" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] \
+  || hosting::die "database '${database}' is not a plain lower-case Postgres name (a-z, 0-9, _; at most 63) — refusing to interpolate it into SQL"
+case "$SYSTEM_DATABASES" in
+  *" ${database} "*) hosting::die "${database} is one of the server's own databases — a reclaim rewrites the mesh's history tables, which live in the instance's database" ;;
+esac
+hosting::safe_host server "$server"
+[ -z "$vault" ] || hosting::safe_name vault "$vault"
+[ -z "$password_secret" ] || hosting::safe_name password-secret "$password_secret"
+[ "${user_given:-0}" = 0 ] || [ -n "$user" ] || hosting::die "--user was given EMPTY: the plan rendered no login (the record states no databaseUsername). Refusing rather than falling back to PGUSER."
+pg_user="${user:-${PGUSER:-}}"
+[ -n "$pg_user" ] || hosting::die "no database login: pass --user <the record's databaseUsername> (the plan does), or export PGUSER by hand. There is no default."
+hosting::safe_name user "$pg_user"
+for _n in top:"$top" min-reclaim-bytes:"$min_reclaim" headroom-percent:"$headroom" budget-seconds:"$budget" \
+          lock-timeout-seconds:"$lock_timeout" rate-mib-per-second:"$rate_mib"; do
+  [[ "${_n#*:}" =~ ^[0-9]{1,15}$ ]] || hosting::die "--${_n%%:*} '${_n#*:}' is not a whole number"
+done
+[ "$top" -ge 1 ] && [ "$top" -le 100 ] || hosting::die "--top ${top} is outside 1..100"
+[ "$rate_mib" -ge 1 ] || hosting::die "--rate-mib-per-second must be at least 1"
+[ "$lock_timeout" -ge 1 ] || hosting::die "--lock-timeout-seconds must be at least 1"
+[ "$verb" = reclaim ] || [ "${reclaim_only:-0}" = 0 ] \
+  || hosting::die "--min-reclaim-bytes, --headroom-percent, --budget-seconds and --lock-timeout-seconds ride reclaim only — measure changes nothing"
+
+hosting::say reclaim_database "$database"
+
+if [ "$verb" = reclaim ] && hosting::dry; then
+  hosting::log "DRY-RUN would measure the ${top} largest mesh_node_history tables of ${database} on ${server} again, then rewrite each one whose estimate is at least ${min_reclaim} bytes — largest first, pg_repack when usable else VACUUM (FULL, ANALYZE) — refusing any table the free storage cannot hold a copy of (live data + ${headroom}%), stopping before a table that no longer fits ${budget}s, and reading each table's size back"
+  hosting::say reclaimed_total dry-run
+  exit 0
+fi
+
+# The admin password is read from the vault by NAME (Memex#132) — see hosting::pg_password.
+hosting::pg_password "$vault" "$password_secret"
+
+trimmed() { printf '%s' "$1" | tr -d '[:space:]'; }
+rate_bps=$((rate_mib * 1048576))
+
+# ── the server's free storage, from Azure ─────────────────────────────────────────────────────
+# Postgres cannot see its own disk on a managed server (no filesystem function for a non-superuser),
+# so the free space is read where it is known: the Flexible Server's provisioned size minus its
+# `storage_used` metric (bytes, the newest 5-minute maximum). Three answers, never two: read, REFUSED
+# (this identity may not read the server or its metrics — nothing was ruled out), and unreadable.
+free_bytes="unknown" storage_bytes="unknown" free_reason=""
+read_free_storage() {
+  free_bytes="unknown" storage_bytes="unknown" free_reason=""
+  local name id gb used rc
+  case "$server" in
+    *.postgres.database.azure.com) name="${server%%.*}" ;;
+    *) free_reason="${server} is not an Azure Flexible Server host (<name>.postgres.database.azure.com) — its free storage has no reader here"; return 0 ;;
+  esac
+  hosting::probe output az postgres flexible-server list --query "[?name=='${name}'].[id, storage.storageSizeGb]" -o tsv; rc=$?
+  case "$rc" in
+    2) free_reason="REFUSED, not absent: this identity may not list Flexible Server ${name} (${HOSTING_PROBE_ERR})"; return 0 ;;
+    1) free_reason="Flexible Server ${name} is not visible to this identity in its subscription (${HOSTING_PROBE_ERR:-no row})"; return 0 ;;
+  esac
+  id="${HOSTING_PROBE_OUT%%$'\t'*}"; gb="$(trimmed "${HOSTING_PROBE_OUT#*$'\t'}")"
+  [[ "$id" =~ ^/subscriptions/[A-Za-z0-9/._()-]+$ ]] && [[ "$gb" =~ ^[0-9]+$ ]] \
+    || { free_reason="the server listing answered '${HOSTING_PROBE_OUT}', not a resource id and a size in GiB"; return 0; }
+  hosting::probe output az monitor metrics list --resource "$id" --metric storage_used --aggregation Maximum \
+    --interval PT5M --offset 1h --query 'value[0].timeseries[0].data[?maximum!=null].maximum | [-1]' -o tsv; rc=$?
+  case "$rc" in
+    2) free_reason="REFUSED, not absent: this identity may not read the storage_used metric of ${name} (${HOSTING_PROBE_ERR})"; return 0 ;;
+    1) free_reason="the storage_used metric of ${name} returned no datapoint in the last hour (${HOSTING_PROBE_ERR:-empty})"; return 0 ;;
+  esac
+  used="$(trimmed "${HOSTING_PROBE_OUT%%.*}")"
+  [[ "$used" =~ ^[0-9]+$ ]] || { free_reason="the storage_used metric answered '${HOSTING_PROBE_OUT}', not a number of bytes"; return 0; }
+  storage_bytes=$((gb * 1073741824))
+  free_bytes=$((storage_bytes - used))
+  [ "$free_bytes" -ge 0 ] || free_bytes=0
+}
+
+# ── the measurement: ONE read-only statement ────────────────────────────────────────────────────
+# Per table, one row: schema, total, heap, toast, index, live, dead, live source, live bytes, sampled
+# rows. The average live row size is a 1% TABLESAMPLE of `pg_column_size(t.*)` (the row as stored,
+# TOAST fetched), run through query_to_xml — the only way plain SQL runs a statement over a table
+# named at run time without creating a function, which a read-only transaction refuses anyway. Every
+# identifier goes through format('%I'). Then two rows: the pg_repack facts, and the end marker.
+measure_sql="$(cat <<'SQL'
+BEGIN TRANSACTION READ ONLY;
+SET LOCAL statement_timeout = '900s';
+WITH stattuple AS (
+  SELECT n.nspname AS schema FROM pg_catalog.pg_extension e JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+  WHERE e.extname = 'pgstattuple'
+), h AS (
+  SELECT n.nspname AS schema, c.oid AS oid,
+         pg_total_relation_size(c.oid) AS total,
+         pg_indexes_size(c.oid) AS idx,
+         COALESCE(pg_total_relation_size(NULLIF(c.reltoastrelid, 0::oid)), 0) AS toast,
+         COALESCE(s.n_live_tup, 0) AS stat_live, COALESCE(s.n_dead_tup, 0) AS dead
+  FROM pg_catalog.pg_class c
+  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+  LEFT JOIN pg_catalog.pg_stat_all_tables s ON s.relid = c.oid
+  WHERE c.relname = 'mesh_node_history' AND c.relkind = 'r'
+  ORDER BY pg_total_relation_size(c.oid) DESC, n.nspname
+  LIMIT :top
+), measured AS (
+  SELECT h.*,
+         CASE WHEN (SELECT count(*) FROM stattuple) = 1 THEN
+           (xpath('/row/a/text()', query_to_xml(format('SELECT approx_tuple_count AS a FROM %I.pgstattuple_approx(%s::oid)',
+              (SELECT schema FROM stattuple), h.oid), false, true, '')))[1]::text::bigint END AS approx_live,
+         query_to_xml(format('SELECT COALESCE(round(avg(pg_column_size(t.*))), 0)::bigint AS a, count(*) AS n FROM %I.mesh_node_history t TABLESAMPLE SYSTEM (1)',
+              h.schema), false, true, '') AS sample
+  FROM h
+), sized AS (
+  SELECT m.*, COALESCE(m.approx_live, m.stat_live) AS live,
+         CASE WHEN m.approx_live IS NULL THEN 'pg_stat' ELSE 'pgstattuple_approx' END AS live_source,
+         (xpath('/row/a/text()', m.sample))[1]::text::bigint AS avg_row,
+         (xpath('/row/n/text()', m.sample))[1]::text::bigint AS sampled
+  FROM measured m
+)
+SELECT 'T', schema, total, total - idx - toast, toast, idx, live, dead, live_source,
+       CASE WHEN live = 0 THEN 0
+            WHEN sampled = 0 THEN -1
+            ELSE (live::numeric * avg_row
+                  + CASE WHEN live + dead = 0 THEN idx ELSE idx::numeric * live / (live + dead) END)::bigint END,
+       sampled
+FROM sized
+UNION ALL
+SELECT 'R',
+       COALESCE((SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_repack'), ''),
+       NULL, NULL, NULL, NULL, NULL, NULL,
+       COALESCE((SELECT default_version FROM pg_catalog.pg_available_extensions WHERE name = 'pg_repack'), ''),
+       NULL, NULL
+UNION ALL
+SELECT 'E', current_database(), NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL;
+COMMIT;
+SQL
+)"
+
+# Fields are separated by the ASCII unit separator, never a tab: tab is IFS WHITESPACE to `read`, so
+# two adjacent tabs (an empty field) collapse into one and every later field shifts left.
+US=$'\037'
+# Filled by measure_tables: one entry per table, largest first.
+t_schema=() t_total=() t_heap=() t_toast=() t_idx=() t_live=() t_dead=() t_source=() t_live_bytes=()
+repack_installed="" repack_available=""
+measure_tables() {
+  t_schema=() t_total=() t_heap=() t_toast=() t_idx=() t_live=() t_dead=() t_source=() t_live_bytes=()
+  repack_installed="" repack_available=""
+  local errfile out rc err line kind schema total heap toast idx live dead source live_bytes ended=""
+  errfile="$(mktemp)"
+  out="$(printf '%s\n' "$measure_sql" | PGOPTIONS="-c default_transaction_read_only=on" \
+    psql -X -q -tA -F "$US" -v ON_ERROR_STOP=1 -v top="$top" -h "$server" -U "$pg_user" -d "$database" -f - 2>"$errfile")"; rc=$?
+  err="$(head -3 "$errfile")"; rm -f "$errfile"
+  [ "$rc" -eq 0 ] || hosting::die "the read-only measurement of ${database} on ${server} failed (psql exit ${rc}). Nothing was changed — the session was read-only. psql said: ${err:-nothing}"
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    [ -n "$line" ] || continue
+    IFS="$US" read -r kind schema total heap toast idx live dead source live_bytes _ <<< "$line"
+    case "$kind" in
+      T)
+        # A schema name this verb would have to escape is not rewritten: the per-user schemas are
+        # e-mail shaped (letters, digits, @ . _ + -), and nothing else is expected here.
+        if ! [[ "$schema" =~ ^[A-Za-z0-9_@.+-]{1,63}$ ]]; then
+          hosting::log "a mesh_node_history in a schema named '${schema}' is not measured — a name outside letters, digits and @ . _ + - is not interpolated into SQL here"
+          continue
+        fi
+        for _v in "$total" "$heap" "$toast" "$idx" "$live" "$dead"; do
+          [[ "$_v" =~ ^[0-9]+$ ]] || hosting::die "the measurement of ${schema}.mesh_node_history answered '${_v}' where a number of bytes or tuples belongs — nothing was changed"
+        done
+        [[ "$live_bytes" =~ ^-?[0-9]+$ ]] || hosting::die "the measurement of ${schema}.mesh_node_history answered '${live_bytes}' for its live bytes — nothing was changed"
+        t_schema+=("$schema") t_total+=("$total") t_heap+=("$heap") t_toast+=("$toast") t_idx+=("$idx")
+        t_live+=("$live") t_dead+=("$dead") t_source+=("$source")
+        if [ "$live_bytes" -lt 0 ]; then t_live_bytes+=("unknown"); else t_live_bytes+=("$live_bytes"); fi ;;
+      R) repack_installed="$schema" repack_available="$source" ;;
+      E) [ "$schema" = "$database" ] && ended=1 ;;
+    esac
+  done <<< "$out"
+  [ -n "$ended" ] || hosting::die "the measurement of ${database} on ${server} did not reach its end marker — refusing to report a partial reading as a whole one. psql said: ${err:-nothing}"
+}
+
+# Whether pg_repack can be used: installed in THIS database (it is never created here), the client on
+# this image, and the SAME version on both (pg_repack refuses a client/extension mismatch).
+repack_usable=false repack_reason=""
+judge_repack() {
+  local client=""
+  if command -v pg_repack >/dev/null 2>&1; then
+    client="$(pg_repack --version 2>&1 | head -1)"; client="${client##* }"
+  fi
+  if [ -z "$repack_installed" ]; then
+    if [ -n "$repack_available" ]; then
+      repack_reason="the pg_repack extension is available on the server (${repack_available}) but not installed in ${database} — installing it is a server change this action does not make"
+    else
+      repack_reason="the pg_repack extension is not available on the server (not allow-listed, or not shipped)"
+    fi
+  elif [ -z "$client" ]; then
+    repack_reason="the pg_repack extension ${repack_installed} is installed in ${database} but this image carries no pg_repack client"
+  elif [ "$client" != "$repack_installed" ]; then
+    repack_reason="the pg_repack client is ${client} and the extension is ${repack_installed} — pg_repack refuses a version mismatch"
+  else
+    repack_usable=true
+    repack_reason="pg_repack ${client}: the extension is installed in ${database} and the client matches"
+  fi
+}
+
+reclaimable_of() {  # reclaimable_of <i> → prints the estimate, or unknown
+  local lb="${t_live_bytes[$1]}" r
+  [ "$lb" = unknown ] && { printf unknown; return; }
+  r=$(( t_total[$1] - lb )); [ "$r" -ge 0 ] || r=0
+  printf '%s' "$r"
+}
+
+report_measurement() {
+  local i n="${#t_schema[@]}" sum=0 r lb est method
+  for ((i = 0; i < n; i++)); do
+    r="$(reclaimable_of "$i")" lb="${t_live_bytes[$i]}"
+    if [ "$lb" = unknown ]; then est=unknown method=none; else est=$(( lb / rate_bps )) method=row_sample; fi
+    hosting::say candidate_table "${t_schema[$i]}.mesh_node_history"
+    hosting::say total_bytes "${t_total[$i]}"
+    hosting::say heap_bytes "${t_heap[$i]}"
+    hosting::say toast_bytes "${t_toast[$i]}"
+    hosting::say index_bytes "${t_idx[$i]}"
+    hosting::say live_tuples "${t_live[$i]}"
+    hosting::say dead_tuples "${t_dead[$i]}"
+    hosting::say live_tuples_source "${t_source[$i]}"
+    hosting::say live_bytes "$lb"
+    hosting::say reclaimable_bytes "$r"
+    hosting::say estimate_method "$method"
+    hosting::say estimated_seconds "$est"
+    hosting::log "${t_schema[$i]}.mesh_node_history: ${t_total[$i]} bytes (heap ${t_heap[$i]}, toast ${t_toast[$i]}, index ${t_idx[$i]}), ${t_live[$i]} live / ${t_dead[$i]} dead tuples, ~${r} reclaimable, ~${est}s to rewrite at ${rate_mib} MiB/s"
+    [ "$r" = unknown ] || sum=$((sum + r))
+  done
+  hosting::say candidate_tables "$n"
+  hosting::say reclaimable_total "$sum"
+  hosting::say repack_usable "$repack_usable"
+  hosting::say repack_reason "$repack_reason"
+  if [ "$repack_usable" = true ]; then hosting::say reclaim_method pg_repack; else hosting::say reclaim_method vacuum_full; fi
+  hosting::say free_bytes "$free_bytes"
+  hosting::say storage_bytes "$storage_bytes"
+  if [ "$free_bytes" = unknown ]; then
+    hosting::say free_storage_verify unknown
+    hosting::log "the server's free storage could not be read: ${free_reason} — a real reclaim REFUSES without it"
+  else
+    hosting::say free_storage_verify true
+    hosting::log "free storage on ${server}: ${free_bytes} of ${storage_bytes} bytes provisioned"
+  fi
+}
+
+measure_tables
+judge_repack
+read_free_storage
+report_measurement
+
+if [ "$verb" = measure ]; then
+  [ "${#t_schema[@]}" -gt 0 ] || hosting::log "${database} holds no mesh_node_history table — a reclaim has nothing to rewrite"
+  exit 0
+fi
+
+# ── reclaim ──────────────────────────────────────────────────────────────────────────────────────
+[ "$free_bytes" != unknown ] \
+  || hosting::die "the server's free storage is UNKNOWN (${free_reason}) — a rewrite needs room for a full copy of a table's live data, and room nobody could read is no room. Nothing was rewritten"
+
+started=$SECONDS
+reclaimed=0 done_tables=0 n="${#t_schema[@]}"
+q() { psql -X -h "$server" -U "$pg_user" -d "$database" -v ON_ERROR_STOP=1 -tAc "$1"; }
+for ((i = 0; i < n; i++)); do
+  table="${t_schema[$i]}.mesh_node_history"
+  quoted="\"${t_schema[$i]}\".mesh_node_history"
+  r="$(reclaimable_of "$i")" lb="${t_live_bytes[$i]}"
+  if [ "$r" != unknown ] && [ "$r" -lt "$min_reclaim" ]; then
+    hosting::say reclaim_skipped "$table"
+    hosting::say skip_reason "estimate ${r} bytes is below --min-reclaim-bytes ${min_reclaim}"
+    continue
+  fi
+  # An unknown live size is sized as the whole table: the worst case, never a guess in the safe direction.
+  [ "$lb" != unknown ] || lb="${t_total[$i]}"
+  required=$(( lb + lb * headroom / 100 ))
+  if [ "$free_bytes" -lt "$required" ]; then
+    hosting::die "REFUSED before ${table}: it needs ${required} bytes free (live data ${lb} + ${headroom}% for the WAL the rewrite writes) and the server has ${free_bytes}. Done so far: ${done_tables} table(s), ${reclaimed} bytes reclaimed; ${table} and every smaller table are untouched"
+  fi
+  est=$(( lb / rate_bps )) elapsed=$(( SECONDS - started )) left=$(( budget - (SECONDS - started) ))
+  if [ $(( elapsed + est )) -gt "$budget" ]; then
+    hosting::die "STOPPED before ${table}: its rewrite is estimated at ${est}s and ${left}s of the ${budget}s budget are left. Done so far: ${done_tables} table(s), ${reclaimed} bytes reclaimed; run the reclaim again to continue with ${table}"
+  fi
+  before="$(q "SELECT pg_total_relation_size('${quoted}'::regclass)")" \
+    || hosting::die "could not read the size of ${table} before its rewrite — nothing more was changed. Done so far: ${done_tables} table(s), ${reclaimed} bytes reclaimed"
+  before="$(trimmed "$before")"
+  [[ "$before" =~ ^[0-9]+$ ]] || hosting::die "the size of ${table} read '${before}', not a number of bytes — nothing more was changed"
+  if [ "$repack_usable" = true ]; then
+    method=pg_repack
+    printf '  + pg_repack -h %s -U %s -d %s --table %s --no-superuser-check --no-kill-backend --wait-timeout %s\n' \
+      "$server" "$pg_user" "$database" "$quoted" "$lock_timeout" >&2
+    pg_repack -h "$server" -U "$pg_user" -d "$database" --table "$quoted" --no-superuser-check \
+      --no-kill-backend --wait-timeout "$lock_timeout" \
+      || hosting::die "pg_repack of ${table} failed — pg_repack keeps the original table until its swap, so ${table} is as it was. Done so far: ${done_tables} table(s), ${reclaimed} bytes reclaimed"
+  else
+    method=vacuum_full
+    printf '  + psql -h %s -U %s -d %s -c %s  (lock_timeout %ss, statement_timeout %ss)\n' \
+      "$server" "$pg_user" "$database" "VACUUM (FULL, ANALYZE) ${quoted}" "$lock_timeout" "$left" >&2
+    PGOPTIONS="-c lock_timeout=$((lock_timeout * 1000)) -c statement_timeout=$((left * 1000))" \
+      q "VACUUM (FULL, ANALYZE) ${quoted}" >/dev/null \
+      || hosting::die "VACUUM FULL of ${table} failed or was cancelled (a lock it could not take within ${lock_timeout}s, or the ${left}s left of the budget) — Postgres rolled the rewrite back and the old files are kept. Done so far: ${done_tables} table(s), ${reclaimed} bytes reclaimed"
+  fi
+  after="$(q "SELECT pg_total_relation_size('${quoted}'::regclass)")" \
+    || hosting::die "${table} was rewritten but its size could not be read back — what it freed is NOT confirmed"
+  after="$(trimmed "$after")"
+  [[ "$after" =~ ^[0-9]+$ ]] || hosting::die "${table} was rewritten but its size read back as '${after}', not a number of bytes — what it freed is NOT confirmed"
+  freed=$(( before - after )); [ "$freed" -ge 0 ] || freed=0
+  hosting::say reclaim_table "$table"
+  hosting::say method "$method"
+  hosting::say before_bytes "$before"
+  hosting::say after_bytes "$after"
+  hosting::say freed_bytes "$freed"
+  hosting::log "${table}: ${before} → ${after} bytes (${freed} freed, ${method}, $(( SECONDS - started ))s elapsed)"
+  reclaimed=$(( reclaimed + freed )) done_tables=$(( done_tables + 1 ))
+  # The metric lags the rewrite by minutes, so the room for the next table is this arithmetic, not a re-read.
+  free_bytes=$(( free_bytes + freed ))
+done
+hosting::log "${done_tables} table(s) rewritten in ${database} on ${server}, ${reclaimed} bytes given back to the server"
+hosting::say reclaimed_total "$reclaimed"
