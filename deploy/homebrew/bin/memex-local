@@ -1647,7 +1647,9 @@ internal_value() { awk -v k="$1" '$1 == "#"k":" { print $2; exit } $1 == k":" { 
 internal_public_hosts() { [ -f "$INTERNAL_FILE" ] || return 0; awk '$1 == "#PublicHost:" { print $2 }' "$INTERNAL_FILE" 2>/dev/null || true; }
 # A public name as the bridge forwards it: a lower-case DNS name, never a local or private-network one. Pure.
 is_public_host() {
-  case "$1" in ''|*[!a-z0-9.-]*|*..*|.*|*.|-*|*-|*.-*|*-.*|localhost|*.localhost|*.local|*.internal) return 1 ;; *.*) ;; *) return 1 ;; esac
+  # The alphabet spelled out, never a range: in a glob, [a-z] follows the locale's collation, and on the CI runner it
+  # matched upper case too ('Moench.example.com' passed there and not here).
+  case "$1" in ''|*[!abcdefghijklmnopqrstuvwxyz0123456789.-]*|*..*|.*|*.|-*|*-|*.-*|*-.*|localhost|*.localhost|*.local|*.internal) return 1 ;; *.*) ;; *) return 1 ;; esac
   [ "$1" != "$(internal_value Host)" ]
 }
 
