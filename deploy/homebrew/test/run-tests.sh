@@ -2454,7 +2454,7 @@ grep -q 'Authentication__Microsoft__ClientId: "c-1"' "$IL" && grep -q 'Authentic
   && ok "public-host add leaves the sign-in (and its secret) untouched" || bad "layer kept" "$(grep -c Authentication "$IL")"
 inn "$CLI" internal public-host add moench.example.com >/dev/null 2>&1
 [ "$(grep -c '^#PublicHost: moench.example.com$' "$IL")" = 1 ] && ok "adding the same name twice keeps one line" || bad "public-host idempotent" "$(grep '^#PublicHost' "$IL")"
-for badname in Moench.example.com moench studio-2.net.example.test x.localhost x.internal 'a b.example.com' 'moench.example.com;id'; do
+for badname in Moench.example.com moench studio-2.net.example.test x.localhost x.internal 'a b.example.com' 'moench.example.com;id' -moench.example.com moench-.example.com; do
   OUT="$(inn "$CLI" internal public-host add "$badname" 2>&1)" && bad "public-host refuses '$badname'" "exited 0" || case "$OUT" in *"not a public DNS name"*) ok "public-host refuses '$badname'" ;; *) bad "public-host refusal '$badname'" "$OUT" ;; esac
 done
 M="$(inn env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; internal_ingress_manifest studio-2.net.example.test "" nginx "moench.example.com"' "$CLI")"
@@ -2464,8 +2464,8 @@ grep -q 'host: "studio-2.net.example.test"' <<<"$M" && grep -q 'host: "moench.ex
 printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn "$CLI" internal on --tenant t-1 --client-id c-2 >/dev/null 2>&1
 grep -q '^#PublicHost: moench.example.com$' "$IL" && grep -q 'Authentication__Microsoft__ClientId: "c-2"' "$IL" \
   && ok "a re-run of internal on (a rotated secret, the sign-in hand-over) keeps the public names" || bad "internal on keeps public names" "$(grep '^#\|ClientId' "$IL")"
-OUT="$(inn "$CLI" internal public-host list 2>&1)"
-case "$OUT" in *"public name: https://moench.example.com"*) ok "public-host list names it" ;; *) bad "public-host list" "$OUT" ;; esac
+OUT="$(inn "$CLI" internal public-host list 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*"public name: https://moench.example.com"*) ok "public-host list names it, and exits 0" ;; *) bad "public-host list" "rc=$RC: $OUT" ;; esac
 inn "$CLI" internal public-host remove moench.example.com >/dev/null 2>&1
 ! grep -q '^#PublicHost:' "$IL" && grep -q '^#Host: studio-2.net.example.test$' "$IL" && ok "public-host remove drops it and keeps the private name" || bad "public-host remove" "$(grep '^#' "$IL")"
 # The front door binds loopback only while internal-only (the network reaches it through tailscale serve).
