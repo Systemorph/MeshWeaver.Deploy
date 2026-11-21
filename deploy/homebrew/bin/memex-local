@@ -1639,15 +1639,45 @@ readonly PUBLISH_OWNED_KEYS=(Authentication__Microsoft__ClientId Authentication_
 # ---------------------------------------------------------------------------
 internal_value() { awk -v k="$1" '$1 == "#"k":" { print $2; exit } $1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$INTERNAL_FILE" 2>/dev/null; }
 
+# The PUBLIC names this Mac's portal also answers through the private network's ingress bridge (MeshWeaver.Deploy
+# deploy/tailnet-bridge; Systemorph/Memex Deployments/Network "A Mac at a public name"), one per line. Kept in the
+# internal-only layer as `#PublicHost: <name>` comment lines — values YAML ignores them, `internal on` carries them over,
+# and `internal public-host add|remove` is the only writer. The bridge sends Host and SNI = the public name to this Mac's
+# 443 over WireGuard, so the internal Ingress must carry a rule for it; TLS for the public name ends at the bridge.
+internal_public_hosts() { [ -f "$INTERNAL_FILE" ] || return 0; awk '$1 == "#PublicHost:" { print $2 }' "$INTERNAL_FILE" 2>/dev/null || true; }
+# A public name as the bridge forwards it: a lower-case DNS name, never a local or private-network one. Pure.
+is_public_host() {
+  # The alphabet spelled out, never a range: in a glob, [a-z] follows the locale's collation, and on the CI runner it
+  # matched upper case too ('Moench.example.com' passed there and not here).
+  case "$1" in ''|*[!abcdefghijklmnopqrstuvwxyz0123456789.-]*|*..*|.*|*.|-*|*-|*.-*|*-.*|localhost|*.localhost|*.local|*.internal) return 1 ;; *.*) ;; *) return 1 ;; esac
+  [ "$1" != "$(internal_value Host)" ]
+}
+
 # The separate Ingress for the private-network name. Separate because the chart's ONE tlsSecret covers every
 # host, and pointing it at this name's certificate would break memex.localhost. Its annotations are the
 # portal Ingress's own (read live), minus the bookkeeping ones. Pure over its arguments: prints the manifest.
 internal_ingress_manifest() {
-  local host="$1" annotations="$2" class="${3:-nginx}"
+  local host="$1" annotations="$2" class="${3:-nginx}" public="${4:-}" h
   printf 'apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: %s\n  labels: { app.kubernetes.io/managed-by: memex-local, app.kubernetes.io/component: memex-portal-net }\n' "$INTERNAL_INGRESS"
   if [ -n "$annotations" ]; then printf '  annotations:\n'; printf '%s\n' "$annotations" | sed 's/^/    /'; fi
   printf 'spec:\n  ingressClassName: %s\n  tls:\n    - hosts: ["%s"]\n      secretName: %s\n' "$class" "$host" "$INTERNAL_TLS_SECRET"
-  printf '  rules:\n    - host: "%s"\n      http:\n        paths:\n          - path: /\n            pathType: Prefix\n            backend: { service: { name: memex-portal-service, port: { number: 8080 } } }\n' "$host"
+  printf '  rules:\n'
+  # The private-network name, then each public name (4th argument, one per line) — the same backend; only the private
+  # name carries this Mac's certificate (the bridge ends TLS for a public name and skips verification inside WireGuard).
+  for h in "$host" $public; do
+    printf '    - host: "%s"\n      http:\n        paths:\n          - path: /\n            pathType: Prefix\n            backend: { service: { name: memex-portal-service, port: { number: 8080 } } }\n' "$h"
+  done
+}
+
+# Re-render and apply the internal Ingress from the layer as it stands (the private name + every public name).
+# 0 applied · 1 failed · 2 SKIPPED (the stack is not running: the next `internal on`, `internal public-host add|remove`
+# or `internal public-host list --apply` applies it).
+internal_ingress_apply() {
+  local host; host="$(internal_value Host)"
+  [ -n "$host" ] || return 1
+  colima_running || return 2
+  internal_ingress_manifest "$host" "$(portal_ingress_annotations)" nginx "$(internal_public_hosts)" > "$LOCAL_HOME/internal-ingress.yaml" \
+    && local_kubectl -n "$NAMESPACE" apply -f "$LOCAL_HOME/internal-ingress.yaml" >/dev/null 2>&1
 }
 
 # The portal Ingress's annotations, one `key: "value"` line each, without kubectl/helm/cert-manager bookkeeping.
@@ -1721,12 +1751,15 @@ cmd_internal() {
       case "$secret" in *'"'*|*'\\'*|*$'\n'*) die "internal on: the client secret contains a quote, backslash or newline" ;; esac
       host="$(tailnet_name)"
       [ -n "$host" ] || die "internal on: this Mac has no private-network name yet — join the network first (MeshWeaver.Plugins Hosting/MacStudioOnboarding step 4)"
+      # A re-run (a rotated secret, the bootstrap's sign-in hand-over) keeps the public names the layer already carries.
+      local kept_public; kept_public="$(internal_public_hosts)"
       [ -f "$(cert_file "$host" crt)" ] || warn "no trusted certificate for $host yet — run 'memex-local cert config … < secret' and 'memex-local cert issue'; until then the name has no certificate"
       mkdir -p "$LOCAL_HOME"
       ( umask 077; cat > "$INTERNAL_FILE" ) <<YAML
 # memex-local INTERNAL ONLY — managed by \`memex-local internal\`; re-run \`on\` to change, \`off\` to delete.
 # This Mac's portal answers at https://${host} over the private network only (Hosting/MacStudioFleet §2b.3).
 #Host: ${host}
+$(for h in $kept_public; do printf '#PublicHost: %s\n' "$h"; done)
 config:
   memex_portal:
     Authentication__Microsoft__ClientId: "${client_id}"
@@ -1743,7 +1776,7 @@ YAML
       ok "internal-only layer written: $INTERNAL_FILE (https://${host}, sign-in Microsoft, invitation-only; the secret never printed)"
       cert_install >/dev/null 2>&1 || true
       if colima_running; then
-        internal_ingress_manifest "$host" "$(portal_ingress_annotations)" > "$LOCAL_HOME/internal-ingress.yaml" \
+        internal_ingress_manifest "$host" "$(portal_ingress_annotations)" nginx "$kept_public" > "$LOCAL_HOME/internal-ingress.yaml" \
           && local_kubectl -n "$NAMESPACE" apply -f "$LOCAL_HOME/internal-ingress.yaml" >/dev/null 2>&1 \
           && ok "Ingress $INTERNAL_INGRESS applied (host $host, TLS Secret $INTERNAL_TLS_SECRET)" \
           || warn "could not apply the Ingress $INTERNAL_INGRESS ($LOCAL_HOME/internal-ingress.yaml)"
@@ -1755,7 +1788,7 @@ YAML
       # answers "redirect URI not registered" there (measured on the second Mac Studio, 2026-11-09).
       # One app per Mac (the shared app holds at most two secrets), so the loopback names are safe on it.
       local rp rh uris=""
-      for rh in "$host" "${HOSTNAME_LOCAL}:${HOST_PORT}" "${HOSTNAME_LOCAL}"; do
+      for rh in "$host" $kept_public "${HOSTNAME_LOCAL}:${HOST_PORT}" "${HOSTNAME_LOCAL}"; do
         for rp in /signin-microsoft /auth/callback/Microsoft /auth/ea/callback; do uris="${uris:+$uris, }https://${rh}${rp}"; done
       done
       info "Register on THIS Mac's own sign-in app exactly: ${uris}"
@@ -1765,6 +1798,7 @@ YAML
       if [ ! -f "$INTERNAL_FILE" ]; then info "not internal-only — memex-local internal on --tenant <id> --client-id <id> < secret"; return 0; fi
       local host got_id; host="$(internal_value Host)"
       ok "INTERNAL ONLY — https://${host} over the private network (sign-in Microsoft, invitation-only)"
+      local ph; for ph in $(internal_public_hosts); do ok "also the public name https://${ph} (through the ingress bridge — reachable only while its switch on control is on)"; done
       got_id="$(local_kubectl -n "$NAMESPACE" get configmap memex-portal-config -o jsonpath='{.data.Authentication__Microsoft__ClientId}' 2>/dev/null || true)"
       if [ -n "$got_id" ] && [ "$got_id" = "$(internal_value Authentication__Microsoft__ClientId)" ]; then ok "the running portal's config carries the client id of this layer"; else warn "the running portal's config does NOT carry this layer's client id (${got_id:-<none>}) — run 'memex-local update'"; fi
       local_kubectl -n "$NAMESPACE" get ingress "$INTERNAL_INGRESS" >/dev/null 2>&1 && ok "Ingress $INTERNAL_INGRESS present" || warn "Ingress $INTERNAL_INGRESS missing — re-run 'memex-local internal on'"
@@ -1777,7 +1811,47 @@ YAML
       if [ -f "$INTERNAL_FILE" ]; then rm -f "$INTERNAL_FILE"; ok "internal-only OFF — the next 'memex-local update' drops its sign-in"; else info "internal-only was not on"; fi
       restart_front_door "all interfaces again"
       ;;
-    *) die "usage: memex-local internal {on --tenant <id> --client-id <id> < secret | status | off}" ;;
+    public-host)
+      # A PUBLIC name this Mac's portal answers through the ingress bridge (Systemorph/Memex Deployments/Network → "A Mac
+      # at a public name"). Whether the name is reachable at all is the bridge's switch on control, never this Mac's.
+      [ -f "$INTERNAL_FILE" ] || die "internal public-host: this Mac is not internal-only yet — 'memex-local internal on' first"
+      local verb="${1:-list}" name="${2:-}" h rest
+      case "$verb" in
+        add|remove)
+          is_public_host "$name" || die "internal public-host $verb: '$name' is not a public DNS name (lower-case, dotted, not .localhost/.local/.internal, not the private-network name)"
+          rest="$(internal_public_hosts | grep -vxF "$name" || true)"
+          [ "$verb" = add ] && rest="$(printf '%s\n%s\n' "$rest" "$name" | sed '/^$/d')"
+          ( umask 077; PUBLIC_HOSTS="$rest" awk '$1 == "#PublicHost:" { next } { print } $1 == "#Host:" { n = split(ENVIRON["PUBLIC_HOSTS"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") print "#PublicHost: " a[i] }' "$INTERNAL_FILE" > "$INTERNAL_FILE.tmp" ) \
+            && mv "$INTERNAL_FILE.tmp" "$INTERNAL_FILE" && chmod 600 "$INTERNAL_FILE" || die "internal public-host $verb: could not rewrite $INTERNAL_FILE"
+          local done_word="added" rc=0; [ "$verb" = remove ] && done_word="removed"
+          internal_ingress_apply || rc=$?
+          case "$rc" in
+            0) ok "public name $name $done_word — the internal Ingress answers: $(internal_value Host) $(internal_public_hosts | paste -sd' ' -)" ;;
+            2) ok "public name $name $done_word in the layer"; warn "the stack is not running — NOT live yet: 'memex-local internal public-host list --apply' once it is up" ;;
+            *) warn "public name $name $done_word in the layer, but the Ingress $INTERNAL_INGRESS could not be applied ($LOCAL_HOME/internal-ingress.yaml)" ;;
+          esac
+          if [ "$verb" = add ]; then
+            local uris="" rp
+            for rp in /signin-microsoft /auth/callback/Microsoft /auth/ea/callback; do uris="${uris:+$uris, }https://${name}${rp}"; done
+            info "Register on THIS Mac's own sign-in app ($(internal_value Authentication__Microsoft__ClientId)) also: ${uris}"
+          fi
+          ;;
+        list)
+          rest="$(internal_public_hosts)"
+          if [ -z "$rest" ]; then info "no public name — the portal answers https://$(internal_value Host) over the private network only"; else for h in $rest; do ok "public name: https://$h (through the ingress bridge)"; done; fi
+          if [ "$name" = "--apply" ]; then
+            local rc=0; internal_ingress_apply || rc=$?
+            case "$rc" in
+              0) ok "Ingress $INTERNAL_INGRESS re-applied" ;;
+              2) warn "the stack is not running — nothing applied" ;;
+              *) warn "could not apply the Ingress $INTERNAL_INGRESS" ;;
+            esac
+          fi
+          ;;
+        *) die "usage: memex-local internal public-host {add <name> | remove <name> | list [--apply]}" ;;
+      esac
+      ;;
+    *) die "usage: memex-local internal {on --tenant <id> --client-id <id> < secret | status | off | public-host {add|remove|list} [<name>]}" ;;
   esac
 }
 

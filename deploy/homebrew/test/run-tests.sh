@@ -2443,6 +2443,31 @@ M="$(inn env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; internal_ingress_manifest studio
 grep -q 'name: memex-portal-net$' <<<"$M" && grep -q 'secretName: memex-portal-net-tls' <<<"$M" && grep -q 'host: "studio-2.net.example.test"' <<<"$M" \
   && grep -q 'service: { name: memex-portal-service, port: { number: 8080 } }' <<<"$M" && grep -q '    nginx.ingress.kubernetes.io/proxy-body-size: "50m"' <<<"$M" \
   && ok "a SEPARATE Ingress for the name: its own TLS Secret, the portal's annotations, the portal service" || bad "internal ingress manifest" "$M"
+
+echo "── internal public-host: a public name through the ingress bridge (Memex Deployments/Network, 'A Mac at a public name') ──"
+OUT="$(inn "$CLI" internal public-host add moench.example.com 2>&1)"; RC=$?
+[ "$RC" = 0 ] && awk '$1 == "#Host:" { h = NR } $1 == "#PublicHost:" && $2 == "moench.example.com" { p = NR } END { exit !(h && p == h + 1) }' "$IL" \
+  && [ "$(ls -l "$IL" | cut -c1-10)" = "-rw-------" ] \
+  && ok "public-host add records the name in the layer (#PublicHost, right after #Host), still 0600" || bad "public-host add" "rc=$RC: $OUT / $(grep '^#' "$IL")"
+case "$OUT" in *"https://moench.example.com/signin-microsoft"*"https://moench.example.com/auth/ea/callback"*) ok "public-host add names the public redirect URIs to register on the Mac's own app" ;; *) bad "public redirect URIs" "$OUT" ;; esac
+grep -q 'Authentication__Microsoft__ClientId: "c-1"' "$IL" && grep -q 'Authentication__Microsoft__ClientSecret: "abcdefghijklmnopqrstuvwxyz0123"' "$IL" \
+  && ok "public-host add leaves the sign-in (and its secret) untouched" || bad "layer kept" "$(grep -c Authentication "$IL")"
+inn "$CLI" internal public-host add moench.example.com >/dev/null 2>&1
+[ "$(grep -c '^#PublicHost: moench.example.com$' "$IL")" = 1 ] && ok "adding the same name twice keeps one line" || bad "public-host idempotent" "$(grep '^#PublicHost' "$IL")"
+for badname in Moench.example.com moench studio-2.net.example.test x.localhost x.internal 'a b.example.com' 'moench.example.com;id' -moench.example.com moench-.example.com; do
+  OUT="$(inn "$CLI" internal public-host add "$badname" 2>&1)" && bad "public-host refuses '$badname'" "exited 0" || case "$OUT" in *"not a public DNS name"*) ok "public-host refuses '$badname'" ;; *) bad "public-host refusal '$badname'" "$OUT" ;; esac
+done
+M="$(inn env MEMEX_LOCAL_LIB=1 bash -c '. "$0"; internal_ingress_manifest studio-2.net.example.test "" nginx "moench.example.com"' "$CLI")"
+grep -q 'host: "studio-2.net.example.test"' <<<"$M" && grep -q 'host: "moench.example.com"' <<<"$M" && grep -q 'hosts: \["studio-2.net.example.test"\]' <<<"$M" \
+  && [ "$(grep -c 'service: { name: memex-portal-service, port: { number: 8080 } }' <<<"$M")" = 2 ] \
+  && ok "the internal Ingress carries a rule per public name (same backend), its TLS only for the private name" || bad "ingress with public host" "$M"
+printf 'abcdefghijklmnopqrstuvwxyz0123\n' | inn "$CLI" internal on --tenant t-1 --client-id c-2 >/dev/null 2>&1
+grep -q '^#PublicHost: moench.example.com$' "$IL" && grep -q 'Authentication__Microsoft__ClientId: "c-2"' "$IL" \
+  && ok "a re-run of internal on (a rotated secret, the sign-in hand-over) keeps the public names" || bad "internal on keeps public names" "$(grep '^#\|ClientId' "$IL")"
+OUT="$(inn "$CLI" internal public-host list 2>&1)"; RC=$?
+case "$RC:$OUT" in 0:*"public name: https://moench.example.com"*) ok "public-host list names it, and exits 0" ;; *) bad "public-host list" "rc=$RC: $OUT" ;; esac
+inn "$CLI" internal public-host remove moench.example.com >/dev/null 2>&1
+! grep -q '^#PublicHost:' "$IL" && grep -q '^#Host: studio-2.net.example.test$' "$IL" && ok "public-host remove drops it and keeps the private name" || bad "public-host remove" "$(grep '^#' "$IL")"
 # The front door binds loopback only while internal-only (the network reaches it through tailscale serve).
 PFI="$HERE/../share/port-forward.sh"
 pfi=$(env MEMEX_LOCAL_HOME="$IN/home/.memex-local" MEMEX_HEADLESS=1 MEMEX_PORT=8443 bash -c '
