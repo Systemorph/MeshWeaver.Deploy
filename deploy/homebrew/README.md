@@ -749,6 +749,26 @@ tailnet name is still published beside it when tailscale reports one (without on
 published alone, and the command says so); each name gets its own marked site and needs its own redirect
 URI. A public name is never the default.
 
+### A fleet Mac's public name (internal-only Macs): `internal public-host`
+
+A fleet Mac runs **internal only** (`memex-local internal on`, installed by the fleet bootstrap from the sign-in
+the join handed over): its own Ingress for its private-network name, `tailscale serve --tcp 443` straight to the
+loopback front door — not the `publish` entry point above, so `publish on --host` does not apply to it. When the
+estate publishes such a Mac through the ingress bridge (Systemorph/Memex `Deployments/Network` → *A Mac at a public
+name*; the bridge's on/off switch on the control instance decides whether the name is reachable at all), the Mac's
+side is:
+
+```bash
+memex-local internal public-host add moench.meshweaver.cloud   # remove <name> · list [--apply]
+```
+
+It records the name in the internal-only layer (`#PublicHost:`, 0600, beside `#Host:`), re-applies the internal
+Ingress with one more rule for it (same backend; TLS stays the private name's — the bridge ends TLS for the public
+name and skips verification inside WireGuard), and prints the redirect URIs to add to THIS Mac's own sign-in app
+(`https://<name>/signin-microsoft`, `/auth/callback/Microsoft`, `/auth/ea/callback`). The sign-in and its secret are
+untouched; a later `internal on` (a rotated secret, the bootstrap's hand-over) keeps the names. Nothing about the
+network changes: the name answers only while the bridge forwards to this Mac.
+
 
 ## `fleet join`: environment switches
 
