@@ -2904,8 +2904,9 @@ fleet_steer_apply() {
 # on the action and the action finishes on it. Only the operations named here run; anything else is REPORTED Failed by name.
 readonly HOST_CMD_DIR="$LOCAL_HOME/host-commands"
 
-# Control's answer (stdin) → one line per pending command: "<id>\t<operation>\t<imageTag>\t<action>". Pure. Malformed rows are
-# dropped here (a value outside its shape never reaches a shell): ids/tags are tokens, the action a mesh path.
+# Control's answer (stdin) → one line per pending command: "<id>\t<operation>\t<imageTag>\t<action>\t<commit>\t<benchVerb>\t<benchJob>".
+# Pure. Malformed rows are dropped here (a value outside its shape never reaches a shell): ids/tags are tokens, the action a mesh
+# path, the commit 40 hex, the verb a word, the bench job compact JSON (re-validated field by field by share/bench-host.py).
 host_commands_of() {
   python3 -c '
 import json, re, sys
@@ -2918,14 +2919,19 @@ for c in (d.get("commands") or []) if isinstance(d, dict) else []:
     i, o, t, a = c.get("id"), c.get("operation"), c.get("imageTag") or "", c.get("action")
     if not (isinstance(i, str) and tok.fullmatch(i) and isinstance(o, str) and tok.fullmatch(o)
             and isinstance(a, str) and pth.fullmatch(a) and ".." not in a and isinstance(t, str)): continue
+    k, v, j = c.get("commit") or "", c.get("benchVerb") or "", c.get("benchJob")
+    k = "-" if k == "" else (k if isinstance(k, str) and re.fullmatch(r"[0-9a-f]{40}", k) else "!invalid")
+    v = "-" if v == "" else (v if isinstance(v, str) and re.fullmatch(r"[a-z]{1,16}", v) else "!invalid")
+    j = "-" if j is None else (json.dumps(j, separators=(",", ":"), ensure_ascii=True) if isinstance(j, dict) else "!invalid")
     # never an EMPTY field: IFS=tab is whitespace to `read`, so an empty one would collapse and shift the action into the tag
-    print("\t".join((i, o, "-" if t == "" else (t if tok.fullmatch(t) else "!invalid"), a)))
+    print("\t".join((i, o, "-" if t == "" else (t if tok.fullmatch(t) else "!invalid"), a, k, v, j)))
 ' 2>/dev/null || true
 }
 
-# Runs one operation on this Mac. Prints the detail line; exit 0 = Done. Never dies (each step in a subshell).
+# Runs one operation on this Mac. Prints the detail line; exit 0 = Done, 75 = Deferred (harness-sync only: asked again at the next
+# tick, never ledgered), anything else = Failed. Never dies (each step in a subshell).
 host_command_run() {
-  local op="$1" tag="$2"
+  local op="$1" tag="$2" commit="${3:--}" verb="${4:--}" job="${5:--}" control="${6:-}" mac="${7:-}" id="${8:-}" share rc out
   case "$op" in
     restart)
       if ( kubectl rollout restart deploy/memex-portal-deployment -n "$NAMESPACE" >/dev/null \
@@ -2939,7 +2945,25 @@ host_command_run() {
         printf 'memex-local update --tag %s completed (the portal verified usable)' "$tag"; return 0
       fi
       printf 'memex-local update --tag %s FAILED — the Mac'"'"'s autoupdate.log carries its output' "$tag"; return 1 ;;
-    *) printf 'unknown operation %s — this memex-local runs restart and update only; nothing was run' "$op"; return 1 ;;
+    harness-sync)
+      # Hosting/BackLease §5.2a: devtools/issue-replay of MeshWeaver.Plugins at the approved commit → ~/bench/harness@<sha12>,
+      # verified, then harness-current repointed — DEFERRED (75) while a runner works from the current harness
+      if [ "$commit" = "-" ] || [ "$commit" = "!invalid" ]; then printf 'no valid commit in the command — nothing was run'; return 1; fi
+      share="$(resolve_share)"
+      [ -f "$share/bench-host.py" ] || { printf 'this memex-local has no bench-host.py — nothing was run'; return 1; }
+      rc=0
+      out="$(MEMEX_FLEET_FILE="$FLEET_FILE" MEMEX_OVERLAY_FILE="$OVERLAY" python3 -I "$share/bench-host.py" harness-sync "$control" "$mac" "$id" "$commit" 2>/dev/null)" || rc=$?
+      out="${out:-bench-host.py printed nothing}"; printf '%s' "${out##*$'\n'}"; return "$rc" ;;
+    bench)
+      if [ "$verb" = "-" ] || [ "$verb" = "!invalid" ] || [ "$job" = "-" ] || [ "$job" = "!invalid" ]; then
+        printf 'no valid bench verb and job in the command — nothing was run'; return 1
+      fi
+      share="$(resolve_share)"
+      [ -f "$share/bench-host.py" ] || { printf 'this memex-local has no bench-host.py — nothing was run'; return 1; }
+      rc=0
+      out="$(python3 -I "$share/bench-host.py" bench "$verb" "$job" 2>/dev/null)" || rc=$?
+      out="${out:-bench-host.py printed nothing}"; printf '%s' "${out##*$'\n'}"; return "$rc" ;;
+    *) printf 'unknown operation %s — this memex-local runs restart, update, harness-sync and bench only; nothing was run' "$op"; return 1 ;;
   esac
 }
 
@@ -2972,9 +2996,9 @@ PY
 # Runs every command control's answer lists for this Mac — each at most ONCE (its outcome is kept in the ledger, and a command
 # whose outcome is already kept is only REPORTED again: the report may not have landed). One dated line per command.
 host_commands_pass() {
-  local control="$1" mac="$2" answer="$3" id op tag action detail outcome rc sent
+  local control="$1" mac="$2" answer="$3" id op tag action commit verb job detail outcome rc sent
   mkdir -p "$HOST_CMD_DIR"; chmod 700 "$HOST_CMD_DIR" 2>/dev/null || true
-  while IFS="$(printf '\t')" read -r id op tag action; do
+  while IFS="$(printf '\t')" read -r id op tag action commit verb job; do
     [ -n "$id" ] || continue
     [ "$tag" != "-" ] || tag=""
     if [ -f "$HOST_CMD_DIR/$id.outcome" ]; then
@@ -2982,9 +3006,10 @@ host_commands_pass() {
       printf '%s host command %s (%s on %s): already ran — %s; reporting again\n' "$(date -u +%FT%TZ)" "$id" "$op" "$action" "$outcome"
     else
       printf '%s host command %s: running %s%s for %s\n' "$(date -u +%FT%TZ)" "$id" "$op" "${tag:+ $tag}" "$action"
-      rc=0; detail="$(host_command_run "$op" "$tag")" || rc=$?
-      [ "$rc" = 0 ] && outcome=Done || outcome=Failed
-      printf '%s\n%s\n' "$outcome" "$detail" > "$HOST_CMD_DIR/$id.outcome"
+      rc=0; detail="$(host_command_run "$op" "$tag" "$commit" "$verb" "$job" "$control" "$mac" "$id")" || rc=$?
+      case "$rc" in 0) outcome=Done ;; 75) outcome=Deferred ;; *) outcome=Failed ;; esac
+      # a DEFERRED command is not ledgered: it is run again at the next tick (Hosting/BackLease §5.2a)
+      [ "$outcome" = Deferred ] || printf '%s\n%s\n' "$outcome" "$detail" > "$HOST_CMD_DIR/$id.outcome"
       printf '%s host command %s: %s — %s\n' "$(date -u +%FT%TZ)" "$id" "$outcome" "$detail"
     fi
     sent="$(host_command_report "$control" "$mac" "$action" "$id" "$outcome" "$detail")"

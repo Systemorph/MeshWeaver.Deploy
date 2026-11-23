@@ -370,6 +370,21 @@ answer's `commands`, the Restart or Roll InstanceActions control filed on this M
   heartbeat inbox, and the action finishes on it.
 - An unknown operation or a malformed tag runs nothing and is reported Failed.
 - `--no-apply` runs no command.
+
+**…and the bench work: `harness-sync` and `bench`** (BackLease §5.2a, `share/bench-host.py`). Both are fixed operations
+whose every argument is validated twice, by control and again here:
+- `harness-sync <commit>` asks control's `/api/fleet/harness-token` (signed with this Mac's own key; control mints a
+  short-lived `contents: read` App token only for a Mac holding the command, and it is never written to disk), checks
+  with GitHub that the commit is on MeshWeaver.Plugins `main`, fetches `devtools/issue-replay` file by file against
+  each git blob id, checks that the scripts are there and compile, runs the harness's own tests, installs it as
+  `~/bench/harness@<sha12>/`, and renames a fresh symlink over `~/bench/harness-current`. While a runner, an agent or a
+  supervised job works from the CURRENT harness, the sync is reported `Deferred`, is not ledgered, and runs again at the
+  next tick. `~/bench/harness` and `~/bench/harness-v6` are never touched.
+- `bench start|stop|status <job>` runs a job DECLARED on control (`Hosting/BenchJob`), never a command line: a
+  benchmark or gen job under a supervisor with `bench-share.sh` semantics, from the `harness-current` it resolved once
+  (`~/bench/jobs/<name>.{json,pid,log,stop}`). A solution-paths job runs `solution_paths.py --root <root> --all`,
+  then `--flush`. `stop` writes the stop file. `status` reports the pid and the last log line.
+- Exit 75 from `bench-host.py` is `Deferred`, 0 is `Done`, anything else is `Failed`, with the last line as the detail.
  On the control instance,
 `Hosting/Heartbeats/Enrolments` lists every join with the first step not yet measured done.
 
@@ -642,6 +657,7 @@ strings from it).
 | `share/com.memex.local.instances.plist` | the executor's launchd login-agent template |
 | `share/buildhost-idle.py` | the idle-only models governor — CI first, a large model only while the build VM is stopped for it — see *Idle-only models* |
 | `share/com.memex.local.buildhost-idle.plist` | its launchd login-agent template |
+| `share/bench-host.py` | the Mac half of control's `harness-sync` and `bench` host commands — see *Join the fleet* (BackLease §5.2a) |
 
 State lives in `~/.memex-local/` (overlay, mkcert cert/key, port-forward script +
 log, ollama log, grafana password) — exactly the paths the doc uses.

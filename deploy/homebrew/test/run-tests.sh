@@ -4106,7 +4106,7 @@ echo "── fleet steer: control's record steers this Mac's update line, every 
 FS="$(mktemp -d)"; mkdir -p "$FS/home/.memex-local"
 printf 'config:\n  memex_portal:\n    Hosting__Deployment: "mini-1"\nsecrets:\n  memex_portal:\n    Hosting__ModuleReportSecret: "s3cr3t-heartbeat-key-value"\n' > "$FS/home/.memex-local/fleet.yaml"
 cat > "$FS/srv.py" <<'PY'
-import hashlib, hmac, http.server, json, os, sys, time
+import base64, hashlib, hmac, http.server, json, os, sys, time
 rec = sys.argv[1]
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -4120,6 +4120,18 @@ class H(http.server.BaseHTTPRequestHandler):
                 self.send_response(401); self.end_headers(); return
             with open(rec + ".reports", "a") as f: f.write(body.decode() + "\n")
             self.send_response(200); self.end_headers(); return
+        if self.path == "/api/fleet/harness-token":
+            # control's rule: a token only for the Mac's OWN signature AND a harness-sync command it holds; the commit is the command's
+            held = [c for c in (json.load(open(rec + ".commands")) if os.path.exists(rec + ".commands") else [])
+                    if c.get("id") == d.get("commandId") and c.get("operation") == "harness-sync"]
+            if self.headers.get("X-Hub-Signature-256") != want or d.get("deployment") != "mini-1":
+                self.send_response(401); self.end_headers(); return
+            if not held:
+                self.send_response(409); self.end_headers(); return
+            with open(rec + ".tokens", "a") as f: f.write(d["commandId"] + "\n")
+            b = json.dumps({"token": "ghs_FAKE_TOKEN_VALUE", "repository": "Systemorph/MeshWeaver.Plugins", "commit": held[0]["commit"],
+                            "path": "devtools/issue-replay"}).encode()
+            self.send_response(200); self.end_headers(); self.wfile.write(b); return
         mode = open(rec).read().strip()
         if mode == "401" or self.path != "/api/fleet/self-status" or self.headers.get("X-Hub-Signature-256") != want or d.get("deployment") != "mini-1" or abs(d["ts"] - time.time()) > 300:
             self.send_response(401); self.end_headers(); return
@@ -4128,6 +4140,35 @@ class H(http.server.BaseHTTPRequestHandler):
             out["desired"] = json.loads(mode)
         if os.path.exists(rec + ".commands"):
             out["commands"] = json.load(open(rec + ".commands"))
+        b = json.dumps(out).encode(); self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(b)
+    # ── a fake GitHub REST API for the harness sync: only the App token control minted opens it ──
+    # the fake runner records its cwd and argv, then logs its model done — what the supervisor waits for
+    FILES = {"runner.py": b"import json, os, sys\nopen(os.environ['BENCH_RUNNER_LOG'], 'a').write(json.dumps({'cwd': os.getcwd(), 'argv': sys.argv}) + '\\n')\n"
+                          b"print(sys.argv[sys.argv.index('--models') + 1] + ' all tasks done')\n",
+             "agent.py": b"pass\n", "push.py": b"pass\n",
+             "solution_paths.py": b"import sys\nprint('solution paths ' + ' '.join(sys.argv[1:]))\n", "serving/serve-qwen.sh": b"#!/bin/zsh\n"}
+    def blob(self, data): return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+    def do_GET(self):
+        if self.headers.get("Authorization") != "Bearer ghs_FAKE_TOKEN_VALUE":
+            self.send_response(401); self.end_headers(); return
+        p = self.path.split("?")[0]; out = None
+        if p.startswith("/repos/Systemorph/MeshWeaver.Plugins/compare/"):
+            commit = p.rsplit("/", 1)[1].split("...")[0]
+            out = {"status": "diverged" if commit.startswith("dead") else "ahead"}
+        elif p.startswith("/repos/Systemorph/MeshWeaver.Plugins/contents/devtools/issue-replay"):
+            sub = p[len("/repos/Systemorph/MeshWeaver.Plugins/contents/devtools/issue-replay"):].strip("/")
+            names = sorted({k.split("/")[0] if not sub else k.split("/", 1)[1] for k in self.FILES if (k.startswith(sub + "/") if sub else True)})
+            out = [{"name": n, "type": "file", "sha": self.blob(self.FILES[(sub + "/" + n) if sub else n])}
+                   if ((sub + "/" + n) if sub else n) in self.FILES else {"name": n, "type": "dir", "sha": "0" * 40} for n in names]
+        elif p.startswith("/repos/Systemorph/MeshWeaver.Plugins/git/blobs/"):
+            sha = p.rsplit("/", 1)[1]
+            for name, data in self.FILES.items():
+                if self.blob(data) == sha:
+                    # "$rec.tamper" makes the fake serve agent.py with bytes that are NOT its blob id
+                    served = data + (b"# tampered\n" if name == "agent.py" and os.path.exists(rec + ".tamper") else b"")
+                    out = {"sha": sha, "content": base64.b64encode(served).decode(), "encoding": "base64"}; break
+        if out is None:
+            self.send_response(404); self.end_headers(); return
         b = json.dumps(out).encode(); self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(b)
 s = http.server.HTTPServer(("127.0.0.1", 0), H)
 with open(sys.argv[2] + ".tmp", "w") as f: f.write(str(s.server_address[1]))
@@ -4229,6 +4270,78 @@ case "$(cat "$REPORTS")" in *s3cr3t*) bad "a host report carried the heartbeat k
 printf '[{"id":"restart-9","operation":"restart","action":"Ops/Actions/r9"}]' > "$FS/record.commands"
 OUT="$(steer no)"
 [ ! -s "$FS/updates" ] && [ ! -s "$REPORTS" ] && ok "--no-apply runs no command (a join's pre-update pass hands nothing to the machine)" || bad "host no-apply" "$OUT"
+
+# ── bench operations (Hosting/BackLease §5.2a): harness-sync <commit> and bench <job>, fixed and validated ──
+BH="$FS/home/bench"; mkdir -p "$BH/harness" "$BH/harness-v6" "$FS/stubs"
+echo keep > "$BH/harness/sentinel"; echo keep > "$BH/harness-v6/sentinel"
+printf '#!/bin/sh\n[ "$1" = list ] && printf "NAME ID SIZE\\nqwen3.8-mw-base:latest x 1\\n"; exit 0\n' > "$FS/stubs/ollama"; chmod +x "$FS/stubs/ollama"
+C1=0123456789abcdef0123456789abcdef01234567; C2=89abcdef0123456789abcdef0123456789abcdef
+bsteer() { MEMEX_BENCH_HOME="$BH" MEMEX_GITHUB_API="http://127.0.0.1:$FS_PORT" BENCH_PYTHON=python3 MEMEX_BENCH_FAKE_PROCS="$FS/procs" \
+  BENCH_CAFFEINATE='' BENCH_JOB_POLL=1 BENCH_RUNNER_LOG="$FS/runner.log" PATH="$FS/stubs:$PATH" steer yes; }
+sync_cmd() { printf '[{"id":"%s","operation":"harness-sync","commit":"%s","action":"Ops/Actions/%s"}]' "$1" "$2" "$1" > "$FS/record.commands"; }
+: > "$REPORTS"; : > "$FS/procs"
+sync_cmd sync-1 "$C1"; OUT="$(bsteer)"
+[ "$(readlink "$BH/harness-current")" = "harness@${C1:0:12}" ] && [ -f "$BH/harness@${C1:0:12}/runner.py" ] && [ -f "$BH/harness@${C1:0:12}/serving/serve-qwen.sh" ] \
+  && grep -q "\"commit\": \"$C1\"" "$BH/harness@${C1:0:12}/.memex-harness.json" \
+  && grep -q '"commandId":"sync-1".*"outcome":"Done"' "$REPORTS" && grep -q 'sync-1' "$FS/record.tokens" \
+  && ok "a harness sync installs devtools/issue-replay at the approved commit into harness@<sha12> (every file checked against its blob id) and points harness-current at it" \
+  || bad "harness sync" "$OUT / $(cat "$REPORTS") / $(ls -la "$BH")"
+[ "$(cat "$BH/harness/sentinel" "$BH/harness-v6/sentinel")" = "$(printf 'keep\nkeep')" ] && [ ! -L "$BH/harness" ] \
+  && ok "the bench harness and harness-v6 directories are never touched (running experiments use them)" || bad "harness untouched" "$(ls -la "$BH")"
+case "$OUT$(cat "$REPORTS")" in *ghs_FAKE*) bad "the App token leaked into the log or a report" "" ;; *) ok "the App token never reaches the log or a report" ;; esac
+! grep -rq 'ghs_FAKE' "$BH" "$FS/home/.memex-local" 2>/dev/null && ok "…nor any file on the Mac" || bad "token on disk" "$(grep -rl ghs_FAKE "$BH" "$FS/home/.memex-local")"
+# a runner working from the CURRENT harness defers the repoint — reported Deferred, NOT ledgered, asked again next tick
+printf '4242\t%s\t/usr/bin/python3 runner.py --models m\n' "$BH/harness@${C1:0:12}" > "$FS/procs"; : > "$REPORTS"
+sync_cmd sync-2 "$C2"; OUT="$(bsteer)"
+[ "$(readlink "$BH/harness-current")" = "harness@${C1:0:12}" ] && grep -q '"commandId":"sync-2".*"outcome":"Deferred".*pid 4242' "$REPORTS" \
+  && [ ! -f "$FS/home/.memex-local/host-commands/sync-2.outcome" ] && [ ! -d "$BH/harness@${C2:0:12}" ] \
+  && ok "REGRESSION: a runner mid-task on the current harness DEFERS the sync — harness-current unchanged, nothing fetched, nothing ledgered" \
+  || bad "harness defer" "$OUT / $(cat "$REPORTS")"
+: > "$REPORTS"; OUT="$(bsteer)"
+grep -q '"commandId":"sync-2".*"outcome":"Deferred"' "$REPORTS" && ! grep -q 'already ran' <<<"$OUT" \
+  && ok "…and the next tick asks again (a deferral is re-evaluated, never replayed from the ledger)" || bad "harness defer again" "$OUT"
+: > "$FS/procs"; : > "$REPORTS"; OUT="$(bsteer)"
+[ "$(readlink "$BH/harness-current")" = "harness@${C2:0:12}" ] && grep -q '"commandId":"sync-2".*"outcome":"Done".*was harness@' "$REPORTS" \
+  && [ -f "$BH/harness@${C1:0:12}/runner.py" ] \
+  && ok "once the runner is gone the sync lands: harness-current repointed atomically, the old harness kept for whoever still holds it" || bad "harness after defer" "$OUT / $(cat "$REPORTS")"
+: > "$REPORTS"; sync_cmd sync-3 "dead456789abcdef0123456789abcdef01234567"; OUT="$(bsteer)"
+grep -q '"commandId":"sync-3".*"outcome":"Failed".*not on Systemorph/MeshWeaver.Plugins main' "$REPORTS" && [ ! -d "$BH/harness@dead456789ab" ] \
+  && [ "$(readlink "$BH/harness-current")" = "harness@${C2:0:12}" ] \
+  && ok "a commit that is not on main is refused (GitHub compare) — nothing installed, harness-current unchanged" || bad "harness off main" "$OUT / $(cat "$REPORTS")"
+: > "$REPORTS"; touch "$FS/record.tamper"; sync_cmd sync-4 "bad0456789abcdef0123456789abcdef01234567"; OUT="$(bsteer)"; rm -f "$FS/record.tamper"
+grep -q '"commandId":"sync-4".*"outcome":"Failed".*does not match its blob id' "$REPORTS" && ! ls -d "$BH"/harness@bad0* >/dev/null 2>&1 \
+  && ok "a file whose bytes are not its blob id fails the sync — nothing installed, the partial download removed" || bad "harness tamper" "$OUT / $(cat "$REPORTS") / $(ls "$BH")"
+: > "$REPORTS"; printf '[{"id":"sync-5","operation":"harness-sync","commit":"main","action":"Ops/Actions/s5"}]' > "$FS/record.commands"; OUT="$(bsteer)"
+grep -q '"commandId":"sync-5".*"outcome":"Failed".*no valid commit' "$REPORTS" && ! grep -q 'sync-5' "$FS/record.tokens" \
+  && ok "a commit that is no 40-hex id runs nothing (no token is even asked for) and is reported Failed by name" || bad "harness bad commit" "$OUT / $(cat "$REPORTS")"
+# bench jobs: the DECLARATION control validated, re-validated here, rendered without a shell
+JOB='{"name":"gen-r2","kind":"gen","deployment":"mini-1","models":["qwen3.8-mw-base"],"root":"~/bench/gen","tasks":null,"only":"all","args":{"max-steps":"120","wall":"7200"},"push":false,"afterModel":null,"afterRoot":null}'
+bench_cmd() { printf '[{"id":"%s","operation":"bench","benchVerb":"%s","benchJob":%s,"action":"Ops/Actions/%s"}]' "$1" "$2" "$3" "$1" > "$FS/record.commands"; }
+: > "$REPORTS"; : > "$FS/runner.log"; bench_cmd bench-1 start "$JOB"; OUT="$(bsteer)"
+for _ in $(seq 1 50); do grep -q 'gen-r2 finished' "$BH/jobs/gen-r2.log" 2>/dev/null && break; sleep 0.2; done
+grep -q '"commandId":"bench-1".*"outcome":"Done".*gen-r2 started' "$REPORTS" && grep -q 'gen-r2 finished' "$BH/jobs/gen-r2.log" \
+  && python3 -c 'import json,sys; r=json.loads(open(sys.argv[1]).readline()); a=r["argv"]; import os
+assert os.path.realpath(r["cwd"]) == os.path.realpath(sys.argv[2]), r["cwd"]
+assert a[a.index("--models")+1] == "qwen3.8-mw-base" and "--no-push" in a and a[a.index("--")+1:] == ["--max-steps","120","--wall","7200"], a
+assert a[a.index("--root")+1] == os.path.join(sys.argv[3], "gen"), a' "$FS/runner.log" "$BH/harness@${C2:0:12}" "$BH" \
+  && ok "a bench START runs the declared job under its supervisor from the harness-current it resolved once: the model, the root, --no-push for gen, only the allow-listed args" \
+  || bad "bench start" "$OUT / $(cat "$REPORTS") / $(cat "$BH/jobs/gen-r2.log" 2>/dev/null) / $(cat "$FS/runner.log")"
+: > "$REPORTS"; bench_cmd bench-2 status "$JOB"; OUT="$(bsteer)"
+grep -q '"commandId":"bench-2".*"outcome":"Done".*gen-r2: not running; last log line: .*gen-r2 finished' "$REPORTS" \
+  && ok "a bench STATUS says whether the job runs and its last log line — and changes nothing" || bad "bench status" "$(cat "$REPORTS")"
+: > "$REPORTS"; bench_cmd bench-3 stop "$JOB"; OUT="$(bsteer)"
+[ -f "$BH/jobs/gen-r2.stop" ] && grep -q '"commandId":"bench-3".*"outcome":"Done".*stop file written' "$REPORTS" \
+  && ok "a bench STOP writes the job's stop file (the runner drains after its current task)" || bad "bench stop" "$(cat "$REPORTS")"
+: > "$REPORTS"; : > "$FS/runner.log"
+bench_cmd bench-4 start '{"name":"evil","kind":"gen","deployment":"mini-1","models":["m"],"root":"~/bench/gen","args":{"repo":"~/code"}}'; OUT="$(bsteer)"
+grep -q '"commandId":"bench-4".*"outcome":"Failed".*not on the allow-list' "$REPORTS" && [ ! -s "$FS/runner.log" ] && [ ! -f "$BH/jobs/evil.json" ] \
+  && ok "fails closed: an argument outside the allow-list runs NOTHING and is reported Failed by name" || bad "bench allow-list" "$(cat "$REPORTS")"
+: > "$REPORTS"; bench_cmd bench-5 start '{"name":"gen-x","kind":"gen","deployment":"mini-1","models":["m"],"root":"~/bench/../code"}'; OUT="$(bsteer)"
+grep -q '"commandId":"bench-5".*"outcome":"Failed".*root' "$REPORTS" && ok "…and so does a root outside ~/bench" || bad "bench root" "$(cat "$REPORTS")"
+: > "$REPORTS"; bench_cmd bench-6 start '{"name":"paths","kind":"solution-paths","deployment":"mini-1","root":"~/bench/gen"}'; OUT="$(bsteer)"
+grep -q '"commandId":"bench-6".*"outcome":"Done".*solution paths .*--flush' "$REPORTS" \
+  && ok "a solution-paths job runs solution_paths.py --root <root> --all, then --flush, to the end" || bad "bench solution paths" "$(cat "$REPORTS")"
+case "$(cat "$REPORTS")" in *s3cr3t*) bad "a bench report carried the heartbeat key" "" ;; *) ok "no bench report carries the heartbeat key" ;; esac
 rm -f "$FS/record.commands"
 fi
 kill "$FS_PID" 2>/dev/null; wait "$FS_PID" 2>/dev/null
