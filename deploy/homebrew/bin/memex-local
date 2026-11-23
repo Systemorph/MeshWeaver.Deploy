@@ -2952,8 +2952,8 @@ host_command_run() {
       share="$(resolve_share)"
       [ -f "$share/bench-host.py" ] || { printf 'this memex-local has no bench-host.py — nothing was run'; return 1; }
       rc=0
-      out="$(MEMEX_FLEET_FILE="$FLEET_FILE" MEMEX_OVERLAY_FILE="$OVERLAY" python3 -I "$share/bench-host.py" harness-sync "$control" "$mac" "$id" "$commit" 2>/dev/null)" || rc=$?
-      out="${out:-bench-host.py printed nothing}"; printf '%s' "${out##*$'\n'}"; return "$rc" ;;
+      out="$(MEMEX_FLEET_FILE="$FLEET_FILE" MEMEX_OVERLAY_FILE="$OVERLAY" python3 -I "$share/bench-host.py" harness-sync "$control" "$mac" "$id" "$commit" 2>>"$LOCAL_HOME/bench-host.log")" || rc=$?
+      out="${out:-bench-host.py printed nothing — its stderr is in ~/.memex-local/bench-host.log}"; printf '%s' "${out##*$'\n'}"; return "$rc" ;;
     bench)
       if [ "$verb" = "-" ] || [ "$verb" = "!invalid" ] || [ "$job" = "-" ] || [ "$job" = "!invalid" ]; then
         printf 'no valid bench verb and job in the command — nothing was run'; return 1
@@ -2961,8 +2961,9 @@ host_command_run() {
       share="$(resolve_share)"
       [ -f "$share/bench-host.py" ] || { printf 'this memex-local has no bench-host.py — nothing was run'; return 1; }
       rc=0
-      out="$(python3 -I "$share/bench-host.py" bench "$verb" "$job" 2>/dev/null)" || rc=$?
-      out="${out:-bench-host.py printed nothing}"; printf '%s' "${out##*$'\n'}"; return "$rc" ;;
+      # the Mac's own id goes along: bench-host.py refuses a declaration that names another machine
+      out="$(python3 -I "$share/bench-host.py" bench "$verb" "$job" "$mac" 2>>"$LOCAL_HOME/bench-host.log")" || rc=$?
+      out="${out:-bench-host.py printed nothing — its stderr is in ~/.memex-local/bench-host.log}"; printf '%s' "${out##*$'\n'}"; return "$rc" ;;
     *) printf 'unknown operation %s — this memex-local runs restart, update, harness-sync and bench only; nothing was run' "$op"; return 1 ;;
   esac
 }

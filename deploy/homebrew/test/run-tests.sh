@@ -4338,6 +4338,9 @@ grep -q '"commandId":"bench-4".*"outcome":"Failed".*not on the allow-list' "$REP
   && ok "fails closed: an argument outside the allow-list runs NOTHING and is reported Failed by name" || bad "bench allow-list" "$(cat "$REPORTS")"
 : > "$REPORTS"; bench_cmd bench-5 start '{"name":"gen-x","kind":"gen","deployment":"mini-1","models":["m"],"root":"~/bench/../code"}'; OUT="$(bsteer)"
 grep -q '"commandId":"bench-5".*"outcome":"Failed".*root' "$REPORTS" && ok "…and so does a root outside ~/bench" || bad "bench root" "$(cat "$REPORTS")"
+: > "$REPORTS"; : > "$FS/runner.log"; bench_cmd bench-7 start "${JOB/\"deployment\":\"mini-1\"/\"deployment\":\"mini-2\"}"; OUT="$(bsteer)"
+grep -q '"commandId":"bench-7".*"outcome":"Failed".*not this Mac' "$REPORTS" && [ ! -s "$FS/runner.log" ] \
+  && ok "a declaration naming ANOTHER Mac runs nothing here — the job is bound to its machine on the Mac too" || bad "bench other mac" "$(cat "$REPORTS")"
 : > "$REPORTS"; bench_cmd bench-6 start '{"name":"paths","kind":"solution-paths","deployment":"mini-1","root":"~/bench/gen"}'; OUT="$(bsteer)"
 grep -q '"commandId":"bench-6".*"outcome":"Done".*solution paths .*--flush' "$REPORTS" \
   && ok "a solution-paths job runs solution_paths.py --root <root> --all, then --flush, to the end" || bad "bench solution paths" "$(cat "$REPORTS")"
