@@ -180,13 +180,16 @@ def say(log, text):
 
 # ── bench verbs ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-def bench(verb, raw):
+def bench(verb, raw, mac):
     try:
         job, why = validate(json.loads(raw))
     except ValueError:
         job, why = None, "the bench job is no JSON"
     if job is None:
         return failed("bench job refused, nothing was run: " + why)
+    # the declaration is bound to ONE machine: a job naming another Mac runs nothing here, whoever addressed it
+    if job["deployment"].lower() != (mac or "").strip().lower():
+        return failed("bench job %s is declared for %r, not this Mac (%r) — nothing was run" % (job["name"], job["deployment"], mac))
     files = job_files(job["name"])
     running = read_pid(job["name"])
     if verb == "status":
@@ -257,6 +260,7 @@ def supervise(jobfile, harness):
             time.sleep(POLL)
     for m in job["models"]:
         mlog = model_log(job["root"], m)
+        failures = 0
         while not stop() and not logged_done(mlog, m):
             if not ollama_up(log):
                 time.sleep(POLL); continue
@@ -265,8 +269,13 @@ def supervise(jobfile, harness):
             say(log, "runner start: %s" % m)
             with open(mlog, "a") as out:
                 rc = subprocess.call(runner_argv(job, m), cwd=harness, stdin=subprocess.DEVNULL, stdout=out, stderr=out)
-            say(log, "runner exit: %s rc=%d" % (m, rc))
-            time.sleep(min(30, POLL))
+            # a runner that keeps dying without finishing backs off — 30 s after the first failure, doubling, at most 30 min
+            # between starts — so a persistent failure (a contract drift, a broken model) is not restarted every 30 s
+            # forever; status shows it. The wait is sliced, so a stop file or a finished log is noticed within seconds.
+            failures = failures + 1 if rc != 0 else 0
+            wait = min(30 * (2 ** min(failures - 1, 6)), 1800) if failures else 30
+            say(log, "runner exit: %s rc=%d%s" % (m, rc, " — failure %d in a row, next start in %d s" % (failures, wait) if failures else ""))
+            nap(wait, lambda: stop() or logged_done(mlog, m))
         subprocess.call(["ollama", "stop", m], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         say(log, "done: %s" % m)
     say(log, "%s %s" % (job["name"], "stopped" if stop() else "finished"))
@@ -275,6 +284,16 @@ def supervise(jobfile, harness):
     except OSError:
         pass
     return 0
+
+
+def nap(seconds, wake):
+    """Sleeps up to `seconds` in short slices, returning early once `wake()` is true (a stop file, a finished log)."""
+    end = time.time() + seconds
+    while time.time() < end and not wake():
+        time.sleep(max(0.05, min(NAP_SLICE, end - time.time())))
+
+
+NAP_SLICE = float(os.environ.get("BENCH_NAP_SLICE", "5"))
 
 
 def logged_done(path, model):
@@ -480,8 +499,8 @@ def fetch_dir(repo, commit, path, into, token):
 def main(argv):
     if len(argv) >= 1 and argv[0] == "harness-sync" and len(argv) == 5:
         return harness_sync(*argv[1:])
-    if len(argv) == 3 and argv[0] == "bench":
-        return bench(argv[1], argv[2])
+    if len(argv) == 4 and argv[0] == "bench":
+        return bench(argv[1], argv[2], argv[3])
     if len(argv) == 3 and argv[0] == "supervise":
         return supervise(argv[1], argv[2])
     if len(argv) == 2 and argv[0] == "busy":
