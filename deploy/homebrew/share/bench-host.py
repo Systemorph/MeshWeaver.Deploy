@@ -269,12 +269,13 @@ def supervise(jobfile, harness):
             say(log, "runner start: %s" % m)
             with open(mlog, "a") as out:
                 rc = subprocess.call(runner_argv(job, m), cwd=harness, stdin=subprocess.DEVNULL, stdout=out, stderr=out)
-            # a runner that keeps dying without finishing backs off — 30 s, doubling, at most 30 min between starts — so a
-            # persistent failure (a contract drift, a broken model) is not restarted every 30 s forever; status shows it
+            # a runner that keeps dying without finishing backs off — 30 s after the first failure, doubling, at most 30 min
+            # between starts — so a persistent failure (a contract drift, a broken model) is not restarted every 30 s
+            # forever; status shows it. The wait is sliced, so a stop file or a finished log is noticed within seconds.
             failures = failures + 1 if rc != 0 else 0
-            wait = min(30 * (2 ** min(failures, 6)) if failures else 30, 1800)
+            wait = min(30 * (2 ** min(failures - 1, 6)), 1800) if failures else 30
             say(log, "runner exit: %s rc=%d%s" % (m, rc, " — failure %d in a row, next start in %d s" % (failures, wait) if failures else ""))
-            time.sleep(min(wait, POLL) if POLL < 30 else wait)
+            nap(wait, lambda: stop() or logged_done(mlog, m))
         subprocess.call(["ollama", "stop", m], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         say(log, "done: %s" % m)
     say(log, "%s %s" % (job["name"], "stopped" if stop() else "finished"))
@@ -283,6 +284,16 @@ def supervise(jobfile, harness):
     except OSError:
         pass
     return 0
+
+
+def nap(seconds, wake):
+    """Sleeps up to `seconds` in short slices, returning early once `wake()` is true (a stop file, a finished log)."""
+    end = time.time() + seconds
+    while time.time() < end and not wake():
+        time.sleep(max(0.05, min(NAP_SLICE, end - time.time())))
+
+
+NAP_SLICE = float(os.environ.get("BENCH_NAP_SLICE", "5"))
 
 
 def logged_done(path, model):
