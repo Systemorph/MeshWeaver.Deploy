@@ -2138,7 +2138,7 @@ grep -q '^enable system/com.memex.local.autoupdate' "$AU/launchctl.log" && grep 
   && ok "… enabled and bootstrapped into the system domain" || bad "enable + bootstrap system" "$(cat "$AU/launchctl.log")"
 [ -f "$AU/home/.memex-local/autoupdate.log" ] && ok "… the log exists before launchd opens it (so it is the user's, not root's)" || bad "log pre-created" "$(ls -la "$AU/home/.memex-local")"
 
-AU_CALL=(cmd_autoupdate on --system); au "$KEG/memex-local" FAKE_NO_GUI=1 MEMEX_TEST_EUID=0 SUDO_USER="$ME" FAKE_USER_HOME="$AU/home"
+AU_CALL=(cmd_autoupdate on --system --quiet); au "$KEG/memex-local" FAKE_NO_GUI=1 MEMEX_TEST_EUID=0 SUDO_USER="$ME" FAKE_USER_HOME="$AU/home"
 [ "$RC" = 0 ] && [ "$(grep -c '' "$AU/launchctl.log")" -gt 0 ] && grep -q '^bootout system/com.memex.local.autoupdate' "$AU/launchctl.log" \
   && ok "--system is idempotent: a re-run boots the old job out and bootstraps the new one" || bad "--system idempotent" "rc=$RC $(cat "$AU/launchctl.log")"
 

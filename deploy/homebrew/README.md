@@ -564,7 +564,9 @@ user's `~/.memex-local/autoupdate.log`, created by the user before launchd opens
 domain runs at a time: installing the daemon boots the gui copy out and removes it, while the
 daemon exists `up`/`update` arm no agent beside it, and `autoupdate off` without root refuses
 and names the sudo command. Without root, `--system` changes nothing and prints the command.
-A re-run is idempotent: the old job is booted out first. A refused `enable` or `bootstrap` is a
+A re-run is idempotent: the old job is booted out first. sudo strips the environment, so a user whose
+`~/.memex-local` is relocated passes it explicitly (`sudo MEMEX_LOCAL_HOME=<dir> … autoupdate on --system`),
+and the daemon then carries it. `status` needs no sudo: launchd answers `print system/<label>` for any user. A refused `enable` or `bootstrap` is a
 red line, never a green one.
 
 What the tick reads needs no console session. The heartbeat key used for the signed

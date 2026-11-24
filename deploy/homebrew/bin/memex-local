@@ -8757,6 +8757,8 @@ autoupdate_system_hint() {
   local cmd; cmd="sudo $(autoupdate_brew_prefix)/bin/memex-local autoupdate on --system"
   printf '%s\n' "  $cmd" "  over ssh (sudo asks for the password): ssh -t <this-mac> $cmd"
 }
+# MEMEX_TEST_EUID is the suite's hook (deploy/homebrew/test). It only selects which message this prints: the real boundary is
+# the write into /Library/LaunchDaemons and `launchctl bootstrap system`, which refuse anyone but root whatever it says.
 autoupdate_euid() { printf '%s' "${MEMEX_TEST_EUID:-$(id -u)}"; }
 # A user's home directory (macOS directory service; the passwd database elsewhere).
 autoupdate_user_home() {
@@ -8777,7 +8779,7 @@ autoupdate_system() {
   local user="${SUDO_USER:-}"
   while [ $# -gt 0 ]; do
     case "$1" in
-      --system) ;;
+      --system|--quiet) ;;
       --user) shift; user="${1:?--user needs an account name}" ;;
       *) die "autoupdate $action --system: unknown argument '$1'" ;;
     esac
@@ -8798,6 +8800,8 @@ autoupdate_system() {
   ugroup="$(id -gn "$user" 2>/dev/null || echo staff)"
   uhome="$(autoupdate_user_home "$user")"
   [ -n "$uhome" ] && [ -d "$uhome" ] || die "autoupdate $action --system: cannot find the home directory of '$user'"
+  # sudo's env_reset strips MEMEX_LOCAL_HOME: a user with a custom local home passes it on the command line
+  # (sudo MEMEX_LOCAL_HOME=… memex-local autoupdate on --system), and the daemon then carries it in its environment.
   ulocal="${MEMEX_LOCAL_HOME:-$uhome/.memex-local}"
   uagent="$uhome/Library/LaunchAgents/${AUTOUPDATE_LABEL}.plist"
   local prefix; prefix="$(autoupdate_brew_prefix)"
