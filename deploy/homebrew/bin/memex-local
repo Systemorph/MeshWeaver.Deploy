@@ -8362,11 +8362,13 @@ COMMANDS:
                   keep the mounted Plugins checkout on origin/main so modules and
                   plugin content auto-roll too (restart-as-fan-out, as in prod).
                   The local equivalent of the AKS in-pod self-update.
-  autoupdate <on|off|status>
+  autoupdate <on|off|status> [--system [--user <name>]]
                   Keep THIS CLI and its chart current from the Homebrew tap: a launchd
                   agent runs brew upgrade memex-local every 6h and re-applies the chart
                   (update --skip-image) when a release changed it. ON by default — \`up\`
                   and \`update\` arm it on every Homebrew install; \`off\` is remembered.
+                  --system (with sudo): a headless Mac with nobody logged in runs it as a
+                  system LaunchDaemon AS the invoking user (SUDO_USER), from boot.
   setup [--no-open]
                   Print the FIRST-RUN WIZARD's URL (the one-time token already in it)
                   and open it once its certificate is trusted; \`up\` and \`update\` do this for you when the portal is
@@ -8736,6 +8738,136 @@ readonly AUTOUPDATE_OFF="$LOCAL_HOME/autoupdate.off"           # written by `aut
 readonly AUTOUPDATE_CHECKED="$LOCAL_HOME/autoupdate.checked"   # mtime throttles the brew poll
 readonly AUTOUPDATE_INTERVAL_MIN="${MEMEX_AUTOUPDATE_INTERVAL_MIN:-360}"
 readonly AUTOUPDATE_FORMULA="memex-local"
+# 🖥️ HEADLESS FLEET MACS (2026-11-24): a LaunchAgent lives in the gui/<uid> domain, and that domain exists only while the
+# person is logged in at the console. A fleet Mac rebooted with FileVault off and no auto-login has no console session, so
+# `autoupdate on` could not load the agent (launchctl aborted, rc 134, with no word), the agent stopped at the reboot, and the
+# host commands control hands a Mac on its record (fleet steer: harness-sync, bench, restart, update) reached nobody.
+# `sudo memex-local autoupdate on --system` installs the SAME tick as a system LaunchDaemon that runs AS THE INVOKING USER
+# (UserName = SUDO_USER: brew, ~/.memex-local, the file-based heartbeat key and the VM all belong to that user, never to root),
+# so it starts at boot with nobody logged in. One domain at a time: installing the daemon boots the gui copy out and removes it.
+readonly AUTOUPDATE_DAEMON_PLIST="${MEMEX_LAUNCHDAEMONS_DIR:-/Library/LaunchDaemons}/${AUTOUPDATE_LABEL}.plist"
+
+# The Homebrew prefix this keg was installed under (…/Cellar/memex-local/<v>/libexec → …). Derived from the script's own path
+# rather than `brew --prefix`, because the --system path runs as root and Homebrew refuses to run as root.
+autoupdate_brew_prefix() { printf '%s' "${SELF_DIR%%/Cellar/*}"; }
+# Is there a console (gui) session for this user? Without one no LaunchAgent can load.
+autoupdate_gui_session() { launchctl print "gui/$(id -u)" >/dev/null 2>&1; }
+# The one command a headless Mac needs, printed wherever the gui domain is missing.
+autoupdate_system_hint() {
+  local cmd; cmd="sudo $(autoupdate_brew_prefix)/bin/memex-local autoupdate on --system"
+  printf '%s\n' "  $cmd" "  over ssh (sudo asks for the password): ssh -t <this-mac> $cmd"
+}
+# MEMEX_TEST_EUID is the suite's hook (deploy/homebrew/test). It only selects which message this prints: the real boundary is
+# the write into /Library/LaunchDaemons and `launchctl bootstrap system`, which refuse anyone but root whatever it says.
+autoupdate_euid() { printf '%s' "${MEMEX_TEST_EUID:-$(id -u)}"; }
+# A user's home directory (macOS directory service; the passwd database elsewhere).
+autoupdate_user_home() {
+  local h
+  h="$(dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}')"
+  [ -n "$h" ] || h="$(python3 -I -c 'import pwd, sys; print(pwd.getpwnam(sys.argv[1]).pw_dir)' "$1" 2>/dev/null)"
+  printf '%s' "$h"
+}
+# The account the installed daemon runs as ("" when no daemon plist is installed).
+autoupdate_daemon_user() {
+  [ -f "$AUTOUPDATE_DAEMON_PLIST" ] || return 0
+  sed -n 's|.*<key>UserName</key><string>\([^<]*\)</string>.*|\1|p' "$AUTOUPDATE_DAEMON_PLIST" | head -1
+}
+
+# memex-local autoupdate on|off --system — run as root (sudo). $1 = on|off, then [--user <name>].
+autoupdate_system() {
+  local action="$1"; shift
+  local user="${SUDO_USER:-}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --system|--quiet) ;;
+      --user) shift; user="${1:?--user needs an account name}" ;;
+      *) die "autoupdate $action --system: unknown argument '$1'" ;;
+    esac
+    shift
+  done
+  is_brew_install || die "autoupdate follows the Homebrew tap, and this CLI runs from $SELF_DIR — not a Homebrew install."
+  if [ "$(autoupdate_euid)" != 0 ]; then
+    printf '%serr %s autoupdate %s --system changes /Library/LaunchDaemons, which only root may do — nothing was changed. Run:\n' "$C_RED" "$C_RESET" "$action" >&2
+    if [ "$action" = on ]; then autoupdate_system_hint >&2
+    else printf '  sudo %s/bin/memex-local autoupdate off --system\n' "$(autoupdate_brew_prefix)" >&2; fi
+    exit 1
+  fi
+  case "$user" in
+    ""|root) die "autoupdate $action --system: no account to run as — run it with sudo from that account (SUDO_USER), or pass --user <name>. The daemon never runs as root: brew and ~/.memex-local belong to a user." ;;
+  esac
+  local uid uhome ulocal ugroup uagent
+  uid="$(id -u "$user" 2>/dev/null)" || die "autoupdate $action --system: no account '$user' on this Mac"
+  ugroup="$(id -gn "$user" 2>/dev/null || echo staff)"
+  uhome="$(autoupdate_user_home "$user")"
+  [ -n "$uhome" ] && [ -d "$uhome" ] || die "autoupdate $action --system: cannot find the home directory of '$user'"
+  # sudo's env_reset strips MEMEX_LOCAL_HOME: a user with a custom local home passes it on the command line
+  # (sudo MEMEX_LOCAL_HOME=… memex-local autoupdate on --system), and the daemon then carries it in its environment.
+  ulocal="${MEMEX_LOCAL_HOME:-$uhome/.memex-local}"
+  uagent="$uhome/Library/LaunchAgents/${AUTOUPDATE_LABEL}.plist"
+  local prefix; prefix="$(autoupdate_brew_prefix)"
+  case "$action" in
+    on)
+      mkdir -p "$ulocal" "$(dirname "$AUTOUPDATE_DAEMON_PLIST")"
+      chown "$user:$ugroup" "$ulocal" 2>/dev/null || true
+      rm -f "$ulocal/autoupdate.off"
+      # launchd opens the log as root before it drops to UserName: a log that does not exist yet would be created root-owned,
+      # and the user's own `update` could no longer append to it. Create it as the user first.
+      touch "$ulocal/autoupdate.log"; chown "$user:$ugroup" "$ulocal/autoupdate.log" 2>/dev/null || true
+      cat > "$AUTOUPDATE_DAEMON_PLIST.tmp" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- memex-local auto-update as a SYSTEM LaunchDaemon (memex-local autoupdate on --system): the same tick as the gui agent,
+     run as the user below with nobody logged in, from boot. Remove with: sudo memex-local autoupdate off --system -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>${AUTOUPDATE_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>${prefix}/bin/memex-local</string><string>autoupdate</string><string>_tick</string></array>
+  <key>UserName</key><string>${user}</string>
+  <key>GroupName</key><string>${ugroup}</string>
+  <key>InitGroups</key><true/>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>300</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>${prefix}/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>${uhome}</string>
+    <key>USER</key><string>${user}</string>
+    <key>LOGNAME</key><string>${user}</string>${MEMEX_LOCAL_HOME:+
+    <key>MEMEX_LOCAL_HOME</key><string>${ulocal}</string>}${CHANNEL:+
+    <key>MEMEX_CHANNEL</key><string>${CHANNEL}</string>}${HOST_PROFILE:+
+    <key>MEMEX_PROFILE</key><string>${HOST_PROFILE}</string>}
+  </dict>
+  <key>StandardOutPath</key><string>${ulocal}/autoupdate.log</string>
+  <key>StandardErrorPath</key><string>${ulocal}/autoupdate.log</string>
+</dict></plist>
+PLIST
+      if command -v plutil >/dev/null 2>&1 && ! plutil -lint "$AUTOUPDATE_DAEMON_PLIST.tmp" >/dev/null; then
+        rm -f "$AUTOUPDATE_DAEMON_PLIST.tmp"; die "autoupdate on --system: the rendered plist is not valid — nothing was installed"
+      fi
+      [ "$(id -u)" = 0 ] && chown root:wheel "$AUTOUPDATE_DAEMON_PLIST.tmp"
+      chmod 0644 "$AUTOUPDATE_DAEMON_PLIST.tmp"; mv -f "$AUTOUPDATE_DAEMON_PLIST.tmp" "$AUTOUPDATE_DAEMON_PLIST"
+      # one domain at a time: two copies would tick concurrently, and a later login would load the gui one beside the daemon
+      launchctl bootout "gui/$uid/${AUTOUPDATE_LABEL}" >/dev/null 2>&1 || true
+      rm -f "$uagent"
+      launchctl bootout "system/${AUTOUPDATE_LABEL}" >/dev/null 2>&1 || true
+      launchctl enable "system/${AUTOUPDATE_LABEL}" || die "autoupdate on --system: launchctl enable system/${AUTOUPDATE_LABEL} FAILED — the daemon is installed at $AUTOUPDATE_DAEMON_PLIST but NOT armed"
+      launchctl bootstrap system "$AUTOUPDATE_DAEMON_PLIST" || die "autoupdate on --system: launchctl bootstrap system $AUTOUPDATE_DAEMON_PLIST FAILED — the daemon is installed but NOT running"
+      launchctl print "system/${AUTOUPDATE_LABEL}" >/dev/null 2>&1 || die "autoupdate on --system: bootstrap returned but launchd does not list system/${AUTOUPDATE_LABEL}"
+      ok "Auto-update ON as a system LaunchDaemon (system/${AUTOUPDATE_LABEL}) running as $user — starts at boot with nobody logged in; ticks every 15m (brew upgrade every ${AUTOUPDATE_INTERVAL_MIN}m). Log: $ulocal/autoupdate.log"
+      ;;
+    off)
+      launchctl bootout "system/${AUTOUPDATE_LABEL}" >/dev/null 2>&1 || true
+      launchctl disable "system/${AUTOUPDATE_LABEL}" >/dev/null 2>&1 || true
+      rm -f "$AUTOUPDATE_DAEMON_PLIST"
+      launchctl bootout "gui/$uid/${AUTOUPDATE_LABEL}" >/dev/null 2>&1 || true
+      rm -f "$uagent"
+      mkdir -p "$ulocal"; : > "$ulocal/autoupdate.off"; chown "$user:$ugroup" "$ulocal/autoupdate.off" 2>/dev/null || true
+      ok "Auto-update OFF — the system LaunchDaemon and any gui agent are removed; remembered, so 'up'/'update' will not re-arm it."
+      ;;
+  esac
+}
 
 # The CLI is a Homebrew install iff this script runs from a keg (…/Cellar/memex-local/<version>/libexec).
 # A checkout is somebody's working tree and is never upgraded behind their back.
@@ -8760,7 +8892,12 @@ autoupdate_default() {
     info "auto-update is OFF on this Mac (memex-local autoupdate on to follow releases again)"
     return 0
   fi
-  cmd_autoupdate on --quiet
+  # the system daemon already runs the tick: arming the gui agent too would tick twice
+  if [ -f "$AUTOUPDATE_DAEMON_PLIST" ]; then
+    info "auto-update runs as the system LaunchDaemon (system/${AUTOUPDATE_LABEL}) — nothing to arm"
+    return 0
+  fi
+  cmd_autoupdate on --quiet || true
 }
 
 # memex-local settle — the in-place repairs of THIS release that need no chart re-apply and no restart (idempotent; the
@@ -8777,8 +8914,18 @@ cmd_autoupdate() {
   local action="${1:-status}"; [ $# -gt 0 ] && shift
   case "$action" in
     on)
-      local quiet=""
-      [ "${1:-}" = "--quiet" ] && quiet=1
+      local quiet="" a
+      for a in "$@"; do [ "$a" != --system ] || { autoupdate_system on "$@"; return; }; done
+      for a in "$@"; do
+        case "$a" in
+          --quiet) quiet=1 ;;
+          *) die "usage: memex-local autoupdate on [--system [--user <name>]] (unknown '$a')" ;;
+        esac
+      done
+      if [ -f "$AUTOUPDATE_DAEMON_PLIST" ]; then
+        ok "Auto-update already runs as the system LaunchDaemon (system/${AUTOUPDATE_LABEL}, as $(autoupdate_daemon_user)) — the gui agent is not armed beside it"
+        return 0
+      fi
       is_brew_install || die "autoupdate follows the Homebrew tap, and this CLI runs from $SELF_DIR — not a Homebrew install. Keep a checkout current with git."
       need brew brew
       mkdir -p "$LOCAL_HOME" "$(dirname "$AUTOUPDATE_PLIST")"
@@ -8807,8 +8954,22 @@ cmd_autoupdate() {
   <key>StandardErrorPath</key><string>${AUTOUPDATE_LOG}</string>
 </dict></plist>
 PLIST
+      # 🚨 No console session = no gui domain: launchctl then aborts (rc 134) without a word and nothing runs. Say so, and
+      # name the one command that does work on a headless Mac. The plist stays written, so a later console login loads it.
+      if ! autoupdate_gui_session; then
+        warn "Auto-update NOT running: $(id -un) has no console (gui) login session on this Mac, so launchd cannot load the LaunchAgent ($AUTOUPDATE_PLIST is written and loads at the next console login)."
+        warn "A headless Mac (no auto-login, nobody at the console) runs it as a system LaunchDaemon instead — once, as an admin:"
+        autoupdate_system_hint >&2
+        return 1
+      fi
       launchctl unload "$AUTOUPDATE_PLIST" >/dev/null 2>&1 || true
-      launchctl load "$AUTOUPDATE_PLIST"
+      local lrc=0 lout
+      lout="$(launchctl load "$AUTOUPDATE_PLIST" 2>&1)" || lrc=$?
+      if [ "$lrc" != 0 ] || ! launchctl list 2>/dev/null | grep -q "$AUTOUPDATE_LABEL"; then
+        warn "Auto-update NOT running: launchctl load $AUTOUPDATE_PLIST exited $lrc${lout:+ — $lout} and launchd does not list ${AUTOUPDATE_LABEL}. On a headless Mac:"
+        autoupdate_system_hint >&2
+        return 1
+      fi
       if [ -n "$quiet" ]; then
         info "auto-update ON — memex-local follows the Homebrew tap every ${AUTOUPDATE_INTERVAL_MIN}m (memex-local autoupdate off to stop)"
       else
@@ -8816,15 +8977,30 @@ PLIST
       fi
       ;;
     off)
+      case " $* " in *" --system "*) autoupdate_system off "$@"; return ;; esac
+      if [ -f "$AUTOUPDATE_DAEMON_PLIST" ]; then
+        die "auto-update runs as the system LaunchDaemon ($AUTOUPDATE_DAEMON_PLIST) — removing it needs root: sudo $(autoupdate_brew_prefix)/bin/memex-local autoupdate off --system"
+      fi
       launchctl unload "$AUTOUPDATE_PLIST" >/dev/null 2>&1 || true
       rm -f "$AUTOUPDATE_PLIST"
       mkdir -p "$LOCAL_HOME"; : > "$AUTOUPDATE_OFF"
       ok "Auto-update OFF — remembered, so 'up'/'update' will not re-arm it (memex-local autoupdate on to resume)."
       ;;
     status)
-      if launchctl list 2>/dev/null | grep -q "$AUTOUPDATE_LABEL"; then ok "Auto-update: RUNNING"
+      if launchctl print "system/${AUTOUPDATE_LABEL}" >/dev/null 2>&1; then
+        ok "Auto-update: RUNNING — system LaunchDaemon (system/${AUTOUPDATE_LABEL}, as $(autoupdate_daemon_user)); runs from boot with nobody logged in"
+      elif [ -f "$AUTOUPDATE_DAEMON_PLIST" ]; then
+        warn "Auto-update: the system LaunchDaemon is installed ($AUTOUPDATE_DAEMON_PLIST, as $(autoupdate_daemon_user)) but NOT loaded — sudo $(autoupdate_brew_prefix)/bin/memex-local autoupdate on --system"
+      elif launchctl list 2>/dev/null | grep -q "$AUTOUPDATE_LABEL"; then
+        ok "Auto-update: RUNNING — gui LaunchAgent (gui/$(id -u)/${AUTOUPDATE_LABEL}); it stops when $(id -un) is not logged in at the console"
       elif [ -f "$AUTOUPDATE_OFF" ]; then info "Auto-update: OFF (opted out)"
-      else info "Auto-update: stopped"; fi
+      else
+        info "Auto-update: stopped"
+        if ! autoupdate_gui_session && is_brew_install; then
+          info "no console (gui) login session — a LaunchAgent cannot run here; a headless Mac runs it as a system LaunchDaemon:"
+          autoupdate_system_hint
+        fi
+      fi
       info "cli:       $(is_brew_install && echo "Homebrew install ($SELF_DIR)" || echo "not a Homebrew install ($SELF_DIR) — never upgraded automatically")"
       info "last:      $(tail -1 "$AUTOUPDATE_LOG" 2>/dev/null || echo none)"
       ;;
@@ -8886,7 +9062,7 @@ PLIST
         fi
       fi
       ;;
-    *) die "usage: memex-local autoupdate {on|off|status}" ;;
+    *) die "usage: memex-local autoupdate {on|off|status} [--system [--user <name>]]" ;;
   esac
 }
 

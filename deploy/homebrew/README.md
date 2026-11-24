@@ -534,6 +534,50 @@ memex-local autoupdate off      # stop it; remembered, so `up`/`update` do not r
 memex-local autoupdate on       # resume
 ```
 
+### A headless Mac: the system LaunchDaemon (`autoupdate on --system`)
+
+A LaunchAgent lives in the `gui/<uid>` domain, and that domain exists only while the person is
+logged in at the console. A fleet Mac that reboots with nobody logged in (no auto-login) therefore
+has no running agent. Until 2026-11-24 `autoupdate on` then aborted inside `launchctl` (rc 134)
+without printing anything. The agent's tick is also what runs the fleet steer and the host
+commands that control hands a Mac on its record (`harness-sync`, `bench`, `restart`, `update`),
+so a headless Mac received none of them.
+
+`autoupdate on` now FAILS loudly when there is no console session and prints the one command
+that works. `autoupdate status` prints the same command whenever the agent is stopped and no
+console session exists:
+
+```bash
+sudo /opt/homebrew/bin/memex-local autoupdate on --system            # on the Mac
+ssh -t <mac> sudo /opt/homebrew/bin/memex-local autoupdate on --system # over ssh; sudo asks for the password
+memex-local autoupdate status                                       # RUNNING — system LaunchDaemon (…, as <user>)
+sudo /opt/homebrew/bin/memex-local autoupdate off --system           # remove it (remembered, like `off`)
+```
+
+`--system` writes `/Library/LaunchDaemons/com.memex.local.autoupdate.plist` (root:wheel, 0644),
+then enables it and bootstraps it into the `system` domain, so it starts at boot with nobody
+logged in. It runs the same tick as the agent (`<prefix>/bin/memex-local autoupdate _tick`, every
+15 minutes, `RunAtLoad`, `KeepAlive` on failure). It runs **as the invoking user**:
+`UserName` = `SUDO_USER`, or `--user <name>`, never root, because Homebrew, `~/.memex-local`
+and the VM all belong to that user. `HOME`, `USER` and `PATH` are those of the user. Its log is the
+user's `~/.memex-local/autoupdate.log`, created by the user before launchd opens it. Only one
+domain runs at a time: installing the daemon boots the gui copy out and removes it, while the
+daemon exists `up`/`update` arm no agent beside it, and `autoupdate off` without root refuses
+and names the sudo command. Without root, `--system` changes nothing and prints the command.
+A re-run is idempotent: the old job is booted out first. sudo strips the environment, so a user whose
+`~/.memex-local` is relocated passes it explicitly (`sudo MEMEX_LOCAL_HOME=<dir> … autoupdate on --system`),
+and the daemon then carries it. `status` needs no sudo: launchd answers `print system/<label>` for any user. A refused `enable` or `bootstrap` is a
+red line, never a green one.
+
+What the tick reads needs no console session. The heartbeat key used for the signed
+self-status and the host-command reports is a FILE (`Hosting__ModuleReportSecret` in
+`~/.memex-local/fleet.yaml` or the overlay, mode 0600, read by the user). Nothing on the tick's
+path reads a keychain: the harness token for `harness-sync` is fetched from control per command
+and never stored. **Not covered by the daemon:** the other per-user agents (the port-forward that
+also starts Colima, the back-lease sampler, the instances executor) are still LaunchAgents. On a
+headless Mac a host command that needs the running stack (`restart`, `update`) therefore fails
+until the stack is up. `harness-sync` and `bench` need only `python3`, the network and Ollama.
+
 Why it is the default (2026-10-30): the portal image and the packages already update in
 place, but registry mode's in-pod image self-updater is switched on by a values layer that
 ships **with the CLI**. A CLI that is never upgraded therefore also leaves the image updater

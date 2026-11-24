@@ -2004,7 +2004,29 @@ KEG="$AU/prefix/Cellar/memex-local/0.3.1/libexec"; mkdir -p "$KEG"; cp "$CLI" "$
 printf 'chart v1\n' > "$AU/prefix/opt/memex-local/libexec/share/values.yaml"
 cp "$CLI" "$AU/prefix/opt/memex-local/libexec/memex-local"
 printf '0.3.1\n' > "$AU/version"
-printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "$FAKE_LAUNCHCTL_LOG"\nexit 0\n' > "$AU/stubs/launchctl"
+# A launchctl with STATE (under $AU/ld): load/bootstrap register a job, unload/bootout remove it, list/print answer from it.
+# FAKE_NO_GUI=1 is a Mac with nobody at the console: the gui domain does not exist and `load` aborts (rc 134) without a word,
+# exactly what the fleet's headless Macs measured. FAKE_BOOTSTRAP_FAILS=1 makes `bootstrap system` refuse (rc 5).
+mkdir -p "$AU/ld"
+cat > "$AU/stubs/launchctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_LAUNCHCTL_LOG"
+st="$FAKE_LAUNCHD_STATE"
+case "$1" in
+  print)     case "$2" in
+               gui/*/*) [ -z "${FAKE_NO_GUI:-}" ] && [ -f "$st/gui" ] ;;
+               gui/*)   [ -z "${FAKE_NO_GUI:-}" ] ;;
+               system/*) [ -f "$st/system" ] ;;
+               *) exit 1 ;;
+             esac; exit $? ;;
+  load)      [ -n "${FAKE_NO_GUI:-}" ] && exit 134; : > "$st/gui" ;;
+  unload)    rm -f "$st/gui" ;;
+  list)      [ -f "$st/gui" ] && printf -- '-\t0\tcom.memex.local.autoupdate\n' ;;
+  bootstrap) case "$2" in system) [ -n "${FAKE_BOOTSTRAP_FAILS:-}" ] && exit 5; : > "$st/system" ;; esac ;;
+  bootout)   case "$2" in system/*) [ -f "$st/system" ] || exit 113; rm -f "$st/system" ;; gui/*) rm -f "$st/gui" ;; esac ;;
+esac
+exit 0
+EOF
 cat > "$AU/stubs/brew" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in
@@ -2023,7 +2045,7 @@ au() {  # au <script> <lib-call…> — run a function of <script> with the fake
   local script="$1"; shift
   : > "$AU/launchctl.log"; : > "$AU/update.log"
   OUT="$(env PATH="$AU/stubs:$STUBS:$PATH" HOME="$AU/home" MEMEX_LOCAL_HOME="$AU/home/.memex-local" FAKE_PREFIX="$AU/prefix" \
-    FAKE_LAUNCHCTL_LOG="$AU/launchctl.log" FAKE_UPDATE_LOG="$AU/update.log" MEMEX_LOCAL_SHARE="$HERE/../share" MEMEX_LOCAL_LIB=1 "$@" \
+    FAKE_LAUNCHCTL_LOG="$AU/launchctl.log" FAKE_LAUNCHD_STATE="$AU/ld" FAKE_UPDATE_LOG="$AU/update.log" MEMEX_LAUNCHDAEMONS_DIR="$AU/LaunchDaemons" MEMEX_LOCAL_SHARE="$HERE/../share" MEMEX_LOCAL_LIB=1 "$@" \
     bash -c '. "$1"; shift; "$@"' _ "$script" "${AU_CALL[@]}" 2>&1)"; RC=$?
 }
 PL="$AU/home/Library/LaunchAgents/com.memex.local.autoupdate.plist"
@@ -2071,6 +2093,79 @@ case "$(cat "$AU/update.log")" in "settle|1"$'\n'"update --skip-image|1") ok "a 
   *) bad "a changed chart is re-applied" "update.log=$(cat "$AU/update.log") out=$OUT" ;; esac
 cmp -s "$AU/home/.memex-local/autoroll-tick" "$AU/prefix/opt/memex-local/libexec/memex-local" \
   && ok "the auto-roll's tick copy is refreshed from the new keg" || bad "the auto-roll tick copy is refreshed" "$OUT"
+
+echo "── auto-update on a HEADLESS Mac: loud in the gui domain, a system LaunchDaemon with --system ──"
+# The fleet's Macs boot with nobody logged in: `autoupdate on` used to abort inside launchctl (rc 134) and say nothing.
+ME="$(id -un)"; MYUID="$(id -u)"; DPL="$AU/LaunchDaemons/com.memex.local.autoupdate.plist"
+printf '#!/bin/bash\nprintf "NFSHomeDirectory: %%s\\n" "$FAKE_USER_HOME"\n' > "$AU/stubs/dscl"; chmod +x "$AU/stubs/dscl"
+rm -f "$AU/ld/"* "$PL" "$AU/home/.memex-local/autoupdate.off"
+APX="$(cd -P "$AU/prefix" && pwd)"   # the CLI resolves its own path physically (/var → /private/var on macOS)
+HINT="sudo $APX/bin/memex-local autoupdate on --system"
+
+AU_CALL=(cmd_autoupdate on); au "$KEG/memex-local" FAKE_NO_GUI=1
+case "$RC:$OUT" in
+  1:*"no console (gui) login session"*"$HINT"*"ssh -t <this-mac> $HINT"*) ok "no console session: 'autoupdate on' FAILS loudly and names the sudo command (also over ssh)" ;;
+  *) bad "no console session is loud" "rc=$RC $OUT" ;;
+esac
+grep -q '^load ' "$AU/launchctl.log" && bad "no console session: launchctl load is not attempted" "$(cat "$AU/launchctl.log")" \
+  || ok "… and launchctl load (which aborts there) is not attempted"
+AU_CALL=(cmd_autoupdate status); au "$KEG/memex-local" FAKE_NO_GUI=1
+case "$OUT" in *"Auto-update: stopped"*"no console (gui) login session"*"$HINT"*) ok "status on a headless Mac says why it is stopped and what to run" ;; *) bad "headless status hint" "$OUT" ;; esac
+rm -f "$PL"
+
+AU_CALL=(cmd_autoupdate on --system); au "$KEG/memex-local" FAKE_NO_GUI=1
+case "$RC:$OUT" in 1:*"only root may do"*"$HINT"*) ok "--system without root changes nothing and prints the sudo command" ;; *) bad "--system without root" "rc=$RC $OUT" ;; esac
+[ ! -f "$DPL" ] && ok "… no daemon plist was written" || bad "--system without root writes nothing" "$(cat "$DPL")"
+
+AU_CALL=(cmd_autoupdate on --system); au "$KEG/memex-local" FAKE_NO_GUI=1 MEMEX_TEST_EUID=0 SUDO_USER=""
+case "$RC:$OUT" in 1:*"no account to run as"*) ok "--system as root with no SUDO_USER refuses (the daemon never runs as root)" ;; *) bad "no SUDO_USER refuses" "rc=$RC $OUT" ;; esac
+
+mkdir -p "$(dirname "$PL")"; printf 'gui agent\n' > "$PL"
+AU_CALL=(cmd_autoupdate on --system); au "$KEG/memex-local" FAKE_NO_GUI=1 MEMEX_TEST_EUID=0 SUDO_USER="$ME" FAKE_USER_HOME="$AU/home"
+DP="$(cat "$DPL" 2>/dev/null)"
+case "$RC:$DP" in
+  0:*"<string>$APX/bin/memex-local</string><string>autoupdate</string><string>_tick</string>"*"<key>UserName</key><string>$ME</string>"*)
+    ok "--system as root installs the daemon running the relinked bin/ tick AS the invoking user (SUDO_USER)" ;;
+  *) bad "--system installs the daemon" "rc=$RC out=$OUT plist=$DP" ;;
+esac
+for want in "<key>HOME</key><string>$AU/home</string>" "<key>RunAtLoad</key><true/>" "<key>KeepAlive</key>" "<key>StartInterval</key><integer>900</integer>" \
+            "<key>StandardOutPath</key><string>$AU/home/.memex-local/autoupdate.log</string>"; do
+  case "$DP" in *"$want"*) ok "daemon plist carries $want" ;; *) bad "daemon plist carries $want" "$DP" ;; esac
+done
+# the optional keys render on their OWN line (a real newline inside ${VAR:+…}, not a literal \n), and the plist lints
+grep -qx "    <key>MEMEX_LOCAL_HOME</key><string>$AU/home/.memex-local</string>" "$DPL" \
+  && ok "an optional env key renders as its own plist line" || bad "optional env key on its own line" "$DP"
+if command -v plutil >/dev/null 2>&1; then
+  plutil -lint "$DPL" >/dev/null && ok "the daemon plist lints (plutil)" || bad "daemon plist lints" "$(plutil -lint "$DPL" 2>&1)"
+fi
+[ ! -f "$PL" ] && grep -q "^bootout gui/$MYUID/com.memex.local.autoupdate" "$AU/launchctl.log" \
+  && ok "… the gui copy is booted out and removed (one domain at a time)" || bad "gui copy removed" "$(cat "$AU/launchctl.log")"
+grep -q '^enable system/com.memex.local.autoupdate' "$AU/launchctl.log" && grep -q "^bootstrap system $DPL" "$AU/launchctl.log" \
+  && ok "… enabled and bootstrapped into the system domain" || bad "enable + bootstrap system" "$(cat "$AU/launchctl.log")"
+[ -f "$AU/home/.memex-local/autoupdate.log" ] && ok "… the log exists before launchd opens it (so it is the user's, not root's)" || bad "log pre-created" "$(ls -la "$AU/home/.memex-local")"
+
+AU_CALL=(cmd_autoupdate on --system --quiet); au "$KEG/memex-local" FAKE_NO_GUI=1 MEMEX_TEST_EUID=0 SUDO_USER="$ME" FAKE_USER_HOME="$AU/home"
+[ "$RC" = 0 ] && [ "$(grep -c '' "$AU/launchctl.log")" -gt 0 ] && grep -q '^bootout system/com.memex.local.autoupdate' "$AU/launchctl.log" \
+  && ok "--system is idempotent: a re-run boots the old job out and bootstraps the new one" || bad "--system idempotent" "rc=$RC $(cat "$AU/launchctl.log")"
+
+AU_CALL=(cmd_autoupdate status); au "$KEG/memex-local" FAKE_NO_GUI=1
+case "$OUT" in *"RUNNING — system LaunchDaemon"*"as $ME"*) ok "status names the system domain and the account" ;; *) bad "status names the system domain" "$OUT" ;; esac
+AU_CALL=(autoupdate_default); au "$KEG/memex-local"
+[ ! -f "$PL" ] && ! grep -q '^load ' "$AU/launchctl.log" && ok "up/update do not arm the gui agent beside the daemon" || bad "no gui agent beside the daemon" "$OUT"
+AU_CALL=(cmd_autoupdate on); au "$KEG/memex-local"
+case "$RC:$OUT" in 0:*"already runs as the system LaunchDaemon"*) ok "'autoupdate on' with the daemon installed keeps it and arms nothing" ;; *) bad "on with the daemon" "rc=$RC $OUT" ;; esac
+
+AU_CALL=(cmd_autoupdate off); au "$KEG/memex-local"
+case "$RC:$OUT" in 1:*"sudo $APX/bin/memex-local autoupdate off --system"*) ok "'autoupdate off' without root names the sudo command and leaves the daemon" ;; *) bad "off without root" "rc=$RC $OUT" ;; esac
+[ -f "$DPL" ] || bad "off without root leaves the daemon" "gone"
+AU_CALL=(cmd_autoupdate off --system); au "$KEG/memex-local" MEMEX_TEST_EUID=0 SUDO_USER="$ME" FAKE_USER_HOME="$AU/home"
+[ "$RC" = 0 ] && [ ! -f "$DPL" ] && [ -f "$AU/home/.memex-local/autoupdate.off" ] && [ ! -f "$AU/ld/system" ] \
+  && ok "'autoupdate off --system' boots the daemon out, removes it and remembers the opt-out" || bad "off --system" "rc=$RC $OUT"
+rm -f "$AU/home/.memex-local/autoupdate.off"
+
+AU_CALL=(cmd_autoupdate on --system); au "$KEG/memex-local" MEMEX_TEST_EUID=0 SUDO_USER="$ME" FAKE_USER_HOME="$AU/home" FAKE_BOOTSTRAP_FAILS=1
+case "$RC:$OUT" in 1:*"bootstrap system"*"FAILED"*"NOT running"*) ok "a refused bootstrap is a loud failure, never a green line" ;; *) bad "bootstrap failure is loud" "rc=$RC $OUT" ;; esac
+rm -f "$DPL" "$AU/ld/"*
 rm -rf "$AU"
 
 # Static: both entry points arm it, and the acr poll cannot store az's preview warning as a digest.
