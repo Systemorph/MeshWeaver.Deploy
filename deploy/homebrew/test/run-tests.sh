@@ -2132,6 +2132,12 @@ for want in "<key>HOME</key><string>$AU/home</string>" "<key>RunAtLoad</key><tru
             "<key>StandardOutPath</key><string>$AU/home/.memex-local/autoupdate.log</string>"; do
   case "$DP" in *"$want"*) ok "daemon plist carries $want" ;; *) bad "daemon plist carries $want" "$DP" ;; esac
 done
+# the optional keys render on their OWN line (a real newline inside ${VAR:+…}, not a literal \n), and the plist lints
+grep -qx "    <key>MEMEX_LOCAL_HOME</key><string>$AU/home/.memex-local</string>" "$DPL" \
+  && ok "an optional env key renders as its own plist line" || bad "optional env key on its own line" "$DP"
+if command -v plutil >/dev/null 2>&1; then
+  plutil -lint "$DPL" >/dev/null && ok "the daemon plist lints (plutil)" || bad "daemon plist lints" "$(plutil -lint "$DPL" 2>&1)"
+fi
 [ ! -f "$PL" ] && grep -q "^bootout gui/$MYUID/com.memex.local.autoupdate" "$AU/launchctl.log" \
   && ok "… the gui copy is booted out and removed (one domain at a time)" || bad "gui copy removed" "$(cat "$AU/launchctl.log")"
 grep -q '^enable system/com.memex.local.autoupdate' "$AU/launchctl.log" && grep -q "^bootstrap system $DPL" "$AU/launchctl.log" \
