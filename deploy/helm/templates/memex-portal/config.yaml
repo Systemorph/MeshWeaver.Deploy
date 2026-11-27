@@ -1133,8 +1133,24 @@ data:
   # `default "false"`, never `default ""`. The `default ""` pattern above is only safe for keys
   # consumed as strings; an empty string fails Boolean.Parse and crashes host startup (issue #352).
   OpenAICompatible__DiscoverModels: "{{ .Values.config.memex_portal.OpenAICompatible__DiscoverModels | default "false" }}"
-  # The tier → model map is `AI__Tiers__{tier id}` (set under config.memex_portal; passed through below). The
-  # deprecated ModelTier__Heavy/Standard/Light/Utility keys are no longer templated (Plugins#4882).
+  # The tier → model map, keyed by the tier NODE id (Doc/AI/ModelTiers). EMITTED ONLY WHEN SET: an absent key
+  # is "no seed for that tier", which is the engine's own default. These replace the deprecated
+  # ModelTier__Heavy/Standard/Light/Utility keys, which are no longer templated (Plugins#4882).
+  {{- if hasKey .Values.config.memex_portal "AI__Tiers__chat" }}
+  AI__Tiers__chat: {{ .Values.config.memex_portal.AI__Tiers__chat | toString | trim | quote }}
+  {{- end }}
+  {{- if hasKey .Values.config.memex_portal "AI__Tiers__reasoning" }}
+  AI__Tiers__reasoning: {{ .Values.config.memex_portal.AI__Tiers__reasoning | toString | trim | quote }}
+  {{- end }}
+  {{- if hasKey .Values.config.memex_portal "AI__Tiers__coding" }}
+  AI__Tiers__coding: {{ .Values.config.memex_portal.AI__Tiers__coding | toString | trim | quote }}
+  {{- end }}
+  {{- if hasKey .Values.config.memex_portal "AI__Tiers__utility" }}
+  AI__Tiers__utility: {{ .Values.config.memex_portal.AI__Tiers__utility | toString | trim | quote }}
+  {{- end }}
+  {{- if hasKey .Values.config.memex_portal "AI__Tiers__review" }}
+  AI__Tiers__review: {{ .Values.config.memex_portal.AI__Tiers__review | toString | trim | quote }}
+  {{- end }}
   # Per-user co-hosted Claude Code config root (the /mnt/users RWX share): each user's `claude`
   # login + .credentials.json live under {root}/{userId}/.claude. Drives the Connect login dir.
   ClaudeCode__ConfigDirRoot: "{{ .Values.config.memex_portal.ClaudeCode__ConfigDirRoot }}"

@@ -3274,6 +3274,15 @@ cmd_fleet() {
 }
 
 llm_value() { [ -f "$LLM_FILE" ] || return 0; awk -v k="$1" '$1 == k":" { gsub(/"/, "", $2); print $2; exit }' "$LLM_FILE" 2>/dev/null || true; }
+# An llm.yaml written before the chart stopped templating the deprecated rank key still names the utility tier
+# as ModelTier__Utility, which no chart reads any more -- the tier would silently drop out of the deployment.
+# Rewrite the key in place (same value) the first time the file is read or layered (Plugins#4882).
+llm_file_migrate() {
+  [ -f "$LLM_FILE" ] || return 0
+  grep -q '^[[:space:]]*ModelTier__Utility:' "$LLM_FILE" 2>/dev/null || return 0
+  sed -i.bak 's/^\([[:space:]]*\)ModelTier__Utility:/\1AI__Tiers__utility:/' "$LLM_FILE" && rm -f "$LLM_FILE.bak"
+  warn "the llm layer ($LLM_FILE) named the utility tier as the retired ModelTier__Utility; renamed it to AI__Tiers__utility (same model)"
+}
 
 # The Colima VM's gateway to the host: where the Mac's own services answer (Ollama on :11434).
 llm_host_ip() {
@@ -4102,6 +4111,7 @@ YAML
     status)
       [ $# -eq 0 ] || die "llm status: unknown flag '$1'"
       install_residency_valid
+      llm_file_migrate
       if [ -f "$LLM_FILE" ]; then
         local endpoint; endpoint="$(llm_value OpenAICompatible__Endpoint)"
         local lres; lres="$(llm_value OpenAICompatible__DataResidency)"
@@ -4979,6 +4989,7 @@ helm_deploy() {
     info "PUBLISHED: also answers at $(publish_urls) — sign-in: $(publish_signin_summary); admission: invitation-only"
   fi
   # LOCAL MODEL layer (`memex-local llm use`): the host's Ollama is the portal's utility-tier model.
+  llm_file_migrate
   if [ -f "$LLM_FILE" ]; then
     mode_args+=(-f "$LLM_FILE")
     info "LOCAL MODEL: utility tier -> $(llm_value AI__Tiers__utility) on $(llm_value OpenAICompatible__Endpoint)"
