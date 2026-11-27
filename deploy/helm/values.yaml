@@ -1606,10 +1606,6 @@ config:
     AzureFoundry__Models__0: ""
     AzureFoundry__Models__1: ""
     AzureFoundry__Models__2: ""
-    ModelTier__Heavy: ""
-    ModelTier__Standard: ""
-    ModelTier__Light: ""
-    ModelTier__Utility: ""
     ClaudeCode__ConfigDirRoot: ""
     # ---- System email (Microsoft Graph) — BIDIRECTIONAL. Off by default; an
     # overlay turns it on per environment by setting Email__Enabled + the env's

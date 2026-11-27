@@ -4091,7 +4091,7 @@ config:
     OpenAICompatible__DiscoverModels: "false"
     OpenAICompatible__Models__0: "${model}"
 ${res_line}
-    ModelTier__Utility: "Provider/OpenAICompatible/${model}"
+    AI__Tiers__utility: "Provider/OpenAICompatible/${model}"
 YAML
       chmod 600 "$LLM_FILE"
       ok "local model layer written: $LLM_FILE (utility tier -> ${model}, residency ${effective_res:-Unknown — none declared}, ${endpoint})"
@@ -4106,7 +4106,7 @@ YAML
         local endpoint; endpoint="$(llm_value OpenAICompatible__Endpoint)"
         local lres; lres="$(llm_value OpenAICompatible__DataResidency)"
         local shown="${lres:-$(install_residency)}"
-        ok "LOCAL MODEL ON -- utility tier -> $(llm_value ModelTier__Utility), ${endpoint}, residency ${shown:-Unknown (none declared)}${lres:+ (llm use --residency)}"
+        ok "LOCAL MODEL ON -- utility tier -> $(llm_value AI__Tiers__utility), ${endpoint}, residency ${shown:-Unknown (none declared)}${lres:+ (llm use --residency)}"
         llm_residency_drift_warn
         if kubectl -n "$NAMESPACE" exec deploy/memex-portal-deployment -c memex-portal -- curl -fsS -m 5 -o /dev/null "${endpoint%/}/models" 2>/dev/null; then
           ok "the portal pod reaches the model endpoint"
@@ -4981,7 +4981,7 @@ helm_deploy() {
   # LOCAL MODEL layer (`memex-local llm use`): the host's Ollama is the portal's utility-tier model.
   if [ -f "$LLM_FILE" ]; then
     mode_args+=(-f "$LLM_FILE")
-    info "LOCAL MODEL: utility tier -> $(llm_value ModelTier__Utility) on $(llm_value OpenAICompatible__Endpoint)"
+    info "LOCAL MODEL: utility tier -> $(llm_value AI__Tiers__utility) on $(llm_value OpenAICompatible__Endpoint)"
   fi
   for repo_path in $(registry_mode || plugin_repo_paths); do
     repo_name="$(plugin_source_name "$repo_path")"
