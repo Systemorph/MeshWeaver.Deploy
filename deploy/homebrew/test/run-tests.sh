@@ -922,6 +922,13 @@ lmu bash -c 'set -euo pipefail; . "$0"; cmd_llm use --residency C1' "$CLI" >/dev
 OUT="$(lmu bash -c 'set -euo pipefail; . "$0"; cmd_llm use' "$CLI" 2>&1)"
 ! grep -q '^    OpenAICompatible__DataResidency:' "$LLMF" && grep -q 'residency CH' <<<"$OUT" \
   && ok "llm use without --residency defaults to the install declaration (CH) and copies none into llm.yaml (the auto layer carries it)" || bad "llm use default" "$OUT / $(cat "$LLMF")"
+# An llm layer written before the chart dropped ModelTier__* names the utility tier by the retired key: rewritten in place, same model.
+printf 'config:\n  memex_portal:\n    ModelTier__Utility: "Provider/OpenAICompatible/qwen3:8b"\n' > "$LLMF"
+OUT="$(lmu bash -c 'set -euo pipefail; . "$0"; llm_file_migrate' "$CLI" 2>&1)"
+grep -qx '    AI__Tiers__utility: "Provider/OpenAICompatible/qwen3:8b"' "$LLMF" && ! grep -q 'ModelTier__' "$LLMF" && grep -q 'renamed it to AI__Tiers__utility' <<<"$OUT" \
+  && ok "an llm layer with the retired ModelTier__Utility is migrated to AI__Tiers__utility with the same model" || bad "llm layer not migrated" "$OUT / $(cat "$LLMF")"
+OUT="$(lmu bash -c 'set -euo pipefail; . "$0"; llm_file_migrate' "$CLI" 2>&1)"
+[ -z "$OUT" ] && ok "migrating an already-migrated llm layer is silent" || bad "second migrate not silent" "$OUT"
 # An llm layer from before this change (llm use wrote "Eu" without a flag) outranks the declaration: named.
 printf 'config:\n  memex_portal:\n    OpenAICompatible__DataResidency: "Eu"\n' > "$LLMF"
 OUT="$(lm env MEMEX_OLLAMA_MODEL=none bash -c '. "$0"; write_llm_auto_layer' "$CLI" 2>&1)"
