@@ -3267,6 +3267,11 @@ S0=$SECONDS; R="$(bv)"; DT=$((SECONDS - S0))
 [ "$R" = "the build VM's kube API does not answer or a node is not Ready" ] && [ "$DT" -lt 25 ] && ok "a hung kubectl is killed at the bound and reported, never waited on" || bad "hang bound" "R=$R dt=$DT"
 rm -f "$BV/hang"
 [ -z "$(bv default)" ] && ok "MEMEX_BUILD_PROFILE=default has no separate build VM → no reading" || bad "default profile" "$(bv default)"
+# a customized COLIMA_HOME: the _lima fallback follows it (review on #421) — the build VM is found there, not missed
+mkdir -p "$BV/ch/_lima/colima-build"; printf 'node1   Ready   control-plane   3d   v1.31\n' > "$BV/nodes"; printf 'Running' > "$BV/pods"; rm -rf "$BV/home/.colima"
+R="$(env PATH="$BV/stubs:$PATH" HOME="$BV/home" COLIMA_HOME="$BV/ch" MEMEX_BUILD_PROFILE= MEMEX_BACKLEASE_DIR="$BV/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; build_vm_health' "$SAMPLER" 2>/dev/null)"
+[ "$R" = ok ] && ok "a build VM found only under \$COLIMA_HOME/_lima is still read (the fallback honours COLIMA_HOME)" || bad "COLIMA_HOME fallback" "$R"
+mkdir -p "$BV/home/.colima/_lima/colima-build"
 printf 'Running' > "$BV/pods"
 bw() { env PATH="$BV/stubs:$PATH" HOME="$BV/home" COLIMA_HOME= MEMEX_BUILD_PROFILE= MEMEX_BACKLEASE_DIR="$BV/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "{\"cores\":2}"; }; owner_cpu() { :; }; host_cpu() { :; }; net_rate() { :; }
   sample_models() { printf "[]"; }; sample_vm() { printf null; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }

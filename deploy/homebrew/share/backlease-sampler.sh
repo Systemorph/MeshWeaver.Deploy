@@ -246,14 +246,14 @@ bounded() { # seconds cmd... — the command's exit status; 124 when it outlived
   "$@" </dev/null & pid=$!
   ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 & wd=$!
   wait "$pid" 2>/dev/null; rc=$?
-  kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+  pkill -P "$wd" 2>/dev/null; kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null   # the watcher's own sleep too, or it lingers
   [ "$rc" = 137 ] && rc=124
   return "$rc"
 }
 build_vm_health() {
   local profile="${MEMEX_BUILD_PROFILE:-build}" ctx nodes pods reason=""
   [ "$profile" = default ] && return 0
-  [ -d "${COLIMA_HOME:-$HOME/.colima}/$profile" ] || [ -d "$HOME/.colima/_lima/colima-$profile" ] || return 0
+  [ -d "${COLIMA_HOME:-$HOME/.colima}/$profile" ] || [ -d "${COLIMA_HOME:-$HOME/.colima}/_lima/colima-$profile" ] || return 0
   ctx="colima-$profile"
   if ! bounded 10 colima status -p "$profile" >/dev/null 2>&1; then reason="the build VM is not running"
   else
