@@ -1102,10 +1102,21 @@ python3 -c 'import plistlib,sys; plistlib.dump({"BootstrapCommit": sys.argv[1], 
 rm -rf "$LD/dir"
 OUT="$(env FLEET_BOOTSTRAP_BASE_URL="file://$LD/web" FLEET_LOADER_DIR="$LD/dir" FLEET_LOG_DIR="$LD/log" FLEET_STATE_DIR="$LD/st" FLEET_MANAGED_PREFS="$LD/prefs" bash "$LD/uploaded.sh" 2>&1)"
 case "$OUT" in *"fetched and verified"*"BOOTSTRAP-A"*) ok "the pin is read from the MDM-delivered com.memex.local profile (BootstrapCommit, BootstrapSha256)" ;; *) bad "pin from profile" "$OUT" ;; esac
-# nothing at all to run: FAILED, exit 1 — never a silent success
+# nothing at all to run, and no pin yet (the enrolment race): exit 0 "waiting", so Intune keeps the hourly schedule
 rm -rf "$LD/dir"; LSCRIPT="$FL"
 OUT="$(lrun)"; RC=$?
-case "$RC:$OUT" in 1:*"FAILED — no pinned, embedded or verified bootstrap"*) grep -q '^failed ' "$LD/st/loader" && ok "no pin, no embedded copy, no verified copy: FAILED, exit 1, reading loader = failed" || bad "loader failed reading" "" ;; *) bad "nothing to run" "rc=$RC $OUT" ;; esac
+case "$RC:$OUT" in 0:*"waiting for the com.memex.local profile"*) grep -q '^waiting ' "$LD/st/loader" && ok "no pin, no embedded copy, no verified copy: WAITING, exit 0, reading loader = waiting (the profile has not landed yet)" || bad "loader waiting reading" "" ;; *) bad "nothing to run, no pin" "rc=$RC $OUT" ;; esac
+# a pin that cannot be fetched, with nothing else to run: FAILED, exit 1, the reason on stderr — never a silent success
+rm -rf "$LD/dir"; mv "$LD/web" "$LD/web.gone"
+OUT="$(env FLEET_BOOTSTRAP_BASE_URL="file://$LD/web" FLEET_LOADER_DIR="$LD/dir" FLEET_LOG_DIR="$LD/log" FLEET_STATE_DIR="$LD/st" FLEET_MANAGED_PREFS="$LD/none" FLEET_BOOTSTRAP_COMMIT="$C1" FLEET_BOOTSTRAP_SHA256="$S1" bash "$FL" 2>&1 >/dev/null)"; RC=$?
+mv "$LD/web.gone" "$LD/web"
+case "$RC:$OUT" in 1:*"FAILED — no pinned, embedded or verified bootstrap"*) grep -q '^failed ' "$LD/st/loader" && ok "a pin that cannot be fetched and nothing else to run: FAILED, exit 1, reason on stderr, reading loader = failed" || bad "loader failed reading" "" ;; *) bad "pinned, nothing to run" "rc=$RC $OUT" ;; esac
+# no pin, an embedded copy that CANNOT be placed (unwritable loader dir): a real failure, never "waiting" (review on #418)
+rm -rf "$LD/dir"; mkdir -p "$LD/dir"; chmod 555 "$LD/dir"
+OUT="$(env FLEET_BOOTSTRAP_BASE_URL="file://$LD/web" FLEET_LOADER_DIR="$LD/dir" FLEET_LOG_DIR="$LD/log" FLEET_STATE_DIR="$LD/st" FLEET_MANAGED_PREFS="$LD/none" bash "$LD/uploaded.sh" 2>&1)"; RC=$?
+chmod 755 "$LD/dir"
+if [ "$(id -u)" = 0 ]; then ok "an embedded copy that cannot be placed is a FAILURE not 'waiting' (skipped as root: a root-owned dir stays writable)"; else
+case "$RC:$OUT" in 1:*"FAILED"*) case "$OUT" in *"waiting for the com.memex.local profile"*) bad "unplaceable embedded copy reported as waiting" "$OUT" ;; *) ok "no pin and an embedded copy that cannot be placed: FAILED, exit 1 — never reported as the enrolment race 'waiting'" ;; esac ;; *) bad "unplaceable embedded copy" "rc=$RC $OUT" ;; esac; fi
 unset LSCRIPT
 grep -q '^return 0 2>/dev/null || exit 0$' "$FL" && [ "$(tail -1 "$FL")" = 'return 0 2>/dev/null || exit 0' ] && ok "the loader ends in an exit: the embedded bytes appended after it are never executed inline" || bad "loader end" "$(tail -1 "$FL")"
 rm -rf "$LD"

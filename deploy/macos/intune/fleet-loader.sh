@@ -54,6 +54,11 @@ embedded_to() {
   [ -s "$1" ]
 }
 
+# Whether this file carries an embedded copy after the marker line (checked in place, writing nothing).
+has_embedded() {
+  awk -v m="$MARK" 'found { n++ } $0 == m { found = 1 } END { exit n ? 0 : 1 }' "${BASH_SOURCE[0]}" 2>/dev/null
+}
+
 choose() {
   local commit want tmp="" got
   commit="$(pref FLEET_BOOTSTRAP_COMMIT BootstrapCommit)"; want="$(pref FLEET_BOOTSTRAP_SHA256 BootstrapSha256)"
@@ -78,6 +83,7 @@ choose() {
     fi
     [ -z "$tmp" ] || rm -f "$tmp"
   else
+    NOPIN=1
     llog "no bootstrap pin in the com.memex.local profile (BootstrapCommit / BootstrapSha256)"
   fi
   tmp="$LOADER_DIR/embedded.sh"
@@ -85,15 +91,30 @@ choose() {
   if embedded_to "$tmp.new" && place "$tmp.new" "$tmp"; then
     rm -f "$tmp.new"; CHOSEN="$tmp"; WHY="the embedded bootstrap (sha256 $(sha_of "$tmp" | cut -c1-12))"; return 0
   fi
+  # 🚨 NOPIN means "the pin is the ONLY thing missing" — the enrolment race. A copy IS embedded in this
+  # file and still could not be extracted or placed: that is a real failure to report, never "waiting".
+  if has_embedded; then
+    NOPIN=0
+    llog "the embedded bootstrap could not be placed in $LOADER_DIR"
+  fi
   rm -f "$tmp.new"
   if [ -f "$VERIFIED" ]; then CHOSEN="$VERIFIED"; WHY="the last verified bootstrap (sha256 $(sha_of "$VERIFIED" | cut -c1-12))"; return 0; fi
   return 1
 }
 
 if [ "${FLEET_LOADER_LIB:-}" != 1 ]; then
-  CHOSEN=""; WHY=""
+  CHOSEN=""; WHY=""; NOPIN=0
   if ! choose; then
-    llog "FAILED — no pinned, embedded or verified bootstrap to run"; reading failed "no bootstrap to run"; exit 1
+    if [ "$NOPIN" = 1 ]; then
+      # Enrolment race: the profile (the pin) arrives minutes after the script. A non-zero exit makes Intune stop the
+      # hourly schedule until its own retry, so say "waiting" and let the next hourly run continue.
+      llog "waiting for the com.memex.local profile — no pin yet and no embedded or verified bootstrap; the next hourly run continues"
+      reading waiting "waiting for the com.memex.local profile"; exit 0
+    fi
+    llog "FAILED — no pinned, embedded or verified bootstrap to run"; reading failed "no bootstrap to run"
+    # Intune keeps stderr of a failed run, so the reason reaches the console (stdout alone reads as 'Unknown').
+    { echo "fleet-loader ${FLEET_LOADER_VERSION}: FAILED — no pinned, embedded or verified bootstrap to run"; tail -n 5 "$LOG_DIR/fleet-loader.log" 2>/dev/null; } >&2
+    exit 1
   fi
   llog "running $WHY"; reading ok "$WHY"
   exec /bin/bash "$CHOSEN" "$@"
