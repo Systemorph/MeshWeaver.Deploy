@@ -1750,7 +1750,11 @@ def load_stages(path: str) -> list[dict]:
 # NUGET_FALLBACK_PACKAGES, and a build stage's project.assets.json NAMES that folder, so a later stage
 # that cannot see it fails ResolvePackageAssets ("Unable to find fallback package folder"). `nuget` stays
 # accepted so existing declarations remain valid.
-STAGE_NEEDS = {"plugins", "outputs", "nuget"}
+# `modules` is the plugins layer's COMPILED half: the module assemblies of the registry's bundles (MeshWeaver.AI, ...)
+# that a repository's NodeTypes reference, staged at `$MW_MODULES_DIR/<module>/<module>.dll`. The platform image ships no
+# modules, so a stage compiling content against one passes `--module $MW_MODULES_DIR/<module>/<module>.dll` to the tester,
+# exactly the composition the Actions lanes make (`registry-modules`).
+STAGE_NEEDS = {"plugins", "outputs", "nuget", "modules"}
 
 
 # 🚨 A PREPARED SERVER, NEVER A PREPARED RUN (MeshWeaver.Plugins Hosting/StandingBuildHosts §H7 → "A prepared
@@ -3472,6 +3476,112 @@ def layer_intact(set_dir: Optional[str], cache: Optional[str] = None) -> bool:
         if not bundle_intact(final, line):
             return False
     return present == pkgs
+
+
+MODULE_ZIP_PREFIXES = ("meshweaver/modules/", "meshweaver/moduleassets/", "meshweaver/modulenatives/")
+
+
+def module_name_of(zf: "zipfile.ZipFile") -> Optional[str]:
+    """The entry assembly a module bundle declares: its manifest's `module.assemblyName`, else the ONE dll under
+    `meshweaver/modules/`. None for a bundle that carries no module assembly (a content-only package)."""
+    names = zf.namelist()
+    if "meshweaver/manifest.json" in names:
+        try:
+            name = ((json.loads(zf.read("meshweaver/manifest.json")) or {}).get("module") or {}).get("assemblyName")
+        except (ValueError, KeyError):
+            name = None
+        if isinstance(name, str) and name:
+            return name
+    dlls = [n for n in names if n.startswith("meshweaver/modules/") and n.count("/") == 2 and n.endswith(".dll")]
+    return os.path.basename(dlls[0])[:-4] if len(dlls) == 1 else None
+
+
+def extract_module_bundle(zip_path: str, out: str) -> Optional[str]:
+    """Land one module bundle as `<out>/<module>/` — its `meshweaver/modules` closure, static assets and natives merged at
+    the module-relative path, the shape `ModuleLandingService` writes and the Actions lanes compose under /ext/modules.
+    Every entry is validated before anything is written (no rooted or parent-traversing path). Returns the module's
+    name, or None when the bundle carries no module assembly (nothing is written then)."""
+    with zipfile.ZipFile(zip_path) as zf:
+        name = module_name_of(zf)
+        if not name or "/" in name or name.startswith("."):
+            return None
+        base = os.path.realpath(os.path.join(out, name))
+        landed_entry = False
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            pre = next((q for q in MODULE_ZIP_PREFIXES if info.filename.startswith(q)), None)
+            if not pre:
+                continue
+            rel = info.filename[len(pre):]
+            dest = os.path.realpath(os.path.join(base, rel))
+            if not rel or rel.startswith("/") or ".." in rel.split("/") or not dest.startswith(base + os.sep):
+                raise Refusal(f"module bundle entry {info.filename!r} escapes its module folder")
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with zf.open(info) as src, open(dest, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            landed_entry = landed_entry or rel == f"{name}.dll"
+        if not landed_entry:
+            shutil.rmtree(base, ignore_errors=True)
+            raise Refusal(f"module bundle declares module {name} but ships no {name}.dll")
+    return name
+
+
+def stage_module_set(lines: list[str], cache: str, download: Callable[[str, str], int]) -> str:
+    """The module assemblies of every bundle the index names, as the SET `<cache>/module-sets/<key-hex>/<module>` (links to
+    the content-addressed `<cache>/module-bundles/<h>/<module>/`, h = the line's digest, so an unchanged bundle is never
+    fetched again). `download(package_at_version, dest_zip)` returns an HTTP-style status (200 = fetched). A bundle
+    that carries no module assembly is skipped. Anything else that fails is a Refusal naming the bundle."""
+    root = os.path.join(cache, "module-bundles")
+    os.makedirs(root, exist_ok=True)
+    places = {}
+    for line in lines:
+        pkg, ver = line.split("@")[0], line.split("@")[1]
+        final = os.path.join(root, hashlib.sha256(line.encode()).hexdigest()[:32])
+        marker = os.path.join(final, ".module")
+        if not os.path.isfile(marker):
+            tmp = tempfile.mkdtemp(prefix=".mod-", dir=root)
+            try:
+                zpath = os.path.join(tmp, ".bundle.zip")
+                status = download(f"{pkg}@{ver}", zpath)
+                if status != 200:
+                    raise Refusal(f"downloading module bundle {pkg}@{ver} failed (HTTP {status or 'no answer'})")
+                try:
+                    name = extract_module_bundle(zpath, tmp)
+                except zipfile.BadZipFile:
+                    raise Refusal(f"module bundle {pkg}@{ver} is not a zip")
+                os.unlink(zpath)
+                with open(os.path.join(tmp, ".module"), "w") as fh:
+                    fh.write((name or "") + "\n")
+                _swap_into_place(tmp, final, lambda f: os.path.isfile(os.path.join(f, ".module")))
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        with open(marker) as fh:
+            name = fh.read().strip()
+        if name:
+            places[name] = os.path.join(final, name)
+    key = plugins_key_of(lines).split(":", 1)[1]
+    sets = os.path.join(cache, "module-sets")
+    os.makedirs(sets, exist_ok=True)
+    set_dir = os.path.join(sets, key)
+    if not module_set_intact(set_dir, places):
+        tmp = tempfile.mkdtemp(prefix=".mset-", dir=sets)
+        for name, place in places.items():
+            os.symlink(place, os.path.join(tmp, name))
+        _swap_into_place(tmp, set_dir, lambda d: module_set_intact(d, places))
+    if not module_set_intact(set_dir, places):
+        raise Refusal("the module set is not intact on the cache after staging")
+    return set_dir
+
+
+def module_set_intact(set_dir: str, places: dict) -> bool:
+    try:
+        present = {n for n in os.listdir(set_dir) if not n.startswith(".")}
+    except OSError:
+        return False
+    return present == set(places) and all(
+        os.path.islink(os.path.join(set_dir, n)) and os.path.realpath(os.path.join(set_dir, n)) == os.path.realpath(p)
+        and os.path.isfile(os.path.join(p, f"{n}.dll")) for n, p in places.items())
 
 
 def layer_record_path(cache: str, identity: str) -> str:
@@ -5337,6 +5447,19 @@ def _registry_get(url: str, key: str) -> tuple[int, object]:
         return 0, str(e)
 
 
+def _registry_download(url: str, key: str, dest: str) -> int:
+    """GET a binary (a module bundle) with the instance key into `dest`; the HTTP status, 0 for no answer."""
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r, open(dest, "wb") as fh:
+            shutil.copyfileobj(r, fh)
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except (urllib.error.URLError, OSError):
+        return 0
+
+
 def _post_form(url: str, form: dict) -> dict:
     data = urllib.parse.urlencode(form).encode()
     req = urllib.request.Request(url, data=data, method="POST",
@@ -5468,6 +5591,7 @@ class Host:
                  pull: Callable[[list[str]], int] = None, checkout: Callable = None,
                  sandbox=None, leftovers: Callable[[], list[int]] = None, reap: Callable[[], int] = None,
                  registry_get: Callable[[str, str], tuple[int, object]] = None,
+                 registry_download: Callable[[str, str, str], int] = None,
                  fetch_runner: Callable[[list[str], dict], int] = None,
                  store_runner: Callable[..., tuple[int, str]] = None,
                  git_runner: Callable[[list[str], dict], tuple[int, str]] = None,
@@ -5502,6 +5626,8 @@ class Host:
         self.leftovers = leftovers or pid_namespace_leftovers
         self.reap = reap or reap_children
         self.registry_get = registry_get or _registry_get
+        self.registry_download = registry_download or _registry_download
+        self.modules_dir: Optional[str] = None
         self.store_runner = store_runner or _run_capture_stdout
         self.git_runner = git_runner or _git_run
         self.fetch_runner = fetch_runner or (lambda argv, env: subprocess.run(argv, env=env, timeout=600).returncode)
@@ -6033,10 +6159,11 @@ class Host:
                 self.modules_seen = rec.get("modulesKey") if isinstance(rec.get("modulesKey"), str) else None
                 self.log(f"plugins layer already installed on the cache: {rec['key'][:19]}…")
         signal = self.modules_signal()
-        if signal is not None and signal == self.modules_seen and self.plugins_key and layer_intact(self.plugins_dir, self.cache):
-            return True                     # nothing handed over since the layer was staged
         url = self.env["MW_REGISTRY_URL"].rstrip("/")
         key_file = self.env.get("MW_REGISTRY_KEY_FILE", "/run/registry-key/key")
+        if signal is not None and signal == self.modules_seen and self.plugins_key and layer_intact(self.plugins_dir, self.cache):
+            self.refresh_modules(url, key_file)
+            return True                     # nothing handed over since the layer was staged
         try:
             with open(key_file) as fh:
                 instance_key = fh.read().strip()
@@ -6073,7 +6200,31 @@ class Host:
             write_layer_record(self.cache, self.identity, key, self.plugins_dir, signal)
         except OSError as e:
             self.log(f"could not record the installed plugins layer on the cache ({e}) — the next host reads the index")
+        self.refresh_modules(url, key_file)
         return True
+
+    def refresh_modules(self, url: str, key_file: str) -> None:
+        """The plugins layer's COMPILED half (`needs: ["modules"]`): the module assemblies of the staged layer's bundles,
+        installed content-addressed beside it. NEVER a reason not to claim — a stage that needs a module the layer lacks
+        fails on its own, naming it, while every other stage (this repository's own) is unaffected; a refusal is said here."""
+        if not self.plugins_dir:
+            self.modules_dir = None
+            return
+        try:
+            with open(os.path.join(self.plugins_dir, ".complete")) as fh:
+                lines = [ln.strip() for ln in fh.read().splitlines() if ln.strip()]
+            if self.modules_dir and os.path.basename(self.modules_dir) == plugins_key_of(lines).split(":", 1)[1] \
+                    and os.path.isdir(self.modules_dir):
+                return
+            with open(key_file) as fh:
+                instance_key = fh.read().strip()
+            self.modules_dir = stage_module_set(
+                lines, self.cache,
+                lambda pv, dest: self.registry_download(f"{url}/api/plugins/bundles/{pv.split('@')[0]}/{pv.split('@')[1]}", instance_key, dest))
+            self.log(f"module assemblies staged beside the plugins layer: {sorted(n for n in os.listdir(self.modules_dir) if not n.startswith('.'))}")
+        except (Refusal, OSError) as e:
+            self.modules_dir = None
+            self.log(f"module assemblies NOT staged ({e}) — a stage that needs them fails naming it; claiming goes on")
 
     def module_fetch(self, registry: str, instance_key: str, package: str, version: str, out: str) -> int:
         """core's `meshweaver-plugin-build module-fetch` — the one implementation that validates a
@@ -6627,6 +6778,7 @@ class Host:
                 "MW_BUILD_CHANNEL": self.channel, "MW_BUILD_VERSION": self.version, "MW_BUILD_REPO": repo, "MW_BUILD_SHA": sha,
                 "MW_BUILD_RUN_PATH": path, "MW_BUILD_IS_TRUNK": "true" if trunk else "false",
                 "MW_PLUGINS_DIR": self.plugins_dir or "", "MW_PLUGINS_DIGEST": self.plugins_digest or "",
+                "MW_MODULES_DIR": self.modules_dir or "",
                 "MW_BUILD_CACHE_OUTPUTS": outputs_root(self.cache, repo), "MW_BUILD_ARTIFACTS": artifacts_dir,
                 "MW_BUILD_OUTPUTS": outputs_dir,
                 "MW_PLUGINS_KEY": self.effective_plugins_key(),
@@ -7413,6 +7565,12 @@ class Host:
                 link = os.path.join(self.plugins_dir, name)
                 if os.path.islink(link):
                     ro.append(os.path.realpath(link))     # a plugin set's links point into /cache/bundles
+        if "modules" in needs and self.modules_dir:
+            ro.append(self.modules_dir)
+            for name in sorted(os.listdir(self.modules_dir)) if os.path.isdir(self.modules_dir) else []:
+                link = os.path.join(self.modules_dir, name)
+                if os.path.islink(link):
+                    ro.append(os.path.realpath(link))     # a module's folder is under /cache/module-bundles
         if "outputs" in needs:
             ro.append(outputs_root(self.cache, repo))
         # The warm NuGet cache, for EVERY stage: sandbox_env hands each one NUGET_FALLBACK_PACKAGES=<cache>/nuget, and
@@ -9751,6 +9909,7 @@ def self_test() -> int:
 
         def host(api, **kw):
             kw.setdefault("pull", pull)
+            kw.setdefault("registry_download", lambda u, k, d: 404)    # no self-test reaches a registry
             kw.setdefault("nuget_feeds", NugetFeeds(stand_in_feed))
             # a pull-request run merges onto a base: a fake git that resolves and merges cleanly
             kw.setdefault("git_runner", lambda args, env_: (0, "e" * 40 + "\n" if "rev-parse" in args else ""))
@@ -10241,6 +10400,81 @@ def self_test() -> int:
                 pass
         check("h8/the instance key never reaches a sandbox",
               not any("REGISTRY" in k for k in sandbox_env(dict(h8env, MW_REGISTRY_INSTANCE_KEY="x"), {}, "/cache")))
+
+        # ── 6b'. the plugins layer's COMPILED half: module assemblies, `needs: ["modules"]` ─────
+        def make_bundle(path, name, extra=None, manifest=True, entry=True):
+            with zipfile.ZipFile(path, "w") as zf:
+                if manifest:
+                    zf.writestr("meshweaver/manifest.json", json.dumps({"module": {"assemblyName": name}}))
+                if entry:
+                    zf.writestr(f"meshweaver/modules/{name}.dll", b"dll-" + name.encode())
+                zf.writestr("meshweaver/moduleassets/wwwroot/x.js", b"js")
+                zf.writestr("meshweaver/modulenatives/runtimes/linux-x64/native/n.so", b"so")
+                zf.writestr("nodes/Root.json", b"{}")
+                for n, b in (extra or {}).items():
+                    zf.writestr(n, b)
+        mb = os.path.join(tmp, "modbundles"); os.makedirs(mb)
+        make_bundle(os.path.join(mb, "AI.zip"), "MeshWeaver.AI")
+        with zipfile.ZipFile(os.path.join(mb, "Content.zip"), "w") as zf:
+            zf.writestr("nodes/Root.json", b"{}")
+        make_bundle(os.path.join(mb, "Evil.zip"), "MeshWeaver.Evil", extra={"meshweaver/modules/../../escape.dll": b"x"})
+        landed = os.path.join(tmp, "modland"); os.makedirs(landed)
+        check("modules/a bundle lands as <module>/ with its modules, assets and natives merged",
+              extract_module_bundle(os.path.join(mb, "AI.zip"), landed) == "MeshWeaver.AI"
+              and open(os.path.join(landed, "MeshWeaver.AI", "MeshWeaver.AI.dll"), "rb").read() == b"dll-MeshWeaver.AI"
+              and os.path.isfile(os.path.join(landed, "MeshWeaver.AI", "wwwroot", "x.js"))
+              and os.path.isfile(os.path.join(landed, "MeshWeaver.AI", "runtimes", "linux-x64", "native", "n.so")))
+        check("modules/a content-only bundle carries no module and writes nothing",
+              extract_module_bundle(os.path.join(mb, "Content.zip"), landed) is None and sorted(os.listdir(landed)) == ["MeshWeaver.AI"])
+        try:
+            extract_module_bundle(os.path.join(mb, "Evil.zip"), landed)
+            check("modules/a parent-traversing entry is refused", False, "landed")
+        except Refusal:
+            check("modules/a parent-traversing entry is refused", not os.path.exists(os.path.join(tmp, "escape.dll")))
+        mcache = os.path.join(tmp, "modcache"); os.makedirs(mcache)
+        downloads: list[str] = []
+
+        def dl(pv, dest):
+            downloads.append(pv)
+            shutil.copyfile(os.path.join(mb, ("AI" if pv.startswith("AI@") else "Content") + ".zip"), dest)
+            return 200
+        mlines = ["AI@1.40.1", "Store@1.36.20"]
+        mset = stage_module_set(mlines, mcache, dl)
+        check("modules/the set links exactly the modules the bundles carry (a content-only bundle adds none)",
+              sorted(os.listdir(mset)) == ["MeshWeaver.AI"] and os.path.isfile(os.path.join(mset, "MeshWeaver.AI", "MeshWeaver.AI.dll")), os.listdir(mset))
+        check("modules/every bundle downloaded once", sorted(downloads) == ["AI@1.40.1", "Store@1.36.20"], downloads)
+        downloads.clear()
+        stage_module_set(mlines, mcache, dl)
+        check("modules/an unchanged layer downloads nothing", downloads == [], downloads)
+        try:
+            stage_module_set(["AI@9.9.9"], mcache, lambda pv, dest: 503)
+            check("modules/a failed download is a Refusal naming the bundle", False, "staged")
+        except Refusal as r:
+            check("modules/a failed download is a Refusal naming the bundle", "AI@9.9.9" in str(r) and "503" in str(r), str(r))
+        # on the host: staged beside the layer, exposed to a stage that declares it, never a reason not to claim
+        mkf = os.path.join(tmp, "modkey"); open(mkf, "w").write("mwi_secret\n")
+        menv = dict(h8env, MW_BUILD_CACHE=os.path.join(tmp, "hmodcache"), MW_REGISTRY_KEY_FILE=mkf)
+        midx = {"frameworkMvid": "c3e1", "bundles": [{"plugin": "AI", "version": "1.40.1"}, {"plugin": "Store", "version": "1.36.20"}]}
+        seen_urls: list[str] = []
+
+        def mdl(u, k, d):
+            seen_urls.append(u)
+            return dl(u.rsplit("/", 2)[-2] + "@" + u.rsplit("/", 1)[-1], d) if k == "mwi_secret" else 401
+        hm = host(_FakeApi({("POST", "/claim"): lambda p_, b: (204, None)}), env=menv,
+                  registry_get=lambda u, k: (200, json.loads(json.dumps(midx))), registry_download=mdl, fetch_runner=fetch_runner)
+        check("modules/a cycle stages the module set beside the layer and claims", hm.cycle() == "idle" and hm.modules_dir
+              and sorted(os.listdir(hm.modules_dir)) == ["MeshWeaver.AI"], hm.modules_dir)
+        check("modules/the bundle route and the instance key are the registry's own",
+              all(u.startswith("https://portal.example.com/api/plugins/bundles/") for u in seen_urls) and seen_urls, seen_urls)
+        ro = hm.stage_readonly("R", {"needs": ["modules"]})
+        check("modules/a stage that declares `modules` reads the set and the bundle folders its links point to",
+              hm.modules_dir in ro and os.path.realpath(os.path.join(hm.modules_dir, "MeshWeaver.AI")) in ro, ro)
+        check("modules/a stage that does not declare it reads none", hm.modules_dir not in hm.stage_readonly("R", {"needs": ["plugins"]}))
+        validate_stages({"stages": [{"name": "g", "kind": "test", "command": "true", "needs": ["modules"]}]})
+        hf = host(_FakeApi({("POST", "/claim"): lambda p_, b: (204, None)}), env=dict(menv, MW_BUILD_CACHE=os.path.join(tmp, "hmodcache2")),
+                  registry_get=lambda u, k: (200, json.loads(json.dumps(midx))), registry_download=lambda u, k, d: 500, fetch_runner=fetch_runner)
+        check("modules/an unreachable bundle download never stops the host claiming (the stage names what is missing)",
+              hf.cycle() == "idle" and hf.modules_dir is None)
 
         # ── 6c. the plugins layer follows the module HAND-OVER signal, and stays installed ─────
         sig = {"key": "sha256:" + "1" * 64}
