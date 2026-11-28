@@ -234,6 +234,40 @@ sample_versions() {
   printf '{%s}' "$out"
 }
 
+# The BUILD VM's health — a reading of its own, because `colima status` of the default profile (the `colima` reading)
+# describes the portal VM and says nothing about the build VM, and a dead build VM (2026-11-12: a VZ state error;
+# `colima list` kept saying Running) went unnoticed for three days. Probes the build profile end to end, each probe
+# BOUNDED (no `timeout` binary on macOS): the VM runs, the kube API answers and every node is Ready (containerd +
+# k3s alive), and a build-host runner pod is Running. Prints nothing when this Mac has no build VM (absent, never
+# "ok"); otherwise "ok" or a fixed reason string (spliced into JSON, so constants only). A failure is also said on
+# stderr, which launchd keeps in the agent's log.
+bounded() { # seconds cmd... — the command's exit status; 124 when it outlived the bound (killed)
+  local secs="$1" pid rc wd; shift
+  "$@" </dev/null & pid=$!
+  ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 & wd=$!
+  wait "$pid" 2>/dev/null; rc=$?
+  kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+  [ "$rc" = 137 ] && rc=124
+  return "$rc"
+}
+build_vm_health() {
+  local profile="${MEMEX_BUILD_PROFILE:-build}" ctx nodes pods reason=""
+  [ "$profile" = default ] && return 0
+  [ -d "${COLIMA_HOME:-$HOME/.colima}/$profile" ] || [ -d "$HOME/.colima/_lima/colima-$profile" ] || return 0
+  ctx="colima-$profile"
+  if ! bounded 10 colima status -p "$profile" >/dev/null 2>&1; then reason="the build VM is not running"
+  else
+    nodes="$(bounded 10 kubectl --context "$ctx" get nodes --request-timeout=5s --no-headers 2>/dev/null)"
+    if [ -z "$nodes" ] || printf '%s\n' "$nodes" | grep -qv ' Ready'; then reason="the build VM's kube API does not answer or a node is not Ready"
+    else
+      pods="$(bounded 10 kubectl --context "$ctx" get pods -A -l app.kubernetes.io/component=build-host --request-timeout=5s \
+        -o jsonpath='{.items[*].status.phase}' 2>/dev/null)"
+      case " $pods " in *" Running "*) ;; *) reason="no build-host runner pod is Running in the build VM" ;; esac
+    fi
+  fi
+  if [ -n "$reason" ]; then echo "backlease-sampler: build VM unhealthy: $reason" >&2; printf '%s' "$reason"; else printf ok; fi
+}
+
 health_of() { # name, probe-exit → "ok" or the reason
   if [ "$2" = 0 ]; then printf '"%s":"ok"' "$1"; else printf '"%s":"%s"' "$1" "$3"; fi
 }
@@ -260,16 +294,23 @@ write_sample() {
   # the ingress answers 404 to a bare IP, so the hostname is resolved to loopback explicitly)
   curl -sk -m 3 -o /dev/null -w '%{http_code}' --resolve "${MEMEX_HOSTNAME:-memex.localhost}:${MEMEX_PORT:-8443}:127.0.0.1" \
     "https://${MEMEX_HOSTNAME:-memex.localhost}:${MEMEX_PORT:-8443}/health" 2>/dev/null | grep -q '^200$'; portal_rc=$?
+  local bvm bvm_json="" bvm_rc
+  bvm="$(build_vm_health)"
+  if [ -n "$bvm" ]; then
+    if [ "$bvm" = ok ]; then bvm_rc=0; else bvm_rc=1; fi
+    bvm_json=",$(health_of buildvm "$bvm_rc" "$bvm")"
+  fi
   tmp="$OUT.tmp.$$"
   {
     printf '{"os":"macOS %s","machine":"%s",' "$(sw_vers -productVersion 2>/dev/null || echo unknown)" \
       "$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Model Name|Chip|Memory/ {printf "%s ", $2}' | sed 's/ *$//')"
     printf '"models":%s,"vm":%s,"host":%s,"versions":%s,' "$models" "$vm" "$host" "$(sample_versions)"
-    printf '"health":{%s,%s,%s,%s},' \
+    printf '"health":{%s,%s,%s,%s%s},' \
       "$(health_of portal "$portal_rc" "no 200 from /health on :${MEMEX_PORT:-8443}")" \
       "$(health_of ollama "$m_rc" "ollama did not answer /api/tags at $OLLAMA")" \
       "$(health_of colima "$colima_rc" "colima status failed")" \
-      "$(health_of kubelet "$v_rc" "the kubelet summary could not be read")"
+      "$(health_of kubelet "$v_rc" "the kubelet summary could not be read")" \
+      "$bvm_json"
     printf '"sampledAt":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } > "$tmp" && mv -f "$tmp" "$OUT"
 }

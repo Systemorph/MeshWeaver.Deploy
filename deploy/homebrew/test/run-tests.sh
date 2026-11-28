@@ -3226,6 +3226,58 @@ vw | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["versions"]==
   && ok "the written readings.json carries the versions object" || bad "versions in readings.json" "$(vw)"
 rm -rf "$VR"
 
+echo "── back-lease sampler: the build VM's own health reading (a dead build VM is never silent) ──"
+BV="$(mktemp -d)"; mkdir -p "$BV/stubs" "$BV/dir" "$BV/home"
+SAMPLER="$HERE/../share/backlease-sampler.sh"
+# colima stub: `status -p build` exits per $BV/colima (default 0); kubectl stub answers nodes / pods from files, or hangs on $BV/hang
+cat > "$BV/stubs/colima" <<EOF
+#!/bin/bash
+[ -e "$BV/colima.fail" ] && exit 1
+exit 0
+EOF
+cat > "$BV/stubs/kubectl" <<EOF
+#!/bin/bash
+[ -e "$BV/hang" ] && exec sleep 30
+case " \$* " in
+  *" get nodes "*) cat "$BV/nodes" 2>/dev/null ;;
+  *" get pods "*) cat "$BV/pods" 2>/dev/null ;;
+esac
+exit 0
+EOF
+chmod +x "$BV/stubs/colima" "$BV/stubs/kubectl"
+bv() { env PATH="$BV/stubs:$PATH" HOME="$BV/home" COLIMA_HOME= MEMEX_BUILD_PROFILE="${1:-}" MEMEX_BACKLEASE_DIR="$BV/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 \
+  bash -c '. "$0"; build_vm_health' "$SAMPLER" 2>"$BV/err"; }
+[ -z "$(bv)" ] && ok "a Mac with no build VM profile reports no buildvm reading (absent, never ok)" || bad "no build vm" "$(bv)"
+mkdir -p "$BV/home/.colima/_lima/colima-build"
+printf 'node1   Ready   control-plane   3d   v1.31\n' > "$BV/nodes"; printf 'Running Running' > "$BV/pods"
+[ "$(bv)" = ok ] && ok "VM running, node Ready, a runner pod Running → ok" || bad "healthy build vm" "$(bv)"
+: > "$BV/colima.fail"
+[ "$(bv)" = "the build VM is not running" ] && grep -q "unhealthy" "$BV/err" && ok "a stopped VM is named, and said on stderr (the launchd log)" || bad "vm down" "$(bv)"
+rm -f "$BV/colima.fail"
+: > "$BV/nodes"
+[ "$(bv)" = "the build VM's kube API does not answer or a node is not Ready" ] && ok "colima up but the kube API silent (containerd/k3s dead) → named" || bad "api dead" "$(bv)"
+printf 'node1   NotReady   control-plane   3d   v1.31\n' > "$BV/nodes"
+[ "$(bv)" = "the build VM's kube API does not answer or a node is not Ready" ] && ok "a NotReady node → named" || bad "node notready" "$(bv)"
+printf 'node1   Ready   control-plane   3d   v1.31\n' > "$BV/nodes"; : > "$BV/pods"
+[ "$(bv)" = "no build-host runner pod is Running in the build VM" ] && ok "no runner pod Running (runner dead or release missing) → named" || bad "no runner" "$(bv)"
+printf 'Pending' > "$BV/pods"
+[ "$(bv)" = "no build-host runner pod is Running in the build VM" ] && ok "a Pending-only runner is not Running" || bad "pending runner" "$(bv)"
+: > "$BV/hang"
+S0=$SECONDS; R="$(bv)"; DT=$((SECONDS - S0))
+[ "$R" = "the build VM's kube API does not answer or a node is not Ready" ] && [ "$DT" -lt 25 ] && ok "a hung kubectl is killed at the bound and reported, never waited on" || bad "hang bound" "R=$R dt=$DT"
+rm -f "$BV/hang"
+[ -z "$(bv default)" ] && ok "MEMEX_BUILD_PROFILE=default has no separate build VM → no reading" || bad "default profile" "$(bv default)"
+printf 'Running' > "$BV/pods"
+bw() { env PATH="$BV/stubs:$PATH" HOME="$BV/home" COLIMA_HOME= MEMEX_BUILD_PROFILE= MEMEX_BACKLEASE_DIR="$BV/dir" MEMEX_BACKLEASE_SAMPLER_LIB=1 bash -c '. "$0"; sample_host() { printf "{\"cores\":2}"; }; owner_cpu() { :; }; host_cpu() { :; }; net_rate() { :; }
+  sample_models() { printf "[]"; }; sample_vm() { printf null; }; curl() { return 1; }; sw_vers() { echo 1; }; system_profiler() { :; }
+  OUT="$1"; write_sample; cat "$OUT"' "$SAMPLER" "$BV/out.json" 2>/dev/null; }
+bw | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["health"]["buildvm"]=="ok"' 2>/dev/null \
+  && ok "the written readings.json carries health.buildvm (the heartbeat forwards it)" || bad "buildvm in readings.json" "$(bw)"
+: > "$BV/colima.fail"
+bw | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["health"]["buildvm"]=="the build VM is not running"' 2>/dev/null \
+  && ok "a dead build VM reaches the heartbeat as health.buildvm with the reason" || bad "buildvm failure in readings.json" "$(bw)"
+rm -rf "$BV"
+
 echo "── idle-only models: CI first, a large model only while the build VM is stopped for it (Hosting/BackLease §15.9) ──"
 IO="$(mktemp -d)"; mkdir -p "$IO/home" "$IO/stubs"
 printf '#!/bin/bash\necho "launchctl $*" >> "%s/launchctl.log"\nexit 0\n' "$IO" > "$IO/stubs/launchctl"; chmod +x "$IO/stubs/launchctl"
