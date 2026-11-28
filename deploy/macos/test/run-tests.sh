@@ -1111,6 +1111,12 @@ rm -rf "$LD/dir"; mv "$LD/web" "$LD/web.gone"
 OUT="$(env FLEET_BOOTSTRAP_BASE_URL="file://$LD/web" FLEET_LOADER_DIR="$LD/dir" FLEET_LOG_DIR="$LD/log" FLEET_STATE_DIR="$LD/st" FLEET_MANAGED_PREFS="$LD/none" FLEET_BOOTSTRAP_COMMIT="$C1" FLEET_BOOTSTRAP_SHA256="$S1" bash "$FL" 2>&1 >/dev/null)"; RC=$?
 mv "$LD/web.gone" "$LD/web"
 case "$RC:$OUT" in 1:*"FAILED — no pinned, embedded or verified bootstrap"*) grep -q '^failed ' "$LD/st/loader" && ok "a pin that cannot be fetched and nothing else to run: FAILED, exit 1, reason on stderr, reading loader = failed" || bad "loader failed reading" "" ;; *) bad "pinned, nothing to run" "rc=$RC $OUT" ;; esac
+# no pin, an embedded copy that CANNOT be placed (unwritable loader dir): a real failure, never "waiting" (review on #418)
+rm -rf "$LD/dir"; mkdir -p "$LD/dir"; chmod 555 "$LD/dir"
+OUT="$(env FLEET_BOOTSTRAP_BASE_URL="file://$LD/web" FLEET_LOADER_DIR="$LD/dir" FLEET_LOG_DIR="$LD/log" FLEET_STATE_DIR="$LD/st" FLEET_MANAGED_PREFS="$LD/none" bash "$LD/uploaded.sh" 2>&1)"; RC=$?
+chmod 755 "$LD/dir"
+if [ "$(id -u)" = 0 ]; then ok "an embedded copy that cannot be placed is a FAILURE not 'waiting' (skipped as root: a root-owned dir stays writable)"; else
+case "$RC:$OUT" in 1:*"FAILED"*) case "$OUT" in *"waiting for the com.memex.local profile"*) bad "unplaceable embedded copy reported as waiting" "$OUT" ;; *) ok "no pin and an embedded copy that cannot be placed: FAILED, exit 1 — never reported as the enrolment race 'waiting'" ;; esac ;; *) bad "unplaceable embedded copy" "rc=$RC $OUT" ;; esac; fi
 unset LSCRIPT
 grep -q '^return 0 2>/dev/null || exit 0$' "$FL" && [ "$(tail -1 "$FL")" = 'return 0 2>/dev/null || exit 0' ] && ok "the loader ends in an exit: the embedded bytes appended after it are never executed inline" || bad "loader end" "$(tail -1 "$FL")"
 rm -rf "$LD"

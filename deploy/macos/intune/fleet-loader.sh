@@ -54,6 +54,11 @@ embedded_to() {
   [ -s "$1" ]
 }
 
+# Whether this file carries an embedded copy after the marker line (checked in place, writing nothing).
+has_embedded() {
+  awk -v m="$MARK" 'found { n++ } $0 == m { found = 1 } END { exit n ? 0 : 1 }' "${BASH_SOURCE[0]}" 2>/dev/null
+}
+
 choose() {
   local commit want tmp="" got
   commit="$(pref FLEET_BOOTSTRAP_COMMIT BootstrapCommit)"; want="$(pref FLEET_BOOTSTRAP_SHA256 BootstrapSha256)"
@@ -85,6 +90,12 @@ choose() {
   mkdir -p "$LOADER_DIR" 2>/dev/null
   if embedded_to "$tmp.new" && place "$tmp.new" "$tmp"; then
     rm -f "$tmp.new"; CHOSEN="$tmp"; WHY="the embedded bootstrap (sha256 $(sha_of "$tmp" | cut -c1-12))"; return 0
+  fi
+  # 🚨 NOPIN means "the pin is the ONLY thing missing" — the enrolment race. A copy IS embedded in this
+  # file and still could not be extracted or placed: that is a real failure to report, never "waiting".
+  if has_embedded; then
+    NOPIN=0
+    llog "the embedded bootstrap could not be placed in $LOADER_DIR"
   fi
   rm -f "$tmp.new"
   if [ -f "$VERIFIED" ]; then CHOSEN="$VERIFIED"; WHY="the last verified bootstrap (sha256 $(sha_of "$VERIFIED" | cut -c1-12))"; return 0; fi
