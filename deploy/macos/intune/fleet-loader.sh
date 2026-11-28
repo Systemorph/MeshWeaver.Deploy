@@ -78,6 +78,7 @@ choose() {
     fi
     [ -z "$tmp" ] || rm -f "$tmp"
   else
+    NOPIN=1
     llog "no bootstrap pin in the com.memex.local profile (BootstrapCommit / BootstrapSha256)"
   fi
   tmp="$LOADER_DIR/embedded.sh"
@@ -91,9 +92,18 @@ choose() {
 }
 
 if [ "${FLEET_LOADER_LIB:-}" != 1 ]; then
-  CHOSEN=""; WHY=""
+  CHOSEN=""; WHY=""; NOPIN=0
   if ! choose; then
-    llog "FAILED — no pinned, embedded or verified bootstrap to run"; reading failed "no bootstrap to run"; exit 1
+    if [ "$NOPIN" = 1 ]; then
+      # Enrolment race: the profile (the pin) arrives minutes after the script. A non-zero exit makes Intune stop the
+      # hourly schedule until its own retry, so say "waiting" and let the next hourly run continue.
+      llog "waiting for the com.memex.local profile — no pin yet and no embedded or verified bootstrap; the next hourly run continues"
+      reading waiting "waiting for the com.memex.local profile"; exit 0
+    fi
+    llog "FAILED — no pinned, embedded or verified bootstrap to run"; reading failed "no bootstrap to run"
+    # Intune keeps stderr of a failed run, so the reason reaches the console (stdout alone reads as 'Unknown').
+    { echo "fleet-loader ${FLEET_LOADER_VERSION}: FAILED — no pinned, embedded or verified bootstrap to run"; tail -n 5 "$LOG_DIR/fleet-loader.log" 2>/dev/null; } >&2
+    exit 1
   fi
   llog "running $WHY"; reading ok "$WHY"
   exec /bin/bash "$CHOSEN" "$@"
