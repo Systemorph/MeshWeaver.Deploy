@@ -985,7 +985,10 @@ jobs:
     # legs' success), and a skipped `image` reads as no failure — so without the leg's own result a
     # hand-over of a PREVIOUSLY armed set would close the alert over a failed build.
     needs: [preflight, test, image-arch, image, handover]
-    if: always() && needs.preflight.result == 'success'
+    # A RED preflight (a missing credential, an unreadable registry, a failed claim) skips every
+    # downstream job, so the report must run on it: that red is the evidence needed most. Only a
+    # SKIPPED preflight (a pull request or a push — events that carry no hand-over) is silent.
+    if: always() && needs.preflight.result != 'skipped'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -995,6 +998,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PREFLIGHT: ${{ needs.preflight.result }}
           TEST: ${{ needs.test.result }}
           ARCH: ${{ needs.image-arch.result }}
           IMAGE: ${{ needs.image.result }}
@@ -1005,13 +1009,16 @@ jobs:
           # A red `test` on a hand-over skips `image`: that is a lane that did not build its runner. A
           # schedule tick skips `test` by its own event condition, and that is no failure.
           if [ "$TEST" != success ] && ! { [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$TEST" = skipped ]; }; then IMAGE="$TEST (test)"; fi
+          # A failed or cancelled preflight skips everything below it: report the preflight itself.
+          case "$PREFLIGHT" in failure|cancelled) IMAGE="$PREFLIGHT (preflight)" ;; esac
           # A failed or cancelled architecture leg counts too: it leaves `image` SKIPPED, not failed.
           case "$ARCH" in failure|cancelled) IMAGE="$ARCH (image-arch)" ;; esac
           open=$(gh api "repos/$GITHUB_REPOSITORY/issues?labels=build-host-latest&state=open&per_page=10" --jq '.[].number')
           # failed OR cancelled (a timeout, a cancelled run) is a lane that did not hand over
           case "$IMAGE" in success|skipped) img_ok=true ;; *) img_ok=false ;; esac
+          if [ "$PREFLIGHT" = failure ] || [ "$PREFLIGHT" = cancelled ]; then img_ok=false; fi
           if [ "$img_ok" = false ] || [ "$HANDOVER" = failure ] || [ "$HANDOVER" = cancelled ]; then
-            body="The build-latest lane failed: [run ${GITHUB_RUN_ID}](${RUN_URL}) — image: \`${IMAGE}\`, handover: \`${HANDOVER}\`. Every image of the platform set IS published and the fleet's delivery is unaffected; build-latest keeps its previous set until a run hands it over. Read the failed job's ::error:: line (platform Doc/Architecture/BuildHosts)."
+            body="The build-latest lane failed: [run ${GITHUB_RUN_ID}](${RUN_URL}) — preflight: \`${PREFLIGHT}\`, image: \`${IMAGE}\`, handover: \`${HANDOVER}\`. Every image of the platform set IS published and the fleet's delivery is unaffected; build-latest keeps its previous set until a run hands it over. Read the failed job's ::error:: line (platform Doc/Architecture/BuildHosts)."
             first=$(printf '%s\n' "$open" | head -n 1)
             if [ -n "$first" ]; then
               gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$first/comments" -f body="$body" >/dev/null
